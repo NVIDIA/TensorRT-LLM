@@ -139,8 +139,8 @@ class DistConfig(BaseModel):
 
         Single source of truth for the three ``DistConfig`` construction sites in
         the AutoDeploy sharding stack: ``LlmArgs.init_dist_config`` (production),
-        ``ShardingTransformConfig._init_mapping`` (legacy test fallback), and
-        ``IRShardingConfig._init_dist_config`` (IR test fallback).
+        ``ShardingTransformConfig._init_mapping`` (heuristic-pipeline test
+        fallback), and ``IRShardingConfig._init_dist_config`` (IR test fallback).
         """
         return cls(
             world_size=world_size,

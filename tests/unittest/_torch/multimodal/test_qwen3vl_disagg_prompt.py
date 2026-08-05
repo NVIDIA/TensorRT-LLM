@@ -15,7 +15,6 @@ _VISION_START_TOKEN_ID = 151652
 _VISION_END_TOKEN_ID = 151653
 _IMAGE_TOKEN_ID = 151655
 _VIDEO_TOKEN_ID = 151656
-_PLACEHOLDER_ID = 200000
 
 
 class _FakeTokenizer:
@@ -41,19 +40,20 @@ def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
     processor._tokenizer = _FakeTokenizer(
         [11, _VISION_START_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_END_TOKEN_ID, 12]
     )
-    processor.tllm_multimodal_token_id = _PLACEHOLDER_ID
 
     handoff = processor.build_disagg_prefill_multimodal_inputs(
         {"prompt": "video prompt"},
         [{"tensor_size": (3, 16)}],
     )
 
+    # In-vocab contract: the video placeholder expands to the real
+    # _VIDEO_TOKEN_ID (no legacy OOV remap).
     assert handoff.prompt_token_ids == [
         11,
         _VISION_START_TOKEN_ID,
-        _PLACEHOLDER_ID,
-        _PLACEHOLDER_ID,
-        _PLACEHOLDER_ID,
+        _VIDEO_TOKEN_ID,
+        _VIDEO_TOKEN_ID,
+        _VIDEO_TOKEN_ID,
         _VISION_END_TOKEN_ID,
         12,
     ]
@@ -89,19 +89,19 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
         image_token_id=_IMAGE_TOKEN_ID,
         video_token_id=_VIDEO_TOKEN_ID,
         vision_start_token_id=_VISION_START_TOKEN_ID,
-        placeholder_id=_PLACEHOLDER_ID,
     )
 
+    # In-vocab contract: placeholders expand to the real image / video token ids.
     assert handoff.prompt_token_ids == [
         _VISION_START_TOKEN_ID,
-        _PLACEHOLDER_ID,
-        _PLACEHOLDER_ID,
+        _IMAGE_TOKEN_ID,
+        _IMAGE_TOKEN_ID,
         _VISION_END_TOKEN_ID,
         42,
         _VISION_START_TOKEN_ID,
-        _PLACEHOLDER_ID,
-        _PLACEHOLDER_ID,
-        _PLACEHOLDER_ID,
+        _VIDEO_TOKEN_ID,
+        _VIDEO_TOKEN_ID,
+        _VIDEO_TOKEN_ID,
         _VISION_END_TOKEN_ID,
     ]
     assert handoff.multimodal_lengths == [3, 4]
@@ -123,7 +123,6 @@ def test_qwen3vl_disagg_prompt_layout_requires_handle_per_placeholder():
             image_token_id=2,
             video_token_id=4,
             vision_start_token_id=1,
-            placeholder_id=99,
         )
 
 

@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @Library(['bloom-jenkins-shared-lib@user/yuanjingx/split-gb300', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.Exception
@@ -92,6 +108,19 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                                         - "rl300-0046.ipp2u1.colossus"
                                         - "rl300-0047.ipp2u1.colossus"
         """
+    } else if (arch == "arm64") {
+        // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
+        selectors += """
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: "kubernetes.io/hostname"
+                                      operator: NotIn
+                                      values:
+                                        - "rl300-0021.ipp2a1.colossus"
+        """
     }
 
     if (arch == "amd64") {
@@ -115,7 +144,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -271,7 +300,7 @@ def buildImage(config, imageKeyToTag)
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
-        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
 
     // Step 2: Build the images
@@ -280,24 +309,53 @@ def buildImage(config, imageKeyToTag)
         sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
-
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
-        }
-
-        withCredentials([
-            usernamePassword(
-                credentialsId: "svc_tensorrt_gitlab_read_api_token",
-                usernameVariable: 'USERNAME',
-                passwordVariable: 'PASSWORD'
-            ),
-            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
-        ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
-        }
     }
-    def containerGenFailure = null
-    try {
+    // resourceLedger.withResource registers the docker-login lifecycle *before*
+    // the first login, then runs the reclaim (logout) in a finally on both
+    // success and failure -- re-raising the body's own error -- replacing the
+    // prior try/catch/finally/containerGenFailure/rethrow. Registering before the
+    // logins means any registry we authenticate to below is owed a logout even if
+    // a later login (or the pod) fails partway through; if the build pod dies
+    // before the finally runs, the entry is left live for a post-build sweep
+    // (Phase 3) rather than being silently lost.
+    resourceLedger.withResource(this,
+        id: "docker-login/${config.stageName}",
+        type: "dockerLogin",
+        reclaim: { p, e ->
+            stage ("Docker Logout") {
+                withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
+                    // Best-effort and independent: attempt every logout even if an
+                    // earlier one fails, so a failure on one registry can't leave
+                    // another still authenticated.
+                    try {
+                        sh "docker logout urm.nvidia.com"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout urm.nvidia.com failed: ${logoutEx}"
+                    }
+                    try {
+                        sh "docker logout ${DEFAULT_GIT_URL}:5005"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout for gitlab registry failed: ${logoutEx}"
+                    }
+                }
+            }
+        }) {
+        stage ("Docker Login") {
+            withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+            }
+
+            withCredentials([
+                usernamePassword(
+                    credentialsId: "svc_tensorrt_gitlab_read_api_token",
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD'
+                ),
+                string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+            ]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
+            }
+        }
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
@@ -393,18 +451,6 @@ def buildImage(config, imageKeyToTag)
                 """
             }
         }
-    } catch (Exception ex) {
-        containerGenFailure = ex
-    } finally {
-        stage ("Docker Logout") {
-            withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
-                sh "docker logout urm.nvidia.com"
-                sh "docker logout ${DEFAULT_GIT_URL}:5005"
-            }
-        }
-        if (containerGenFailure != null) {
-            throw containerGenFailure
-        }
     }
 }
 
@@ -424,15 +470,26 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     ]
 
     def release_action = params.action
+    def stageNames = [
+        internalReleaseX86:  "Build Internal release (x86_64 trtllm)",
+        internalReleaseSBSA: "Build Internal release (SBSA trtllm)",
+        ciImageX86:          "Build CI Image (x86_64 tritondevel)",
+        ciImageSBSA:         "Build CI Image (SBSA tritondevel)",
+        ciImageRockyPy310:   "Build CI Image (RockyLinux8 Python310)",
+        ciImageRockyPy312:   "Build CI Image (RockyLinux8 Python312)",
+        ciImageSBSAUbuntu:   "Build CI Image (SBSA Ubuntu24.04 Python312)",
+        ngcReleaseX86:       "Build NGC devel And release (x86_64)",
+        ngcReleaseSBSA:      "Build NGC devel And release (SBSA)",
+    ]
     def buildConfigs = [
-        "Build Internal release (x86_64 trtllm)": [
+        (stageNames.internalReleaseX86): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
             dockerfileStage: "release",
         ],
-        "Build Internal release (SBSA trtllm)": [
+        (stageNames.internalReleaseSBSA): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
@@ -440,27 +497,27 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             arch: "arm64",
             dockerfileStage: "release",
         ],
-        "Build CI Image (x86_64 tritondevel)": [:],
-        "Build CI Image (SBSA tritondevel)": [
+        (stageNames.ciImageX86): [:],
+        (stageNames.ciImageSBSA): [
             arch: "arm64",
         ],
-        "Build CI Image (RockyLinux8 Python310)": [
+        (stageNames.ciImageRockyPy310): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI Image (RockyLinux8 Python312)": [
+        (stageNames.ciImageRockyPy312): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build CI Image (SBSA Ubuntu24.04 Python312)": [
+        (stageNames.ciImageSBSAUbuntu): [
             arch: "arm64",
             target: "ubuntu24",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build NGC devel And release (x86_64)": [
+        (stageNames.ngcReleaseX86): [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
@@ -471,7 +528,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             ],
             dockerfileStage: "release",
         ],
-        "Build NGC devel And release (SBSA)": [
+        (stageNames.ngcReleaseSBSA): [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
@@ -484,6 +541,19 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def enabledStages = []
+    if (params.buildInternalRelease) {
+        enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
+    }
+    if (params.buildCiImage) {
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+    }
+    if (params.buildNgcRelease) {
+        enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
+    }
+    buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
+    echo "Running stages: ${buildConfigs.keySet()}"
+
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
         defaultBuildConfig.each { defaultKey, defaultValue ->
@@ -551,6 +621,21 @@ pipeline {
             name: "action",
             choices: ["build", "push"],
             description: "Docker image generation action. build: only perform image build step; push: build docker image and push it to artifacts"
+        )
+        booleanParam(
+            name: "buildInternalRelease",
+            defaultValue: true,
+            description: "Build internal release images (x86_64 and SBSA trtllm)"
+        )
+        booleanParam(
+            name: "buildCiImage",
+            defaultValue: true,
+            description: "Build CI images (tritondevel and OS variant images)"
+        )
+        booleanParam(
+            name: "buildNgcRelease",
+            defaultValue: true,
+            description: "Build NGC devel and release images (x86_64 and SBSA)"
         )
     }
     options {

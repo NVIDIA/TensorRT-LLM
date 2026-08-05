@@ -19,6 +19,7 @@ turns every passthrough / aux-stream impl into a pure pass-through that
 never touches the CUDA stream manager.
 """
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.utils import multi_stream_utils as msu
@@ -100,3 +101,49 @@ class TestDisableMultiStream:
 
         assert out == "ok"
         assert called == [((1, 2), {"key": "v"})]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestRecordStreamDuringCudaGraphCapture:
+    """Regression guard for the multi-stream record_stream fix.
+
+    In the monolithic decode CUDA-graph path the aux-stream passthroughs are
+    captured (multi-stream stays enabled). ``begin_aux_stream_passthrough`` MUST
+    call ``record_stream`` on its tensor outputs *even during CUDA graph capture*,
+    otherwise the caching allocator frees ``x``'s block after the main stream's
+    last use and recycles it for a later allocation inside the same captured
+    graph, before the aux-stream shared-expert work has read it. That silently
+    corrupts the shared-expert input on replay -> garbage logits -> no-EOS
+    runaway generation (reproduced as 24/24 batch-1 requests running to
+    max_tokens on SuperV3-MTP with multi_stream_moe enabled).
+
+    A previous version skipped record_stream while capturing
+    (``if not torch.cuda.is_current_stream_capturing(): ...``). This test fails
+    if that guard is ever reintroduced.
+    """
+
+    def test_records_stream_even_while_capturing(self, monkeypatch):
+        device = torch.cuda.current_device()
+        msu.cuda_stream_manager.add_device(device)
+
+        recorded = []
+        monkeypatch.setattr(
+            msu, "_record_stream_for_tensor_outputs", lambda t, stream: recorded.append((t, stream))
+        )
+        # Simulate being inside CUDA graph capture without actually capturing,
+        # so the surrounding stream bookkeeping still executes normally.
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+        x = torch.randn(8, device="cuda")
+        try:
+            out = msu.begin_aux_stream_passthrough(x, device=device)
+        finally:
+            # begin_aux switches the current stream to aux; restore the default.
+            torch.cuda.set_stream(torch.cuda.default_stream(device))
+
+        assert out is x
+        assert len(recorded) == 1, (
+            "begin_aux_stream_passthrough must call record_stream during CUDA "
+            "graph capture (regression of the multi-stream record_stream fix)"
+        )
+        assert recorded[0][0] is x

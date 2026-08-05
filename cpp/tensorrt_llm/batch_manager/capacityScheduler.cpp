@@ -151,23 +151,26 @@ MaxRequestsScheduler::MaxRequestsScheduler(
 }
 
 MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
-    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState, bool enablePrefixAwareScheduling)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
     , mTwoStepsLookAhead{twoStepsLookAhead}
+    , mEnablePrefixAwareScheduling{enablePrefixAwareScheduling}
 {
 }
 
-GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(
-    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState, bool enablePrefixAwareScheduling)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
+    , mEnablePrefixAwareScheduling{enablePrefixAwareScheduling}
 {
 }
 
-StaticBatchScheduler::StaticBatchScheduler(
-    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
-    : GuaranteedNoEvictScheduler(maxNumRequests, noScheduleUntilState, noScheduleAfterState)
+StaticBatchScheduler::StaticBatchScheduler(SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState, bool enablePrefixAwareScheduling)
+    : GuaranteedNoEvictScheduler(
+        maxNumRequests, noScheduleUntilState, noScheduleAfterState, enablePrefixAwareScheduling)
 {
 }
 
@@ -226,7 +229,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         = peftCacheManager ? peftCacheManager->getMaxDevicePages() : std::numeric_limits<SizeType32>::max();
 
     // The optimization of delaying requests won't work for variable window attention
-    bool skippingIsRelevant = (!kvCacheManager.getBlockManager().isVariableWindow())
+    bool skippingIsRelevant = mEnablePrefixAwareScheduling && (!kvCacheManager.getBlockManager().isVariableWindow())
         && (!crossKvCacheManager || !crossKvCacheManager->getBlockManager().isVariableWindow());
 
     // Keep track of blocks contributed by requests in context phase
@@ -323,28 +326,39 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 bool const isEncoderInit = req->isEncoderInitState();
                 std::optional<kv_cache_manager::PrefixReuseSummary> summary;
                 std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;
-                if (isFirstChunkContext)
+                if (mEnablePrefixAwareScheduling)
                 {
-                    // analyzePrefixReuse asserts on variable-window managers; skip the walk there
-                    // and let downstream callers fall back to their fresh tree-walk path.
-                    if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
+                    if (isFirstChunkContext)
                     {
-                        auto uniqueTokens = req->getUniqueTokens(0);
-                        summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
+                        // analyzePrefixReuse asserts on variable-window managers; skip the walk there
+                        // and let downstream callers fall back to their fresh tree-walk path.
+                        if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
+                        {
+                            auto uniqueTokens = req->getUniqueTokens(0);
+                            summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
+                        }
+                        if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                            && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                        {
+                            auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
+                            crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                        }
                     }
-                    if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                    else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
                         && !crossKvCacheManager->getBlockManager().isVariableWindow())
                     {
+                        // Encoder admission only needs the cross summary for reuse ordering.
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                         crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                     }
                 }
-                else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
-                    && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                else if (isFirstChunkContext)
                 {
-                    // Encoder admission only needs the cross summary for reuse ordering.
-                    auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
-                    crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                    summary = kv_cache_manager::PrefixReuseSummary{};
+                    if (crossKvCacheManager)
+                    {
+                        crossSummary = kv_cache_manager::PrefixReuseSummary{};
+                    }
                 }
                 // Beneficial-to-skip check using the cached summary
                 if (!StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit)
@@ -442,7 +456,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     }
 
     // The optimization of delaying requests won't work for variable window attention
-    bool skippingIsRelevant = !kvCacheManager.getBlockManager().isVariableWindow();
+    bool skippingIsRelevant = mEnablePrefixAwareScheduling && !kvCacheManager.getBlockManager().isVariableWindow();
 
     // Keep track of number of requests and block needed for the scheduled requests
     auto scheduledBlocksManager
@@ -459,8 +473,13 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     std::unordered_set<uint64_t> seenTaskIds;
 
     // Keep track of blocks contributed by requests in context phase
-    auto [newlyContributedContextBlocks, newlyContributedCrossContextBlocks]
-        = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager);
+    std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks;
+    std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedCrossContextBlocks;
+    if (skippingIsRelevant)
+    {
+        std::tie(newlyContributedContextBlocks, newlyContributedCrossContextBlocks)
+            = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager);
+    }
 
     // Find last active in case we need to evict.  Encoder-init requests are
     // intentionally excluded here: they hold no started self- or cross-pool
@@ -511,7 +530,11 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         std::optional<kv_cache_manager::PrefixReuseSummary> summary;
         // analyzePrefixReuse asserts on variable-window managers; skip the walk there
         // and let downstream callers fall back to their fresh tree-walk path.
-        if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse()
+        if (isFirstChunkContext && !mEnablePrefixAwareScheduling)
+        {
+            summary = kv_cache_manager::PrefixReuseSummary{};
+        }
+        else if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse()
             && !kvCacheManager.getBlockManager().isVariableWindow())
         {
             auto uniqueTokens = req->getUniqueTokens(0);
@@ -644,7 +667,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
 
 CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     executor::CapacitySchedulerPolicy capacitySchedulerPolicy, bool hasKvCacheManager, bool twoStepsLookAhead,
-    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+    LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState, bool enablePrefixAwareScheduling)
 {
     if (!hasKvCacheManager)
     {
@@ -652,16 +675,18 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kMAX_UTILIZATION)
     {
-        mScheduler
-            = MaxUtilizationScheduler{maxNumRequests, twoStepsLookAhead, noScheduleUntilState, noScheduleAfterState};
+        mScheduler = MaxUtilizationScheduler{
+            maxNumRequests, twoStepsLookAhead, noScheduleUntilState, noScheduleAfterState, enablePrefixAwareScheduling};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
     {
-        mScheduler = GuaranteedNoEvictScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
+        mScheduler = GuaranteedNoEvictScheduler{
+            maxNumRequests, noScheduleUntilState, noScheduleAfterState, enablePrefixAwareScheduling};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kSTATIC_BATCH)
     {
-        mScheduler = StaticBatchScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
+        mScheduler = StaticBatchScheduler{
+            maxNumRequests, noScheduleUntilState, noScheduleAfterState, enablePrefixAwareScheduling};
     }
     else
     {

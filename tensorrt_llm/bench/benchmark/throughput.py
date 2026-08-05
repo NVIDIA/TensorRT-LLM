@@ -195,6 +195,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     "length of dataset.",
 )
 @optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requires --concurrency. Requests dropped at the deadline are excluded from the report, so the statistics "
+    "cover the requests that completed rather than the whole dataset.",
+)
+@optgroup.option(
     "--warmup",
     type=int,
     default=2,
@@ -328,6 +337,14 @@ def throughput_command(
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
@@ -449,6 +466,16 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
+        if (options.modality is None and options.backend == "pytorch"
+                and "disable_mm_encoder" not in kwargs
+                and not kwargs.get("mm_encoder_only", False)):
+            # Text-only benchmark: skip a multimodal checkpoint's encoder so
+            # its GPU memory goes to the KV cache pool instead. Text-only
+            # models ignore this flag. Overridable via extra_llm_api_options.
+            kwargs["disable_mm_encoder"] = True
+            logger.info(
+                "Text-only benchmark (--modality not set): the multimodal "
+                "encoder, if the model has one, will not be loaded.")
         if bench_env.telemetry_config is not None:
             kwargs["telemetry_config"] = bench_env.telemetry_config
 
@@ -508,7 +535,8 @@ def throughput_command(
                                 options.concurrency,
                                 iteration_writer.full_address,
                                 modality=options.modality,
-                                tokenizer=multi_turn_tokenizer))
+                                tokenizer=multi_turn_tokenizer,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:

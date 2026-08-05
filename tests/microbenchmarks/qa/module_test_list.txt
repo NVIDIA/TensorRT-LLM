@@ -10,10 +10,39 @@ tests/microbenchmarks/bench_moe/test_discrete_metrics.py::test_moe_backend_selec
 tests/microbenchmarks/bench_moe/test_discrete_metrics.py::test_moe_forward_launch_count   discrete    # Cat11/2 — fused-MoE kernel count (golden: sm120=9,sm90=10,sm103=10)
 
 # --- Attention (context / decode; harness: attention_perf/attention_perf_harness.py) ---
-tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_ctx_dispatch     discrete      # Cat2/3 — context use_paged_context_fmha (verified sm120=false)
-tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_decode_dispatch  discrete      # Cat2/4 — decode XQA launch_count (verified sm120=49)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_ctx_dispatch     discrete      # Cat2/3 — context use_paged_context_fmha (toy 64/16/128; sm120=false)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_decode_dispatch  discrete      # Cat2/4 — decode launch_count (toy; isolated sm120=1)
 tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_ctx_fmha_time    continuous    # context FMHA gpu_time (backstops ctx discrete blind spot)
 tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_decode_xqa_time  continuous    # decode XQA gpu_time — the green-discrete + red-continuous blind-spot case
 
-# Backlog (PLATFORM §4, not yet implemented): fmha_cubin_present, fmha_no_jit_recompile,
-#   moe_quant_kernel_select, moe_smallM_gemm_time, cudagraph_batch_bucketing, host_ws1_no_broadcast
+# --- GQA model-representative shapes (ctx prefill seq=2048 / decode cached=1024 bs=256) ---
+#   q8b = Qwen3-8B (32/8/128); l70b = Qwen3-32B / Llama-3.3-70B / Nemotron-Super-49B (64/8/128)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_ctx_dispatch[attn_q8b_ctx_dispatch]       discrete
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_ctx_dispatch[attn_l70b_ctx_dispatch]      discrete
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_decode_dispatch[attn_q8b_decode_dispatch]  discrete
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_decode_dispatch[attn_l70b_decode_dispatch] discrete
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_ctx_time[attn_q8b_ctx_fmha_time]          continuous
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_ctx_time[attn_l70b_ctx_fmha_time]         continuous
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_decode_time[attn_q8b_decode_xqa_time]      continuous
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_gqa_decode_time[attn_l70b_decode_xqa_time]     continuous
+
+# --- MLA (DeepSeek-V3/R1 latent attention) decode; harness is_mla path ---
+#   DeepSeek dims: 128 heads, q_lora 1536, kv_lora 512, qk_nope 128, qk_rope 64, v 128.
+#   use_paged_context_fmha forced False for MLA -> discrete signal = launch_count.
+#   fp8-KV = the attention-side quant of the "fp4" DeepSeek models (fp4 is weight-only).
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_mla_decode_dispatch          discrete      # MLA decode launch_count (sm120=2)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_mla_decode_time              continuous    # MLA decode gpu_time (sm120 bf16 0.637ms)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_mla_fp8_decode_dispatch      discrete      # MLA fp8-KV decode launch_count (sm120=2)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_mla_fp8_decode_time          continuous    # MLA fp8-KV decode gpu_time (sm120 0.217ms)
+
+# --- DSA (DeepSeek-V3.2 sparse attention) context; harness is_dsa path ---
+#   MLA + sparse Indexer (top-k KV select). seq_len 4096 > index_topk 2048 -> genuine sparsity.
+#   Targets the +202% deepseek-v32-fp4 regression (rc15->rc16, NVBug 6229365).
+#   ARCH: DeepGEMM MQA-logits kernels are sm90/sm100/sm103 ONLY -> SKIPS on sm120; bless on cluster.
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_dsa_ctx_dispatch             discrete      # DSA context launch_count (indexer + sparse-FMHA chain); no golden yet -> bootstrap
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_dsa_ctx_time                 continuous    # DSA context gpu_time; no golden yet -> bootstrap
+
+# Backlog: DSA DECODE (forward_generation_dsa — needs cache pre-population, follow-up to the
+#   context case above), SWA+sink family (gpt_oss-20b/120b — sliding-window + attention-sink).
+#   Other discrete probes (PLATFORM §4): fmha_cubin_present, fmha_no_jit_recompile (both need the
+#   cubin/nvrtc HOOKs wired), moe_quant_kernel_select.

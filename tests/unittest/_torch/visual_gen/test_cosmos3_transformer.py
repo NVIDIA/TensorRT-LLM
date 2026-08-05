@@ -20,20 +20,24 @@ Override checkpoint:
 import gc
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    PRETRAINED_CONFIG_COMPAT_DEFAULTS,
+    Cosmos3VFMTransformer,
+    apply_pretrained_config_compat_defaults,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-pytestmark = pytest.mark.cosmos3
+pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -73,6 +77,7 @@ COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
+_NUM_TRAIN_TIMESTEPS = 1000.0
 
 COSMOS3_FP8_QUANT_CONFIG = {
     "quant_algo": "FP8",
@@ -107,6 +112,30 @@ def _load_model_config(checkpoint_dir: str) -> DiffusionModelConfig:
         torch_compile_config=TorchCompileConfig(enable=False),
     )
     return DiffusionPipelineConfig.from_pretrained(checkpoint_dir, args=args).primary_model_config
+
+
+def _enable_audio(
+    model_config: DiffusionModelConfig,
+    *,
+    audio_dim: int = 16,
+    audio_latent_fps: float = 24.0,
+    temporal_compression_factor: int = 1,
+) -> DiffusionModelConfig:
+    """Pin the audio (sound) modality on with small, test-friendly dimensions.
+
+    The Cosmos3 checkpoint already enables sound by default; this overrides the
+    audio dims so random-weight builds stay light and assertions can rely on a
+    known ``audio_dim``. The transformer reads audio attributes via ``sound_*``
+    fallbacks (see ``Cosmos3VFMTransformer.__init__``), so we set those legacy
+    keys. ``pretrained_config`` is a ``SimpleNamespace``, so attributes can be
+    set freely.
+    """
+    cfg = model_config.pretrained_config
+    cfg.sound_gen = True
+    cfg.sound_dim = audio_dim
+    cfg.sound_latent_fps = audio_latent_fps
+    cfg.temporal_compression_factor_sound = temporal_compression_factor
+    return model_config
 
 
 def _init_all_weights(model: torch.nn.Module, std: float = 0.02) -> None:
@@ -192,12 +221,13 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
             )
-        _assert_finite_output(out, hs.shape)
+        _assert_finite_output(out.video, hs.shape)
 
     @pytest.mark.high_cuda_memory
     def test_reset_cache(self, cosmos3_model_config):
@@ -209,20 +239,22 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out1 = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
             )
             out2 = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
             )
-        _assert_finite_output(out1, hs.shape)
-        _assert_finite_output(out2, hs.shape)
+        _assert_finite_output(out1.video, hs.shape)
+        _assert_finite_output(out2.video, hs.shape)
 
     @pytest.mark.high_cuda_memory
     def test_sanity_forward_i2v_mask(self, cosmos3_model_config):
@@ -237,13 +269,136 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
                 noisy_frame_mask=noisy_frame_mask,
             )
-        _assert_finite_output(out, hs.shape)
+        _assert_finite_output(out.video, hs.shape)
+
+
+@pytest.mark.integration
+class TestCosmos3Audio:
+    """Audio (sound) modality — Nano architecture, random weights, audio_gen on.
+
+    Loads the Nano transformer config and flips on the audio modality so the
+    audio projection heads and sound-token injection path are exercised without
+    needing an audio-capable checkpoint.
+    """
+
+    AUDIO_DIM = 16
+    T_AUDIO = 8
+
+    @pytest.fixture(autouse=True)
+    def _require_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    @pytest.fixture
+    def audio_model_config(self):
+        # Function-scoped + freshly loaded so we never mutate a config shared
+        # with the video-only test classes.
+        checkpoint_dir = _require_checkpoint()
+        model_config = _load_model_config(checkpoint_dir)
+        return _enable_audio(model_config, audio_dim=self.AUDIO_DIM)
+
+    @pytest.fixture
+    def cosmos3_model_config_noaudio(self):
+        # The Cosmos3 checkpoint enables sound by default, so explicitly disable
+        # it to exercise the video-only construction path.
+        checkpoint_dir = _require_checkpoint()
+        model_config = _load_model_config(checkpoint_dir)
+        model_config.pretrained_config.sound_gen = False
+        return model_config
+
+    def test_audio_model_structure(self, audio_model_config):
+        model = Cosmos3VFMTransformer(model_config=audio_model_config)
+        assert model.audio_gen is True
+        assert model.audio_dim == self.AUDIO_DIM
+        assert hasattr(model, "audio2llm")
+        assert hasattr(model, "llm2audio")
+        assert hasattr(model, "audio_modality_embed")
+        # audio2llm: audio_dim -> hidden_size, llm2audio: hidden_size -> audio_dim
+        assert model.audio2llm.in_features == self.AUDIO_DIM
+        assert model.audio2llm.out_features == model.hidden_size
+        assert model.llm2audio.in_features == model.hidden_size
+        assert model.llm2audio.out_features == self.AUDIO_DIM
+        assert model.audio_modality_embed.shape == (model.hidden_size,)
+
+    def test_video_only_model_has_no_audio_heads(self, cosmos3_model_config_noaudio):
+        model = Cosmos3VFMTransformer(model_config=cosmos3_model_config_noaudio)
+        assert model.audio_gen is False
+        assert not hasattr(model, "audio2llm")
+        assert not hasattr(model, "llm2audio")
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_audio(self, audio_model_config):
+        cfg = audio_model_config.pretrained_config
+        model = _build_random_weight_model(audio_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        audio_latents = torch.randn(1, model.audio_dim, self.T_AUDIO, device=DEVICE, dtype=DTYPE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                audio_latents=audio_latents,
+            )
+        # Video velocity is unchanged in shape; audio velocity mirrors the input.
+        _assert_finite_output(out.video, hs.shape)
+        assert out.audio is not None
+        _assert_finite_output(out.audio, torch.Size([1, model.audio_dim, self.T_AUDIO]))
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_without_audio_latents_returns_none(self, audio_model_config):
+        """An audio-capable model still returns audio=None when no audio is passed."""
+        cfg = audio_model_config.pretrained_config
+        model = _build_random_weight_model(audio_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        assert out.audio is None
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_audio_multiframe(self, audio_model_config):
+        """Audio injection works alongside a multi-frame video sequence."""
+        cfg = audio_model_config.pretrained_config
+        model = _build_random_weight_model(audio_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel, t=3
+        )
+        audio_latents = torch.randn(1, model.audio_dim, self.T_AUDIO, device=DEVICE, dtype=DTYPE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                audio_latents=audio_latents,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        _assert_finite_output(out.audio, torch.Size([1, model.audio_dim, self.T_AUDIO]))
 
 
 @pytest.mark.integration
@@ -276,12 +431,13 @@ class TestCosmos3TransformerCheckpoint:
         with torch.inference_mode():
             out = transformer(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
             )
-        _assert_finite_output(out, hs.shape)
+        _assert_finite_output(out.video, hs.shape)
 
     @pytest.mark.parametrize("quant_algo", ["FP8"])
     def test_load_fp8_quantization(self, quant_algo: str):
@@ -305,13 +461,104 @@ class TestCosmos3TransformerCheckpoint:
             with torch.inference_mode():
                 out = transformer(
                     hidden_states=hs,
-                    timestep=ts,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
                     text_ids=text_ids,
                     text_mask=text_mask,
                     video_shape=video_shape,
                 )
-            _assert_finite_output(out, hs.shape)
+            _assert_finite_output(out.video, hs.shape)
         finally:
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()
+
+
+# --- CPU-only coverage: checkpoint config schema compatibility ---
+
+
+class TestConfigCompatDefaults:
+    """Newer diffusers conversions omit fields older ones carried explicitly."""
+
+    def test_new_schema_gets_defaults(self):
+        config = SimpleNamespace(hidden_size=64, rope_axes_dim=[4, 2, 2])
+        apply_pretrained_config_compat_defaults(config)
+        for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
+            assert getattr(config, key) == value
+
+    def test_old_schema_untouched(self):
+        # Every field deliberately differs from its compat default, so an
+        # overwrite of any one of them fails its assertion.
+        config = SimpleNamespace(
+            position_embedding_type="rope_3d",
+            max_position_embeddings=12345,
+            temporal_compression_factor_sound=7,
+        )
+        apply_pretrained_config_compat_defaults(config)
+        assert config.position_embedding_type == "rope_3d"
+        assert config.max_position_embeddings == 12345
+        assert config.temporal_compression_factor_sound == 7
+
+    def test_idempotent(self):
+        config = SimpleNamespace(hidden_size=64)
+        apply_pretrained_config_compat_defaults(config)
+        snapshot = vars(config).copy()
+        apply_pretrained_config_compat_defaults(config)
+        assert vars(config) == snapshot
+
+
+class TestI2V4StepConfigShape:
+    """The Image2Video-4Step conversion drops the audio/action towers
+    (``sound_dim: null``, no ``action_*`` keys) and carries newer schema
+    fields (``qk_norm_for_text``, ``hidden_act``, nested ``rope_theta``).
+    The transformer must construct from that exact key set. CPU-only with
+    shrunk dimensions; the real 64B shape is covered by the checkpoint
+    integration test."""
+
+    def _reduced_i2v_config(self) -> SimpleNamespace:
+        # Key set mirrors the checkpoint's transformer/config.json verbatim;
+        # only the sizes are reduced (head_dim 8 -> mrope_section sums to 4).
+        return SimpleNamespace(
+            attention_bias=False,
+            attention_dropout=0.0,
+            base_fps=16,
+            enable_fps_modulation=True,
+            head_dim=8,
+            hidden_act="silu",
+            hidden_size=32,
+            intermediate_size=64,
+            latent_channel=4,
+            latent_patch_size=2,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            num_key_value_heads=2,
+            patch_latent_dim=16,
+            qk_norm_for_text=True,
+            rms_norm_eps=1e-6,
+            rope_axes_dim=[2, 1, 1],
+            rope_scaling={
+                "mrope_interleaved": True,
+                "mrope_section": [2, 1, 1],
+                "rope_theta": 5000000,
+                "rope_type": "default",
+            },
+            rope_theta=5000000,
+            sound_dim=None,
+            sound_gen=False,
+            sound_latent_fps=25,
+            timestep_scale=0.001,
+            unified_3d_mrope_reset_spatial_ids=True,
+            unified_3d_mrope_temporal_modality_margin=15000,
+            vocab_size=64,
+        )
+
+    def test_constructs_without_audio_or_action_towers(self):
+        model_config = DiffusionModelConfig(pretrained_config=self._reduced_i2v_config())
+        model = Cosmos3VFMTransformer(model_config)
+
+        assert model.audio_gen is False
+        assert model.action_gen is False
+        assert not hasattr(model, "audio2llm")
+        assert not hasattr(model, "audio_modality_embed")
+        assert model.base_fps == 16
+        assert len(model.gen_layers) == 2

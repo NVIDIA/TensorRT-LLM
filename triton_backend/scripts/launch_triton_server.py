@@ -74,7 +74,7 @@ def parse_arguments():
         default=False,
     )
 
-    path = str(Path(__file__).parent.absolute()) + '/../all_models/gpt'
+    path = str(Path(__file__).parent.absolute()) + '/../all_models/llmapi'
     parser.add_argument('--model_repo', type=str, default=path)
 
     parser.add_argument(

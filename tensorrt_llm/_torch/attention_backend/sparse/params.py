@@ -18,8 +18,12 @@ User-facing SparseAttentionConfig live in LLM / VisualGen args and
 ModelConfig. They lower through ``to_sparse_params()`` for per-backend runtime
 state and ``to_sparse_metadata_params()`` for metadata allocation/update state.
 
-Concrete parameter classes live with their backend implementations.
+Concrete sparse algorithm params live with their backend implementations;
+shared kernel-facing carriers live here when they are part of the generic
+attention-forward contract.
 """
+
+from dataclasses import dataclass
 
 
 class SparseParams:
@@ -42,3 +46,15 @@ class SparseMetadataParams:
     metadata owns batch/runtime buffers rather than per-layer
     ``AttentionBackend`` behavior.
     """
+
+
+@dataclass
+class SkipSoftmaxKernelParams:
+    """Skip-softmax thresholds passed to attention backend kernels."""
+
+    # The kernel divides this by the context length to get the skip threshold;
+    # zero turns skip-softmax off.
+    threshold_scale_factor_prefill: float = 0.0
+    # Only autoregressive (LLM) decoding has a decode phase; diffusion and
+    # visual generation leave this at zero.
+    threshold_scale_factor_decode: float = 0.0

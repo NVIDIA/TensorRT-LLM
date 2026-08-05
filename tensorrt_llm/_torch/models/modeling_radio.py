@@ -21,6 +21,8 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
+    _ENCODER_FALLBACK_MAX_NUM_REQUESTS, MultimodalEncoderMixin)
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)
@@ -556,7 +558,7 @@ class Block(nn.Module):
         return x
 
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     """ Vision Transformer.
 
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
@@ -751,24 +753,42 @@ class VisionTransformer(nn.Module):
 
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
-        metadata_kwargs = dict(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=model_config.max_num_tokens,
-            kv_cache_manager=None,
-        )
-        if model_config.attn_backend == "FLASHINFER":
-            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
-            # the default to "HND" for paged KV cache paths (see PR #6917).
-            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
-            # explicitly use "NHD" because ragged k/v tensors computed directly
-            # from input are always in NHD format ([tokens, heads, dim]).
-            metadata_kwargs["kv_layout"] = "NHD"
-        self.attn_metadata = self.metadata_cls(**metadata_kwargs)
+        self._attn_backend = model_config.attn_backend
+
+        # Establish default encoder AttentionMetadata at construction (legacy
+        # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
+        # / metadata provider can read `self.attn_metadata` before the engine
+        # re-sizes it via `setup_attn_metadata`.
+        self.setup_attn_metadata(max_num_requests=8192,
+                                 max_num_tokens=model_config.max_num_tokens)
 
         # CUDA-graph runner for the block stack. None means graphs are off and
         # the eager path is always taken; the caller opts in via
-        # `enable_blocks_cuda_graph`.
+        # `enable_blocks_cuda_graph`. Initialized here (not in
+        # `setup_attn_metadata`) so it is always present regardless of call
+        # order.
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
+
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override the default to add `kv_layout="NHD"` for FlashInfer.
+        # FlashInfer's original default is "NHD"; TRT-LLM switched the default
+        # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
+        # (kv_cache_manager=None) computes k/v directly from input, which is
+        # always in NHD format ([tokens, heads, dim]).
+        # Floor the request capacity at the same legacy fallback as the mixin
+        # default: one attention segment per image, which can exceed the
+        # LLM-side `max_batch_size` that `encoder_max_batch_size` falls back to.
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        metadata_kwargs = dict(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+        if self._attn_backend == "FLASHINFER":
+            metadata_kwargs["kv_layout"] = "NHD"
+        self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
     def enable_blocks_cuda_graph(
         self,

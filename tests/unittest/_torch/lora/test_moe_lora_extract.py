@@ -17,6 +17,9 @@ moe_h_to_4h to fc1, moe_gate to gated, moe_4h_to_h to fc2.
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
+
 # These imports are pure-Python; skip cleanly if the package layout changes.
 fused_moe_cutlass = pytest.importorskip("tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass")
 lora_layer = pytest.importorskip("tensorrt_llm._torch.peft.lora.layer")
@@ -28,12 +31,14 @@ LoraModuleType = lora_layer.LoraModuleType
 class _ExtractStub:
     """Minimal stand-in for a CutlassFusedMoE instance.
 
-    _extract_moe_lora_tensors only reads self.layer_idx and the class attribute
-    self._MOE_LORA_MODULE_NAMES, so we can drive it via the unbound method
+    _extract_moe_lora_tensors reads self.layer_idx and the small slot-gathering
+    helpers, which we borrow from CutlassFusedMoE so the unbound method can run
     without constructing real weights or a GPU layer.
     """
 
-    _MOE_LORA_MODULE_NAMES = CutlassFusedMoE._MOE_LORA_MODULE_NAMES
+    _gather_moe_lora_slots = CutlassFusedMoE._gather_moe_lora_slots
+    _require_fc1_fc2 = staticmethod(CutlassFusedMoE._require_fc1_fc2)
+    _empty_kernel_slot_dict = staticmethod(CutlassFusedMoE._empty_kernel_slot_dict)
 
     def __init__(self, layer_idx=0):
         self.layer_idx = layer_idx

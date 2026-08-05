@@ -7,6 +7,15 @@ cuda_graph_config:
 kv_cache_config:
   free_gpu_memory_fraction: 0.88
 transforms:
+  apply_sharding_hints:
+    # Mamba (layer_type="ssm") in_proj is a fused [z|x|B|C|dt] weight. Its dt
+    # slice equals mamba_num_heads (=64 here), which cannot be NVFP4-aligned
+    # (multiple of 32) when TP-split at this world size (64 < 4*32), and it must
+    # stay head-consistent with z/x. So the Mamba block is not TP-shardable under
+    # NVFP4 for this model; replicate it (exclude "ssm") and shard only attention
+    # ("mha") and MoE ("moe"). Larger Nemotron variants (Super/Ultra) have enough
+    # mamba heads to shard, so this filter is per-model (kept out of their YAMLs).
+    shard_layers: ['mha', 'moe', 'mlp']
   detect_sharding:
     allreduce_strategy: SYMM_MEM
     # NOTE: add 'tp' to sharding dims only for high-throughput runs

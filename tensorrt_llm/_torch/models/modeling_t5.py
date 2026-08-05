@@ -31,7 +31,7 @@ HF config normalization:
 """
 
 import math
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +43,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, PredefinedAttentionMask
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.cross_attention import CrossAttention
@@ -112,8 +113,12 @@ def _t5_dense_act_fn(config: T5Config):
 
 def _t5_gated_act_fn(config: T5Config):
     act_fn = _t5_dense_act_fn(config)
+    act_name = getattr(config, "dense_act_fn", None) or "relu"
+    use_fused_gelu = act_name == "gelu_new" and IS_FLASHINFER_AVAILABLE
 
     def gated_act_fn(hidden_states: torch.Tensor) -> torch.Tensor:
+        if use_fused_gelu and hidden_states.dtype in (torch.float16, torch.bfloat16):
+            return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(hidden_states)
         gate, up = hidden_states.chunk(2, dim=-1)
         return act_fn(gate) * up
 
@@ -152,19 +157,36 @@ class T5LayerNorm(RMSNorm):
         super().__init__(hidden_size=hidden_size, eps=eps, dtype=dtype)
         self._use_hopper_rms_norm: Optional[bool] = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self._use_hopper_rms_norm is None and hidden_states.is_cuda:
             sm_version = get_sm_version()
             self._use_hopper_rms_norm = 90 <= sm_version < 100
 
+        if residual is not None and hidden_states.dtype == torch.float16:
+            hidden_states = _clamp_fp16_infs(hidden_states + residual)
+            return self.forward(hidden_states), hidden_states
+
         if self._use_hopper_rms_norm and hidden_states.dtype in (torch.float16, torch.bfloat16):
-            return super().forward(hidden_states)
+            if residual is None:
+                return super().forward(hidden_states)
+            return super().forward(hidden_states, residual)
+
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            residual = hidden_states
 
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         if self.weight.dtype in (torch.float16, torch.bfloat16):
             hidden_states = hidden_states.to(self.weight.dtype)
-        return self.weight * hidden_states
+        hidden_states = self.weight * hidden_states
+        if residual is None:
+            return hidden_states
+        return hidden_states, residual
 
 
 def _t5_encoder_num_layers(config: T5Config) -> int:
@@ -472,10 +494,14 @@ class T5EncoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         position_ids: Optional[torch.IntTensor] = None,
         position_bias: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -484,16 +510,10 @@ class T5EncoderLayer(nn.Module):
             attention_mask=PredefinedAttentionMask.FULL,
             position_bias=position_bias,
         )
-        hidden_states = residual + hidden_states
-        hidden_states = _clamp_fp16_infs(hidden_states)
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        hidden_states = _clamp_fp16_infs(hidden_states)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 # ---------------------------------------------------------------------------
@@ -570,11 +590,15 @@ class T5DecoderLayer(nn.Module):
         position_bias: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self-attention (pre-norm)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -584,12 +608,9 @@ class T5DecoderLayer(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
         )
-        hidden_states = residual + hidden_states
-        hidden_states = _clamp_fp16_infs(hidden_states)
 
         # Cross-attention (pre-norm)
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.cross_attn(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
@@ -597,17 +618,12 @@ class T5DecoderLayer(nn.Module):
             cross_attn_metadata=cross_attn_metadata,
             skip_cross_kv_projection=skip_cross_kv_projection,
         )
-        hidden_states = residual + hidden_states
-        hidden_states = _clamp_fp16_infs(hidden_states)
 
         # MLP (pre-norm)
-        residual = hidden_states
-        hidden_states = self.cross_attn_layernorm(hidden_states)
+        hidden_states, residual = self.cross_attn_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        hidden_states = _clamp_fp16_infs(hidden_states)
 
-        return hidden_states
+        return hidden_states, residual
 
 
 # ---------------------------------------------------------------------------
@@ -654,14 +670,16 @@ class T5Encoder(nn.Module):
             seq_len = hidden_states.shape[0] if seq_lens is None else int(seq_lens.max().item())
         position_bias = self.relative_position_bias(seq_len, seq_len, hidden_states.device)
 
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
                 position_bias=position_bias,
+                residual=residual,
             )
-        hidden_states = self.final_layernorm(hidden_states)
+        hidden_states, _ = self.final_layernorm(hidden_states, residual)
         return hidden_states
 
 
@@ -716,8 +734,9 @@ class T5Decoder(nn.Module):
             )
             relative_attention_max_distance = self.relative_position_bias.max_distance
 
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
@@ -727,8 +746,9 @@ class T5Decoder(nn.Module):
                 position_bias=position_bias,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
+                residual=residual,
             )
-        hidden_states = self.final_layernorm(hidden_states)
+        hidden_states, _ = self.final_layernorm(hidden_states, residual)
         return hidden_states
 
 
@@ -755,7 +775,6 @@ class T5Model(nn.Module):
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
         )
 
         self.encoder = T5Encoder(model_config)
@@ -908,6 +927,11 @@ class T5ForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         config = self.model_config.pretrained_config
         tllm_weights = _convert_hf_t5_weights(weights, config, dtype=self.model_config.torch_dtype)
 
+        # __init__ aliases lm_head.weight to shared_embedding.weight when
+        # tie_word_embeddings=True, so checkpoints that omit lm_head.weight are
+        # handled correctly (lm_head picks up the loaded embedding automatically).
+        # When lm_head.weight is present in the checkpoint, break the alias so
+        # lm_head gets its own independent weight loaded from the checkpoint.
         if "lm_head.weight" in weights:
             self.lm_head.weight = nn.Parameter(torch.empty_like(self.lm_head.weight))
 

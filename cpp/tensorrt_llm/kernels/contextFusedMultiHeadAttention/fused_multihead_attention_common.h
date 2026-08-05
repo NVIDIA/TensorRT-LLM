@@ -147,6 +147,8 @@ struct MHARunnerFixedParams
     bool useSparseMLA = false;
     // Use sparse attention in trtllm-gen ?
     bool useTllmGenSparseAttention = false;
+    // Fuse DSv4 inverse RoPE and FP8 output quantization in trtllm-gen.
+    bool fusesDsv4InvRopeFp8Quant = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -199,6 +201,7 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
         output += ", useSparseMLA = " + std::string(useSparseMLA ? "true" : "false");
         output += ", useTllmGenSparseAttention = " + std::string(useTllmGenSparseAttention ? "true" : "false");
+        output += ", fusesDsv4InvRopeFp8Quant = " + std::string(fusesDsv4InvRopeFp8Quant ? "true" : "false");
 
         return output;
     }
@@ -289,8 +292,21 @@ struct MHARunnerParams
     KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
-    // The output scaling factor buffer ptr. (only used for FP4 output)
+    // The output scaling factor buffer ptr. Used by FP4 output and DSv4 fused epilogue.
     void* outputSfPtr;
+
+    struct Dsv4EpilogueFusionParams
+    {
+        // Enable DSv4 inverse-RoPE + FP8 quant epilogue fusion.
+        bool enabled = false;
+        // The cos/sin cache used by the fused inverse-RoPE epilogue.
+        float const* cosSinCache = nullptr;
+        // The physical token stride of the FP32 output scale tensor.
+        int32_t scaleBufM = 0;
+    };
+
+    // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams dsv4EpilogueFusion;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
     // The attention sinks ptr.

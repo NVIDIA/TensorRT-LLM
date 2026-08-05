@@ -387,11 +387,10 @@ def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
 
 
 def golden_manifest() -> dict[str, list[dict[str, Any]]]:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     return {
         "TorchLlmArgs": manifest_rows(TorchLlmArgs),
-        "TrtLlmArgs": manifest_rows(TrtLlmArgs),
     }
 
 

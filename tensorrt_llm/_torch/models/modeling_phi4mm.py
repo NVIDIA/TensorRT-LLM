@@ -1026,10 +1026,17 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = updated_weights
         self.llm.load_weights(weights)
 
-        # Move mm_token_ids to the correct device.
         self.mm_token_ids = torch.tensor(
-            [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
-            device=self.device)
+            [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID])
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
+    @mm_token_ids.setter
+    def mm_token_ids(self, token_ids: torch.Tensor) -> None:
+        self._mm_token_ids = token_ids.to("cpu")
+        self._mm_token_ids_device = token_ids.to(self.device)
 
     @property
     def vocab_size_padded(self) -> int:
@@ -1075,7 +1082,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if len(multimodal_params) > 0:
             if not _is_mm_disagg():
                 encoder_kwargs = {
-                    "mm_token_ids": self.mm_token_ids,
+                    "mm_token_ids": self._mm_token_ids_device,
                 }
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self.hf_phi4mm_model.forward,
@@ -1094,8 +1101,9 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=self.mm_token_ids,
-            **kwargs,
+            mm_token_ids=self._mm_token_ids_device,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         output_prob = self.llm.forward(

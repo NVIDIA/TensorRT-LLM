@@ -28,8 +28,8 @@ CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backen
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
     , mKvTransferSenderFutureTimeoutMs(kvTransferSenderFutureTimeoutMs)
-    , mKvTransferPollIntervalMs(kvTransferPollIntervalMs)
 {
+    setKvTransferPollIntervalMs(kvTransferPollIntervalMs);
 }
 
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const

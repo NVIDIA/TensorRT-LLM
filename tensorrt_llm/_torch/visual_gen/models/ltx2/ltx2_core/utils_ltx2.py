@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
 # NVFP4 fused-quant AdaLN: every fused AdaLN CUDA kernel below has a ``_quant``
@@ -22,6 +23,8 @@ def get_nvfp4_input_scale(linear) -> Optional[torch.Tensor]:
     Used by call sites to dispatch the fused-quant variant of the AdaLN wrappers
     when the downstream Linear can consume a pre-quantized Fp4QuantizedTensor.
     """
+    if not isinstance(getattr(linear, "quant_method", None), NVFP4LinearMethod):
+        return None
     input_scale = getattr(linear, "input_scale", None)
     if input_scale is None:
         return None

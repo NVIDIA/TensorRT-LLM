@@ -27,8 +27,18 @@ def update_quant_config_from_compressed_tensors(
     if config_groups is None:
         raise ValueError(f"config_groups is not set in {hf_quant_config}.")
 
-    weights_quant_config = config_groups["group_0"]["weights"]
-    inputs_quant_config = config_groups["group_0"]["input_activations"]
+    # compressed-tensors keys config_groups by group name: custom recipes use
+    # "group_0"; named preset schemes (e.g. FP8_DYNAMIC) use the scheme name.
+    # This path applies a single algo globally, so resolve to one group.
+    group_config = config_groups.get("group_0")
+    if group_config is None:
+        if len(config_groups) != 1:
+            raise ValueError(
+                f"Expected 'group_0' or exactly one config group, got {sorted(config_groups)}."
+            )
+        group_config = next(iter(config_groups.values()))
+    weights_quant_config = group_config["weights"]
+    inputs_quant_config = group_config["input_activations"]
     weights_quant_strategy = weights_quant_config["strategy"]
     inputs_quant_strategy = inputs_quant_config["strategy"]
 

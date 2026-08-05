@@ -67,27 +67,6 @@ def get_default_trtllm_modules_to_hf_modules():
     }
 
 
-def use_lora(
-    model,
-    lora_config: "LoraConfig",
-    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
-):
-    """Use LoRA with the given model and configuration.
-
-    This function is a wrapper that delegates to the appropriate loading function
-    based on the LoRA checkpoint source.
-    """
-    if lora_config.lora_ckpt_source == "nemo":
-        from .lora_manager import load_nemo_lora
-        load_nemo_lora(model, lora_config)
-    elif lora_config.lora_ckpt_source == "hf":
-        from .lora_manager import load_hf_lora
-        load_hf_lora(model, lora_config, trtllm_modules_to_hf_modules)
-    else:
-        raise ValueError(
-            f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
-
-
 class LoraConfig(StrictBaseModel):
     lora_dir: List[str] = Field(
         default_factory=list,

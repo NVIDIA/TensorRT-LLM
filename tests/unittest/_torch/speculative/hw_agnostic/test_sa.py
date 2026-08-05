@@ -34,12 +34,10 @@ def get_perf_metrics(result):
 # - attn_backend: Attention implementation (TRTLLM only - FLASHINFER not supported)
 # - max_matching_ngram_size: SA matching mode (2=fixed size, -1=longest match)
 #
-# NOTE: FLASHINFER backend is NOT supported for one-engine speculative decoding modes
-# (SA, MTP, Eagle3-one-model). The FLASHINFER backend's decode path expects exactly
-# 1 token per sequence, but one-engine speculative decoding requires processing multiple
-# tokens per generation sequence (last_accepted + draft_tokens). This is a fundamental
-# architectural limitation of the FLASHINFER integration that would require significant
-# changes to support multi-token generation sequences.
+# NOTE: FLASHINFER target decode supports multiple queries per request, but
+# non-shared one-engine modes still require a separate draft KV cache. The
+# draft KV metadata/manager swap is currently implemented only for TRTLLM
+# attention. Shared-target-KV modes use a separate FlashInfer metadata view.
 @pytest.mark.parametrize(
     "disable_overlap_scheduler,use_cuda_graph,attn_backend,max_matching_ngram_size",
     [
@@ -216,6 +214,7 @@ def test_llama_sa(
     torch.cuda.synchronize()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("max_matching_ngram_size", [2, 4, -1])
 def test_sa_config_validation(max_matching_ngram_size: int):
     """Test SADecodingConfig validation."""
@@ -227,6 +226,7 @@ def test_sa_config_validation(max_matching_ngram_size: int):
     assert config.max_matching_ngram_size == max_matching_ngram_size
 
 
+@pytest.mark.cpu_only
 def test_sa_config_invalid_zero():
     """Test that max_matching_ngram_size=0 raises error for SA."""
     with pytest.raises(ValueError, match="max_matching_ngram_size must be"):

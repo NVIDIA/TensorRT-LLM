@@ -11,7 +11,7 @@ CBTS narrows test cases only; Build always runs.
 
 | Layer | Where | Action |
 |---|---|---|
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages always excluded. Empty affectedSet + nothing force-kept → no-op. |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages run only when present in `affected_stages` (not force-kept). Empty affectedSet + nothing force-kept → no-op. |
 | **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
@@ -129,6 +129,10 @@ CBTS activates on bare `/bot run` and `/bot run --post-merge`. Any
 stage-selection flag (`--stage-list`, `--extra-stage`, `--gpu-type`,
 `--test-backend`, `--skip-test`, `--add-multi-gpu-test`, `--only-multi-gpu-test`,
 `--disable-multi-gpu-test`) makes `getCbtsResult` return null.
+
+`--disable-cbts` is an explicit kill switch: `getCbtsResult` returns null
+before any narrowing, so the pipeline runs the full test set. The opt-out is
+recorded in OpenSearch with `s_cbts_status=disabled`.
 
 Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
 `--detailed-log`, `--disable-fail-fast`, `--high-priority`) do not affect CBTS.

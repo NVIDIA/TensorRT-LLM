@@ -24,6 +24,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from tensorrt_llm.mapping import Mapping
+
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PredefinedAttentionMask
 from ..attention_backend.utils import create_attention
@@ -79,16 +81,48 @@ class CrossAttention(nn.Module):
 
         self.mapping = config.mapping
         tp_size = self.mapping.tp_size
+        pp_size = self.mapping.pp_size
+        cp_size = self.mapping.cp_size
+        dp_size = 1
+        # Unreachable for enc-dec models today (validate_encoder_decoder_tp_scope
+        # rejects attention DP); kept for parity with Attention.__init__.
         if self.mapping.enable_attention_dp:
+            dp_size = tp_size
             tp_size = 1
 
         assert self.num_heads % tp_size == 0
+        if self.num_key_value_heads % tp_size != 0:
+            raise ValueError(
+                "Cross-attention requires the encoder KV head count "
+                f"({self.num_key_value_heads}) to be divisible by tp_size ({tp_size}); "
+                "KV head duplication is not supported for cross-attention."
+            )
+
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size - 1) // tp_size
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
-        mapping = config.mapping
+        mapping = Mapping(
+            world_size=dp_size * tp_size * pp_size * cp_size,
+            tp_size=tp_size,
+            pp_size=pp_size * dp_size,
+            cp_size=cp_size,
+            cp_config=self.mapping.cp_config,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+        )
+
+        mapping_o = Mapping(
+            world_size=dp_size * tp_size * pp_size * cp_size,
+            tp_size=tp_size * cp_size,
+            pp_size=pp_size * dp_size,
+            cp_size=1,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+        )
 
         self.q_proj = Linear(
             self.hidden_size,
@@ -99,6 +133,7 @@ class CrossAttention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy,
         )
 
         self.k_proj = Linear(
@@ -110,6 +145,7 @@ class CrossAttention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy,
         )
 
         self.v_proj = Linear(
@@ -121,6 +157,7 @@ class CrossAttention(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy,
         )
 
         self.o_proj = Linear(
@@ -128,11 +165,12 @@ class CrossAttention(nn.Module):
             self.hidden_size,
             bias=dense_bias,
             dtype=dtype,
-            mapping=mapping,
+            mapping=mapping_o,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             reduce_output=True,
+            allreduce_strategy=config.allreduce_strategy,
         )
 
         # Cross-attention backend selection honors ``ModelConfig.attn_backend``

@@ -51,7 +51,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
+from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, MultimodalConfig, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
@@ -141,13 +141,21 @@ def maybe_pad_for_cuda_graph(func):
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
         def _call_func_eager():
-            # When this wrapper has decided that all ranks must run eager, also force
-            # the inner cudagraph backend to bypass captured graphs. Otherwise, ranks
-            # whose shapes happen to match a captured graph would still replay and
-            # use stale capture-time scalar kernel args (e.g. runtime_max_tokens_per_rank
-            # baked from local total at capture, vs cross-rank max read fresh in eager).
+            # Force captured-graph wrappers to short-circuit to eager (see
+            # BypassCapturedGraphs): a rank whose shapes match a captured graph would
+            # otherwise replay with stale capture-time per-rank scalar args.
             with BypassCapturedGraphs():
                 return _call_func()
+
+        # Pick the cudagraph-fallback path: only attention-DP mixed mode needs the
+        # eager bypass (stale per-rank scalar args). Without attention-DP all ranks
+        # share shapes, so the plain eager call keeps piecewise cudagraph for prefill
+        # — bypassing would force every prefill eager (a needless low-concurrency hit).
+        _fallback = (
+            _call_func_eager
+            if (self.enable_attention_dp and self.dist_config.tp_size > 1)
+            else _call_func
+        )
 
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
@@ -180,7 +188,7 @@ def maybe_pad_for_cuda_graph(func):
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
 
         if not can_run_cuda_graph_all:
-            return _call_func_eager()
+            return _fallback()
 
         # get closest cudagraph batch size based on max_batch_size across ALL ranks
         # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
@@ -189,14 +197,14 @@ def maybe_pad_for_cuda_graph(func):
         cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
 
         if cg_batch_size is None:
-            return _call_func_eager()
+            return _fallback()
 
         # let's check if all ranks can pad the batch if they need to
         can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
 
         # fall back if we cannot run cudagraph due to padding issues
         if not can_pad_all:
-            return _call_func_eager()
+            return _fallback()
 
         # check actual amount of padding needed
         num_padding = cg_batch_size - batch_size
@@ -453,6 +461,11 @@ class ADEngine(ModelEngine):
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
+        # AutoDeploy does not support the sleep/wakeup feature.
+        self.llm_args.sleep_config = None
+        self.llm_args.multimodal_config = (
+            ad_config.multimodal_config if ad_config else MultimodalConfig()
+        )
         self.iter_counter = 0
         self.iter_states = {}
 
@@ -1057,20 +1070,6 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 14
-        # (``max_dp_num_tokens``). Mirrors base TRT-LLM's pattern in
-        # ``model_engine._get_all_rank_num_tokens``: MoE all-to-all needs the
-        # cross-rank max to size dispatch padding without over-padding to the
-        # static config ``max_num_tokens``. ``nest_sequences`` already
-        # initialized slot 14 to the local ``total_num_tokens``; this overrides
-        # with the cross-rank max only when attention-DP requires it.
-        if self.enable_attention_dp and self.dist_config.tp_size > 1:
-            assert self.dist is not None, "Distributed object is required for attention DP mode"
-            info = self.cache_seq_interface.info
-            local_total_num_tokens = info.batch_info.get_total_num_tokens()
-            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
-            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
-
         # compute outputs
         outputs = self._run_forward()
 
@@ -1315,6 +1314,14 @@ def create_autodeploy_executor(
             vocab_size_padded=vocab_size_padded,
         )
 
+    # Speculative-decoding draft sizes must be forwarded to PyExecutor so that the
+    # attention-DP dummy created in `_pad_attention_dp_dummy_request` is materialized
+    # with `py_draft_tokens = [1] * max_total_draft_tokens` instead of `[]`. An empty
+    # `py_draft_tokens` makes the dummy classify as decode in `_prepare_inputs` and
+    # trips the eagle wrapper's `assert num_decode == 0` under MTP + attention_dp.
+    max_draft_len = 0 if spec_config is None else spec_config.max_draft_len
+    max_total_draft_tokens = 0 if spec_config is None else spec_config.tokens_per_gen_step - 1
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -1327,6 +1334,8 @@ def create_autodeploy_executor(
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_beam_width=ad_config.max_beam_width,
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         guided_decoder=guided_decoder,
         kv_cache_transceiver=kv_cache_transceiver,
         resource_governor_queue=resource_governor_queue,

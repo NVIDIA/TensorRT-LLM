@@ -16,7 +16,7 @@
 import array
 import enum
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -37,6 +37,7 @@ from .._common import (
     CudaStream,
     PageIndex,
     PageIndexMode,
+    PageStatus,
     Priority,
     TokenIdExt,
 )
@@ -73,7 +74,6 @@ from .._utils import (
     filled_list,
     intersect,
     make_typed,
-    map_optional,
     stream_wait_events,
     to_typed,
     typed_enumerate,
@@ -81,7 +81,6 @@ from .._utils import (
     typed_map,
     typed_range,
     unwrap_optional,
-    unwrap_rawref,
     value_or,
 )
 from ._moving_average import Average
@@ -126,6 +125,58 @@ class SeqBlock:
     def __del__(self) -> None:
         self.tree_block = None
         self.pages.clear()
+
+
+class PlannedDropHandle:
+    """Track committed pages planned for dropping without owning them.
+
+    The handle stores weak references and does not keep pages alive. Dropping it
+    decrements each live page's planned-drop count and removes an already-droppable
+    page from eviction tracking when no plans remain.
+    """
+
+    __slots__ = ("_page_refs",)
+
+    _page_refs: tuple[rawref.ref[CommittedPage], ...] | None
+
+    def __init__(self, pages: Iterable[CommittedPage]) -> None:
+        planned_pages = tuple({id(page): page for page in pages}.values())
+        self._page_refs = tuple(rawref.ref(page) for page in planned_pages)
+        for page in planned_pages:
+            page.planned_drop_count += 1
+
+    def drop(self) -> None:
+        """Apply this drop plan and invalidate the handle.
+
+        A live page is removed from eviction tracking only when this is its final
+        plan and it is already droppable and queued for eviction. Calling this
+        method twice is invalid.
+        """
+        page_refs = self._page_refs
+        if page_refs is None:
+            raise ValueError("Planned drop handle has already been dropped")
+
+        pages = list[CommittedPage]()
+        for page_ref in page_refs:
+            page = page_ref()
+            if page is not None:
+                if page.planned_drop_count <= 0:
+                    raise ValueError("Committed page has no planned drop")
+                pages.append(page)
+
+        self._page_refs = None
+        for page in pages:
+            page.planned_drop_count -= 1
+            if (
+                page.planned_drop_count == 0
+                and page.status == PageStatus.DROPPABLE
+                and page.scheduled_for_eviction
+            ):
+                page.manager.exclude_from_eviction(page)
+
+    def __del__(self) -> None:
+        if self._page_refs is not None:
+            self.drop()
 
 
 class _Status(enum.Enum):
@@ -358,6 +409,9 @@ class _KVCache:
         self.manager.commit_stats(
             self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
         )
+        self.manager._commit_ssm_snapshot_iteration_stats(
+            self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
+        )
         request_stats = self._pending_stats.request_stats.copy()
         self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
@@ -483,6 +537,32 @@ class _KVCache:
                     iteration_stats.iter_intra_device_copy_bytes = page_size
             if not stats.empty or not iteration_stats.empty:
                 self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
+
+    def _record_dropped_pages(
+        self,
+        pages: Sequence[Page],
+        cache_level: CacheLevel,
+    ) -> None:
+        """Record host-tier LRU drops (pages released without onboarding back to GPU).
+
+        Mirrors _record_migrated_slots in structure: per-life-cycle attribution,
+        gated on _should_record_stats(), per-page bytes computed from slot_size.
+        cache_level is unused for now (we only have a 2-tier setup in practice;
+        all last-level drops are host drops) but kept in the signature for future
+        per-tier disambiguation.
+        """
+        if not self._should_record_stats() or not pages:
+            return
+        for page in pages:
+            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
+            if life_cycle_key is None:
+                continue
+            pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
+            page_size = sum(self.manager._storage.slot_size(pg_idx))
+            iteration_stats = KVCacheIterationStatsDelta()
+            iteration_stats.iter_host_dropped_blocks = 1
+            iteration_stats.iter_host_dropped_bytes = page_size
+            self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
@@ -734,6 +814,7 @@ class _KVCache:
                     new_slots = storage.new_gpu_slots(
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles),
                         self._record_migrated_slots,
+                        self._record_dropped_pages,
                     )
                 except OutOfPagesError:
                     self._recover_excess_scratch_slots(excess_scratch_slots)
@@ -877,35 +958,142 @@ class _KVCache:
     # beam_search_indices: indices indicating which candidate to choose for each token. A block with all
     # tokens committed will be unified to one memory page and the other memory pages are dropped. Only for
     # beam search.
+    # is_end: if True, this call records a final reusable snapshot and stops committing.
+    # This is a terminal-memory contract: callers must not perform later writes to this
+    # _KVCache memory. The final live pages may be moved into the radix tree instead
+    # of copied, including SSM state and the last partial block for commit_min_snapshot.
     def commit(
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
+        is_end: bool = False,
     ):
         if self.beam_width != 1:
             raise NotImplementedError("Not implemented yet for beam search")
         if not accepted_input_tokens:
+            if is_end:
+                self.stop_committing()
             return
         assert beam_search_indices is None
         assert self.status == self.Status.ACTIVE
         if self._commit_state == self.CommitState.USER_STOP:
             raise LogicError("Cannot commit tokens after stop_committing()")
+        commit_min_snapshot = self.manager.commit_min_snapshot
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        if commit_min_snapshot:
+            new_num_committed_tokens = self.num_committed_tokens + len(accepted_input_tokens)
+            assert self.history_length in (
+                self.num_committed_tokens,
+                new_num_committed_tokens,
+            ), "commit_min_snapshot requires commit() to start or end at history_length"
         self._committed_tokens.extend(accepted_input_tokens)
         if self._commit_state == self.CommitState.VIRTUAL_STOP:
+            if is_end:
+                self._commit_state = self.CommitState.USER_STOP
             return
-        num_committed_blocks = self._num_committed_blocks
-        new_num_full_blocks = BlockOrdinal(self.num_committed_tokens // self.tokens_per_block)
-        if new_num_full_blocks > num_committed_blocks:
-            with self._record_event():
-                for ordinal in typed_range(num_committed_blocks, new_num_full_blocks):
-                    self._commit_block(ordinal, False)
         if self.history_length < self.num_committed_tokens:
             self.history_length = self.num_committed_tokens
+        num_committed_blocks = self._num_committed_blocks
+        new_num_full_blocks = BlockOrdinal(self.num_committed_tokens // self.tokens_per_block)
+        has_partial_snapshot = (
+            commit_min_snapshot
+            and self.num_committed_tokens % self.tokens_per_block != 0
+            and self.num_committed_tokens > 0
+        )
+        has_new_full_blocks = new_num_full_blocks > num_committed_blocks
+        if has_new_full_blocks or has_partial_snapshot:
+            ssm_snapshot_ordinal = _KVCache._to_block_ordinal(
+                self.tokens_per_block, self.num_committed_tokens - 1
+            )
+            with self._record_event():
+                for ordinal in typed_range(num_committed_blocks, new_num_full_blocks):
+                    self._commit_block(
+                        ordinal,
+                        False,
+                        commit_ssm=(
+                            commit_min_snapshot
+                            and ssm_lc_id is not None
+                            and ordinal == ssm_snapshot_ordinal
+                        ),
+                        move_ssm=is_end,
+                    )
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
+                    partial_ordinal = BlockOrdinal(new_num_full_blocks)
+                    if is_end:
+                        self._commit_block(
+                            partial_ordinal,
+                            True,
+                            commit_ssm=ssm_lc_id is not None,
+                            move_ssm=ssm_lc_id is not None,
+                        )
+                    else:
+                        self._snapshot_partial_block_to_tree(
+                            partial_ordinal, commit_ssm=ssm_lc_id is not None
+                        )
+        if is_end and self._commit_state != self.CommitState.USER_STOP:
+            self.stop_committing()
 
     # Note that the tokens may not be ready yet, if the event passed to the past commit() calls are not yet signaled.
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]:
+        return list(self._committed_tokens)
+
+    @property
+    def reuse_scope(self) -> ReuseScope:
+        return self._reuse_scope
+
+    def plan_committed_block_drop(self) -> PlannedDropHandle | None:
+        """Plan dropping pages needed only by the next conversation turn.
+
+        The plan covers committed pages in each SWA life cycle's current
+        attention window and the exact SSM snapshot for the committed prefix.
+        Full-attention and attention-sink blocks are excluded because later
+        turns may still need them. This must be called after stop_committing().
+        Returns None without creating a plan if any required page is unavailable.
+        """
+        if self._commit_state != self.CommitState.USER_STOP:
+            raise LogicError("plan_committed_block_drop() requires stop_committing()")
+
+        if self.num_committed_tokens == 0:
+            return None
+
+        # Locate pages through the radix tree rather than
+        # SeqBlock.tree_block: the latter is not guaranteed to identify a
+        # partial snapshot after reuse. Requiring an exact match keeps the
+        # preceding conversation plan intact if this turn no longer has a
+        # complete reusable endpoint. All PP ranks use the same lookup so
+        # attention-only ranks include the final partial SWA block too.
+        match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+        if match.num_tokens != self.num_committed_tokens or not match.blocks:
+            return None
+
+        end = BlockOrdinal(len(match.blocks))
+        pages_to_drop: list[CommittedPage] = []
+        for lc_idx, lc in self.manager._life_cycles.items():
+            if isinstance(lc, AttnLifeCycle):
+                if lc.window_size is None:
+                    continue
+                stale_range = _KVCache._get_stale_range(
+                    self.tokens_per_block, self.num_committed_tokens, lc
+                )
+                window_start = min(stale_range.end, end)
+            else:
+                window_start = BlockOrdinal(end - 1)
+            for ordinal in typed_range(window_start, end):
+                page = match.blocks[ordinal].get_page(lc_idx)
+                if page is None:
+                    return None
+                pages_to_drop.append(page)
+        return PlannedDropHandle(pages_to_drop)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
@@ -996,7 +1184,9 @@ class _KVCache:
 
         if any(c > 0 for c in num_slots):
             try:
-                tmp_slots = storage.new_gpu_slots(num_slots, self._record_migrated_slots)
+                tmp_slots = storage.new_gpu_slots(
+                    num_slots, self._record_migrated_slots, self._record_dropped_pages
+                )
             except OutOfPagesError:
                 return False
 
@@ -1006,7 +1196,7 @@ class _KVCache:
                 if self._never_resumed and (
                     type(life_cycles[lc_idx]) is SsmLifeCycle or has_partial
                 ):
-                    deferred_slots[lc_idx] = slot_lst.pop(0)
+                    deferred_slots[lc_idx] = slot_lst.pop()
                 scratch_slots_to_add[lc_idx] = slot_lst
 
             stream_wait_events(
@@ -1029,7 +1219,9 @@ class _KVCache:
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
         try:
-            locks = batched_lock_to_gpu(self, tasks, self._record_migrated_slots)
+            locks = batched_lock_to_gpu(
+                self, tasks, self._record_migrated_slots, self._record_dropped_pages
+            )
         except OutOfPagesError:
             for lc_idx, slot in typed_enumerate(deferred_slots):
                 if slot is not None:
@@ -1241,23 +1433,23 @@ class _KVCache:
             else self._blocks[block_ordinal].pages[beam_index]
         )
 
-    def _snapshot_ssm_to_tree_block(
-        self, tree_block: Block, ssm_lc_id: LifeCycleId, beam_idx: BeamIndex
-    ) -> None:
-        """Copy live SSM state to a new page and attach it to the radix tree block."""
+    def _copy_page_to_tree_block(
+        self,
+        tree_block: Block,
+        lc_idx: LifeCycleId,
+        src_page: Page,
+        num_tokens_in_block: int,
+    ) -> CommittedPage | None:
+        if not tree_block.can_replace_page(lc_idx, num_tokens_in_block):
+            return tree_block.get_page(lc_idx)
+
         storage = self.manager._storage
-        ssm_lock = expect_type(_SharedPageLock, self._ssm_blocks[beam_idx][ssm_lc_id])
-        src_page = ssm_lock.page
-        pg_idx = storage.get_pool_group_index(ssm_lc_id)
-        # Try to find a slot in any cache level, starting from the source page's level
-        for i in range(storage.num_cache_levels):
-            lvl = CacheLevel(i + src_page.cache_level)
+        pg_idx = storage.get_pool_group_index(lc_idx)
+        for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
                 new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
             except OutOfPagesError:
                 continue
-            except Exception:
-                raise
             cuda_stream = self.cuda_stream
             new_slot.ready_event.wait_in_stream(cuda_stream)
             slot_size = storage.slot_size(pg_idx)
@@ -1271,21 +1463,114 @@ class _KVCache:
                     [CopyTask(dst, src)],
                     cuda_stream,
                 )
-            ready_event = CachedCudaEvent(cuda_stream)
-            assert self.tokens_per_block * (tree_block.ordinal + 1) == self.num_committed_tokens
-            temp_page = UncommittedPage(
-                self, tree_block.ordinal, ssm_lc_id, lvl, new_slot, beam_idx
+            new_slot.ready_event = CachedCudaEvent(cuda_stream)
+            priority = self._get_priority(tree_block.ordinal, self.manager._life_cycles[lc_idx])
+            committed = CommittedPage(
+                storage, tree_block, lc_idx, lvl, new_slot, num_tokens_in_block, priority
             )
-            committed = temp_page.convert_to_committed(tree_block, ready_event)
-            # The tree only holds a weak rawref to the page. Schedule for eviction so the
-            # eviction controller keeps a strong reference, preventing the page from being GC'd.
+            # Drops the superseded page, deferred until the copy is issued: an
+            # OutOfPagesError above must not destroy a usable shorter snapshot.
+            tree_block.replace_page(lc_idx, committed)
             storage.schedule_for_eviction(committed)
-            break  # success
-        else:
-            return  # No pages available in any level, silently skip snapshot
+            return committed
+        return None
 
-    def _commit_block(self, ordinal: BlockOrdinal, is_last: bool) -> None:
-        "Commit the block for reuse. Block must be full of tokens except for the last block."
+    def _snapshot_ssm_to_tree_block(
+        self, tree_block: Block, ssm_lc_id: LifeCycleId, num_tokens: int, move: bool = False
+    ) -> None:
+        """Snapshot live SSM state to tree_block for the given committed token count."""
+        tokens_per_block = self.tokens_per_block
+        num_tokens_in_block = num_tokens - tree_block.ordinal * tokens_per_block
+        assert 0 < num_tokens_in_block <= tokens_per_block
+        if tree_block.page_coverage(ssm_lc_id) >= num_tokens_in_block:
+            return
+
+        ssm_block = self._ssm_blocks[DEFAULT_BEAM_INDEX]
+        ssm_lock = expect_type(_SharedPageLock, ssm_block[ssm_lc_id])
+        src_page = ssm_lock.page
+        if move:
+            src_page = expect_type(UncommittedPage, ssm_lock.unlock())
+            ssm_block[ssm_lc_id] = None
+            # convert_to_committed() reserves the slot, dropping any shorter snapshot.
+            committed = src_page.convert_to_committed(
+                tree_block, self.finish_event, num_tokens_in_block
+            )
+            storage = self.manager._storage
+            storage.schedule_for_eviction(committed)
+            return
+
+        self._copy_page_to_tree_block(tree_block, ssm_lc_id, src_page, num_tokens_in_block)
+
+    def _snapshot_partial_block_to_tree(self, ordinal: BlockOrdinal, commit_ssm: bool) -> None:
+        tokens_per_block = self.tokens_per_block
+        start = ordinal * tokens_per_block
+        tokens = self._committed_tokens[start : start + tokens_per_block]
+        num_tokens = len(tokens)
+        assert 0 < num_tokens < tokens_per_block
+        prev: RootBlock | Block
+        if ordinal == 0:
+            prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
+        else:
+            prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
+        try:
+            tree_block = Block(tokens, prev)
+            is_new = True
+        except UselessBlockError as e:
+            tree_block = e.block
+            assert tree_block.tokens[:num_tokens] == tokens
+            is_new = False
+
+        beam_idx = DEFAULT_BEAM_INDEX
+        beam_block = self._blocks[ordinal].pages[beam_idx]
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        # `tree_block` may be a longer existing sibling that covers these tokens. Attaching
+        # the partial attention pages to it is still correct because each page records the
+        # token span it covers, and prefix matching honours that span.
+        attached_lcs = list[LifeCycleId]()
+        for lc_idx, _ in self.manager._life_cycles.attention_life_cycles():
+            holder = beam_block[lc_idx]
+            if holder is None or tree_block.page_coverage(lc_idx) >= num_tokens:
+                continue
+            if (
+                self._copy_page_to_tree_block(tree_block, lc_idx, holder.page, num_tokens)
+                is not None
+            ):
+                attached_lcs.append(lc_idx)
+        if commit_ssm:
+            assert ssm_lc_id is not None
+            self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, start + num_tokens)
+        event_manager = self.manager.event_manager
+        if event_manager is not None:
+            if is_new:
+                event_manager.add_stored_block_event_from_block(tree_block)
+            else:
+                # The block was already announced, so report just the life cycles this
+                # snapshot added. The event manager itself drops the ones whose page does
+                # not span the whole block: the payload carries the block's full token
+                # list and cannot express a shorter valid prefix.
+                for lc_idx in attached_lcs:
+                    event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc_idx))
+
+    def _commit_block(
+        self,
+        ordinal: BlockOrdinal,
+        is_last: bool,
+        commit_ssm: bool = False,
+        move_ssm: bool = False,
+    ) -> None:
+        """
+        Commit one sequence block into the radix tree.
+
+        `is_last` controls the commit-state transition. It is set when this is
+        the last block committed before a virtual or user stop-committing
+        transition; it permits a partial final block and runs stop cleanup.
+
+        `commit_ssm` snapshots the current SSM state for this block. `move_ssm`
+        controls SSM page ownership for that snapshot: it requires the caller to
+        know there will be no later data writes to this _KVCache's memory pages,
+        because the live SSM page may be moved into the radix tree instead of
+        copied. `move_ssm` is independent from `is_last`.
+        """
         assert self._commit_state == self.CommitState.ALLOWED
         assert (
             ordinal == self._num_committed_blocks or self._commit_state != self.CommitState.ALLOWED
@@ -1316,6 +1601,7 @@ class _KVCache:
 
         assert tree_block.tokens_per_block == tokens_per_block
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        did_commit = False
         if is_new:
             # We are the only writer to padding. Other _KVCache reusing it should make copies.
             skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
@@ -1324,33 +1610,18 @@ class _KVCache:
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
                 if page is None:
                     continue
-                p = page.convert_to_committed(tree_block, self.finish_event)
-                tree_block.storage[lc] = rawref.ref(p)
+                p = page.convert_to_committed(tree_block, self.finish_event, num_tokens)
                 # The page comes from uncommitted page of self, so safe to skip wait.
                 beam_block[lc] = (
                     p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
                 )
-            # SSM snapshot: copy live SSM state at interval boundaries.
-            # The live SSM state corresponds to num_committed_tokens (updated
-            # before _commit_block is called), so snapshot only on the block
-            # whose end equals num_committed_tokens and that count is a
-            # non-zero multiple of the reuse interval.
-            if ssm_lc_id is not None:
-                num_committed = self.num_committed_tokens
-                block_end = (ordinal + 1) * tokens_per_block
-                if (
-                    block_end == num_committed
-                    and num_committed % self.manager.ssm_reuse_interval == 0
-                ):
-                    self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, beam_idx)
-                else:
-                    tree_block.storage[ssm_lc_id] = None
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
             event_manager = self.manager.event_manager
             if event_manager is not None:
                 event_manager.add_stored_block_event_from_block(tree_block)
+            did_commit = True
         elif tree_block.is_full and self.manager.allow_seq_rebasing and is_full:
             # Happens when a concurrent request committed the same tokens before us.
             # Try to replace our pages with pages from the existing block to save memory.
@@ -1360,13 +1631,24 @@ class _KVCache:
                     continue  # SSM pages are not rebased
                 if beam_block[lc] is None:
                     continue
-                existing_page = map_optional(tree_block.storage[lc], lambda p: p())
+                # A page covering fewer tokens than this block spans (moved in from a
+                # shorter sibling) is NOT a substitute for our own full page: adopting it
+                # would feed uninitialized KV for the uncovered tail into a live request.
+                existing_page = tree_block.get_page(lc)
+                if existing_page is not None and existing_page.num_tokens_in_block < num_tokens:
+                    existing_page = None
                 locked = isinstance(beam_block[lc], _SharedPageLock)
                 if existing_page is None:
                     # The reusable page is gone. We put our own page into the tree block.
-                    page = cast(UncommittedPage, cast(_SharedPageLock, beam_block[lc]).page)
+                    # Keep this a single expression: a local holding the lock/holder would
+                    # keep it alive past `beam_block[lc] = None`, and convert_to_committed()
+                    # requires the page to be droppable by then.
+                    page = cast(
+                        UncommittedPage,
+                        cast("_SharedPageLock | _PageHolder", beam_block[lc]).page,
+                    )
                     beam_block[lc] = None
-                    p = page.convert_to_committed(tree_block, self.finish_event)
+                    p = page.convert_to_committed(tree_block, self.finish_event, num_tokens)
                     event_manager = self.manager.event_manager
                     if event_manager is not None:
                         event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc))
@@ -1382,15 +1664,23 @@ class _KVCache:
                 self,
                 [BatchedLockTarget(p, beam_idx, ordinal, lc) for lc, p in reuse_list],
                 self._record_migrated_slots,
+                self._record_dropped_pages,
             )
             for (lc, _), lock in zip(reuse_list, locks):
                 beam_block[lc] = lock
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
+            did_commit = True
         else:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP
+
+        if did_commit and commit_ssm:
+            assert ssm_lc_id is not None
+            self._snapshot_ssm_to_tree_block(
+                tree_block, ssm_lc_id, start + num_tokens, move=move_ssm
+            )
 
         if seq_block.is_committed:
             for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
@@ -1417,8 +1707,9 @@ class _KVCache:
                 assert not block.is_committed
                 for beam_block in block.pages:
                     if beam_block[lc_idx] is None:
-                        assert self.enable_swa_scratch_reuse
-                        continue  # Scratch block — already handled
+                        # Nothing to release: scratch block, commit_min_snapshot early
+                        # release, or a stale block created unallocated by resize().
+                        continue
                     assert isinstance(beam_block[lc_idx], _PageHolder)
                     beam_block[lc_idx] = None
         assert NDEBUG or self._check_sanity()
@@ -1449,12 +1740,15 @@ class _KVCache:
                     block = self._blocks[ordinal]
                     is_committed = block.is_committed
                     hold_for_commit = (
-                        not is_committed and self._commit_state == self.CommitState.ALLOWED
+                        not self.manager.commit_min_snapshot
+                        and not is_committed
+                        and self._commit_state == self.CommitState.ALLOWED
                     )
                     for beam_idx, beam_block in typed_enumerate(block.pages):
                         if beam_block[lc_idx] is None:
-                            assert self.enable_swa_scratch_reuse
-                            continue  # Scratch block — no page to unlock
+                            # No page to unlock: scratch block, commit_min_snapshot early
+                            # release, or a stale block created unallocated by resize().
+                            continue
                         holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                         ret.append((ordinal, beam_idx, lc_idx, holder))
                         beam_block[lc_idx] = holder if hold_for_commit else None
@@ -1472,6 +1766,7 @@ class _KVCache:
                 for ordinal, beam_idx, lc, holder in backup_holders
             ],
             self._record_migrated_slots,
+            self._record_dropped_pages,
         )
         for lock in locks:
             user = lock._user
@@ -1539,7 +1834,9 @@ class _KVCache:
                 if lc == ssm_lc_id:
                     assert b is None  # SSM pages live in _ssm_blocks
                 elif b is not None:
-                    assert isinstance(b.page, CommittedPage) and b.page.block() is ret
+                    # b.page.block() may differ from `ret`: a page can be moved to a longer
+                    # sibling block, or replaced there by one with larger token coverage.
+                    assert isinstance(b.page, CommittedPage)
         return ret
 
     def _take_uncommitted_page(
@@ -1595,18 +1892,24 @@ class _KVCache:
                         assert holder is None
                         continue
                     start, end = stale_ranges[lc]
+                    lc_obj = self.manager._life_cycles[lc]
                     if start <= ordinal < end:
                         if is_committed or self._commit_state != self.CommitState.ALLOWED:
                             assert holder is None
+                        elif ordinal in self._get_scratch_range(lc_obj, 0):
+                            # It is uncertain whether this block should hold a page: it may
+                            # have been scratch-allocated by an earlier chunk, but the prior
+                            # history length and capacity are not retained.
+                            pass
                         else:
                             # For the decoder-side disagg case, for the first step, we will skip the
                             # out-of-window blocks.
                             assert isinstance(holder, _PageHolder) or (
-                                holder is None and not self._committed_tokens
+                                holder is None
+                                and (not self._committed_tokens or self.manager.commit_min_snapshot)
                             )
                     else:
                         # Scratch blocks have None pages but valid base_page_indices
-                        lc_obj = self.manager._life_cycles[lc]
                         sr = self._get_scratch_range(lc_obj)
                         is_scratch = ordinal in sr
                         if is_scratch:
@@ -1742,7 +2045,7 @@ class _KVCache:
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_rawref(unwrap_optional(matched[ordinal].storage[lc_idx])).hold()
+                holder = unwrap_optional(matched[ordinal].get_page(lc_idx)).hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
@@ -1766,12 +2069,21 @@ class _KVCache:
         # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1]
-            snapshot_ref = snapshot_block.storage[ssm_lc_id]
-            assert snapshot_ref is not None, (
+            snapshot_page = snapshot_block.get_page(ssm_lc_id)
+            assert snapshot_page is not None, (
                 "Last matched block must have SSM snapshot after truncation"
             )
-            snapshot_holder = unwrap_rawref(snapshot_ref).hold()
+            snapshot_holder = snapshot_page.hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        if should_record_stats and ssm_lc_id is not None:
+            changed = self._pending_stats.record_ssm_snapshot_lookup(
+                ssm_lc_id,
+                lookup_tokens=match.num_lookup_tokens,
+                reused_tokens=num_tokens,
+                tokens_per_block=tokens_per_block,
+            )
+            if changed:
+                self.manager.mark_stats_dirty(self.id)
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:

@@ -272,7 +272,9 @@ def test_qwen_vl_attach_multimodal_embeddings_builds_mrope_config(
         SamplingParams(),
     )
 
-    placeholder_id = processor.tllm_multimodal_token_id
+    # In-vocab contract: placeholders stay as the real image_token_id (no
+    # legacy OOV remap); the model engine locates mm positions via torch.isin.
+    placeholder_id = config.image_token_id
     assert prompt_token_ids == [
         7,
         config.vision_start_token_id,

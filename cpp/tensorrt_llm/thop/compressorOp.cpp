@@ -38,6 +38,10 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
     torch::Tensor cu_kv_comp,                            // [bsz+1] int32
     int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t next_n)
 {
+    constexpr int64_t kMinNextN = 1;
+    constexpr int64_t kMaxNextN = 8;
+    TORCH_CHECK(next_n >= kMinNextN && next_n <= kMaxNextN, "next_n must be in [1, 8], got ", next_n);
+
     auto stream = at::cuda::getCurrentCUDAStream();
     int kv_score_eb = static_cast<int>(kv_score.element_size());
     int state_eb = static_cast<int>(paged_kv.element_size());
