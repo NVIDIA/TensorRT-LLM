@@ -1661,6 +1661,54 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_scratch_slots_staging,
         )
 
+    def _stage_host_block_offsets_for_copy(self) -> torch.Tensor:
+        """Snapshot the persistent host block-offset buffer into a fresh pinned
+        buffer to serve as the private source of an asynchronous H2D copy.
+
+        Same bug and same fix as nvbug 6293536 in KVCacheManager
+        (``_stage_block_offsets_for_copy``): the persistent buffer is rewritten
+        whenever blocks are allocated or freed, which happens at *scheduling*
+        time -- and with the overlap scheduler that is while the previous
+        step's H2D from this buffer can still be queued behind an in-flight
+        forward. The queued copy then reads the next step's block layout and
+        the attention kernels walk freed or reassigned blocks.
+
+        Lifetime: for the per-layer branch the consumer is a torch ``copy_``,
+        which records the pinned block's use with the caching host allocator,
+        so dropping the Python reference is safe. The flat branch hands the
+        snapshot to a C++ op torch knows nothing about -- its caller must keep
+        the snapshot referenced until the op's stream has drained past it
+        (see ``_retain_flat_snapshot``).
+        """
+        src = self.host_kv_cache_block_offsets
+        host_block_offsets = torch.empty(
+            src.shape,
+            dtype=src.dtype,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        host_block_offsets.copy_(src)
+        return host_block_offsets
+
+    def _retain_flat_snapshot(self, snapshot: torch.Tensor) -> None:
+        """Keep a pinned snapshot alive until the C++ copy op has consumed it.
+
+        The op reads the host buffer at *execution* time on ``self._stream``,
+        and torch records no event for it, so the caching host allocator would
+        otherwise hand the block to the next same-size pinned allocation while
+        the op is still queued. Hold (event, snapshot) pairs and drop the ones
+        whose event has completed -- no synchronization, bounded by the
+        scheduler's run-ahead depth.
+        """
+        retained = getattr(self, "_flat_snapshots_in_flight", None)
+        if retained is None:
+            retained = self._flat_snapshots_in_flight = []
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self._stream):
+            event.record()
+        retained.append((event, snapshot))
+        retained[:] = [(e, t) for e, t in retained if not e.query()]
+
     def _copy_batch_block_offsets_per_layer(
         self,
         dst_tensor: torch.Tensor,
@@ -1670,8 +1718,9 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
     ) -> None:
         device_copy_idx = self._copy_idx_to_device(copy_idx)
+        host_block_offsets = self._stage_host_block_offsets_for_copy()
         self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             non_blocking=True,
         )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
@@ -3600,14 +3649,16 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        host_block_offsets = self._stage_host_block_offsets_for_copy()
         copy_batch_block_offsets_to_device(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             dst_tensor,
             copy_idx,
             self.index_scales,
             self.kv_offset,
             self._stream.cuda_stream,
         )
+        self._retain_flat_snapshot(host_block_offsets)
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> int | None:

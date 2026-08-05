@@ -28,17 +28,25 @@ This test drives that exact window deterministically: it stalls the stream with
 stall that delays the H2D), enqueues batch A's async H2D behind the stall, then
 lets the host immediately issue batch B before A's copy can drain. With the bug
 present, batch A's device tensor ends up holding batch B's offsets.
+
+``KVCacheManagerV2`` shared the bug through the persistent
+``host_kv_cache_block_offsets`` it fed to the same async H2D — worse, in V2
+that buffer's rows are the live page-index buffers the C++ allocator rewrites
+in place at scheduling time. The V2 twin at the bottom drives the equivalent
+window against its snapshot fix (``_stage_host_block_offsets_for_copy``).
 """
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType, LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 # Small geometry so each sequence spans several blocks and the two batches get
 # visibly different physical block indices.
@@ -52,6 +60,10 @@ _TOKENS_PER_SEQ = _TOKENS_PER_BLOCK * 5
 # Long GPU stall so the host reliably wins the race and overwrites the staging
 # buffer before batch A's H2D drains. Generous to stay deterministic on fast GPUs.
 _SLEEP_CYCLES = 2_000_000_000
+# Overwrites every V2 page index during the race window. Any value distinct
+# from real page indices (and from BAD_PAGE_INDEX == -1) works; the copies
+# only move it as data, never index with it.
+_V2_CLOBBER_PAGE_INDEX = 0x0BAD
 
 
 def _build_manager():
@@ -89,8 +101,13 @@ def _build_manager():
 
 
 def _empty_device_offsets(mgr):
+    # Dim 0 mirrors production's kv_cache_block_offsets allocation (see
+    # TrtllmAttentionMetadata): V2 sizes it by num_attention_op_pools, which
+    # equals num_pools unless SWA scratch reuse widens it to one virtual pool
+    # per layer. V1 has no such attribute.
+    num_pools = getattr(mgr, "num_attention_op_pools", mgr.num_pools)
     return torch.zeros(
-        mgr.num_pools, 2 * _BATCH, 2, mgr.max_blocks_per_seq, dtype=torch.int32, device="cuda"
+        num_pools, 2 * _BATCH, 2, mgr.max_blocks_per_seq, dtype=torch.int32, device="cuda"
     )
 
 
@@ -186,3 +203,99 @@ def test_copy_batch_block_offsets_survives_overlap_overwrite():
     )
     # And batch B's copy is independently correct.
     assert torch.equal(dst_b[:, :_BATCH], ref_b)
+
+
+def _build_manager_v2(enable_swa_scratch_reuse):
+    """Plain full-attention V2 manager with the same small geometry as V1's.
+
+    ``enable_swa_scratch_reuse=True`` routes ``copy_batch_block_offsets``
+    through ``_copy_batch_block_offsets_per_layer`` — the branch production
+    DSV4 serving takes and the one the snapshot fix primarily targets.
+    ``False`` covers the flat ``copy_batch_block_offsets_to_device`` branch,
+    which stages through the same helper.
+    """
+    init_cuda_once()
+    kv_cache_config = KvCacheConfig(
+        max_tokens=4096,
+        enable_block_reuse=False,
+        enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+    )
+    return KVCacheManagerV2(
+        kv_cache_config,
+        CacheType.SELF,
+        num_layers=_NUM_LAYERS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        tokens_per_block=_TOKENS_PER_BLOCK,
+        max_seq_len=_MAX_SEQ_LEN,
+        max_batch_size=2 * _BATCH,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=32000,
+        # Keep the pool solver's typical step at test scale instead of the
+        # constructor's 8192-token default.
+        max_num_tokens=_MAX_SEQ_LEN,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize("swa_scratch_reuse", [True, False], ids=["per_layer_scratch", "flat"])
+def test_kv_cache_manager_v2_copy_batch_block_offsets_survives_host_rewrite(swa_scratch_reuse):
+    """V2 twin of the overlap-overwrite test above.
+
+    Batch A's copy is enqueued behind a stream stall, then the persistent
+    ``host_kv_cache_block_offsets`` is rewritten in place before the copy can
+    drain. The rewrite is direct rather than a free-A/allocate-B cycle: the
+    C++ allocator mutates exactly these rows in place (through the
+    memoryviews registered by ``_create_kv_cache`` /
+    ``_restore_page_index_bufs``), but a re-allocation may hand the freed
+    pages back in the same order and reproduce identical rows, masking the
+    race. Batch A's device tensor must keep batch A's offsets.
+    """
+    mgr = _build_manager_v2(swa_scratch_reuse)
+    assert mgr.enable_swa_scratch_reuse == swa_scratch_reuse
+    requests = None
+    saved_host_offsets = None
+    try:
+        ids = list(range(1, 1 + _BATCH))
+        toks = [_TOKENS_PER_SEQ] * _BATCH
+        requests = mgr.add_dummy_requests(request_ids=ids, token_nums=toks, prepare_resource=True)
+        assert requests is not None, "test setup invalid: dummy request allocation failed"
+
+        # Also warms the (maybe-compiled) per-layer copy op outside the race
+        # window, so the stalled call below enqueues without host-side
+        # compilation pauses that would let the H2D drain early.
+        ref = _reference_offsets(mgr, ids)
+        saved_host_offsets = mgr.host_kv_cache_block_offsets.clone()
+
+        dst = _empty_device_offsets(mgr)
+        torch.cuda.synchronize()
+
+        # Drive the scheduling window: stall the stream, enqueue batch A's
+        # async H2D behind the stall, then rewrite the persistent host rows
+        # before the copy can drain.
+        torch.cuda._sleep(_SLEEP_CYCLES)
+        mgr.copy_batch_block_offsets(dst, ids, 1, _BATCH, _BATCH)
+        mgr.host_kv_cache_block_offsets.fill_(_V2_CLOBBER_PAGE_INDEX)
+        torch.cuda.synchronize()
+
+        # Setup validity: a copy issued against the clobbered buffer must
+        # produce something else, or the rewrite wasn't observable.
+        clobbered = _reference_offsets(mgr, ids)
+        assert not torch.equal(clobbered, ref), (
+            "test setup invalid: host-buffer rewrite did not change the copied offsets"
+        )
+
+        assert torch.equal(dst[:, :_BATCH], ref), (
+            "nvbug 6293536 (V2): batch A's async H2D read the rewritten "
+            "persistent host_kv_cache_block_offsets instead of a private "
+            "snapshot (_stage_host_block_offsets_for_copy)"
+        )
+    finally:
+        if saved_host_offsets is not None:
+            # The rows are live page-index buffers; put them back before the
+            # allocator touches them again in free/shutdown.
+            mgr.host_kv_cache_block_offsets.copy_(saved_host_offsets)
+        for req in requests or []:
+            mgr.free_resources(req)
+        mgr.shutdown()
