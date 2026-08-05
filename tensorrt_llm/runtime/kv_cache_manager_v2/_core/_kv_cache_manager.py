@@ -394,7 +394,8 @@ class KVCacheManager:
         reuse_scope: namespace to match before matching any tokens.
         custom_priority_callback: takes block index and layer sliding window size, returns priority.
         If priority returned is higher than existing priority for reused blocks, the block priority is updated.
-        expected_prompt_length: optional prompt length hint used to size SWA scratch slots.
+        expected_prompt_length: optional logical prompt/history boundary used to classify
+            generation allocations.
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -636,6 +637,10 @@ class KVCacheManager:
     @property
     def enable_partial_match(self) -> bool:
         return self._init_config.enable_partial_reuse
+
+    @property
+    def enable_partial_commit(self) -> bool:
+        return self._init_config.enable_partial_commit
 
     @property
     def enable_swa_scratch_reuse(self) -> bool:
