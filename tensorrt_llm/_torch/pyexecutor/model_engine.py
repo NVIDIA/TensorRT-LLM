@@ -832,6 +832,11 @@ class PyTorchModelEngine(ModelEngine):
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
+        # Pinned staging buffers for async H2D copies on the ragged path; see
+        # _pinned_host / _pinned_host_record.
+        self._pinned_host_cache = {}
+        self._pinned_host_events = {}
+
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
             use_cuda_graph=(self._is_encode_only
@@ -1875,18 +1880,10 @@ class PyTorchModelEngine(ModelEngine):
                     f"token buckets from tiers {tiers}; draft_len pinned to "
                     f"{top_tier}).")
                 return graphs
-            # One draft length, not the ladder. The cross product above was
-            # right while the uniform tier path existed and picked a different
-            # draft_len per step; that path is gone, and nothing varies
-            # draft_len at runtime any more:
-            #
-            #   scheduling off  never reaches this branch (guarded above)
-            #   cap-accept      runtime_draft_len = planner.max_tier, always
-            #   compact         takes the ragged branch, pinned to top_tier
-            #
-            # So the lower tiers were captured and never selected -- with
-            # tiers {1,3,5}, two thirds of these graphs were dead, and captured
-            # graph memory comes straight out of KV cache.
+            # One draft length, not the ladder: nothing varies draft_len at
+            # runtime any more (cap-accept pins runtime_draft_len to
+            # planner.max_tier; compact takes the ragged branch above), so
+            # lower tiers would be captured graphs paid for out of KV cache.
             top_tier = tiers[-1]
             graphs = [(bs, top_tier) for bs in cuda_graph_batch_sizes]
             logger.info(
@@ -2051,14 +2048,9 @@ class PyTorchModelEngine(ModelEngine):
                 # in this pass uses the non-greedy key; populate's override
                 # below will keep it False on every subsequent iteration.
                 spec_metadata.is_all_greedy_sample = False
-            # Measure what the captured graphs actually cost. Ragged keys graphs
-            # on (batch_size, token_bucket) rather than batch size alone, which
-            # multiplies the capture set -- 12.1 graphs per batch-size bucket
-            # against 4.1 uniform, measured. The graph count was easy to count
-            # from the log; the memory was not, and an OOM at max_batch_size=512
-            # reported 13.97 GiB in "private pools (e.g., CUDA Graphs)" without
-            # attributing it. Report the delta so the cost is a number rather
-            # than an inference.
+            # Count graphs and report private-pool memory (in the finally
+            # block below): ragged keys multiply the capture set, and OOM
+            # messages report private-pool bytes without attributing them.
             _graph_mem_before = (torch.cuda.memory_reserved(),
                                  torch.cuda.memory_allocated())
             _graph_count = 0
@@ -2115,15 +2107,10 @@ class PyTorchModelEngine(ModelEngine):
                 # the fit -- the planner declining, or a non-ragged mode -- would
                 # otherwise key on a bucket from capture.
                 self.cuda_graph_runner.agreed_ragged_bucket = None
-                # Absolute private-pool size, not a delta. Deltas are useless
-                # here: an engine build runs several capture passes over a
-                # shared allocator, so the per-pass increments came out as
-                # +13.9 / +5.5 / -0.8 / +0.7 GiB for the same 19 graphs -- the
-                # later passes reuse pool memory the earlier ones reserved, and
-                # reserved can even fall. CUDA graphs live in private pools
-                # (segment_pool_id != (0, 0)), which is the same quantity
-                # PyTorch's OOM message reports as "allocated in private pools
-                # (e.g., CUDA Graphs)", so sum those directly.
+                # Absolute private-pool size, not a delta: capture passes share
+                # the allocator, so per-pass deltas mislead. CUDA graphs live in
+                # private pools (segment_pool_id != (0, 0)) -- the same quantity
+                # PyTorch's OOM message reports -- so sum those directly.
                 _pool_bytes = 0
                 _pool_ids = set()
                 for _seg in torch.cuda.memory_snapshot():
@@ -2137,16 +2124,10 @@ class PyTorchModelEngine(ModelEngine):
                     f"across {len(_pool_ids)} pool(s) "
                     f"(ragged={getattr(self.spec_config, 'enable_ragged_verify', False)})")
 
-        # The capture loop stamps `self.runtime_draft_len` per graph so each
-        # captured shape is built at its own draft length. Nothing puts it back,
-        # which was harmless while there was one draft length to capture: the
-        # value it was left at was the value it started with. A tier ladder ends
-        # on its *smallest* tier, so the engine comes out of capture claiming a
-        # draft length it is not going to use, and the very next thing that runs
-        # -- the generic token warmup -- builds dummy requests at the full draft
-        # length while the spec metadata still says otherwise. Acceptance then
-        # reshapes `[num_gens * max_draft_len]` drafts into
-        # `[num_gens, smallest_tier]` and raises.
+        # The capture loop stamps `self.runtime_draft_len` per captured shape
+        # and nothing puts it back, so the engine would exit capture claiming
+        # the LAST shape's draft length; restore it after the passes, before
+        # the generic token warmup builds requests at the full draft length.
         saved_runtime_draft_len = self.runtime_draft_len
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
@@ -3701,14 +3682,8 @@ class PyTorchModelEngine(ModelEngine):
         for request, tokens in zip(requests, filled.verify_lens.tolist()):
             request.py_verify_len = int(tokens) - 1
         # Publish it to the runner as well: the graph key carries this value
-        # (`_ragged_verify_bucket` returns the fit's claim so every
-        # attention-DP rank keys identically), and the layout assert
-        # cross-checks it against the batch walk. During capture nothing else
-        # sets it, because the runtime fit never runs here. Before this line existed the capture-time key's
-        # token axis was None while the batch really held `verify_bucket`
-        # tokens, and the mismatch surfaced far away, in the MoE's
-        # shared-vs-routed row count, as `unmatched tensor shape` two graphs
-        # into the capture pass.
+        # and the layout assert cross-checks it against the batch walk; the
+        # runtime fit never runs during capture, so nothing else sets it here.
         self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)
 
     def ragged_verify_token_buckets(self, padded_bs: int) -> List[int]:
@@ -3870,18 +3845,9 @@ class PyTorchModelEngine(ModelEngine):
         # Decline to go ragged rather than fit against rows that will not exist.
         # Uniform always has a captured graph, so the fallback is cheap and the
         # step still runs.
-        # `will_pad_to` mirrors _get_padded_batch's SIZE guards. It cannot see
-        # the group's graph-capability answer -- that is what `all_can_graph`
-        # above now supplies -- and it deliberately does not model the
-        # resource-dependent bails (KV capacity for the dummy). Being wrong
-        # optimistically there does not "leave the pre-existing behaviour", as
-        # an earlier version of this comment claimed: it budgets tokens for a
-        # row that never appears, so the layout carries n_real*(w+1) tokens
-        # while the graph key says padded_bs*(w+1). Observed as
-        #   requests carry 18 generation tokens but the key's token axis is 24
-        # on 2 of 8 ranks, which threw inside the forward, and under
-        # attention-DP a rank that throws stops issuing collectives -- the
-        # other six deadlocked and the run was hard-killed after 300s.
+        # `will_pad_to` mirrors only the SIZE guards; the group's graph answer
+        # is `all_can_graph` above, and the resource bails stay unmodeled -- an
+        # optimistic miss desyncs the layout from the graph key under ADP.
         if not runner.will_pad_to(padded_bs, len(token_lens)):
             logger.debug(
                 f"DSpark ragged: padding to {padded_bs} rows is not available "
@@ -4071,14 +4037,13 @@ class PyTorchModelEngine(ModelEngine):
             # does not describe. Checked here because the ragged branch below
             # never runs for uniform steps, which made the staleness invisible
             # even with this assert enabled.
-            agreed_stale = getattr(self.cuda_graph_runner,
-                                   "agreed_ragged_bucket", None)
+            agreed_stale = self.cuda_graph_runner.agreed_ragged_bucket
             assert agreed_stale is None, (
                 f"uniform step carries a stale published ragged bucket "
                 f"{agreed_stale}; a failed fit exited without clearing it")
             # Uniform step: assert the converse, that nothing ragged leaked
             # through. A half-published layout is the dangerous state.
-            assert getattr(spec_metadata, "total_verify_tokens", None) is None, (
+            assert spec_metadata.total_verify_tokens is None, (
                 "uniform batch left a stale total_verify_tokens on the spec "
                 f"metadata: {spec_metadata.total_verify_tokens}")
             assert getattr(attn_metadata, "ragged_verify_lens", None) is None, (
@@ -4089,7 +4054,7 @@ class PyTorchModelEngine(ModelEngine):
         from_requests = sum(verify_lens)
         from_layout = attn_metadata.num_tokens - attn_metadata.num_ctx_tokens
         from_spec = int(spec_metadata.total_verify_tokens)
-        agreed = getattr(self.cuda_graph_runner, "agreed_ragged_bucket", None)
+        agreed = self.cuda_graph_runner.agreed_ragged_bucket
 
         assert from_requests == from_layout, (
             f"ragged layout mismatch: requests carry {from_requests} generation "
@@ -4143,23 +4108,14 @@ class PyTorchModelEngine(ModelEngine):
         PyTorch does not extend the lifetime of an async H2D source -- that is
         the caller's job -- so the DMA can read a freed page.
 
-        It survives most of the time, which is why this went unnoticed: it
-        needs the allocator to actually hand the page back before the copy
-        drains. Raising the number of ragged steps per run from 3 to 35 was
-        enough to turn it from never-seen into a run-killer, surfacing as
-        `CUDA error: an illegal memory access` on one rank and `unspecified
-        launch failure` on its peers, hundreds of frames from the copy.
-        CUDA_LAUNCH_BLOCKING=1 makes the copy synchronous and hides it
-        completely, which is how it was identified.
+        Intermittent by nature: the fault needs the allocator to reuse the
+        page before the queued copy drains (CUDA_LAUNCH_BLOCKING=1 hides it).
 
         Buffers are keyed by name and grown monotonically, so a steady state
         allocates nothing.
         """
         values = list(values)
-        cache = getattr(self, "_pinned_host_cache", None)
-        if cache is None:
-            cache = self._pinned_host_cache = {}
-            self._pinned_host_events = {}
+        cache = self._pinned_host_cache
         # WAR guard, the counterpart of the use-after-free this helper fixed:
         # a persistent buffer can be REWRITTEN while its previous non_blocking
         # H2D is still queued behind an in-flight forward, so the device copies
@@ -7238,9 +7194,8 @@ class PyTorchModelEngine(ModelEngine):
                 self._record_dspark_graph_use(
                     replayed=can_run_graph,
                     shape=None if can_run_graph else
-                    (getattr(self.cuda_graph_runner, "last_miss_reason", None)
-                     or "unknown",
-                     getattr(self.cuda_graph_runner, "last_miss_key", None)))
+                    (self.cuda_graph_runner.last_miss_reason or "unknown",
+                     self.cuda_graph_runner.last_miss_key))
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata

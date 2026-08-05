@@ -380,12 +380,8 @@ class DSparkVerifyPlanner:
         input layout is built per request (so it goes ragged) while the spec
         metadata sees a ``None`` and stays uniform.
         """
-        # Counted before any decline, so the four fallback counters below have a
-        # denominator. Without it they are absolute counts against an unknown
-        # total, which is how a run reported `planner_declined: 2` alongside an
-        # all-zero planner block: nothing said how many decisions there had
-        # been, so nothing said whether zero fallbacks meant "healthy" or
-        # "never asked".
+        # Counted before any decline, so the fallback counters below have a
+        # denominator rather than being absolute counts against an unknown total.
         self.stats["decisions"] += 1
 
         if num_gen_requests <= 0:
@@ -396,18 +392,10 @@ class DSparkVerifyPlanner:
             return None
 
         if self._forced_verify_len is not None:
-            # Ahead of the cost-table gate on purpose: the profiler runs without
-            # a table (that is the artifact it is producing), so a pin placed
-            # after this gate would never fire and the run would look entirely
-            # normal while measuring the untrimmed block.
-            #
-            # It sets ``lens`` rather than returning, so the pinned path still
-            # runs the cross-rank agreement and the length assert below. An
-            # early return skipped both -- harmless while the pin equals the
-            # block (every rank agrees trivially and the packed buffers are
-            # full-width anyway), which is why arm B ran clean, but it left the
-            # short-window case taking a different route through the same code
-            # than any real decision ever does.
+            # Ahead of the cost-table gate on purpose: the profiler runs
+            # without a table, so a pin placed after it would never fire. Sets
+            # `lens` rather than returning, so the pinned path still runs the
+            # cross-rank agreement and the length assert below.
             self.stats["forced_steps"] += 1
             lens = [int(self._forced_verify_len)] * int(num_gen_requests)
         else:

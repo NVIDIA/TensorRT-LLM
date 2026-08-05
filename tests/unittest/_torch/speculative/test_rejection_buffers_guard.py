@@ -91,6 +91,7 @@ def _valid_state():
     return types.SimpleNamespace(
         draft_probs=torch.empty((R, K, V), device="cuda"),
         batch_slot_ids=torch.arange(R, device="cuda", dtype=torch.long),
+        is_ragged_verify=False,
     )
 
 
@@ -209,6 +210,7 @@ def _dispatch_meta(**over):
     base = dict(
         use_rejection_sampling=True,
         is_all_greedy_sample=False,
+        is_ragged_verify=False,
         draft_probs_vocab_size=V,
         draft_probs_last_dim=V,
         batch_slot_ids=torch.arange(R, device="cuda", dtype=torch.long),

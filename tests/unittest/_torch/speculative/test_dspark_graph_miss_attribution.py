@@ -154,6 +154,7 @@ def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
 
     class _R:
         spec_config = type("S", (), {"enable_ragged_verify": True})()
+        agreed_ragged_bucket = None
 
     def _batch(*verify_lens):
         return types.SimpleNamespace(generation_requests=[

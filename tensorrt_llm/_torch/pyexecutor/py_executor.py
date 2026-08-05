@@ -2447,18 +2447,9 @@ class PyExecutor:
     def _maybe_assert_dspark_ragged_active(self, stats) -> None:
         """Run the ragged gate mid-loop, once the step floor is reached.
 
-        The same check also runs at executor-loop cleanup, but only there it is
-        useless as a gate: cleanup happens after every request has completed and
-        the driver has already returned its results, so the AssertionError is
-        raised into a shutdown path that pytest never sees. A run whose ragged
-        path silently did nothing reported ``1 passed`` with eight ranks each
-        raising in their logs -- the worst possible outcome for a guard, since
-        the green result is what gets believed.
-
-        Raised from inside the loop instead, the exception propagates out
-        through the in-flight requests and fails the run. Only once: the
-        counters keep moving, and re-raising every step would bury the first
-        (and only informative) failure.
+        The cleanup-time copy of this check raises into a shutdown path pytest
+        never sees; raised mid-loop instead, the exception fails the run. Only
+        once, so the first (and only informative) failure is not buried.
         """
         # Lazy rather than set in __init__: this class has several
         # construction paths and a gate that silently no-ops because one of
@@ -2466,11 +2457,9 @@ class PyExecutor:
         if getattr(self, "_dspark_asserted", False):
             return
         min_steps = self._dspark_assert_min_steps
-        # Counted over steps with a real batch, not all steps. trtllm-bench
-        # ramps concurrency from zero, so step 64 can be a batch of two, where
-        # every window is trivially identical and the gate would fail a run
-        # whose scheduler had done nothing wrong -- observed as "Broadcasting
-        # event-loop error to 2 pending request(s)".
+        # Counted over steps with a real batch, not all steps: trtllm-bench
+        # ramps concurrency from zero, and a tiny early batch has trivially
+        # identical windows, which would fail an innocent run.
         if min_steps is None or stats.steps_multi_request < min_steps:
             return
         self._dspark_asserted = True
@@ -2507,33 +2496,21 @@ class PyExecutor:
         """
         worker = getattr(self.model_engine, "_get_spec_worker", None)
         stats = getattr(worker(), "ragged_stats", None) if worker else None
-        # Drained BEFORE the ragged early-return. The two are unrelated: STS
-        # collection runs in static mode too, and gating its final flush on
-        # `ragged_stats.steps_total > 0` silently discarded the tail of every
-        # static-mode collection run -- up to flush_every steps x batch rows,
-        # and the shards still looked well-formed.
+        # Drained BEFORE the ragged early-return: STS collection runs in static
+        # mode too, so gating the final flush on ragged counters drops the tail
+        # of every static-mode collection run.
         recorder = getattr(self.sampler, "sts_recorder", None)
         if recorder is not None:
             recorder.flush()
-        if stats is None or not getattr(stats, "steps_total", 0):
+        if stats is None or not stats.steps_total:
             return
         stats.log_summary(prefix="DSpark ragged verify [final]")
-        raw = os.environ.get("TLLM_DSPARK_ASSERT_ACTIVE", "")
-        if not raw or raw in ("0", "false", "False"):
-            return
-        # The value is a MINIMUM STEP COUNT, not a boolean. An engine build
-        # spins up more than one executor -- KV-cache estimation runs a
-        # throwaway one that completes a couple of decode steps and shuts down
-        # -- and asserting on that one kills the run before the real work
-        # starts, reporting "the feature did nothing" about an executor that was
-        # never asked to do anything. Requiring a floor is what distinguishes
-        # "the scheduler declined" from "this executor barely ran".
-        try:
-            min_steps = 32 if raw in ("1", "true", "True") else int(raw)
-        except ValueError:
-            logger.warning(
-                f"ignoring TLLM_DSPARK_ASSERT_ACTIVE={raw!r}: expected a "
-                f"minimum decode-step count, or 1 for the default")
+        # The value is a MINIMUM STEP COUNT, not a boolean: an engine build
+        # spins up throwaway executors (KV-cache estimation) that run a couple
+        # of decode steps, and asserting on one of those reports "the feature
+        # did nothing" about an executor never asked to do anything.
+        min_steps = self._dspark_assert_min_steps
+        if min_steps is None:
             return
         if stats.steps_total < min_steps:
             logger.info(
@@ -3380,7 +3357,7 @@ class PyExecutor:
                 "this engine runs static (uniform) verification; the "
                 "verify-length pin only affects window-computing modes, so "
                 "pinning here would be accepted and silently never applied")
-        if (getattr(worker, "sts_recorder", None) is not None
+        if (worker.sts_recorder is not None
                 and verify_len is not None
                 and int(verify_len) < int(self.model_engine.max_draft_len)):
             # The collector's own guard refuses to START under a censoring
@@ -3431,7 +3408,7 @@ class PyExecutor:
         # the environment override exists so a run can be switched between
         # `static` and `compact` without editing the serving config, and every
         # counter below is keyed off the same decision.
-        stats = getattr(worker, "ragged_stats", None)
+        stats = worker.ragged_stats
         # The sampler is built independently of the worker, so nothing connects
         # them; do it here, where both are reachable. Acceptance has to be
         # recorded in the sampler (that is where the accepted count and the
@@ -3447,33 +3424,23 @@ class PyExecutor:
         # keys must come from the allocator that wrote the buffer.
         if (self.sampler is not None
                 and getattr(self.sampler, "sts_recorder", None) is None):
-            recorder = getattr(worker, "sts_recorder", None)
+            recorder = worker.sts_recorder
             if recorder is not None:
                 self.sampler.sts_recorder = recorder
                 self.sampler.sts_row_for = worker.sts_row_for
                 self.sampler.sts_seq_provider = worker.verified_draft_seq
-        mode = getattr(worker, "ragged_verify_mode", None)
-        compute_windows = (mode.computes_windows if mode is not None else
-                           getattr(self.model_engine.spec_config,
-                                   "enable_ragged_verify", False))
+        mode = worker.ragged_verify_mode
+        compute_windows = mode.computes_windows
 
         is_distributed = (self.dist is not None
-                          and getattr(self.dist, "tp_size", 1) > 1)
+                          and self.dist.tp_size > 1)
 
         # --- Phase 1: decide locally, issue nothing ---------------------------
         #
-        # goal doc H9. Every reason to give up on a ragged split is rank-local,
-        # and one of them -- whether the confidence snapshot's copy event has
-        # landed (`_ready_snapshot`) -- is timing-dependent, so it can differ
-        # between ranks on the same step for no reason the ranks can see. A
-        # collective placed after those checks is therefore entered by some
-        # ranks and skipped by others: the rank that went ragged used to issue
-        # two (the planner's max, then `peer_stats`), a rank that declined
-        # issued one, and a rank that declined only at the bucket fit issued
-        # three. That is a deadlock, and it is a timing-dependent one.
-        #
-        # So: nothing below this point may branch on rank-local state before the
-        # single collective, and nothing after it may issue another one.
+        # goal doc H9. Every decline reason is rank-local and one
+        # (_ready_snapshot) is timing-dependent, so a collective placed after
+        # them deadlocks: nothing below may branch on rank-local state before
+        # the single collective, and nothing after it may issue another one.
         ragged_lens = None
         fallback_reason = None
         if compute_windows:
@@ -3485,14 +3452,9 @@ class PyExecutor:
                 fallback_reason = "planner_declined"
         else:
             fallback_reason = "mode_static"
-            # Nothing to compute: the fallback verifies the full drafted
-            # block. This used to call decide_draft_len, which picked one tier
-            # for the whole batch -- a middle ground between "schedule per
-            # request" and "verify everything". It is gone: it could not act on
-            # per-request confidence, which is the point of scheduling, and it
-            # degenerated to the full block whenever acceptance was high, which
-            # was every workload measured here. The config that reached it is
-            # rejected in llm_args now, so there are two states, not three.
+            # Nothing to compute: the fallback verifies the full drafted block.
+            # (The batch-wide uniform-tier middle ground was removed; llm_args
+            # now rejects the config that reached it, so two states, not three.)
 
         # --- Phase 2: one collective, same shape on every rank, every step ----
         #
@@ -3614,17 +3576,10 @@ class PyExecutor:
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
             else:
-                # No rank can replay a graph this step -- such steps were
-                # eager long before this feature existed (can_run_cuda_graph
-                # is num_context_requests == 0), so declining ragged would buy
-                # no replay and only forfeit the trimming (measured: 46 of the
-                # first 64 steps, trim_ratio 0.62 -> 0). Run the windows
-                # eagerly, and do not fit a bucket: fitting sizes pad rows
-                # `_get_padded_batch` will not append on an ungraphable step.
-                # The fault once blamed on this path was a ragged graph KEY
-                # derived over a window-less step replaying stale row maps;
-                # with the key derivation checking windows, this path
-                # publishes no bucket and replays nothing.
+                # No rank can replay a graph this step (context requests
+                # present); such steps were always eager, so run the windows
+                # eagerly. Do not fit a bucket: fitting sizes pad rows that
+                # _get_padded_batch will not append on an ungraphable step.
                 runner = self.model_engine.cuda_graph_runner
                 runner.agreed_ragged_bucket = None
                 runner.ragged_pad_verify_len = 0
@@ -3667,14 +3622,10 @@ class PyExecutor:
             stats.record_step(num_gen_requests=num_gen_requests,
                               verify_lens=fitted,
                               bucket=bucket,
-                              # Only when the fit delivered: bucket is non-None
-                              # exactly then. Reading the attribute on every
-                              # step booked the LAST fit's padded row count
-                              # into padded_bs_hist on eager-ragged and
-                              # cap-accept steps -- phantom entries on exactly
-                              # the steps the histogram exists to explain, and
-                              # clearing at fit entry cannot help the branches
-                              # that never enter the fit.
+                              # Only when the fit delivered (bucket non-None):
+                              # reading it every step books the LAST fit's row
+                              # count into padded_bs_hist on eager-ragged and
+                              # cap-accept steps, which never enter the fit.
                               padded_bs=(getattr(self.model_engine,
                                                  "_dspark_last_padded_bs", None)
                                          if bucket is not None else None),
@@ -3724,12 +3675,8 @@ class PyExecutor:
             # The stamp buffer says which draft pass last wrote each slot; the
             # sequence bump marks "everything drafted so far" so the planner
             # can histogram how stale each gathered row was at decision time.
-            staged_seq = None
-            bump = getattr(worker, "bump_draft_seq", None)
-            if bump is not None:
-                staged_seq = bump()
-            stamps_fn = getattr(worker, "confidence_stamp_buffer", None)
-            stamps = stamps_fn() if stamps_fn is not None else None
+            staged_seq = worker.bump_draft_seq()
+            stamps = worker.confidence_stamp_buffer()
             planner.stage_confidence(buffer, stamps=stamps,
                                      staged_seq=staged_seq)
             # The STS recorder keeps its own ring of these snapshots: its
@@ -3737,7 +3684,7 @@ class PyExecutor:
             # pass that DRAFTED the block being labeled, not with whatever the
             # live buffer holds by then. Same relay, same stamps, staged in
             # the same breath as the planner's copy.
-            recorder = getattr(worker, "sts_recorder", None)
+            recorder = worker.sts_recorder
             if recorder is not None:
                 recorder.stage_snapshot(device_logits=buffer,
                                         device_stamps=stamps,

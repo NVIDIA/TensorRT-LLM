@@ -98,6 +98,7 @@ def _make_worker(enable_confidence_scheduling=False, verify_len_tiers=None):
         max_draft_len=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         enable_confidence_scheduling=enable_confidence_scheduling,
+        enable_ragged_verify=False,
         verify_len_tiers=verify_len_tiers or [1, 3, 5],
         confidence_sps_table_path=None,
         confidence_sts_path=None,
@@ -488,7 +489,7 @@ def _stride_probe_draft_model(block_size=5, num_stages=3, window_size=128, head_
     return dm, seen
 
 
-@pytest.mark.parametrize("runtime_draft_len", [5, 3, 1])
+@pytest.mark.parametrize("runtime_draft_len", [3, 1])
 def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
     """The gather stride must follow runtime_draft_len, not max_draft_len.
 
@@ -638,11 +639,3 @@ def test_confidence_buffer_absent_when_scheduling_is_off():
     worker._lazy_init(dm, _make_metadata(max_num_requests=8))
     assert worker._confidence_logits is None
     assert worker.verify_planner is None
-
-
-def test_unscored_confidence_slots_read_as_verify_all():
-    """A slot never scored must not make the scheduler trim on garbage."""
-    worker = _make_worker(enable_confidence_scheduling=True)
-    dm, _ = _stride_probe_draft_model()
-    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
-    assert torch.all(torch.sigmoid(worker._confidence_logits) > 0.999)

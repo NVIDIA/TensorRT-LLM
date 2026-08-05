@@ -226,7 +226,7 @@ class Compressor(nn.Module):
             # bound) and the real per-request counts come through
             # new_tokens_per_seq.
             next_n = metadata.num_gen_tokens_per_seq
-            new_tokens_per_seq = getattr(metadata, "gen_new_tokens_per_seq", None)
+            new_tokens_per_seq = metadata.gen_new_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
             torch.ops.trtllm.compressor_paged_kv_compress(

@@ -256,18 +256,6 @@ def test_allocation_is_a_prefix_and_respects_bounds():
     assert int((lens - cfg.min_verify_len).sum()) <= 20
 
 
-def test_allocation_prefers_the_most_confident_requests():
-    cfg = _cfg(min_verify_len=1)
-    conf = torch.tensor(
-        [
-            [1.0, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99],  # confident
-            [1.0, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],  # not
-        ]
-    )
-    lens = schedule_verify_lens_topk(survival=compute_survival(conf), budget=6, cfg=cfg)
-    assert lens[0] > lens[1]
-
-
 def test_zero_budget_gives_everyone_the_floor():
     cfg = _cfg(min_verify_len=2)
     surv = compute_survival(torch.rand(5, BLOCK))

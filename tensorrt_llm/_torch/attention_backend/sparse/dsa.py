@@ -832,24 +832,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
 
     def prepare(self):
-        # One write-after-read guard over EVERYTHING prepare stages through
-        # pinned memory -- the base class's kv_lens and block-table copies as
-        # much as the ragged row maps. Every one of these buffers is rewritten
-        # here each step and copied device-ward with non_blocking=True; under
-        # the overlap scheduler the previous step's copies can still be QUEUED
-        # behind an in-flight forward when this rewrite starts, and the device
-        # then copies this step's values into last step's consumers. The GPU
-        # coredump for the resulting fault names
-        # applyMLARopeAndAssignQKVKernelGeneration (Warp MMU Fault) storing
-        # through KVBlockArray -- garbage block offsets, which trace back
-        # through the token-major gather to the BASE block-table staging, not
-        # only the ragged row set. Hence one coarse guard at the boundary
-        # rather than per-buffer events: synchronize on the event recorded
-        # after the previous prepare's copies were enqueued, which by stream
-        # order means they have executed before any pinned buffer is touched
-        # again. Steady-state cost is nothing (the event completed long ago);
-        # it blocks only when the CPU has genuinely outrun the device, which is
-        # exactly the window that corrupted the copies.
+        # WAR guard over EVERYTHING prepare() stages through pinned memory:
+        # under the overlap scheduler last step's non_blocking H2D copies can
+        # still be queued when this rewrite starts, so wait on the event
+        # recorded after the previous prepare's copies before touching any.
         if not torch.cuda.is_current_stream_capturing():
             evt = getattr(self, "_prepare_stage_evt", None)
             if evt is None:
@@ -1666,22 +1652,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             int(max_total_draft_tokens),
             getattr(self, "_draft_alloc_cap", 0) or 0)
         capture_graph = self.is_cuda_graph
-        # GROW-ONLY ratchet, never an equality check. Under DSpark ragged
-        # verification max_draft_len varies per step with the planner's
-        # windows; the old `!=` conditions re-created every expanded buffer
-        # whenever it moved, while already-captured graphs kept the previous
-        # allocations' raw addresses baked in. The caching allocator then
-        # reused the freed memory for the per-step indptr tensors, and every
-        # replay read indptr ramps where its row->request map and per-row KV
-        # extents used to live -- the ragged IMA. (Frozen-scene forensics:
-        # the retired attn_row buffers' addresses held int64 cumsum ramps.)
-        # Growing above the high-water mark before any graph exists is fine;
-        # after that the sizes plateau at the config ceiling and the
-        # addresses never move again. Consumers slice [:rows]/[:width], so a
-        # wider-than-this-step buffer is just capacity.
-        ratchet = max(self._draft_sizing_cap,
-                      getattr(self, "_expanded_alloc_draft_cap", -1))
-        if ratchet > getattr(self, "_expanded_alloc_draft_cap", -1):
+        # GROW-ONLY ratchet, never an equality check: captured graphs bake the
+        # buffer addresses in, and the old `!=` re-created the buffers whenever
+        # max_draft_len moved per step -- the graph-path ragged IMA (see
+        # docs/dspark_ragged_ima_handoff.md). Consumers slice [:rows]/[:width].
+        prev_cap = getattr(self, "_expanded_alloc_draft_cap", -1)
+        ratchet = max(self._draft_sizing_cap, prev_cap)
+        if ratchet > prev_cap:
             self._expanded_alloc_draft_cap = ratchet
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
             self.create_expanded_buffers(capture_graph=capture_graph)
@@ -2186,12 +2163,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Costs a device-to-host read, so it is opt-in.
         if (os.environ.get("TLLM_DSPARK_ASSERT_ROWS")
                 and not torch.cuda.is_current_stream_capturing()):
-            # The .max() below is a device-to-host read, and this function runs
-            # inside the CUDA-graph capture body (on_update_kv_lens). Reading
-            # during capture raises cudaErrorStreamCaptureInvalidated and takes
-            # the whole engine down before any real step runs -- which is what
-            # the first attempt at this check did. Capture is also not where
-            # the interesting case lives: the eager path is.
+            # The .max() is a device-to-host read; during capture it would
+            # raise cudaErrorStreamCaptureInvalidated. The eager path is where
+            # the interesting case lives anyway.
             worst = int(self.attn_row_req_idx_cuda[:rows].max())
             assert worst < self.num_seqs, (
                 f"token-major row map is stale: {rows} rows index up to "

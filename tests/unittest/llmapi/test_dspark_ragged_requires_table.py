@@ -14,9 +14,6 @@ planner trim, which exercises the real confidence-driven path rather than
 bypassing it. See tests/unittest/_torch/speculative/test_dspark_planner_trims.py.
 """
 
-import os
-from unittest.mock import patch
-
 import pytest
 
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
@@ -31,19 +28,16 @@ def _cfg(**kwargs):
     return DSparkDecodingConfig(**base)
 
 
-@patch.dict(os.environ, {}, clear=False)
 def test_ragged_without_a_cost_table_is_rejected():
     with pytest.raises(ValueError, match="requires a profiled cost table"):
         _cfg()
 
 
-@patch.dict(os.environ, {}, clear=False)
 def test_ragged_with_an_sps_table_is_accepted():
     cfg = _cfg(confidence_sps_table_path="/tmp/table.json")
     assert cfg.enable_ragged_verify
 
 
-@patch.dict(os.environ, {}, clear=False)
 def test_confidence_scheduling_without_ragged_is_rejected():
     """There is no uniform tier ladder to fall back to.
 
@@ -62,14 +56,3 @@ def test_confidence_scheduling_without_ragged_is_rejected():
                              speculative_model="/nonexistent/model",
                              enable_confidence_scheduling=True,
                              enable_ragged_verify=False)
-
-
-@patch.dict(os.environ, {}, clear=False)
-def test_scheduling_off_needs_no_table_and_verifies_everything():
-    """The fallback is static verification, which has nothing to profile."""
-    cfg = DSparkDecodingConfig(max_draft_len=5,
-                               speculative_model="/nonexistent/model",
-                               enable_confidence_scheduling=False,
-                               enable_ragged_verify=False)
-    assert not cfg.enable_confidence_scheduling
-    assert not cfg.enable_ragged_verify

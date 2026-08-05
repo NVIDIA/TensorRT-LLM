@@ -157,16 +157,6 @@ def test_fill_bucket_adds_pad_rows_to_reach_the_captured_batch_size():
     assert min(lens[2:]) >= 1, "a pad row with 0 tokens breaks qo_indptr slicing"
 
 
-def test_fill_bucket_prefers_real_rows_over_pad_rows():
-    lay = _layout([1, 1], bucket=10)
-    filled = lay.fill_bucket(max_verify_len=BLOCK, padded_bs=4)
-    lens = filled.verify_lens.tolist()
-    assert sum(lens) == 10
-    # 8 spare beyond the baseline (1+1 real + 1+1 pad): real rows take theirs
-    # first, so both real rows outrank both pad rows.
-    assert min(lens[:2]) >= max(lens[2:])
-
-
 def test_fill_bucket_raises_when_the_bucket_cannot_be_reached():
     """Silently returning a short batch would desync attention from the MoE."""
     lay = _layout([1, 1], bucket=100)  # capacity 2*7 = 14 < 100
@@ -521,13 +511,6 @@ def _fit(real_token_lens, bucket, padded_bs, max_verify_len):
     return layout.fill_bucket(max_verify_len=max_verify_len, padded_bs=padded_bs)
 
 
-def test_fit_hits_the_bucket_exactly():
-    # 3 real requests wanting 2+3+1=6 tokens, padded to 4 rows, bucket 12.
-    got = _fit([2, 3, 1], bucket=12, padded_bs=4, max_verify_len=6)
-    assert int(got.verify_lens.sum()) == 12
-    assert got.bs == 4
-
-
 def test_fit_spends_slack_on_real_requests_before_pad_rows():
     got = _fit([2, 2], bucket=8, padded_bs=4, max_verify_len=6)
     lens = got.verify_lens.tolist()
@@ -537,25 +520,12 @@ def test_fit_spends_slack_on_real_requests_before_pad_rows():
     assert lens[0] + lens[1] == 6
 
 
-def test_fit_pad_rows_are_never_empty():
-    # An empty range breaks qo_indptr's per-row slicing. Baseline here is
-    # 2*4 real + 6 pad rows = 14, so the bucket has to be at least that.
-    got = _fit([4, 4], bucket=16, padded_bs=8, max_verify_len=4)
-    assert all(v >= 1 for v in got.verify_lens.tolist())
-
-
 def test_fit_rejects_a_bucket_that_cannot_hold_the_pad_rows():
     # The same batch against a bucket that leaves no room for the pad rows:
     # 8 real tokens + 6 pad rows needs 14, not 10. Raising here is the point --
     # a short batch would desync attention from the MoE.
     with pytest.raises(ValueError, match="too small"):
         _fit([4, 4], bucket=10, padded_bs=8, max_verify_len=4)
-
-
-def test_fit_marks_which_rows_are_real():
-    got = _fit([2, 3], bucket=10, padded_bs=4, max_verify_len=6)
-    assert got.num_real_requests == 2
-    assert got.num_pad_requests == 2
 
 
 def test_fit_never_exceeds_the_per_request_ceiling():

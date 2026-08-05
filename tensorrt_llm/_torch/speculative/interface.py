@@ -1087,7 +1087,7 @@ def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
         return
     caps = caps[:gen.shape[0]].to(gen.dtype)
     capped = torch.minimum(gen, caps)
-    trim = getattr(spec_metadata, "accept_cap_trim", None)
+    trim = spec_metadata.accept_cap_trim
     if trim is not None:
         # Zero the context slots too. The buffer is persistent and the batch
         # composition moves every step, so a slot left unwritten would carry
@@ -1785,14 +1785,13 @@ class SpecWorkerBase(nn.Module, ABC):
         # rows one-hot, and clamps the accepted count back to `verify_lens`)
         # unreachable. Greedy GSM8K cannot see any of this.
         logits_rows = logits.shape[0] if logits.dim() > 1 else 1
-        if getattr(spec_metadata, "is_ragged_verify", False):
+        if spec_metadata.is_ragged_verify:
             # Fail closed on a half-built ragged layout: the branch below
             # dereferences all three of these.
-            total_verify_tokens = getattr(spec_metadata, "total_verify_tokens",
-                                          None)
+            total_verify_tokens = spec_metadata.total_verify_tokens
             if (total_verify_tokens is None
-                    or getattr(spec_metadata, "verify_lens", None) is None
-                    or getattr(spec_metadata, "qo_indptr", None) is None):
+                    or spec_metadata.verify_lens is None
+                    or spec_metadata.qo_indptr is None):
                 return False
             required_gen_rows = int(total_verify_tokens)
         else:

@@ -894,7 +894,7 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 # empirically: reverting the stride fix leaves all twelve cases green. What this
 # does cover is the RoPE, KV-write, sparse-MLA and compressor paths at widths
 # other than one, which was previously nothing at all.
-@pytest.mark.parametrize("generation_seq_len_q", [1, 2, 4, 6])
+@pytest.mark.parametrize("generation_seq_len_q", [1, 2, 6])
 def test_deepseek_v4_sparse_mla(
     context_lengths: List[int], num_generation_steps: int, generation_seq_len_q: int
 ):

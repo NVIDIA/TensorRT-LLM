@@ -490,9 +490,9 @@ class DSparkWorker(SpecWorkerBase):
                     f"every mid-shelf total upward. Re-emit the table with a "
                     f"current profiler if trimming behaves oddly.")
             check_table_fingerprint(payload=raw, live={
-                "tp": int(getattr(self.mapping, "tp_size", 0) or 0),
-                "ep": int(getattr(self.mapping, "moe_ep_size", 0) or 0),
-                "attention_dp": bool(getattr(self.mapping, "enable_attention_dp", False)),
+                "tp": int(self.mapping.tp_size),
+                "ep": int(self.mapping.moe_ep_size),
+                "attention_dp": bool(self.mapping.enable_attention_dp),
                 "block": int(block_size),
                 "max_batch_size": int(max_batch),
                 # moe_backend deliberately NOT in the live dict yet: the
@@ -583,8 +583,8 @@ class DSparkWorker(SpecWorkerBase):
         from .dspark_observability import (DSparkRaggedStats, RaggedVerifyMode,
                                            read_ragged_verify_mode)
 
-        configured = (RaggedVerifyMode.COMPACT if getattr(
-            self.spec_config, "enable_ragged_verify", False) else
+        configured = (RaggedVerifyMode.COMPACT
+                      if self.spec_config.enable_ragged_verify else
                       RaggedVerifyMode.STATIC)
         self.ragged_verify_mode = read_ragged_verify_mode(default=configured)
         # STS calibration data collection. Off unless the env var is set; when
@@ -595,10 +595,10 @@ class DSparkWorker(SpecWorkerBase):
         # next line uses it the same way.
         self.sts_recorder = make_recorder_from_env(
             block_size=int(block_size),
-            rank=int(getattr(getattr(self, "mapping", None), "rank", 0) or 0),
+            rank=int(self.mapping.rank),
             has_cost_table=bool(
                 self.spec_config.confidence_sps_table_path),
-            ragged_mode=getattr(self.ragged_verify_mode, "value", None))
+            ragged_mode=self.ragged_verify_mode.value)
 
         self.ragged_stats = DSparkRaggedStats(mode=self.ragged_verify_mode,
                                               max_draft_len=block_size)
@@ -724,7 +724,7 @@ class DSparkWorker(SpecWorkerBase):
         # Note the ``or K``: SpecMetadata.runtime_draft_len defaults to 0, not
         # None, so an ``is None`` check would leave a stride of 1 on any path
         # that has not populated it yet.
-        runtime_draft_len = getattr(spec_metadata, "runtime_draft_len", 0) or K
+        runtime_draft_len = spec_metadata.runtime_draft_len or K
         Kp1 = int(runtime_draft_len) + 1
         device = accepted_tokens.device
 
@@ -754,8 +754,8 @@ class DSparkWorker(SpecWorkerBase):
         # tokens, so the offsets come from the same qo_indptr the input layout
         # was packed with. Striding by Kp1 there would have request r read from
         # request r-1's tail -- no error, just a silent acceptance collapse.
-        qo_indptr = getattr(spec_metadata, "qo_indptr", None)
-        if getattr(spec_metadata, "verify_lens", None) is not None and qo_indptr is not None:
+        qo_indptr = spec_metadata.qo_indptr
+        if spec_metadata.verify_lens is not None and qo_indptr is not None:
             base = gen_start + qo_indptr[:num_gens].to(device=device, dtype=torch.long)
         else:
             arange_g = torch.arange(num_gens, device=device)
@@ -985,7 +985,7 @@ class DSparkWorker(SpecWorkerBase):
         # cap-accept only: what each request's window threw away, written by
         # `apply_accept_caps` above. Rides the sampler's existing copy rather
         # than a read of its own, so the measurement costs no synchronization.
-        cap_trim = getattr(spec_metadata, "accept_cap_trim", None)
+        cap_trim = spec_metadata.accept_cap_trim
         if cap_trim is not None and spec_metadata.accept_caps is not None:
             outputs["cap_trim_lens"] = cap_trim[:batch_size]
         return outputs

@@ -1,8 +1,7 @@
 # DSpark ragged verify — handoff
 
 Written 2026-08-04. Supersedes nothing; read alongside
-`docs/dspark_p0_task_prompt.md` (the original task) and
-`docs/dspark_ragged_verify_status.md` (design/status).
+`docs/dspark_p0_task_prompt.md` (the original task; §10 is the results record).
 
 Branch `dspark-p0`, fork `origin` = `github.com/lancelly/TensorRT-LLM`,
 PR branch `origin/confidence_head` (NVIDIA/TensorRT-LLM#17056).
@@ -11,21 +10,7 @@ PR branch `origin/confidence_head` (NVIDIA/TensorRT-LLM#17056).
 
 ## 0. The one thing to read first
 
-**There is an open CUDA illegal memory access on the ragged verify path, and my
-framing of it was wrong until the last experiment of the session.** I spent most
-of a day believing it was confined to a path I had just added (running ragged on
-steps with no CUDA graph). The final run disproved that: with that path gated
-OFF, the default configuration still faults.
-
-So the correct statement is:
-
-> Planner-driven ragged verification with real trimming has **never** completed a
-> GSM8K run without `CUDA_LAUNCH_BLOCKING=1`.
-
-Everything in §4 was designed under the wrong hypothesis. The falsifications
-are still valid as facts, but the *set* of candidates they were drawn from was
-too narrow. Re-derive the candidate list from "ragged trimming is unsafe", not
-from "eager is unsafe".
+**The CUDA illegal memory access this document hands off has since been root-caused and FIXED** — see §3's dated entries: a ragged graph key derived over a window-less step replayed the previous ragged step's row state; fixed at the key derivation (`6a59b01e53`, with the WAR-staging hardening in `c7e6d78ac2`/`74f1a82d06`/`5c38441a00`), validated 131 steps / zero IMA with ragged fully active. The rest of this section is preserved as the record of how the framing went wrong: I spent most of a day believing the fault was confined to a path I had just added (running ragged on steps with no CUDA graph); the final run disproved that with the path gated OFF. Everything in §4 was designed under that wrong hypothesis — the falsifications stand as facts, but re-derive any future candidate list from "ragged trimming is unsafe", not "eager is unsafe".
 
 ---
 
@@ -72,7 +57,7 @@ accuracy. GSM8K passing proves nothing on its own.
 
 | # | Item |
 |---|---|
-| **IMA** | §3. Blocks everything else. |
+| ~~IMA~~ | **Closed** — root cause and fix in §3 (2026-08-04 ~16:30 entry); validated 131 steps, zero IMA/hang/tripwire, ragged fully active. |
 | #19 | Verify budget is quantised to the tier ladder. Measured cost up to **73%** of the planner's own objective. Not implemented. |
 | #11 | Sync control never completed. **Do not cite any sync-related conclusion.** |
 | #20 | Three-way differential incomplete (compact leg needs a non-blocking run) |
@@ -340,7 +325,6 @@ Useful switches, all wired through `tmp/run_dspark_e2e.sh`:
 |---|---|
 | `LAUNCH_BLOCKING=1` | `CUDA_LAUNCH_BLOCKING=1` — the only thing that passes |
 | `NO_OVERLAP=1` | `disable_overlap_scheduler=True` |
-| `EAGER_RAGGED=1` | re-enable the gated eager-ragged path |
 | `ASSERT_ROWS=1` | row-map staleness assertion (skipped during capture) |
 | `SANITIZER=1` | compute-sanitizer — see §5, not currently viable |
 
@@ -438,19 +422,7 @@ rank is untried and is the obvious next move.
 
 ## 6. Next steps
 
-1. **Validate the coarse prepare() guard** (§3 root cause) — a gated and an
-   eager run with `COREDUMP=1`. A pass means both complete ≥128 steps with
-   non-zero `steps_ragged` and no new corefile; do not accept anything less.
-2. If it still faults: the corefile names the kernel again. The remaining
-   unguarded staging is then *outside* `prepare()` — sweep `model_engine.py`
-   and `py_executor.py` for persistent pinned buffers with `non_blocking=True`
-   consumers (the `_pinned_host` sites are already event-guarded).
-3. After the pass: replace the coarse guard's protection of the worst offenders
-   with the base class's snapshot idiom where profiling justifies it, drop the
-   dead capture-skip conditionals, re-evaluate the `4f81cc5534` gate, and clean
-   up the ~34 corefiles (keep one as evidence).
-4. Only after the IMA: #19 (budget quantisation, the largest measured gap),
-   then #11 and #20.
+1. #19 (budget quantisation — the largest measured gap, up to 73% of the planner's own objective), then #11 (sync control; until it completes, do not cite any sync conclusion) and #20 (the three-way static / cap-accept / compact differential). All IMA work has landed: coarse prepare() WAR guard with the `_prepare_impl` subclass rule (`c7e6d78ac2`), KVCacheManagerV2 snapshot staging (`74f1a82d06`), bounded/zeroed overlap staging inputs (`5c38441a00`), window-consistent ragged graph key (`6a59b01e53`), and the eager-ragged gate reverted on its merits (`35a1ac4c4a`).
 
 ### Do not
 
@@ -461,24 +433,6 @@ rank is untried and is the obvious next move.
 - Do not cite `docs/dspark_p0_task_prompt.md` §10 sync numbers; the control never
   ran.
 - Do not trust a throughput number taken with the synthetic steep table.
-
----
-
-## 7. Unpushed work
-
-`origin/confidence_head` is at `d36c9b4757`. Two local commits plus the
-coarse-guard working tree, none end-to-end verified yet:
-
-| commit | what | note |
-|---|---|---|
-| `0bb36c11b6` | event-guard the ragged row-map staging + `_pinned_host` sites | did **not** stop the fault alone, but closes real WAR holes; keep |
-| `9bc5dec76c` | skip staging copies during capture | **no-op** — `prepare()` never runs inside the capture region (§3); fold into cleanup |
-| *(uncommitted)* | coarse WAR guard around all of `DSAtrtllmAttentionMetadata.prepare` | the actual fix candidate, in validation |
-
-Two fixes worth keeping regardless of the IMA, already in the above:
-`_pinned_host` (persistent staging buffers — PyTorch does not extend an async
-H2D source's lifetime, and three sites were passing temporaries) and the
-`TLLM_DSPARK_DISABLE_OVERLAP` diagnostic switch.
 
 ---
 

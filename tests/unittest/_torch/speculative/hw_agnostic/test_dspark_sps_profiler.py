@@ -263,6 +263,7 @@ def test_fit_recovers_relative_structure_exactly():
     every cell must be reproduced to the last bit."""
     cells = _synthetic_cells(BATCH_SIZES, VERIFY_LENS, alpha=ALPHA.get, theta=THETA)
     fit = fit_additive_cost_model(cells)
+    assert fit.warnings == ()
 
     for cell in cells:
         predicted = fit.intercept_ms[cell.batch_size] + fit.theta_ms[cell.total_verify_tokens]
@@ -298,11 +299,6 @@ def test_fit_surfaces_a_bad_cell_rather_than_hiding_it():
     # batch size or token count, so the report names a neighbourhood -- the bad
     # cell is in it, but so are innocent ones, which is why it is worded that way.
     assert "bs=32, L=3" in report
-
-
-def test_fit_stays_quiet_when_the_model_holds():
-    cells = _synthetic_cells(BATCH_SIZES, VERIFY_LENS, alpha=ALPHA.get, theta=THETA)
-    assert fit_additive_cost_model(cells).warnings == ()
 
 
 def test_fit_clamps_a_dip_upward():
@@ -589,13 +585,14 @@ def test_token_budget_is_scaled_when_acceptance_is_not_pinned():
 def test_validate_rejects_a_sequence_that_would_be_evicted():
     """An evicted request drains the batch mid-cell and shrinks the shape."""
     with pytest.raises(SweepGeometryError, match="max-seq-len"):
-        _sweep(input_len=4064).validate()
+        _sweep(input_len=4064, block_follows_verify_len=True).validate()
 
 
 def test_validate_rejects_a_decode_step_wider_than_max_num_tokens():
     """A split decode step never has the shape its cell is filed under."""
     with pytest.raises(SweepGeometryError, match="widest decode step"):
-        _sweep(batch_sizes=[8, 4096], max_num_tokens=1024).validate()
+        _sweep(batch_sizes=[8, 4096], max_num_tokens=1024, max_seq_len=8192,
+               block_follows_verify_len=True).validate()
 
 
 def test_validate_accepts_a_sane_sweep():

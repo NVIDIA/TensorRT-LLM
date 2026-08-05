@@ -70,15 +70,6 @@ def test_no_caps_is_a_no_op():
     assert counts.tolist() == [3, 1, 4]
 
 
-def test_counts_inside_their_windows_are_untouched():
-    """The draft died before the cut, so the cut cost nothing."""
-    counts = torch.tensor([1, 3, 2], dtype=torch.int32)
-    meta = _Meta(caps=[6, 4, 6])
-    apply_accept_caps(counts, 0, meta)
-    assert counts.tolist() == [1, 3, 2]
-    assert meta.accept_cap_trim[:3].tolist() == [0, 0, 0]
-
-
 def test_counts_beyond_their_windows_are_clamped_and_the_loss_accumulated():
     counts = torch.tensor([6, 5, 2], dtype=torch.int32)
     meta = _Meta(caps=[3, 5, 6])

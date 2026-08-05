@@ -141,6 +141,9 @@ class CUDAGraphRunner:
         # by ModelEngine.fit_ragged_verify_lens when it picks the token bucket;
         # the padding rows are one shared dummy object so they all share it.
         self.ragged_pad_verify_len = 0
+        # Published by ModelEngine when the ragged fit picks a token bucket;
+        # None is the resting value (no ragged step in flight).
+        self.agreed_ragged_bucket: Optional[int] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -303,16 +306,10 @@ class CUDAGraphRunner:
         from ..speculative.dspark_observability import trims_submitted_tokens
         if not trims_submitted_tokens(self.spec_config):
             return None
-        # Enforce what the docstring promises: None unless EVERY generation
-        # request carries a window. The fit publishes `agreed_ragged_bucket`,
-        # but windows can be absent by the time the key is derived (planner
-        # or peer declined after the fit, roster changed) -- and a ragged key
-        # over a window-less batch replays a graph whose token-major row maps
-        # were never staged this step, so the replay consumes the previous
-        # ragged step's rows: stale request mapping, stale extents, stale
-        # block table, and the rope KV-append walks off a retired request's
-        # allocation (the ragged IMA; proven by prepare-tick vs staged-tick
-        # stamps: tick N prepare, tick N-1 staging, no skip-guard fired).
+        # Enforce the docstring: None unless EVERY generation request carries a
+        # window. Windows can vanish between the fit and key derivation (planner
+        # or peer declined, roster changed); a ragged key over a window-less
+        # batch replays stale token-major row maps -- the ragged IMA.
         if any(
                 getattr(request, "py_verify_len", None) is None
                 for request in batch.generation_requests):
@@ -324,7 +321,7 @@ class CUDAGraphRunner:
         # fitted value is computed from allgathered peer stats by rules every
         # rank runs identically, so it agrees by construction. None means this
         # step is not ragged, which keeps the key exactly what it was.
-        return getattr(self, "agreed_ragged_bucket", None)
+        return self.agreed_ragged_bucket
 
     @staticmethod
     def _local_draft_len(batch: ScheduledRequests) -> int:
@@ -406,16 +403,10 @@ class CUDAGraphRunner:
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            # goal doc §4.4. Comparing only "all generation" and the batch size
-            # is not enough once the token count stops being a function of the
-            # row count. Under ragged verification a rank that fell back to
-            # uniform scheduling produces the same batch size but a different
-            # token total, so this gate used to pass and let one rank replay a
-            # graph full of collectives while another ran a different width.
-            # That mismatch is undetectable at replay time: `all_rank_num_tokens`
-            # is a host list read inside forward, so the captured graph keeps
-            # using the value it saw at capture. Compare every component of the
-            # key that a rank can decide for itself.
+            # goal doc §4.4. Batch size alone is not enough once the token
+            # count stops tracking the row count, and replay freezes
+            # all_rank_num_tokens, so a mismatch is invisible at replay time:
+            # compare every key component a rank can decide for itself.
             #
             # `draft_len` is agreed by the DSpark planner's single collective,
             # but it is also settable rank-locally by the acceptance-rate
@@ -533,15 +524,9 @@ class CUDAGraphRunner:
         max_draft_len = key[1]
         token_per_request = max_draft_len + 1
         # Ragged keys carry the flat token total as a sixth element (see
-        # _get_graph_key). It is exactly the width the captured graph will be
-        # replayed at, and it is NOT batch_size * (draft_len + 1): the block is
-        # still drafted in full, so draft_len stays at the top tier while the
-        # verified total shrinks. Sizing the static slices from the product
-        # instead would capture a graph whose input_ids are wider than the
-        # attention metadata's num_tokens on every trimmed replay -- and the
-        # widest bucket happens to match the product, which is what warmup
-        # captures, so it would capture clean and diverge on the first real
-        # trimmed step.
+        # _get_graph_key); that is the replay width, NOT bs * (draft_len + 1):
+        # the block is drafted in full while the verified total shrinks (the
+        # two only coincide at the widest bucket, which is what warmup sees).
         num_tokens_for_capture = (key[5] if len(key) > 5 else
                                   batch_size * self.max_beam_width *
                                   token_per_request)
@@ -653,10 +638,8 @@ class CUDAGraphRunner:
         """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
 
         The ragged fit derives its token-bucket grid from an assumed padded row
-        count and hands the rounding slack to pad rows. If padding then
-        declines, those rows never appear and the fitted total lands in no
-        captured bucket -- seen as a graph key of batch_size 193 against a
-        ladder holding 192 and 256, costing every rank a replay.
+        count and hands the rounding slack to pad rows; if padding declines,
+        the fitted total lands in no captured bucket and every rank runs eager.
 
         Mirrors the size guards in :meth:`_get_padded_batch`. It deliberately
         does not try to predict the resource-dependent bails (KV capacity for

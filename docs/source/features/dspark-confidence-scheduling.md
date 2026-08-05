@@ -139,15 +139,7 @@ iteration t:  [hook(t)]  ->  [prepare]  ->  [forward(t)]
 无论 overlap scheduler 开不开都成立：overlap 改变的是拷贝**何时落地**，而不是它抓的是
 哪一次 forward。没落地的拷贝会退化成"验全块"，而不是退化成一个陈旧的猜测。
 
-因此 `DSparkVerifyPlanner` 把"引擎给的滞后"和"想要的总滞后"分开接收，差值用一个 host 侧
-carry ring 补上：
-
-```text
-carry_steps = confidence_relay_lag_steps - ENGINE_CONFIDENCE_RELAY_LAG
-```
-
-默认值下差值为 0，ring 完全 inert。未填充的 ring 层初始化成**中性 confidence** 加上一个
-**不可能的 generation**，所以启动后的前 `carry_steps` 步不可能在未初始化内存上做裁剪。
+实现中滞后不可配置：executor loop 恒定给出两步（上图），planner 直接消费该快照。快照行的新鲜度由 `_confidence_stamp` 守卫 —— 逐 buffer 行的 draft-pass 序号，随 confidence 经同一个 `slots` scatter 在 graph 内写入；陈旧或从未打分的行读到中性 confidence，survival 归 1.0，退化为验证整块。
 
 ### slot 索引与 generation 守卫
 
@@ -159,11 +151,11 @@ slot 还会被回收，这带来两种不同的陈旧风险，由两个互补机
 | 风险 | 机制 |
 |------|------|
 | device 上那一行还留着上一个占用者的分数 | `_assign_slot` 在把行交给新请求时重置为中性值 |
-| carry ring 里存着回收之前的**host 副本**，device 侧的重置够不着 | 每行带一个 `_slot_generation` 标签，与 confidence 一起 stage；和当前 generation 对不上就把该行 survival 强制为 1.0 |
+| host 侧快照里还留着回收之前的副本，device 侧的重置够不着 | 每行带一个 `_confidence_stamp`（draft-pass 序号），与 confidence 一起 stage；与当前 pass 对不上就把该行按中性处理，survival 归 1.0 |
 
 这两者是**互补的，不是二选一**。generation 标签是在 stage 时于 host 侧快照的，而
 confidence 是在 forward 时于 device 上写的 —— 所以正是那次重置让标签说的是真话：只 bump
-不重置，就会把上一个占用者的分数打上新占用者的标签。反过来，只重置也清不掉 ring 里已经
+不重置，就会把上一个占用者的分数打上新占用者的标签。反过来，只重置也清不掉快照里已经
 存在的 host 副本。
 
 两种风险都收敛到同一个安全方向：**survival = 1.0，即验证整个 block**，也就是启用该特性
@@ -421,7 +413,8 @@ bucket    = round_up_bucket( padded_bs + max_r slack_r )
 ```text
                      +- planner 未构建 -----------------> 全块（无 checkpoint）
                      |
-                     +- 成本表未 profile（flat）--------> 全块 + 启动时告警
+                     +- 成本表 flat（仅当只给了 sts 表时可达；两表
+                     |   皆缺在构造时即被拒）------------> 全块 + 告警
                      |     "每个 token 都免费" => 裁剪等于盲猜
                      |
 _dspark_confidence --+- 快照还没落地 -------------------> 全块
@@ -456,19 +449,17 @@ speculative_config:
   # 调度器消费的是累积乘积，所以逐位置误差会沿 block 几何级放大。
   confidence_sts_path: /path/to/sts.json
 
-  # profile 好的 step-cost 曲线。省略 => flat => planner 拒绝裁剪。
+  # profile 好的 step-cost 曲线。开启 ragged 时必填（除非提供 confidence_sts_path）：
+  # 两者皆缺在构造时即报错 —— flat 成本模型下 planner 永远拒绝裁剪，跑完也是空跑。
   confidence_sps_table_path: /path/to/sps.json
 
   # 被捕获的长度 ladder；调度器只能从这个集合里选。
   # 默认：[1, ceil(K/2), K]
   confidence_verify_len_tiers: [1, 3, 7]
 
-  # confidence relay 的总滞后（decode step 数）。
-  # executor loop 本身已经提供恰好 2 步，所以默认值不额外增加任何滞后。
-  confidence_relay_lag_steps: 2
-
-  # 逐请求 verify 窗口。需要 enable_confidence_scheduling。
-  enable_ragged_verify: false
+  # 逐请求 verify 窗口。必须与 enable_confidence_scheduling 同开 —— 两个 flag 描述同一个
+  # 特性，只开其中一个会在构造时被拒绝；关闭特性 = 两个都设 false。
+  enable_ragged_verify: true
 ```
 
 `sps.json`：
@@ -511,7 +502,7 @@ speculative_config:
 |------|------|
 | tier ladder 跨 batch size 有损 | shelf 右边缘随 `bs` 移动，一套 ladder 不可能同时坐在所有 batch size 的边缘上。残差要实测 |
 | 快照是 2 步之前的 | 纯吞吐启发式（I2 保证正确性与它无关），但在剧烈抖动的负载下决策质量会下降 |
-| ragged 模式未做端到端验证 | 需要带训练好的 confidence-head 权重的 checkpoint；默认关闭 |
+| ragged 模式的端到端数字仅在一个平台上取得 | DeepSeek-V4-Pro-DSpark，8×B300 DEP8，overlap + CUDA graph（GSM8K 96.44，基线 96.21）；仍默认关闭，跨硬件需重测 |
 | 逐 token 采样参数路径只有非全贪心 batch 才会触发 | `temperature=0` 的精度跑覆盖不到它 |
 
 ## 参考

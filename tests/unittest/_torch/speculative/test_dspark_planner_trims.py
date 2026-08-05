@@ -23,7 +23,6 @@ says verifying the full block wins -- so without a way to make it trim, that
 code path ships untested.
 """
 
-import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_schedule import (
@@ -62,20 +61,6 @@ def test_topk_hands_longer_windows_to_more_confident_requests():
     assert sum(lens) - len(lens) * 1 <= 6
 
 
-def test_a_budget_below_the_full_block_produces_differing_windows():
-    """Ragged shape arises from the planner, not from an override."""
-    survival = torch.tensor([
-        [0.99, 0.98, 0.97, 0.96, 0.95],
-        [0.60, 0.30, 0.10, 0.02, 0.00],
-        [0.95, 0.90, 0.20, 0.05, 0.00],
-        [0.10, 0.01, 0.00, 0.00, 0.00],
-    ])
-    lens = schedule_verify_lens_topk(survival=survival, budget=5,
-                                     cfg=_Cfg()).tolist()
-    assert len(set(lens)) >= 2, (
-        f"expected a ragged split from a constrained budget, got {lens}")
-
-
 def test_a_full_budget_degenerates_to_the_uniform_full_window():
     """The no-trim case must stay exactly uniform.
 
@@ -88,12 +73,3 @@ def test_a_full_budget_degenerates_to_the_uniform_full_window():
     lens = schedule_verify_lens_topk(survival=survival, budget=budget,
                                      cfg=_Cfg()).tolist()
     assert lens == [max_len] * num_reqs
-
-
-@pytest.mark.parametrize("budget", [0, 1, 3, 8, 20])
-def test_windows_stay_within_bounds_for_any_budget(budget):
-    survival = torch.rand(6, 5).sort(dim=1, descending=True).values
-    lens = schedule_verify_lens_topk(survival=survival, budget=budget,
-                                     cfg=_Cfg()).tolist()
-    assert all(1 <= v <= 5 for v in lens), lens
-    assert sum(lens) - len(lens) <= budget

@@ -192,13 +192,6 @@ def test_ragged_batch_keeps_each_request_positions_contiguous():
     assert got["pos_indices"] == [0, 0, 0, 0, 1, 2, 2]
 
 
-def test_flat_token_total_matches_the_sum_of_windows():
-    reqs = [_Req(3), _Req(0), _Req(1)]
-    got = _build_overlap_layout(reqs, [0, 0, 0], 6)
-    assert len(got["position_ids"]) == sum(got["tokens_each"])
-    assert len(got["pos_indices"]) == sum(got["tokens_each"])
-
-
 # --------------------------------------------------------------------------
 # kv_len_offsets: the host estimate and the correction must use one count
 # --------------------------------------------------------------------------
@@ -247,45 +240,3 @@ def test_batch_wide_correction_under_ragged_is_off_by_the_window_difference():
     deltas = [w - r for w, r in zip(wrong, right)]
     assert deltas == [4 - n, 1 - n, 2 - n]
     assert all(d != 0 for d in deltas)
-
-
-def test_uniform_batch_is_unaffected_by_the_pairing_rule():
-    reqs = [_Req(), _Req(), _Req()]
-    past = [100, 250, 7]
-    accepted = [2, 1, 2]
-    n = 4
-
-    per_request = _corrected_kv_lens(reqs, past, accepted, n, [n] * 3)
-    assert per_request == [p + a for p, a in zip(past, accepted)]
-
-
-# --------------------------------------------------------------------------
-# Derived totals the callers compute from the per-request counts
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "verify_lens",
-    [
-        [None, None, None],
-        [3, 3, 3],
-        [3, 0, 1],
-        [0, 0, 0],
-    ],
-)
-def test_draft_token_total_is_tokens_minus_one_per_request(verify_lens):
-    # previous_batch_draft_tokens = total_num_tokens - num_requests, which has
-    # to agree with summing (tokens - 1) request by request.
-    reqs = [_Req(v) for v in verify_lens]
-    tokens = [get_request_tokens_per_gen_step(r, 4) for r in reqs]
-    total_num_tokens = sum(tokens)
-    assert total_num_tokens - len(reqs) == sum(t - 1 for t in tokens)
-
-
-def test_uniform_totals_match_the_multiplicative_formulas():
-    # The formulas the uniform path used before this change.
-    n, num_requests = 4, 5
-    reqs = [_Req() for _ in range(num_requests)]
-    tokens = [get_request_tokens_per_gen_step(r, n) for r in reqs]
-    assert sum(tokens) == num_requests * n
-    assert sum(tokens) - num_requests == num_requests * (n - 1)

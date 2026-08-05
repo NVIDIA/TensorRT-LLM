@@ -254,6 +254,9 @@ class DSparkConfidenceHead(nn.Module):
             torch.ones(max(int(block_size), 1), dtype=torch.float32),
             persistent=False,
         )
+        # CPU mirror of ``sts_temperatures``; rebuilt lazily by
+        # ``_host_sts_temperatures`` and dropped by ``load_sts_temperatures``.
+        self._sts_temperatures_host: Optional[torch.Tensor] = None
 
     def forward(
         self, hidden_states: torch.Tensor, prev_embeddings: Optional[torch.Tensor] = None
@@ -295,7 +298,7 @@ class DSparkConfidenceHead(nn.Module):
 
     def _host_sts_temperatures(self) -> torch.Tensor:
         """CPU mirror of ``sts_temperatures``, materialized at most once."""
-        cached = getattr(self, "_sts_temperatures_host", None)
+        cached = self._sts_temperatures_host
         if cached is None:
             cached = self.sts_temperatures.detach().to("cpu")
             self._sts_temperatures_host = cached

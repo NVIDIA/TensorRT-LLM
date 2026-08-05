@@ -17,8 +17,6 @@ D1/D2/D3 三个方案对比、G1–G8 验收标准、§7 的 U1–U7 未知项�
 你的工作是**执行它的 P0 阶段**，不是重新做分析。任何与该文档冲突的结论，必须先用
 `file:line` 证明文档错了，再改。
 
-配套还有 `docs/dspark_ragged_verify_status.md`（388 行）。
-
 ### 拉取方式
 
 本地 checkout：`/lustre/fsw/coreai_comparch_trtllm/laliao/repos/trtllm-dsv4/TensorRT-LLM`
