@@ -783,6 +783,24 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // rejects anything else) so pipeline persistence is unaffected; the SlurmCluster
 // is rebuilt from clusterName at reconcile time. The functions below are thin
 // SLURM-specific adapters over that generic ledger.
+//
+// Shared-library contract used below (trtllm-jenkins-shared-lib), documented here
+// for equivalence with the pre-shared inlined finalizer this replaced:
+//   * ContextDeath.isContextDeath(e) -- true when the flattened cause + suppressed
+//     chain contains a dispatcher-pod-death signal: "pod failed (reason:", "pod
+//     just failed", "pod failed because container terminated", "unable to create
+//     live filepath". Same pattern set the inlined isDispatcherPodFailure matched,
+//     now also traversing suppressed exceptions' own cause chains.
+//   * register(id, type, fields, ownerBuildTag) -- merges non-null fields into the
+//     id's entry; stores serializable primitives only (rejects anything else); a
+//     `fields` map may not overwrite the reserved id/type/ownerBuildTag keys.
+//   * markReclaimed(id) -- drops the entry (idempotent).
+//   * get(id) -- a deep-copied snapshot of the entry, or null.
+//   * reconcile(pipeline, select, reclaim) -- for each live entry matching
+//     select(entry), runs reclaim(pipeline, entry): deregisters entries whose
+//     reclaim returns truthy; leaves live those returning falsy or throwing (a
+//     throw is logged, never propagated). This is the equivalence backbone --
+//     "reconcile off-pod, deregister on success, leave for the sweep on failure."
 
 // Register a live SLURM resource. The pod wrapper passes a podSpec (recorded
 // under "<stage>/dispatcher-pod"); the stage body passes the SLURM job / Jenkins
@@ -826,6 +844,12 @@ void deregisterSlurmResource(String stageName) {
 // never masks the stage's own failure. Used as the reclaim body for both the
 // in-catch finalize and the post-build sweep.
 def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
+    // The ledger is shared build-wide; only SLURM job/node entries are
+    // reconcilable here. Never touch (or deregister) another subsystem's entry a
+    // selector might pass in -- return false to leave it live and untouched.
+    if (entry.type != 'slurmJob' && entry.type != 'slurmNode') {
+        return false
+    }
     // Pod died before any job/node was provisioned: nothing to reconcile.
     if (!entry.jobUID && !entry.nodeName) {
         return true
@@ -875,8 +899,11 @@ def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverrid
 // failure mode the catch never saw). Runs off-pod from a fresh cleanup pod; inert
 // dispatcher-pod-only entries are skipped by the selector.
 def sweepOrphanedSlurmResources(pipeline) {
+    // Scope to this subsystem's SLURM job/node entries: the ledger is shared
+    // build-wide, so filter by type as well as a live job/node handle rather than
+    // passing any entry that merely happens to carry a jobUID/nodeName field.
     resourceLedger.reconcile(pipeline,
-        { it.jobUID || it.nodeName },
+        { (it.type == 'slurmJob' || it.type == 'slurmNode') && (it.jobUID || it.nodeName) },
         { p, entry -> reconcileSlurmResource(p, entry) })
 }
 
@@ -2211,10 +2238,12 @@ def cbtsResizeSplits(configs) {
 // agent otherwise going offline. Retrying inside such a pod is futile (every
 // step runs on the dead agent and fails immediately) and its in-pod cleanup can
 // no longer reach the SLURM controller, so callers stop retrying in place and
-// reconcile the orphaned SLURM job / Jenkins node off-pod. Matches the flattened
-// cause chain so the signal is still recognized when wrapped by the cleanup's
-// AbortException (e.g. "Error during clean up SLURM resources: ... marked
-// offline: Pod failed (Reason: Evicted ...)").
+// reconcile the orphaned SLURM job / Jenkins node off-pod. Delegates to the shared
+// ContextDeath.isContextDeath, which matches the same pattern set the inlined
+// version used (see the contract block above) across the flattened cause chain --
+// so the signal is still recognized when wrapped by the cleanup's AbortException
+// (e.g. "Error during clean up SLURM resources: ... marked offline: Pod failed
+// (Reason: Evicted ...)") -- and additionally traverses suppressed causes.
 boolean isDispatcherPodFailure(Throwable e) {
     return ContextDeath.isContextDeath(e)
 }
