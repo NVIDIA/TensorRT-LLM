@@ -388,6 +388,15 @@ def test_lifespan_startup_completes_without_an_engine():
         ("/v1/completions", "POST"),
         ("/metrics", "GET"),
         ("/definitely-not-a-route", "GET"),
+        # Disagg-orchestrator-only routes. These matter more than the rest:
+        # their callers parse the body without checking the status, so a
+        # half-initialized handler here is cached rather than retried --
+        # see Router._fetch_server_info, which now raise_for_status()es
+        # precisely because this endpoint answers during STARTING.
+        ("/server_info", "GET"),
+        ("/steady_clock_offset", "GET"),
+        ("/kv_cache_events", "POST"),
+        ("/perf_metrics", "GET"),
     ],
 )
 def test_every_route_is_503_while_starting(path, method):
