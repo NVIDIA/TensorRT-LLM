@@ -3,7 +3,9 @@ import torch
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from .cpp_custom_ops import _register_fake
+from .cpp_custom_ops import _register_fake as _register_cpp_fake
+from .fp8_block_scaling_dispatch_ops import \
+    register_fp8_block_scaling_dispatch_ops
 from .torch_custom_ops import BufferKind, bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
@@ -11,6 +13,11 @@ from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 # Attention custom ops are defined in modules.attention, and MLA custom ops are
 # defined in modules.mla. They are not re-exported here to avoid circular imports:
 # custom_ops must not depend on modules.attention or modules.mla.
+
+
+def _register_fake() -> None:
+    _register_cpp_fake()
+    register_fp8_block_scaling_dispatch_ops()
 
 
 def inplace_slice_copy(dest: torch.Tensor, src: torch.Tensor, dim1_start: int,

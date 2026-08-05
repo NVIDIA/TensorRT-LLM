@@ -65,6 +65,12 @@ def _trtllm_build_id() -> str:
     if configured:
         return configured
 
+    try:
+        return str(torch.ops.trtllm.fp8_block_scaling_gemm_runtime_build_id())
+    except (AttributeError, RuntimeError):
+        # Keep source-only tooling compatible with an older installed libth_common.
+        pass
+
     library_path = Path(__file__).parents[2] / "libs" / "libth_common.so"
     if not library_path.is_file():
         return "unknown"

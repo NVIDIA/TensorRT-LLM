@@ -4,6 +4,7 @@
 from pathlib import Path
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.custom_ops.fast_custom_op import FastCustomOp
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch import (
@@ -60,10 +61,26 @@ def _cache(*entries: DispatchEntry, identity: CacheIdentity | None = None) -> Di
 
 
 def test_fp8_dispatcher_does_not_pay_torch_custom_op_wrapper_tax() -> None:
-    assert isinstance(fp8_block_scaling_gemm, FastCustomOp), (
-        "FP8 dispatch must use the low-overhead custom-op registration path"
+    assert not isinstance(fp8_block_scaling_gemm, FastCustomOp), (
+        "FP8 dispatch must be implemented by the native libth_common CUDA op"
     )
     assert torch.Tag.pt2_compliant_tag in (torch.ops.trtllm.fp8_block_scaling_gemm.default.tags)
+    assert torch._C._dispatch_has_kernel_for_dispatch_key(
+        "trtllm::fp8_block_scaling_gemm", "Autograd"
+    ), "The non-differentiable op must reject backward without a Python autograd wrapper"
+
+
+def test_fp8_dispatcher_fake_tensor_contract() -> None:
+    with FakeTensorMode():
+        a = torch.empty((17, 256), device="cuda", dtype=torch.float8_e4m3fn)
+        b = torch.empty((31, 256), device="cuda", dtype=torch.float8_e4m3fn)
+        a_scale = torch.empty((17, 2), device="cuda", dtype=torch.float32)
+        b_scale = torch.empty((1, 2), device="cuda", dtype=torch.float32)
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(a, b, a_scale, b_scale)
+
+    assert output.shape == (17, 31)
+    assert output.dtype is torch.bfloat16
+    assert output.device.type == "cuda"
 
 
 def test_small_m_guard_precedes_deep_gemm_cache_hit() -> None:

@@ -18,7 +18,7 @@ import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
-from typing import ClassVar, List, Mapping, NoReturn, Optional, Tuple, Union
+from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
@@ -39,11 +39,6 @@ from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
-from .fp8_block_scaling_dispatch import DispatchBackend
-from .fp8_block_scaling_dispatch_runtime import (
-    get_dispatch_backend,
-    legacy_backend_override_enabled,
-)
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
@@ -1958,51 +1953,7 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-@fast_custom_op(
-    "trtllm::fp8_block_scaling_gemm",
-    mutates_args=(),
-    tags=(torch.Tag.pt2_compliant_tag,),
-)
-def fp8_block_scaling_gemm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    tune_max_num_tokens: int = 4096,
-) -> torch.Tensor:
-    if legacy_backend_override_enabled():
-        return torch.ops.trtllm.fp8_block_scaling_gemm_impl(
-            a, b, a_scale, b_scale)
-    del tune_max_num_tokens
-    backend = get_dispatch_backend(a, b, a_scale, b_scale)
-    if backend is DispatchBackend.TRTLLM:
-        return torch.ops.trtllm.fp8_block_scaling_gemm_trtllm(
-            a, b, a_scale, b_scale)
-    return torch.ops.trtllm.fp8_block_scaling_gemm_deep_gemm(
-        a, b, a_scale, b_scale)
-
-
-@fp8_block_scaling_gemm.register_fake
-def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
-    m = a.shape[0]
-    n = b.shape[0]
-    return a.new_empty((m, n), dtype=torch.bfloat16)
-
-
-def _fp8_block_scaling_gemm_backward(
-    _context: object,
-    _grad_output: torch.Tensor,
-) -> NoReturn:
-    raise RuntimeError(
-        "Trying to backward through trtllm.fp8_block_scaling_gemm.default "
-        "but no autograd formula was registered. Please use register_autograd to add one."
-    )
-
-
-torch.library.register_autograd(
-    "trtllm::fp8_block_scaling_gemm",
-    _fp8_block_scaling_gemm_backward,
-)
+fp8_block_scaling_gemm = torch.ops.trtllm.fp8_block_scaling_gemm
 
 
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())

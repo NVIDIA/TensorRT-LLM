@@ -69,6 +69,7 @@ add_library(
   fp4BatchedQuantize.cpp
   fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
+  fp8BlockScalingGemmDispatch.cpp
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
@@ -154,12 +155,10 @@ if(BUILD_DEEP_GEMM)
   else()
     set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
   endif()
-  get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR}
-                         ABSOLUTE)
+  get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR} ABSOLUTE)
 
-  target_compile_definitions(th_common
-                             PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC
-                                     TRTLLM_ENABLE_DEEP_GEMM_THOP)
+  target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC
+                                               TRTLLM_ENABLE_DEEP_GEMM_THOP)
   target_include_directories(
     th_common
     PRIVATE ${DEEP_GEMM_SOURCE_DIR}/csrc

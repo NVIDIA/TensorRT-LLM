@@ -18,9 +18,11 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
 
+#include "tensorrt_llm/thop/fp8BlockScalingGemmDispatch.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
+#include <torch/csrc/autograd/autograd_not_implemented_fallback.h>
 
 #include <algorithm>
 #include <cctype>
@@ -35,8 +37,8 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "jit/compiler.hpp"
-#include "jit/kernel_runtime.hpp"
 #include "jit/include_parser.hpp"
+#include "jit/kernel_runtime.hpp"
 
 #include <dlfcn.h>
 #endif
@@ -95,6 +97,24 @@ Fp8BlockScalingGemmBackend get_fp8_block_scaling_gemm_backend()
     TORCH_CHECK(false, "Unsupported ", kFp8BlockScalingGemmBackendEnv, "=", backend,
         ". Expected 'trtllm', 'direct_deep_gemm', or 'auto'.");
     return Fp8BlockScalingGemmBackend::Trtllm;
+}
+
+bool legacy_backend_override_enabled()
+{
+    char const* env = std::getenv(kFp8BlockScalingGemmBackendEnv);
+    if (env == nullptr)
+    {
+        return false;
+    }
+    auto backend = normalize_backend_name(env);
+    auto const first = backend.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return false;
+    }
+    auto const last = backend.find_last_not_of(" \t\r\n");
+    backend = backend.substr(first, last - first + 1);
+    return backend != "auto";
 }
 
 void check_input_dtypes(torch::Tensor const& mat, torch::Tensor const& matScale)
@@ -536,8 +556,8 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     }
 }
 
-// Internal forced-backend entry points used by the shape-gated dispatcher in the Python
-// runner. They select the backend deterministically per call, bypassing the
+// Internal forced-backend entry points used by the shape-gated dispatcher. They select
+// the backend deterministically per call, bypassing the
 // TRTLLM_FP8_BLOCK_SCALING_GEMM_BACKEND environment variable. Per-call selection is safe
 // under concurrency and CUDA graph capture/replay, unlike the process-global env var. The
 // public env-var-driven op (fp8_block_scaling_gemm_impl) is intentionally left unchanged.
@@ -566,8 +586,8 @@ torch::Tensor fp8_block_scaling_gemm_deep_gemm(torch::Tensor const& mat1, torch:
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 90,
-        "Direct DeepGEMM FP8 block scaling backend is currently wired only for SM90/Hopper (got SM ", sm, ").");
+    TORCH_CHECK(sm == 90, "Direct DeepGEMM FP8 block scaling backend is currently wired only for SM90/Hopper (got SM ",
+        sm, ").");
 #if defined(TRTLLM_ENABLE_DEEP_GEMM_THOP)
     return fp8_block_scaling_gemm_hopper_deep_gemm(mat1, mat2, mat1Scale, mat2Scale);
 #else
@@ -585,6 +605,23 @@ bool fp8_block_scaling_gemm_deep_gemm_available(torch::Tensor const& reference)
 #else
     return false;
 #endif
+}
+
+torch::Tensor fp8_block_scaling_gemm_dispatch(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t tuneMaxNumTokens)
+{
+    static_cast<void>(tuneMaxNumTokens);
+    if (legacy_backend_override_enabled())
+    {
+        return fp8_block_scaling_gemm(mat1, mat2, mat1Scale, mat2Scale);
+    }
+#if defined(TRTLLM_ENABLE_DEEP_GEMM_THOP)
+    if (shouldUseDeepGemm(mat1, mat2, mat1Scale, mat2Scale))
+    {
+        return fp8_block_scaling_gemm_hopper_deep_gemm(mat1, mat2, mat1Scale, mat2Scale);
+    }
+#endif
+    return fp8_block_scaling_gemm_trtllm(mat1, mat2, mat1Scale, mat2Scale);
 }
 
 torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
@@ -792,11 +829,17 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def(
+        "fp8_block_scaling_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, int "
+        "tune_max_num_tokens=4096) -> Tensor",
+        {at::Tag::pt2_compliant_tag});
     m.def("fp8_block_scaling_gemm_impl(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
     // Internal forced-backend ops for the shape-gated dispatcher (deterministic, env-var-free).
     m.def("fp8_block_scaling_gemm_trtllm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
     m.def("fp8_block_scaling_gemm_deep_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
     m.def("fp8_block_scaling_gemm_deep_gemm_available(Tensor reference) -> bool");
+    m.def("fp8_block_scaling_gemm_configure_dispatch(str deep_gemm_version) -> ()");
+    m.def("fp8_block_scaling_gemm_runtime_build_id() -> str");
     m.def(
         "fp8_block_scaling_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, ScalarType? "
         "out_dtype=None) -> Tensor");
@@ -810,6 +853,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("fp8_block_scaling_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_dispatch);
     m.impl("fp8_block_scaling_gemm_impl", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm);
     m.impl("fp8_block_scaling_gemm_trtllm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_trtllm);
     m.impl("fp8_block_scaling_gemm_deep_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_deep_gemm);
@@ -818,4 +862,15 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_block_scaling_bmm", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm);
     m.impl("fp8_block_scaling_bmm_out", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm_out);
     m.impl("fp8_block_scaling_moe_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_moe_gemm);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, Autograd, m)
+{
+    m.impl("fp8_block_scaling_gemm", torch::autograd::autogradNotImplementedFallback());
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("fp8_block_scaling_gemm_configure_dispatch", &tensorrt_llm::torch_ext::configureFp8BlockScalingGemmDispatch);
+    m.impl("fp8_block_scaling_gemm_runtime_build_id", &tensorrt_llm::torch_ext::fp8BlockScalingGemmRuntimeBuildId);
 }

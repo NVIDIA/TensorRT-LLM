@@ -176,7 +176,10 @@ def test_public_op_preserves_no_autograd_error() -> None:
     output = torch.ops.trtllm.fp8_block_scaling_gemm(a, b, a_scale, b_scale)
 
     # Then
-    with pytest.raises(RuntimeError, match="no autograd formula was registered"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"derivative for trtllm::fp8_block_scaling_gemm is not implemented",
+    ):
         output.sum().backward()
 
 
