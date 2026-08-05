@@ -980,15 +980,25 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASSWORD'
                     )]) {
-                        def credCmd = [
-                            "set +x",
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials_slurm")
+                        // Create + chmod before writing so the secret never exists world-readable.
+                        Utils.exec(pipeline, script: "install -m 600 /dev/null ${credsLocal}")
+                        pipeline.writeFile(
+                            file: credsLocal,
+                            text: "machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\n"
+                        )
+                        def setupCmd = [
                             "mkdir -p '${enrootConfigDir}'",
-                            "install -m 600 /dev/null '${enrootConfigDir}/.credentials'",
-                            "printf 'machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\\n' > '${enrootConfigDir}/.credentials'",
                             // Point the agent setup script at this job-private config; clean up on exit.
                             "sed -i '2i export ENROOT_CONFIG_PATH=${enrootConfigDir}\\ntrap \"rm -rf ${enrootConfigDir}\" EXIT' '${remoteScript}'",
                         ].join(" ; ")
-                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(credCmd)))
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(setupCmd)))
+                        Utils.copyFileToRemoteHost(
+                            pipeline,
+                            remote,
+                            credsLocal,
+                            "${enrootConfigDir}/.credentials"
+                        )
                     }
                 }
 
@@ -1693,10 +1703,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials")
                         // Create + chmod before writing so the secret never exists world-readable.
                         Utils.exec(pipeline, script: "install -m 600 /dev/null ${credsLocal}")
-                        Utils.exec(pipeline, script: """
-                            set +x
-                            printf 'machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\\n' > ${credsLocal}
-                        """)
+                        pipeline.writeFile(
+                            file: credsLocal,
+                            text: "machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\n"
+                        )
                         Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${enrootConfigDirNode}\""), numRetries: 3)
                         Utils.copyFileToRemoteHost(
                             pipeline,
