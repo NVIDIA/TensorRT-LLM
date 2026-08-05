@@ -803,7 +803,7 @@ class DecoderModelForCausalLM(nn.Module,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
                      skip_modules: list[str] = [],
                      params_map: dict[str, str] | None = None,
-                     allow_partial_loading: bool = False):
+                     allow_partial_loading: bool = False) -> None:
         """Load checkpoint weights into this model.
 
         Basic function for an LLM class to load weights from a dict of weight

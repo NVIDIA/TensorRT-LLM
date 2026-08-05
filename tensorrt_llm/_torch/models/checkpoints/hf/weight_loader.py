@@ -316,7 +316,7 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _load_safetensors_file(file) -> dict[str, torch.Tensor]:
+    def _load_safetensors_file(file: str) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
