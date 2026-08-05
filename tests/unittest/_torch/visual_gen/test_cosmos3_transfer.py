@@ -46,6 +46,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import TransformerOutput
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer
+from tensorrt_llm.media.decoding import VideoStreamInfo
+from tensorrt_llm.visual_gen.params import VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
 
@@ -67,10 +69,31 @@ def _fake_decode_window(num_frames: int):
     return _decode
 
 
+def _stub_info(height, width, frame_rate=None):
+    """Stand in for the container-header probe."""
+    return lambda _data: VideoStreamInfo(height, width, frame_rate)
+
+
 def _req(**overrides):
-    values = {"num_frames": None, "guidance_scale": None, "frame_rate": None}
-    values.update(overrides)
-    return SimpleNamespace(**values)
+    """Params as a caller supplied them: what is passed is marked caller intent.
+
+    A real ``VisualGenParams``, not a stand-in, because telling a caller's value
+    from an executor-merged default is exactly what ``model_fields_set``
+    carries — and a ``SimpleNamespace`` cannot express the difference.
+    """
+    return VisualGenParams(**overrides)
+
+
+def _merged_req(**merged):
+    """Params as the executor hands them to ``infer()``.
+
+    The values are present but marked as pipeline defaults rather than caller
+    intent, mirroring ``DiffusionExecutor._merge_defaults``.
+    """
+    params = VisualGenParams(**merged)
+    for field_name in merged:
+        params.model_fields_set.discard(field_name)
+    return params
 
 
 class StubScheduler:
@@ -227,7 +250,7 @@ class TestTransferConfig:
         are advertised defaults the executor merges into every request before
         `infer()` sees it. A request carrying only those merged values must
         still get the preset; values the caller actually chose must win."""
-        merged = _req(
+        merged = _merged_req(
             num_frames=COSMOS3_PIPELINE_DEFAULTS["num_frames"],
             frame_rate=COSMOS3_PIPELINE_DEFAULTS["frame_rate"],
         )
@@ -298,8 +321,8 @@ class TestTransferMediaHelpers:
                 )
 
 
-class TestOutputAspectFit:
-    """An unset output size follows the reference's aspect, worker-side.
+class TestSourceDerivedDefaults:
+    """Unset output size and frame rate follow the reference, worker-side.
 
     Previously only the offline example fitted the aspect, so a served portrait
     or square reference was center-cropped into the default landscape bucket.
@@ -308,27 +331,31 @@ class TestOutputAspectFit:
 
     REFERENCE = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
-    def _infer_req(self, **extra):
-        params = SimpleNamespace(
-            height=None,
-            width=None,
-            num_inference_steps=None,
-            guidance_scale=None,
-            num_frames=COSMOS3_720P_PARAMS["num_frames"],
-            max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
-            frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
-            seed=0,
-            negative_prompt=None,
-            image=None,
-            extra_params=dict(extra),
+    def _infer_req(self, _params=None, **extra):
+        # Executor-merged shape: num_frames/frame_rate carry pipeline defaults,
+        # height/width are declared None, and nothing reads as caller intent.
+        params = (
+            _params
+            if _params is not None
+            else _merged_req(
+                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
+                seed=0,
+            )
         )
+        params.extra_params = dict(extra)
         return SimpleNamespace(params=params, prompt="a prompt")
 
-    def _size(self, req):
+    def _captured(self, req):
         pipeline = _make_pipeline()  # rank is 0 while dist is uninitialized
         captured = {}
         pipeline.forward = lambda **kwargs: captured.update(kwargs)
         pipeline.infer(req)
+        return captured
+
+    def _size(self, req):
+        captured = self._captured(req)
         return captured["width"], captured["height"]
 
     def test_square_reference_picks_the_square_bucket(self):
@@ -348,20 +375,20 @@ class TestOutputAspectFit:
         ],
     )
     def test_aspect_selects_the_matching_bucket(self, source_hw, bucket, monkeypatch):
-        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: source_hw)
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(*source_hw))
         req = self._infer_req(video=b"stand-in for encoded bytes")
         assert self._size(req) == VIDEO_RES_SIZE_INFO["720"][bucket]
 
     def test_explicit_dimensions_win(self, monkeypatch):
-        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: (320, 192))
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(320, 192))
         req = self._infer_req(video=b"stand-in")
-        req.params.height, req.params.width = 704, 1280
+        req.params.height, req.params.width = 704, 1280  # assignment marks them
         assert self._size(req) == (1280, 704)
 
     def test_a_half_specified_size_is_left_alone(self, monkeypatch):
         # Overriding the unset half of a stated intent would be worse than
         # leaving the request on the mode defaults.
-        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: (320, 192))
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(320, 192))
         req = self._infer_req(video=b"stand-in")
         req.params.width = 1280
         assert self._size(req) == (1280, COSMOS3_720P_PARAMS["height"])
@@ -378,9 +405,36 @@ class TestOutputAspectFit:
 
     def test_transfer_fits_to_a_control_when_there_is_no_video(self, monkeypatch):
         # Transfer can run on precomputed controls alone.
-        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: (320, 192))
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(320, 192))
         req = self._infer_req(edge={"control": b"stand-in"})
         assert self._size(req) == VIDEO_RES_SIZE_INFO["720"]["9,16"]
+
+    # --- frame rate -------------------------------------------------------
+
+    def test_source_frame_rate_is_adopted_when_unset(self, monkeypatch):
+        # Emitting an 8 fps source at the merged 24 fps default replays it at
+        # 3x speed and misreports its duration to the text conditioning.
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(192, 320, 8.0))
+        req = self._infer_req(video=b"stand-in")
+        assert self._captured(req)["frame_rate"] == 8.0
+
+    def test_explicit_frame_rate_wins(self, monkeypatch):
+        # The whole point of the caller-intent bit: an explicit 24.0 is the
+        # same *value* the executor would have merged, but not the same intent.
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(192, 320, 8.0))
+        for chosen in (24.0, 30.0):
+            req = self._infer_req(_params=_req(seed=0, frame_rate=chosen), video=b"stand-in")
+            assert self._captured(req)["frame_rate"] == chosen
+
+    def test_default_stands_without_a_usable_source_rate(self, monkeypatch):
+        monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(192, 320, None))
+        req = self._infer_req(video=b"stand-in")
+        assert self._captured(req)["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+
+    def test_default_stands_without_a_reference(self):
+        assert (
+            self._captured(self._infer_req())["frame_rate"] == (COSMOS3_720P_PARAMS["frame_rate"])
+        )
 
 
 class TestTransferPreflightValidation:

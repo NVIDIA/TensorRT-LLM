@@ -25,6 +25,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
+from tensorrt_llm.visual_gen.params import VisualGenParams
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
@@ -93,20 +94,22 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
 
 
 def _fake_request(output_type: str = "video", **param_overrides) -> SimpleNamespace:
-    """A DiffusionRequest look-alike with executor-merged (None = unset) params."""
-    params = SimpleNamespace(
-        height=None,
-        width=None,
-        num_inference_steps=None,
-        guidance_scale=None,
-        num_frames=COSMOS3_720P_PARAMS["num_frames"],
-        max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
-        frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
-        seed=0,
-        negative_prompt=None,
-        image=None,
-        extra_params={"output_type": output_type},
-    )
+    """A DiffusionRequest look-alike carrying executor-merged params.
+
+    A real ``VisualGenParams``, because ``infer()`` tells a caller-supplied
+    value from a merged pipeline default via ``model_fields_set``, and only the
+    real type carries that bit. The merged fields are left un-marked exactly as
+    ``DiffusionExecutor._merge_defaults`` leaves them; ``param_overrides`` are
+    assigned, which marks them as caller intent.
+    """
+    merged = {
+        "num_frames": COSMOS3_720P_PARAMS["num_frames"],
+        "max_sequence_length": COSMOS3_720P_PARAMS["max_sequence_length"],
+        "frame_rate": COSMOS3_720P_PARAMS["frame_rate"],
+    }
+    params = VisualGenParams(seed=0, extra_params={"output_type": output_type}, **merged)
+    for field_name in merged:
+        params.model_fields_set.discard(field_name)
     for key, value in param_overrides.items():
         setattr(params, key, value)
     return SimpleNamespace(prompt="x", params=params)

@@ -45,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.decoding import decode_video_reference_window, video_frame_size
+from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
 from .defaults import (
     COSMOS3_720P_PARAMS,
@@ -342,13 +342,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
         height, width = req.params.height, req.params.width
-        if height is None and width is None:
-            # Size the output to the reference's aspect when the request asks
-            # for nothing, so a portrait or square source is not center-cropped
-            # into the default landscape bucket. Only when *neither* dimension
-            # is given: a request naming one is stating an intent, and
-            # overriding half of it would be worse than leaving it alone.
-            # Reading the container header costs no GPU and decodes no frame.
+        frame_rate = req.params.frame_rate
+        # Anything the executor merged is a pipeline default, not caller
+        # intent; `model_fields_set` is the only way to tell the two apart,
+        # since a merged value is indistinguishable from the same value asked
+        # for explicitly.
+        specified = req.params.model_fields_set
+        wants_source_size = "height" not in specified and "width" not in specified
+        wants_source_fps = "frame_rate" not in specified
+        if wants_source_size or wants_source_fps:
             source = video
             if source is None and transfer_config is not None:
                 # Transfer can run on precomputed controls alone; then the
@@ -357,12 +359,24 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     (hint.control for hint in transfer_config.ordered_hints if hint.control),
                     None,
                 )
-            source_size = video_frame_size(source) if source is not None else None
-            if source_size is not None:
-                width, height = find_closest_target_size(*source_size, 720)
+            # One header read serves both: no GPU, no frame decoded.
+            info = video_stream_info(source) if source is not None else None
+            if info is not None:
+                if wants_source_size:
+                    # Follow the reference's aspect, so a portrait or square
+                    # source is not center-cropped into the default landscape
+                    # bucket. Skipped when either dimension was named: that
+                    # states an intent, and overriding half of it would be
+                    # worse than leaving it alone.
+                    width, height = find_closest_target_size(info.height, info.width, 720)
+                if wants_source_fps and info.frame_rate is not None:
+                    # Emitting an 8 fps source at the 24 fps default would play
+                    # it back at 3x speed and misreport its duration to the
+                    # text conditioning.
+                    frame_rate = info.frame_rate
                 if self.rank == 0:
                     logger.info(
-                        f"Cosmos3 fitting output to the source aspect: {width}x{height} (WxH)"
+                        f"Cosmos3 following the source: {width}x{height} (WxH) @ {frame_rate} fps"
                     )
         height = resolved(height, "height")
         width = resolved(width, "width")
@@ -380,7 +394,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
-            frame_rate=req.params.frame_rate,
+            frame_rate=frame_rate,
             use_duration_template=extra_params.get(
                 "use_duration_template",
                 COSMOS3_EXTRA_SPECS["use_duration_template"].default,

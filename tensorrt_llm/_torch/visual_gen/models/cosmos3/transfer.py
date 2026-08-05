@@ -22,7 +22,7 @@ from tensorrt_llm._torch.visual_gen.triton_kernels import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.media.decoding import decode_video_reference_window
 
-from .defaults import COSMOS3_720P_PARAMS, VIDEO_RES_SIZE_INFO
+from .defaults import VIDEO_RES_SIZE_INFO
 
 
 def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
@@ -308,36 +308,26 @@ def resolve_transfer_config(
 
     if len(hints) == 1:
         hint_key = next(iter(hints))
+        # `frame_rate` and `num_frames` arrive materialized to the mode default
+        # (the serve layer needs concrete values to turn `seconds` into a frame
+        # count), so "is not None" cannot tell a caller's value from a merged
+        # one. `model_fields_set` can: the executor un-marks what it fills.
+        specified = getattr(req_params, "model_fields_set", frozenset())
         for field_name, default_value in TRANSFER_DEFAULTS[hint_key].items():
             if field_name == "guidance_scale":
                 user_set = config.guidance_scale is not None
             elif field_name == "flow_shift":
                 user_set = extra_params.get("flow_shift", None) is not None
             elif field_name == "fps":
-                # frame_rate arrives materialized to the mode default (the serve
-                # layer needs a concrete value to turn `seconds` into a frame
-                # count), so "is not None" cannot tell a request apart from a
-                # default here — only a value that differs from the table can.
-                request_fps = getattr(req_params, "frame_rate", None)
                 user_set = (
                     extra_params.get("fps", None) is not None
                     or extra_params.get("frame_rate", None) is not None
                     or extra_params.get("resolved_frame_rate", None) is not None
-                    or (
-                        request_fps is not None
-                        and float(request_fps) != float(COSMOS3_720P_PARAMS["frame_rate"])
-                    )
+                    or "frame_rate" in specified
                 )
             elif field_name == "num_frames":
-                # Same story as fps: `num_frames` is an advertised default that
-                # the executor merges into every request, so only a value that
-                # differs from the table can have come from the caller. The
-                # cost is that asking for exactly 189 frames alongside a wsm
-                # hint still yields wsm's 101.
-                request_frames = getattr(req_params, "num_frames", None)
                 user_set = extra_params.get("num_frames", None) is not None or (
-                    request_frames is not None
-                    and int(request_frames) != int(COSMOS3_720P_PARAMS["num_frames"])
+                    "num_frames" in specified
                 )
             else:
                 user_set = extra_params.get(field_name, None) is not None
