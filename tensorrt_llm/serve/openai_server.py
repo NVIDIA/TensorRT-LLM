@@ -459,6 +459,21 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
+            # Deliberately inline on the event loop, despite being slow and
+            # synchronous.
+            #
+            # Blocking the loop means no asyncio timer can fire while this
+            # runs, so the teardown is never abandoned half-done: it either
+            # completes or was never entered, and callers can tell which.
+            # On a worker thread it would instead keep running after its
+            # caller gave up, uncancellable, while that caller concludes the
+            # engine still needs tearing down -- and BaseLLM.shutdown() takes
+            # no lock, so the two would drive ZeroMqQueue.close() from
+            # different threads, which is not ZMQ-safe.
+            #
+            # The cost is real: /health and every open connection stall for
+            # the duration of the shutdown. That is accepted here because the
+            # process is on its way out either way.
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -2533,14 +2548,55 @@ class OpenAIServer(_VideoRoutesMixin):
         return self._create_not_supported_error(
             "Image editing is not supported by any in-tree pipeline yet.")
 
+    def record_address(self, host, port) -> None:
+        """Record the address this server is reachable at.
+
+        Must be called before the app's lifespan runs: metadata-server
+        registration and the disagg cluster worker both read it. ``__call__``
+        does so implicitly; the lifecycle path (``serve_with_lifecycle``)
+        calls it explicitly because there the app is built after uvicorn is
+        already listening.
+        """
+        self.binding_addr = f"http://{host}:{port}"
+        self.host = host
+        self.port = port
+
+    def shutdown_generator(self) -> None:
+        """Tear the engine down outside the app's lifespan.
+
+        The engine is built before the app's lifespan runs, so if startup
+        fails between those two points the lifespan's own teardown never
+        executes and the engine's worker processes would outlive the
+        frontend. Safe to call when the lifespan did run: the underlying
+        shutdown is idempotent.
+
+        Blocking and synchronous; callers on an event loop must run it off
+        the loop (see ``serve_with_lifecycle``'s ``on_startup_failure``).
+        """
+        self.generator.shutdown()
+
+    async def register_with_disagg_cluster(self) -> bool:
+        """Register with the disagg cluster once the socket is serving.
+
+        Returns False if registration failed, in which case the caller is
+        expected to shut the server down rather than leave an unregistered
+        worker running.
+        """
+        if self.disagg_cluster_worker is None:
+            return True
+        try:
+            await self.disagg_cluster_worker.register_worker()
+        except Exception as e:
+            logger.error(f"Worker registration failed: {e}")
+            return False
+        return True
+
     async def __call__(self,
                        host,
                        port,
                        sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
-        self.binding_addr = f"http://{host}:{port}"
-        self.host = host
-        self.port = port
+        self.record_address(host, port)
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
@@ -2551,12 +2607,8 @@ class OpenAIServer(_VideoRoutesMixin):
         async def _register_after_serving():
             while not server.started:
                 await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    await self.disagg_cluster_worker.register_worker()
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
+            if not await self.register_with_disagg_cluster():
+                server.should_exit = True
 
         asyncio.create_task(_register_after_serving())
         await server.serve(sockets=sockets)

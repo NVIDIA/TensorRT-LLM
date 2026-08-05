@@ -206,8 +206,18 @@ def test_completion(client: openai.OpenAI,
     elif is_gen_node():
         # keep gen workers alive until the test ends, again we hope the NODE_LIST is ordered by NODE_RANK
         url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
-        wait_for_endpoint_ready(url)
-        wait_for_endpoint_down(url)
+        # Rank 0 terminates the disagg server ~10s after its assertions pass,
+        # so this rank can legitimately arrive once the endpoint is already
+        # gone. wait_for_endpoint_ready now raises on timeout instead of
+        # returning silently, so treat that as "the run is already over"
+        # rather than a failure of this rank.
+        try:
+            wait_for_endpoint_ready(url)
+        except RuntimeError as err:
+            print(f"rank {RANK}: disagg endpoint never became ready ({err}); "
+                  "assuming the owning rank already finished")
+        else:
+            wait_for_endpoint_down(url)
         assert True
     else:
         assert True

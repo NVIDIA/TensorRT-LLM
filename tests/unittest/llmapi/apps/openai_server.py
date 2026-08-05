@@ -18,6 +18,10 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
     MAX_SERVER_START_WAIT_S = 7200  # wait for server to start for 7200 seconds (~ 2 hours) for LLM models weight loading
+    HEALTH_POLL_INTERVAL_S = 0.5
+    # Bounded so a server that accepts the connection but never answers is
+    # caught by the startup deadline instead of blocking the poll forever.
+    HEALTH_REQUEST_TIMEOUT_S = 10
 
     def __init__(self,
                  model: str,
@@ -103,28 +107,52 @@ class RemoteOpenAIServer:
 
     def _wait_for_server(self, *, url: str, timeout: float):
         # run health check on the first rank only.
+        if self.rank != 0:
+            time.sleep(timeout)
+            return
+
         start = time.time()
         while True:
+            err = None
             try:
-                if self.rank == 0:
-                    if requests.get(url).status_code == 200:
-                        break
-                    else:
-                        time.sleep(0.5)
-                else:
-                    time.sleep(timeout)
-                    break
-            except Exception as err:
-                result = self.proc.poll()
-                if result is not None and result != 0:
-                    raise RuntimeError("Server exited unexpectedly.") from err
+                response = requests.get(url,
+                                        timeout=self.HEALTH_REQUEST_TIMEOUT_S)
+                if response.status_code == 200:
+                    return
+                # trtllm-serve answers 503 while the engine is initializing
+                # (see the startup lifecycle contract); surface the state it
+                # reports so a timeout says *why* it never became ready.
+                state = response.headers.get("x-trtllm-server-state")
+                status = f"HTTP {response.status_code}"
+                if state:
+                    status += f" (server state: {state})"
+            except requests.RequestException as e:
+                err = e
+                status = f"{type(e).__name__}: {e}"
 
-                time.sleep(0.5)
-                if time.time() - start > timeout:
-                    # Terminate the server to avoid the process keeping running in background after timeout
-                    self.terminate()
-                    raise RuntimeError(
-                        "Server failed to start in time.") from err
+            # Both outcomes -- connection refused and "listening but not ready"
+            # -- must be subject to the same liveness and deadline checks.
+            # Keeping them on the exception path only would loop forever
+            # against a server that answers 503 indefinitely, which is exactly
+            # what a hung engine initialization now looks like.
+            result = self.proc.poll() if self.proc is not None else None
+            if result is not None:
+                # Any exit is a failure here, code 0 included: the server was
+                # asked to serve and has not answered /health with a 200 yet.
+                # Excusing a clean exit would leave this loop polling a
+                # refused port until the (hours-long) deadline elapsed.
+                raise RuntimeError(
+                    f"Server exited unexpectedly with code {result}. "
+                    f"Last health check: {status}") from err
+
+            if time.time() - start > timeout:
+                # Terminate the server to avoid the process keeping running in background after timeout
+                self.terminate()
+                raise RuntimeError(
+                    f"Server failed to start within {timeout:.0f}s. "
+                    f"Last health check: {status}") from err
+
+            time.sleep(self.HEALTH_POLL_INTERVAL_S)
 
     @property
     def url_root(self) -> str:
@@ -219,7 +247,10 @@ class RemoteMMEncoderServer(RemoteOpenAIServer):
 
         self.host = "localhost"
         self.port = port if port is not None else get_free_port()
-        self.rank = os.environ.get("SLURM_PROCID", 0)
+        # int(): a string rank never compares equal to 0, which would make
+        # _wait_for_server take the non-rank-0 path and sleep out the whole
+        # startup timeout.
+        self.rank = int(os.environ.get("SLURM_PROCID", 0))
         self.log_path = log_path
         self.log_file = None
 

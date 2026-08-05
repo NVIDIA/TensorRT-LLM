@@ -54,6 +54,7 @@ l0_a10:
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lm_eval.py
   - unittest/others/test_lora_manager.py
+  - unittest/others/test_serve_lifecycle.py
   - unittest/others/test_lora_module_count.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py

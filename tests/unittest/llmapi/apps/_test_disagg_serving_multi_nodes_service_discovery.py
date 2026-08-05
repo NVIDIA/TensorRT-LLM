@@ -197,7 +197,21 @@ def test_completion(
     model_name: str,
 ):
     disagg_health_url = f"http://{disagg_host}:{DISAGG_SERVER_PORT}/health/"
-    wait_for_endpoint_ready(disagg_health_url)
+    # The pytest node owns the disagg server and terminates it as soon as its
+    # assertions pass, so a follower rank can legitimately arrive once the
+    # endpoint is already gone. wait_for_endpoint_ready now raises on timeout
+    # instead of returning silently, so only the owning rank treats "never
+    # became ready" as a failure.
+    if is_pytest_node():
+        wait_for_endpoint_ready(disagg_health_url)
+    else:
+        try:
+            wait_for_endpoint_ready(disagg_health_url)
+        except RuntimeError as err:
+            print(
+                f"rank {RANK}: disagg endpoint never became ready ({err}); "
+                "assuming the owning rank already finished"
+            )
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "
