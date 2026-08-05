@@ -7,7 +7,8 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, cast
+from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
+                    cast)
 
 import torch
 import transformers
@@ -15,7 +16,8 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalParams)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -24,44 +26,30 @@ from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
-from ..executor import (
-    DetokenizedGenerationResultBase,
-    GenerationExecutor,
-    GenerationResult,
-    IterationResult,
-    LoRARequest,
-    PostprocWorkerConfig,
-    PromptAdapterRequest,
-)
+from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
+                        GenerationResult, IterationResult, LoRARequest,
+                        PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
-from ..executor.postprocessor_hook import PostProcessorHook, load_post_processor_hook
+from ..executor.postprocessor_hook import (PostProcessorHook,
+                                           load_post_processor_hook)
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
-from ..executor.utils import RequestError, create_mpi_comm_session, get_spawn_proxy_process_env
-from ..inputs import (
-    PromptInputs,
-    TokensPrompt,
-    create_input_processor,
-    create_input_processor_with_hash,
-    maybe_compute_mm_embed_cumsum,
-    prompt_inputs,
-)
+from ..executor.utils import (RequestError, create_mpi_comm_session,
+                              get_spawn_proxy_process_env)
+from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
+                      create_input_processor_with_hash,
+                      maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
-from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, LlmBuildStats, ModelLoader
+from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
+                        LlmBuildStats, ModelLoader)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
-
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (
-    append_docstring,
-    exception_handler,
-    get_device_count,
-    logger_debug,
-    set_api_status,
-)
+from .utils import (append_docstring, exception_handler, get_device_count,
+                    logger_debug, set_api_status)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -323,7 +311,8 @@ class BaseLLM:
 
             elif backend == '_autodeploy':
                 logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import LlmArgs as AutoDeployLlmArgs
+                from .._torch.auto_deploy.llm_args import \
+                    LlmArgs as AutoDeployLlmArgs
                 llm_args_cls = AutoDeployLlmArgs
             else:
                 raise ValueError(
@@ -1801,7 +1790,8 @@ class _TorchLLM(BaseLLM):
 
         if self._encode_only:
             # Create ONLY the EncoderExecutor — skip decoder infrastructure.
-            from tensorrt_llm._torch.pyexecutor.py_executor_creator import create_encoder_executor
+            from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                create_encoder_executor
             self._encoder_executor = create_encoder_executor(
                 llm_args=self.args,
                 checkpoint_dir=str(self._hf_model_dir)

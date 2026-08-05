@@ -16,7 +16,8 @@ import json
 import threading
 from typing import List, Optional, Union
 
-from ..llmapi.mpi_session import MpiPoolSession, MpiSession, validate_session_world_size
+from ..llmapi.mpi_session import (MpiPoolSession, MpiSession,
+                                  validate_session_world_size)
 from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor

@@ -30,7 +30,8 @@ from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank, nvtx_range_debug
+from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
+                      nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
@@ -42,23 +43,14 @@ from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocParams, PostprocWorker, PostprocWorkerConfig
+from .postproc_worker import (PostprocParams, PostprocWorker,
+                              PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
-from .result import (
-    GenerationResult,
-    LogProbsResult,
-    ResponseWrapper,
-    compute_logprobs,
-    get_metrics_dict,
-)
-from .utils import (
-    ErrorResponse,
-    IntraProcessQueue,
-    RequestError,
-    bucket_responses_by_frontend,
-    frontend_lane_index,
-    is_llm_response,
-)
+from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
+                     compute_logprobs, get_metrics_dict)
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    bucket_responses_by_frontend, frontend_lane_index,
+                    is_llm_response)
 
 if TYPE_CHECKING:
     from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -175,16 +167,17 @@ class BaseWorker(GenerationExecutor):
             ), "llm_args should be with backend in _create_py_executor"
             _ = self._get_comm_ranks_device_id()
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import create_py_executor
+                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                    create_py_executor
                 create_executor = create_py_executor
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
             elif self._backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs as ADLlmArgs
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import (
-                    create_autodeploy_executor,
-                )
+                from tensorrt_llm._torch.auto_deploy.llm_args import \
+                    LlmArgs as ADLlmArgs
+                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
+                    create_autodeploy_executor
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
                 args["ad_config"] = self.llm_args
@@ -199,7 +192,8 @@ class BaseWorker(GenerationExecutor):
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.model_loader import _construct_checkpoint_loader
+                from tensorrt_llm._torch.pyexecutor.model_loader import \
+                    _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
@@ -224,7 +218,8 @@ class BaseWorker(GenerationExecutor):
         self._runtime_model_config: Optional[ModelConfig] = None
 
         if self._backend == "pytorch" and self._lora_config is not None:
-            from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+            from tensorrt_llm._torch.pyexecutor.resource_manager import \
+                ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
                 ResourceManagerType.PEFT_CACHE_MANAGER)
             self._lora_manager = peft_cache_manager.get_lora_manager()
@@ -678,12 +673,10 @@ class BaseWorker(GenerationExecutor):
                 values; forwarded verbatim to each rank's VMM call.
         """
         from tensorrt_llm._torch.pyexecutor.py_executor import (
-            _SLEEP_WAKEUP_ACK_TIMEOUT_S,
-            _recv_sleep_wakeup_ack_until,
-            _SleepWakeupAction,
-            _SleepWakeupTag,
-        )
-        from tensorrt_llm._torch.virtual_memory import materialize_with_tag, release_with_tag
+            _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
+            _SleepWakeupAction, _SleepWakeupTag)
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
 
         if self.rank != 0:
             raise RuntimeError(

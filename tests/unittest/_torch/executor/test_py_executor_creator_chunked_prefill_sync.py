@@ -29,6 +29,7 @@ cover the full chain that keeps the main process in sync:
 """
 
 from types import MethodType, SimpleNamespace
+from typing import List, Optional, Tuple
 
 import pytest
 
@@ -36,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.rpc.rpc_common import RPCError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm import LLM
@@ -77,7 +79,9 @@ class _DummyModelEngine:
         )
 
 
-def _make_llm_args(attn_backend="TRTLLM", enable_chunked_prefill=False):
+def _make_llm_args(
+    attn_backend: str = "TRTLLM", enable_chunked_prefill: bool = False
+) -> SimpleNamespace:
     kv_cache_config = SimpleNamespace(
         enable_block_reuse=True,
         enable_partial_reuse=False,
@@ -121,9 +125,16 @@ def _make_llm_args(attn_backend="TRTLLM", enable_chunked_prefill=False):
     )
 
 
-def _run_create_py_executor(monkeypatch, *, sm_version, attn_backend, enable_chunked_prefill):
+def _run_create_py_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sm_version: int,
+    attn_backend: str,
+    enable_chunked_prefill: bool,
+) -> Tuple[bool, List[bool]]:
     """Run ``create_py_executor`` with mocked dependencies and return the
-    post-call value of ``llm_args.enable_chunked_prefill``.
+    post-call value of ``llm_args.enable_chunked_prefill`` and the flags
+    observed by the ``validate_feature_combination`` stub.
     """
     llm_args = _make_llm_args(
         attn_backend=attn_backend,
@@ -147,10 +158,11 @@ def _run_create_py_executor(monkeypatch, *, sm_version, attn_backend, enable_chu
         "get",
         staticmethod(lambda mapping: SimpleNamespace()),
     )
+    observed_flags: List[bool] = []
     monkeypatch.setattr(
         py_executor_creator,
         "validate_feature_combination",
-        lambda *args, **kwargs: None,
+        lambda llm_args, *args, **kwargs: observed_flags.append(llm_args.enable_chunked_prefill),
     )
     monkeypatch.setattr(
         py_executor_creator,
@@ -240,56 +252,63 @@ def _run_create_py_executor(monkeypatch, *, sm_version, attn_backend, enable_chu
 
     py_executor_creator.create_py_executor(llm_args=llm_args, checkpoint_dir=None)
 
-    return llm_args.enable_chunked_prefill
+    return llm_args.enable_chunked_prefill, observed_flags
 
 
-def test_mla_unsupported_sm_fallback_syncs_llm_args_chunked_prefill(monkeypatch):
+def test_mla_unsupported_sm_fallback_syncs_llm_args_chunked_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When the MLA SM gate fires, llm_args.enable_chunked_prefill must
     be flipped to False so the user-facing LLM._check_arguments runs the
     per-request prompt-length validation."""
-    llm_args_chunked_prefill = _run_create_py_executor(
+    llm_args_chunked_prefill, observed_flags = _run_create_py_executor(
         monkeypatch,
         sm_version=89,
         attn_backend="TRTLLM",
         enable_chunked_prefill=True,
     )
     assert llm_args_chunked_prefill is False
+    assert observed_flags == [False]
 
 
-def test_flashinfer_star_fallback_syncs_llm_args_chunked_prefill(monkeypatch):
+def test_flashinfer_star_fallback_syncs_llm_args_chunked_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When the FlashInfer-Star gate fires, llm_args.enable_chunked_prefill
     must be flipped to False so the user-facing LLM._check_arguments runs
     the per-request prompt-length validation."""
-    llm_args_chunked_prefill = _run_create_py_executor(
+    llm_args_chunked_prefill, observed_flags = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
         attn_backend="FLASHINFER_STAR_ATTENTION",
         enable_chunked_prefill=True,
     )
     assert llm_args_chunked_prefill is False
+    assert observed_flags == [False]
 
 
-def test_supported_path_preserves_llm_args_chunked_prefill(monkeypatch):
+def test_supported_path_preserves_llm_args_chunked_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
     """When neither gate fires, llm_args.enable_chunked_prefill must stay
     as the user requested (chunked prefill on for a supported SM with
     TRTLLM backend)."""
-    llm_args_chunked_prefill = _run_create_py_executor(
+    llm_args_chunked_prefill, observed_flags = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
         attn_backend="TRTLLM",
         enable_chunked_prefill=True,
     )
     assert llm_args_chunked_prefill is True
+    assert observed_flags == [True]
 
 
-def _make_worker(llm_args=None):
+def _make_worker(llm_args: Optional[SimpleNamespace] = None) -> SimpleNamespace:
     """A minimal worker-like object exposing the worker-side getter."""
     worker = SimpleNamespace(llm_args=llm_args)
     worker.get_effective_llm_args = MethodType(BaseWorker.get_effective_llm_args, worker)
     return worker
 
 
-def test_worker_get_effective_llm_args_exposes_mutated_field():
+def test_worker_get_effective_llm_args_exposes_mutated_field() -> None:
     """The worker-side getter must report the post-engine-creation value of
     enable_chunked_prefill, and stay a no-op without llm_args."""
     llm_args = _make_llm_args(enable_chunked_prefill=False)
@@ -301,21 +320,31 @@ def test_worker_get_effective_llm_args_exposes_mutated_field():
     assert _make_worker(None).get_effective_llm_args() == {}
 
 
-def _make_proxy(rpc_client):
+def _make_proxy(rpc_client: Optional[SimpleNamespace]) -> GenerationExecutorProxy:
     proxy = object.__new__(GenerationExecutorProxy)
     proxy.rpc_client = rpc_client
     return proxy
 
 
-def _make_rpc_proxy(rpc_client):
+def _make_rpc_proxy(rpc_client: Optional[SimpleNamespace]) -> GenerationExecutorRpcProxy:
     proxy = object.__new__(GenerationExecutorRpcProxy)
     proxy.rpc_client = rpc_client
     return proxy
 
 
-def test_proxy_get_effective_llm_args_fetches_via_rpc():
+def _make_failing_rpc_client() -> SimpleNamespace:
+    """A present RPC client whose ``remote()`` call raises RPCError."""
+
+    def _raise(*args, **kwargs):
+        raise RPCError("worker unavailable")
+
+    return SimpleNamespace(get_effective_llm_args=lambda: SimpleNamespace(remote=_raise))
+
+
+def test_proxy_get_effective_llm_args_fetches_via_rpc() -> None:
     """Both proxy flavors must fetch the effective llm_args from the worker
-    via RPC and fall back to {} when the client is unavailable."""
+    via RPC and fall back to {} when the client is unavailable or the RPC
+    call fails."""
     rpc_client = SimpleNamespace(
         get_effective_llm_args=lambda: SimpleNamespace(
             remote=lambda: {"enable_chunked_prefill": False}
@@ -328,10 +357,15 @@ def test_proxy_get_effective_llm_args_fetches_via_rpc():
     assert _make_proxy(None).get_effective_llm_args() == {}
     assert _make_rpc_proxy(None).get_effective_llm_args() == {}
 
+    failing_rpc_client = _make_failing_rpc_client()
+    assert _make_proxy(failing_rpc_client).get_effective_llm_args() == {}
+    assert _make_rpc_proxy(failing_rpc_client).get_effective_llm_args() == {}
 
-def test_ray_executor_get_effective_llm_args_fetches_via_rpc():
+
+def test_ray_executor_get_effective_llm_args_fetches_via_rpc() -> None:
     """The Ray executor must fetch the effective llm_args from the worker
-    via RPC like the other proxied executors."""
+    via RPC like the other proxied executors, and fall back to {} when the
+    RPC call fails."""
     pytest.importorskip("ray")
     from tensorrt_llm.executor.ray_executor import RayExecutor
 
@@ -343,8 +377,12 @@ def test_ray_executor_get_effective_llm_args_fetches_via_rpc():
     )
     assert proxy.get_effective_llm_args() == {"enable_chunked_prefill": False}
 
+    failing_proxy = object.__new__(RayExecutor)
+    failing_proxy.rpc_client = _make_failing_rpc_client()
+    assert failing_proxy.get_effective_llm_args() == {}
 
-def test_llm_syncs_effective_llm_args_from_executor():
+
+def test_llm_syncs_effective_llm_args_from_executor() -> None:
     """LLM._sync_effective_llm_args must patch the frontend LLM.args with the
     effective value reported by the (proxied) executor, so that frontend-side
     validation reads the same state as the worker runtime."""
@@ -359,7 +397,7 @@ def test_llm_syncs_effective_llm_args_from_executor():
     assert llm.args.enable_chunked_prefill is False
 
 
-def test_llm_sync_is_noop_without_pytorch_backend():
+def test_llm_sync_is_noop_without_pytorch_backend() -> None:
     """The sync must not touch non-PyTorch backends (e.g. AutoDeploy)."""
     llm = LLM.__new__(LLM)
     llm.args = SimpleNamespace(backend="_autodeploy", enable_chunked_prefill=True)
@@ -372,7 +410,7 @@ def test_llm_sync_is_noop_without_pytorch_backend():
     assert llm.args.enable_chunked_prefill is True
 
 
-def _make_frontend_llm(*, enable_chunked_prefill, enable_block_reuse):
+def _make_frontend_llm(*, enable_chunked_prefill: bool, enable_block_reuse: bool) -> LLM:
     llm = LLM.__new__(LLM)
     llm.args = SimpleNamespace(
         backend="pytorch",
@@ -384,7 +422,7 @@ def _make_frontend_llm(*, enable_chunked_prefill, enable_block_reuse):
     return llm
 
 
-def test_check_arguments_rejects_oversize_without_block_reuse():
+def test_check_arguments_rejects_oversize_without_block_reuse() -> None:
     """With block reuse disabled and chunked prefill off, an oversized
     request must be rejected up front."""
     llm = _make_frontend_llm(enable_chunked_prefill=False, enable_block_reuse=False)
@@ -394,7 +432,7 @@ def test_check_arguments_rejects_oversize_without_block_reuse():
         )
 
 
-def test_check_arguments_allows_oversize_with_block_reuse():
+def test_check_arguments_allows_oversize_with_block_reuse() -> None:
     """With block reuse enabled, the scheduler subtracts estimated reusable
     prefix tokens from the prompt length, so the frontend must not reject a
     cache-hit request that exceeds max_num_tokens in raw length (e.g. MLA on

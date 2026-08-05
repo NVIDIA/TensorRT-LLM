@@ -11,7 +11,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, AsyncIterable, Dict, Generator, List, Optional, Union
+from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+                    Optional, Union)
 
 import numpy as np
 import torch
@@ -25,20 +26,19 @@ from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
-from ..llmapi.mpi_session import MpiSession, external_mpi_comm_available, need_spawn_mpi_workers
+from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
+                                  need_spawn_mpi_workers)
 from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.utils import (
-    AsyncQueue,
-    enable_llm_debug,
-    enable_worker_single_process_for_tp1,
-    logger_debug,
-    print_colored,
-)
-from ..sampling_params import BatchedLogitsProcessor, LogprobParams, SamplingParams
+from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
+                            enable_worker_single_process_for_tp1, logger_debug,
+                            print_colored)
+from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
+                               SamplingParams)
 from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
-from .request import DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest, PromptAdapterRequest
+from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
+                      PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 

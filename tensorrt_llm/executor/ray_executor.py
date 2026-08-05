@@ -9,7 +9,8 @@ except ModuleNotFoundError as e:
     e.msg = """Cannot import Ray. Please install 'ray' package to use ray orchestrator"""
     raise
 
-from ray.util.placement_group import get_current_placement_group, placement_group
+from ray.util.placement_group import (get_current_placement_group,
+                                      placement_group)
 
 try:
     # Ray >= 2.55.0
