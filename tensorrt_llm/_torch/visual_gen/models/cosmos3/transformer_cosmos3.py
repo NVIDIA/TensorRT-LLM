@@ -811,8 +811,12 @@ def _compute_default_rope_parameters(
 class Qwen3VLTextRotaryEmbedding(nn.Module):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
-        # Edge checkpoints omit rope_type from rope_scaling.
-        self.rope_type = model_config.pretrained_config.rope_scaling.get("rope_type", "default")
+        # Edge checkpoints omit rope_type from rope_scaling, and a checkpoint
+        # declaring the axes via top-level ``rope_axes_dim`` may omit the block
+        # entirely -- ``resolve_rope_axes_dim`` below supports that, so read it
+        # with the same tolerance rather than failing before reaching it.
+        rope_scaling = getattr(model_config.pretrained_config, "rope_scaling", None) or {}
+        self.rope_type = rope_scaling.get("rope_type", "default")
         self.max_seq_len_cached = model_config.pretrained_config.max_position_embeddings
         self.original_max_seq_len = model_config.pretrained_config.max_position_embeddings
 
