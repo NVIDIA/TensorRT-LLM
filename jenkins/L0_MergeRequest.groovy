@@ -1260,10 +1260,17 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 }
 
 // Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
+// Both x86_64 and SBSA jobs upload to the same test-results directory, so filter by arch before
+// downloading to avoid cross-contamination. SBSA stage names begin with GH200-, GB10-, GB200-,
+// GB300-, or CPU-Generic-arm-; all other stage names belong to x86_64.
 def uploadArchCoverage(String arch, pipeline, testFilter) {
     if (!testFilter[(CBTS_COVERAGE)]) {
         return
     }
+    def sbsaPrefixPattern = "^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-"
+    def archGrepCmd = (arch == "SBSA")
+        ? "grep -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
+        : "grep -v -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
     try {
         timeout(time: 15, unit: 'MINUTES') {
             def podSpec = createKubernetesPodConfig("", "agent")
@@ -1275,7 +1282,8 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
                     sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat result_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
+                    sh archGrepCmd
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat arch_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
                     sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
                     sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
                     def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
