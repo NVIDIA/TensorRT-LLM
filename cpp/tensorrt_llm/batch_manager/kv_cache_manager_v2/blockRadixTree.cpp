@@ -287,11 +287,15 @@ namespace
 bool isPrefix(TokenIdExt const* prefix, size_t prefixLen, TokenIdExt const* full, size_t fullLen)
 {
     if (prefixLen > fullLen)
+    {
         return false;
+    }
     for (size_t i = 0; i < prefixLen; ++i)
     {
         if (prefix[i] != full[i])
+        {
             return false;
+        }
     }
     return true;
 }

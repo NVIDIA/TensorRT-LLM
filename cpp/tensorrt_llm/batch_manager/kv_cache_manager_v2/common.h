@@ -124,16 +124,17 @@ inline constexpr Priority kPriorityDefault = 35;
 using SlidingWindowSize = std::optional<int>;
 
 // ---------------------------------------------------------------------------
-// Span<T> — non-owning view into a contiguous buffer (a C++17 stand-in for
-// std::span). Aggregate, so `Span<T>{}` value-initializes to an empty view and
-// `Span<T>{ptr, len}` is a plain brace-init. Supports operator[] for uniform
-// access with std::vector<T>.
+//! Non-owning view into a contiguous buffer (a C++17 stand-in for std::span).
+//!
+//! The referenced buffer must outlive the view. This remains an aggregate, so
+//! `Span<T>{}` creates an empty view and `Span<T>{ptr, len}` is plain brace-init.
+//! Supports operator[] for uniform access with std::vector<T>.
 // ---------------------------------------------------------------------------
 template <typename T>
 struct Span
 {
-    T* ptr;
-    int len;
+    T* ptr = nullptr;
+    int len = 0;
 
     T& operator[](int idx)
     {
@@ -166,8 +167,10 @@ struct Span
     }
 };
 
-// Non-owning const Span over a std::vector — for call sites that hold an owning vector but
-// need a Span (e.g. the per-element/multimodal fallback).
+//! Create a non-owning const Span over a std::vector.
+//!
+//! The source vector must outlive the returned view and must not reallocate while
+//! the view is in use.
 template <typename T>
 inline Span<T const> toSpan(std::vector<T> const& vec) noexcept
 {
@@ -175,10 +178,12 @@ inline Span<T const> toSpan(std::vector<T> const& vec) noexcept
     return Span<T const>{vec.data(), static_cast<int>(vec.size())};
 }
 
-// Non-owning view of a token sequence — a C++17 stand-in for std::span<TokenIdExt const>.
-// Used on the hot ingest path: a digest-free int32 token buffer can be reinterpret_cast to
-// TokenIdExt const* and matched/hashed with no per-token copy. TokenIdExt is 4 bytes and
-// bit-identical to a normal int32 token (see tokenIdExt.h).
+//! Non-owning view of a token sequence; the source buffer must outlive the view.
+//!
+//! Used on the hot ingest path: a digest-free int32 token buffer can be
+//! reinterpret_cast to TokenIdExt const* and matched/hashed with no per-token
+//! copy. TokenIdExt is 4 bytes and bit-identical to a normal int32 token (see
+//! tokenIdExt.h).
 using TokenSpan = Span<TokenIdExt const>;
 
 // ---------------------------------------------------------------------------

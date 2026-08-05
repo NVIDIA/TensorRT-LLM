@@ -199,6 +199,8 @@ TEST(DigestPoolTest, FrontPackAndTailShrinkChurn)
         EXPECT_EQ(tokens[i].digest(), distinctDigest(i)) << "content at " << i;
     }
 
+    uint32_t const reclaimedSlot = tokens.front().raw();
+
     // Release the first half (front slots), then confirm the survivors are intact
     // after the shrink churn triggered by freeing.
     tokens.erase(tokens.begin(), tokens.begin() + count / 2);
@@ -210,6 +212,7 @@ TEST(DigestPoolTest, FrontPackAndTailShrinkChurn)
 
     // A fresh allocation must front-pack into a reclaimed low slot.
     TokenIdExt const refill(distinctDigest(9999));
+    EXPECT_EQ(refill.raw(), reclaimedSlot);
     EXPECT_EQ(refill.digest(), distinctDigest(9999));
 
     tokens.clear();
