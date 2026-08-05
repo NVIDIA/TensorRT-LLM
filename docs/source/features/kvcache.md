@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # KV Cache System
 
 The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
