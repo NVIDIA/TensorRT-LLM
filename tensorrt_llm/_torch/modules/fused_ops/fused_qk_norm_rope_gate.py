@@ -284,7 +284,28 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Prepare packed QKV and gate with one compile-safe Triton custom op."""
+    """Prepare packed QKV and gate with one Triton kernel.
+
+    Args:
+        qkv: ``[num_tokens, 2 * q_size + 2 * kv_size]`` BF16/FP16 projection
+            output in per-head interleaved Q/G layout.
+        q_weight: ``[head_dim]`` raw Gemma RMSNorm Q weights.
+        k_weight: ``[head_dim]`` raw Gemma RMSNorm K weights.
+        cos_sin: ``[max_positions, 2, rotary_dim // 2]`` FP32 NeoX table.
+        positions: Flattenable ``[num_tokens]`` plain-RoPE positions, or
+            ``[3, ..., num_tokens]`` interleaved-MRoPE positions.
+        eps: RMSNorm epsilon.
+        num_q_heads: Local query-head count.
+        num_kv_heads: Local key/value-head count.
+        head_dim: Per-head Q/K/V dimension.
+        rotary_dim: Prefix dimension receiving NeoX RoPE.
+        mrope_section: Temporal/height/width rotary-half dimensions. ``None``
+            selects plain RoPE; a tuple selects Qwen-style interleaved MRoPE.
+
+    Returns:
+        Packed QKV ``[num_tokens, q_size + 2 * kv_size]`` and gate
+        ``[num_tokens, num_q_heads, head_dim]``.
+    """
     use_mrope = mrope_section is not None
     if use_mrope:
         assert len(mrope_section) == 3
@@ -348,10 +369,15 @@ def _fused_sigmoid_mul_kernel(
     )
 
 
-def _fused_sigmoid_mul_inplace_impl(
+@torch.library.custom_op(
+    "trtllm::fused_sigmoid_mul_inplace",
+    mutates_args=("attention_output",),
+)
+def fused_sigmoid_mul_inplace(
     attention_output: torch.Tensor,
     gate: torch.Tensor,
 ) -> None:
+    """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
     assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
     num_tokens, hidden_size = attention_output.shape
     if gate.dim() == 3:
@@ -387,15 +413,3 @@ def _fused_sigmoid_mul_inplace_impl(
         block_size=block_size,
         num_warps=4,
     )
-
-
-@torch.library.custom_op(
-    "trtllm::fused_sigmoid_mul_inplace",
-    mutates_args=("attention_output",),
-)
-def fused_sigmoid_mul_inplace(
-    attention_output: torch.Tensor,
-    gate: torch.Tensor,
-) -> None:
-    """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
-    _fused_sigmoid_mul_inplace_impl(attention_output, gate)

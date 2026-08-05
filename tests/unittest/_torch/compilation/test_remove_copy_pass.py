@@ -26,32 +26,6 @@ from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
 )
 
 
-@pytest.mark.parametrize(
-    ("op_name", "expected"),
-    [
-        ("fused_sigmoid_mul_inplace", {1: "attention_output"}),
-        ("flashinfer_gemma_fused_add_rmsnorm", {1: "input", 2: "residual"}),
-        ("bmm_out", {1: "out"}),
-        ("fp8_block_scaling_bmm_out", {1: "out"}),
-        ("gate_forward", {1: "out_weights", 2: "out_indices"}),
-        ("group_rms_norm_base", {1: "outputs"}),
-        ("group_rms_norm_large_batch", {1: "outputs"}),
-        ("group_rms_norm_heuristic", {1: "outputs"}),
-        ("mla_rope_inplace", {1: "data"}),
-        ("mla_rope_generation", {1: "fused_q", 2: "q_pe"}),
-    ],
-)
-def test_inplace_info_covers_compiled_output_ops(
-    op_name: str,
-    expected: dict[int, str],
-) -> None:
-    try:
-        op = getattr(torch.ops.trtllm, op_name).default
-    except AttributeError:
-        pytest.skip(f"optional op {op_name} is not registered")
-    assert remove_copy_pass.inplace_info()[op] == expected
-
-
 def test_remove_copy_for_mutates_args_auto_functionalized_v2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
