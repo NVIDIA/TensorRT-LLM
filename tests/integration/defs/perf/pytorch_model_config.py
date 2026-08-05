@@ -84,7 +84,7 @@ def get_model_yaml_config(model_label: str,
     pattern_configs = [
         # Deepseek default cases
         {
-            'patterns': ['deepseek_r1', 'kimi_k2_nvfp4'],
+            'patterns': ['deepseek_r1'],
             'config': {
                 'enable_attention_dp': True,
             }
@@ -295,9 +295,6 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'deepseek_r1_distill_llama_70b',
-                'llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8',
-                'llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8',
-                'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16'
             ],
             'config': {
                 # True causes hang, needs model-specific fix.
@@ -325,16 +322,6 @@ def get_model_yaml_config(model_label: str,
                 'kv_cache_config': {
                     'enable_block_reuse': False,
                 },
-            }
-        },
-        # MiniMax-M2.5 FP8: every perf case must route MoE through attention DP.
-        # TP=8: intermediate_size=1536 is not block-scale divisible (1536/8=192, %128!=0).
-        # TP=4: trtllm-gen FP8 block-scale MoE kernel IMAs during CUDA-graph warmup
-        # on the 1536/4=384 N-shard (Blackwell B200/B300).
-        {
-            'patterns': ['minimax_m2.5_fp8'],
-            'config': {
-                'enable_attention_dp': True,
             }
         },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
