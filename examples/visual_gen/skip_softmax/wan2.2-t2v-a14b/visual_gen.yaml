@@ -31,6 +31,9 @@ attention_config:
     target_sparsity: 0.65
     disabled_until_timestep: 0.86
 
+compilation_config:
+  skip_warmup: true
+
 torch_compile_config:
   enable: true
   enable_autotune: false

@@ -20,7 +20,7 @@
   because the two transformer components use different calibration formulas.
 - [ ] Publish the seven exact prompts, their seeds, the default negative
   prompt, scheduler settings, and `boundary_ratio`.
-- [ ] Publish a runnable sweep harness that records the full warmup, CUDA
+- [ ] Publish a runnable sweep harness that records the six-step exact-shape warmup, CUDA
   synchronization, timed-forward, dense-anchor, eager-reference, and
   multi-GPU scheduling procedures.
 - [x] Record the TensorRT-LLM release image used for the sweep and the commands
@@ -53,9 +53,8 @@
   final claim scoped to Wan 2.2 T2V-A14B on B200.
 - [ ] Define a stable same-build quality reference and quantify eager versus
   compiled BF16 drift before comparing quantized families across builds.
-- [ ] Profile more prompts and configurations if the component percentages
-  are intended as a general workload breakdown; otherwise label the current
-  profile as one representative BF16 run.
+- [x] Keep the component percentages scoped to one representative BF16 run
+  rather than generalizing them across prompts and configurations.
 
 ## Final-blog cleanup
 
