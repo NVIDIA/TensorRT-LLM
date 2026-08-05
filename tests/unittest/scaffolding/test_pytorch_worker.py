@@ -180,6 +180,19 @@ class TestPyTorchWorkerGeneration:
         # Output should not contain the stop sequence
         assert "\n" not in task.output_str
 
+    def test_strip_stop_sequence_cuts_at_earliest_match(self, pytorch_worker):
+        """Order in task.stop must not decide where the text is cut."""
+        task = GenerationTask.create_from_prompt("irrelevant")
+        task.stop = ["B", "A"]
+
+        assert pytorch_worker._strip_stop_sequence("xxAyyBzz", task) == "xx"
+
+        task.stop = ["A", "B"]
+        assert pytorch_worker._strip_stop_sequence("xxAyyBzz", task) == "xx"
+
+        task.stop = ["missing"]
+        assert pytorch_worker._strip_stop_sequence("xxAyyBzz", task) == "xxAyyBzz"
+
     @pytest.mark.asyncio
     async def test_generation_deterministic(self, pytorch_worker, test_prompt):
         """Test deterministic generation with temperature=0."""
@@ -262,26 +275,46 @@ class TestPyTorchWorkerStreamGeneration:
         assert task.output_str is not None
 
 
+@pytest.fixture(scope="module")
+def reward_worker(small_model_path):
+    """A sequence-classification worker, as reward scoring actually requires."""
+    worker = PyTorchWorker.from_pretrained_reward_model(
+        small_model_path, device="cpu", torch_dtype=torch.float32, num_labels=2
+    )
+    yield worker
+    worker.shutdown()
+
+
 class TestPyTorchWorkerReward:
     @pytest.mark.asyncio
-    async def test_reward_with_input_tokens(self, pytorch_worker):
-        """Test reward handler with input_tokens fallback.
+    async def test_reward_scores_from_input_str(self, reward_worker):
+        task = RewardTask()
+        task.input_str = "This is a test."
 
-        Note: Using a causal LM for reward will likely error since it's
-        not a classification model. This tests the input routing logic.
-        """
-        tokenizer = pytorch_worker.tokenizer
-        tokens = tokenizer.encode("This is a test.")
+        assert await reward_worker.reward_handler(task) == TaskStatus.SUCCESS
+        assert task.custom_output_params is not None
+        score = task.custom_output_params["score"]
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
 
+    @pytest.mark.asyncio
+    async def test_reward_with_input_tokens(self, reward_worker):
+        """input_tokens is accepted in place of input_str."""
         task = RewardTask()
         task.input_str = None
-        task.input_tokens = tokens
+        task.input_tokens = reward_worker.tokenizer.encode("This is a test.")
 
-        # Will likely fail since gpt2 is not a classification model,
-        # but should not fail due to missing input
-        status = await pytorch_worker.reward_handler(task)
-        # Accept either SUCCESS or error (model type mismatch is OK)
-        assert status in (TaskStatus.SUCCESS, TaskStatus.WORKER_EXECEPTION)
+        assert await reward_worker.reward_handler(task) == TaskStatus.SUCCESS
+        assert isinstance(task.custom_output_params["score"], float)
+
+    @pytest.mark.asyncio
+    async def test_reward_without_any_input_fails(self, reward_worker):
+        """Missing input is an error, not a score computed from empty text."""
+        task = RewardTask()
+        task.input_str = None
+        task.input_tokens = None
+
+        assert await reward_worker.reward_handler(task) == TaskStatus.WORKER_EXECEPTION
 
 
 class TestPyTorchWorkerContextLogits:
@@ -469,9 +502,14 @@ class TestPyTorchWorkerWithScaffolding:
 
 
 class TestPyTorchWorkerShutdown:
-    def test_shutdown_clears_resources(self, small_model_path):
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU to observe the move")
+    def test_shutdown_moves_model_off_gpu(self, small_model_path):
+        """On CPU the assertion would hold even if shutdown() did nothing."""
         worker = PyTorchWorker.from_pretrained(
-            small_model_path, device="cpu", torch_dtype=torch.float32
+            small_model_path, device="cuda", torch_dtype=torch.float32
         )
+        assert next(worker.model.parameters()).device.type == "cuda"
+
         worker.shutdown()
+
         assert next(worker.model.parameters()).device.type == "cpu"

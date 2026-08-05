@@ -221,11 +221,10 @@ class PyTorchWorker(Worker):
         if not task.stop:
             return text
         stop_strings = [task.stop] if isinstance(task.stop, str) else task.stop
-        for s in stop_strings:
-            idx = text.find(s)
-            if idx != -1:
-                return text[:idx]
-        return text
+        # Cut at the earliest match across all stop strings, not at whichever happens to
+        # be listed first: for stop=["B", "A"] and "xxAyyBzz" the answer is "xx".
+        indices = [idx for idx in (text.find(s) for s in stop_strings) if idx != -1]
+        return text[: min(indices)] if indices else text
 
     def _extract_logprobs(self, scores: tuple, generated_tokens: List[int], num_logprobs: int):
         """Extract top-k logprobs from generation scores.
@@ -440,10 +439,10 @@ class PyTorchWorker(Worker):
         try:
             inputs = self._tokenize_input(task.input_str, task.input_tokens)
             if inputs is None:
-                # Fallback to empty string for backward compatibility
-                inputs = self.tokenizer(
-                    "", return_tensors="pt", padding=True, truncation=True, max_length=512
-                ).to(self.device)
+                # Scoring empty text would hand back a plausible number for what is really
+                # a caller error. Fail the same way generation_handler does.
+                logger.error("PyTorchWorker reward task has neither input_str nor input_tokens")
+                return TaskStatus.WORKER_EXECEPTION
 
             if not isinstance(inputs, dict):
                 inputs = dict(inputs)
