@@ -10,17 +10,41 @@ gated output projection.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
 from torch import nn
 
 from ....functional import PositionEmbeddingType
+from ....logger import logger
 from ....models.modeling_utils import QuantConfig
 from ...attention_backend import AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
 from ..mla import MLA
+
+_KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
+
+
+def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
+    """Select K3's absorbed-generation MLA backend.
+
+    K3 was tuned with the FlashInfer CuTe-DSL backend for BF16 KV cache.
+    FP8 KV cache carries device scales that CuTe-DSL does not support, so
+    retain the TRTLLM-Gen fallback used by the pre-refactor implementation.
+    """
+    backend = os.environ.get(_KIMI_K3_MLA_GEN_BACKEND_ENV, "cute-dsl")
+    has_fp8_kv_cache = bool(
+        quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
+    )
+    if has_fp8_kv_cache and backend != "trtllm-gen":
+        logger.info(
+            "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
+            f"generation backend; overriding '{backend}' -> 'trtllm-gen'."
+        )
+        return "trtllm-gen"
+    return backend
 
 
 def _meta_safe_cast_dtype(module, dtype):
@@ -187,6 +211,7 @@ class KimiK3MLAAttention(MLA):
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
+            flashinfer_mla_backend=_select_mla_generation_backend(quant_config),
         )
         # K3 calls forward_impl() directly to insert its output gate before
         # the base row-parallel o_proj. The original executor metadata remains

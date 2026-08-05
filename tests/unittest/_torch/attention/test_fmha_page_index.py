@@ -57,3 +57,40 @@ def test_flashinfer_cute_dsl_mla_backend_rejects_fp8_kv_cache() -> None:
 
     with pytest.raises(ValueError, match="does not support FP8 KV cache"):
         FlashInferTrtllmGenFmha(attn)
+
+
+@pytest.mark.parametrize(
+    (
+        "requested_backend",
+        "num_contexts",
+        "num_generations",
+        "num_tokens",
+        "expected_backend",
+    ),
+    [
+        ("cute-dsl", 0, 4, 4, "cute-dsl"),
+        ("cute-dsl", 1, 3, 4, "trtllm-gen"),
+        ("cute-dsl", 0, 4, 8, "trtllm-gen"),
+        ("trtllm-gen", 1, 3, 4, "trtllm-gen"),
+    ],
+)
+def test_flashinfer_mla_backend_falls_back_for_mixed_batches(
+    requested_backend: str,
+    num_contexts: int,
+    num_generations: int,
+    num_tokens: int,
+    expected_backend: str,
+) -> None:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._mla_backend = requested_backend
+
+    assert (
+        fmha._get_effective_mla_backend(
+            SimpleNamespace(
+                num_contexts=num_contexts,
+                num_generations=num_generations,
+            ),
+            num_tokens,
+        )
+        == expected_backend
+    )
