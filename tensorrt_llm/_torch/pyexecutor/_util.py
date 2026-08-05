@@ -594,6 +594,28 @@ class KvCacheCreator:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
+            # The C++ CacheTransceiver is constructed from
+            # ``kv_cache_manager.impl`` and expects the nanobind
+            # KVCacheManagerCpp; V2's ``.impl`` is the Python KVCacheManagerPy,
+            # so a disaggregated deployment dies inside a nanobind constructor
+            # with a TypeError that names neither the model nor disagg. Catch
+            # it here, where the manager class is chosen and the message can say
+            # which feature combination is unsupported.
+            #
+            # Scoped to the C++ runtime: KvCacheTransceiverV2 takes the manager
+            # object rather than ``.impl``. ``transceiver_runtime`` may still be
+            # the unresolved "auto" sentinel on paths that skip
+            # _resolve_transceiver_runtime_auto (e.g. AutoDeploy), and
+            # create_kv_cache_transceiver maps that to the C++ runtime, so
+            # anything that is not an explicit "PYTHON" is treated as C++.
+            if (self._cache_transceiver_config is not None
+                    and self._cache_transceiver_config.backend is not None
+                    and self._cache_transceiver_config.transceiver_runtime
+                    != "PYTHON"):
+                incompat.append(
+                    "disaggregated serving with the C++ cache transceiver "
+                    "(try cache_transceiver_config.transceiver_runtime="
+                    "'PYTHON' with backend='NIXL')")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall
