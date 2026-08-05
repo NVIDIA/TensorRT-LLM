@@ -1,4 +1,3 @@
-import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -12,17 +11,9 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
-from .spec_sampler_base import SampleStateSpec, SpecSampler
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
-
-if sys.version_info[:2] >= (3, 12):
-    pass
-else:
-    pass
-
-SampleStateMTP = SampleStateSpec
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -242,12 +233,6 @@ class MTPSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_contexts:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
-
-
-# All one-model speculative modes share a single sampler; the per-mode
-# subclasses only differed in buffer sizing, which now derives from
-# TorchSampler.Args. Kept as an alias for backwards compatibility.
-MTPSampler = SpecSampler
 
 
 class MTPWorker(SpecWorkerBase):

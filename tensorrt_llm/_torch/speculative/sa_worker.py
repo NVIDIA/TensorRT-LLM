@@ -21,7 +21,6 @@ integrating the suffix automaton pattern matching into the model's forward pass.
 Key components:
 - SASpecMetadata: Metadata for SA speculative decoding
 - SAWorker: Spec worker that uses suffix automaton for draft generation
-- SASampler: Sampler that handles GPU->CPU result extraction
 """
 
 from dataclasses import dataclass, field
@@ -33,7 +32,6 @@ from tensorrt_llm._utils import prefer_pinned
 
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from .interface import SpecMetadata, SpecWorkerBase
-from .spec_sampler_base import SpecSampler
 from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
@@ -333,7 +331,3 @@ class SAWorker(SpecWorkerBase):
         draft_tokens = draft_tokens * mask
 
         return draft_tokens  # [batch_size, max_draft_len] GPU tensor
-
-
-# Alias for backwards compatibility -- see SpecSampler.
-SASampler = SpecSampler
