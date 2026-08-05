@@ -767,9 +767,11 @@ class PyExecutor:
                 self.sampler._initialize_store()
                 self.sampler._instantiate_algorithms()
 
-        # Set of request IDs that are currently in flight across all micro batches.
-        # The scheduler will avoid scheduling requests that are already in flight.
+        # Set of request IDs that are currently in flight across all micro batches
+        # or waiting for synchronized PP resource teardown. The scheduler avoids
+        # these requests until their prior execution state is safe to reuse.
         self.inflight_req_ids = ReqIdsSet()
+        self._pending_recompute_pause_ids: set[int] = set()
 
         # Encoder-decoder models execute the encoder and decoder in separate
         # iterations in both executor loops. PP usage is very rare for these
@@ -960,7 +962,7 @@ class PyExecutor:
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.dist, self._do_terminate_request)
+                self.dist, self._on_disagg_pp_termination)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -2838,6 +2840,8 @@ class PyExecutor:
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
+                self._progress_recompute_pause_termination_if_idle(
+                    executed_batch_num)
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -3133,7 +3137,18 @@ class PyExecutor:
                     tag=tag,
                 )
 
-    def _handle_executed_batch(self, executed_batch: Optional[BatchStatePP]):
+    def _progress_recompute_pause_termination_if_idle(
+            self, executed_batch_num: int) -> None:
+        """Advance deferred recompute teardown when no batch can drive it."""
+        if executed_batch_num != 0 or not self._pending_recompute_pause_ids:
+            return
+        if self._disagg_pp_termination_handler is None:
+            raise RuntimeError(
+                "Deferred recompute pause requires a PP termination handler")
+        self._disagg_pp_termination_handler.terminate_pending_requests()
+
+    def _handle_executed_batch(self,
+                               executed_batch: Optional[BatchStatePP]) -> None:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
@@ -4034,6 +4049,9 @@ class PyExecutor:
                         for req in scheduled_batch.generation_requests:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
+                        self._terminate_recompute_paused_requests(
+                            scheduled_batch)
+                        self._pause_recompute_paused_requests(scheduled_batch)
                     self._finalize_adp_dummy_allocation(False)
                     continue
 
@@ -4513,6 +4531,9 @@ class PyExecutor:
                         for req in scheduled_batch.generation_requests:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
+                        self._terminate_recompute_paused_requests(
+                            scheduled_batch)
+                        self._pause_recompute_paused_requests(scheduled_batch)
                     self._finalize_adp_dummy_allocation(False)
                     continue
 
@@ -6703,7 +6724,7 @@ class PyExecutor:
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
 
-    def _terminate_request(self, request: LlmRequest):
+    def _terminate_request(self, request: LlmRequest) -> None:
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -6714,14 +6735,38 @@ class PyExecutor:
         else:
             self._do_terminate_request(request)
 
-    def _do_terminate_request(self, request: LlmRequest):
+    def _free_request_resources(self, request: LlmRequest) -> None:
+        """Release execution resources without removing response routing."""
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
+    def _do_terminate_request(self, request: LlmRequest) -> None:
+        self._free_request_resources(request)
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+
+    def _on_disagg_pp_termination(self, request: LlmRequest) -> None:
+        """Finish a PP-synchronized termination and any deferred recompute."""
+        request_id = request.py_request_id
+        if request_id not in self._pending_recompute_pause_ids:
+            self._do_terminate_request(request)
+            return
+
+        should_recompute = (any(active_request is request
+                                for active_request in self.active_requests)
+                            and not request.is_finished)
+        if should_recompute:
+            self._free_request_resources(request)
+            self._pause_recompute_request(request)
+        else:
+            # Cancellation or failure made this request terminal while its
+            # recompute teardown was waiting for PP consensus.
+            self._do_terminate_request(request)
+
+        self._pending_recompute_pause_ids.remove(request_id)
+        self.inflight_req_ids.erase(request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -7093,33 +7138,43 @@ class PyExecutor:
             # defend against anyway.
             return []
 
-    def _terminate_requests(self, requests_to_terminate):
+    def _terminate_requests(
+            self, requests_to_terminate: Iterable[LlmRequest]) -> None:
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not updated.
         for req in requests_to_terminate:
             self._terminate_request(req)
 
-    def _pause_requests(self, requests_to_pause):
+    def _pause_requests(self, requests_to_pause: Iterable[LlmRequest]) -> None:
         for req in requests_to_pause:
             req.pause(self.max_input_len)
 
-    def _pause_recompute_request(self, req):
+    def _pause_recompute_request(self, req: LlmRequest) -> None:
         req.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
 
     def _terminate_recompute_paused_requests(
-            self, scheduled_batch: ScheduledRequests):
-        requests = scheduled_batch.recompute_paused_requests
-        if not requests:
-            return
-        self._terminate_requests(requests)
-
-    def _pause_recompute_paused_requests(self,
-                                         scheduled_batch: ScheduledRequests):
+            self, scheduled_batch: ScheduledRequests) -> None:
         requests = scheduled_batch.recompute_paused_requests
         if not requests:
             return
         for req in requests:
-            self._pause_recompute_request(req)
+            if (self._disagg_pp_termination_handler is not None
+                    and not req.is_dummy_request):
+                request_id = req.py_request_id
+                self._pending_recompute_pause_ids.add(request_id)
+                self.inflight_req_ids.insert(request_id)
+                self._disagg_pp_termination_handler.terminate(req)
+            else:
+                self._free_request_resources(req)
+
+    def _pause_recompute_paused_requests(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        requests = scheduled_batch.recompute_paused_requests
+        if not requests:
+            return
+        for req in requests:
+            if req.py_request_id not in self._pending_recompute_pause_ids:
+                self._pause_recompute_request(req)
 
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.
