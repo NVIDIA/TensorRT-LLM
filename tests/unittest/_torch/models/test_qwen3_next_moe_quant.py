@@ -15,8 +15,10 @@
 """Unquantized-MoE probe for the Qwen3Next / Qwen3.5 MTP layer."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3_5 import _normalize_qwen35_exclude_modules
 from tensorrt_llm._torch.models.modeling_qwen3_next import _experts_excluded_from_quant
@@ -163,3 +165,103 @@ def test_regular_layers_are_covered_too(pattern, layer_idx, expected):
 
 def test_missing_layer_idx_is_a_noop():
     assert not _experts_excluded_from_quant(_model_config(["model.layers.5*"]), None)
+
+
+class _StopBlockInit(Exception):
+    """Raised after the test captures the arguments passed to ``create_moe``."""
+
+
+def _build_moe_block(moe_backend, exclude_modules, layer_idx, quant_config_dict=None):
+    """Run sparse-MoE initialization through its ``create_moe`` call."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextSparseMoeBlock
+
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_hidden_layers=NUM_HIDDEN_LAYERS,
+            num_nextn_predict_layers=1,
+            torch_dtype=torch.bfloat16,
+            model_type="qwen3_next",
+            mlp_bias=False,
+        ),
+        moe_backend=moe_backend,
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            exclude_modules=exclude_modules,
+        ),
+        quant_config_dict=quant_config_dict,
+    )
+    captured = {}
+
+    def _capture(*args, **kwargs):
+        from tensorrt_llm._torch.modules.fused_moe.create_moe import resolve_moe_cls
+
+        captured["moe_backend"] = kwargs["model_config"].moe_backend
+        captured["override"] = kwargs["override_quant_config"]
+        captured["moe_cls"] = resolve_moe_cls(
+            kwargs["model_config"],
+            kwargs["routing_method"],
+            kwargs["dtype"],
+            kwargs["override_quant_config"],
+            kwargs["layer_idx"],
+        ).__name__
+        raise _StopBlockInit
+
+    import tensorrt_llm._torch.models.modeling_qwen3_next as qwen3_next
+
+    with patch.object(qwen3_next, "create_moe", _capture), pytest.raises(_StopBlockInit):
+        Qwen3NextSparseMoeBlock(model_config, aux_stream=None, layer_idx=layer_idx)
+    return captured
+
+
+@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "DEEPGEMM", "WIDEEP", "CUTEDSL"])
+@pytest.mark.parametrize("layer_idx", [5, MTP_LAYER_IDX])
+def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
+    per_layer_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    captured = _build_moe_block(
+        backend,
+        [f"model.layers.{layer_idx}*"],
+        layer_idx,
+        quant_config_dict={
+            f"model.layers.{layer_idx}.mlp.experts": per_layer_quant_config,
+        },
+    )
+
+    assert captured["moe_backend"] == "CUTLASS"
+    assert captured["moe_cls"] == "CutlassFusedMoE"
+    assert captured["override"] is not per_layer_quant_config
+    assert not captured["override"].layer_quant_mode.has_any_quant(exclude_kv_cache=True)
+    assert captured["override"].kv_cache_quant_algo == QuantAlgo.FP8
+
+
+_UNEXCLUDED_EXPECTED_MOE_CLS = {
+    "CUTLASS": "CutlassFusedMoE",
+    "TRTLLM": "TRTLLMGenFusedMoE",
+    "DEEPGEMM": "DeepGemmFusedMoE",
+    "WIDEEP": "WideEPMoE",
+    "CUTEDSL": "CuteDslFusedMoE",
+}
+
+
+@pytest.mark.parametrize("backend", sorted(_UNEXCLUDED_EXPECTED_MOE_CLS))
+def test_unexcluded_layer_keeps_configured_backend_and_layer_quant_config(backend):
+    per_layer_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    captured = _build_moe_block(
+        backend,
+        ["model.layers.7*"],
+        5,
+        quant_config_dict={
+            "model.layers.5.mlp.experts": per_layer_quant_config,
+        },
+    )
+
+    assert captured["moe_backend"] == backend
+    assert captured["moe_cls"] == _UNEXCLUDED_EXPECTED_MOE_CLS[backend]
+    assert captured["override"] is per_layer_quant_config

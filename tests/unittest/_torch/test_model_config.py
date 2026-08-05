@@ -13,6 +13,8 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 def make_pretrained_config(
     *,

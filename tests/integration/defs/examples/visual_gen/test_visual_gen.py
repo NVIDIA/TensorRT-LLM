@@ -96,8 +96,8 @@ WAN22_LPIPS_FRAME_RATE = 16.0
 
 # QwenImage (text-to-image) — default-setting LPIPS golden.
 # Params mirror the QwenImage 20B reference defaults (pipeline_qwen_image.py).
-# NOTE: QwenImage's forward CFG knob is ``true_cfg_scale`` (not ``guidance_scale``),
-# and real-CFG only engages when a negative prompt is supplied.
+# NOTE: QwenImage's forward CFG knob is ``negative_prompt_cfg_scale`` (not
+# ``guidance_scale``), and negative-prompt CFG only engages when it is > 1.0.
 QWENIMAGE_MODEL_SUBPATH = "qwen-image"
 QWEN_IMAGE_EDIT_MODEL_SUBPATH = "Qwen-Image-Edit-2511"
 QWENIMAGE_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
@@ -105,7 +105,7 @@ QWENIMAGE_LPIPS_NEGATIVE_PROMPT = ""
 QWENIMAGE_LPIPS_HEIGHT = 1328
 QWENIMAGE_LPIPS_WIDTH = 1328
 QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS = 50
-QWENIMAGE_LPIPS_TRUE_CFG_SCALE = 4.0
+QWENIMAGE_LPIPS_NEGATIVE_PROMPT_CFG_SCALE = 4.0
 QWENIMAGE_LPIPS_SEED = 42
 QWENIMAGE_LPIPS_THRESHOLD = 0.05
 QWEN_IMAGE_LAYERED_LPIPS_PROMPT = ""
@@ -894,7 +894,7 @@ def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_grap
                 height=QWENIMAGE_LPIPS_HEIGHT,
                 width=QWENIMAGE_LPIPS_WIDTH,
                 num_inference_steps=QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS,
-                true_cfg_scale=QWENIMAGE_LPIPS_TRUE_CFG_SCALE,
+                negative_prompt_cfg_scale=QWENIMAGE_LPIPS_NEGATIVE_PROMPT_CFG_SCALE,
                 seed=QWENIMAGE_LPIPS_SEED,
             )
         generated_image = result.image[0].detach().cpu()

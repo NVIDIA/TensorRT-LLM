@@ -16,8 +16,8 @@ import hashlib
 import math
 import os
 import sys
-from collections import OrderedDict, defaultdict
-from dataclasses import dataclass, replace
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -153,13 +153,14 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
-    planned_drop_handle: Optional[PlannedDropHandle] = None
+    planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
 
 
 class ConversationManager:
     """Track the current request and drop plan for each conversation."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_num_turns: int) -> None:
+        self._max_num_turns = max_num_turns
         self._conversation_states: Dict[str, _ConversationState] = {}
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
@@ -180,10 +181,9 @@ class ConversationManager:
                 f"{conversation_id} have been dropped."
             )
         else:
-            previous_handle = state.planned_drop_handle
-            state.planned_drop_handle = drop_handle
-            if previous_handle is not None:
-                previous_handle.drop()
+            state.planned_drop_handles.append(drop_handle)
+            if len(state.planned_drop_handles) > self._max_num_turns:
+                state.planned_drop_handles.popleft().drop()
 
         self.finish_request(request)
 
@@ -215,7 +215,7 @@ class ConversationManager:
             return
 
         state.current_request_id = None
-        if state.planned_drop_handle is None:
+        if not state.planned_drop_handles:
             self._conversation_states.pop(conversation_id)
 
     def clear(self) -> None:
@@ -767,6 +767,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        is_estimating_kv_cache: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -789,12 +790,20 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+
+        # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
+        # can distinguish the throwaway estimation-phase managers from the
+        # final ones: the estimation cache is sized with no headroom for
+        # retained dummy requests.
+        self.is_estimating_kv_cache = is_estimating_kv_cache
+
         # Set True by a compression manager; generation-step resize then leaves history untouched.
         self.kv_compression_manages_history: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
-        self.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
+        block_reuse_config = kv_cache_config.block_reuse_config
+        self.block_reuse_policy = BlockReusePolicy(block_reuse_config.block_reuse_policy)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -1136,7 +1145,11 @@ class KVCacheManagerV2(BaseResourceManager):
             and self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION
             and not self.is_draft
         )
-        self.conversation_manager = ConversationManager() if enable_conversation_manager else None
+        self.conversation_manager = (
+            ConversationManager(block_reuse_config.max_num_turns)
+            if enable_conversation_manager
+            else None
+        )
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.

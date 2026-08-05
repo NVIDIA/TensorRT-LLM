@@ -8,6 +8,8 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _write_hf_quant_config(model_dir, kv_cache_quant_algo: str = "FP8"):
     with open(model_dir / "hf_quant_config.json", "w") as f:
@@ -44,7 +46,7 @@ def _compressed_tensors_nvfp4_config(**overrides):
 
 
 def test_get_llm_args_plumbs_kv_cache_dtype():
-    llm_args, _ = get_llm_args(model="dummy", kv_cache_dtype="nvfp4")
+    llm_args, _ = get_llm_args(model="dummy", kv_cache_dtype="nvfp4", gpus_per_node=1)
     assert llm_args["kv_cache_config"].dtype == "nvfp4"
 
 
