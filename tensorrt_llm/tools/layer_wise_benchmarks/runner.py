@@ -3,7 +3,6 @@ import functools
 import inspect
 import itertools
 import os
-import unittest.mock
 import weakref
 from enum import IntEnum
 from typing import Optional
@@ -17,7 +16,6 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -509,37 +507,9 @@ class Runner:
 
             return select_alltoall_method_type
 
-        def make_select_alltoall_method_type_2(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(self):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                top_k = self.routing_method.experts_per_token
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                with unittest.mock.patch.object(
-                    self.routing_method.__class__,
-                    "experts_per_token",
-                    new_callable=unittest.mock.PropertyMock,
-                ) as mock_top_k:
-                    mock_top_k.return_value = fake_top_k
-                    return select_alltoall_method_type_orig(self)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_cutlass = CutlassFusedMoE.select_alltoall_method_type
-        select_alltoall_method_type_trtllm_gen = TRTLLMGenFusedMoE.select_alltoall_method_type
         select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        CutlassFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_cutlass
-        )
-        TRTLLMGenFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_trtllm_gen
         )
         WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
             select_alltoall_method_type_wide_ep
@@ -548,8 +518,6 @@ class Runner:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            CutlassFusedMoE.select_alltoall_method_type = select_alltoall_method_type_cutlass
-            TRTLLMGenFusedMoE.select_alltoall_method_type = select_alltoall_method_type_trtllm_gen
             WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
@@ -646,6 +614,26 @@ class Runner:
             sparse_metadata_params=sparse_metadata_params,
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
+        # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
+        # serving the executor announces that via update_spec_dec_param(), the only
+        # place max_draft_tokens is set. Without it the DSA indexer's context_lens
+        # buffer stays one column wide and DeepGEMM aborts on the next_n mismatch.
+        # Shapes only -- spec-dec masking stays off.
+        #
+        # Gate on kv_lens_cuda_2d, not on the method: update_spec_dec_param() is on
+        # the base metadata class, so hasattr() would let every backend in, and the
+        # base sets max_total_draft_tokens unconditionally -- which reaches the
+        # attention op cache key and FMHA kernel selection. kv_lens_cuda_2d exists
+        # only on DSA metadata, which is the backend that needs this.
+        if run_type == "GEN" and seq_len_q > 1 and hasattr(attn_metadata, "kv_lens_cuda_2d"):
+            attn_metadata.update_spec_dec_param(
+                batch_size=batch_size,
+                is_spec_decoding_enabled=False,
+                is_spec_dec_tree=False,
+                is_spec_dec_dynamic_tree=False,
+                max_draft_len=seq_len_q - 1,
+                max_total_draft_tokens=seq_len_q - 1,
+            )
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(

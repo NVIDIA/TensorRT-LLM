@@ -719,9 +719,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 
 bool use_fp32_acc()
 {
-    // we use fp16 acc type by default due to keep align with nccl
+    // FP32 accumulation is the default: native-dtype accumulation measurably hurts
+    // accuracy on models with large residual-stream outliers.
+    // Opt out with ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 to restore the legacy behavior.
     static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
-    return fp32_acc != nullptr;
+    return fp32_acc == nullptr || fp32_acc[0] != '0';
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)

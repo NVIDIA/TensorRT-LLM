@@ -19,7 +19,6 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_nemotron_nano_v2_vl"
   - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
-  - unittest/_torch/modeling/test_modeling_llava_next.py::test_llava_next_expand_prompt_token_ids_for_mm
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
@@ -36,6 +35,8 @@ l0_l40s:
   # AutoDeploy: Nemotron-Nano-V3 on Ada uses flashinfer; trtllm has no
   # (E4M3 input, BF16 output, paged_kv, head_dim=128, sm_89) FMHA cubin.
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
+  # PyTorch: force NVFP4 Marlin on Ada to cover the SM89-compiled Marlin kernels.
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=1]
   # ------------- Encoder-decoder tests ---------------
   # Representative pre-merge set: eager smoke, CUDA-graph greedy/beam, kv-v2,
   # overlap scheduler, mBART, mixed batches.
@@ -54,6 +55,29 @@ l0_l40s:
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-overlap-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch
+  # Whisper (encoder-decoder) — customer-side deployment targets L40S/H200
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*l40s*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # Whisper (encoder-decoder) — customer-side deployment targets L40S/H200
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[fp32-kv-v1-graphs-off-beam2]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v1-decoder-graphs-on-beam2]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v2-graphs-off-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-requested-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v1-graphs-off-greedy]
 - condition:
     ranges:
       system_gpu_count:

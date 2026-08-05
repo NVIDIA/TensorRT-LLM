@@ -593,6 +593,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     std::optional<BaseAgentConfig> agentConfig, bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize,
     SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<std::vector<bool>> const& indexerKCacheLayerMask,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations, SizeType32 blocksInDiskPool,
     std::string const& diskCachePath, bool diskRetainedOnly, bool diskProtectUnexpired)
@@ -625,6 +626,11 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         mLoopbackAgent = makeLoopbackAgent("nixl", &agentConfig.value());
     else
         mLoopbackAgent = nullptr;
+
+    TLLM_CHECK_WITH_INFO(
+        !indexerKCacheLayerMask.has_value() || static_cast<SizeType32>(indexerKCacheLayerMask->size()) == mNumLayers,
+        "indexerKCacheLayerMask must have one entry per layer (expected %d, got %zu)", mNumLayers,
+        indexerKCacheLayerMask.has_value() ? indexerKCacheLayerMask->size() : 0);
 
     auto const uniqueWindowSizeToLayers
         = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, mNumLayers);
@@ -698,7 +704,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             diskCachePath, diskRetainedOnly, diskProtectUnexpired, maxNumSequences, stream, cacheType,
             secondaryOffloadMinPriority, mEventManager, enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager,
             mLookupTree, mLoopbackAgent, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-            indexerKCacheUseFp4,
+            indexerKCacheUseFp4, indexerKCacheLayerMask,
             LinearAttentionMetadata::hasLinearCache(windowSize) ? linearAttentionMetadata : std::nullopt,
             numPlaceholderBlocks);
     }
@@ -756,8 +762,8 @@ WindowBlockManager::WindowBlockManager(tensorrt_llm::DataType dtype, SizeType32 
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
-    SizeType32 numPlaceholderBlocks)
+    bool indexerKCacheUseFp4, std::optional<std::vector<bool>> const& indexerKCacheLayerMask,
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata, SizeType32 numPlaceholderBlocks)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -801,6 +807,7 @@ WindowBlockManager::WindowBlockManager(tensorrt_llm::DataType dtype, SizeType32 
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
     , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
     , mIndexerKCacheUseFp4{indexerKCacheUseFp4}
+    , mIndexerKCacheLayerMask{indexerKCacheLayerMask}
     , mLinearAttentionMetadata{std::move(linearAttentionMetadata)}
 {
     TLLM_LOG_DEBUG("Creating WindowBlockManager for windowSize=%d", windowSize);
@@ -859,7 +866,7 @@ WindowBlockManager::WindowBlockManager(tensorrt_llm::DataType dtype, SizeType32 
 
     if (mEnableIndexerKCache)
     {
-        createIndexerKCachePools();
+        createIndexerKCachePools(managedLayers);
     }
 
     // Create free blocks
@@ -1085,7 +1092,7 @@ void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
     }
 }
 
-void WindowBlockManager::createIndexerKCachePools()
+void WindowBlockManager::createIndexerKCachePools(std::vector<SizeType32> const& managedLayers)
 {
     SizeType32 numPools = mPools.size();
     for (SizeType32 i = 0; i < numPools; ++i)
@@ -1095,6 +1102,38 @@ void WindowBlockManager::createIndexerKCachePools()
         {
             continue;
         }
+        // Count the layers of this KV pool that own an indexer K cache and assign each its
+        // pool row. Rows follow managedLayers order restricted to this pool, matching the
+        // KV pool's own layer-row order (mLayerToIndexWithinPool). Without a mask every layer
+        // owns a row and the indexer pool mirrors the KV pool layer count (dense, legacy
+        // layout); with a mask (e.g. GLM 5.2 cross-layer indexer sharing) only full-indexer
+        // layers get a row, so shared layers cost no indexer pool memory.
+        SizeType32 numIndexerLayers = 0;
+        for (auto const layerIdx : managedLayers)
+        {
+            if (mLayerToPoolIndex.at(layerIdx) != i)
+            {
+                continue;
+            }
+            if (mIndexerKCacheLayerMask.has_value() && !mIndexerKCacheLayerMask->at(layerIdx))
+            {
+                continue;
+            }
+            mLayerToIndexerPoolRow[layerIdx] = numIndexerLayers++;
+        }
+        if (numIndexerLayers == 0)
+        {
+            TLLM_LOG_WARNING(
+                "[%s] Indexer K cache is enabled but every layer of pool %d is masked out; skipping indexer "
+                "K cache pool creation for this pool.",
+                mLogPrefix.c_str(), i);
+            continue;
+        }
+        if (numIndexerLayers < kvPool.numLayers)
+        {
+            TLLM_LOG_INFO("[%s] Indexer K cache pool: %d of %d layers own an indexer K cache.", mLogPrefix.c_str(),
+                numIndexerLayers, kvPool.numLayers);
+        }
         // scaleSize evaluates to 4 at indexHeadDim=128 / quantBlockSize=128 for both
         // FP8 (float32 scale) and FP4 (packed UE8M0 x4 stored as one int32). The
         // data size is either indexHeadDim bytes (one FP8 byte per element) or
@@ -1103,7 +1142,7 @@ void WindowBlockManager::createIndexerKCachePools()
         SizeType32 dataSize = mIndexerKCacheUseFp4 ? mIndexerKCacheIndexHeadDim / 2 : mIndexerKCacheIndexHeadDim;
         SizeType32 perTokenSize = scaleSize + dataSize;
 
-        mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1, perTokenSize, kvPool.tokensPerBlock,
+        mPools.emplace_back(numIndexerLayers, kvPool.kvFactor, 1, perTokenSize, kvPool.tokensPerBlock,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/false,
@@ -3733,7 +3772,8 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    bool indexerKCacheUseFp4, std::optional<std::vector<bool>> const& indexerKCacheLayerMask,
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations, SizeType32 blocksInDiskPool,
     std::string const& diskCachePath, bool diskRetainedOnly, bool diskProtectUnexpired)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
@@ -3741,8 +3781,8 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse, nullptr,
         enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
-        linearAttentionMetadata, poolConfigurations, blocksInDiskPool, diskCachePath, diskRetainedOnly,
-        diskProtectUnexpired)
+        indexerKCacheLayerMask, linearAttentionMetadata, poolConfigurations, blocksInDiskPool, diskCachePath,
+        diskRetainedOnly, diskProtectUnexpired)
 {
 }
 
@@ -3754,6 +3794,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<std::vector<bool>> const& indexerKCacheLayerMask,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations, SizeType32 blocksInDiskPool,
     std::string const& diskCachePath, bool diskRetainedOnly, bool diskProtectUnexpired)
@@ -3762,8 +3803,8 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
         kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations, blocksInDiskPool, diskCachePath,
-        diskRetainedOnly, diskProtectUnexpired)
+        indexerKCacheUseFp4, indexerKCacheLayerMask, linearAttentionMetadata, poolConfigurations, blocksInDiskPool,
+        diskCachePath, diskRetainedOnly, diskProtectUnexpired)
 {
 }
 
@@ -3775,6 +3816,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<std::vector<bool>> const& indexerKCacheLayerMask,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations, SizeType32 blocksInDiskPool,
     std::string const& diskCachePath, bool diskRetainedOnly, bool diskProtectUnexpired)
@@ -3789,8 +3831,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, dtype, mSinkBubbleLength,
           mChunkSize, cacheType, secondaryOffloadMinPriority, std::move(eventManager), enablePartialReuse,
           copyOnPartialReuse, std::move(kvCacheConnectorManager), std::nullopt, enableIndexerKCache,
-          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata,
-          poolConfigurations, blocksInDiskPool, diskCachePath, diskRetainedOnly, diskProtectUnexpired)
+          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, indexerKCacheLayerMask,
+          linearAttentionMetadata, poolConfigurations, blocksInDiskPool, diskCachePath, diskRetainedOnly,
+          diskProtectUnexpired)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
@@ -3818,6 +3861,7 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<std::vector<bool>> const& indexerKCacheLayerMask,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
     std::vector<PoolConfiguration> const& poolConfigurations, SizeType32 blocksInDiskPool,
     std::string const& diskCachePath, bool diskRetainedOnly, bool diskProtectUnexpired)
@@ -3825,8 +3869,9 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, std::move(stream),
         maxSequenceLength, chunkSize, enableBlockReuse, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
         enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager), enableIndexerKCache,
-        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata,
-        poolConfigurations, blocksInDiskPool, diskCachePath, diskRetainedOnly, diskProtectUnexpired)
+        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, indexerKCacheLayerMask,
+        linearAttentionMetadata, poolConfigurations, blocksInDiskPool, diskCachePath, diskRetainedOnly,
+        diskProtectUnexpired)
 {
 }
 

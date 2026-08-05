@@ -105,6 +105,7 @@ class MoEOpBackend:
         gemm2_weights_scale: torch.Tensor,
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -204,11 +205,9 @@ class TRTLLMOpBackend(MoEOpBackend):
 
     def __init__(self):
         from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
-        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 
         self._MnnvlMemory = MnnvlMemory
         self._MnnvlMoe = MnnvlMoe
-        self._MoeAlltoAll = MoeAlltoAll
 
     # Quantization
     def fp4_quantize(
@@ -247,6 +246,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         gemm2_weights_scale,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -276,6 +276,7 @@ class TRTLLMOpBackend(MoEOpBackend):
             gemm2_weights_scale,
             num_experts,
             top_k,
+            num_fused_shared_experts,
             n_group,
             topk_group,
             intermediate_size,
@@ -592,6 +593,7 @@ class FlashinferOpBackend(MoEOpBackend):
         gemm2_weights_scale,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -610,6 +612,9 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        assert not num_fused_shared_experts, (
+            "Flashinfer backend does not support fusing shared experts"
+        )
         if gemm1_clamp_limit is not None:
             raise NotImplementedError(
                 "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
