@@ -1817,7 +1817,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Pytest command
                 String pytestUtil = ""
-                def visualGenMultinodeSlurmMode = testList == "l0_b200_visual_gen_multinode"
+                def visualGenMultinodeSlurmMode = testList == "l0_b200_visual_gen_multi_nodes"
                 if (nodeCount > 1 && !visualGenMultinodeSlurmMode) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
@@ -5502,7 +5502,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-VisualGen-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_multinode", 1, 1, 16, 2],
+        "DGX_B200-16_GPUs-2_Nodes-PyTorch-VisualGen-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_multi_nodes", 1, 1, 16, 2],
         // Single-GPU Gemma4 PerfSanity regression gate and baseline
         "DGX_B200-PyTorch-PerfSanity-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
