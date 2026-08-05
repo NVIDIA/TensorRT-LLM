@@ -96,8 +96,8 @@ WAN22_LPIPS_FRAME_RATE = 16.0
 
 # QwenImage (text-to-image) — default-setting LPIPS golden.
 # Params mirror the QwenImage 20B reference defaults (pipeline_qwen_image.py).
-# NOTE: QwenImage's forward CFG knob is ``true_cfg_scale`` (not ``guidance_scale``),
-# and real-CFG only engages when a negative prompt is supplied.
+# NOTE: QwenImage's forward CFG knob is ``negative_prompt_cfg_scale`` (not
+# ``guidance_scale``), and negative-prompt CFG only engages when it is > 1.0.
 QWENIMAGE_MODEL_SUBPATH = "qwen-image"
 QWEN_IMAGE_EDIT_MODEL_SUBPATH = "Qwen-Image-Edit-2511"
 QWENIMAGE_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
@@ -105,7 +105,7 @@ QWENIMAGE_LPIPS_NEGATIVE_PROMPT = ""
 QWENIMAGE_LPIPS_HEIGHT = 1328
 QWENIMAGE_LPIPS_WIDTH = 1328
 QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS = 50
-QWENIMAGE_LPIPS_TRUE_CFG_SCALE = 4.0
+QWENIMAGE_LPIPS_NEGATIVE_PROMPT_CFG_SCALE = 4.0
 QWENIMAGE_LPIPS_SEED = 42
 QWENIMAGE_LPIPS_THRESHOLD = 0.05
 QWEN_IMAGE_LAYERED_LPIPS_PROMPT = ""
@@ -126,6 +126,10 @@ COSMOS3_LPIPS_HEIGHT = 720
 COSMOS3_LPIPS_WIDTH = 1280
 COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
 COSMOS3_LPIPS_T2I_NUM_FRAMES = 1
+# 9 frames = 3 latent frames: latents (0, 1) are pinned to the V2V reference,
+# latent 2 (pixel frames 5-8) is generated. Frame 8 is the golden-compared frame.
+COSMOS3_LPIPS_V2V_NUM_FRAMES = 9
+COSMOS3_LPIPS_V2V_FREE_FRAME_INDEX = 8
 COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
 COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
 COSMOS3_LPIPS_SEED = 42
@@ -890,7 +894,7 @@ def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_grap
                 height=QWENIMAGE_LPIPS_HEIGHT,
                 width=QWENIMAGE_LPIPS_WIDTH,
                 num_inference_steps=QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS,
-                true_cfg_scale=QWENIMAGE_LPIPS_TRUE_CFG_SCALE,
+                negative_prompt_cfg_scale=QWENIMAGE_LPIPS_NEGATIVE_PROMPT_CFG_SCALE,
                 seed=QWENIMAGE_LPIPS_SEED,
             )
         generated_image = result.image[0].detach().cpu()
@@ -992,12 +996,13 @@ def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path
     save_image(generated_image, output_path)
 
 
-def _run_cosmos3_lpips_pipeline(num_frames):
+def _run_cosmos3_lpips_pipeline(num_frames, video=None):
     """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
     or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path.
+    single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
+    decoded on the worker's NVDEC) yields the video-to-video path.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -1034,6 +1039,7 @@ def _run_cosmos3_lpips_pipeline(num_frames):
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
+                    video=video,
                 )
             if result is None or result.video is None:
                 return None
@@ -1053,6 +1059,42 @@ def _generate_cosmos3_lpips_video(output_path):
     video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2V_NUM_FRAMES)
     assert video is not None, "Cosmos3-Nano T2V LPIPS run produced no video"
     _save_lpips_video_mp4(video, output_path, frame_rate=COSMOS3_LPIPS_FRAME_RATE)
+
+
+# 5-frame 720p conditioning window (the default
+# ``max(condition_video_latent_indexes) * 4 + 1``): gray background with a
+# block moving 40 px/frame — a real structure signal. Encoded once offline
+# with ffmpeg/libx264 (H.264 decode is bit-exact by spec, so NVDEC output is
+# deterministic across machines); provenance in test_data/README.md.
+COSMOS3_LPIPS_V2V_REFERENCE_MP4 = os.path.join(
+    os.path.dirname(__file__), "test_data", "cosmos3_v2v_lpips_reference.mp4"
+)
+
+
+def _cosmos3_v2v_lpips_reference_bytes():
+    _skip_if_missing(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "Cosmos3 V2V LPIPS reference fixture")
+    with open(COSMOS3_LPIPS_V2V_REFERENCE_MP4, "rb") as f:
+        return f.read()
+
+
+def _generate_cosmos3_v2v_lpips_frame(output_path):
+    """Generate the Cosmos3-Nano video-to-video LPIPS sample (free frame only).
+
+    The golden stores a single frame, not a video: frames 0-4 are pinned to the
+    reference's VAE round-trip (that contract is asserted semantically by the
+    V2V unit smokes), so the only content unique to this gate is what the model
+    generates *under* conditioning — the free latent, pixel frames 5-8. Frame 8
+    is compared. 9 frames keeps the run to seconds while still exercising the
+    pinned/free latent boundary.
+    """
+    from tensorrt_llm.media.encoding import save_image
+
+    video = _run_cosmos3_lpips_pipeline(
+        COSMOS3_LPIPS_V2V_NUM_FRAMES, video=_cosmos3_v2v_lpips_reference_bytes()
+    )
+    assert video is not None, "Cosmos3-Nano V2V LPIPS run produced no video"
+    # video is (B, T, H, W, C); take the free frame -> (H, W, C) for save_image.
+    save_image(video[0, COSMOS3_LPIPS_V2V_FREE_FRAME_INDEX], output_path)
 
 
 def _generate_cosmos3_lpips_image(output_path):
@@ -1295,6 +1337,26 @@ def test_cosmos3_nano_t2v_lpips_against_golden(_visual_gen_deps, tmp_path):
         tmp_path,
         "cosmos3_nano_t2v",
         "video",
+        COSMOS3_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
+    generated_path = tmp_path / "cosmos3_nano_v2v_generated_frame.png"
+    golden_path = _golden_media_path(
+        tmp_path,
+        "cosmos3_nano_v2v_lpips_golden_frame.png",
+        "Cosmos3-Nano V2V LPIPS golden frame",
+    )
+    _generate_cosmos3_v2v_lpips_frame(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_nano_v2v",
+        "image",
         COSMOS3_LPIPS_PROMPT,
         golden_path,
         generated_path,

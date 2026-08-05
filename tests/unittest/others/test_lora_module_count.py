@@ -21,7 +21,11 @@ get accurate LoRA module-layer counts instead of the uniform over-estimate.
 import unittest
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor._util import _compute_num_lora_modules
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_block_config(

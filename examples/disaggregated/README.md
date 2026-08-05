@@ -253,6 +253,12 @@ it would look like:
 hostname: localhost
 port: 8000
 backend: pytorch
+internal_request_auth_key: <shared-secret>
+# Optional: HTTP keep-alive timeout in seconds (default: 10), applied to the
+# client-facing listener and to the coordinator's when it runs in-process.
+# Raise it when clients hold large idle connection pools and hit
+# "Connection reset by peer" on a reused connection.
+# server_keep_alive_timeout: 3600
 context_servers:
   num_instances: 2
   urls:
@@ -265,6 +271,11 @@ generation_servers:
 ```
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI API compatible endpoint.
+Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
+server config and in each context/generation worker config. The proxy signs internal
+generation requests with this key, and generation workers reject request-supplied
+disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
+the internal handoff does not carry a valid signature.
 
 
 #### Sending requests to the disaggregated server
@@ -542,6 +553,8 @@ the active context/generation servers is below the corresponding threshold.
 - `inactive_interval_sec`: A server is marked inactive if no heartbeat is received within this interval (set higher than the heartbeat interval).
 
 Note that the disaggregated server and all the context/generation servers should have the same `disagg_cluster` configuration values, or the disaggregated server may not be able to keep alive or detect inactivity the other servers properly. If `disagg_cluster` section is specified, 
+the disaggregated server and all context/generation worker configs should also set the
+same `internal_request_auth_key` value.
 
 Additionally, we offer a fully executable script—please refer to [Disaggregated SLURM Scripts](./slurm/service_discovery_example/).
 

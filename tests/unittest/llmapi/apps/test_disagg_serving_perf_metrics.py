@@ -1,4 +1,5 @@
 import os
+import secrets
 from typing import Tuple
 
 import openai
@@ -67,10 +68,21 @@ def disagg_cluster_config(disagg_port: int):
     }
 
 
-def worker_config(model_name: str, disagg_cluster_config: dict, perf_metrics_output_dir):
+@pytest.fixture
+def internal_request_auth_key():
+    return secrets.token_hex(32)
+
+
+def worker_config(
+    model_name: str,
+    disagg_cluster_config: dict,
+    perf_metrics_output_dir,
+    internal_request_auth_key: str,
+):
     return {
         "model": model_name,
         "disagg_cluster": disagg_cluster_config,
+        "internal_request_auth_key": internal_request_auth_key,
         "cache_transceiver_config": {
             "backend": "DEFAULT",
         },
@@ -93,9 +105,12 @@ def workers(
     ctx_port: int,
     gen_port: int,
     perf_metrics_output_dir,
+    internal_request_auth_key: str,
 ):
     model_path = get_model_path(model_name)
-    extra_config = worker_config(model_name, disagg_cluster_config, perf_metrics_output_dir)
+    extra_config = worker_config(
+        model_name, disagg_cluster_config, perf_metrics_output_dir, internal_request_auth_key
+    )
 
     def worker(server_role: str, port: int):
         return RemoteOpenAIServer(
@@ -114,11 +129,18 @@ def workers(
 
 
 @pytest.fixture
-def disagg_server(disagg_cluster_config: dict, workers, disagg_port: int, perf_metrics_output_dir):
+def disagg_server(
+    disagg_cluster_config: dict,
+    workers,
+    disagg_port: int,
+    perf_metrics_output_dir,
+    internal_request_auth_key: str,
+):
     disagg_config = {
         "hostname": "localhost",
         "port": disagg_port,
         "disagg_cluster": disagg_cluster_config,
+        "internal_request_auth_key": internal_request_auth_key,
         "perf_metrics_max_requests": 1000,
         "return_perf_metrics": True,
         "perf_metrics_output_dir": str(perf_metrics_output_dir),

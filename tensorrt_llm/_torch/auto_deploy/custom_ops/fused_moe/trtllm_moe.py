@@ -384,13 +384,16 @@ def _run_moe_with_alltoall(
             fc2_ws_f32,
             global_num_experts,
             top_k,
-            None,  # n_group
-            None,  # topk_group
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            None,  # routed_scaling_factor
-            RoutingMethodType.Renormalize,
+            # Keyword args from here on so the call stays aligned if the op
+            # schema gains new optional parameters (e.g. num_fused_shared_experts).
+            num_fused_shared_experts=None,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize,
             topk_weights=routing_weights_bf16,
             topk_ids=dispatched_selected,
         )
@@ -1043,13 +1046,16 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             fc2_weight_scale_f32,
             num_experts,
             top_k,
-            None,  # n_group
-            None,  # topk_group
-            intermediate_size,
-            0,  # local_expert_offset
-            num_experts,  # local_num_experts
-            None,  # routed_scaling_factor
-            RoutingMethodType.Renormalize,
+            # Keyword args from here on so the call stays aligned if the op
+            # schema gains new optional parameters (e.g. num_fused_shared_experts).
+            num_fused_shared_experts=None,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize,
             topk_weights=routing_weights_bf16,
             topk_ids=selected_experts,
         )
