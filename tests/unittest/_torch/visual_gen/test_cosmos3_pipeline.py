@@ -265,7 +265,9 @@ def _make_test_image() -> PIL.Image.Image:
 @pytest.fixture
 def cosmos3_format_pipeline():
     """Minimal pipeline for prompt formatting helpers (no checkpoint)."""
-    return Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+    pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+    pipeline._device = torch.device("cpu")
+    return pipeline
 
 
 def _format_prompt_with_metadata(
@@ -664,6 +666,7 @@ class TestCosmos3V2V:
 
     def test_v2v_flow_shift_override_request_path(self):
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         calls = []
@@ -730,6 +733,7 @@ class TestCosmos3V2V:
         the checkpoint's flow shift / Karras sigmas and the streams step on
         different schedules."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = True
         rebuilt = []
@@ -919,7 +923,7 @@ class TestCosmos3FP8Load:
         checkpoint = _require_checkpoint()
         pipeline = _load_pipeline(checkpoint, quant_config=COSMOS3_FP8_QUANT_CONFIG)
         try:
-            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
             result = _run_forward(pipeline, image=None, num_frames=NUM_FRAMES)
             _assert_valid_video(result.video, num_frames=NUM_FRAMES)
             assert result.frame_rate == FRAME_RATE

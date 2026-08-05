@@ -29,6 +29,7 @@ from .args import (
     CacheConfig,
     CacheDiTConfig,
     CompilationConfig,
+    CpuOffloadConfig,
     CudaGraphConfig,
     ParallelConfig,
     QuantAttentionConfig,
@@ -55,6 +56,7 @@ __all__ = [
     # Cross-cutting sub-configs
     "CompilationConfig",
     "CudaGraphConfig",
+    "CpuOffloadConfig",
     "TorchCompileConfig",
     "ParallelConfig",
     "AttentionConfig",
