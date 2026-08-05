@@ -74,7 +74,9 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl[cu13]==4.5.0; python_version >= "3.10"
+# Blackwell CuTeDSL kernels that use branch-merged shared-memory allocation
+# require the LaunchConfig API added in 4.6.
+nvidia-cutlass-dsl[cu13]==4.6.1; python_version >= "3.10"
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
 quack-kernels>=0.2.10; python_version >= "3.10" # required for MinimaxM3 MSA
 jinja2 # required for MinimaxM3 MSA
