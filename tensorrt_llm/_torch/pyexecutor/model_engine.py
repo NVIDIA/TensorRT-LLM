@@ -2496,6 +2496,8 @@ class PyTorchModelEngine(ModelEngine):
                     resource_manager, num_tokens, 0)
                 with self._release_batch_context(warmup_request,
                                                  resource_manager) as batch:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
                     if batch is None:
                         continue
 
@@ -2529,6 +2531,7 @@ class PyTorchModelEngine(ModelEngine):
                                                          least_requests=False)
             with self._release_batch_context(warmup_request,
                                              resource_manager) as batch:
+                self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                 if batch is None:
                     continue
                 logger.info(
