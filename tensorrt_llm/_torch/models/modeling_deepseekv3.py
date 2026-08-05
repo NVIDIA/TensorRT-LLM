@@ -1919,25 +1919,17 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             cls,
             pretrained_config: Any = None
     ) -> Optional[Literal["CPP", "PYTHON"]]:
-        """Preferred KV-cache transceiver runtime, differentiated per checkpoint.
+        """Preferred KV-cache transceiver runtime.
 
-        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` use MLA attention, which transfers
-        a large latent KV that the Python (v2) transceiver handles better in disaggregated
-        serving, so they prefer the Python transceiver. GLM 5.2 (``GlmMoeDsaForCausalLM`` /
-        ``glm_moe_dsa``) uses a per-layer masked DSA indexer k-cache pool (cross-layer indexer
-        sharing) that the Python transceiver does not support, so GLM checkpoints must use the
-        C++ transceiver, which handles both the masked pool and dense indexer layouts. Applied
-        only when ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
+        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` / ``GlmMoeDsaForCausalLM``
+        (GLM 5.2) use MLA attention, which transfers a large latent KV that the Python
+        (v2) transceiver handles better in disaggregated serving. The Python transceiver
+        also supports GLM 5.2's per-layer masked DSA indexer k-cache pool (cross-layer
+        indexer sharing), so every checkpoint sharing this implementation prefers the
+        Python transceiver. Applied only when
+        ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
         is always respected.
         """
-        if pretrained_config is not None:
-            architectures = getattr(pretrained_config, 'architectures',
-                                    None) or []
-            # model_type is checked as a fallback: it is 'glm_moe_dsa' on GLM
-            # checkpoints until __init__ rewrites it to 'deepseek_v32'.
-            if ("GlmMoeDsaForCausalLM" in architectures or getattr(
-                    pretrained_config, 'model_type', None) == 'glm_moe_dsa'):
-                return "CPP"
         return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):

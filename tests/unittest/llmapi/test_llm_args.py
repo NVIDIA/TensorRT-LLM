@@ -4042,10 +4042,8 @@ class TestTransceiverRuntimeAutoResolution:
 class TestDeepseekRuntimePreferences:
     """DeepSeek KV-cache manager and transceiver preferences.
 
-    DeepseekV3ForCausalLM and DeepseekV32ForCausalLM prefer the Python KV-cache
-    transceiver, while GlmMoeDsaForCausalLM (GLM 5.2) requires the C++ transceiver
-    because its per-layer masked DSA indexer k-cache pool is not supported by the
-    Python (v2) transceiver.
+    DeepseekV3ForCausalLM, DeepseekV32ForCausalLM, and GlmMoeDsaForCausalLM
+    prefer the Python KV-cache transceiver.
     """
 
     @staticmethod
@@ -4055,19 +4053,18 @@ class TestDeepseekRuntimePreferences:
         cfg.model_type = model_type
         return cfg
 
-    @pytest.mark.parametrize("architectures,model_type,expected", [
-        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "CPP"),
-        (["DeepseekV3ForCausalLM"], "deepseek_v3", "PYTHON"),
-        (["DeepseekV32ForCausalLM"], "deepseek_v32", "PYTHON"),
+    @pytest.mark.parametrize("architectures,model_type", [
+        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa"),
+        (["DeepseekV3ForCausalLM"], "deepseek_v3"),
+        (["DeepseekV32ForCausalLM"], "deepseek_v32"),
     ])
     def test_preference_per_architecture(self, architectures: list[str],
-                                         model_type: str,
-                                         expected: str) -> None:
+                                         model_type: str) -> None:
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
         cfg = self._pretrained_config(architectures, model_type)
         assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
-            cfg) == expected
+            cfg) == "PYTHON"
 
     def test_prefers_python_without_config(self) -> None:
         """Preference is unconditional without a pretrained config."""
