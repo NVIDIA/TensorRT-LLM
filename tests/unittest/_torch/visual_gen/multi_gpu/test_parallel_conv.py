@@ -35,7 +35,7 @@ try:
     )
     from tensorrt_llm._torch.visual_gen.modules.vae.conv import (
         _cat_spatial_halos,
-        _pack_spatial_halo,
+        _halo_exchange_buffer,
         _physical_to_logical_channels_last,
         _spatial_channels_last_format,
     )
@@ -356,6 +356,20 @@ class TestHaloExchangeConv2dStride2:
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
+class TestHaloExchangeValidation:
+    def test_missing_required_adjacent_group_fails_at_construction(self) -> None:
+        conv = nn.Conv2d(4, 4, kernel_size=3, padding=1)
+
+        with pytest.raises(ValueError, match="missing VAE adjacent process group 0"):
+            HaloExchangeConv(conv, chunk_dim=3, adj_groups=[None], rank=0, world_size=2)
+
+    def test_kernel_one_does_not_require_adjacent_group(self) -> None:
+        conv = nn.Conv2d(4, 4, kernel_size=(3, 1))
+
+        HaloExchangeConv(conv, chunk_dim=3, adj_groups=[None], rank=0, world_size=2)
+
+
+@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 class TestSpatialChannelsLastFormat:
     """CPU unit tests for the halo channels-last layout helper.
 
@@ -417,7 +431,7 @@ class TestSpatialChannelsLastFormat:
             ((1, 4, 3, 8, 9), 4),
         ],
     )
-    def test_physical_halo_wire_round_trip(
+    def test_channels_last_halo_buffer_round_trip(
         self,
         shape: tuple[int, ...],
         dim: int,
@@ -425,17 +439,17 @@ class TestSpatialChannelsLastFormat:
         x = torch.randn(shape)
         expected = torch.narrow(x, dim, shape[dim] - 1, 1)
 
-        wire = _pack_spatial_halo(
+        buffer = _halo_exchange_buffer(
             x,
             dim,
             shape[dim] - 1,
             1,
-            physical_wire=True,
+            memory_format=(torch.channels_last_3d if len(shape) == 5 else torch.channels_last),
         )
-        actual = _physical_to_logical_channels_last(wire)
+        actual = _physical_to_logical_channels_last(buffer)
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert wire.is_contiguous()
+        assert buffer.is_contiguous()
         expected_format = torch.channels_last_3d if len(shape) == 5 else torch.channels_last
         assert actual.is_contiguous(memory_format=expected_format)
 
