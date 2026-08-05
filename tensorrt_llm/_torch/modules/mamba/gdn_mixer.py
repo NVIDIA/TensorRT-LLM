@@ -175,7 +175,7 @@ def gdn_custom_op_inplace(
     )
 
 
-breakable_gdn_custom_op_inplace = eager_on_graph(gdn_custom_op_inplace)
+maybe_bcg_gdn_custom_op_inplace = eager_on_graph(gdn_custom_op_inplace)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -1062,12 +1062,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             attn_out = mixed_qkv.new_empty(
                 (1, mixed_qkv.shape[0], self.num_v_heads_per_tp, self.head_v_dim)
             )
-            custom_op = (
-                breakable_gdn_custom_op_inplace
-                if use_breakable_cuda_graph
-                else gdn_custom_op_inplace
-            )
-            custom_op(mixed_qkv, a, b, self.layer_idx_str, attn_out)
+            maybe_bcg_gdn_custom_op_inplace(mixed_qkv, a, b, self.layer_idx_str, attn_out)
         else:
             attn_out = self.forward_core(
                 mixed_qkv,
