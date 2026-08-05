@@ -5065,7 +5065,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
             # Divide bias by tp_size as we shard along the hidden dimension.
             # The bias is applied at each TP rank before the final accumulation.
-            w2_weight /= module.tp_size
+            w2_weight = w2_weight / module.tp_size
 
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
