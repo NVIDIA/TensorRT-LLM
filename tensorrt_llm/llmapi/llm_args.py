@@ -1415,16 +1415,18 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
+                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+                      "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
-    backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
-        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL"] = Field(
-            default='AUTO',
-            description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
-        )
+    backend: _MoeBackend = Field(
+        default='AUTO',
+        description="MoE backend to use. "
+        "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -1782,6 +1784,12 @@ class DecodingBaseConfig(StrictBaseModel):
         "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
         "target's embedded mtp.* weights.")
 
+    moe_backend: Optional[_MoeBackend] = Field(
+        default=None,
+        description=
+        "MoE backend override for the speculative (draft) model on the PyTorch backend. None preserves the existing behavior, AUTO selects a backend from the draft model configuration, and a concrete backend applies only to the draft model. The resolved backend may fall back based on model, quantization, and hardware support. One-engine MTP backed by target-checkpoint draft layers does not support this override because target and draft layers share quantization metadata; shared-KV external assistants are supported."
+    )
+
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
@@ -1983,6 +1991,34 @@ class DecodingBaseConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def _validate_moe_backend_compatibility(self,
+                                            *,
+                                            model_config_resolved: bool = False
+                                            ) -> None:
+        if self.moe_backend is None:
+            return
+
+        spec_mode = self.spec_dec_mode
+        unsupported_internal_mtp = (spec_mode.is_mtp_vanilla()
+                                    or (model_config_resolved
+                                        and spec_mode.is_mtp_eagle_one_model()
+                                        and not self._use_shared_kv_cache))
+        if unsupported_internal_mtp:
+            raise ValueError(
+                "speculative_config.moe_backend does not support "
+                "one-engine MTP backed by target-checkpoint draft layers "
+                "because target and draft layers share quantization metadata. "
+                "Leave moe_backend unset to inherit the target backend, or "
+                "use a separate draft checkpoint.")
+
+        has_neural_drafter = (spec_mode.has_draft_model()
+                              or (spec_mode.use_one_engine()
+                                  and not spec_mode.is_sa()))
+        if not has_neural_drafter:
+            raise ValueError("speculative_config.moe_backend requires a neural "
+                             "draft model or draft layers, but decoding_type "
+                             f"{self.decoding_type} does not use one.")
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -5780,6 +5816,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            self.speculative_config._validate_moe_backend_compatibility()
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,

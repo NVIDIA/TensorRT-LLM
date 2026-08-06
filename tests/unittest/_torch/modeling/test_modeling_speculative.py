@@ -29,8 +29,11 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     DFlashForCausalLM,
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
+    _copy_model_config_with_moe_backend,
+    external_drafter_config_kwargs,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 
 class _FakeDraftModel(nn.Module):
@@ -424,3 +427,59 @@ def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
         wrapper._dflash_trtllm_gen_counters = torch.empty(16, dtype=torch.uint8, device="meta")
         with pytest.raises(RuntimeError, match="counter buffer.*before CUDA graph capture"):
             _prepare_dflash_buffers(wrapper, 2)
+
+
+# ---------------------------------------------------------------------------
+# One-engine draft MoE backend selection
+# ---------------------------------------------------------------------------
+
+
+def _draft_backend_test_model_config(moe_backend: str = "CUTLASS") -> ModelConfig:
+    return ModelConfig(
+        pretrained_config=PretrainedConfig(
+            architectures=["DraftBackendTestForCausalLM"],
+            hidden_size=64,
+            vocab_size=128,
+            num_hidden_layers=2,
+        ),
+        moe_backend=moe_backend,
+    )
+
+
+def _external_spec_config(moe_backend: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.PARD,
+        moe_backend=moe_backend,
+    )
+
+
+def test_external_draft_moe_backend_none_inherits_target() -> None:
+    """None preserves the existing target-backend inheritance behavior."""
+    model_config = _draft_backend_test_model_config("CUTLASS")
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config(None))
+
+    assert kwargs["moe_backend"] == "CUTLASS"
+
+
+def test_external_draft_moe_backend_auto_reaches_draft_loader() -> None:
+    """AUTO remains unresolved until the draft checkpoint quant config is read."""
+    model_config = _draft_backend_test_model_config("TRTLLM")
+
+    kwargs = external_drafter_config_kwargs(model_config, _external_spec_config("AUTO"))
+
+    assert kwargs["moe_backend"] == "AUTO"
+
+
+def test_loaded_draft_moe_backend_uses_isolated_model_config() -> None:
+    """Resolving a loaded draft config does not modify another config."""
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    with patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend:
+        draft_config = _copy_model_config_with_moe_backend(target_config, "AUTO")
+
+    assert draft_config is not target_config
+    assert draft_config.moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "CUTLASS"
+    resolve_backend.assert_called_once_with(
+        "AUTO", "DraftBackendTestForCausalLM", quant_config=target_config.quant_config
+    )

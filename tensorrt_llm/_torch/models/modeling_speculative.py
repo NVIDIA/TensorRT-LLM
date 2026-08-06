@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import copy
 import inspect
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
@@ -2374,6 +2375,29 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
+def _get_requested_draft_moe_backend(model_config: ModelConfig,
+                                     spec_config: object) -> str:
+    """Return the draft MoE backend request, preserving target inheritance."""
+    requested_backend = getattr(spec_config, "moe_backend", None)
+    return (model_config.moe_backend
+            if requested_backend is None else requested_backend)
+
+
+def _copy_model_config_with_moe_backend(
+        model_config: ModelConfig, requested_moe_backend: str) -> ModelConfig:
+    """Copy a ModelConfig and resolve its MoE backend against its own weights."""
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or []
+    architecture = architectures[0] if architectures else ""
+    resolved_moe_backend = ModelConfig.resolve_moe_backend(
+        requested_moe_backend,
+        architecture,
+        quant_config=model_config.quant_config)
+    draft_config = copy.copy(model_config)
+    object.__setattr__(draft_config, "moe_backend", resolved_moe_backend)
+    return draft_config
+
+
 def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     """`ModelConfig.from_pretrained` kwargs for a one-model external drafter.
 
@@ -2393,7 +2417,7 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     kwargs = dict(
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=model_config.moe_backend,
+        moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
         mapping=model_config.mapping,
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
@@ -2466,6 +2490,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
             getattr(model, "aux_stream_dict", None),
             num_stages=num_stages,
             block_size=model_config.spec_config.block_size,
+            draft_moe_backend=getattr(model_config.spec_config, "moe_backend",
+                                      None),
         )
     elif spec_dec_mode.is_draft_target_one_model():
         # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
@@ -2509,6 +2535,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
+                requested_draft_moe_backend = _get_requested_draft_moe_backend(
+                    model_config, spec_config)
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
@@ -2516,18 +2544,28 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
                             mapping=model_config.mapping,
-                            moe_backend=model_config.moe_backend,
+                            moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
+                        if getattr(spec_config, "moe_backend",
+                                   None) is not None:
+                            # Unlike ModelConfig.from_pretrained, the Mistral
+                            # loader does not resolve AUTO after loading quant
+                            # metadata. Resolve it against the draft config now,
+                            # before constructing any draft modules.
+                            self.draft_config = \
+                                _copy_model_config_with_moe_backend(
+                                    self.draft_config,
+                                    requested_draft_moe_backend)
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=model_config.moe_backend,
+                            moe_backend=requested_draft_moe_backend,
                             mapping=model_config.mapping,
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
@@ -2545,7 +2583,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
+                        moe_backend=requested_draft_moe_backend,
                         mapping=model_config.mapping,
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
