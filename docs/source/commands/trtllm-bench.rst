@@ -13,7 +13,7 @@ Syntax
 .. click:: tensorrt_llm.commands.bench:main
    :prog: trtllm-bench
    :nested: full
-   :commands: throughput, latency, build, prepare-dataset
+   :commands: throughput, latency, prepare-dataset
 
 
 
