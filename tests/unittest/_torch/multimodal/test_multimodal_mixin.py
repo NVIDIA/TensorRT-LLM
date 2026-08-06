@@ -23,10 +23,13 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
+    make_multimodal_encoder_model_config,
+    reorder_multimodal_embeddings_by_modality,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+from tensorrt_llm.mapping import Mapping
 
 
 def make_embedding(
@@ -123,6 +126,42 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
         )
 
 
+class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
+    def __init__(self, rank: int, *, enable_attention_dp: bool = False):
+        embedding = make_embedding(num_embeddings=8, hidden_size=2)
+        super().__init__(embedding, torch.tensor([7]))
+        self.model_config = ModelConfig(
+            mapping=Mapping(
+                world_size=2,
+                rank=rank,
+                tp_size=2,
+                enable_attention_dp=enable_attention_dp,
+            ),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1 if enable_attention_dp else 2,
+                encoder_cache_max_bytes=0,
+            ),
+        )
+        self.peer_output = None
+        self.encoded_item_ids = []
+
+    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
+        rows = []
+        for param in multimodal_params:
+            item_ids = param.multimodal_data["image"]["pixel_values"][:, 0, 0, 0]
+            lengths = param.multimodal_data["multimodal_embedding_lengths"]
+            self.encoded_item_ids.extend(int(item_id) for item_id in item_ids)
+            for item_id, length in zip(item_ids, lengths, strict=True):
+                rows.append(torch.full((length, 2), float(item_id)))
+        return torch.cat(rows, dim=0)
+
+    def _allreduce_encoder_dp_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype == torch.int32:
+            return tensor
+        assert self.peer_output is not None
+        return tensor + self.peer_output
+
+
 def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:
     return MultimodalParams(multimodal_data={"multimodal_embedding": mm_embeds})
 
@@ -177,6 +216,119 @@ def make_keyed_multimodal_param(
         multimodal_data=mm_data,
         multimodal_runtime=make_runtime(sum(embedding_lengths)),
     )
+
+def make_encoder_dp_param() -> MultimodalParams:
+    return MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.tensor([10.0, 20.0, 30.0]).reshape(3, 1, 1, 1),
+                "image_sizes": [[1, 1], [1, 1], [1, 1]],
+            },
+            "multimodal_embedding_lengths": [4, 1, 3],
+        }
+    )
+
+
+def make_sparse_encoder_dp_output(
+    model: DataParallelEncoderMultimodalModel,
+    param: MultimodalParams,
+) -> torch.Tensor:
+    plan = model._plan_encoder_dp_work([param])
+    assert plan is not None
+    local_params, placements, total_rows = plan
+    local_output = model.encode_multimodal_inputs(local_params)
+    sparse_output = torch.zeros(total_rows, model.embedding_dim)
+    for placement in placements:
+        sparse_output[
+            placement.global_row_start : placement.global_row_start + placement.row_count
+        ] = local_output[
+            placement.local_row_start : placement.local_row_start + placement.row_count
+        ]
+    return sparse_output
+
+
+def test_make_multimodal_encoder_model_config_replicates_encoder_mapping():
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=2, rank=1, tp_size=2),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
+    )
+
+    encoder_config = make_multimodal_encoder_model_config(model_config)
+
+    assert model_config.mapping.tp_size == 2
+    assert encoder_config.mapping.tp_size == 1
+    assert encoder_config.mapping.pp_size == 2
+    assert encoder_config.mapping.rank == 1
+    assert encoder_config.mapping.local_rank == model_config.mapping.local_rank
+
+
+def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp():
+    model_config = ModelConfig(
+        mapping=Mapping(
+            world_size=2,
+            rank=0,
+            tp_size=2,
+            enable_attention_dp=True,
+        ),
+        multimodal_config=MultimodalConfig(),
+    )
+
+    encoder_config = make_multimodal_encoder_model_config(model_config)
+
+    assert model_config.mapping.enable_attention_dp
+    assert encoder_config.mapping.tp_size == 1
+    assert not encoder_config.mapping.enable_attention_dp
+
+
+def test_encoder_data_parallel_partitions_items_and_restores_order():
+    param = make_encoder_dp_param()
+    rank_zero_model = DataParallelEncoderMultimodalModel(rank=0)
+    rank_one_model = DataParallelEncoderMultimodalModel(rank=1)
+    rank_zero_model.peer_output = make_sparse_encoder_dp_output(rank_one_model, param)
+
+    output = rank_zero_model._run_multimodal_encoder([param])
+
+    assert rank_zero_model.encoded_item_ids == [10]
+    assert rank_one_model.encoded_item_ids == [20, 30]
+    expected = torch.tensor([10.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    torch.testing.assert_close(output, expected)
+
+
+def test_attention_data_parallel_encodes_only_local_requests_without_collective():
+    model = DataParallelEncoderMultimodalModel(rank=1, enable_attention_dp=True)
+    param = make_encoder_dp_param()
+
+    output = model._run_multimodal_encoder([param])
+
+    assert model.encoded_item_ids == [10, 20, 30]
+    assert output.shape == (8, 2)
+
+
+def test_reorder_modality_grouped_embeddings_restores_prompt_order():
+    params = [
+        MultimodalParams(
+            multimodal_data={
+                "image": {"pixel_values": torch.empty(2, 1)},
+                "video": {"pixel_values_videos": torch.empty(3, 1)},
+                "multimodal_embedding_lengths": [3, 2],
+            },
+            mm_item_order=[
+                {"modality": "video", "index": 0},
+                {"modality": "image", "index": 0},
+            ],
+        )
+    ]
+    image_embeddings = torch.full((2, 1), 10.0)
+    video_embeddings = torch.full((3, 1), 20.0)
+
+    output = reorder_multimodal_embeddings_by_modality(
+        params,
+        ("image", "video"),
+        (image_embeddings, video_embeddings),
+    )
+
+    expected = torch.tensor([[20.0], [20.0], [20.0], [10.0], [10.0]])
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.cpu_only
