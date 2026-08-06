@@ -308,7 +308,9 @@ inline int getSMVersion(bool queryRealSmArch = false)
 
 inline bool isSM100Family(std::optional<int> sm = std::nullopt)
 {
-    int smVersion = sm.value_or(getSMVersion());
+    // Not value_or(): its argument is evaluated eagerly, so an explicit sm
+    // would still trigger a device query (which throws with no device present).
+    int smVersion = sm.has_value() ? *sm : getSMVersion();
     return smVersion >= 100 && smVersion < 110;
 }
 
