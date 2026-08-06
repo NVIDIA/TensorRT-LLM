@@ -93,6 +93,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
 
+    @field_validator("generation_config", mode="after")
+    @classmethod
+    def ensure_no_generation_config_defaults(cls, value: str) -> str:
+        if value != "trtllm":
+            raise ValueError("AutoDeploy does not support generation_config='auto'; use 'trtllm'.")
+        return value
+
     @field_validator(
         "tensor_parallel_size",
         "pipeline_parallel_size",
