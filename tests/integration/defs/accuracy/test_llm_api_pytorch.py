@@ -39,7 +39,8 @@ from tensorrt_llm.llmapi import (
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (check_device_contain, get_device_count, llm_models_root,
+from ..conftest import (check_device_contain, get_device_count,
+                        get_mpi_world_size, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
@@ -80,6 +81,20 @@ def _get_default_torch_compile_config(torch_compile):
                               enable_piecewise_cuda_graph=True,
                               capture_num_tokens=[2048, 8192],
                               max_num_streams=3) if torch_compile else None
+
+
+def _latest_kv_cache_stats(llm):
+    """Cumulative KV cache stats, warmup-adjusted, from the last iteration.
+
+    Requires the LLM to be built with enable_iter_perf_stats=True; without it
+    the reuse counters are never populated.
+    """
+    entries = [
+        s["kvCacheStats"] for s in llm.get_stats(timeout=5)
+        if s.get("kvCacheStats")
+    ]
+    assert entries, "No kvCacheStats reported; is enable_iter_perf_stats set?"
+    return entries[-1]
 
 
 def _run_multinode_accuracy(model_path,
@@ -176,11 +191,25 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  attn_backend=attn_backend,
                  enable_chunked_prefill=True,
-                 max_num_tokens=512) as llm:
+                 max_num_tokens=512,
+                 enable_iter_perf_stats=True) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           sampling_params=(SamplingParams(
                               temperature=0.001) if use_temperature else None))
+
+            # MMLU prepends a fixed 5-shot prefix per subject (~12 blocks at the median), and
+            # iterates subject by subject, so block reuse should be hit heavily here regardless of
+            # attention backend.
+            stats = _latest_kv_cache_stats(llm)
+            # Uncomment for debugging:
+            # print(f"[MMLU] backend={attn_backend} "
+            #       f"reused={stats['reusedBlocks']} "
+            #       f"missed={stats['missedBlocks']} "
+            #       f"hit_rate={stats['cacheHitRate']:.4f}")
+
+            # This should be close to 0.8, but keeping it low out of caution for CI.
+            assert stats["reusedBlocks"] > 0.5
 
     @pytest.mark.skip_less_device_memory(32000)
     def test_dummy_load_format(self):
@@ -3452,6 +3481,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             "host_cache_offload", "host_cache_offload_mtp1",
             "host_cache_offload_mtp3_no_adp"
         ])
+    # Executor warmup runs close to H200 capacity; use a fresh worker pool so
+    # allocations retained by earlier tests cannot consume its memory headroom.
+    @pytest.mark.private_mpi_session
     def test_dsa_host_cache_offload(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     overlap_scheduler, max_batch_size,
                                     host_cache_size_gb, attention_dp):
@@ -6894,12 +6926,15 @@ class TestNemotronV3Nano(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @skip_post_hopper
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(45000)
     @parametrize_with_ids("tp_size", [1, 2, 4, 8])
     def test_nvfp4_marlin_multi_gpus(self, tp_size):
+        if get_mpi_world_size() < tp_size:
+            pytest.skip(
+                f"Requires MPI world size >= {tp_size} for TP={tp_size}")
+
         ep_size = tp_size
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",

@@ -642,11 +642,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:self.num_seqs],
         )
 
-    def prepare_encoder_decoder(self, prompt_lens: torch.Tensor,
-                                kv_lens: torch.Tensor, context_kv_tokens: int,
-                                generation_kv_tokens: int,
-                                max_kv_len: int) -> None:
-        """Prepare simple encoder-decoder attention from native host buffers."""
+    def prepare_encoder_decoder_from_precomputed_lengths(
+            self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
+            context_kv_tokens: int, generation_kv_tokens: int,
+            max_kv_len: int) -> None:
+        """Prepare encoder-decoder attention from precomputed lengths."""
         super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:

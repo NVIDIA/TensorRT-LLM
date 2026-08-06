@@ -39,6 +39,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SerializableSchedulerOutput,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _InflightRequestIds:
     def __init__(self):

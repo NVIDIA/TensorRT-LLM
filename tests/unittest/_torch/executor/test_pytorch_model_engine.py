@@ -11,13 +11,15 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
     MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    CUDAGraphRunner, EncoderCUDAGraphRunner, _restore_spec_decode_capture_state,
-    _save_spec_decode_capture_state)
+    CUDAGraphRunner, EncoderCUDAGraphRunner, KeyType,
+    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -39,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.mapping import CpType, Mapping
@@ -188,8 +191,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
 
 
 def _make_forward_only_engine(
-    graph_key: tuple[int, int, bool, bool, bool, tuple[int, ...],
-                     tuple[int, ...]] | None,
+    graph_key: KeyType | None,
     runner_enabled: bool = True,
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
@@ -269,18 +271,21 @@ def create_model_engine_and_kvcache(
     num_layers = 1
     batch_size = 13
 
-    llm_args = llm_args if llm_args else TorchLlmArgs(
-        model="dummy",
-        max_batch_size=batch_size,
-        max_num_tokens=max_tokens,
-        cuda_graph_config=CudaGraphConfig(
-            enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]))
-    test_batches = (5, 13)
-    for batch_size in test_batches:
-        assert batch_size not in llm_args.cuda_graph_config.batch_sizes
+    if llm_args is None:
+        llm_args = TorchLlmArgs(model="dummy",
+                                max_batch_size=batch_size,
+                                max_num_tokens=max_tokens,
+                                cuda_graph_config=CudaGraphConfig(
+                                    enable_padding=True,
+                                    batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]))
+        # The padding tests below rely on these properties of the default
+        # config: batches of 5 and 13 must round up to 8 and 16 respectively.
+        test_batches = (5, 13)
+        for test_batch_size in test_batches:
+            assert test_batch_size not in llm_args.cuda_graph_config.batch_sizes
 
-    assert (8 in llm_args.cuda_graph_config.batch_sizes
-            and 16 in llm_args.cuda_graph_config.batch_sizes)
+        assert (8 in llm_args.cuda_graph_config.batch_sizes
+                and 16 in llm_args.cuda_graph_config.batch_sizes)
 
     model_engine = DummyModelEngine(llm_args, torch.half, spec_config)
 
@@ -611,7 +616,83 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         runner._get_seq_len_mode.assert_called_once_with(
             batch, None, promoted_ids)
-        self.assertEqual(key, (1, 0, False, True, True, (), (0, )))
+        self.assertEqual(
+            key,
+            KeyType(batch_size=1,
+                    draft_len=0,
+                    is_first_draft=False,
+                    short_seq_len_mode=True,
+                    num_encoder_tokens=0))
+
+    def test_graph_key_aggregates_encoder_tokens(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._get_seq_len_mode.return_value = False
+        context = _make_request_stub(1)
+        context.encoder_output_len = 7
+        context.py_skip_cross_kv_projection = False
+        skipped_context = _make_request_stub(2)
+        skipped_context.encoder_output_len = 11
+        skipped_context.py_skip_cross_kv_projection = True
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [context, skipped_context]
+        batch.generation_requests = [_make_request_stub(3)]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        assert key is not None
+        self.assertEqual(key.num_contexts, 2)
+        self.assertEqual(key.context_query_len, 1)
+        self.assertEqual(key.num_encoder_tokens, 7)
+        self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
+                         3)
+
+    def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        first_context = _make_request_stub(1)
+        first_context.encoder_output_len = 7
+        first_context.py_skip_cross_kv_projection = False
+        second_context = _make_request_stub(2)
+        second_context.context_chunk_size = 2
+        second_context.encoder_output_len = 11
+        second_context.py_skip_cross_kv_projection = False
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [first_context, second_context]
+        batch.generation_requests = [_make_request_stub(3)]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        self.assertIsNone(key)
+
+    def test_graph_key_rounds_encoder_tokens_up_to_captured_extent(
+            self) -> None:
+        key = KeyType(batch_size=2,
+                      draft_len=0,
+                      is_first_draft=False,
+                      num_contexts=1,
+                      context_query_len=1,
+                      num_encoder_tokens=7)
+        smaller_key = key._replace(num_encoder_tokens=6)
+        compatible_key = key._replace(num_encoder_tokens=8)
+        larger_key = key._replace(num_encoder_tokens=16)
+        runner = SimpleNamespace(
+            padding_enabled=True,
+            _capture_allowed=False,
+            graph_metadata={},
+            graph_outputs={
+                smaller_key: object(),
+                compatible_key: object(),
+                larger_key: object(),
+            },
+        )
+
+        actual_key = CUDAGraphRunner._get_compatible_mixed_encoder_decoder_key(
+            runner, key)
+
+        self.assertEqual(actual_key, compatible_key)
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
@@ -620,7 +701,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             enable_attention_dp=False,
             use_mrope=False,
         )
-        key = (1, 0, False, True, True, (), (0, ))
+        key = KeyType(batch_size=1,
+                      draft_len=0,
+                      is_first_draft=False,
+                      short_seq_len_mode=True,
+                      num_encoder_tokens=0)
         graph_attn_metadata = object()
         graph_spec_metadata = object()
         runner.get_graph_key.return_value = key
@@ -654,7 +739,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                          (graph_attn_metadata, graph_spec_metadata, key))
 
     def test_forward_commits_candidate_only_on_graph_hit(self) -> None:
-        key = (2, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         context = _make_request_stub(1)
@@ -713,7 +798,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:
-        key = (2, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
@@ -809,7 +894,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.replay.assert_not_called()
 
     def test_forward_allows_guided_context_logits_on_graph_hit(self) -> None:
-        key = (1, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         engine.guided_decoder = Mock()
@@ -862,7 +947,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIn("multimodal_embedding", multimodal_data)
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
-        key = (1, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         generation = _make_request_stub(2)
         batch = ScheduledRequests()
@@ -1123,7 +1208,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           max_num_tokens=32,
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
-        spec_metadata = Mock()
+        # A bare Mock auto-vivifies every attribute, so the capture-only
+        # override has to be pinned off or _prepare_tp_inputs reads it as live.
+        spec_metadata = Mock(_force_non_greedy_for_capture=False)
 
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_current_position = 3
@@ -1180,6 +1267,55 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
+
+    def test_multimodal_encoder_max_seq_len(self) -> None:
+
+        class CapturingEncoder(torch.nn.Module, MultimodalEncoderMixin):
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.setup_args = None
+                self.max_seq_len = None
+
+            def setup_attn_metadata(self, max_num_requests: int,
+                                    max_num_tokens: int) -> None:
+                self.setup_args = (max_num_requests, max_num_tokens)
+
+            def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+                self.max_seq_len = max_seq_len
+
+        encoder_batch_size = 32
+        encoder_max_num_tokens = 16384
+        processor_max_num_tokens = 65536
+        cases = [
+            ({
+                "image": processor_max_num_tokens
+            }, processor_max_num_tokens),
+            ({
+                "image": 4096
+            }, encoder_max_num_tokens),
+            ({}, encoder_max_num_tokens),
+            (None, encoder_max_num_tokens),
+        ]
+        for max_tokens_per_item, expected_max_seq_len in cases:
+            with self.subTest(max_tokens_per_item=max_tokens_per_item):
+                encoder = CapturingEncoder()
+                model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+                model_engine.model = torch.nn.Sequential(encoder)
+                model_engine.encoder_batch_size = encoder_batch_size
+                model_engine.encoder_max_num_tokens = encoder_max_num_tokens
+                if max_tokens_per_item is None:
+                    model_engine.input_processor = Mock()
+                else:
+                    model_engine.input_processor = Mock(
+                        spec=BaseMultimodalDummyInputsBuilder)
+                    model_engine.input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+
+                model_engine._set_up_multimodal_encoder_attn_metadata()
+
+                self.assertEqual(encoder.setup_args,
+                                 (encoder_batch_size, encoder_max_num_tokens))
+                self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
@@ -1371,11 +1507,91 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         num_free_before = kv_cache_manager.get_num_free_blocks()
         model_engine.warmup(resource_manager)
-        # Make sure we don't leak any blocks.
+
+        # Warmup pre-allocates the CUDA graph padding dummy for each captured
+        # draft length (only draft_len 0 here, no speculation), which
+        # intentionally keeps holding its KV blocks so padding cannot fall
+        # back to eager once the cache saturates.
+        padding_dummies = model_engine.cuda_graph_runner.padding_dummy_requests
+        self.assertEqual([0], sorted(padding_dummies.keys()))
+
+        # Make sure we don't leak any blocks beyond that dummy: freeing it
+        # must restore the exact pre-warmup free-block count.
+        kv_cache_manager.free_resources(padding_dummies[0])
         self.assertEqual(num_free_before,
                          kv_cache_manager.get_num_free_blocks())
 
         kv_cache_manager.shutdown()
+
+    def test_warmup_skips_padding_dummy_when_padding_impossible(self):
+        # With max_batch_size=1 and a graph for batch size 1, every batch
+        # already matches a graph size, so no padded batch can ever occur and
+        # warmup must not retain a padding dummy (it would permanently hold
+        # KV blocks and spec/hybrid resources that are never used).
+        llm_args = TorchLlmArgs(model="dummy",
+                                max_batch_size=1,
+                                max_num_tokens=258,
+                                cuda_graph_config=CudaGraphConfig(
+                                    enable_padding=True, batch_sizes=[1, 2, 4]))
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            llm_args)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        num_free_before = kv_cache_manager.get_num_free_blocks()
+        model_engine.warmup(resource_manager)
+
+        self.assertEqual({},
+                         model_engine.cuda_graph_runner.padding_dummy_requests)
+        self.assertEqual(num_free_before,
+                         kv_cache_manager.get_num_free_blocks())
+
+        kv_cache_manager.shutdown()
+
+    def test_warmup_skips_padding_dummy_during_estimation(self):
+        # The estimation-phase KV cache is sized with no headroom for retained
+        # dummies; holding blocks there can leave the estimation requests
+        # unschedulable. Warmup must skip the preallocation for managers
+        # created for KV cache capacity estimation.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        kv_cache_manager.is_estimating_kv_cache = True
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        num_free_before = kv_cache_manager.get_num_free_blocks()
+        model_engine.warmup(resource_manager)
+
+        self.assertEqual({},
+                         model_engine.cuda_graph_runner.padding_dummy_requests)
+        self.assertEqual(num_free_before,
+                         kv_cache_manager.get_num_free_blocks())
+
+        kv_cache_manager.shutdown()
+
+    def test_preallocate_padding_dummies_uses_captured_draft_lens(self):
+        # Speculative engines pad batches with the runtime draft length, so
+        # the preallocation must create dummies for the draft lengths of the
+        # captured graphs — not draft_len 0 unconditionally (an extra
+        # draft_len-0 dummy would permanently hold KV blocks that runtime
+        # padding never uses).
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        runner = model_engine.cuda_graph_runner
+        # Simulate a spec-decode capture: graphs keyed (batch_size, draft_len,
+        # is_first_draft, short_seq_len_mode, is_all_greedy_sample) exist only
+        # for draft_len 2.
+        runner.graphs[(8, 2, False, False, True)] = Mock()
+        try:
+            runner.preallocate_padding_dummies(resource_manager)
+
+            self.assertEqual([2], sorted(runner.padding_dummy_requests.keys()))
+        finally:
+            runner.graphs.clear()
+            for dummy in runner.padding_dummy_requests.values():
+                kv_cache_manager.free_resources(dummy)
+            kv_cache_manager.shutdown()
 
     def test_layerwise_nvtx_marker(self):
         llm_args = TorchLlmArgs(

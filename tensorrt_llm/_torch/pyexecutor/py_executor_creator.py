@@ -437,8 +437,9 @@ def create_py_executor(
         tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
 
-    if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
-        # Workaround for flashinfer and star attention
+    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION":
+        # Star attention still derives its page table from every allocated block,
+        # which is incompatible with blocks allocated ahead for reuse.
         if kv_cache_config.enable_block_reuse:
             logger.warning(
                 f"Disabling block reuse for {llm_args.attn_backend} backend")
@@ -461,14 +462,12 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
-            raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
+            and spec_config.spec_dec_mode.use_one_engine()
+            and not spec_config._use_shared_kv_cache):
+        raise ValueError(
+            "FLASHINFER attention backend supports one-engine speculative "
+            "decoding only when the draft model shares the target KV cache.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

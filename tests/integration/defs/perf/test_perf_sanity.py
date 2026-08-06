@@ -19,6 +19,7 @@ import fcntl
 import glob
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,6 +30,7 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -586,7 +588,6 @@ class ServerConfig:
             "gpus_per_node",
             "match_mode",
             "client_configs",
-            "match_mode",
             "backend",
             "extra_llm_api_config_path",
             "server_env_var",
@@ -622,30 +623,7 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "s_model_name",
-            "l_tp",
-            "l_ep",
-            "l_pp",
-            "l_cp",
-            "l_gpus_per_node",
-            "l_max_batch_size",
-            "b_enable_attention_dp",
-            "s_serving_backend",
-            # kv_cache_config
-            "s_kv_cache_dtype",
-            # cache_transceiver_config
-            "s_cache_transceiver_backend",
-            # speculative_config
-            # Keep baseline matching on the legacy key during DB migration.
-            # l_max_draft_len is written to DB but not used for matching until
-            # backfill completes.
-            "s_spec_decoding_type",
-            "l_num_nextn_predict_layers",
-            "l_force_num_accepted_tokens",
-            # moe_config
-            "l_load_balancer_num_slots",
-        ]
+        return get_server_match_keys(self.match_mode)
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -1013,18 +991,7 @@ class ClientConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "l_concurrency",
-            "l_iterations",
-            "l_isl",
-            "l_osl",
-            "d_random_range_ratio",
-            "s_backend",
-            "b_use_chat_template",
-            "b_streaming",
-            "b_use_nv_sa_benchmark",
-            "b_eos",
-        ]
+        return get_client_match_keys()
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
@@ -1069,6 +1036,7 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        internal_request_auth_key: str | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1079,6 +1047,7 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.internal_request_auth_key = internal_request_auth_key
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1210,6 +1179,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    internal_request_auth_key: str = ""
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1274,6 +1244,7 @@ class DisaggTestCmds(NamedTuple):
             "hostname": self.hostname,
             "port": disagg_server_port,
             "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
             "context_servers": {
                 "num_instances": self.num_ctx_servers,
                 "urls": ctx_hostnames,
@@ -1892,6 +1863,7 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        internal_request_auth_key = self._resolve_internal_request_auth_key(config)
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1933,6 +1905,7 @@ class PerfSanityTestConfig:
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
             ctx_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1942,6 +1915,7 @@ class PerfSanityTestConfig:
             }
 
             gen_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1963,6 +1937,7 @@ class PerfSanityTestConfig:
                 model_name=model_name,
                 hardware=hardware,
                 server_env_var=server_env_var,
+                internal_request_auth_key=internal_request_auth_key,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -2013,6 +1988,32 @@ class PerfSanityTestConfig:
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
+
+    def _resolve_internal_request_auth_key(self, config: dict) -> str:
+        explicit_key = config.get("internal_request_auth_key")
+        if explicit_key:
+            return explicit_key
+
+        test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(test_output_dir, exist_ok=True)
+        key_path = os.path.join(test_output_dir, "internal_request_auth_key.txt")
+        lock_path = f"{key_path}.lock"
+
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if os.path.exists(key_path):
+                    with open(key_path, "r") as key_file:
+                        internal_request_auth_key = key_file.read().strip()
+                    if internal_request_auth_key:
+                        return internal_request_auth_key
+
+                internal_request_auth_key = secrets.token_hex(32)
+                with open(key_path, "w") as key_file:
+                    key_file.write(f"{internal_request_auth_key}\n")
+                return internal_request_auth_key
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def get_commands(self):
         """Get commands based on runtime and benchmark_mode."""
@@ -2126,6 +2127,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )
