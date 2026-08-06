@@ -885,6 +885,60 @@ class TestImageEdit:
         assert gen.last_params is None
         assert list(tmp_path.iterdir()) == []
 
+    def test_image_edit_rejects_non_image_base64_input(self, tmp_path, monkeypatch):
+        """Decoded image-edit bytes must be a supported image before disk write."""
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model="Qwen/Qwen-Image-Layered",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": base64.b64encode(b"not an image").decode("utf-8"),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="image edit input is not a PNG/JPEG image",
+        )
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_non_image_upload_input(self, tmp_path, monkeypatch):
+        """Multipart image-edit bytes are sniffed before materialization."""
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model="Qwen/Qwen-Image-Layered",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+
+        resp = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "split layers",
+                "response_format": "b64_json",
+            },
+            files={"image": ("input.png", BytesIO(b"not an image"), "image/png")},
+        )
+
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="image edit input is not a PNG/JPEG image",
+        )
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
     def test_image_edit_maps_n_and_output_format(self, tmp_path, monkeypatch):
         """OpenAI edit fields map through the visual-gen serving path."""
         gen = MockVisualGen(

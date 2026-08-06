@@ -2,8 +2,11 @@ import asyncio
 import base64
 import binascii
 import os
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+
+from PIL import Image, UnidentifiedImageError
 
 from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
 from tensorrt_llm.logger import logger
@@ -18,6 +21,8 @@ IMAGE_EDIT_MAX_IMAGES = 16
 IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
 IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
 IMAGE_EDIT_MAX_OUTPUT_IMAGES = 64
+_IMAGE_EDIT_INPUT_FORMATS = {"PNG", "JPEG"}
+_INVALID_IMAGE_EDIT_INPUT_MESSAGE = "image edit input is not a PNG/JPEG image"
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message
@@ -136,28 +141,40 @@ def _write_bytes_with_limit(value: bytes, path: str) -> int:
             "Image edit input exceeds the per-image byte limit "
             f"({size} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
         )
+    _validate_png_jpeg_image(value)
     with open(path, "wb") as f:
         f.write(value)
     return size
+
+
+def _validate_png_jpeg_image(value: bytes) -> None:
+    try:
+        with Image.open(BytesIO(value)) as image:
+            image_format = image.format
+            image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE) from exc
+    if image_format not in _IMAGE_EDIT_INPUT_FORMATS:
+        raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE)
 
 
 def _copy_upload_with_limit(value: Any, path: str) -> int:
     total = 0
     if hasattr(value.file, "seek"):
         value.file.seek(0)
-    with open(path, "wb") as f:
-        while True:
-            chunk = value.file.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
-                raise ValueError(
-                    "Image edit input exceeds the per-image byte limit "
-                    f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
-                )
-            f.write(chunk)
-    return total
+    chunks = []
+    while True:
+        chunk = value.file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit input exceeds the per-image byte limit "
+                f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+            )
+        chunks.append(chunk)
+    return _write_bytes_with_limit(b"".join(chunks), path)
 
 
 def _materialize_conditioning_input(
