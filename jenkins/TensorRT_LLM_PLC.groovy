@@ -8,6 +8,8 @@ def createKubernetesPodConfig()
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
     def image = "urm.nvidia.com/docker/ubuntu:24.04"
+    // release mode requires a longer pod lifetime to survive the manual license review window
+    def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -35,7 +37,7 @@ def createKubernetesPodConfig()
                     imagePullPolicy: Always
                   - name: pulse-container-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:6.2.1
-                    command: ['sleep', '7200']
+                    command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
                       requests:
@@ -52,7 +54,7 @@ def createKubernetesPodConfig()
                       runAsGroup: 0
                   - name: pulse-oss-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable
-                    command: ['sleep', '7200']
+                    command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
                       requests:
@@ -434,7 +436,6 @@ pipeline {
     options {
         skipDefaultCheckout()
         timestamps()
-        timeout(time: 150, unit: 'MINUTES')
     }
     environment {
         LLM_REPO = getLLMRepo()
@@ -462,6 +463,7 @@ pipeline {
             }
         }
         stage('Run TRT-LLM PLC Jobs') {
+            options { timeout(time: 90, unit: 'MINUTES') }
             parallel {
                 stage("Source Code OSS Scanning") {
                     when {
@@ -497,6 +499,7 @@ pipeline {
             }
         }
         stage("Process In Pipeline Scan Result") {
+            options { timeout(time: 60, unit: 'MINUTES') }
             steps {
                 script {
                     processScanResults(env.REF)
