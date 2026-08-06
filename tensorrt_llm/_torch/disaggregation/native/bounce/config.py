@@ -23,26 +23,25 @@ from tensorrt_llm import logger
 
 _MIB = 1024 * 1024
 
-# Test/advanced override for the block-count gate below (users only tune the bounce size). Read on
-# the generation side, so set it there; unset uses the default.
+# Test/advanced overrides for the size gates below (users only tune the bounce size). Read on the
+# generation side, so set them there; unset uses the defaults.
+_MIN_BYTES_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES"
 _MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"
 
 
-def _env_min_blocks(default: int) -> int:
-    """Read the gate from the env, defensively: unset or malformed falls back to the default (never
+def _env_int_gate(name: str, default: int) -> int:
+    """Read a gate from the env, defensively: unset or malformed falls back to the default (never
     crashing), and the value is clamped to at least 1."""
-    raw = os.environ.get(_MIN_BLOCKS_ENV)
+    raw = os.environ.get(name)
     if raw is None:
         return default
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(f"{_MIN_BLOCKS_ENV}={raw!r} is not an integer; using default {default}")
+        logger.warning(f"{name}={raw!r} is not an integer; using default {default}")
         return default
     if value < 1:
-        logger.warning(
-            f"{_MIN_BLOCKS_ENV}={value} < 1; clamping to 1 (bounce always clears the gate)"
-        )
+        logger.warning(f"{name}={value} < 1; clamping to 1 (bounce always clears the gate)")
         return 1
     return value
 
@@ -103,20 +102,35 @@ def fit_within_free(
     return capacity_bytes
 
 
+# Use a byte gate because cache block size varies substantially across models. The break-even point
+# is small: a bounce adds one device-local gather and scatter, while an in-place inter-node transfer
+# can fall back to host-staged bandwidth. Keep this advanced/test tunable through the environment.
+DEFAULT_MIN_BYTES = 2 * _MIB
+
+
 @dataclass
 class Config:
     sizing: Sizing = field(default_factory=FixedSizing)  # how much memory to reserve (pluggable)
     chunk_mb: int = 32  # physical chunk size; a large chunk keeps the write to a single descriptor
-    # skip bounce below this many blocks (roughly 12k tokens at 128 per block); heuristic, tunable
-    min_blocks: int = 96
+    # skip bounce below this many bytes; this is the operative, model-independent gate
+    min_bytes: int = DEFAULT_MIN_BYTES
+    # legacy override retained for compatibility; the default is vacuous so the byte gate decides
+    min_blocks: int = 1
 
 
-def config_from_size(size_mb: int, min_blocks: Optional[int] = None) -> Optional[Config]:
+def config_from_size(
+    size_mb: int | None, min_blocks: Optional[int] = None, min_bytes: Optional[int] = None
+) -> Optional[Config]:
     """Build a bounce config from a per-region size in MiB, or None to leave bounce off (size <= 0).
-    Size is both the capacity and the on/off switch. min_blocks is the gate below which a transfer
-    stays on the per-block path; when unset it comes from the env, else the default."""
+    Size is both the capacity and the on/off switch. min_bytes and the legacy min_blocks are the
+    gates below which a transfer stays on the per-block path; when unset each comes from its
+    environment override or the default."""
     if size_mb is None or size_mb <= 0:
         return None
     if min_blocks is None:
-        min_blocks = _env_min_blocks(Config.min_blocks)
-    return Config(sizing=FixedSizing(capacity_mb=size_mb), min_blocks=min_blocks)
+        min_blocks = _env_int_gate(_MIN_BLOCKS_ENV, Config.min_blocks)
+    if min_bytes is None:
+        min_bytes = _env_int_gate(_MIN_BYTES_ENV, Config.min_bytes)
+    return Config(
+        sizing=FixedSizing(capacity_mb=size_mb), min_bytes=min_bytes, min_blocks=min_blocks
+    )
