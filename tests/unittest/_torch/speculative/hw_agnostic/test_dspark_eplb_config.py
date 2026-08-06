@@ -149,6 +149,31 @@ def test_external_drafter_kwargs_are_stable_across_modes():
     assert set(dspark) - set(common) == {"moe_load_balancer"}
 
 
+def test_dspark_draft_backend_auto_resolves_on_isolated_copy():
+    quant_config = SimpleNamespace(quant_algo=None)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        sparse_attention_config=None,
+        quant_config_dict=None,
+        quant_config=quant_config,
+        moe_backend="CUTLASS",
+    )
+
+    with patch.object(
+        modeling_dspark.ModelConfig, "resolve_moe_backend", return_value="TRTLLM"
+    ) as resolve_backend:
+        draft_config = modeling_dspark.DSparkDraftModel._derive_draft_model_config(
+            model_config, NUM_HIDDEN_LAYERS, NUM_STAGES, "AUTO"
+        )
+
+    assert draft_config is not model_config
+    assert draft_config.moe_backend == "TRTLLM"
+    assert model_config.moe_backend == "CUTLASS"
+    resolve_backend.assert_called_once_with(
+        "AUTO", "DeepseekV4ForCausalLM", quant_config=quant_config
+    )
+
+
 # --------------------------------------------------------------------------
 # 2. stage-layer placement coverage
 # --------------------------------------------------------------------------
