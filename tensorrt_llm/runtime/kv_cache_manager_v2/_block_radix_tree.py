@@ -46,11 +46,29 @@ def gen_multimodal_cache_key_tokens(
     """Create synthetic tokens used only when building multimodal KV-cache keys.
 
     Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
+
+    Args:
+        id_offset: First synthetic id, usually ``vocab_size``, so generated ids cannot
+            collide with real token ids.
+        multi_modal_data_digest: Content digest of the multimodal item; must be exactly
+            ``_SHA256_DIGEST_SIZE`` bytes.
+        num_tokens: Number of synthetic tokens to generate. Must be positive.
+        token_offset: Item-local index of the first generated token. Must be non-negative;
+            only offset 0 carries the digest.
+
+    Returns:
+        The generated tokens, digest first when ``token_offset`` is 0.
+
+    Raises:
+        ValueError: If the digest length is wrong, ``num_tokens`` is not positive, or
+            ``token_offset`` is negative.
     """
     if len(multi_modal_data_digest) != _SHA256_DIGEST_SIZE:
         raise ValueError(f"multi_modal_data_digest must have length {_SHA256_DIGEST_SIZE}")
-    assert num_tokens > 0
-    assert token_offset >= 0
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if token_offset < 0:
+        raise ValueError("token_offset must be non-negative")
     return [
         multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
         for i in range(num_tokens)
@@ -58,6 +76,18 @@ def gen_multimodal_cache_key_tokens(
 
 
 class Hasher:
+    """Incremental SHA-256 hasher used to derive block keys for the radix tree.
+
+    Accepts ints (encoded as 4 little-endian bytes each, matching the C++ backend's
+    4-byte ``TokenIdExt`` layout), raw ``bytes`` (multimodal content digests and
+    reuse-scope fields), or a sequence mixing the two. Both backends must produce
+    identical digests for the same logical input, so the encoding is part of the
+    on-disk/cross-process contract and cannot change unilaterally.
+
+    Args:
+        data: Optional initial value, hashed immediately as if passed to ``update``.
+    """
+
     # SECURITY INVARIANT: the block-key hash MUST stay cryptographically
     # collision-resistant and >= 256-bit. The radix tree is a globally shared,
     # cross-request/cross-tenant cache index; prefix matches are decided purely by
@@ -77,8 +107,18 @@ class Hasher:
         if data is not None:
             self.update(data)
 
-    # This function is perf-critical. Expect compromised code quality.
     def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
+        """Fold ``data`` into the running digest.
+
+        Args:
+            data: An int token id (0 <= id < 2**31), raw ``bytes``, or a sequence of
+                either. An all-int sequence takes a single-call fast path; a sequence
+                containing ``bytes`` (multimodal blocks) falls back to per-item hashing.
+
+        Returns:
+            This ``Hasher``, to allow chaining.
+        """
+        # This function is perf-critical. Expect compromised code quality.
         if type(data) is int:
             assert NDEBUG or (data >= 0 and data < (1 << 31))
             self._hasher.update(data.to_bytes(4, "little"))

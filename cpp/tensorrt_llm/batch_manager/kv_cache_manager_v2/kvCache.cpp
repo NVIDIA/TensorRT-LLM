@@ -1731,6 +1731,10 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     if (mCommitState == CommitState::USER_STOP)
         throw LogicError("Cannot commit tokens after stop_committing()");
 
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        !mTextOnly || std::none_of(tokens.begin(), tokens.end(), [](TokenIdExt const& t) { return t.isDigest(); }),
+        "Cannot commit digest tokens to a text-only KV cache");
+
     bool const commitMinSnapshot = mManager->commitMinSnapshot();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     if (commitMinSnapshot)
