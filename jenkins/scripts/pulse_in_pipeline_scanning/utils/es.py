@@ -9,17 +9,13 @@ from elasticsearch import Elasticsearch, RequestsHttpConnection
 
 ES_QUERY_URL = os.environ.get("TRTLLM_ES_QUERY_URL")
 ES_INDEX_BASE = os.environ.get("TRTLLM_ES_INDEX_BASE") or ""
-ES_INDEX_PREAPPROVED_BASE = os.environ.get("TRTLLM_ES_INDEX_PREAPPROVED_BASE") or ""
+ES_INDEX_PREAPPROVED = "df-swdl-tensorrt-infra-plc-pre-approve"
 ES_PREAPPROVED_POST_URL = os.environ.get("TRTLLM_ES_PREAPPROVED_POST_URL", "")
 
 if not ES_QUERY_URL:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_QUERY_URL' is not set!")
 if not ES_INDEX_BASE:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_INDEX_BASE' is not set!")
-if not ES_INDEX_PREAPPROVED_BASE:
-    raise EnvironmentError(
-        "Error: Environment variable 'TRTLLM_ES_INDEX_PREAPPROVED_BASE' is not set!"
-    )
 
 TIMEOUT = 1000
 ES_CLIENT = Elasticsearch(
@@ -74,7 +70,7 @@ def get_preapproved_deps(scan_type: str) -> list[dict]:
         if search_after:
             body["search_after"] = search_after
         try:
-            resp = ES_CLIENT.search(index=ES_INDEX_PREAPPROVED_BASE + "-*", body=body)
+            resp = ES_CLIENT.search(index=ES_INDEX_PREAPPROVED, body=body)
         except Exception as exc:
             print(f"Failed to query preapproved deps for {scan_type}: {exc}", file=sys.stderr)
             break
