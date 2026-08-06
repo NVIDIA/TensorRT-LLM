@@ -26,6 +26,7 @@ batch shapes (and collectives) diverge.
 """
 
 from dataclasses import dataclass
+from typing import Union
 
 import torch
 
@@ -106,7 +107,7 @@ def compute_survival(confidence: torch.Tensor) -> torch.Tensor:
 def schedule_verify_lens_topk(
     *,
     survival: torch.Tensor,
-    budget: int,
+    budget: Union[int, torch.Tensor],
     cfg: DSparkScheduleConfig,
 ) -> torch.Tensor:
     """Allocate ``budget`` verify tokens across the batch by global survival rank.
@@ -115,6 +116,9 @@ def schedule_verify_lens_topk(
         survival: ``[bs, K]`` prefix-survival probabilities from
             :func:`compute_survival`.
         budget: total verify tokens to hand out *above* the per-request floor.
+            A 0-d integer tensor is honoured without a host sync (the value
+            stays device-resident through the ``rank < budget`` cut), which is
+            what lets the whole function run inside a captured graph.
         cfg: bounds; see :class:`DSparkScheduleConfig`.
     Returns:
         ``[bs]`` int32 verify lengths, each in
@@ -137,8 +141,11 @@ def schedule_verify_lens_topk(
     floor = int(cfg.min_verify_len)
     schedulable = int(cfg.schedulable_per_request)
     verify_lens = torch.full((bs,), floor, dtype=torch.int32, device=device)
-    budget = int(budget)
-    if bs == 0 or schedulable <= 0 or budget <= 0:
+    if not isinstance(budget, torch.Tensor):
+        budget = int(budget)
+        if budget <= 0:
+            return verify_lens
+    if bs == 0 or schedulable <= 0:
         return verify_lens
 
     # Positions [0, floor) are already granted to every request; only those
