@@ -960,6 +960,45 @@ class TestResourceManager(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
+    def test_add_dummy_requests_failure_frees_partial_allocation(self):
+        """A partial add_dummy_requests failure must free every block it
+        allocated (TRTLLM-14903): leaked blocks on the minimal pool built for
+        cache-size estimation starve the estimation requests and hang startup.
+        """
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=2,
+            mapping=Mapping(),
+        )
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            self.assertEqual(total_free, 4)
+            # Both sequences fit in one block each, but the per-request draft
+            # add_token loop needs two more blocks per request: request 0
+            # drains the pool and request 1's first add_token raises, after
+            # three of the four blocks were already allocated.
+            with self.assertRaises(Exception):
+                kv_cache_manager.add_dummy_requests([0, 1],
+                                                    token_nums=[64, 64],
+                                                    is_gen=True,
+                                                    max_num_draft_tokens=128)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+            # The freed pool must serve follow-up allocations.
+            requests = kv_cache_manager.add_dummy_requests([2], token_nums=[64])
+            self.assertIsNotNone(requests)
+            kv_cache_manager.free_resources(requests[0])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.
