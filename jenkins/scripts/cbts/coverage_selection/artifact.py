@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import urllib.error
@@ -43,6 +43,9 @@ from typing import Optional
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
 TARBALL_NAME = "cbts_pystart_report.tar.gz"
 SQLITE_NAME = "cbts_touchmap.sqlite"
+# Per-build metadata the pipeline uploads next to the artifacts; `commit=<sha>`
+# is the revision that build ran, and is absent on some builds.
+BUILD_INFO_NAME = "build_info.txt"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
@@ -92,10 +95,83 @@ def tarball_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
     return f"{_URM}/{artifact_base}/{build}/cbts-coverage/{TARBALL_NAME}"
 
 
-def build_from_url(url: str) -> Optional[int]:
-    """Post-merge build number encoded in a `tarball_url()`, or None if absent."""
-    m = re.search(r"/(\d+)/cbts-coverage/", url or "")
-    return int(m.group(1)) if m else None
+def build_info_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
+    return f"{_URM}/{artifact_base}/{build}/{BUILD_INFO_NAME}"
+
+
+def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str]:
+    """Revision a build ran, from its `build_info.txt`, or None when unavailable."""
+    status, data = _get(build_info_url(build, artifact_base))
+    if status != 200 or not data:
+        return None
+    for line in data.decode("utf-8", "replace").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "commit" and value.strip():
+            return value.strip()
+    return None
+
+
+def commit_distance(commit: str, repo_root: str = ".", ref: str = "HEAD") -> Optional[int]:
+    """Commits in `ref` not reachable from `commit`, or None if git cannot answer."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-list", "--count", f"{commit}..{ref}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+
+
+def select_tarball(
+    artifact_base: str = ARTIFACT_BASE,
+    jenkins_base: str = _JENKINS_BASE,
+    max_probe: int = _MAX_PROBE,
+    repo_root: str = ".",
+) -> Optional[dict]:
+    """Pick the coverage tarball collected at the newest revision.
+
+    Build numbers do not order revisions: a build can be a re-run of an older
+    commit, so walking numbers down can land on a DB older than a lower-numbered
+    build's. Rank the probe window's tarball-bearing builds by how far their
+    commit trails `repo_root`'s HEAD instead, and keep the build number only as
+    the tie-break for builds whose commit git cannot resolve.
+
+    Returns {url, build, commit, lag} — commit/lag are None when unavailable.
+    """
+    build = latest_build_number(jenkins_base)
+    if build is None:
+        print("[artifact] could not resolve latest build number", file=sys.stderr)
+        return None
+    candidates = []
+    for b in range(build, max(0, build - max_probe), -1):
+        url = tarball_url(b, artifact_base)
+        if not _exists(url):
+            continue
+        commit = build_commit(b, artifact_base)
+        lag = commit_distance(commit, repo_root) if commit else None
+        candidates.append({"url": url, "build": b, "commit": commit, "lag": lag})
+    if not candidates:
+        print(f"[artifact] no tarball in the last {max_probe} builds", file=sys.stderr)
+        return None
+    # Known lag first (smallest = closest to HEAD); unknown lag falls back to build order.
+    best = min(candidates, key=lambda c: (c["lag"] is None, c["lag"] or 0, -c["build"]))
+    if best["lag"] is None:
+        print(
+            f"[artifact] build {best['build']}: commit unknown, selected by build number",
+            file=sys.stderr,
+        )
+    skipped = [c["build"] for c in candidates if c["build"] > best["build"]]
+    if skipped:
+        print(
+            f"[artifact] builds {skipped} carry an older commit than {best['build']}; skipped",
+            file=sys.stderr,
+        )
+    return best
 
 
 def latest_tarball_url(
@@ -103,20 +179,9 @@ def latest_tarball_url(
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
 ) -> Optional[str]:
-    """URL of the newest build whose coverage tarball actually exists, or None."""
-    build = latest_build_number(jenkins_base)
-    if build is None:
-        print("[artifact] could not resolve latest build number", file=sys.stderr)
-        return None
-    floor = max(0, build - max_probe)
-    while build > floor:
-        url = tarball_url(build, artifact_base)
-        if _exists(url):
-            return url
-        print(f"[artifact] build {build} has no tarball, trying {build - 1}", file=sys.stderr)
-        build -= 1
-    print(f"[artifact] no tarball in the last {max_probe} builds", file=sys.stderr)
-    return None
+    """URL of the best available coverage tarball; see `select_tarball`."""
+    best = select_tarball(artifact_base, jenkins_base, max_probe)
+    return best["url"] if best else None
 
 
 def extract_touch_db(tarball: Path | str, dest_dir: Path | str) -> Optional[Path]:
@@ -161,11 +226,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--print-url", action="store_true", help="resolve and print the tarball URL only"
     )
     ap.add_argument(
+        "--print-selection",
+        action="store_true",
+        help="resolve and print {url, build, commit, lag} as JSON",
+    )
+    ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
     )
+    ap.add_argument("--repo-root", default=".", help="repo the lag is measured against")
     args = ap.parse_args(argv)
 
     url = tarball_url(args.build) if args.build is not None else None
+
+    if args.print_selection:
+        if args.build is not None:
+            commit = build_commit(args.build)
+            best = {
+                "url": url,
+                "build": args.build,
+                "commit": commit,
+                "lag": commit_distance(commit, args.repo_root) if commit else None,
+            }
+        else:
+            best = select_tarball(repo_root=args.repo_root)
+        if best is None:
+            return 1
+        print(json.dumps(best))
+        return 0
 
     if args.print_url:
         url = url or latest_tarball_url()
