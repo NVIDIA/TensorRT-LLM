@@ -10,7 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.nemotron_h_weight_mapper import \
     NemotronHHfWeightMapper
 from tensorrt_llm._torch.speculative.utils import (
     filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model,
-    update_spec_config_from_model_config)
+    select_mtp_checkpoint_weights, update_spec_config_from_model_config)
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
 
@@ -38,7 +38,7 @@ def test_loads_mtp_from_speculative_model_helper():
     assert loads_mtp_from_speculative_model(None) is False
 
 
-def test_filter_mtp_checkpoint_weights():
+def test_filter_and_select_mtp_checkpoint_weights():
     weights = {
         "backbone.layers.0.mixer.weight": torch.ones(2),
         "mtp.layers.0.enorm.weight": torch.ones(4),
@@ -50,6 +50,12 @@ def test_filter_mtp_checkpoint_weights():
     assert "lm_head.weight" in filtered
     assert "mtp.layers.0.enorm.weight" not in filtered
     assert "mtp.layers.1.norm.weight" not in filtered
+
+    selected = select_mtp_checkpoint_weights(weights)
+    assert set(selected) == {
+        "mtp.layers.0.enorm.weight",
+        "mtp.layers.1.norm.weight",
+    }
 
 
 def test_update_spec_config_prefers_speculative_model_mtp_fields(tmp_path):

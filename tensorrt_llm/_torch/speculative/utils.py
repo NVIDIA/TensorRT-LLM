@@ -115,6 +115,19 @@ def filter_mtp_checkpoint_weights(weights: dict) -> dict:
     }
 
 
+def select_mtp_checkpoint_weights(weights: dict) -> dict:
+    """Keep only ``mtp.*`` keys from a (possibly full) checkpoint dict.
+
+    Separate MTP-head checkpoints may still ship unrelated tensors (or a full
+    target copy). Loading those into the one-engine model would overwrite the
+    already-loaded target backbone and corrupt generation.
+    """
+    return {
+        k: v
+        for k, v in weights.items() if _is_mtp_checkpoint_weight_key(k)
+    }
+
+
 def loads_mtp_from_speculative_model(spec_config) -> bool:
     """True when one-model MTP should load heads from ``speculative_model``."""
     if spec_config is None:

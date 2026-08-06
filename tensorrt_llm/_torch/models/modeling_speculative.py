@@ -2143,13 +2143,26 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
-        from tensorrt_llm._torch.speculative.utils import \
-            loads_mtp_from_speculative_model
+        from tensorrt_llm._torch.speculative.utils import (
+            loads_mtp_from_speculative_model, select_mtp_checkpoint_weights)
 
         if loads_mtp_from_speculative_model(self.spec_config):
             # One-model MTP with separate heads: MTP modules are attached under
-            # model.layers[N+] (shared with draft_model.mtp_layers). Load via the
-            # parent so family weight mappers (e.g. mtp.layers.* remap) apply.
+            # model.layers[N+] (shared with draft_model.mtp_layers). Only load
+            # mtp.* tensors — never backbone/embed/lm_head from the draft ckpt.
+            n_total = len(weights)
+            weights = select_mtp_checkpoint_weights(weights)
+            if not weights:
+                raise ValueError(
+                    "speculative_model was set for MTP but no 'mtp.*' weights "
+                    f"were found in {self.spec_config.speculative_model!r}. "
+                    "Expected keys like 'mtp.layers.0.*'.")
+            n_dropped = n_total - len(weights)
+            if n_dropped:
+                logger.warning(
+                    "Ignoring %d non-mtp.* tensors from speculative_model while "
+                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
+                    len(weights))
             if weight_mapper is not None:
                 preprocess = getattr(weight_mapper, "preprocess_weights", None)
                 if callable(preprocess):
