@@ -283,6 +283,14 @@ class DeepSeekR1Parser(BaseReasoningParser):
                 if self._hold_preamble and not self._entered_reasoning:
                     self._buffer = delta_text
                     return ReasoningParserResult()
+                # After the first reasoning block, a trailing suffix may be a
+                # partial ``<think>`` split across deltas (``mid<th`` + ``ink>``).
+                partial_start_idx = delta_text.rfind(self.reasoning_start[0])
+                if (partial_start_idx != -1 and self.reasoning_start.startswith(
+                        delta_text[partial_start_idx:])):
+                    self._buffer = delta_text[partial_start_idx:]
+                    return ReasoningParserResult(
+                        content=delta_text[:partial_start_idx])
                 self._buffer = ""
                 return ReasoningParserResult(content=delta_text)
             # Start tag found.
