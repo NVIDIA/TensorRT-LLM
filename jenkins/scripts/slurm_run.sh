@@ -72,6 +72,59 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# The only install lock (slurm_install.sh) lives under $resourcePathNode, a per-step
+# tmpfs in the pyxis container, so it fences just the $SLURM_LOCALID peers on one node
+# -- nothing stops one node from reaching `eval $pytestCommand` below while another is
+# still installing. Pytest's first action is `import tensorrt_llm`, whose module-scope
+# MPI collective must be entered by every rank, and under --mpi=pmix (added exactly
+# when nodeCount > 1) that collective has a 300s fence timeout -- so the skew aborts
+# every rank instead of merely running late. Fence on the shared $jobWorkspace so all
+# ranks enter pytest together. Must stay below the SLURM_* unset block above, which is
+# what makes this a no-op for single-node and disaggregated runs.
+slurm_wait_all_ranks() {
+    # SLURM_NTASKS rather than a node count: this is exactly the set of ranks that
+    # enters the aborting collective.
+    local numRanks="${SLURM_NTASKS:-1}"
+    if [ "$numRanks" -le 1 ] || [ -z "${jobWorkspace:-}" ]; then
+        return 0
+    fi
+
+    # Keyed per job *and* per step: $jobWorkspace outlives a single step, so markers
+    # from another job or from an earlier step must not satisfy the count. Slurm gives
+    # every rank of a step the same step id, so all of them agree on this path.
+    local readyDir="$jobWorkspace/run_ready_job_${SLURM_JOB_ID:-local}_step_${SLURM_STEP_ID:-0}"
+    mkdir -p "$readyDir"
+    touch "$readyDir/rank_${SLURM_PROCID}.ready"
+
+    # Bounded above the 2700s pip3 retry budget in slurm_install.sh: a merely slow rank
+    # still releases the barrier, while a dead one fails the stage loudly instead of
+    # hanging until the partition walltime kills it.
+    local timeoutSecs=3600
+    local deadline=$((SECONDS + timeoutSecs))
+    local markers ready
+    while true; do
+        # Globbed, not `ls | wc -l`: under `set -Eeuo pipefail` a failing `ls` fires the
+        # ERR trap. The touch above guarantees a match, so no nullglob is needed.
+        markers=("$readyDir"/*.ready)
+        ready=${#markers[@]}
+        if [ "$ready" -ge "$numRanks" ]; then
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: rank ${SLURM_PROCID} timed out after ${timeoutSecs}s waiting for" \
+                 "all $numRanks ranks to be ready; ready: $ready/$numRanks"
+            return 1
+        fi
+        # One rank reports progress; all of them would spam the log every 10s.
+        if [ "$SLURM_PROCID" -eq 0 ]; then
+            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
+        fi
+        sleep 10
+    done
+}
+
+slurm_wait_all_ranks
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
