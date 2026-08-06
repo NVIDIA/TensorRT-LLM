@@ -384,6 +384,7 @@ class DFlashWorker(SpecWorkerBase):
         # inputs are not already int32.
         slots_i32 = slots.to(torch.int32)
         positions_i32 = positions.to(torch.int32)
+        kv_indices = self._ctx_page_table.flatten().contiguous()
         for layer_idx in range(k.size(1)):
             trtllm_gen_ops.append_paged_kv_cache(
                 append_key=k[:, layer_idx].contiguous(),
@@ -391,7 +392,7 @@ class DFlashWorker(SpecWorkerBase):
                 batch_indices=slots_i32,
                 positions=positions_i32,
                 paged_kv_cache=self._ctx_kv_buf[layer_idx],
-                kv_indices=self._ctx_page_table.flatten().contiguous(),
+                kv_indices=kv_indices,
                 kv_indptr=self._ctx_kv_indptr,
                 kv_last_page_len=self._ctx_kv_last_page_len,
                 kv_layout="HND",

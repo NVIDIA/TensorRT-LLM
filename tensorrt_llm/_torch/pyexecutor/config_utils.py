@@ -38,7 +38,8 @@ def get_layer_attention_window(
 
     An explicit ``use_sliding_window=False`` disables sliding attention.
     Otherwise, infer it from ``sliding_window`` and ``layer_types`` so legacy
-    configs that omit the flag continue to work.
+    configs that omit the flag continue to work. Qwen2-style configs that omit
+    ``layer_types`` use ``max_window_layers`` as the first sliding-layer index.
     """
     use_sliding_window = getattr(config, "use_sliding_window", None)
     if use_sliding_window is False:
@@ -60,6 +61,12 @@ def get_layer_attention_window(
     if layer_types:
         layer_type = layer_types[layer_idx % len(layer_types)]
         if not _is_sliding_attention_layer(layer_type):
+            return None
+    else:
+        max_window_layers = getattr(config, "max_window_layers", None)
+        if (isinstance(max_window_layers, int)
+                and not isinstance(max_window_layers, bool)
+                and layer_idx < max_window_layers):
             return None
 
     if (not isinstance(sliding_window, int) or isinstance(sliding_window, bool)

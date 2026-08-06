@@ -301,6 +301,10 @@ def test_dflash_attention_mask_args():
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
     assert wrapper._get_attention_mask_args(2) == (True, (4095, 0))
 
+    with patch("tensorrt_llm._torch.models.modeling_speculative.logger.warning") as warning:
+        wrapper._warn_inferred_attention_windows()
+    warning.assert_not_called()
+
     disabled_wrapper = _fake_dflash_mask_wrapper(
         SimpleNamespace(
             num_hidden_layers=2,
@@ -328,13 +332,27 @@ def test_dflash_attention_mask_args():
 
     laguna_wrapper = _fake_dflash_mask_wrapper(
         SimpleNamespace(
-            num_hidden_layers=1,
-            layer_types=["sliding_attention"],
+            model_type="laguna",
+            architectures=["DFlashLagunaForCausalLM"],
+            num_hidden_layers=5,
+            layer_types=["sliding_attention"] * 5,
+            sliding_window=512,
         ),
         sliding_layers_causal=True,
     )
 
-    assert laguna_wrapper._get_attention_mask_args(0) == (True, (-1, -1))
+    for layer_idx in range(5):
+        assert laguna_wrapper._get_attention_mask_args(layer_idx) == (True, (511, 0))
+
+    with patch("tensorrt_llm._torch.models.modeling_speculative.logger.warning") as warning:
+        laguna_wrapper._warn_inferred_attention_windows()
+    warning.assert_called_once_with(
+        "DFlash inferred pooled-context sliding-window attention from checkpoint "
+        "config for draft layers [0, 1, 2, 3, 4]: window=512. Context attention "
+        "is truncated to 512 tokens for these layers; if the drafter expects full "
+        "context, acceptance rate may drop. Set use_sliding_window explicitly to "
+        "confirm or disable windowing."
+    )
 
 
 def _fake_dflash_buffer_wrapper():
