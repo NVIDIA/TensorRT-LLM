@@ -936,6 +936,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
 
         self.__post_init__()
@@ -1162,9 +1163,43 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def unpack_action(tokens: torch.Tensor) -> torch.Tensor:
         return tokens
 
+    def register_cuda_graph_extra_key_fns(self, runner) -> None:
+        """Make the position-determining scalars part of the graph key.
+
+        The base key is tensor shapes only, but the rotary tables are built
+        from Python scalars that leave every shape unchanged: the frame rate,
+        the action clock, and the offset of the first action step. Two requests
+        differing only in these produce different positions at identical
+        shapes, so without them one captured graph would be replayed for both.
+        Each returns ``None`` when absent, which drops that part of the key --
+        a video-only request keys exactly as it did before.
+        """
+        super().register_cuda_graph_extra_key_fns(runner)
+
+        def _float_key(name):
+            def fn(*args, **kwargs):
+                value = kwargs.get(name)
+                return None if value is None else float(value)
+
+            return fn
+
+        def _int_key(name):
+            def fn(*args, **kwargs):
+                value = kwargs.get(name)
+                return None if value is None else int(value)
+
+            return fn
+
+        runner.register_extra_key_fn("fps", _float_key("fps"))
+        runner.register_extra_key_fn("action_fps", _float_key("action_fps"))
+        runner.register_extra_key_fn(
+            "action_start_frame_offset", _int_key("action_start_frame_offset")
+        )
+
     def reset_cache(self):
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
 
     def forward(
@@ -1327,38 +1362,49 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     hidden_action.dtype
                 )
             hidden_gen = torch.cat([hidden_gen, hidden_action], dim=1)
-            effective_action_fps = action_fps if action_fps is not None else (fps or self.base_fps)
-            cos_a, sin_a = self._compute_action_rope_freqs(
-                T_action,
-                text_mask,
-                float(effective_action_fps),
-                action_start_frame_offset,
-                hidden_states.device,
-                hidden_gen.dtype,
-            )
-            cos_v, sin_v = self.cached_freqs_gen
-            freqs_gen_combined = (
-                torch.cat([cos_v, cos_a], dim=1),
-                torch.cat([sin_v, sin_a], dim=1),
-            )
+            # The rotary table is request-invariant: chunk size, prompt lengths,
+            # fps and the frame offset are all fixed once the request starts.
+            # Recomputing it per step costs a device-to-host sync per batch
+            # element (the prompt-length readback), an H2D copy of the position
+            # ids, and two concatenations -- all for the same numbers.
+            if self.cached_freqs_gen_combined is None:
+                effective_action_fps = (
+                    action_fps if action_fps is not None else (fps or self.base_fps)
+                )
+                cos_a, sin_a = self._compute_action_rope_freqs(
+                    T_action,
+                    text_mask,
+                    float(effective_action_fps),
+                    action_start_frame_offset,
+                    hidden_states.device,
+                    hidden_gen.dtype,
+                )
+                cos_v, sin_v = self.cached_freqs_gen
+                self.cached_freqs_gen_combined = (
+                    torch.cat([cos_v, cos_a], dim=1),
+                    torch.cat([sin_v, sin_a], dim=1),
+                )
+            freqs_gen_combined = self.cached_freqs_gen_combined
         elif audio_latents is not None and self.audio_gen:
             T_audio = audio_latents.shape[2]
             hidden_audio = self.pack_audio_latents(audio_latents).to(hidden_gen.dtype)
             hidden_audio = self.audio2llm(hidden_audio) + self.audio_modality_embed
             hidden_audio = hidden_audio + time_embed.unsqueeze(1)
-            cos_a, sin_a = self._compute_audio_rope_freqs(
-                T_audio,
-                text_mask,
-                float(self.audio_latent_fps),
-                hidden_states.device,
-                hidden_gen.dtype,
-            )
             hidden_gen = torch.cat([hidden_gen, hidden_audio], dim=1)
-            cos_v, sin_v = self.cached_freqs_gen
-            freqs_gen_combined = (
-                torch.cat([cos_v, cos_a], dim=1),
-                torch.cat([sin_v, sin_a], dim=1),
-            )
+            if self.cached_freqs_gen_combined is None:
+                cos_a, sin_a = self._compute_audio_rope_freqs(
+                    T_audio,
+                    text_mask,
+                    float(self.audio_latent_fps),
+                    hidden_states.device,
+                    hidden_gen.dtype,
+                )
+                cos_v, sin_v = self.cached_freqs_gen
+                self.cached_freqs_gen_combined = (
+                    torch.cat([cos_v, cos_a], dim=1),
+                    torch.cat([sin_v, sin_a], dim=1),
+                )
+            freqs_gen_combined = self.cached_freqs_gen_combined
         else:
             freqs_gen_combined = self.cached_freqs_gen
         # --------------------------------------------------------------------------

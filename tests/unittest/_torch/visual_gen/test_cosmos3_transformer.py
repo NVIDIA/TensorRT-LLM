@@ -521,6 +521,73 @@ class TestCosmos3Action:
         run_step()
         assert len(calls) == 2
 
+    def test_graph_key_separates_requests_that_differ_only_in_scalars(self, action_model_config):
+        """TRT-LLM captures a family of graphs and dispatches by key. fps, the
+        action clock and the start offset change the rotary positions without
+        changing any tensor shape, so they must discriminate keys or two such
+        requests would replay the same graph."""
+        from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+            CUDAGraphRunner,
+            CUDAGraphRunnerConfig,
+        )
+
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        model.register_cuda_graph_extra_key_fns(runner)
+
+        base = dict(fps=24.0, action_fps=5.0, action_start_frame_offset=1)
+        key = runner.get_graph_key(**base)
+        for field, other in (
+            ("fps", 16.0),
+            ("action_fps", 10.0),
+            ("action_start_frame_offset", 0),
+        ):
+            assert runner.get_graph_key(**{**base, field: other}) != key, field
+
+        # A video-only request keys exactly as before: absent scalars drop out.
+        assert runner.get_graph_key(fps=None, action_fps=None) == runner.get_graph_key()
+
+    @pytest.mark.high_cuda_memory
+    def test_action_rope_table_built_once_per_request(self, action_model_config):
+        """Chunk size, prompt lengths, fps and the frame offset are fixed for a
+        request, so the rotary table is too. Rebuilding it per step costs a
+        device-to-host sync per batch element plus an H2D copy of the position
+        ids -- for identical numbers."""
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+
+        calls = []
+        real = model._compute_action_rope_freqs
+        model._compute_action_rope_freqs = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+
+        def run_step():
+            with torch.inference_mode():
+                model(
+                    hidden_states=hs,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    video_shape=video_shape,
+                    fps=24.0,
+                    action_latents=action_latents,
+                    action_domain_ids=domain_ids,
+                )
+
+        run_step()
+        run_step()
+        run_step()
+        assert len(calls) == 1
+
+        model.reset_cache()
+        run_step()
+        assert len(calls) == 2
+
     @pytest.mark.high_cuda_memory
     def test_forward_with_action_domain_id_out_of_range_raises(self, action_model_config):
         cfg = action_model_config.pretrained_config
