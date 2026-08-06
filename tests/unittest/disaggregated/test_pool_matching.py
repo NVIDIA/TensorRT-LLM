@@ -267,7 +267,7 @@ def test_kv_and_indexer_in_same_lg():
 
 
 def test_minimax_split_kv_and_replicated_index_pools_match():
-    """MiniMax M3 shape: NHD KV pool + REPLICATED index-key pool.
+    """MiniMax M3 Triton shape: NHD KV pool + REPLICATED index-key pool.
 
     coalescing_group derivation keeps INDEX_KEY in its own pool on every
     topology, so both sides always present the same two role sets and
