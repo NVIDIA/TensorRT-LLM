@@ -467,6 +467,41 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
+def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+        )
+    )
+
+    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
+        model_config,
+        activation=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+
+    assert activation == "situ"
+    assert situ_beta == 4.0
+    assert situ_linear_beta == 25.0
+
+
+def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
+    model_config = ModelConfig(pretrained_config=SimpleNamespace())
+
+    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
+        model_config,
+        activation=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+
+    assert activation == "swiglu"
+    assert situ_beta is None
+    assert situ_linear_beta is None
+
+
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
     routing_method = RenormalizeMoeRoutingMethod(top_k=1)
     model_config = ModelConfig(
