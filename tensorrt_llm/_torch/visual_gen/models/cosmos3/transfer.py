@@ -255,6 +255,11 @@ def resolve_transfer_config(
         # are resolved, so single-hint presets must not silently promote it.
         request_guidance_scale = 1.0
 
+    # `frame_rate` and `num_frames` are advertised defaults the executor merges
+    # into every request, so only `model_fields_set` distinguishes a caller's
+    # value from a merged one.
+    specified = getattr(req_params, "model_fields_set", frozenset())
+
     config = Cosmos3TransferConfig(
         hints=hints,
         guidance_scale=request_guidance_scale,
@@ -297,6 +302,10 @@ def resolve_transfer_config(
         num_frames=_extra_or_default(
             extra_params, "num_frames", getattr(req_params, "num_frames", None)
         ),
+        # Only a caller-supplied frame_rate seeds this. Taking the request's
+        # value unconditionally would capture the executor-merged default,
+        # which then wins in _forward_transfer over a rate the pipeline
+        # inferred from the source -- silently pinning every transfer to 24.
         fps=_extra_or_default(
             extra_params,
             "fps",
@@ -304,7 +313,9 @@ def resolve_transfer_config(
                 extra_params,
                 "frame_rate",
                 _extra_or_default(
-                    extra_params, "resolved_frame_rate", getattr(req_params, "frame_rate", None)
+                    extra_params,
+                    "resolved_frame_rate",
+                    getattr(req_params, "frame_rate", None) if "frame_rate" in specified else None,
                 ),
             ),
         ),
@@ -312,11 +323,6 @@ def resolve_transfer_config(
 
     if len(hints) == 1:
         hint_key = next(iter(hints))
-        # `frame_rate` and `num_frames` arrive materialized to the mode default
-        # (the serve layer needs concrete values to turn `seconds` into a frame
-        # count), so "is not None" cannot tell a caller's value from a merged
-        # one. `model_fields_set` can: the executor un-marks what it fills.
-        specified = getattr(req_params, "model_fields_set", frozenset())
         for field_name, default_value in TRANSFER_DEFAULTS[hint_key].items():
             if field_name == "guidance_scale":
                 user_set = config.guidance_scale is not None

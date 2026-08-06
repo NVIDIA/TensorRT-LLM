@@ -349,7 +349,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # for explicitly.
         specified = req.params.model_fields_set
         wants_source_size = "height" not in specified and "width" not in specified
-        wants_source_fps = "frame_rate" not in specified
+        # Timing resolves as a unit. A caller who pinned `num_frames` -- directly,
+        # or via `seconds`, which the serving layer already converted at the
+        # default rate -- has fixed the output duration; adopting a different
+        # frame rate underneath that would silently stretch or compress it.
+        wants_source_fps = "frame_rate" not in specified and "num_frames" not in specified
         if wants_source_size or wants_source_fps:
             source = video
             if source is None and transfer_config is not None:

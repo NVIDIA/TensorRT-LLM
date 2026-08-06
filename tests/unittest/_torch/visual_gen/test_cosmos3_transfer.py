@@ -832,6 +832,87 @@ class TestForwardTransferChunks:
         )
 
 
+class TestTransferFrameRateResolution:
+    """What `_forward_transfer` actually emits at, not what `infer()` hands it.
+
+    `resolve_transfer_config` runs before the pipeline probes the source, and
+    `_forward_transfer` prefers ``transfer_config.fps`` over its ``frame_rate``
+    argument. A test that stubs ``forward()`` and asserts what ``infer()``
+    passes cannot see that, and will pass while the value is discarded one
+    layer down -- which is exactly what happened.
+    """
+
+    def _emitted_fps(self, monkeypatch, *, hints, caller, infer_fps):
+        pipeline = _make_pipeline()
+        monkeypatch.setattr(
+            transfer_module, "decode_video_reference_window", _fake_decode_window(5)
+        )
+        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
+        tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
+        pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
+        pipeline._apply_flow_shift = lambda *a, **k: None
+        pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
+
+        params = _merged_req(frame_rate=COSMOS3_720P_PARAMS["frame_rate"], num_frames=5)
+        for key, value in caller.items():
+            setattr(params, key, value)  # assignment marks it as caller intent
+        cfg = resolve_transfer_config({**hints, "num_video_frames_per_chunk": 5}, params)
+        return pipeline._forward_transfer(
+            prompt="transfer",
+            negative_prompt="",
+            height=16,
+            width=16,
+            max_frames=cfg.max_frames,
+            num_inference_steps=35,
+            max_sequence_length=8,
+            use_system_prompt=False,
+            use_duration_template=False,
+            use_resolution_template=False,
+            seed=1,
+            frame_rate=infer_fps,  # what infer() resolved and passed down
+            num_frames=5,
+            use_guardrails=False,
+            timer=_started_timer(),
+            transfer_config=cfg,
+            video=None,
+        ).frame_rate
+
+    def test_source_rate_reaches_the_output(self, monkeypatch):
+        # The regression: config.fps used to capture the executor-merged 24 and
+        # shadow the rate the pipeline inferred from the source.
+        fps = self._emitted_fps(
+            monkeypatch, hints={"edge": {"control": b"clip"}}, caller={}, infer_fps=8.0
+        )
+        assert fps == 8.0
+
+    def test_explicit_request_rate_wins_over_the_source(self, monkeypatch):
+        fps = self._emitted_fps(
+            monkeypatch,
+            hints={"edge": {"control": b"clip"}},
+            caller={"frame_rate": 30.0},
+            infer_fps=30.0,
+        )
+        assert fps == 30.0
+
+    def test_a_pinned_frame_count_keeps_the_default_rate(self, monkeypatch):
+        # `seconds` is converted to num_frames at the default rate before the
+        # worker sees the media, so adopting the source rate here would change
+        # the duration the caller asked for.
+        fps = self._emitted_fps(
+            monkeypatch,
+            hints={"edge": {"control": b"clip"}},
+            caller={"num_frames": 5},
+            infer_fps=COSMOS3_720P_PARAMS["frame_rate"],
+        )
+        assert fps == COSMOS3_720P_PARAMS["frame_rate"]
+
+    def test_wsm_preset_outranks_the_source(self, monkeypatch):
+        fps = self._emitted_fps(
+            monkeypatch, hints={"wsm": {"control": b"clip"}}, caller={}, infer_fps=8.0
+        )
+        assert fps == 10
+
+
 class TestTransferSamplingAndSafety:
     """The transfer branch must not skip what every other mode goes through."""
 
