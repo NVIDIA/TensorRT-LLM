@@ -227,13 +227,21 @@ def test_kv_norm_fusion_is_coupled_to_the_q_rope_fold() -> None:
     _cos_sin, specs = mla._fused_q_rope_specs(metadata, num_contexts=3, num_generations=0)
     assert not specs
 
-    # Both ingredients of the decision `forward_impl_with_deepseek_v4` makes.
+    # The KV predicate on its own still says yes -- so the coupling, not a shared
+    # precondition, is what has to turn the fusion off.
     assert mla._is_fused_kv_norm_enabled(num_generations=0) is True
-    fused_kv_norm_active = (
-        mla._is_fused_kv_norm_enabled(num_generations=0)
-        and mla._is_fused_q_fp8_quant_enabled(num_generations=0, num_contexts=3)
-        and bool(specs)
-    )
-    assert fused_kv_norm_active is False, (
-        "kv-norm fusion must not engage when the Q RoPE fold is unavailable"
+
+    # `forward_impl_with_deepseek_v4` assigns `_fused_kv_norm_active` from exactly
+    # this call, so asserting on it here is asserting on the shipped decision.
+    assert (
+        mla._is_fused_prologue_active(num_contexts=3, num_generations=0, rope_specs=specs) is False
+    ), "kv-norm fusion must not engage when the Q RoPE fold is unavailable"
+
+    # ...and it does engage once the specs exist, so the False above is the coupling
+    # talking and not a predicate that is off for some unrelated reason.
+    assert (
+        mla._is_fused_prologue_active(
+            num_contexts=3, num_generations=0, rope_specs=[("dummy", None, 0, None)]
+        )
+        is True
     )
