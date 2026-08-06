@@ -1002,7 +1002,7 @@ class DFlashWorker(SpecWorkerBase):
         # shrunk to the captured graph bucket by create_cuda_graph_metadata,
         # which would pin the pool to whichever bucket drafts first and leave
         # _dummy_slot aliasing a live request's row.
-        max_batch = spec_metadata.num_seq_slots or spec_metadata.max_num_requests
+        max_batch = spec_metadata.num_seq_slots
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
         # max_position_embeddings does not: K3's drafter advertises 1048576,
