@@ -17,9 +17,15 @@ l0_gb10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention/test_attention_mla.py
-  - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
-  - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_streaming]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[tool_calling]
+  - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b]
 - condition:
     ranges:
       system_gpu_count:
@@ -40,3 +46,13 @@ l0_gb10:
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=8-dtype=torch.float16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
+  - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf]
+  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-bf16-instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
+  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
+  - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP4-modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4]
+  - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-20B-gpt_oss/gpt-oss-20b]
+  - examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[image]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[video]
