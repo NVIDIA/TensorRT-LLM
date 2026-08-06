@@ -86,6 +86,7 @@ l0_b200:
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
   - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
+  - unittest/_torch/modeling/test_pre_mlp_nvfp4_fusion.py
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
