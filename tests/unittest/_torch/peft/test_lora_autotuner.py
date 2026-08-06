@@ -49,6 +49,23 @@ def test_lora_split_k_runner_uses_token_buckets():
     assert profile[0][0] == 4
 
 
+def test_lora_split_k_runner_uses_default_tactic(monkeypatch):
+    runner = _make_runner()
+    runner.lora_params = {}
+    split_ks = []
+
+    def fake_forward_impl(x, lora_params, layer_idx, split_k):
+        del lora_params, layer_idx
+        split_ks.append(split_k)
+        return x
+
+    monkeypatch.setattr(runner.layer, "_forward_cuda_graph_mode_impl", fake_forward_impl)
+
+    x = torch.empty(2, runner.input_hidden_size)
+    assert runner([x], tactic=-1) is x
+    assert split_ks == [lora_layer._LORA_DEFAULT_SPLIT_K]
+
+
 def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
     layer = lora_layer.LoraLayer(
         [lora_layer.LoraModuleType.ATTENTION_Q],
@@ -61,19 +78,19 @@ def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
     )
 
     class FakeLayerParams:
-        def __init__(self):
-            self.d_b_ptrs = torch.tensor([1])
-            self.d_b_prime_ptrs = torch.tensor([2])
+        def __init__(self, max_lora_size: int = 4):
+            self.d_b_ptrs = torch.ones((1, max_lora_size), dtype=torch.int64)
+            self.d_b_prime_ptrs = torch.full((1, max_lora_size), 2, dtype=torch.int64)
             self.d_output_sizes = torch.tensor([128])
             self.d_output_sizes_offset = torch.tensor([0])
             self.h_output_sizes = torch.tensor([128])
 
     class FakeCudaGraphParams:
         def __init__(self):
-            self.layer_info = {layer_key: object()}
-            self.layer_params = {layer_key: FakeLayerParams()}
             self.max_rank = 16
             self.max_lora_size = 4
+            self.layer_info = {layer_key: object()}
+            self.layer_params = {layer_key: FakeLayerParams(self.max_lora_size)}
             self.slot_counts = torch.tensor([4, 0, 0, 0])
             self.slot_ranks = torch.tensor([16, 0, 0, 0])
             self.slot_offsets_full = torch.tensor([0, 4, 4, 4, 4])
@@ -99,31 +116,43 @@ def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
 
     monkeypatch.setattr(lora_layer.AutoTuner, "get", staticmethod(lambda: FakeTuner()))
 
-    forwarded_params = []
+    parameter_fill_calls = []
 
-    def fake_forward_impl(x, runner_lora_params, forwarded_layer_idx, split_k):
-        forwarded_params.append((runner_lora_params, split_k))
-        assert forwarded_layer_idx == layer_idx
-        return x
+    def fake_parameter_fill(*args):
+        parameter_fill_calls.append(args)
 
-    monkeypatch.setattr(layer, "_forward_cuda_graph_mode_impl", fake_forward_impl)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "lora_group_gemm_param_fill_row_reorder_fusion",
+        fake_parameter_fill,
+    )
+    operator_split_ks = []
+
+    def fake_grouped_gemm(*args):
+        operator_split_ks.append(args[-1])
+
+    monkeypatch.setattr(torch.ops.trtllm, "lora_grouped_gemm_cuda_graph", fake_grouped_gemm)
 
     cuda_graph_params = FakeCudaGraphParams()
     original_layer_params = cuda_graph_params.get_layer_params(layer_key)
     original_slot_counts = cuda_graph_params.slot_counts
     original_b_ptrs = original_layer_params.d_b_ptrs
     lora_params = {"cuda_graph_params": cuda_graph_params}
+    warmup_lora_params = []
     for batch_size in (4, 8):
         x = torch.empty(batch_size, 256)
-        assert layer._forward_cuda_graph_mode(x, lora_params, layer_idx) is x
+        output = layer._forward_cuda_graph_mode(x, lora_params, layer_idx)
+        assert output.shape == (batch_size, 128)
+        warmup_lora_params.append(layer._split_k_runner.lora_params)
 
     runner = layer._split_k_runner
     assert runner is not None
     assert tuned_runners == [runner, runner]
-    assert len(forwarded_params) == 2
-    assert forwarded_params[0][0] is not forwarded_params[1][0]
+    assert operator_split_ks == [1, 1]
+    assert warmup_lora_params[0] is not warmup_lora_params[1]
 
-    runner_lora_params = forwarded_params[-1][0]
+    runner_lora_params = warmup_lora_params[-1]
+    assert runner_lora_params is not None
     runner_cuda_graph_params = runner_lora_params["cuda_graph_params"]
     runner_layer_params = runner_cuda_graph_params.get_layer_params(layer_key)
     assert runner_lora_params is not lora_params
@@ -133,12 +162,11 @@ def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
 
     synthetic_inputs = runner._prepare_synthetic_inputs([torch.empty(2, 256)])
     runner(synthetic_inputs, tactic=2)
+    assert operator_split_ks == [1, 1, 2]
 
-    synthetic_lora_params = forwarded_params[-1][0]
-    synthetic_cuda_graph_params = synthetic_lora_params["cuda_graph_params"]
-    synthetic_layer_params = synthetic_cuda_graph_params.get_layer_params(layer_key)
-    assert synthetic_cuda_graph_params.slot_counts is synthetic_inputs[1]
-    assert synthetic_layer_params.d_b_ptrs is synthetic_inputs[4]
+    synthetic_fill_args = parameter_fill_calls[-1]
+    assert synthetic_fill_args[16] is synthetic_inputs[1]
+    assert synthetic_fill_args[21] is synthetic_inputs[4]
     assert runner_cuda_graph_params.slot_counts is original_slot_counts
     assert runner_layer_params.d_b_ptrs is original_b_ptrs
     assert cuda_graph_params.slot_counts is original_slot_counts
