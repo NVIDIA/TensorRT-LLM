@@ -1376,10 +1376,8 @@ class PyTorchModelEngine(ModelEngine):
         self._warmup_cute_dsl_radix_topk()
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if self.encoder_cuda_graph_runner.feature_mode:
-            # After decoder-graph capture so the decoder pool's high-water
-            # mark is set first. The runner now shares the decoder's graph
-            # pool (16706's behaviour); see the concurrency caveat on
-            # encoder_stream in the PR description.
+            # After decoder-graph capture, so the decoder pool's high-water
+            # mark is set before the encoder runner allocates its own pool.
             self._capture_enc_dec_encoder_graphs()
             log_mem_snapshot("warmup/after_enc_dec_encoder_graph_capture")
         if can_run_general_warmup:
@@ -2036,6 +2034,11 @@ class PyTorchModelEngine(ModelEngine):
         """Capture encoder-decoder encoder graphs on their runtime host thread."""
         runner = self.encoder_cuda_graph_runner
         if not runner.is_encoder_decoder:
+            return
+        if runner.feature_mode:
+            # This driver synthesizes packed token inputs, which a feature
+            # encoder cannot consume. Feature mode captures from
+            # `_capture_enc_dec_encoder_graphs` during engine warmup instead.
             return
 
         capture = functools.partial(

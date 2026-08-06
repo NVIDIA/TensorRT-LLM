@@ -1838,8 +1838,7 @@ class EncoderCUDAGraphRunner:
         padded_num_tokens = key[1]
 
         if self.feature_mode:
-            self._capture_features(key, forward_fn, inputs)
-            return
+            return self._capture_features(key, forward_fn, inputs)
 
         sliced_static_tensors = {
             "input_ids":
@@ -1928,7 +1927,7 @@ class EncoderCUDAGraphRunner:
         key: EncoderKeyType,
         forward_fn: Callable[[Dict[str, Any]], Any],
         inputs: Dict[str, Any],
-    ) -> None:
+    ) -> Any:
         """Capture path for the fixed-shape feature mode (enc-dec encoders).
 
         The capture region receives the static device feature buffer sliced
@@ -1961,11 +1960,18 @@ class EncoderCUDAGraphRunner:
         # after the host has already refilled it for the next batch. The
         # eager H2D in `_replay_features` is stream-ordered and guarded by
         # per-mirror events instead.
-        graph = torch.cuda.CUDAGraph()
+        output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
-                forward_fn(capture_inputs)
+                output = forward_fn(capture_inputs)
 
+            # The warmup pass runs these shapes eagerly to settle PyTorch and
+            # attention state; it must not build a graph, and its caller
+            # consumes the eager output directly.
+            if self.is_warmup_only:
+                return output
+
+            graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
 
@@ -1973,8 +1979,10 @@ class EncoderCUDAGraphRunner:
             raise TypeError(
                 "Encoder CUDA graph does not support nested tensor outputs.")
         self.graphs[key] = graph
-        self.graph_outputs[key] = make_weak_ref(output)
+        graph_output = make_weak_ref(output)
+        self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
+        return graph_output
 
     def _replay_features(
         self,
