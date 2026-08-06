@@ -71,7 +71,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 @pytest.mark.parametrize(
     "k, n",
     [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
-     (2048, 7168), (1024, 1024)],
+     (2048, 7168), (1024, 1024), (5120, 5120)],
 )
 @pytest.mark.parametrize(
     "m",
@@ -164,7 +164,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 )
 @pytest.mark.parametrize(
     "k, n",
-    [(7168, 2112), (512, 32768), (16384, 7168), (2048, 7168)],
+    [(7168, 2112), (512, 32768), (16384, 7168), (2048, 7168), (5120, 5120)],
 )
 @pytest.mark.parametrize(
     "m",
@@ -209,6 +209,68 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
     output_expected = torch.einsum('mgk,gnk->gmn', a, b)
     output = torch.empty((num_groups, m, n), device='cuda', dtype=dtype)
+
+    torch.ops.trtllm.fp8_block_scaling_bmm_out(a_fp8, b_fp8, a_scales, b_scales,
+                                               output)
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 120,
+    reason=
+    "Strided-out BMM regression test targets SM120 SwapAB sliced-K path. Current SM is %d."
+    % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(5120, 2112), (7168, 2112)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 8],
+)
+@pytest.mark.parametrize(
+    "num_groups",
+    [2, 4],
+)
+def test_fp8_block_scale_bmm_strided_out(m, k, n, num_groups):
+    """Regression test for the SwapAB sliced-K multi-batch stride bug.
+
+    The `_out` API allows non-contiguous `out` (strides[2]==1, strides[1] > n).
+    Before the fix, the kernel's workspace atomicAdd used params.ld_D and the
+    convert kernel hardcoded ld_dst=shape_n, so strided out wrote to the wrong
+    addresses in both stages. This test constructs such a strided view and
+    verifies bitwise-near output.
+    """
+    torch.random.manual_seed(0)
+    dtype = torch.bfloat16
+    a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=dtype) / k
+
+    a_fp8, a_scales = fp8_utils.per_token_quant_and_transform(
+        a, need_permute102=True)
+    b_fp8, b_scales = per_block_cast_to_fp8_e8m0(b)
+    b_scales = fp8_utils.transform_sf_into_required_layout(
+        b_scales,
+        mn=n,
+        k=k,
+        recipe=(1, 128, 128),
+        num_groups=num_groups,
+        is_sfa=False)
+
+    output_expected = torch.einsum('mgk,gnk->gmn', a, b)
+
+    # Build `out` as a slice of a padded tensor so strides[1] > n while strides[2] == 1.
+    padded_n = n * 2
+    output_padded = torch.empty((num_groups, m, padded_n),
+                                device='cuda',
+                                dtype=dtype)
+    output_padded.fill_(float('nan'))
+    output = output_padded.narrow(2, 0, n)
+    assert output.stride(2) == 1
+    assert output.stride(1) == padded_n
 
     torch.ops.trtllm.fp8_block_scaling_bmm_out(a_fp8, b_fp8, a_scales, b_scales,
                                                output)
