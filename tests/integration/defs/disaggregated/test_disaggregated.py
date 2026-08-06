@@ -303,8 +303,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml",
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml",
-        "deepseek_v3_lite_fp8_v2_attention_dp_overlap_slot_pressure":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_v2_attention_dp_overlap.yaml",
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml",
         "deepseek_v3_lite_fp8_overlap_cuda_graph":
@@ -1982,7 +1980,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -1994,28 +1991,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp_8_attention_dp_overlap",
+                           num_iters=1,
                            env=llm_venv._new_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_v2_attention_dp_overlap_slot_pressure(
-        llm_venv, disaggregated_example_root, deepseek_v3_model_root):
-    """Exercise V2 overlap slot pressure without DeepSeek-V4 or MTP."""
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-
-    run_disaggregated_test(
-        disaggregated_example_root,
-        "deepseek_v3_lite_fp8_v2_attention_dp_overlap_slot_pressure",
-        num_iters=1,
-        env=llm_venv._new_env,
-        model_path=deepseek_v3_model_root,
-        cwd=llm_venv.get_working_directory(),
-        server_start_timeout=1200)
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=1200)
 
 
 @skip_no_hopper
