@@ -374,6 +374,8 @@ def _beam_step_preprocess(
     returns ``(logprobs, softmax, batch_size)``. ``softmax`` is None when
     ``return_probs`` is False.
 
+    Eager only: it mutates ``args.cache_indirection_buffer`` in place.
+
     ``row_stride`` is how many rows the forward path allocated per request,
     which is the static admission width. It differs from ``beam_width_in``
     under Variable-Beam-Width-Search, where only the first ``beam_width_in``
@@ -742,9 +744,24 @@ def _cba_step_math(
     it can be fused by torch.compile: everything between candidate selection
     and the store writebacks. Pure — all mutations happen in the caller.
 
-    NB: this function is torch.compile'd (see ``_cba_step_compiled``). Keep it
-    free of data-dependent shapes and of in-place ops on the input tensors
-    (use out-of-place ``masked_fill`` etc.), so tracing stays fullgraph-clean.
+    NB: this function is torch.compile'd with ``fullgraph=True`` (see
+    ``_cba_step_compiled``), which makes the following a contract rather than
+    a style preference:
+
+    - Keep it free of data-dependent shapes and of in-place ops on the input
+      tensors (use out-of-place ``masked_fill`` etc.), so tracing stays
+      fullgraph-clean.
+    - The caller marks dim 0 of ``cand_cum``, ``cand_pred``, ``cand_tok``,
+      ``slots``, ``seq_lens`` and ``exponent`` dynamic. Never read that
+      dimension as a concrete size or branch on it in Python: recent dynamo
+      raises if a ``mark_dynamic`` dim is specialized to a constant.
+    - ``snap_arange`` is only ``maybe_mark_dynamic``, so specializing on its
+      length is allowed. Its length is the snapshot width, which grows by one
+      per step until it saturates at ``max_gen_len``; the resulting
+      recompiles are expected to be absorbed by automatic-dynamic.
+    - ``beam_width_in``, ``num_beams``, ``early_stopping`` and ``max_seq_len``
+      are plain ints and therefore static. Each distinct combination costs one
+      compilation, which is why the dispatch groups requests by them.
     """
     batch_size, num_candidates = cand_cum.shape
     neg_inf = float("-inf")
