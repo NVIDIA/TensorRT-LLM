@@ -24,6 +24,7 @@ from pathlib import Path
 
 import yaml
 from blocks import (
+    ALWAYS_RUN_STAGE_PREFIX,
     TARGET_SHARD_SECONDS,
     Stage,
     YAMLIndex,
@@ -130,7 +131,10 @@ def _build_narrowing(
 
     Returns (removed per block, fully-emptied instrumented stages, must-run tally).
     """
-    instrumented = set(cov.skippable)
+    # Always-run families are dropped from `instrumented` rather than filtered
+    # later: the shared-block rule below prunes a block only when every served
+    # stage is instrumented, so this keeps every block they serve intact.
+    instrumented = {f for f in cov.skippable if not f.startswith(ALWAYS_RUN_STAGE_PREFIX)}
     rule_kept = {
         key: _rule_kept_entries(b, rule_block_filters[key])
         for b in yaml_index.blocks

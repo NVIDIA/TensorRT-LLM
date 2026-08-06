@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "coverage_selection"))
 
 from artifact import build_from_url  # noqa: E402
 from blocks import (  # noqa: E402
+    ALWAYS_RUN_STAGE_PREFIX,
     Stage,
     YAMLIndex,
     compute_stage_split_counts,
@@ -485,6 +486,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
             durations=durations,
         )
+
+    # Stages that run whatever the decision. Added before the trigger-mode filter
+    # so a Post-Merge one is still dropped in pre-merge, and left out of the
+    # per-stage counts so Layer 2.5 neither renames nor resizes them.
+    if result.scope is not None:
+        result.affected_stages |= {s for s in stages if s.startswith(ALWAYS_RUN_STAGE_PREFIX)}
 
     # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
     # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
