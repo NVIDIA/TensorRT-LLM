@@ -284,7 +284,8 @@ public:
 private:
     tkc::CutlassGemmConfig const& getConfig(int64_t const configIdx) const
     {
-        TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs());
+        TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs(), "MXFP8 config index ", configIdx,
+            " is out of range [0, ", getNumConfigs(), ").");
         return mConfigs.at(configIdx);
     }
 

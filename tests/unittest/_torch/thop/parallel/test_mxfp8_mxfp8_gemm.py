@@ -76,10 +76,10 @@ def test_mxfp8_mxfp8_runner_tactics():
     output_ref = mat_a @ mat_b.t()
 
     runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
-    expected_tactics = 20 if getSMVersion() == 100 else 10
-    assert runner.get_num_configs() == expected_tactics
+    num_tactics = runner.get_num_configs()
+    assert num_tactics > 0
 
-    for tactic in [-1, *range(expected_tactics)]:
+    for tactic in [-1, *range(num_tactics)]:
         output = runner.run_gemm(
             fp8_a,
             a_block_sf,

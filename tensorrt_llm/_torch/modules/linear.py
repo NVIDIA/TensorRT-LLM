@@ -3120,7 +3120,7 @@ class MXFP8LinearMethod(LinearMethodBase):
     @property
     def needs_native_autotune(self) -> bool:
         return (self.use_native_autotuner and not self._native_autotuned
-                and self.use_cutlass and self.backend == "trtllm")
+                and self.use_cutlass)
 
     def _load_flashinfer(self, *, required: bool) -> bool:
         if not self.use_cutlass:

@@ -558,6 +558,7 @@ _MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
 
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
+    """Map known large-M bands to stable native autotuning profiles."""
     for (lower_bound, upper_bound), bucket in zip(_MXFP8_LARGE_M_BANDS,
                                                   _MXFP8_LARGE_M_BUCKETS):
         if lower_bound <= num_tokens <= upper_bound:
@@ -566,18 +567,22 @@ def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
 
 
 def _get_mxfp8_large_m_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
+    """Return large-M profiles reachable by the configured token limit."""
     mapped_max = _map_to_mxfp8_large_m_bucket(max_num_tokens)
     return tuple(bucket for bucket in _MXFP8_LARGE_M_BUCKETS
                  if bucket <= mapped_max)
 
 
 def _mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Infer the swizzled MXFP8 activation-scale storage size."""
     _, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0], sf_vec_size=32)
     return scale_shape
 
 
 class MXFP8GemmRunner(TunableRunner):
     runner_dict = dict()
+    synced_cache_keys: ClassVar[dict[tuple[torch.dtype, int, int], set[tuple]]]
+    synced_cache_keys = {}
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, _get_mxfp8_large_m_tuning_buckets,
         _map_to_mxfp8_large_m_bucket), ),
@@ -595,19 +600,30 @@ class MXFP8GemmRunner(TunableRunner):
                     output_dtype)
         self.mxfp8_gemm_runner = MXFP8GemmRunner.runner_dict[instance_key]
 
-    def unique_id(self):
+    def unique_id(self) -> tuple[torch.dtype, int]:
+        """Return the native tactic-cache identity for this runner."""
         return (self.output_dtype, self.sm_version)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
+        """Return the generic fallback followed by every compiled tactic."""
         return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
 
     def sync_tactic_cache(self, tuner: AutoTuner) -> None:
+        """Register newly profiled tactics in the native serving cache."""
         runner_name = self.__class__.__name__
         unique_id = str(self.unique_id())
         cache = tuner.profiling_cache.get_specific_custom_op(
             _MXFP8_AUTOTUNED_OP)
+        sync_key = (*self.unique_id(), id(tuner.profiling_cache))
+        synced_cache_keys = self.synced_cache_keys.setdefault(sync_key, set())
         for cache_key, (_runner_id, tactic, _min_time) in cache.items():
+            if cache_key in synced_cache_keys:
+                continue
+            # Each cache entry is immutable once profiled, so remember both
+            # matching and non-matching entries to avoid rescanning the full
+            # shared custom-op cache on every synchronization.
+            synced_cache_keys.add(cache_key)
             _, cached_runner_name, cached_unique_id, profile = cache_key
             if cached_runner_name != runner_name or cached_unique_id != unique_id:
                 continue
