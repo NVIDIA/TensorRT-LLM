@@ -348,37 +348,28 @@ def test_fused_qk_norm_rope_gemma_mrope(
     torch.testing.assert_close(output, ref_output, rtol=5e-2, atol=1e-1)
 
 
-# FP8 out-variant coverage. Includes an M3-like GQA shape (8 Q / 1 KV, head_dim
-# 128) so the MiniMax-M3 FP8-KV path geometry is exercised directly.
-fp8_num_heads_groups = [
+_FP8_NUM_HEADS_GROUPS = (
     (16, 8, 8),
     (32, 8, 8),
     (8, 1, 1),  # MiniMax-M3 sharded GQA (num_heads=8, num_kv_heads=1)
-]
+)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("num_heads_group", fp8_num_heads_groups)
+@pytest.mark.parametrize("num_heads_group", _FP8_NUM_HEADS_GROUPS)
 @pytest.mark.parametrize("num_tokens", [1, 3, 8, 256])
 @pytest.mark.parametrize("is_neox", [False, True])
 @pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
-# MiniMax-M3 stores every RMSNorm as a Gemma norm, so use_gemma=True is the
-# configuration that actually ships through this op.
+# MiniMax-M3 stores every RMSNorm as a Gemma norm, so use_gemma=True is what ships.
 @pytest.mark.parametrize("use_gemma", [False, True])
 def test_fused_qk_norm_rope_to_fp8(
     head_dim, num_heads_group, num_tokens, partial_rotary_factor, is_neox, use_gemma
 ):
     """Test the FP8 out-variant of fused QK RMSNorm + RoPE.
 
-    The op reads a BF16 qkv, applies RMSNorm + RoPE to Q/K and copy-casts V, and
-    returns a new FP8 (E4M3) tensor, folding the FP8 activation-quant into the
-    norm+RoPE epilogue. Verifies:
-      1. The input qkv is left untouched (out-of-place).
-      2. Output dtype is FP8 E4M3 with the same shape.
-      3. V is bit-exactly the E4M3 cast of the input V (pure copy-cast, so this
-         pins down the kernel's rounding against torch's).
-      4. The dequantized Q/K output matches the BF16 fused reference within
-         FP8-appropriate tolerance.
+    Checks that the input is left untouched, the output is FP8 E4M3 of the same
+    shape, V is a bit-exact E4M3 cast of the input V, and Q/K match the BF16
+    reference after dequantization.
     """
     device = "cuda"
     dtype = torch.bfloat16
@@ -427,10 +418,9 @@ def test_fused_qk_norm_rope_to_fp8(
     # Out-of-place: the BF16 input must be left byte-for-byte unchanged.
     torch.testing.assert_close(qkv, qkv_ref, rtol=0.0, atol=0.0)
 
-    # V is copy-cast only (no norm, no RoPE), so it must match torch's E4M3 cast
-    # exactly. This pins down the kernel's round-to-nearest-even FP8 store, which
-    # nothing else here verifies. The inputs are standard normal, so they stay
-    # well inside E4M3 range and the two casts' clamp/NaN behaviors don't diverge.
+    # V is copy-cast only, so it pins down the kernel's FP8 rounding against
+    # torch's. The inputs stay well inside E4M3 range, so the two casts'
+    # clamp/NaN behaviors don't diverge.
     v_start = (num_heads_q + num_heads_k) * head_dim
     torch.testing.assert_close(
         out_fp8[:, v_start:].float(),
@@ -455,12 +445,8 @@ def test_fused_qk_norm_rope_to_fp8(
         use_gemma=use_gemma,
     )
 
-    # The op folds the E4M3 cast into the epilogue, so the dominant error is the
-    # single E4M3 rounding: 3 mantissa bits give a worst-case relative error of
-    # 2^-4 = 6.25%, plus the ~2^-9 the BF16 reference itself carries. The kernel
-    # accumulates in fp32 and casts straight to FP8, i.e. one rounding step fewer
-    # than the reference's fp32 -> bf16 -> fp8, so it should clear this
-    # comfortably.
+    # Dominated by the single E4M3 rounding: 3 mantissa bits give a worst-case
+    # relative error of 2^-4 = 6.25%, plus the ~2^-9 the BF16 reference carries.
     torch.testing.assert_close(
         out_fp8.float(),
         ref_output.float(),

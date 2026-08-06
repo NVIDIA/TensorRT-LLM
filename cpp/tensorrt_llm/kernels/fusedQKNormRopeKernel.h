@@ -51,13 +51,9 @@ void launchFusedQKNormRope(
     int mrope_section1,     // mrope_section[1] (height)
     int mrope_section2);    // mrope_section[2] (width)
 
-// Out-of-place FP8 variant of launchFusedQKNormRope that reads a BF16 qkv input
-// and writes __nv_fp8_e4m3 to a separate output buffer.
-//
-// This folds the FP8 activation-quant into the norm+RoPE epilogue so callers do
-// not need separate cast kernels for Q/K/V. Q and K get RMSNorm + RoPE; V is
-// copy-cast only. The output layout matches the input:
-// [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim].
+// Out-of-place FP8 variant of launchFusedQKNormRope, folding the FP8
+// activation-quant into the norm+RoPE epilogue. Q and K get RMSNorm + RoPE; V is
+// copy-cast only.
 void launchFusedQKNormRopeToFp8(void const* qkv_in, // BF16 input [num_tokens, total_heads*head_dim]
     void* qkv_out,                                  // FP8 E4M3 output buffer, same layout as input
     int const num_tokens, int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim,
