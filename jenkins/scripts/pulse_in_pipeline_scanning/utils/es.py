@@ -6,10 +6,11 @@ from urllib.parse import quote
 
 import requests
 from elasticsearch import Elasticsearch, RequestsHttpConnection
+from elasticsearch.helpers import scan as es_scan
 
 ES_QUERY_URL = os.environ.get("TRTLLM_ES_QUERY_URL")
 ES_INDEX_BASE = os.environ.get("TRTLLM_ES_INDEX_BASE") or ""
-ES_INDEX_PREAPPROVED = "df-swdl-tensorrt-infra-plc-pre-approve"
+ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-pre-approve"
 ES_PREAPPROVED_POST_URL = os.environ.get("TRTLLM_ES_PREAPPROVED_POST_URL", "")
 
 if not ES_QUERY_URL:
@@ -52,36 +53,23 @@ def es_post(url, documents):
 
 
 def get_preapproved_deps(scan_type: str) -> list[dict]:
-    """Return all preapproved dependency records for the given scan type.
+    """Return preapproved dependency records for the given scan type.
 
-    Each record is an individual ES document with fields s_package_name,
-    s_package_version, and s_package_type. Uses search_after pagination to
-    handle arbitrarily large result sets.
+    Queries all individual records stored by post_preapproved_deps and returns
+    them as a list of dicts with s_package_name and s_package_type.
     """
-    PAGE_SIZE = 1000
-    query = {"bool": {"filter": [{"term": {"s_scan_type": scan_type}}]}}
-    source = ["s_package_name", "s_package_version", "s_package_type"]
-    sort = [{"s_package_name": "asc"}, {"_id": "asc"}]
-
-    results = []
-    search_after = None
-    while True:
-        body = {"size": PAGE_SIZE, "query": query, "_source": source, "sort": sort}
-        if search_after:
-            body["search_after"] = search_after
-        try:
-            resp = ES_CLIENT.search(index=ES_INDEX_PREAPPROVED, body=body)
-        except Exception as exc:
-            print(f"Failed to query preapproved deps for {scan_type}: {exc}", file=sys.stderr)
-            break
-        hits = resp["hits"]["hits"]
-        if not hits:
-            break
-        results.extend(hit["_source"] for hit in hits)
-        if len(hits) < PAGE_SIZE:
-            break
-        search_after = hits[-1]["sort"]
-    return results
+    query = {"query": {"match": {"s_scan_type": scan_type}}}
+    try:
+        return [
+            hit["_source"]
+            for hit in es_scan(
+                ES_CLIENT, index=ES_INDEX_PREAPPROVED_BASE + "-*", query=query, size=1000
+            )
+            if hit.get("_source")
+        ]
+    except Exception as exc:
+        print(f"Failed to query preapproved deps for {scan_type}: {exc}", file=sys.stderr)
+        return []
 
 
 def get_triaged_deps(scan_type: str, branch: str, container: str = "") -> dict:
