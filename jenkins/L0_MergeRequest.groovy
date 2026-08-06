@@ -28,6 +28,13 @@ import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 
+def gitlabParamsFromBot = [:]
+if (env.gitlabTriggerPhrase)
+{
+    gitlabParamsFromBot = readJSON text: env.gitlabTriggerPhrase, returnPojo: true
+}
+runMode = gitlabParamsFromBot.get("run_mode", "full")
+
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
@@ -80,18 +87,11 @@ BUILD_CHECK_CHOICE = env.buildCheckChoice ? env.buildCheckChoice : STAGE_CHOICE_
 X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
 SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
-def gitlabParamsFromBot = [:]
-
-if (env.gitlabTriggerPhrase)
-{
-    gitlabParamsFromBot = readJSON text: env.gitlabTriggerPhrase, returnPojo: true
-}
-
 // "Fail Fast" feature is enabled by default for the pre-merge pipeline.
 // "Fail Fast" feature is always disabled for the post-merge pipeline.
 boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
 
-boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
+boolean isReleaseCheckMode = (runMode == "release_check")
 
 GEN_POST_MERGE_BUILDS_ONLY = (env.JOB_NAME?.contains("GenPostMergeBuilds") ?: false)
 
@@ -187,13 +187,22 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def RUN_MODE = "run_mode"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
+    (TRTLLM_VERSION_OVERRIDE): null,
+    (RUN_MODE): runMode,
 ]
+if (runMode == "nightly_release") {
+    globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
+}
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 // GenPostMergeBuilds pipelines do not update GitLab status.
@@ -700,7 +709,9 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
+    if (env.alternativeTRT ||
+        isOfficialPostMergeJob ||
+        runMode == "nightly_release") {
         pipeline.echo("Force set changed file list to empty list.")
         return []
     }
@@ -734,7 +745,9 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     // Note: This function intentionally propagates exceptions to the caller.
     // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
+    if (env.alternativeTRT ||
+        isOfficialPostMergeJob ||
+        runMode == "nightly_release") {
         pipeline.echo("Force set changed file diff to empty string.")
         return ""
     }
@@ -1073,6 +1086,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
+        "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
@@ -1545,6 +1559,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 // and post-merge consumers; case-level narrowing happens later
                 // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
                 // (Layer 3).
+                // Nightly publishes the PackageSanityCheck wheel, while this
+                // build still provides the source tar consumed by test runners.
                 def testStageName = "[Build-x86_64] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
@@ -1813,10 +1829,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
-                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                            'triggerType': runMode == "nightly_release" ?
+                                "nightly-release" :
+                                (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
+                            'runSanityCheck':
+                                runMode == "nightly_release" ||
+                                env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                         ]
+                        if (runMode == "nightly_release") {
+                            additionalParameters += [
+                                'buildInternalRelease': false,
+                                'buildCiImage': false,
+                                'buildNgcRelease': true,
+                                'register_images': true,
+                                'wait_success_seconds': "",
+                            ]
+                        }
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -1837,7 +1866,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     ]
 
-    if (env.JOB_NAME ==~ /.*PostMerge.*/ && !GEN_POST_MERGE_BUILDS_ONLY) {
+    if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
+        !GEN_POST_MERGE_BUILDS_ONLY) {
         stages += dockerBuildJob
     }
     if (!GEN_POST_MERGE_BUILDS_ONLY && (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
@@ -1869,15 +1899,24 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
-                            'triggerType': "post-merge",
-                            'runSanityCheck': false,
+                            'triggerType': runMode == "nightly_release" ?
+                                "nightly-release" : "post-merge",
+                            'runSanityCheck': runMode == "nightly_release",
                             'defaultTag': defaultTag,
                             'buildInternalRelease': false,
                             'buildCiImage': false,
                             'artifactPath': ARTIFACT_PATH,
-                            'nspect_id': "",
                             'uploadPath': UPLOAD_PATH
                         ]
+                        if (runMode == "nightly_release") {
+                            additionalParameters += [
+                                'buildNgcRelease': true,
+                                'register_images': true,
+                                'wait_success_seconds': "",
+                            ]
+                        } else {
+                            additionalParameters['nspect_id'] = ""
+                        }
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
@@ -1899,7 +1938,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def params = [
                             string(name: 'postMergePipelineName', value: env.JOB_NAME),
                             string(name: 'postMergeBuildNumber', value: env.BUILD_NUMBER),
-                            string(name: 'scanMode', value: 'pre_merge'),
+                            string(
+                                name: 'scanMode',
+                                value: runMode == "nightly_release" ? 'release' : 'pre_merge'),
                             string(name: 'runSourceCodeScanning', value: 'false'),
                             string(name: 'runContainerScanning', value: 'true'),
                             string(name: 'runSonarQube', value: 'false'),
@@ -1911,21 +1952,32 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             propagate: false
                         )
                         if (handle.result != "SUCCESS") {
-                            catchError(buildResult: currentBuild.result ?: 'SUCCESS', stageResult: 'UNSTABLE') {
-                                error "Risks detected on NGC Containers"
+                            if (runMode == "nightly_release") {
+                                error "Risks detected on nightly NGC Containers"
+                            } else {
+                                catchError(buildResult: currentBuild.result ?: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                    error "Risks detected on NGC Containers"
+                                }
                             }
                         }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                            error "OSS Compliance Check failed: ${e.getMessage()}"
+                        if (runMode == "nightly_release") {
+                            throw e
+                        } else {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                                error "OSS Compliance Check failed: ${e.getMessage()}"
+                            }
                         }
                     }
                 }
             }
         }
     ]
+    if (runMode == "nightly_release" && !GEN_POST_MERGE_BUILDS_ONLY) {
+        stages += plcContainerScanningJob
+    }
     if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
         stages += plcContainerScanningJob
         testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")

@@ -1352,14 +1352,14 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.15"
+version = "0.6.16"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.15-py3-none-any.whl", hash = "sha256:da6c339e14db4831ade0d593324f02907d44bd4b86b640faad4727d9e089477b"},
-    {file = "flashinfer_python-0.6.15.tar.gz", hash = "sha256:2a3f1ed47129f9ac9505a26a8f12cadefc0f27d3104fb623ae281032f49eae5f"},
+    {file = "flashinfer_python-0.6.16-py3-none-any.whl", hash = "sha256:059d629cf352dae2d2e17c9b632f1be7c12fd7feb4979d71cdffd96104219e53"},
+    {file = "flashinfer_python-0.6.16.tar.gz", hash = "sha256:0c89970ee42b0640d3dfd65ea4770710e21101ce2b43a09eda3e29cd1874fe48"},
 ]
 
 [package.dependencies]
@@ -1371,7 +1371,7 @@ einops = "*"
 nccl4py = ">=0.3.1"
 ninja = "*"
 numpy = "*"
-nvidia-cudnn-frontend = ">=1.13.0"
+nvidia-cudnn-frontend = ">=1.25.0"
 nvidia-cutlass-dsl = ">=4.5.0"
 nvidia-ml-py = "*"
 packaging = ">=24.2"
@@ -6103,14 +6103,14 @@ test = ["pytest"]
 
 [[package]]
 name = "sse-starlette"
-version = "3.4.6"
+version = "3.4.8"
 description = "SSE plugin for Starlette"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sse_starlette-3.4.6-py3-none-any.whl", hash = "sha256:56217ab4c9a9f9c5db7b21e08732d3e7c2b807f45231ad23de0551a24c4a41f6"},
-    {file = "sse_starlette-3.4.6.tar.gz", hash = "sha256:725f8a1bd6d26ae1b2c9610c0ef5065dfdd496f3988d28adcf8c4b49dc25c627"},
+    {file = "sse_starlette-3.4.8-py3-none-any.whl", hash = "sha256:6e82314c786709a3cd9520f2285cf9fff90e181e598e8a357b0cf80f66afba0d"},
+    {file = "sse_starlette-3.4.8.tar.gz", hash = "sha256:ed89ffbb75cbf78a5fe2f2109cd584792ee7f9dfac96f791db546df8f15f3f9c"},
 ]
 
 [package.dependencies]
@@ -6126,14 +6126,14 @@ uvicorn = ["uvicorn (>=0.34.0)"]
 
 [[package]]
 name = "starlette"
-version = "1.3.1"
+version = "1.4.1"
 description = "The little ASGI library that shines."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "starlette-1.3.1-py3-none-any.whl", hash = "sha256:c7372aae11c3c3f26a42df7bd626cec2f47d03483d261d369516a615a53714c6"},
-    {file = "starlette-1.3.1.tar.gz", hash = "sha256:05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0"},
+    {file = "starlette-1.4.1-py3-none-any.whl", hash = "sha256:7d078e0fbefae0d2cecfb80a799d6fb84b1c0c6acd4f14ac79d17d0e7ec27f19"},
+    {file = "starlette-1.4.1.tar.gz", hash = "sha256:b7332de6e9375593a29ba9eee1e6ecfeb3eb2043e2e19a13b4b71da73ff35540"},
 ]
 
 [package.dependencies]
@@ -7187,4 +7187,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6efb69c9fb5cf45baaebd398f9dc04301991dad63096035bf05152f009334b3d"
+content-hash = "4a5add9776e2a34402b10a4635c87123fc38efb1c580ec4559ae7fb09837a13c"
