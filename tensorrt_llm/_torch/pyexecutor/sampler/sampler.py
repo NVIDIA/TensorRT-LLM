@@ -89,13 +89,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .beam_search import (
-    BeamHistoryBuilder,
-    BeamSearchHandler,
-    _finalize_beam,
-    _prepare_beam_search,
-    _request_uses_cba,
-)
+from .beam_search import BeamHistoryBuilder, BeamSearchHandler, _finalize_beam, _prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import (
     LogProbsState,
@@ -2057,8 +2051,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             assert beam_search_store is not None
             # Allocate the CBA tensors on the first beam-search request: every
             # early_stopping mode runs on that path.
-            if any(_request_uses_cba(request) for request in new_requests):
-                beam_search_store.ensure_cba()
+            beam_search_store.ensure_cba()
             _prepare_beam_search(
                 beam_search_store,
                 self.store.log_probs_store,

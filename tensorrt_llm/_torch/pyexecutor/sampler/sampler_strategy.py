@@ -35,7 +35,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
     BeamSearchMetadata,
     BeamSearchStore,
     CBAState,
-    beam_search_sampling_batch,
     beam_search_sampling_batch_cba,
 )
 
@@ -86,7 +85,6 @@ __all__ = [
     "CBAState",
     "Fusions",
     "StrategyMetadata",
-    "beam_search_sampling_batch",
     "beam_search_sampling_batch_cba",
     "get_rejected_indices",
     "greedy_search_sampling_batch",
@@ -340,7 +338,7 @@ def sample(
         ):
             row_stride = cast(BeamSearch, strategy).row_stride
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
-                "BeamSearchMetadata is required for beam_search_sampling_batch"
+                "BeamSearchMetadata is required for beam search"
             )
             # Every early_stopping mode goes through the candidate-beams-array
             # path: TRUE differs only in the done verdict (pool full, without
