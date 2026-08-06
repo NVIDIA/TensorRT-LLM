@@ -52,7 +52,10 @@ from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+    FP8BlockScaleMoERunner,
+    _select_explicit_fallback_tactic,
+)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
@@ -124,6 +127,33 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
     with pytest.raises(RuntimeError, match="no valid fallback tactic"):
         _select_explicit_fallback_tactic([])
+
+
+@pytest.mark.parametrize("num_fused_shared_experts", [None, 1])
+def test_fp8_block_scale_moe_fallback_passes_fused_shared_experts(
+    monkeypatch,
+    num_fused_shared_experts,
+):
+    monkeypatch.setattr(FP8BlockScaleMoERunner, "fallback_tactic_dict", {})
+    native_runner = MagicMock()
+    native_runner.get_valid_configs.return_value = [[32, 0]]
+
+    runner = FP8BlockScaleMoERunner.__new__(FP8BlockScaleMoERunner)
+    runner.top_k = 10
+    runner.num_fused_shared_experts = num_fused_shared_experts
+    runner.intermediate_size = 256
+    runner.local_num_experts = 512
+    runner.get_runner = MagicMock(return_value=native_runner)
+
+    assert runner.get_fallback_tactic(hidden_size=8192, num_tokens=4) == [32, 0]
+    native_runner.get_valid_configs.assert_called_once_with(
+        10,
+        num_fused_shared_experts,
+        8192,
+        256,
+        512,
+        4,
+    )
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
