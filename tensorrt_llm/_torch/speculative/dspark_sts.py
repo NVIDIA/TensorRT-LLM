@@ -293,6 +293,19 @@ def make_recorder_from_env(*, block_size: int, rank: int = 0,
             f"{STS_COLLECT_ENV} is set with ragged verify mode 'compact'. Padded "
             f"verify rows corrupt the per-position prefix label. Collect in "
             f"static mode (TLLM_DSPARK_RAGGED_VERIFY_MODE=static).")
+
+    frac = os.environ.get("TLLM_DSPARK_FORCE_BUDGET_FRAC", "").strip()
+    if frac:
+        try:
+            frac_full = float(frac) >= 1.0
+        except ValueError:
+            frac_full = False
+        if not frac_full:
+            raise ValueError(
+                f"{STS_COLLECT_ENV} is set while TLLM_DSPARK_FORCE_BUDGET_FRAC="
+                f"{frac!r} trims the verify budget; a trimmed window censors "
+                f"the acceptance label for every collected sample. Collect "
+                f"with the fraction unset or at 1.0.")
     logger.warning(
         f"DSpark STS collection ON ({STS_COLLECT_ENV}={stem!r}). This adds one "
         f"device->host copy per decode step; it is a calibration mode, not a "

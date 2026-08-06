@@ -886,6 +886,18 @@ class BaseWorker(GenerationExecutor):
             raise RuntimeError("engine is not initialized")
         return self.engine.set_dspark_verify_len_pin(verify_len)
 
+    def set_dspark_budget_frac(self,
+                               frac: Optional[float]) -> Optional[float]:
+        """Set (or clear) the DSpark verify-budget fraction on this executor.
+
+        Same delivery contract as :meth:`set_dspark_verify_len_pin`: a scalar
+        queued on rank 0 and handed to every rank by the decode loop's own
+        per-step allgather.
+        """
+        if self.engine is None:
+            raise RuntimeError("engine is not initialized")
+        return self.engine.set_dspark_budget_frac(frac)
+
     def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
@@ -1014,6 +1026,7 @@ class BaseWorker(GenerationExecutor):
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
+        num_generation_tokens = stats[8] if len(stats) > 8 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -1056,6 +1069,11 @@ class BaseWorker(GenerationExecutor):
         # CPU wall. Set per-record so consumers do not need server config.
         if scheduler_mode is not None:
             stats_dict["schedulerMode"] = scheduler_mode
+        # Executed (padded) generation-token total -- the M axis of the DSpark
+        # SPS cost table. Rank 0's value, broadcast per row by the ADP fanout;
+        # group-uniform on graph steps by construction.
+        if num_generation_tokens is not None:
+            stats_dict["numGenerationTokens"] = int(num_generation_tokens)
 
         # Convert back to JSON string
         return json.dumps(stats_dict)

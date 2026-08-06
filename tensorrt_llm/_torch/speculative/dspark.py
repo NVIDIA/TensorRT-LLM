@@ -490,6 +490,14 @@ class DSparkWorker(SpecWorkerBase):
                       if self.spec_config.enable_ragged_verify else
                       RaggedVerifyMode.STATIC)
         self.ragged_verify_mode = read_ragged_verify_mode(default=configured)
+        if (self.verify_planner is not None
+                and self.verify_planner.forced_budget_frac is not None
+                and not self.ragged_verify_mode.trims_submitted_tokens):
+            raise ValueError(
+                "TLLM_DSPARK_FORCE_BUDGET_FRAC is set but ragged verify mode "
+                f"'{self.ragged_verify_mode.value}' does not trim submitted "
+                "tokens; the fraction would be logged as FORCED and silently "
+                "never applied. Unset it or run compact mode.")
         # STS collection is env-gated; it costs one device->host copy per
         # decode step.
         from .dspark_sts import make_recorder_from_env

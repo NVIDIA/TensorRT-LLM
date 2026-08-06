@@ -39,6 +39,18 @@ from .dspark_schedule import (NEUTRAL_CONFIDENCE_LOGIT, DSparkScheduleConfig,
 #: verify window at this length, bypassing the planner. Not a serving knob.
 FORCE_VERIFY_LEN_ENV = "TLLM_DSPARK_FORCE_VERIFY_LEN"
 
+#: Profiling-only budget override (SPS profiling on the live ragged path):
+#: replaces the cost-table argmax with ``frac`` of the maximum trimmable
+#: budget, while windows still flow through the real confidence top-k. Unlike
+#: the verify-length pin this keeps the executed shape production-faithful
+#: (ragged windows, bucket fit); the profiler sweeps it to visit off-diagonal
+#: (bs, M) cells. Not a serving knob.
+FORCE_BUDGET_FRAC_ENV = "TLLM_DSPARK_FORCE_BUDGET_FRAC"
+
+#: Wire encoding for the frac's cross-rank agreement: fractions travel as
+#: fixed-point ints so the allgather payload stays homogeneous ints.
+_FRAC_WIRE_SCALE = 10_000
+
 __all__ = ["DSparkVerifyPlanner"]
 
 
@@ -83,6 +95,11 @@ class DSparkVerifyPlanner:
         # step's cross-rank allgather so every rank starts pinning on the
         # same step; applying it locally would diverge the shape gate.
         self._pending_verify_len_pin: int = -1
+        # Budget-fraction override (same lifecycle as the pin: env at init,
+        # runtime requests adopted through the step's allgather). Wire values:
+        # -1 nothing queued, 0 clear, >0 frac * _FRAC_WIRE_SCALE.
+        self._forced_budget_frac = self._read_forced_budget_frac()
+        self._pending_budget_frac: int = -1
 
         self._host_buffer: Optional[torch.Tensor] = None
         self._copy_event: Optional[torch.cuda.Event] = None
@@ -189,6 +206,81 @@ class DSparkVerifyPlanner:
                 f"{self.tiers}; every step would fall out of CUDA-graph replay "
                 f"and the measured times would not be step costs")
         return value
+
+    def _read_forced_budget_frac(self) -> Optional[float]:
+        raw = os.environ.get(FORCE_BUDGET_FRAC_ENV, "").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            raise ValueError(
+                f"{FORCE_BUDGET_FRAC_ENV}={raw!r} is not a float") from None
+        value = self.validate_budget_frac(value)
+        logger.warning(
+            f"DSpark: verify budget FORCED to {value} of the trimmable "
+            f"maximum by {FORCE_BUDGET_FRAC_ENV}. Windows still follow "
+            f"confidence; this is a profiling mode, not a serving "
+            f"configuration.")
+        return value
+
+    def validate_budget_frac(self, value: Optional[float]) -> Optional[float]:
+        """Check a budget fraction; None clears the override."""
+        if value is None:
+            return None
+        value = float(value)
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"budget fraction {value} outside (0.0, 1.0]")
+        return value
+
+    @property
+    def forced_budget_frac(self) -> Optional[float]:
+        """The budget fraction currently in force, or None."""
+        return self._forced_budget_frac
+
+    @property
+    def forced_verify_len(self) -> Optional[int]:
+        """The verify-length pin currently in force, or None."""
+        return self._forced_verify_len
+
+    def request_budget_frac(self, value: Optional[float]) -> Optional[float]:
+        """Queue a budget-fraction override (``None`` clears) for the next step.
+
+        Validated here but NOT applied: the step's allgather carries it so all
+        ranks adopt it together (see :meth:`adopt_budget_frac`). Returns the
+        wire-quantized value that will actually be adopted, so the caller sees
+        what applies rather than what it asked for.
+        """
+        value = self.validate_budget_frac(value)
+        wire = (0 if value is None else
+                max(1, int(round(value * _FRAC_WIRE_SCALE))))
+        self._pending_budget_frac = wire
+        return None if value is None else min(1.0, wire / _FRAC_WIRE_SCALE)
+
+    def pending_budget_frac(self) -> int:
+        """The queued request as a wire value: -1 none, 0 clear, >0 fixed-point."""
+        return int(self._pending_budget_frac)
+
+    def adopt_budget_frac(self, wire_value: int) -> None:
+        """Apply the group's agreed budget fraction from the allgathered payload."""
+        wire_value = int(wire_value)
+        if wire_value < 0:
+            return
+        # Same non-atomic compare-and-clear as the pin above: an RPC-thread
+        # request landing between the compare and the store is dropped. Both
+        # knobs are single-operator profiling controls, so the race is
+        # tolerated for both rather than fixed for one.
+        if self._pending_budget_frac == wire_value:
+            self._pending_budget_frac = -1
+        new_frac = (None if wire_value == 0 else
+                    min(1.0, wire_value / _FRAC_WIRE_SCALE))
+        if new_frac == self._forced_budget_frac:
+            return
+        self._forced_budget_frac = new_frac
+        logger.warning(
+            f"DSpark: verify budget fraction set to {new_frac} at runtime. "
+            f"This bypasses the cost table and is a profiling mode, not a "
+            f"serving configuration.")
 
     def request_verify_len_pin(self, value: Optional[int]) -> Optional[int]:
         """Queue a pin (or ``None`` to clear) for the next decode step.
@@ -319,6 +411,25 @@ class DSparkVerifyPlanner:
             # path still runs the cross-rank agreement below.
             self.stats["forced_steps"] += 1
             lens = [int(self._forced_verify_len)] * int(num_gen_requests)
+        elif self._forced_budget_frac is not None:
+            # Also ahead of the cost-table gate (the frac sweep is how the
+            # table gets built). Unlike the pin, the windows stay real: the
+            # forced fraction only replaces the argmax'd budget, and the
+            # confidence top-k spends it exactly as in production.
+            selected = self._gather_rows(num_gen_requests=num_gen_requests,
+                                         rows=rows)
+            if selected is None:
+                return None
+            self._note_snapshot_stats(selected, rows)
+            survival = compute_survival(self.apply_calibration(selected))
+            trimmable = (self.cfg.resolved_max_verify_len
+                         - self.cfg.min_verify_len)
+            budget = int(round(self._forced_budget_frac
+                               * int(num_gen_requests) * trimmable))
+            self.stats["forced_budget_steps"] = (
+                self.stats.get("forced_budget_steps", 0) + 1)
+            lens = schedule_verify_lens_topk(survival=survival, budget=budget,
+                                             cfg=self.cfg).tolist()
         else:
             if self.cost_table is None or self.cost_table.is_flat:
                 self.stats["fallback_flat_cost"] += 1

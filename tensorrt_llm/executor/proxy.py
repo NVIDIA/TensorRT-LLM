@@ -64,7 +64,8 @@ __all__ = [
 # set_dspark_verify_len_pin() needs no control communicator at all: it queues
 # a scalar that the decode loop's own per-step allgather hands to every rank,
 # so rank-0 receiving it is sufficient and the loop is never paused.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup", "set_dspark_verify_len_pin"})
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
+    {"sleep", "wakeup", "set_dspark_verify_len_pin", "set_dspark_budget_frac"})
 
 
 def _check_collective_rpc_guard(

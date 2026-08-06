@@ -268,27 +268,38 @@ class StepSample:
     verify_len: int
     step_time_ms: float
     iteration: int = -1
+    #: Ragged (frac-sweep) steps: the group's executed token total, read from
+    #: the stats rows. None on pinned sweeps, where M is derived instead.
+    measured_tokens: Optional[int] = None
 
     @property
     def total_verify_tokens(self) -> int:
-        """``M`` for this step. Derived, never stored, so it cannot drift."""
+        """``M`` for this step. Measured when the shape was ragged; derived
+        from the pin otherwise, so it cannot drift from the label."""
+        if self.measured_tokens is not None:
+            return int(self.measured_tokens)
         return total_verify_tokens(self.batch_size, self.verify_len)
 
     def to_json(self) -> dict:
-        return {
+        payload = {
             "batch_size": int(self.batch_size),
             "verify_len": int(self.verify_len),
             "step_time_ms": float(self.step_time_ms),
             "iteration": int(self.iteration),
         }
+        if self.measured_tokens is not None:
+            payload["measured_tokens"] = int(self.measured_tokens)
+        return payload
 
     @classmethod
     def from_json(cls, raw: dict) -> "StepSample":
+        measured = raw.get("measured_tokens")
         return cls(
             batch_size=int(raw["batch_size"]),
             verify_len=int(raw["verify_len"]),
             step_time_ms=float(raw["step_time_ms"]),
             iteration=int(raw.get("iteration", -1)),
+            measured_tokens=None if measured is None else int(measured),
         )
 
 
@@ -302,9 +313,14 @@ class CellStat:
     num_samples: int
     p10_ms: float
     p90_ms: float
+    #: Ragged (frac-sweep) cells: the executed token total the samples agreed
+    #: on. None on pinned sweeps.
+    measured_tokens: Optional[int] = None
 
     @property
     def total_verify_tokens(self) -> int:
+        if self.measured_tokens is not None:
+            return int(self.measured_tokens)
         return total_verify_tokens(self.batch_size, self.verify_len)
 
     def to_json(self) -> dict:
@@ -368,6 +384,53 @@ def aligned_steps_from_stats(
             continue
         aligned.append((iteration, num_gen_requests, float(timing)))
     return aligned
+
+
+def ragged_steps_from_stats(
+    rows: Sequence[dict],
+    *,
+    expected_ranks: int = 1,
+    timing_key: str = HOST_STEP_TIME_KEY,
+) -> List[Tuple[int, int, int, float]]:
+    """``(iteration, num_gen_requests, executed_tokens, step_time_ms)`` steps.
+
+    The ragged (frac-sweep) sibling of :func:`aligned_steps_from_stats`: on top
+    of its alignment rules, every rank must also report the same
+    ``numGenerationTokens``. Under attention-DP the executed token total is the
+    group's agreed bucket -- every rank pads and fills to the same shape -- so
+    a step whose ranks disagree is a ramp/fallback step whose shape is not one
+    shape at all, and averaging it in would file its cost under a bucket it did
+    not run.
+    """
+    by_iteration: Dict[int, List[dict]] = {}
+    for row in rows:
+        iteration = row.get("iter")
+        if iteration is None:
+            continue
+        by_iteration.setdefault(int(iteration), []).append(row)
+
+    kept: List[Tuple[int, int, int, float]] = []
+    for iteration in sorted(by_iteration):
+        group = by_iteration[iteration]
+        if len({int(r.get("attentionDpRank", 0)) for r in group}) != int(expected_ranks):
+            continue
+        batching = [row.get("inflightBatchingStats") or {} for row in group]
+        if any(int(stats.get("numContextRequests", 0) or 0) for stats in batching):
+            continue
+        gen_counts = {int(stats.get("numGenRequests", 0) or 0) for stats in batching}
+        if len(gen_counts) != 1 or (num_gen := gen_counts.pop()) <= 0:
+            continue
+        token_counts = {row.get("numGenerationTokens") for row in group}
+        if len(token_counts) != 1:
+            continue
+        tokens = token_counts.pop()
+        if tokens is None or int(tokens) <= 0:
+            continue
+        timing = group[0].get(timing_key)
+        if timing is None or float(timing) <= 0.0:
+            continue
+        kept.append((iteration, num_gen, int(tokens), float(timing)))
+    return kept
 
 
 def explain_alignment(
@@ -470,18 +533,27 @@ def summarize_cells(
             disconnect the batch-size ladder, which changes the fit rather
             than just widening its error bars.
     """
-    grouped: Dict[Tuple[int, int], List[StepSample]] = {}
+    grouped: Dict[Tuple[int, int, Optional[int]], List[StepSample]] = {}
     for sample in samples:
-        grouped.setdefault((int(sample.batch_size), int(sample.verify_len)), []).append(sample)
+        key = (int(sample.batch_size), int(sample.verify_len),
+               None if sample.measured_tokens is None else int(sample.measured_tokens))
+        grouped.setdefault(key, []).append(sample)
 
     requested = None if expected_cells is None else {
         (int(b), int(l)) for b, l in expected_cells}
     dropped: List[str] = []
     cells: List[CellStat] = []
-    for (batch_size, verify_len), cell_samples in sorted(grouped.items()):
+    for (batch_size, verify_len, measured_tokens), cell_samples in sorted(
+            grouped.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or -1)):
         ordered = sorted(cell_samples, key=lambda s: s.iteration)
         steady = [s.step_time_ms for s in ordered[int(warmup_steps) :]]
         if len(steady) < int(min_samples):
+            # Ragged sweeps visit whichever buckets the planner picked, so a
+            # thin incidental bucket is normal coverage noise, not a failed
+            # cell: drop it loudly rather than aborting the fit.
+            if measured_tokens is not None:
+                dropped.append(f"(bs={batch_size}, M={measured_tokens}, n={len(steady)})")
+                continue
             if requested is not None and (batch_size, verify_len) not in requested:
                 dropped.append(f"(bs={batch_size}, L={verify_len}, n={len(steady)})")
                 continue
@@ -503,6 +575,7 @@ def summarize_cells(
                 num_samples=int(values.size),
                 p10_ms=float(np.percentile(values, 10)),
                 p90_ms=float(np.percentile(values, 90)),
+                measured_tokens=measured_tokens,
             )
         )
     if dropped:
@@ -1077,6 +1150,10 @@ class SweepConfig:
     seed_table_path: Optional[str] = None
     #: Restore the original sweep geometry; see the note in _build_llm.
     block_follows_verify_len: bool = False
+    #: Frac sweep (run_frac_sweep): budget fractions to visit on the live
+    #: ragged path. When set, verify_lens is pinned to [max_draft_len] by the
+    #: CLI and the per-cell M comes from measurement instead of the pin.
+    fracs: Optional[List[float]] = None
     attn_backend: str = "TRTLLM"
     disable_overlap_scheduler: bool = False
     #: On by default because the deployment being profiled runs with it on, and
@@ -1133,26 +1210,26 @@ class SweepConfig:
 
     def validate(self) -> None:
         """Catch the geometry mistakes that would otherwise fail mid-sweep."""
+        if self.fracs is not None:
+            bad = [f for f in self.fracs if not 0.0 < float(f) <= 1.0]
+            if bad:
+                raise SweepGeometryError(
+                    f"--fracs values must be in (0, 1], got {sorted(bad)}")
+            if self.block_follows_verify_len:
+                raise SweepGeometryError(
+                    "--fracs measures the live ragged path at the constant "
+                    "block; --block-follows-verify-len contradicts it")
         if not self.batch_sizes or not self.verify_lens:
             raise SweepGeometryError("both --batch-sizes and --verify-lens must be non-empty")
         if min(self.verify_lens) < 1:
             raise SweepGeometryError("verify lengths must be >= 1 (the planner's floor)")
-        if (not self.block_follows_verify_len
-                and min(self.verify_lens) < int(self.max_draft_len)):
-            # Constant-block with a pinned window below the block currently
-            # dies on a device-side assert (Repeat.cu output_size vs
-            # sum(repeats)) at the first short cell -- AFTER minutes of engine
-            # build. Refusing here is this docstring's whole job; letting the
-            # default geometry walk into a known assert is not a validation.
-            raise SweepGeometryError(
-                f"constant-block geometry with verify lengths "
-                f"{sorted(self.verify_lens)} below the block "
-                f"{self.max_draft_len} runs the regime that currently trips "
-                f"the Repeat.cu output_size assert. Pass "
-                f"--block-follows-verify-len (each cell drafts exactly what "
-                f"it verifies), or sweep only L == {self.max_draft_len}, or "
-                f"use --base-url / --from-iter-log which measure a deployment "
-                f"instead of building one.")
+        # Constant-block with a pinned window below the block used to die on a
+        # device-side assert (Repeat.cu output_size vs sum(repeats)); a guard
+        # here refused that geometry. The assert was another symptom of the
+        # graph key describing a different token width than the batch carried,
+        # fixed by publishing the fit's bucket into the key; verified gone
+        # 2026-08-06 by pinned L=3 runs under both real and synthetic
+        # acceptance (64+ steps each, no assert).
         # A request that hits max_seq_len is evicted mid-cell, so the batch
         # drains and the steady window shrinks -- which surfaces much later as a
         # confusing "not enough steady samples".
@@ -1222,12 +1299,14 @@ def _prepare_environment(config: SweepConfig) -> None:
     # only the axis the planner actually controls.
     os.environ[RAGGED_VERIFY_MODE_ENV] = RaggedVerifyMode.COMPACT.value
     if config.pin_acceptance:
-        from .interface import FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR
+        from tensorrt_llm._torch.speculative.interface import (
+            FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR)
 
         os.environ[FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR] = repr(float(config.pin_acceptance))
 
 
-def _build_llm(config: SweepConfig, verify_len: int):
+def _build_llm(config: SweepConfig, verify_len: int, *,
+               pin_verify_len: bool = True):
     """One engine per verify length; see the module docstring for why."""
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import CudaGraphConfig, DSparkDecodingConfig, KvCacheConfig
@@ -1272,14 +1351,22 @@ def _build_llm(config: SweepConfig, verify_len: int):
     # their label does not describe. assert_swept_shape refuses such a sweep
     # downstream (verify_len_hist vs the nominal L), which is why it gates the
     # fit rather than merely warning.
-    os.environ[FORCE_VERIFY_LEN_ENV] = str(int(verify_len))
+    # Frac sweeps leave the pin unset: their windows come from the live
+    # planner (that is the experiment), and the budget fraction travels by
+    # RPC + the step's own allgather, which reaches pre-spawned worlds the
+    # env mutation below cannot.
+    if pin_verify_len:
+        os.environ[FORCE_VERIFY_LEN_ENV] = str(int(verify_len))
+    else:
+        os.environ.pop(FORCE_VERIFY_LEN_ENV, None)
     # Which knob moves M.
     #
     # constant block (default): the block stays at the checkpoint's trained
     # length for every cell and only the verify window moves, which is exactly
-    # what the deployment does. It is the right experiment -- but it makes the
-    # whole batch run with max(verify_len) < block_size, and the ragged packing
-    # currently asserts in that regime (Repeat.cu output_size vs sum(repeats)).
+    # what the deployment does. The all-short-window regime this creates used
+    # to trip the Repeat.cu output_size assert; that was the graph-key/batch
+    # width divergence, fixed with the published-bucket key and verified gone
+    # 2026-08-06.
     #
     # block follows verify_len: the original design. Never produces
     # max(lens) < block, so it runs today, at the price of shrinking the DRAFT
@@ -1323,7 +1410,12 @@ def _build_llm(config: SweepConfig, verify_len: int):
         # every downstream path (bucket choice, padding reservation, graph
         # selection) runs exactly as it does in production.
         confidence_verify_len_tiers=(
-            [int(verify_len)] if config.enable_confidence_scheduling else None
+            # Frac sweeps need the PRODUCTION ladder: the token-bucket grid is
+            # derived from it, and a one-rung ladder would collapse every
+            # captured bucket to the full block -- the sweep would then only
+            # ever measure M = bs * (block + 1) regardless of the frac.
+            (None if not pin_verify_len else [int(verify_len)])
+            if config.enable_confidence_scheduling else None
         ),
     )
     llm_kwargs = dict(
@@ -1360,8 +1452,15 @@ def _build_llm(config: SweepConfig, verify_len: int):
     return LLM(**llm_kwargs)
 
 
-def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> List[StepSample]:
-    """Hold ``batch_size`` generating requests per rank and record every step."""
+def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int,
+              measure_ragged: bool = False) -> List[StepSample]:
+    """Hold ``batch_size`` generating requests per rank and record every step.
+
+    With ``measure_ragged`` the per-step token total is READ from the stats
+    (the group's agreed bucket) instead of derived from the pin, and samples
+    carry it in ``measured_tokens``; one cell then legitimately yields samples
+    at several M values.
+    """
     from tensorrt_llm import SamplingParams
 
     rng = random.Random(config.seed + batch_size * 1000 + verify_len)
@@ -1471,6 +1570,34 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> 
               f"window may have closed early and the cell lost its tail",
               file=sys.stderr)
 
+    if measure_ragged:
+        ragged = ragged_steps_from_stats(
+            rows, expected_ranks=config.dp_size, timing_key=config.timing_key)
+        kept_ragged = [s for s in ragged if s[1] == int(batch_size)]
+        if not kept_ragged:
+            print(
+                f"[dspark-sps]   bs={batch_size:>5} (ragged) kept nothing -- "
+                + explain_alignment(rows, expected_ranks=config.dp_size,
+                                    timing_key=config.timing_key)
+                + "; also requires numGenerationTokens on every rank row",
+                file=sys.stderr)
+            return []
+        # Warmup is discarded per CELL by iteration order, here rather than in
+        # summarize_cells: one ragged cell yields several (bs, M) groups, and a
+        # per-group trim would re-charge the warmup against every bucket.
+        cutoff = sorted(s[0] for s in kept_ragged)
+        cutoff = cutoff[min(int(config.warmup_steps), len(cutoff) - 1)]
+        return [
+            StepSample(
+                batch_size=int(batch_size),
+                verify_len=int(verify_len),
+                step_time_ms=step_time,
+                iteration=iteration,
+                measured_tokens=tokens,
+            )
+            for iteration, num_gen, tokens, step_time in kept_ragged
+            if iteration >= cutoff
+        ]
     aligned = aligned_steps_from_stats(
         rows, expected_ranks=config.dp_size, timing_key=config.timing_key
     )
@@ -1533,6 +1660,70 @@ def run_sweep(config: SweepConfig) -> List[StepSample]:
                 samples.extend(cell)
         finally:
             llm.shutdown()
+    return samples
+
+
+def run_frac_sweep(config: SweepConfig) -> List[StepSample]:
+    """Measure ``(batch_size, frac)`` cells on the LIVE ragged path.
+
+    One engine build for the whole sweep: the block stays at the checkpoint's
+    trained length, no verify-length pin is set, and per cell the budget
+    fraction is switched at runtime (``set_dspark_budget_frac`` -- rank 0's
+    queue, delivered by the decode loop's own allgather). Windows come from
+    the real confidence top-k and the executed shape is the group's agreed
+    bucket, so the cells sample exactly the geometry production runs --
+    including the token-major presentation and the bucket fit -- instead of
+    the pinned-uniform approximation. M is read per step from the stats
+    (``measured_tokens``), so one cell contributes samples at every bucket the
+    planner visited.
+    """
+    config.validate()
+    _prepare_environment(config)
+    fracs = sorted({float(f) for f in (config.fracs or [])})
+    if not fracs:
+        raise ValueError("run_frac_sweep requires a non-empty --fracs")
+    print(
+        f"[dspark-sps] building engine once: block_size={config.max_draft_len} "
+        f"(constant), live planner windows, frac sweep {fracs} ...",
+        file=sys.stderr,
+    )
+    samples: List[StepSample] = []
+    llm = _build_llm(config, int(config.max_draft_len), pin_verify_len=False)
+
+    def _set_frac(value):
+        executor = llm._executor
+        rpc = getattr(executor, "collective_rpc", None)
+        if rpc is not None:
+            return rpc("set_dspark_budget_frac", args=(value,))
+        # Single-process executor path: the worker IS the executor.
+        return executor.set_dspark_budget_frac(value)
+
+    try:
+        for frac in fracs:
+            _set_frac(float(frac))
+            for batch_size in sorted(config.batch_sizes):
+                started = time.time()
+                cell: List[StepSample] = []
+                for _ in range(max(1, int(config.repeats))):
+                    cell.extend(
+                        _run_cell(llm, config, batch_size=batch_size,
+                                  verify_len=int(config.max_draft_len),
+                                  measure_ragged=True))
+                buckets = sorted({s.measured_tokens for s in cell})
+                print(
+                    f"[dspark-sps]   bs={batch_size:>5} frac={frac:.2f} "
+                    f"aligned_steps={len(cell):>5} buckets={buckets[:8]}"
+                    f"{' ...' if len(buckets) > 8 else ''} "
+                    f"({time.time() - started:.1f}s)",
+                    file=sys.stderr,
+                )
+                samples.extend(cell)
+    finally:
+        try:
+            _set_frac(None)
+        except Exception:  # noqa: BLE001 - shutdown path, engine may be gone
+            pass
+        llm.shutdown()
     return samples
 
 
@@ -1667,6 +1858,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Uniform verify lengths to sweep. Defaults to 1..--max-draft-len. "
         "Each value costs one engine build.",
+    )
+    sweep.add_argument(
+        "--fracs",
+        default=None,
+        help="Budget fractions in (0, 1] to sweep on the LIVE ragged path "
+        "(one engine build total; windows from the real confidence top-k, "
+        "per-step M measured from the group's agreed bucket). Mutually "
+        "exclusive with --verify-lens and --block-follows-verify-len.",
     )
     sweep.add_argument("--input-len", type=int, default=1024, help="Prompt length in tokens.")
     sweep.add_argument("--block-follows-verify-len", action="store_true",
@@ -2218,11 +2417,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             with open(args.extra_llm_api_options, encoding="utf-8") as handle:
                 extra = yaml.safe_load(handle) or {}
+        fracs = _float_list(args.fracs) if args.fracs else None
+        if fracs:
+            if args.verify_lens:
+                raise SystemExit("--fracs and --verify-lens are mutually "
+                                 "exclusive; the frac sweep's M is measured, "
+                                 "not pinned")
+            # The frac sweep runs the constant block with live windows; the
+            # nominal verify_len only labels the samples and sizes the token
+            # budget, and max_draft_len satisfies every geometry guard.
+            verify_lens = [int(args.max_draft_len)]
         config = SweepConfig(
             model=args.model,
             speculative_model=args.speculative_model or args.model,
             batch_sizes=batch_sizes,
             verify_lens=verify_lens,
+            fracs=fracs,
             tp_size=args.tp_size,
             ep_size=args.ep_size,
             enable_attention_dp=args.enable_attention_dp,
@@ -2247,9 +2457,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             seed=args.seed,
             extra_llm_api_options=extra,
         )
-        samples = run_sweep(config)
-        expected_cells = frozenset(
-            (int(b), int(l)) for b in batch_sizes for l in verify_lens)
+        if fracs:
+            samples = run_frac_sweep(config)
+            # Which buckets a frac visits is the planner's choice, not a
+            # promise; thin incidental buckets are dropped by summarize_cells.
+            expected_cells = None
+        else:
+            samples = run_sweep(config)
+            expected_cells = frozenset(
+                (int(b), int(l)) for b in batch_sizes for l in verify_lens)
         _write_samples(samples_out, samples)
         print(f"[dspark-sps] wrote {len(samples)} raw samples to {samples_out}", file=sys.stderr)
         provenance = {
@@ -2263,10 +2479,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "acceptance_pinned": bool(config.pin_acceptance),
             "overlap_scheduler": not config.disable_overlap_scheduler,
             "confidence_scheduling": config.enable_confidence_scheduling,
-            "ragged_verify_mode": RaggedVerifyMode.STATIC.value,
+            # _prepare_environment pins COMPACT for both sweep flavours; the
+            # pinned sweep's uniform shape comes from the pin, not the mode.
+            "ragged_verify_mode": RaggedVerifyMode.COMPACT.value,
+            **({"fracs": [float(f) for f in fracs]} if fracs else {}),
         }
 
-    cells = summarize_cells(samples, warmup_steps=args.warmup_steps,
+    cells = summarize_cells(samples,
+                            # Frac cells discard warmup inside _run_cell (per
+                            # cell, by iteration); trimming again here would
+                            # re-charge it against every (bs, M) bucket.
+                            warmup_steps=(0 if args.fracs else args.warmup_steps),
                             min_samples=args.min_samples,
                             expected_cells=expected_cells)
     if not cells:

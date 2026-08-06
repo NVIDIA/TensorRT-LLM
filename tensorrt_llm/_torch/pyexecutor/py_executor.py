@@ -2231,7 +2231,8 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           num_generation_tokens: Optional[int] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2300,6 +2301,16 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            # The executed (padded) generation-token total -- the M axis of
+            # the SPS cost table. Same value the iteration log prints in
+            # `states`; carried per rank so ragged sweeps can align steps on
+            # the group's agreed shape.
+            num_gen_tokens = (num_generation_tokens
+                              if num_generation_tokens is not None else
+                              (self.model_engine.iter_states
+                               or {}).get('num_generation_tokens'))
+            if num_gen_tokens is not None:
+                local_dict["numGenerationTokens"] = int(num_gen_tokens)
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
@@ -2318,6 +2329,8 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] num_generation_tokens: Optional[int] -- executed (padded)
+        #       generation-token total, rank0's value broadcast per row
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -2325,7 +2338,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, num_generation_tokens))
 
     def _process_iter_stats(
         self,
@@ -2390,7 +2403,9 @@ class PyExecutor:
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                num_generation_tokens=(self.model_engine.iter_states
+                                       or {}).get('num_generation_tokens'))
         else:
             self._append_iter_stats(
                 stats,
@@ -3252,7 +3267,64 @@ class PyExecutor:
                 "below the full block censors the acceptance label for every "
                 "sample collected after it. Pin the full block, clear the "
                 "pin, or restart without the collector.")
+        if verify_len is not None and (planner.forced_budget_frac is not None
+                                       or planner.pending_budget_frac() >= 0):
+            raise RuntimeError(
+                "a budget fraction is in force (or queued) on this engine; a "
+                "pin would silently shadow it. Clear the fraction first.")
         return planner.request_verify_len_pin(verify_len)
+
+    def set_dspark_budget_frac(self,
+                               frac: Optional[float]) -> Optional[float]:
+        """Queue a DSpark verify-budget fraction, or ``None`` to clear it.
+
+        Replaces the cost-table argmax with ``frac`` of the maximum trimmable
+        budget while the confidence top-k keeps assigning the windows -- the
+        production ragged path at a controlled load point, for SPS cost-table
+        sweeps. Validated here, applied on the next decode step through the
+        step's cross-rank allgather.
+
+        Raises:
+            RuntimeError: if this executor has no DSpark confidence planner,
+                runs static verification, or is collecting STS calibration
+                data (a trimmed budget censors the acceptance labels).
+            ValueError: if ``frac`` is outside ``(0.0, 1.0]``.
+        """
+        worker_fn = getattr(self.model_engine, "_get_spec_worker", None)
+        worker = worker_fn() if worker_fn else None
+        planner = getattr(worker, "verify_planner", None) if worker else None
+        if planner is None:
+            raise RuntimeError(
+                "no DSpark confidence planner on this executor; the budget "
+                "fraction only applies to a DSpark engine with confidence "
+                "scheduling enabled")
+        mode = getattr(worker, "ragged_verify_mode", None)
+        trims = (mode.trims_submitted_tokens if mode is not None else
+                 self.model_engine.spec_config.enable_ragged_verify)
+        if not trims:
+            # Static never computes windows; cap-accept computes them but
+            # submits the full block, so a frac there cannot move the load
+            # point -- it would only cap live acceptance, which is not what a
+            # cost sweep asks for.
+            raise RuntimeError(
+                "this engine does not trim submitted tokens (static or "
+                "cap-accept mode); the budget fraction only moves the load "
+                "point in compact mode, so setting it here would change "
+                "nothing or change acceptance instead")
+        if frac is not None and (planner.forced_verify_len is not None
+                                 or planner.pending_verify_len_pin() >= 0):
+            raise RuntimeError(
+                "a verify-length pin is in force (or queued) on this engine; "
+                "the pin takes precedence and the fraction would be adopted, "
+                "logged, and never applied. Clear the pin first.")
+        if (worker.sts_recorder is not None and frac is not None
+                and float(frac) < 1.0):
+            raise RuntimeError(
+                "STS calibration collection is active on this engine; a "
+                "trimmed budget censors the acceptance label for every sample "
+                "collected after it. Use 1.0, clear the fraction, or restart "
+                "without the collector.")
+        return planner.request_budget_frac(frac)
 
     def _dspark_confidence_draft_len(self,
                                      scheduled_batch: ScheduledRequests) -> int:
@@ -3344,14 +3416,19 @@ class PyExecutor:
                 local_max_window,
                 1 if scheduled_batch.can_run_cuda_graph else 0,
                 planner.pending_verify_len_pin(),
+                planner.pending_budget_frac(),
             ])
-            # The pin rides the allgather so every rank adopts the same value
-            # on the same step (the endpoint lands on one rank). -1 means
-            # nobody queued anything.
+            # The pin and the budget fraction ride the allgather so every rank
+            # adopts the same value on the same step (the endpoint lands on
+            # one rank). -1 means nobody queued anything.
             agreed_pin = next(
                 (int(payload[5]) for payload in payloads
                  if len(payload) > 5 and int(payload[5]) >= 0), -1)
             planner.adopt_verify_len_pin(agreed_pin)
+            agreed_frac = next(
+                (int(payload[6]) for payload in payloads
+                 if len(payload) > 6 and int(payload[6]) >= 0), -1)
+            planner.adopt_budget_frac(agreed_frac)
             if not all(int(payload[0]) for payload in payloads):
                 # All-or-nothing across ranks: `all_rank_num_tokens` is frozen
                 # into the captured graph, so a mixed step's mismatch would
@@ -3372,6 +3449,7 @@ class PyExecutor:
         else:
             # Single-rank world: the local queue IS the group's agreement.
             planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
+            planner.adopt_budget_frac(planner.pending_budget_frac())
 
         # --- Phase 3: no more collectives -------------------------------------
         #
@@ -5344,7 +5422,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        num_generation_tokens=record.num_generation_tokens)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
