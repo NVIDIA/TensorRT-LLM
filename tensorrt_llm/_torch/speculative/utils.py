@@ -44,11 +44,62 @@ _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
 
 # MTP structure fields copied from a separate MTP-head checkpoint onto the
 # target pretrained config when ``speculative_model`` is set.
+# Prefer writable HF fields: NemotronHConfig exposes mtp_hybrid_override_pattern
+# as a read-only property derived from mtp_layers_block_type.
 _MTP_STRUCTURE_FIELDS_FROM_DRAFT = (
     "num_nextn_predict_layers",
-    "mtp_hybrid_override_pattern",
+    "mtp_layers_block_type",
     "mtp_block_configs",
 )
+
+_MTP_PATTERN_TO_LAYER = {
+    "M": "mamba",
+    "E": "moe",
+    "*": "attention",
+    "-": "mlp",
+}
+
+
+def _set_pretrained_config_attr(model_config,
+                                 name: str,
+                                 value,
+                                 *,
+                                 required: bool = True) -> bool:
+    """Set a config field, tolerating read-only properties / strict dataclasses.
+
+    Returns True if the value was applied. When ``required`` is False, failures
+    are logged and ignored (used for optional fields like ``mtp_block_configs``).
+    """
+    try:
+        setattr(model_config, name, value)
+        return True
+    except AttributeError:
+        pass
+    try:
+        vars(model_config)[name] = value
+        return True
+    except (TypeError, AttributeError) as exc:
+        if required:
+            raise AttributeError(
+                f"Unable to set '{name}' on {type(model_config).__name__}"
+            ) from exc
+        logger.warning(
+            "Skipping optional MTP config field '%s' on %s: %s",
+            name,
+            type(model_config).__name__,
+            exc,
+        )
+        return False
+
+
+def _pattern_to_mtp_layers_block_type(pattern: str) -> list:
+    try:
+        return [_MTP_PATTERN_TO_LAYER[char] for char in pattern]
+    except KeyError as exc:
+        raise ValueError(
+            f"Invalid mtp_hybrid_override_pattern {pattern!r}: "
+            f"expected characters in {sorted(_MTP_PATTERN_TO_LAYER)}"
+        ) from exc
 
 
 def _is_mtp_checkpoint_weight_key(key: str) -> bool:
@@ -110,10 +161,28 @@ def _merge_mtp_fields_from_speculative_model(spec_config,
 
     for field in _MTP_STRUCTURE_FIELDS_FROM_DRAFT:
         if field in draft_cfg and draft_cfg[field] is not None:
-            setattr(model_config, field, draft_cfg[field])
+            _set_pretrained_config_attr(
+                model_config,
+                field,
+                draft_cfg[field],
+                required=(field != "mtp_block_configs"),
+            )
+
+    # HF NemotronHConfig: mtp_hybrid_override_pattern is a read-only property
+    # derived from mtp_layers_block_type. Convert the pattern when the draft
+    # checkpoint only provides the legacy string form.
+    if (draft_cfg.get("mtp_layers_block_type") is None
+            and draft_cfg.get("mtp_hybrid_override_pattern") is not None):
+        _set_pretrained_config_attr(
+            model_config,
+            "mtp_layers_block_type",
+            _pattern_to_mtp_layers_block_type(
+                draft_cfg["mtp_hybrid_override_pattern"]),
+        )
 
     if draft_nextn is not None:
-        setattr(model_config, "num_nextn_predict_layers", draft_nextn)
+        _set_pretrained_config_attr(model_config, "num_nextn_predict_layers",
+                                    draft_nextn)
         return int(draft_nextn)
     return None
 

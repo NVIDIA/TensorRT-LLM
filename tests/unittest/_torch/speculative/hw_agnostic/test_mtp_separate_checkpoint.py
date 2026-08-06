@@ -69,7 +69,7 @@ def test_update_spec_config_prefers_speculative_model_mtp_fields(tmp_path):
     model_config = SimpleNamespace(
         architectures=["NemotronHForCausalLM"],
         num_nextn_predict_layers=0,
-        mtp_hybrid_override_pattern=None,
+        mtp_layers_block_type=None,
         mtp_block_configs=None,
     )
     spec_config = MTPDecodingConfig(max_draft_len=5,
@@ -79,13 +79,34 @@ def test_update_spec_config_prefers_speculative_model_mtp_fields(tmp_path):
 
     assert spec_config.num_nextn_predict_layers == 1
     assert model_config.num_nextn_predict_layers == 1
-    assert model_config.mtp_hybrid_override_pattern == "*E"
+    # Legacy pattern string is converted to the writable HF field.
+    assert model_config.mtp_layers_block_type == ["attention", "moe"]
     assert model_config.mtp_block_configs == [{
         "block_type": "moe",
         "num_experts": 8
     }]
     # User-set max_draft_len is preserved for Eagle-style replay.
     assert spec_config.max_draft_len == 5
+
+
+def test_update_spec_config_uses_mtp_layers_block_type_when_present(tmp_path):
+    mtp_dir = tmp_path / "mtp_heads"
+    mtp_dir.mkdir()
+    (mtp_dir / "config.json").write_text(
+        json.dumps({
+            "num_nextn_predict_layers": 1,
+            "mtp_layers_block_type": ["attention", "moe"],
+        }))
+
+    model_config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        num_nextn_predict_layers=0,
+        mtp_layers_block_type=None,
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=3,
+                                    speculative_model=str(mtp_dir))
+    update_spec_config_from_model_config(spec_config, model_config)
+    assert model_config.mtp_layers_block_type == ["attention", "moe"]
 
 
 def test_nemotron_mapper_remaps_mtp_layers_keys():
