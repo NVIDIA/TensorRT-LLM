@@ -935,7 +935,8 @@ def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
 
 
 @pytest.mark.cpu_only
-def test_KvCacheConfig_unified_memory_forces_host_cache_size_zero(monkeypatch):
+def test_kv_cache_config_unified_memory_forces_host_cache_size_zero(
+        monkeypatch):
     monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: True)
 
     config = KvCacheConfig(host_cache_size=1024)
@@ -944,8 +945,23 @@ def test_KvCacheConfig_unified_memory_forces_host_cache_size_zero(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_KvCacheConfig_discrete_memory_preserves_host_cache_size(monkeypatch):
+def test_kv_cache_config_discrete_memory_preserves_host_cache_size(monkeypatch):
     monkeypatch.setattr(llm_args_mod, "is_device_integrated", lambda: False)
+
+    config = KvCacheConfig(host_cache_size=1024)
+
+    assert config.host_cache_size == 1024
+
+
+@pytest.mark.cpu_only
+def test_kv_cache_config_preserves_host_cache_size_when_detection_fails(
+        monkeypatch):
+
+    def raise_detection_error():
+        raise RuntimeError("CUDA device detection failed")
+
+    monkeypatch.setattr(llm_args_mod, "is_device_integrated",
+                        raise_detection_error)
 
     config = KvCacheConfig(host_cache_size=1024)
 
