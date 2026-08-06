@@ -2258,9 +2258,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     seq_lens=group_seq_lens_cuda,
                     finished_beams=beam_search_store.first_finish_reasons,
                     predecessor_beams=beam_search_store.predecessor_beams,
-                    seq_offsets=beam_search_store.seq_offsets,
                     beam_idx_arange=beam_search_store.beam_idx_arange,
-                    beam_gen_lengths=beam_search_store.beam_gen_lengths,
                     stop_past_tokens=self._finish_reasons_handler.store.past_tokens_cuda,
                     # None unless a beam-search request has been
                     # admitted; the CBA tensors are not allocated before that.
@@ -3632,7 +3630,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Because req_num_generated_tokens may differ from the number of sampled tokens in
             # beam search, the sampled rank computation would entail extra complexity to resolve
             # the relationships between incoming and outgoing beams. For the sampled logprobs, this
-            # matching happens in beam_search_sampling_batch() which updates
+            # matching happens in beam_search_sampling_batch_cba() which updates
             # log_probs_store.sampled_log_probs. Therefore, neither sampled ranks nor sampled logprobs
             # are handled here.
             if logprobs_reqs_indices_n_beam:

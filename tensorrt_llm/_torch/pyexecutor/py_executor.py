@@ -6501,7 +6501,6 @@ class PyExecutor:
         # is admitted here, so seed it to 1: length_penalty normalizes by this
         # counter, and leaving it at zero would divide by one less than the
         # true length for the whole request.
-        beam_search_store.beam_gen_lengths[seq_slot, :beam_width].fill_(1)
         return True
 
     @staticmethod

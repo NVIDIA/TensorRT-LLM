@@ -15,8 +15,7 @@
 """PyTorch-native beam-search sampling kernels.
 
 The candidate-selection, beam-expansion, and candidate-beams-array (CBA)
-exhaustive-early-stopping logic for TorchSampler beam search, split out of
-``ops.vanilla`` so the regular and CBA paths live in one place. Pure tensor
+beam-search logic for TorchSampler, split out of ``ops.vanilla``. Pure tensor
 functions plus their metadata dataclasses; no dependency on the
 ``sampling_utils`` interface.
 """
@@ -32,7 +31,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..llm_request import LlmRequest, LlmRequestState
-from .logprobs import LogProbsStore, convert_logprobs_tensor_to_list, get_logprobs_from_request
+from .logprobs import LogProbsStore, convert_logprobs_tensor_to_list
 from .ops.flashinfer import radix_topk_op
 from .ops.vanilla import StrategyMetadata
 from .sampler_common import _get_beam_width_in, _unwrap_singleton, int_tensor
@@ -60,8 +59,7 @@ class BeamSearchEarlyStop(IntEnum):
     """
 
     TRUE = 1
-    """HF ``True`` (default): stop once ``beam_width`` finished candidates exist.
-    Regular (non-CBA) path."""
+    """HF ``True`` (default): stop once ``beam_width`` finished candidates exist."""
 
     FALSE = 0
     """HF ``False``: CBA path bounding attainability by the beam's current
@@ -142,8 +140,8 @@ class _CBAFields:
 
 @dataclass(kw_only=True)
 class CBAState(_CBAFields):
-    """Candidate-Beams-Array (CBA) state, present only for requests using
-    every beam-search request, whatever its early_stopping mode; see
+    """Candidate-Beams-Array (CBA) state, present for every beam-search
+    request whatever its early_stopping mode; see
     beam_search_sampling_batch_cba.
 
     A per-step view over the persistent ``BeamSearchStore`` (shared CBA tensors
@@ -197,17 +195,9 @@ class BeamSearchStore:
     predecessor_beams: torch.Tensor
     """[max_num_sequences, max_beam_width] int32, predecessor beam per beam, used
     for stop word detection."""
-    seq_offsets: torch.Tensor
-    """[max_num_sequences] int64, cached ``arange(max_num_sequences) *
-    max_beam_width`` used by ``beam_search_sampling_batch_cba`` to flatten
-    (batch_idx, beam_idx) pairs."""
     beam_idx_arange: torch.Tensor
     """[max_beam_width] int32, cached ``arange(max_beam_width)`` used as the
     scatter source in the per-step ``cache_indirection.scatter_``."""
-    beam_gen_lengths: torch.Tensor
-    """[max_num_sequences, max_beam_width] int32, number of generated tokens per
-    beam (frozen once a beam finishes). Only maintained for requests with a
-    non-zero beam-search length_penalty."""
     original_tokens: torch.Tensor
     """[max_num_sequences, max_beam_width, max_seq_len] int32, uncorrected
     per-slot tokens, written every beam-search step; read with
@@ -242,11 +232,7 @@ class BeamSearchStore:
             predecessor_beams=int_tensor(per_beam),
             original_tokens=int_tensor(cache_indirection_shape),
             first_finish_reasons=int_tensor(per_beam),
-            seq_offsets=(
-                torch.arange(max_num_sequences, device="cuda", dtype=torch.int64) * max_beam_width
-            ),
             beam_idx_arange=torch.arange(max_beam_width, device="cuda", dtype=torch.int32),
-            beam_gen_lengths=int_tensor(per_beam),
             prompt_lens=int_tensor((max_num_sequences,)),
             batch_dones=torch.zeros((max_num_sequences,), device="cuda", dtype=torch.bool),
         )
@@ -290,29 +276,6 @@ class BeamHistory:
     """[num_beams] float, cumulative log-prob per beam."""
 
 
-@dataclass(kw_only=True, frozen=True)
-class _BeamHistoryLogProbsSlices:
-    """Correlated beam-history log-prob tensors; all three fields are bound together."""
-
-    sampled_log_probs: torch.Tensor
-    sampled_logprobs_indices: torch.Tensor
-    cum_logprobs: torch.Tensor
-
-
-@dataclass(kw_only=True, frozen=True)
-class _BeamHistoryTensors:
-    """Beam-history tensor slices.
-
-    Used to carry both device-side views (before D2H) and host-side
-    snapshots (after D2H). `log_probs` is bound iff log-probs are
-    requested.
-    """
-
-    cache_indirection: torch.Tensor
-    current_path: torch.Tensor
-    log_probs: _BeamHistoryLogProbsSlices | None
-
-
 def _gather_beam_path(
     *, current_path: torch.Tensor, cache_indirection: torch.Tensor
 ) -> torch.Tensor:
@@ -334,13 +297,11 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
-    seq_offsets: torch.Tensor
     beam_idx_arange: torch.Tensor
-    beam_gen_lengths: torch.Tensor
     stop_past_tokens: Optional[torch.Tensor] = None
     """[max_stop_word_length, max_num_sequences, max_beam_width] int32, the
     finish handler's rolling stop-word window (FinishReasonsHandler store).
-    Used by both the regular and CBA paths: the beam axis is reordered by the
+    The beam axis is reordered by the
     step's predecessor beams so the handler's stop-word matching stays correct
     across beam swaps. When None (tests without stop words), the reorder is
     skipped — multi-token stop-word matching would then be unreliable across
@@ -449,8 +410,8 @@ def beam_candidate_topk(
     The diversity term ``diversity_rate * source_beam_index`` spreads selection
     across source beams (candidates from lower-ranked beams get a boost), and
     the length term normalizes by ``gen_length**length_penalty``. Finished
-    beams stay frozen in their slots rather than in a separate pool, so a
-    finished beam's (single) candidate receives the same ``rate * slot_index``
+    beams are harvested into the candidate pool, but until the harvest lands
+    a finished beam's (single) candidate receives the same ``rate * slot_index``
     boost as any other — slot position thus slightly affects how hard a
     finished beam is to evict.
 
@@ -945,7 +906,7 @@ def beam_search_sampling_batch_cba(
     if reordered_window is not None and stop_window is not None:
         stop_window[:, slots, :num_beams] = reordered_window
 
-    # --- Beam-slot state updates (same contract as beam_search_sampling_batch).
+    # --- Beam-slot state updates (same contract as beam_search_sampling_batch_cba).
     args.predecessor_beams[slots, :num_beams] = slot_pred
     cache_indirection = args.cache_indirection[slots, :num_beams]
     cache_indirection_buffer = args.cache_indirection_buffer[slots, :beam_width_in]
@@ -1031,7 +992,6 @@ def _prepare_beam_search(
         0, seq_slots_long, FinishReason.NOT_FINISHED.value
     )
     beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
-    beam_search_store.beam_gen_lengths.index_fill_(0, seq_slots_long, 0)
     beam_search_store.prompt_lens.index_copy_(0, seq_slots_long, prompt_lens_cuda)
     beam_search_store.batch_dones.index_fill_(0, seq_slots_long, False)
     # The CBA tensors only exist once a beam-search request has
@@ -1153,48 +1113,6 @@ def _prepare_beam_history_cba(
         )
 
     return _builder
-
-
-def _postprocess_beam_logprobs(
-    request: LlmRequest,
-    *,
-    cache_indirection: torch.Tensor,
-    log_probs_host: _BeamHistoryLogProbsSlices,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reorder per-step beam logprobs along the cache-indirection axis.
-
-    Concatenates the freshly-sampled per-step entries onto the
-    request's existing host-side logprobs buffer and gathers each
-    beam's history through `cache_indirection`. Returns the gathered
-    (logprobs, logprobs_indices, cum_logprobs) triple.
-    """
-    current_logprobs, current_logprobs_indices = get_logprobs_from_request(
-        request, preallocate_extra_steps=1
-    )
-    # concatenate the newly generated logprobs and newly
-    # generated tokens to the current logprobs and logprobs indices
-    current_logprobs[:, -1, :].copy_(log_probs_host.sampled_log_probs)
-    current_logprobs_indices[:, -1, :].copy_(log_probs_host.sampled_logprobs_indices)
-
-    # Gather the correct logprobs for each beam.
-    new_logprobs = torch.zeros_like(current_logprobs)
-    new_logprobs_indices = torch.zeros_like(current_logprobs_indices)
-    cache_indirection_for_logprobs = cache_indirection.unsqueeze(-1).expand(
-        -1, -1, current_logprobs.shape[2]
-    )
-    torch.gather(
-        input=current_logprobs,
-        dim=0,
-        index=cache_indirection_for_logprobs,
-        out=new_logprobs,
-    )
-    torch.gather(
-        input=current_logprobs_indices,
-        dim=0,
-        index=cache_indirection_for_logprobs,
-        out=new_logprobs_indices,
-    )
-    return new_logprobs, new_logprobs_indices, log_probs_host.cum_logprobs
 
 
 def _finalize_beam(
