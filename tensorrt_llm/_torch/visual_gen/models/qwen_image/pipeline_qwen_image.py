@@ -351,20 +351,6 @@ class QwenImagePipeline(BasePipeline):
             return prompt_embeds, None
         return prompt_embeds, prompt_embeds_mask
 
-    @staticmethod
-    def _validate_ulysses_prompt_masks(
-        ulysses_size: int,
-        *prompt_masks: Optional[torch.Tensor],
-    ) -> None:
-        if ulysses_size <= 1:
-            return
-        if any(mask is not None for mask in prompt_masks):
-            raise ValueError(
-                "Qwen-Image Ulysses parallelism requires unmasked prompt "
-                "conditioning. Use prompts that produce all-valid prompt "
-                "masks, or set ulysses_size=1 for padded prompt conditioning."
-            )
-
     # ------------------------------------------------------------------
     # Latent prep / packing (identical shape to FLUX).
     # ------------------------------------------------------------------
@@ -573,9 +559,6 @@ class QwenImagePipeline(BasePipeline):
         do_cfg_parallel, cfg_size, cfg_rank, cfg_pg = self._cfg_parallel_state(
             use_negative_prompt_cfg
         )
-        vgm = self.pipeline_config.visual_gen_mapping
-        ulysses_size = vgm.ulysses_size if vgm else 1
-
         device = self.device
         generator = make_noise_generator(seed, device)
 
@@ -588,11 +571,6 @@ class QwenImagePipeline(BasePipeline):
             neg_prompt_embeds, neg_prompt_embeds_mask = self._encode_prompt(
                 negative_prompt, device, max_sequence_length
             )
-        self._validate_ulysses_prompt_masks(
-            ulysses_size,
-            prompt_embeds_mask,
-            neg_prompt_embeds_mask,
-        )
 
         # Latents.
         num_channels_latents = self.transformer.in_channels // 4  # 16
