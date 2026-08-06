@@ -1462,8 +1462,7 @@ class PyTorchModelEngine(ModelEngine):
                         f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
             warmup_requests_configs.append((_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
 
-        if (not self.is_draft_model and self.guided_decoder is None
-                and can_run_general_warmup):
+        if self.guided_decoder is None and can_run_general_warmup:
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
             # One MIXED context+generation batch (1 ctx token + 1 gen request).
             warmup_requests_configs.append(
