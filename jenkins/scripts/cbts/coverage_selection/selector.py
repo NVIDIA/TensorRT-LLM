@@ -118,8 +118,7 @@ class CoverageSelector:
             diff = diffs.get(path) or ""
             source = self._read_source(path)
             if not diff.strip() or source is None:
-                # The API omits the patch for binary / renamed / oversized files, so
-                # which qualname changed is unknown; bound it as an import-time one.
+                # Patch omitted (binary / renamed / oversized): bound as import-time.
                 no_diff.append(path)
                 tests = self._underrecorded_bound(cf, "<module>")
                 if tests is None:
@@ -132,9 +131,7 @@ class CoverageSelector:
                 # Comment-only or unparsable: no qualname to resolve, file-level bound.
                 impacted |= self.db.tests_touching_file(cf)
                 continue
-            # Qualnames whose rows do not record the changed code: import-time bodies
-            # (recorded only in whichever process imported under a test context) and
-            # closure attributions (the producer records no `<locals>` frame at all).
+            # Qualnames whose rows do not record the changed code.
             underrecorded = import_executed_qualnames(source) | closure_attributed_qualnames(
                 source, lines
             )
@@ -177,8 +174,7 @@ class CoverageSelector:
     def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
         """Decide over residual files; ok=False for non-core, not-in-DB, or unbounded import-time changes."""
         for path in residual_files:
-            # Gate on the repo path, not canon(): canon matches `tensorrt_llm/` anywhere,
-            # so cpp/tensorrt_llm/*.py would otherwise map onto the package namespace.
+            # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
             if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
                 return CoverageResult(ok=False, reason=f"non-core-Python residual file: {path}")
             cf = canon(path)
