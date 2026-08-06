@@ -903,8 +903,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+        return (self.top_k, self.num_fused_shared_experts,
+                self.intermediate_size, self.local_num_experts, self.act_type)
 
     def get_runner(self):
         instance_key = ()
