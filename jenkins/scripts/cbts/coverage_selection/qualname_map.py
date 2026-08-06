@@ -84,3 +84,31 @@ def qualnames_for_lines(source: str, lines: set[int]) -> tuple[set[str], bool]:
         return set(), False
     scopes = _collect_scopes(tree)
     return {_attribute(ln, scopes) for ln in lines}, True
+
+
+def import_executed_qualnames(source: str) -> set[str]:
+    """Qualnames whose code runs once, at import: `<module>` and every class body.
+
+    A signature or decorator line attributes to its *enclosing* scope (see
+    `_attribute`), so a method's `def` line lands on the class and is covered by
+    this set too. Unparsable source yields just `<module>`.
+    """
+    out = {"<module>"}
+
+    def walk(stmts, prefix: str) -> None:
+        for node in stmts:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                qual = prefix + node.name
+                if isinstance(node, ast.ClassDef):
+                    out.add(qual)
+                    walk(node.body, qual + ".")
+                else:
+                    walk(node.body, qual + ".<locals>.")
+            else:
+                walk(list(_substatements(node)), prefix)
+
+    try:
+        walk(ast.parse(source).body, "")
+    except SyntaxError:
+        pass
+    return out

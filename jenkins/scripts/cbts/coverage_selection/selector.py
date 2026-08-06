@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from qualname_map import qualnames_for_lines
+from qualname_map import import_executed_qualnames, qualnames_for_lines
 from rules._helpers import iter_diff_post_line_numbers
 from touch_db import (
     _LAUNCH_MARKERS,
@@ -105,8 +105,12 @@ class CoverageSelector:
 
     def _impacted_tests(
         self, residual_files: list[str], diffs: dict[str, str]
-    ) -> tuple[set[str], list[str]]:
-        """Return (impacted stage-prefixed tests, file::qualname symbols with no DB rows)."""
+    ) -> tuple[set[str], list[str], str | None]:
+        """Return (impacted tests, file::qualname symbols with no DB rows, decline reason).
+
+        A non-None decline reason means the change cannot be resolved soundly and
+        the caller must not narrow; see `_import_executed_impact`.
+        """
         impacted: set[str] = set()
         no_data: list[str] = []
         for path in residual_files:
@@ -120,13 +124,43 @@ class CoverageSelector:
             if not ok:
                 impacted |= self.db.tests_touching_file(cf)
                 continue
+            import_executed = import_executed_qualnames(source)
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
+                if qualname in import_executed:
+                    tests, decline = self._import_executed_impact(cf, qualname, path)
+                    if decline is not None:
+                        return impacted, no_data, decline
+                    impacted |= tests
+                    continue
                 tests = self.db.tests_touching_func(cf, qualname)
                 impacted |= tests
-                if not tests and qualname != "<module>":
+                if not tests:
                     no_data.append(f"{cf}::{qualname}")
                     impacted |= self._no_data_fallback(cf)
-        return impacted, no_data
+        return impacted, no_data, None
+
+    def _import_executed_impact(
+        self, cf: str, qualname: str, path: str
+    ) -> tuple[set[str], str | None]:
+        """Resolve a changed qualname whose code runs at import time.
+
+        Module and class bodies execute once per process, during import. A test
+        only holds a row for one if its process was already being recorded then,
+        which excludes every test served by a pool worker (those import before
+        capture starts) and every in-process import done at collection time
+        (recorded under the empty context). The rows are therefore a subset of
+        the tests that actually ran the code, and narrowing on them alone drops
+        the difference.
+
+        The file's own row set covers the gap whenever the same process later
+        entered any function in the file. When it does not — a file whose only
+        recorded rows are the import-time ones — no sound impact set exists and
+        the change is declined instead.
+        """
+        file_tests = self.db.tests_touching_file(cf)
+        if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
+            return file_tests, None
+        return set(), (f"import-executed scope changed with no wider row set: {path}::{qualname}")
 
     def _no_data_fallback(self, cf: str) -> set[str]:
         """Tests to force-run for a changed function the DB never captured.
@@ -149,7 +183,8 @@ class CoverageSelector:
     def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
         """Decide over residual files (repo-relative paths no rule claimed).
 
-        Returns ok=False for any non-core-Python file or file absent from the DB.
+        Returns ok=False for any non-core-Python file, any file absent from the DB,
+        and any import-executed change `_import_executed_impact` cannot bound.
         """
         for path in residual_files:
             cf = canon(path)
@@ -160,7 +195,9 @@ class CoverageSelector:
                     ok=False, reason=f"zero-touch residual file (new/uninstrumented): {path}"
                 )
 
-        impacted_tests, no_data_funcs = self._impacted_tests(residual_files, diffs)
+        impacted_tests, no_data_funcs, decline = self._impacted_tests(residual_files, diffs)
+        if decline is not None:
+            return CoverageResult(ok=False, reason=decline)
 
         impacted: dict[str, set[str]] = {}
         for test in impacted_tests:
