@@ -126,12 +126,12 @@ torch::Tensor fused_qk_norm_rope_to_fp8(torch::Tensor const& qkv, // [num_tokens
 
     auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
-    tensorrt_llm::kernels::launchFusedQKNormRopeOut(qkv.data_ptr(), out.data_ptr(), /*out_fp8=*/true,
-        /*process_v=*/true, static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
-        static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<int>(rotary_dim),
-        static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base), !is_neox,
-        reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
-        static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm, use_gemma, use_mrope,
+    tensorrt_llm::kernels::launchFusedQKNormRopeToFp8(qkv.data_ptr(), out.data_ptr(), static_cast<int>(num_tokens),
+        static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
+        static_cast<int>(head_dim), static_cast<int>(rotary_dim), static_cast<float>(eps), q_weight.data_ptr(),
+        k_weight.data_ptr(), static_cast<float>(base), !is_neox, reinterpret_cast<int const*>(position_ids.data_ptr()),
+        static_cast<float>(factor), static_cast<float>(low), static_cast<float>(high),
+        static_cast<float>(attention_factor), stream, is_qk_norm, use_gemma, use_mrope,
         static_cast<int>(mrope_section1), static_cast<int>(mrope_section2));
 
     return out;

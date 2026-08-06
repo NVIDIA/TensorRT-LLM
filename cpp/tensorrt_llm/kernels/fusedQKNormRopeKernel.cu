@@ -59,8 +59,10 @@ __device__ __forceinline__ float selectMRopePosId(int const* position_ids, int t
 
 // Store a per-thread run of `numElemsPerThread` float elements to the output
 // head, converting to the output dtype. BF16 uses the packed uint vector store;
-// FP8 E4M3 packs pairs via __nv_fp8x2_e4m3 (saturating round-to-nearest, matching
-// torch's .to(torch.float8_e4m3fn)).
+// FP8 E4M3 packs pairs via __nv_fp8x2_e4m3, i.e. round-to-nearest-even with
+// __NV_SATFINITE clamping to +/-448. That matches torch's
+// .to(torch.float8_e4m3fn) for in-range values; out-of-range values clamp to
+// +/-448 here whereas torch produces NaN.
 template <typename OutT, int numElemsPerThread, int vecSize>
 __device__ __forceinline__ void storeHeadElements(
     OutT* out, int offsetThread, float const (&elements)[numElemsPerThread])
@@ -69,6 +71,7 @@ __device__ __forceinline__ void storeHeadElements(
     if constexpr (std::is_same_v<OutT, __nv_bfloat16>)
     {
         vec_T vec;
+#pragma unroll
         for (int i = 0; i < vecSize; i++)
         {
             __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
@@ -186,6 +189,7 @@ __global__ void fusedQKNormRopeKernel(
     // Load from the BF16 input.
     {
         vec_T vec = *reinterpret_cast<vec_T const*>(&qkv_in[offsetThread]);
+#pragma unroll
         for (int i = 0; i < vecSize; i++)
         {
             float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
@@ -381,7 +385,15 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
         TLLM_CHECK(attention_factor == 1.0f);
     }
 
-    TLLM_CHECK_WITH_INFO(rotary_dim % 2 == 0, "rotary_dim must be even");
+    // rotary_dim == 0 would divide by zero when deriving the RoPE frequencies, and
+    // rotary_dim > head_dim breaks the warp-level pairing assumptions.
+    TLLM_CHECK_WITH_INFO(rotary_dim > 0 && rotary_dim <= head_dim && rotary_dim % 2 == 0,
+        "rotary_dim must be positive, even and no greater than head_dim (got rotary_dim=%d, head_dim=%d)", rotary_dim,
+        head_dim);
+    // Skipping V is only well-defined in-place, where the V slots of the output
+    // already hold their final values; out-of-place they would stay uninitialized.
+    TLLM_CHECK_WITH_INFO(process_v || static_cast<void const*>(qkv_in) == static_cast<void const*>(qkv_out),
+        "process_v=false requires qkv_in and qkv_out to alias");
     if (!interleave)
     {
         // To allow warp-level pairing for partial rope
@@ -446,29 +458,18 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
         attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
 }
 
-void launchFusedQKNormRopeOut(void const* qkv_in, void* qkv_out, bool out_fp8, bool process_v, int const num_tokens,
-    int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim, int const rotary_dim,
-    float const eps, void const* q_weight, void const* k_weight, float const base, bool const interleave,
-    int const* position_ids, float factor, float low, float high, float attention_factor, cudaStream_t stream,
-    bool is_qk_norm, bool use_gemma, bool use_mrope, int mrope_section1, int mrope_section2)
+void launchFusedQKNormRopeToFp8(void const* qkv_in, void* qkv_out, int const num_tokens, int const num_heads_q,
+    int const num_heads_k, int const num_heads_v, int const head_dim, int const rotary_dim, float const eps,
+    void const* q_weight, void const* k_weight, float const base, bool const interleave, int const* position_ids,
+    float factor, float low, float high, float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma,
+    bool use_mrope, int mrope_section1, int mrope_section2)
 {
-    auto const* in = reinterpret_cast<__nv_bfloat16 const*>(qkv_in);
-    auto const* qw = reinterpret_cast<__nv_bfloat16 const*>(q_weight);
-    auto const* kw = reinterpret_cast<__nv_bfloat16 const*>(k_weight);
-    if (out_fp8)
-    {
-        launchFusedQKNormRopeImpl<__nv_fp8_e4m3>(in, reinterpret_cast<__nv_fp8_e4m3*>(qkv_out), process_v, num_tokens,
-            num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim, eps, qw, kw, base, interleave, position_ids,
-            factor, low, high, attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-            mrope_section2);
-    }
-    else
-    {
-        launchFusedQKNormRopeImpl<__nv_bfloat16>(in, reinterpret_cast<__nv_bfloat16*>(qkv_out), process_v, num_tokens,
-            num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim, eps, qw, kw, base, interleave, position_ids,
-            factor, low, high, attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-            mrope_section2);
-    }
+    // Out-of-place FP8: qkv_out is a fresh buffer, so V must be copy-cast too.
+    launchFusedQKNormRopeImpl<__nv_fp8_e4m3>(reinterpret_cast<__nv_bfloat16 const*>(qkv_in),
+        reinterpret_cast<__nv_fp8_e4m3*>(qkv_out), /*process_v=*/true, num_tokens, num_heads_q, num_heads_k,
+        num_heads_v, head_dim, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+        reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, interleave, position_ids, factor, low, high,
+        attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
 }
 } // namespace kernels
 
