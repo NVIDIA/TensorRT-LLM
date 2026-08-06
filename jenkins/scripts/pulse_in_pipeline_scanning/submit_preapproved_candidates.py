@@ -27,7 +27,7 @@ risk_docs = [
         "s_type": c["scan_type"],
         "s_package_name": c["package_name"],
         "s_package_version": c.get("package_version"),
-        "s_package_type": c.get("package_type"),
+        "s_package_type": c.get("package_type").lower(),
     }
     for c in candidates
 ]

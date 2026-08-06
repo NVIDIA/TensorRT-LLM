@@ -376,7 +376,7 @@ def processScanResults(ref) {
                         needsManualReview = true
                         manualReviewUrl = pipelineUrl
                         def candidates = result.preapproved_candidates ?: []
-                        writeJSON file: '/tmp/preapproved_candidates.json',
+                        writeJSON file: "${pwd()}/preapproved_candidates.json",
                                   json: candidates
                     }
                     if (result.detected_licenses) {
@@ -533,7 +533,7 @@ pipeline {
                             "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                             "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
                         ]) {
-                            sh "venv/bin/python /tmp/pulse_in_pipeline_scanning/submit_preapproved_candidates.py /tmp/preapproved_candidates.json"
+                            sh "venv/bin/python /tmp/pulse_in_pipeline_scanning/submit_preapproved_candidates.py ${pwd()}/preapproved_candidates.json"
                         }
                     }
                 }
