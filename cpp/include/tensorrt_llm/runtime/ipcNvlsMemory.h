@@ -52,14 +52,25 @@ void MPI_group_barrier(std::set<int> ranks);
 //! fabric/IMEX plane is not provisioned. The result is cached.
 bool ipcNvlsSupported();
 
-//! \brief Whether the NVLink fabric/IMEX plane is provisioned so that NVLS
-//! multicast memory can actually be *bound* (not merely statically supported).
-//! Extends ipcNvlsSupported() with a live fabric probe (getMemHandleType() must
-//! resolve to CU_MEM_HANDLE_TYPE_FABRIC). Use this to decide whether NCCL may
-//! attempt NVLS: on an unprovisioned node the static multicast attribute is a
-//! false positive and NCCL aborts during init, so callers should disable
-//! NCCL_NVLS when this returns false. The (heavy) result is cached.
-bool ipcNvlsFabricUsable();
+//! \brief Whether NVLS multicast memory can actually be *bound* in this session
+//! (not merely statically supported). Extends ipcNvlsSupported() with NVML's
+//! fabric state: Fabric Manager must have configured the NVLink switch fabric
+//! (state COMPLETED). For single-node sessions the IMEX plane is intentionally
+//! not required -- NVLS binds work over POSIX-FD handles without it. Multi-node
+//! sessions additionally require a provisioned fabric/IMEX plane, because
+//! cross-node multicast memory can only be shared via FABRIC handles. Use this
+//! to decide whether NCCL may attempt NVLS: on a node whose fabric is not
+//! configured the static multicast attribute is a false positive and NCCL
+//! aborts during init, so callers should disable NCCL_NVLS when this returns
+//! false. The result is cached.
+bool ipcNvlsUsable();
+
+//! \brief Disable NCCL NVLS (setenv NCCL_NVLS_ENABLE=0, no-overwrite) when
+//! ipcNvlsUsable() says it cannot work in this session, warning with the
+//! reason. Call before the first ncclCommInitRank: NCCL caches the env var on
+//! first read, so the decision is process-wide. A pre-existing NCCL_NVLS_ENABLE
+//! setting skips the probe and the warning. No-op on Windows.
+void maybeDisableNcclNvls();
 
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);
 
