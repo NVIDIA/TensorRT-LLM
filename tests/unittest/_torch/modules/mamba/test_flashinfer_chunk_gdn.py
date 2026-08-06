@@ -10,6 +10,8 @@ across the call shapes used by ``Qwen3NextGatedDeltaNet.forward_extend``.
 import pytest
 import torch
 
+from tensorrt_llm._utils import is_sm_100f
+
 # Skip rules ---------------------------------------------------------------
 
 
@@ -24,6 +26,14 @@ def _supported_arch() -> bool:
 skip_unsupported = pytest.mark.skipif(
     not _supported_arch(),
     reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100 (Blackwell)",
+)
+
+# Reuse the wrapper's own predicate so the gate cannot drift from the dispatch
+# condition in ``flashinfer_chunk.chunk_gated_delta_rule``. CPU-safe:
+# ``get_sm_version()`` returns -1 when no CUDA device is present.
+skip_unless_indexed_pool_io = pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="FlashInfer implements indexed state-pool I/O only on SM100/SM103",
 )
 
 
@@ -296,11 +306,35 @@ def test_packed_initial_state_with_output_final_state_matches_triton():
 
 
 @skip_unsupported
-def test_indexed_gather_inplace_scatter_matches_triton():
-    """Non-spec prefill path: caller passes the full SSM pool plus cache_indices,
-    kernel does inplace gather/scatter (inplace_indexed_state_update=True, output_final_state=False)."""
+@pytest.mark.parametrize(
+    "pool_dtype",
+    [torch.float32, torch.bfloat16],
+    ids=["fp32_pool", "bf16_pool"],
+)
+def test_indexed_gather_inplace_scatter_matches_triton(monkeypatch, pool_dtype):
+    """Non-spec prefill path via the **gather/scatter** branch: caller passes the
+    full SSM pool plus cache_indices, the wrapper gathers into FlashInfer's packed
+    layout and scatters the result back (inplace_indexed_state_update=True,
+    output_final_state=False).
+
+    ``is_sm_100f`` is forced False to pin the wrapper to that branch. Without the
+    pin this test would take the indexed-pool fast path on SM100/SM103 -- which
+    ``test_indexed_state_pool_fast_path_bf16_matches_triton`` already covers --
+    and since l0_b200/l0_b300 are the only test-db entries for this directory,
+    gather/scatter (still the production path on SM90/SM120) would have no CI
+    coverage at all.
+
+    The pin also forces ``state_dtype`` to fp32, so the ``bf16_pool`` case
+    exercises the up-cast/down-cast that SM90/SM120 require (bf16 -> fp32 on
+    gather, fp32 -> bf16 on scatter). With ``fp32_pool`` no cast happens and the
+    two helpers degenerate to a plain indexed gather/scatter, which is why both
+    dtypes are covered.
+    """
+    from tensorrt_llm._torch.modules.fla import flashinfer_chunk
     from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as triton_cgdr
-    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as fi_cgdr
+
+    fi_cgdr = flashinfer_chunk.chunk_gated_delta_rule
+    monkeypatch.setattr(flashinfer_chunk, "is_sm_100f", lambda *a, **kw: False)
 
     seq_lens = [4096, 8192]
     q, k, v, g, beta, cu = _make_inputs(seq_lens)
@@ -311,7 +345,7 @@ def test_indexed_gather_inplace_scatter_matches_triton():
     cache_indices = torch.tensor([3, 7], dtype=torch.int32, device=q.device)
     pool_init = (
         torch.randn(pool_slots, num_v_heads, head_dim, head_dim, device=q.device) * 0.01
-    ).to(torch.float32)
+    ).to(pool_dtype)
 
     pool_triton = pool_init.clone()
     out_triton, _ = triton_cgdr(
@@ -357,6 +391,98 @@ def test_indexed_gather_inplace_scatter_matches_triton():
     )
     untouched = [i for i in range(pool_slots) if i not in cache_indices.tolist()]
     torch.testing.assert_close(pool_fi[untouched], pool_init[untouched], atol=0.0, rtol=0.0)
+
+
+@skip_unless_indexed_pool_io
+@pytest.mark.parametrize(
+    "cache_indices_list",
+    [
+        [11, 2, 14, 5],  # scattered and out of ascending order
+        [15, 0],  # both pool edges, descending
+    ],
+    ids=["scattered_unsorted", "edges_descending"],
+)
+def test_indexed_state_pool_fast_path_bf16_matches_triton(monkeypatch, cache_indices_list):
+    """SM100/SM103 fast path: the pool and its slot indices go straight to the
+    kernel (no gather/scatter passes, see ``flashinfer_chunk.py`` "Fast path").
+
+    Covers the production prefill configuration the fast path was written for --
+    a **bf16** state pool (SM100/SM103 keep the recurrent state fp32 in TMEM, so
+    the pool needs no fp32 round-trip) addressed by **non-contiguous, unsorted**
+    ``cache_indices``. Since the kernel now writes the pool itself, the slot
+    addressing is its responsibility rather than the wrapper's scatter, so this
+    asserts all three: the output, the updated slots, and that every other slot
+    is left bit-identical.
+    """
+    from tensorrt_llm._torch.modules.fla import flashinfer_chunk
+    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as triton_cgdr
+
+    fi_cgdr = flashinfer_chunk.chunk_gated_delta_rule
+
+    seq_lens = [4096, 8192, 1024, 2048][: len(cache_indices_list)]
+    q, k, v, g, beta, cu = _make_inputs(seq_lens)
+    num_v_heads, head_dim = v.shape[2], v.shape[3]
+
+    pool_slots = 16
+    cache_indices = torch.tensor(cache_indices_list, dtype=torch.int32, device=q.device)
+    # bf16 pool, matching the SM100/SM103 production dtype.
+    pool_init = (
+        torch.randn(pool_slots, num_v_heads, head_dim, head_dim, device=q.device) * 0.01
+    ).to(torch.bfloat16)
+
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state_indices=cache_indices,
+        inplace_indexed_state_update=True,
+        output_final_state=False,
+        cu_seqlens=cu,
+        head_first=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    pool_triton = pool_init.clone()
+    out_triton, _ = triton_cgdr(initial_state=pool_triton, **common)
+
+    # Prove the *direct* indexed-pool dispatch, not just a matching result: the
+    # value assertions below would also pass through the gather/scatter
+    # fallback, so a regression that silently disables the fast path would go
+    # unnoticed. Trip on the fallback's first step instead.
+    def _no_gather(*args, **kwargs):
+        raise AssertionError(
+            "indexed-pool fast path must not gather: gather_cast_vk_to_fp32_vk was called"
+        )
+
+    monkeypatch.setattr(flashinfer_chunk, "gather_cast_vk_to_fp32_vk", _no_gather)
+
+    pool_fi = pool_init.clone()
+    out_fi, final_fi = fi_cgdr(initial_state=pool_fi, **common)
+
+    assert final_fi is None  # inplace=True returns no separate final state
+    assert pool_fi.dtype == torch.bfloat16  # fast path must not silently up-cast
+    torch.testing.assert_close(out_fi, out_triton, atol=2e-2, rtol=2e-2)
+
+    # Written slots: compare per index so a mis-addressed write (e.g. writing in
+    # cu_seqlens order instead of slot order) fails here rather than averaging out.
+    for seq_id, slot in enumerate(cache_indices_list):
+        torch.testing.assert_close(
+            pool_fi[slot].to(torch.float32),
+            pool_triton[slot].to(torch.float32),
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda s, seq_id=seq_id, slot=slot: f"seq {seq_id} -> pool slot {slot}: {s}",
+        )
+
+    # Every other slot must be bit-identical to the pre-call pool: the kernel
+    # writes the pool directly now, so an off-by-one or a full-pool store would
+    # corrupt live state belonging to other requests.
+    untouched = [i for i in range(pool_slots) if i not in cache_indices_list]
+    assert torch.equal(pool_fi[untouched], pool_init[untouched]), (
+        f"fast path modified untouched pool slots {untouched}"
+    )
 
 
 # Env-flag routing test (no GPU required) ---------------------------------
