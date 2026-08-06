@@ -16,9 +16,11 @@
 the contract in core.py. Holds the buffers, the gather and scatter kernels, and the scatter worker,
 and runs the side effects that drive each region's state machine. Never imports transfer.py."""
 
+from __future__ import annotations
+
 import queue
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -29,6 +31,7 @@ except ImportError:
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
+    BaseTransferAgent,
     MemoryDescs,
     MemoryType,
     TransferOp,
@@ -37,9 +40,13 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
 from tensorrt_llm._utils import CUASSERT
 
 from .buffer import SlotAllocator
-from .config import SizingContext, fit_within_free
+from .config import DEFAULT_MIN_BYTES, Config, SizingContext, fit_within_free
 from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo
+    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -57,7 +64,12 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: List[int]
+        cls,
+        agent: BaseTransferAgent,
+        cfg: Config,
+        *,
+        device_id: int,
+        block_bytes_per_group: List[int],
     ) -> Optional["VmmBounceTransport"]:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
@@ -83,27 +95,29 @@ class VmmBounceTransport(BounceTransport):
             capacity_bytes=capacity_bytes,
             phys_chunk_size=chunk,
             block_bytes_per_group=block_bytes_per_group,
+            min_bytes=cfg.min_bytes,
             min_blocks=cfg.min_blocks,
         )
 
     def __init__(
         self,
-        agent,
+        agent: BaseTransferAgent,
         *,
         device_id: int,
         capacity_bytes: int,
         phys_chunk_size: int,
         block_bytes_per_group: List[int],
-        min_blocks: int = 96,
+        min_bytes: int = DEFAULT_MIN_BYTES,
+        min_blocks: int = 1,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
         name: str = "kv_bounce",
-    ):
+    ) -> None:
         self._agent = agent
         self._device_id = device_id
         # The byte size of one cache block, listed for each attention layer group.
         self._block_bytes_per_group = list(block_bytes_per_group)
-        # Below this many blocks, skip bounce: coalescing only pays off for long context (the default
-        # is roughly twelve thousand tokens; a heuristic, and tunable).
+        # The byte gate is model-independent; the legacy block gate is vacuous by default.
+        self._min_bytes = min_bytes
         self._min_blocks = min_blocks
         # how long an orphaned region is held out of reuse; must outlast the worst in-flight write
         self._quarantine_grace_s = quarantine_grace_s
@@ -217,14 +231,15 @@ class VmmBounceTransport(BounceTransport):
         return False
 
     def reserve(
-        self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = _RESERVE_TIMEOUT_S
+        self,
+        recv_req: RecvReqInfo,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers."""
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
-        if nblocks < self._min_blocks:
-            return self._skip_bounce(f"{nblocks} blocks < min {self._min_blocks} (too small)")
         total = 0
         for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
             if g >= len(self._block_bytes_per_group):
@@ -232,6 +247,19 @@ class VmmBounceTransport(BounceTransport):
             total += int(block_ids.size) * self._block_bytes_per_group[g]
         if total <= 0:
             return self._skip_bounce(f"computed transfer size {total} <= 0")
+        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        if total < self._min_bytes:
+            return self._skip_bounce(
+                f"{total}B ({nblocks} blocks) < min {self._min_bytes}B (too small; tune "
+                f"TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES)",
+                warn_key="kv-bounce-below-min-bytes",
+            )
+        if nblocks < self._min_blocks:
+            return self._skip_bounce(
+                f"{nblocks} blocks < min {self._min_blocks} (too small; legacy "
+                f"TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS gate)",
+                warn_key="kv-bounce-below-min-blocks",
+            )
         if num_writers > 1 and total % num_writers != 0:
             return self._skip_bounce(
                 f"fan-in {total}B across {num_writers} senders is not an even split "
@@ -525,16 +553,28 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def block_bytes_per_group(page_table) -> list:
-    """Byte size of one cache block for each leading attention layer group, stopping at the first
-    non-attention group."""
+def block_bytes_per_group(page_table: KVCachePageTable) -> list[int]:
+    """Transferred bytes in one cache block for each leading attention layer group.
+
+    A layer group may expose multiple physical pools, such as GLM-5.2's MLA KV
+    pool plus its masked indexer-K pool. The bounce reservation must cover all
+    advertised pools because the sender coalesces every matched pool into the
+    same write. Multiple mapper views may reference one physical pool, so count
+    each physical pool only once.
+    """
     from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
-    out: list = []
+    out: list[int] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if not isinstance(lg, AttentionLayerGroup):
             break
-        out.append(int(get_physical_pool(page_table, lg_idx, 0).slot_bytes))
+        pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
+        out.append(
+            sum(
+                int(get_physical_pool(page_table, lg_idx, pool_idx).slot_bytes)
+                for pool_idx in pool_indices
+            )
+        )
     return out
