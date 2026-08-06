@@ -398,7 +398,9 @@ def processScanResults(ref) {
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    currentBuild.result = 'UNSTABLE'
+                    if (not result.needs_manual_review) {
+                        currentBuild.result = 'UNSTABLE'
+                    }
                 } else {
                     echo "No new risks detected."
                 }

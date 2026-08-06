@@ -51,6 +51,7 @@ def _license_doc_to_agent_item(doc: dict) -> dict:
         "current_version": ver,
         "artifact_type": artifact_type,
         "container": container,
+        "license": license_ids if license_ids and license_ids != "N/A" else None,
         "action_detail": action_detail,
     }
 
