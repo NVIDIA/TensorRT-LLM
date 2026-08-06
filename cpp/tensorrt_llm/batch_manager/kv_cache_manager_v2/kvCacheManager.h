@@ -314,6 +314,10 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    // Throw unless every KvCache has been closed. `api` names the caller so the message
+    // points at the mistake rather than at whatever breaks later.
+    void _checkNoLivingKvCaches(char const* api) const;
+
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;

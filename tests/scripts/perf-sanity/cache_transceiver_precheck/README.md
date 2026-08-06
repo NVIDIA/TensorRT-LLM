@@ -26,13 +26,15 @@ layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`.
 
 ## Enabling / disabling
 
-**On by default** for every disaggregated perf-sanity test. To opt out:
+**Off by default** until the gate is validated on the post-merge stages
+(the precheck is a launch-script gate, not a pytest case, so it cannot be
+waived in `waives.txt` — this default is the waive). To opt in:
 
 - per test yaml:
 
   ```yaml
   cache_transceiver_precheck:
-    enabled: false
+    enabled: true
     # optional overrides (defaults in precheck_config.PRECHECK_DEFAULTS):
     # request_lengths: [1024, 8192]
     # num_requests: 2

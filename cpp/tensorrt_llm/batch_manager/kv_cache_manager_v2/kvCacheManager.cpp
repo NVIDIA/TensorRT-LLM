@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -127,11 +128,25 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
-    shutdown();
+    try
+    {
+        shutdown();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR("%s", e.what());
+    }
+}
+
+void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
+{
+    TLLM_CHECK_WITH_INFO(mLivingKvCaches.empty(),
+        "%s with %zu KV cache(s) still open; close them (or drain the engine) first", api, mLivingKvCaches.size());
 }
 
 void KvCacheManager::shutdown()
 {
+    _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
 
@@ -150,6 +165,7 @@ void KvCacheManager::shutdown()
 
 void KvCacheManager::clearReusableBlocks()
 {
+    _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
     mRadixTree->clear();
 }

@@ -220,6 +220,24 @@ def isCbtsStage(String stageName) {
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
 }
 
+def freezeCbtsCoverage(String stageDir) {
+    // Stop .cbtscov writes and wait for the dir to settle before the results tar reads it.
+    sh(
+        returnStatus: true,
+        script: """
+            mkdir -p ${stageDir}
+            touch ${stageDir}/${CBTS_STOP_FILE_NAME}
+            prev=\$(stat -c %y ${stageDir} 2>/dev/null || echo unknown)
+            for i in \$(seq 1 15); do
+                sleep 1
+                cur=\$(stat -c %y ${stageDir} 2>/dev/null || echo unknown)
+                [ "\$cur" = "\$prev" ] && break
+                prev=\$cur
+            done
+        """
+    )
+}
+
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
     if (remote.privateKeyPath) {
@@ -354,12 +372,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 sh "mkdir -p ${cbtsLocalDir}"
                 try {
                     timeout(time: 5, unit: 'MINUTES') {
-                        // Pack on the login node; drop a partial archive when nothing matches so the scp fails cleanly.
+                        // Freeze writers, then pack on the login node; an archive with no member is dropped.
                         Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
                                 remote,
-                                "\"cd '${remoteWs}' && tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null || rm -f '${cbtsArchive}'\""
+                                "\"cd '${remoteWs}' && touch '${CBTS_STOP_FILE_NAME}' && sleep 2 && " +
+                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
+                                "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
                             ),
                             returnStatus: true,
                             numRetries: 3,
@@ -1399,6 +1419,7 @@ def getPytestBaseCommandLine(
         extraInternalEnv += " PYTHONPATH=${cbtsScriptDir}:\${PYTHONPATH:-}"
         extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
         extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
+        extraInternalEnv += " CBTS_STOP_FILE=${outputPath}/${CBTS_STOP_FILE_NAME}"
     }
 
     // Container port allocation environment variables for avoiding port conflicts
@@ -2488,6 +2509,9 @@ def CBTS_COVERAGE = "cbts_coverage"
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
+// Sentinel in the stage output dir; while it exists no process writes a .cbtscov file.
+@Field
+def CBTS_STOP_FILE_NAME = "cbts_stop"
 @Field
 def testFilter = [
     (REUSE_TEST): null,
@@ -2518,11 +2542,17 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def RUN_MODE = "run_mode"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
+    (TRTLLM_VERSION_OVERRIDE): null,
+    (RUN_MODE): null,
 ]
 
 class GlobalState {
@@ -2923,6 +2953,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             }
             sh "STAGE_NAME=${stageName}"
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
+            if (isCbtsStage(stageName)) {
+                freezeCbtsCoverage(stageName)
+            }
             echo "Upload test results."
             if (suppressTestReporting) {
                 // This attempt is superseded by a planned retry. Keep the tar for
@@ -4320,6 +4353,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (isCbtsStage(stageName)) {
             // K8s runner knows TRTLLM_WHL_PATH here, so all placeholders are substituted at controller time (no worker-side sed).
             sh """
+                # A sentinel left in a reused workspace would suppress this stage's writes.
+                mkdir -p ${WORKSPACE}/${stageName} && rm -f ${WORKSPACE}/${stageName}/${CBTS_STOP_FILE_NAME}
                 cp ${llmSrc}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ${coverageConfigFile}
                 sed -i \\
                     -e 's|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHL_PATH}|g' \\
@@ -4598,13 +4633,17 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
-def checkPipInstall(pipeline, wheel_path, version_local)
+def checkPipInstall(pipeline, wheel_path, version_override)
 {
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-        cd ${LLM_ROOT}/tests/unittest && \
-        python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "${version_local}"
-        """)
+    def versionLocal = version_override?.contains("+") ?
+        version_override.substring(version_override.indexOf("+") + 1) : ""
+    withEnv(["TRTLLM_VERSION_LOCAL=${versionLocal}"]) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+            cd ${LLM_ROOT}/tests/unittest && \
+            python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
+            """)
+    }
 }
 
 
@@ -4693,7 +4732,7 @@ def runLLMBuild(
     cpu_arch,
     reinstall_dependencies=false,
     wheel_path="",
-    version_local="",
+    version_override="",
     cpver="cp312",
     plat_name="",
     pin_torch=false)
@@ -4734,20 +4773,13 @@ def runLLMBuild(
     }
     def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
-    if (version_local) {
-        sh """
-            cd tensorrt_llm
-            sed -i.bak 's/^__version__ = "\\(.*\\)"\$/__version__ = "\\1+${version_local}"/' tensorrt_llm/version.py
-            if diff tensorrt_llm/version.py.bak tensorrt_llm/version.py; then
-                echo "ERROR: failed to inject local version '+${version_local}' into tensorrt_llm/version.py" >&2
-                exit 1
-            fi
-            rm tensorrt_llm/version.py.bak
-        """
-    }
-
-    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
+    withEnv([
+        "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
+        "TRTLLM_VERSION_OVERRIDE=${version_override}",
+    ]) {
+        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
+        }
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -4758,8 +4790,8 @@ def runLLMBuild(
     trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
     def uploadedWheelPath = "${cpu_arch}/${wheel_path}${wheelName}"
     def kitmakerDryRunMetadata = null
-    if (version_local) {
-        echo "Skipping Kitmaker wheel dry run for local version '+${version_local}'"
+    if (version_override?.contains("+")) {
+        echo "Skipping Kitmaker wheel dry run for local version '${version_override}'"
     } else if (!isKitmakerWheelDryRunEnabled()) {
         echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptCommit is not set"
     } else {
@@ -5159,8 +5191,9 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
     return configs
 }
 
-def launchTestJobs(pipeline, testFilter)
+def launchTestJobs(pipeline, testFilter, globalVars)
 {
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -5769,14 +5802,15 @@ def launchTestJobs(pipeline, testFilter)
             sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
             def isDlfw = values[4]
-            def versionLocal = ""
+            def packageVersionOverride = versionOverride
             if (isDlfw) {
                 // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
                 def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
                 if (!matcher.find()) {
                     error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
                 }
-                versionLocal = "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
+                packageVersionOverride +=
+                    "+ngcpytorch${matcher.group(1)}${matcher.group(2)}"
             }
             def wheelName = ""
             def cpver = "cp312"
@@ -5787,7 +5821,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7], values[0] != LLM_DOCKER_IMAGE)
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", packageVersionOverride, cpver, values[7], values[0] != LLM_DOCKER_IMAGE)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
@@ -5853,7 +5887,7 @@ def launchTestJobs(pipeline, testFilter)
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, "${cpu_arch}", versionLocal)
+                                    checkPipInstall(pipeline, "${cpu_arch}", packageVersionOverride)
                                 }
                             })
                         }
@@ -6057,6 +6091,10 @@ def launchTestJobs(pipeline, testFilter)
         }
     }
 
+    if (globalVars[RUN_MODE] == "nightly_release") {
+        parallelJobsFiltered = sanityCheckJobs
+    }
+
     echo "Check the passed GitLab bot testFilter parameters."
     def keysStr = parallelJobsFiltered.keySet().join(",\n")
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
@@ -6223,6 +6261,7 @@ pipeline {
             when {
                 expression {
                     // Only run the test list validation when necessary
+                    globalVars[RUN_MODE] != "nightly_release" &&
                     env.targetArch == X86_64_TRIPLE &&
                     testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
                     !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
@@ -6243,7 +6282,7 @@ pipeline {
                         if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
                             parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
                         } else {
-                            parallelJobs = launchTestJobs(this, testFilter)
+                            parallelJobs = launchTestJobs(this, testFilter, globalVars)
                         }
 
                         singleGpuJobs = parallelJobs
