@@ -2582,3 +2582,56 @@ class TestOneModelMTPDraftTokenScheduling:
         assert disagg_gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
         # Context requests are not generation requests and must be left alone.
         assert ctx.num_draft_tokens == 0
+
+
+class TestAttentionDpLowOccupancyBalance:
+    @staticmethod
+    def _make_executor(all_ranks_requests, min_generation_requests=48):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock()
+        executor.dist.tp_allgather.return_value = all_ranks_requests
+        executor.max_batch_size = 64
+        executor.attention_dp_enable_balance = True
+        executor.attention_dp_time_out_iters = 60
+        executor.attention_dp_low_occupancy_timeout_iters = 0
+        executor.attention_dp_min_generation_requests = min_generation_requests
+        executor.attention_dp_batching_wait_iters = 0
+        executor.adp_ctx_waiting_iters_count = 0
+        executor.adp_ctx_batching_wait_iters_count = 0
+        return executor
+
+    @staticmethod
+    def _make_context_request():
+        request = Mock()
+        request.get_tokens.return_value = [0] * 2048
+        return request
+
+    def test_saturated_imbalance_uses_configured_timeout(self):
+        executor = self._make_executor([[1, 63, 2111], [0, 63, 63]])
+        context_request = self._make_context_request()
+
+        balanced = executor._balance_adp_requests([context_request], [Mock()] * 63)
+
+        assert balanced == []
+        assert executor.adp_ctx_waiting_iters_count == 1
+        executor.dist.tp_allgather.assert_called_once_with([1, 63, 2111])
+
+    def test_low_occupancy_on_any_rank_releases_context(self):
+        executor = self._make_executor([[1, 63, 2111], [0, 20, 20]])
+        context_request = self._make_context_request()
+
+        balanced = executor._balance_adp_requests([context_request], [Mock()] * 63)
+
+        assert balanced == [context_request]
+        assert executor.adp_ctx_waiting_iters_count == 0
+        executor.dist.tp_allgather.assert_called_once_with([1, 63, 2111])
+
+    def test_default_threshold_preserves_existing_behavior(self):
+        executor = self._make_executor([[1, 20, 2068], [0, 20, 20]], min_generation_requests=0)
+        context_request = self._make_context_request()
+
+        balanced = executor._balance_adp_requests([context_request], [Mock()] * 20)
+
+        assert balanced == []
+        assert executor.adp_ctx_waiting_iters_count == 1
+        executor.dist.tp_allgather.assert_called_once_with([1, 20, 2068])
