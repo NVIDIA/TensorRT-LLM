@@ -60,6 +60,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
@@ -68,7 +69,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
 )
-from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
+from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -134,6 +135,25 @@ def should_skip_gptoss(
         )
 
     return None
+
+
+def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
+    """An upstream fused down projection owns quantization on this path."""
+    monkeypatch.delenv("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", raising=False)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen.get_sm_version",
+        MagicMock(side_effect=AssertionError("SM probe must be short-circuited")),
+    )
+    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    hidden_states = MxFp8QuantizedTensor(
+        fp8_tensor=torch.empty(1, 3584, dtype=torch.float8_e4m3fn),
+        scaling_factor=torch.empty(1, 112, dtype=torch.uint8),
+    )
+
+    assert (
+        backend.try_fused_kimi_route_quant(hidden_states, torch.empty(1, 896, dtype=torch.float32))
+        is None
+    )
 
 
 def create_test_backend(

@@ -397,11 +397,31 @@ class ExternalCommMoEScheduler(MoEScheduler):
             or moe.comm is not None
             or FORCE_SEPARATED_ROUTING
         )
+        used_fused_route_quant = False
         if requires_separated_routing:
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = moe.routing_method.apply(
-                router_logits, input_ids
+            can_quantize_before_dispatch = (
+                moe.comm is None or moe.comm.supports_post_quant_dispatch()
             )
+            if (
+                can_quantize_before_dispatch
+                and isinstance(moe.backend, TRTLLMGenFusedMoE)
+                and not moe._using_load_balancer()
+                and not moe.apply_router_weight_on_input
+            ):
+                fused_result = moe.backend.try_fused_kimi_route_quant(x, router_logits)
+            else:
+                fused_result = None
+
+            if fused_result is None:
+                # Separated routing: ConfigurableMoE calls routing_method.
+                token_selected_experts, token_final_scales = moe.routing_method.apply(
+                    router_logits, input_ids
+                )
+                if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+            else:
+                token_selected_experts, token_final_scales, x, x_sf = fused_result
+                used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
 
@@ -411,9 +431,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if isinstance(moe.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
                 assert token_final_scales.dtype == torch.float32
             assert token_selected_experts.dtype == torch.int32
-
-            if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
-                token_final_scales = token_final_scales.to(torch.bfloat16)
 
             # apply_router_weight_on_input: fuse top-k weight onto x
             if moe.apply_router_weight_on_input:
@@ -509,7 +526,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             if supports_post_quant:
                 # Quantize -> Dispatch
-                x, x_sf = moe.backend.quantize_input(x)
+                if not used_fused_route_quant:
+                    x, x_sf = moe.backend.quantize_input(x)
 
                 # W4AFP8 + DeepEPLowLatency needs pre_quant_scale_1; other strategies
                 # absorb the kwarg via **kwargs so unconditional passing is safe.
@@ -539,10 +557,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
+                assert not used_fused_route_quant
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
-            x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+            if not used_fused_route_quant:
+                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
