@@ -1243,7 +1243,9 @@ def test_beam_search_cba_done_bound_by_early_stopping(early_stopping,
         return_probs=False,
     )
     assert m.cba.batch_dones[0].item() is expect_done
-    expected_reason = (FinishReason.END_ID.value
+    # A beam with no reason of its own ends because the pool can no longer be
+    # beaten, not because it hit a token, so the verdict publishes LENGTH.
+    expected_reason = (FinishReason.LENGTH.value
                        if expect_done else FinishReason.NOT_FINISHED.value)
     assert (m.finished_beams[0] == expected_reason).all()
     # CBA untouched either way (no eligible end candidates this step).
