@@ -114,10 +114,6 @@ __global__ void deepseekV4QNormKernel(T const* input, T* output, int totalRows, 
 
     using Vec2 = typename Vec2Traits<T>::Type;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
-
     int const warpId = threadIdx.x / kWarpSize;
     int const laneId = threadIdx.x % kWarpSize;
     int const row = blockIdx.x * kWarpsPerBlock + warpId;
@@ -132,6 +128,10 @@ __global__ void deepseekV4QNormKernel(T const* input, T* output, int totalRows, 
 
     float2 values[kPairsPerLane];
     float sumSquares = 0.0F;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
 #pragma unroll
     for (int i = 0; i < kPairsPerLane; ++i)
@@ -236,10 +236,6 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 
     using Vec2 = typename Vec2Traits<T>::Type;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
-
     int const warpId = threadIdx.x / kWarpSize;
     int const laneId = threadIdx.x % kWarpSize;
     int const row = blockIdx.x * kWarpsPerBlock + warpId;
@@ -256,6 +252,10 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
         = reinterpret_cast<__nv_fp8_e4m3*>(quant_q_nope) + static_cast<int64_t>(row) * quantQNopeRowStrideBytes;
     auto* nopeOutPair = reinterpret_cast<__nv_fp8x2_e4m3*>(nopeOut);
     auto* ropeOutPair = reinterpret_cast<Vec2*>(q_pe_out + static_cast<int64_t>(row) * kRopeDim);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
     float const quantScale = quant_scale_qkv_ptr ? quant_scale_qkv_ptr[0] : 1.0F;
 

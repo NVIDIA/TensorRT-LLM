@@ -1302,6 +1302,10 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* __restrict__ fuse_buf, 
         kRowVecs % kWarpSize == 0, "Fused kv-norm needs the latent row to split evenly across a warp's 16B vectors.");
     static_assert(kVecsPerLane >= 1, "Latent row is too narrow for one warp.");
 
+    size_t const batch_idx = blockIdx.y;
+    int const lane = threadIdx.x % kWarpSize;
+    int const warp_id = threadIdx.x / kWarpSize;
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
@@ -1325,9 +1329,6 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* __restrict__ fuse_buf, 
         }
     }
 
-    size_t const batch_idx = blockIdx.y;
-    int const lane = threadIdx.x % kWarpSize;
-    int const warp_id = threadIdx.x / kWarpSize;
     float const quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
 
     // These are functions of blockIdx.y alone. Inside the loop they were three
