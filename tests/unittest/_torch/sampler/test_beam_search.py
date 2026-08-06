@@ -552,8 +552,42 @@ def test_beam_search_large_beam_width_regression(
             f"all {beam_width} beams are identical: {beam_sequences[0]}")
 
 
+@pytest.mark.parametrize(
+    "beam_width_array, extra_params",
+    [
+        # Widening on its own.
+        ([2, 3, 4], {}),
+        # A constant array is the control: it exercises the VBWS plumbing
+        # without ever changing width, so a failure here points at the
+        # mechanism rather than at the transition.
+        ([4, 4, 4], {}),
+        # length_penalty normalizes by a per-beam generated length, which has
+        # to follow the beams across a width change.
+        ([2, 3, 4], {
+            "length_penalty": 1.0
+        }),
+        # diversity_rate keys on the source beam's rank among the step's input
+        # beams, which the width change renumbers.
+        ([2, 3, 4], {
+            "beam_search_diversity_rate": 0.5
+        }),
+        # The exhaustive modes size their candidate pool from both widths.
+        ([2, 3, 4], {
+            "early_stopping": 0
+        }),
+        ([2, 3, 4], {
+            "early_stopping": 2
+        }),
+    ],
+    ids=[
+        "widening", "constant", "length_penalty", "diversity", "es_false",
+        "es_never"
+    ],
+)
 @pytest.mark.threadleak(enabled=False)
-def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
+def test_beam_search_vbws_e2e(beam_width_array: list[int],
+                              extra_params: dict[str, Any],
+                              monkeypatch: pytest.MonkeyPatch) -> None:
     """Variable-Beam-Width-Search through the full engine path.
 
     Drives beam_width_array end to end (scheduler -> ModelEngine ->
@@ -568,7 +602,6 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
     abort the batch (TRTLLM-14792).
     """
     max_beam_width = 4
-    beam_width_array = [2, 3, 4]
     input_prompts = [[1, 2, 3]]
     vocab_size = DummyConfig().vocab_size
     # Decode well past the end of beam_width_array, so the width has to hold at
@@ -636,6 +669,15 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
     monkeypatch.setattr(TorchSampler, "update_requests",
                         recording_update_requests)
 
+    # Each parametrization builds a fresh engine in this same process, and the
+    # CBA step is torch.compile'd with fullgraph=True. Dynamo counts recompiles
+    # per code object across the whole process, so by the last case the default
+    # limit is exhausted and compilation fails hard rather than falling back.
+    # Raise it for the duration of the test; the limit is a guard against
+    # runaway recompilation, not a correctness property.
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit",
+                        max(64, torch._dynamo.config.recompile_limit))
+
     gc.collect(2)  # force destruction of any other LLM instances
     with _single_process_context():
         llm = LLM(
@@ -656,6 +698,7 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
                 best_of=max_beam_width,
                 use_beam_search=True,
                 beam_width_array=beam_width_array,
+                **extra_params,
                 end_id=-1,
             )
             outputs = llm.generate(deepcopy(input_prompts),
