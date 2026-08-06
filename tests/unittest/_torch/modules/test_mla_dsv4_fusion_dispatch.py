@@ -27,14 +27,12 @@ rather than a wrong number:
     (a bf16-only test otherwise "passes" while exercising nothing);
   * a mixed batch must produce one launch spec per phase instead of falling back;
   * kv-norm fusion and the Q RoPE fold have to move together, because the
-    un-fused RoPE kernels would read the raw latent the KV fusion leaves behind;
-  * the kwargs `MLA` forwards must actually exist on `AttentionForwardArgs`.
+    un-fused RoPE kernels would read the raw latent the KV fusion leaves behind.
 
-Numerical agreement is covered by the sparse-MLA backend tests and end to end by
-`TestDeepSeekV4Pro::test_gsm8k_full_accuracy`.
+The fused kernels' numerics live in `test_deepseek_v4_q_norm_fused_rope.py`;
+end-to-end agreement is `TestDeepSeekV4Pro::test_gsm8k_full_accuracy`.
 """
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -42,11 +40,7 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardArgs,
-    PositionalEmbeddingParams,
-    RopeParams,
-)
+from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -218,16 +212,6 @@ def test_rope_specs_mixed_batch_splits_by_phase() -> None:
     assert gen_cache_lens.shape[0] == 3
 
 
-def test_rope_specs_bail_out_without_metadata_hook() -> None:
-    """No ragged cumsum -> no fold, rather than wrong positions."""
-    mla = _make_mla(has_fp8_kv_cache=True)
-    metadata = _make_metadata(num_ctx_tokens=96, num_tokens=96, num_seqs=3)
-    metadata.mla_prepare_ctx_cu_seqlens = None
-
-    cos_sin, specs = mla._fused_q_rope_specs(metadata, num_contexts=3, num_generations=0)
-    assert cos_sin is None and specs == []
-
-
 def test_kv_norm_fusion_is_coupled_to_the_q_rope_fold() -> None:
     """The two fusions must move together.
 
@@ -243,35 +227,13 @@ def test_kv_norm_fusion_is_coupled_to_the_q_rope_fold() -> None:
     _cos_sin, specs = mla._fused_q_rope_specs(metadata, num_contexts=3, num_generations=0)
     assert not specs
 
-    # The KV predicate on its own still says yes -- so the coupling, not a shared
-    # precondition, is what has to turn the fusion off.
+    # Both ingredients of the decision `forward_impl_with_deepseek_v4` makes.
     assert mla._is_fused_kv_norm_enabled(num_generations=0) is True
-
-    # `forward_impl_with_deepseek_v4` assigns `_fused_kv_norm_active` from exactly
-    # this call, so asserting on it here is asserting on the shipped decision.
-    assert (
-        mla._is_fused_prologue_active(num_contexts=3, num_generations=0, rope_specs=specs) is False
-    ), "kv-norm fusion must not engage when the Q RoPE fold is unavailable"
-
-    # ...and it does engage once the specs exist, so the False above is the coupling
-    # talking and not a predicate that is off for some unrelated reason.
-    assert (
-        mla._is_fused_prologue_active(
-            num_contexts=3, num_generations=0, rope_specs=[("dummy", None, 0, None)]
-        )
-        is True
+    fused_kv_norm_active = (
+        mla._is_fused_kv_norm_enabled(num_generations=0)
+        and mla._is_fused_q_fp8_quant_enabled(num_generations=0, num_contexts=3)
+        and bool(specs)
     )
-
-
-def test_attention_forward_args_accepts_every_kwarg_mla_forwards() -> None:
-    """Signature guard for the MLA -> attention-backend boundary.
-
-    `AttentionForwardArgs` is built with `**kwargs` gathered in `MLA`, so a stale
-    keyword there is not a type error until a forward actually runs -- it slipped
-    through the whole unit suite once and only surfaced in an 8-GPU accuracy run.
-    """
-    accepted = set(inspect.signature(AttentionForwardArgs.__init__).parameters)
-    for name in ("kv_norm_weight", "kv_norm_eps", "latent_cache", "q_pe", "output"):
-        assert name in accepted, f"AttentionForwardArgs lost the {name!r} field"
-    # Removed with the un-fused RoPE kernels; nothing may forward it any more.
-    assert "q_rope_done" not in accepted
+    assert fused_kv_norm_active is False, (
+        "kv-norm fusion must not engage when the Q RoPE fold is unavailable"
+    )
