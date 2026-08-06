@@ -2396,7 +2396,7 @@ class PyTorchModelEngine(ModelEngine):
         def _run_capture_pass(force_non_greedy: bool, label: str,
                               force_lora_graph: bool) -> None:
             spec_metadata = self.spec_metadata
-            previous_force_lora_graph = self._force_lora_graph_for_capture
+            assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
             if force_non_greedy and spec_metadata is not None:
                 spec_metadata._force_non_greedy_for_capture = True
@@ -2443,7 +2443,7 @@ class PyTorchModelEngine(ModelEngine):
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
-                self._force_lora_graph_for_capture = previous_force_lora_graph
+                self._force_lora_graph_for_capture = None
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
                     # The base object is not the only holder of the flag: every
