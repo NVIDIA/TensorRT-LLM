@@ -697,7 +697,7 @@ class LoraLayer(torch.nn.Module):
             self._split_k_runner = _LoraGroupedGemmRunner(
                 layer=self,
                 layer_idx=layer_idx,
-                input_hidden_size=x.shape[1],
+                input_hidden_size=x.shape[-1],
                 max_rank=cuda_graph_params.max_rank,
                 max_lora_size=cuda_graph_params.max_lora_size,
                 problem_count=cuda_graph_params.get_problem_count(layer_key),
@@ -941,16 +941,15 @@ class _LoraGroupedGemmRunner(TunableRunner):
         """
         del kwargs
         assert self.lora_params is not None
-        lora_params = self.copy_lora_params(self.lora_params)
-        cuda_graph_params = lora_params['cuda_graph_params']
-        layer_params = cuda_graph_params.get_layer_params(self.layer_key)
-        assert layer_params is not None
-
-        # The list of tensor input arguments is re-packed into
-        # the local lora_params copy such that we can invoke
-        # LoraLayer's _forward_cuda_graph_mode_impl().
+        lora_params = self.lora_params
         x = inputs[0]
         if len(inputs) > 1:
+            # Re-pack synthetic inputs into a local copy so that tactic
+            # evaluation does not modify the inference parameters.
+            lora_params = self.copy_lora_params(lora_params)
+            cuda_graph_params = lora_params['cuda_graph_params']
+            layer_params = cuda_graph_params.get_layer_params(self.layer_key)
+            assert layer_params is not None
             cuda_graph_params.slot_ranks_host = (
                 cuda_graph_params.slot_ranks_host.clone())
             cuda_graph_params.slot_ranks_host.zero_()
