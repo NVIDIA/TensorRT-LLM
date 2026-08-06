@@ -209,6 +209,24 @@ class TouchDB:
             for row in self._conn.execute("SELECT file, qualname FROM touch WHERE test=?", (test,))
         ]
 
+    def incomplete_capture_tests(self) -> set[str]:
+        """Stage-prefixed tests the DB itself reports as incompletely captured.
+
+        `test_meta` (schema_version 2) records each test's pytest outcome and how
+        many processes saved coverage against how many the coordinator spawned;
+        absent on older DBs, which yield an empty set.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT test FROM test_meta WHERE test != '' AND "
+                "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
+            )
+        except sqlite3.OperationalError:
+            return set()
+        # Intersect with the touch universe: rows for tests that recorded nothing
+        # are not selection candidates, and would break `untrusted <= known`.
+        return {row[0] for row in rows} & self.known_tests()
+
     # -- coverage-completeness heuristic --
 
     def untrusted_tests(
@@ -250,4 +268,4 @@ class TouchDB:
                 for test in self.known_tests()
                 if any(marker in split_stage(test)[0] for marker in untrusted_stage_markers)
             }
-        return missing_worker | tiny | on_untrusted_stage
+        return missing_worker | tiny | on_untrusted_stage | self.incomplete_capture_tests()

@@ -43,17 +43,8 @@ sys.path.insert(0, str(CBTS / "coverage_selection"))
 
 from qualname_map import qualnames_for_lines  # noqa: E402
 from rules._helpers import iter_diff_post_line_numbers  # noqa: E402
-from touch_db import (  # noqa: E402
-    _LAUNCH_MARKERS,
-    _MIN_FUNCS,
-    _SERVING_PATH_MARKERS,
-    _UNTRUSTED_STAGE_MARKERS,
-    _WORKER_SENTINEL,
-    TouchDB,
-    canon,
-    split_stage,
-    stage_family,
-)
+from selector import CoverageSelector  # noqa: E402
+from touch_db import TouchDB, canon, stage_family  # noqa: E402
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -91,45 +82,35 @@ def main(argv: list[str] | None = None) -> int:
     core = [f for f in files if f.endswith(".py") and canon(f).startswith("tensorrt_llm/")]
     non_core = [f for f in files if f not in core]
 
-    # `decide()` refuses the whole change here, so no removal below would be reachable.
-    zero_touch = [f for f in core if not db.file_has_touch_rows(canon(f))]
-    if zero_touch:
+    # Delegate the decision itself so the gates cannot drift from the selector.
+    diffs = {f: _git(repo, "diff", f"{args.sha}^", args.sha, "--", f, check=False) for f in core}
+    selector = CoverageSelector(db, repo, read_source=lambda f: _src_at(repo, args.sha, f))
+    res = selector.decide(core, diffs)
+    if not res.ok:
         print(f"commit {args.sha[:12]} — coverage selection REFUSES this change:")
-        for f in zero_touch:
-            print(f"  zero-touch residual file (new/uninstrumented): {f}")
+        print(f"  {res.reason}")
         print("\nNo case is removable; every stage runs in full.")
         return 0
 
-    # Impact set: (file, qualname) per function, or the whole file when it falls back.
+    # Forward lookup for the per-case justification the selector does not return.
     impact_funcs: set[tuple[str, str]] = set()
-    impact_files: set[str] = set()  # file-level fallback
+    impact_files: set[str] = set()
     changed_files: set[str] = set()
-    impacted: set[str] = set()
-    no_data: list[str] = []
     for f in core:
         cf = canon(f)
         changed_files.add(cf)
-        diff = _git(repo, "diff", f"{args.sha}^", args.sha, "--", f, check=False)
-        lines = iter_diff_post_line_numbers(diff)
+        lines = iter_diff_post_line_numbers(diffs.get(f, ""))
         src = _src_at(repo, args.sha, f)
-        if not lines or src is None:
-            impact_files.add(cf)
-            impacted |= db.tests_touching_file(cf)
-            continue
-        qns, ok = qualnames_for_lines(src, lines)
+        qns, ok = qualnames_for_lines(src, lines) if (lines and src) else (set(), False)
         if not ok:
             impact_files.add(cf)
-            impacted |= db.tests_touching_file(cf)
             continue
         for q in qns:
-            impact_funcs.add((cf, q))
-            tests = db.tests_touching_func(cf, q)
-            impacted |= tests
-            # Mirrors the selector's default no_data_policy="file".
-            if not tests and q != "<module>":
-                no_data.append(f"{cf}::{q}")
+            if db.tests_touching_func(cf, q):
+                impact_funcs.add((cf, q))
+            else:
                 impact_files.add(cf)
-                impacted |= db.tests_touching_file(cf)
+    no_data = res.no_data_funcs
 
     print(f"commit {args.sha[:12]} — {len(core)} core file(s), impact set:")
     for cf, q in sorted(impact_funcs):
@@ -148,21 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         for f in sorted(non_core):
             print(f"    {f}")
 
-    # Untrusted capture is forced to run by the selector; it is never removable.
-    untrusted = db.untrusted_tests(
-        _WORKER_SENTINEL,
-        _LAUNCH_MARKERS,
-        _SERVING_PATH_MARKERS,
-        _MIN_FUNCS,
-        _UNTRUSTED_STAGE_MARKERS,
-    )
-    # Keyed by family: untrusted on any shard means untrusted for the family.
-    untrusted_fam = {f"{stage_family(s)}/{n}" for s, n in map(split_stage, untrusted) if s}
-
-    impacted_by_stage: dict[str, set[str]] = {}
-    for t in impacted:
-        stage, nodeid = split_stage(t)
-        impacted_by_stage.setdefault(stage, set()).add(nodeid)
+    untrusted_fam = selector.untrusted_families()
 
     def entered_changed(nodeid: str, stage: str) -> tuple[int, int, list[str]]:
         """(total rows, funcs entered in changed files, changed qualnames entered)."""
@@ -176,8 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.stage and stage != args.stage:
             continue
         known_s = db.known_by_stage()[stage]
-        imp_s = impacted_by_stage.get(stage, set()) & known_s
         fam = stage_family(stage)
+        imp_s = res.impacted.get(fam, set()) & known_s
         forced_s = {n for n in known_s - imp_s if f"{fam}/{n}" in untrusted_fam}
         skip_s = known_s - imp_s - forced_s
         print(
