@@ -21,21 +21,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
+from ..._compat import is_pdl_enabled
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 try:
     import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 except (ModuleNotFoundError, ImportError):
     fp4_utils = None
-
-try:
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-except (ModuleNotFoundError, ImportError):
-    import os
-
-    def get_env_enable_pdl() -> bool:
-        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-
 
 try:
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import _layer_norm_fwd
@@ -77,7 +69,7 @@ def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) ->
     """
     # Flashinfer rmsnorm expects a 2D input
     input_flat = input.reshape(-1, input.shape[-1])
-    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps, enable_pdl=get_env_enable_pdl())
+    rmsnorm_flat = flashinfer.norm.rmsnorm(input_flat, weight, eps, enable_pdl=is_pdl_enabled())
     return rmsnorm_flat.reshape(input.shape)
 
 

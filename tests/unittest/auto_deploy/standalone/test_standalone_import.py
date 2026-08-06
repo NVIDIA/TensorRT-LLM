@@ -123,6 +123,78 @@ class TestStandaloneImport:
         )
         assert result.returncode == 0, f"Failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
+    def test_pdl_hardware_gate(self, standalone_env: dict[str, str]) -> None:
+        """Verify standalone PDL detection and the shared consumer helper."""
+        result = _run_standalone(
+            standalone_env,
+            """
+            import os
+            from unittest import mock
+
+            from tensorrt_llm._torch.auto_deploy import _compat
+
+            assert not _compat.TRTLLM_AVAILABLE
+
+            _compat.get_sm_version.cache_clear()
+            with (
+                mock.patch.object(_compat.torch.cuda, "is_available", return_value=False),
+                mock.patch.object(
+                    _compat.torch.cuda,
+                    "get_device_properties",
+                    side_effect=AssertionError("unexpected device query"),
+                ) as get_device_properties,
+            ):
+                assert _compat.get_sm_version() == -1
+                get_device_properties.assert_not_called()
+            _compat.get_sm_version.cache_clear()
+
+            os.environ.pop("TRTLLM_ENABLE_PDL", None)
+            for sm_version, expected in [(-1, False), (89, False), (90, True)]:
+                with mock.patch.object(_compat, "get_sm_version", return_value=sm_version):
+                    assert _compat.is_pdl_enabled() is expected
+
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            with mock.patch.object(_compat, "get_sm_version", return_value=90):
+                assert _compat.is_pdl_enabled() is True
+
+            for sm_version, detected_device in [(-1, "no CUDA GPU"), (89, "SM89")]:
+                with mock.patch.object(_compat, "get_sm_version", return_value=sm_version):
+                    try:
+                        _compat.is_pdl_enabled()
+                    except ValueError as error:
+                        message = str(error)
+                    else:
+                        raise AssertionError("explicit PDL enable should fail")
+                assert "TRTLLM_ENABLE_PDL=1 requires SM90 or newer" in message
+                assert detected_device in message
+                assert "Unset TRTLLM_ENABLE_PDL" in message
+                assert "set it to 0" in message
+
+            os.environ["TRTLLM_ENABLE_PDL"] = "0"
+            with mock.patch.object(
+                _compat,
+                "get_sm_version",
+                side_effect=AssertionError("unexpected hardware probe"),
+            ) as get_sm_version:
+                assert _compat.is_pdl_enabled() is False
+                get_sm_version.assert_not_called()
+
+            from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (
+                flashinfer_attention,
+            )
+            from tensorrt_llm._torch.auto_deploy.custom_ops.normalization import (
+                flashinfer_fused_add_rms_norm,
+                rms_norm,
+            )
+
+            assert flashinfer_attention.is_pdl_enabled is _compat.is_pdl_enabled
+            assert rms_norm.is_pdl_enabled is _compat.is_pdl_enabled
+            assert flashinfer_fused_add_rms_norm.is_pdl_enabled is _compat.is_pdl_enabled
+            print("OK: standalone PDL hardware gate works")
+            """,
+        )
+        assert result.returncode == 0, f"Failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
     def test_auto_deploy_imports(self, standalone_env):
         """Verify that the auto_deploy package imports successfully."""
         result = _run_standalone(

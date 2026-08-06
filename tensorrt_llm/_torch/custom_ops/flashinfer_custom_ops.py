@@ -1,6 +1,6 @@
 import torch
 
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, is_pdl_enabled
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.activation import gelu_tanh_and_mul, silu_and_mul
@@ -12,7 +12,7 @@ if IS_FLASHINFER_AVAILABLE:
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
     def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-        return silu_and_mul(x, enable_pdl=get_env_enable_pdl())
+        return silu_and_mul(x, enable_pdl=is_pdl_enabled())
 
     @flashinfer_silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
@@ -21,7 +21,7 @@ if IS_FLASHINFER_AVAILABLE:
     @torch.library.custom_op("trtllm::flashinfer_gelu_tanh_and_mul",
                              mutates_args=())
     def flashinfer_gelu_tanh_and_mul(x: torch.Tensor) -> torch.Tensor:
-        return gelu_tanh_and_mul(x, enable_pdl=get_env_enable_pdl())
+        return gelu_tanh_and_mul(x, enable_pdl=is_pdl_enabled())
 
     @flashinfer_gelu_tanh_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
@@ -31,7 +31,7 @@ if IS_FLASHINFER_AVAILABLE:
     @torch.library.custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
     def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor,
                            eps: float) -> torch.Tensor:
-        return rmsnorm(input, weight, eps, enable_pdl=get_env_enable_pdl())
+        return rmsnorm(input, weight, eps, enable_pdl=is_pdl_enabled())
 
     @flashinfer_rmsnorm.register_fake
     def _(input: torch.Tensor, weight: torch.Tensor,
@@ -42,10 +42,7 @@ if IS_FLASHINFER_AVAILABLE:
                              mutates_args=())
     def flashinfer_gemma_rmsnorm(input: torch.Tensor, weight: torch.Tensor,
                                  eps: float) -> torch.Tensor:
-        return gemma_rmsnorm(input,
-                             weight,
-                             eps,
-                             enable_pdl=get_env_enable_pdl())
+        return gemma_rmsnorm(input, weight, eps, enable_pdl=is_pdl_enabled())
 
     @flashinfer_gemma_rmsnorm.register_fake
     def _(input: torch.Tensor, weight: torch.Tensor,
@@ -61,7 +58,7 @@ if IS_FLASHINFER_AVAILABLE:
                           residual,
                           weight,
                           eps,
-                          enable_pdl=get_env_enable_pdl())
+                          enable_pdl=is_pdl_enabled())
 
     @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_quant",
                              mutates_args=("out", "residual"))
@@ -77,7 +74,7 @@ if IS_FLASHINFER_AVAILABLE:
                                 weight,
                                 scale,
                                 eps,
-                                enable_pdl=get_env_enable_pdl())
+                                enable_pdl=is_pdl_enabled())
 
     @flashinfer_fused_add_rmsnorm_quant.register_fake
     def _(out: torch.Tensor, input: torch.Tensor, residual: torch.Tensor,
@@ -94,7 +91,7 @@ if IS_FLASHINFER_AVAILABLE:
                                 residual,
                                 weight,
                                 eps,
-                                enable_pdl=get_env_enable_pdl())
+                                enable_pdl=is_pdl_enabled())
 
     @torch.library.custom_op(
         "trtllm::flashinfer_apply_rope_with_cos_sin_cache_inplace",

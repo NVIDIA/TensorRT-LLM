@@ -22,17 +22,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from ..._compat import KvCacheConfig
-
-try:
-    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-except (ModuleNotFoundError, ImportError):
-    import os
-
-    def get_env_enable_pdl() -> bool:
-        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-
-
+from ..._compat import KvCacheConfig, is_pdl_enabled
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
@@ -457,7 +447,7 @@ def flashinfer_mha_with_cache(
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
-            enable_pdl=get_env_enable_pdl(),
+            enable_pdl=is_pdl_enabled(),
             out=y[:num_prefill_tokens],
         )
 
@@ -488,7 +478,7 @@ def flashinfer_mha_with_cache(
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
-            enable_pdl=get_env_enable_pdl(),
+            enable_pdl=is_pdl_enabled(),
             out=y[num_prefill_tokens:num_total_tokens],
         )
 
