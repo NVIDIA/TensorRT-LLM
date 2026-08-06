@@ -803,7 +803,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
         block_reuse_config = kv_cache_config.block_reuse_config
-        self.block_reuse_policy = BlockReusePolicy(block_reuse_config.block_reuse_policy)
+        self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width

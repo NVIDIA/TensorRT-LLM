@@ -172,6 +172,7 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        self._override_quant_config = override_quant_config
         if override_quant_config is not None:
             self.quant_config = override_quant_config
 
@@ -343,8 +344,14 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        if not backend_model_config.skip_create_weights_in_init:
-            self.backend.create_weights()
+        # Layerwise quantization is applied after the model is constructed.
+        # Defer allocation so the backend is built from the final wrapper
+        # quant_config rather than an earlier global value. Module exclusions
+        # reset _weights_created on matching modules during __post_init__, so
+        # unrelated exclusions retain the historical eager allocation path.
+        has_post_init_quant_config = model_config.quant_config_dict is not None
+        if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
+            self.create_weights()
 
     def _supports_load_balancer(self) -> bool:
         """Check if this MoE implementation supports load balancer.
@@ -656,6 +663,14 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "create_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement create_weights()"
         )
+        # An explicit override is authoritative. Otherwise use the wrapper's
+        # final value, after model __post_init__ has applied layerwise and
+        # exclusion-based quantization settings.
+        self.backend.quant_config = (
+            self._override_quant_config
+            if self._override_quant_config is not None
+            else self.quant_config
+        )
         return self.backend.create_weights()
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
@@ -735,6 +750,14 @@ class ConfigurableMoE(MoE):
             f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
         )
         return self.backend._weights_created
+
+    @_weights_created.setter
+    def _weights_created(self, value: bool) -> None:
+        """Update backend weight state during post-init quantization changes."""
+        assert hasattr(self.backend, "_weights_created"), (
+            f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
+        )
+        self.backend._weights_created = value
 
     # ========== Explicit Backend Attribute Proxies ==========
     # These properties delegate to backend for commonly accessed attributes

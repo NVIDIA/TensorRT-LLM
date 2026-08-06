@@ -97,6 +97,9 @@ kv_cache_config:
   enable_block_reuse: true
   use_kv_cache_manager_v2: true
   avg_seq_len: 2048
+  block_reuse_config:
+    policy: per_conversation
+    max_num_turns: 2
   mamba_state_config:
     periodic_snapshot_interval: 0
     additional_snapshot_offsets_from_start: [128]
