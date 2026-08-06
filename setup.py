@@ -209,6 +209,8 @@ package_data += [
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
+    '_torch/attention_backend/prims_ts/README.md',
+    '_torch/attention_backend/prims_ts/kernels/*/README.md',
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
@@ -241,13 +243,15 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns telemetry schema JSON.
-    Skip those wheel files so Python-only schema edits layer over old wheels.
+    Precompiled wheels own native bits. Source owns telemetry schema JSON and
+    vendored documentation. Skip those wheel files so Python-only source edits
+    layer over old wheels.
     """
     filename = filename.replace("\\", "/")
-    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
-    return filename.endswith(".json") and filename.startswith(
-        source_owned_package_data_prefixes)
+    return ((filename.endswith(".json")
+             and filename.startswith("tensorrt_llm/usage/schemas/"))
+            or (filename.endswith(".md") and filename.startswith(
+                "tensorrt_llm/_torch/attention_backend/prims_ts/")))
 
 
 def extract_from_precompiled(precompiled_location: str, package_data: list[str],
@@ -292,8 +296,8 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 if dst_file.endswith(".yaml"):
                     continue
 
-                # Keep source-owned package data local so Python-only schema edits
-                # layer over precompiled wheels.
+                # Keep source-owned package data local so source edits layer
+                # over precompiled wheels.
                 if should_skip_precompiled_package_data(dst_file):
                     continue
 
@@ -386,8 +390,8 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             if file.filename.endswith(".yaml"):
                 continue
 
-            # Keep source-owned package data local so Python-only schema edits
-            # layer over precompiled wheels.
+            # Keep source-owned package data local so source edits layer over
+            # precompiled wheels.
             if should_skip_precompiled_package_data(file.filename):
                 continue
 
