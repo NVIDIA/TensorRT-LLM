@@ -23,8 +23,7 @@ def _vuln_doc_to_agent_item(doc: dict) -> dict:
     sev = doc.get("s_severity", "")
     scan_type = doc.get("s_type", "")
     fix_version = doc.get("s_package_fix_version") or "N/A"
-    detail_parts = [f"severity={sev}"]
-    detail_parts = [f"scan_type={scan_type}"]
+    detail_parts = [f"scan_type={scan_type}", f"severity={sev}"]
     if cve:
         detail_parts.append(f"CVE={cve}")
     detail_parts.append(f"fixVer={fix_version}")
@@ -122,7 +121,7 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     """
     refs = {}
 
-    print(agent_response, file=sys.stderr)
+    print(f"[Triage agent raw response] {agent_response}", file=sys.stderr)
     agent_resp_value = json.loads(agent_response.get("value", "{}"))
     license_ticket = agent_resp_value.get("license_correction_ticket")
     if license_ticket and license_ticket.get("link"):
@@ -146,7 +145,7 @@ def extract_ticket_refs(agent_response: dict) -> dict:
 
     refs["vulnerability"] = []
     for item in agent_resp_value.get("version_bump_tickets") or []:
-        print(item, file=sys.stderr)
+        print(f"[Triage agent version_bump_ticket] {item}", file=sys.stderr)
         link = item.get("link", "")
         if not link:
             continue

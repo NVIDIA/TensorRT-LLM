@@ -45,7 +45,7 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
             risk_docs if not is_vuln else [],
         )
     )
-    print(agent_resp, file=sys.stderr)
+    print(f"[Triage agent raw response] {agent_resp}", file=sys.stderr)
     if not agent_resp:
         return {}, {}
     ticket_refs = extract_ticket_refs(agent_resp)
