@@ -842,16 +842,20 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
 
-        Overrides the C++ binding for Variable-Beam-Width-Search: the C++
-        implementation clamps the decoding-iteration index with the global
-        kMaxBeamWidthArrayLength constant (it assumes a padded array) and
-        reads past the end of the raw user array once decoding runs longer
-        than the array — returning garbage widths. Same formula, clamped
-        with the actual array length.
+        Mirrors the C++ binding for Variable-Beam-Width-Search, clamping the
+        decoding-iteration index with the array's own length so that decoding
+        past the end of the array holds its last width.
 
-        NB: the C++ method is not virtual and the binding has no trampoline,
-        so this override only covers callers on the Python side; C++ callers
-        still use the unfixed formula.
+        The C++ implementation used to clamp with the global
+        kMaxBeamWidthArrayLength constant instead, reading past the end of
+        the user array and returning arbitrary widths; that is fixed in
+        llmRequest.cpp and the two now agree. This override is kept because
+        the C++ method is neither virtual nor trampolined, so Python callers
+        would otherwise bind to whatever libtensorrt_llm.so happens to
+        provide -- including a prebuilt one from before that fix, against
+        which the mismatch starves the request in the micro-batch scheduler
+        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
+        pins the agreement.
         """
         beam_width_array = self.sampling_config.beam_width_array
         if beam_width_array is not None:

@@ -819,10 +819,13 @@ def test_beam_search_sampling_batch_basic():
                                      dtype=torch.int32),
     )
 
-    # Run beam search sampling. (No assert_no_cuda_sync guard: on GPU under
-    # recent torch, ordinary ops in the step such as softmax and scalar-float
-    # temperature division synchronize, so the guard's no-sync contract does
-    # not hold here; it is unrelated to the beam-search logic under test.)
+    # Run beam search sampling. No assert_no_cuda_sync guard here: the guard
+    # trips on the caching allocator's first allocation for a new shape, not on
+    # the step itself -- ops that report as synchronizing without a warmed
+    # allocator (softmax, the scalar-float temperature division, topk) all pass
+    # the guard once the allocator has served those shapes. Tests that do want
+    # the no-sync contract go through run_test_with_warmup, which pre-allocates
+    # for exactly this reason; this one exercises the op's arithmetic instead.
     next_tokens, softmax = beam_search_sampling_batch(
         logits=logits,
         beam_width_in=beam_width,
@@ -2118,6 +2121,7 @@ class TestBeamSearchStepFromStrategies:
             _StrategyImpls.BeamSearchStep(  # type: ignore[abstract]
                 2, 2, 2, torch.ones(1), None, None)
 
+    @staticmethod
     @pytest.mark.parametrize(
         "early_stopping",
         [
@@ -2126,7 +2130,6 @@ class TestBeamSearchStepFromStrategies:
             BeamSearchEarlyStop.NEVER,
         ],
     )
-    @staticmethod
     @_kernel_test
     def test_from_strategies_builds_concrete_impl(early_stopping):
         # Every stopping mode runs on the candidate-beams-array step; the mode

@@ -286,11 +286,23 @@ Parameter Configuration:
   candidate expands from among the current step's input beams, ordered by their cumulative
   log-probability (`0` for the strongest beam, `1` for the next, and so on). The default (`0.0`)
   disables the adjustment.
-- `early_stopping`: Controls when beam search stops. With the default (`1`), generation ends as
-  soon as `best_of` finished candidates exist. The exhaustive modes (`0`, and other values for
-  intermediate heuristics) keep a pool of finished candidates and continue searching while an
-  unfinished beam could still outscore the worst of them (`0` bounds attainability with the
-  current length; other values with the maximum length when `length_penalty > 0`).
+- `early_stopping`: Controls when beam search stops. It is a three-state setting following
+  Hugging Face: `1` (the default) ends generation as soon as `best_of` finished candidates
+  exist; `0` and `2` are exhaustive, keeping a pool of finished candidates and continuing while
+  an unfinished beam could still outscore the worst of them. The two differ in how optimistic
+  that bound is: `0` measures attainability against the beams' current length, `2` ("never")
+  against `max_seq_len` when `length_penalty > 0`. Any other integer is treated as `2`.
+
+Beam search rejects the following combinations, raising an error at admission:
+
+- **Disaggregated serving.** The pool of finished candidates the context server builds is not
+  part of the handoff, so a completion found there would be silently dropped. Use
+  `best_of=1` on a disaggregated deployment.
+- **A decreasing `beam_width_array`.** Only non-decreasing schedules are supported; the
+  semantics of narrowing mid-decode are not defined.
+- **A `best_of` other than `max_beam_width`.** Every request in an engine runs at the same
+  beam width. Note that mixing widths would fail at forward time rather than per request, so
+  the check happens on admission instead.
 
 The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:
 
@@ -307,6 +319,18 @@ sampling_params = SamplingParams(
 llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
+
+### Over the OpenAI-compatible API
+
+`length_penalty` and `early_stopping` now default to `null` in the HTTP schema, deferring to
+the engine defaults (`0.0` and `1`) rather than restating them. Previously the schema defaulted
+`length_penalty` to `1.0`, so a beam-search request that did not set it was normalizing scores
+by sequence length; the same request now ranks by the raw cumulative log-probability. Set
+`"length_penalty": 1.0` explicitly to keep the old ranking.
+
+`early_stopping` accepts `false`, `true` and `"never"` over HTTP, mirroring HuggingFace, and is
+translated to the engine's `0` / `1` / `2`. Integers outside that set are rejected by the
+schema rather than silently reinterpreted.
 
 ## Logits processor
 
