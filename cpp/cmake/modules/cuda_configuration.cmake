@@ -61,7 +61,7 @@ Functions
 
   ``all`` or unset
     Resolves to architectures TensorRT-LLM is optimized for and the
-    compiler supports (80, 86, 89, 90, 100, 103, 120 depending on CUDA version).
+    compiler supports (80, 86, 89, 90, 100, 103, 107, 120 depending on CUDA version).
 
   ``all-major``
     Unsupported. Results in a fatal error.
@@ -341,6 +341,9 @@ function(setup_cuda_architectures)
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
       list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 103)
     endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.4")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_RAW 107)
+    endif()
   endif()
 
   # CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
@@ -376,7 +379,7 @@ function(setup_cuda_architectures)
 
   # Compatibility low bounds: Always compile kernels for these architectures. 86
   # is enabled to avoid perf regression when using 80 kernels.
-  set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 120)
+  set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 107 120)
   # Exclude Tegra architectures
   set(ARCHITECTURES_NO_COMPATIBILITY 87 101)
 
@@ -431,6 +434,7 @@ function(setup_cuda_architectures)
       90
       100
       103
+      107
       120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
     if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
@@ -447,6 +451,11 @@ function(setup_cuda_architectures)
        AND NOT CUDA_ARCH IN_LIST ARCHITECTURES_NO_COMPATIBILITY)
       list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}f-real")
       list(APPEND CMAKE_CUDA_ARCHITECTURES_FAMILIES "${CUDA_ARCH}f")
+      # SM107 (Rubin) uses SM100 kernels for compatibility, so add 100f to
+      # families list
+      if(CUDA_ARCH EQUAL 107)
+        list(APPEND CMAKE_CUDA_ARCHITECTURES_FAMILIES "100f")
+      endif()
     elseif(CUDA_ARCH GREATER_EQUAL ${CMAKE_CUDA_MIN_ARCHITECTURE_HAS_ACCEL})
       list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}a-real")
     else()
