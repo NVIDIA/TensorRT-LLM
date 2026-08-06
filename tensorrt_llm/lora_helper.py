@@ -111,6 +111,12 @@ class LoraConfig(StrictBaseModel):
         "Whether to swap gate/up projection order in fused gate_up_proj LoRA B weights. "
         "Set to False for models like Phi-4-MM that use a different weight order."
     )
+    cudagraph_specialize_lora: bool = Field(
+        default=False,
+        description=
+        "Whether to capture separate CUDA graphs for batches with and without "
+        "active LoRA adapters. Reduces overhead for batches without LoRA at "
+        "the cost of increased warmup time and CUDA graph metadata.")
 
     @property
     def missing_qkv_modules(self) -> List[str]:

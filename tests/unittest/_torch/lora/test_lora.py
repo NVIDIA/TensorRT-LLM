@@ -2,7 +2,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.adapter_slot_manager import AdapterSlotManager
+from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
+from unittest.mock import Mock
 
 
 def test_cuda_graph_lora_params_handle_missing_peft_table():
@@ -38,3 +40,16 @@ def test_adapter_slot_manager_handles_missing_peft_cache_manager():
 
     assert manager.get_slot_to_task_mapping() == (123, None)
     assert manager.task2slot[123] == 0
+
+
+def test_base_only_batch_maintains_peft_cache_state():
+    manager = object.__new__(CudaGraphLoraManager)
+    manager.adapter_slot_manager = Mock()
+    peft_cache_manager = Mock()
+
+    manager.prepare_base_only_batch(peft_cache_manager)
+
+    peft_cache_manager.get_and_reset_batch_peft_table.assert_called_once_with()
+    manager.adapter_slot_manager.remove_evicted_slots_in_cpp.assert_called_once_with(
+        peft_cache_manager
+    )
