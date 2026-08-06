@@ -49,6 +49,25 @@ See `examples/visual_gen/configs/`:
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
 
+### Prompt inputs
+
+`--prompt` and `--negative_prompt` each accept **either literal text or a path to a
+prompt file**, chosen by whether the value names an existing file. `--prompt_file`
+and `--negative_prompt_file` accept a path only and fail if the file is missing, so
+use those when a silent fallback to literal text would be a bug (scripts, CI).
+
+A prompt file may hold any of three shapes:
+
+| Shape | Example | Notes |
+|---|---|---|
+| Omni prompt object | `prompts/t2v.json` | `prompt` plus optional `model_mode`, `vision_path`, `enable_audio`, which supply defaults for the matching flags |
+| Structured caption | a checkpoint's `assets/example_i2v_prompt.json` | the object *is* the caption; carries no options |
+| Plain text | any `.txt` | used verbatim |
+
+Structured captions are what the model cards ship and what the checkpoints were
+tuned on; they give noticeably cleaner output than a one-line summary.
+`--negative_prompt` defaults to `cosmos3_negative_prompt.json` in this directory.
+
 ## Usage
 
 ```bash
@@ -105,13 +124,17 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step \
     --image_path https://example.com/frame.jpg \
     --output_path output.mp4
 
-# Cosmos3-Edge image-to-video (480p-native defaults: 832x480 x 121 frames)
+# Cosmos3-Edge image-to-video (480p-native defaults: 832x480 x 121 frames).
+# Reproduces the model-card sample: the checkpoint ships a structured prompt and
+# its own negative prompt alongside the conditioning image. Fetch them with
+#   hf download nvidia/Cosmos3-Edge --local-dir Cosmos3-Edge
 python cosmos3.py --model nvidia/Cosmos3-Edge \
-    --prompt "The camera slowly pans right across the scene" \
-    --image_path https://example.com/frame.jpg \
+    --prompt Cosmos3-Edge/assets/example_i2v_prompt.json \
+    --negative_prompt Cosmos3-Edge/assets/negative_prompt.json \
+    --image_path Cosmos3-Edge/assets/example_i2v_input.jpg \
     --output_path output.mp4
 
-# Inline prompt (--prompt or a JSON file path)
+# Inline prompt
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A cute puppy playing with a ball in a park" \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
