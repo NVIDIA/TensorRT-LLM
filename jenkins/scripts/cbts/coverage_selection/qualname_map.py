@@ -66,11 +66,16 @@ def _collect_scopes(tree: ast.Module) -> list[_Scope]:
     return scopes
 
 
-def _attribute(line: int, scopes: list[_Scope]) -> str:
+def _innermost(line: int, scopes: list[_Scope]) -> _Scope | None:
     best: _Scope | None = None
     for s in scopes:
         if s.sig_start <= line <= s.body_end and (best is None or s.sig_start > best.sig_start):
             best = s
+    return best
+
+
+def _attribute(line: int, scopes: list[_Scope]) -> str:
+    best = _innermost(line, scopes)
     if best is None:
         return "<module>"
     return best.sig_attr if line < best.body_start else best.body_attr
@@ -106,4 +111,23 @@ def import_executed_qualnames(source: str) -> set[str]:
         walk(ast.parse(source).body, "")
     except SyntaxError:
         pass
+    return out
+
+
+def closure_attributed_qualnames(source: str, lines: set[int]) -> set[str]:
+    """Qualnames a changed line only reaches by walking out of a `<locals>` scope.
+
+    The producer records no closure frames, so such a qualname's rows are the
+    enclosing function's callers, not the changed code's.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    scopes = _collect_scopes(tree)
+    out: set[str] = set()
+    for line in lines:
+        best = _innermost(line, scopes)
+        if best is not None and "<locals>" in best.qualname:
+            out.add(_attribute(line, scopes))
     return out
