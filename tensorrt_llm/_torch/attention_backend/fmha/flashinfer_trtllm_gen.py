@@ -1133,23 +1133,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         return counter_buffer
 
     def _get_effective_mla_backend(self, meta: "TrtllmAttentionMetadata", num_tokens: int) -> str:
-        """Select the MLA decode backend for the current scheduler batch.
+        """Resolve the MLA decode backend for the current scheduler batch.
 
-        CuTe-DSL reuses one staged page table across MLA layers for a
-        generation-only, one-token-per-request batch. A mixed
-        context/generation batch cannot use that reuse key, so selecting
-        CuTe-DSL would repeat the staging copies in every MLA layer and regress
-        time to first token. K3's 128 padded query heads also restrict the
-        CuTe-DSL kernel to one query token per request. Keep the requested
-        CuTe-DSL fast path for plain decode and use TRTLLM-Gen for mixed batches
-        and speculative multi-token verification.
+        ``attn.mla_backend_policy`` is a neutral per-batch override hook.
+        A model whose backend choice depends on the batch composition (e.g.
+        Kimi K3's MLA module) installs a policy on the attention instance it
+        owns; the policy receives the statically configured backend, the batch
+        metadata, and the batch token count, and returns the backend to use
+        for this batch. Without a policy (the default for every model) this
+        returns ``self._mla_backend`` unchanged, so every call site behaves
+        exactly like the plain ``self._mla_backend`` checks it replaced.
         """
-        is_single_token_generation = num_tokens == meta.num_generations
-        if self._mla_backend == "cute-dsl" and (
-            meta.num_contexts > 0 or not is_single_token_generation
-        ):
-            return "trtllm-gen"
-        return self._mla_backend
+        policy = self.attn.mla_backend_policy
+        if policy is None:
+            return self._mla_backend
+        return policy(self._mla_backend, meta, num_tokens)
 
     @staticmethod
     def _compute_window_left(

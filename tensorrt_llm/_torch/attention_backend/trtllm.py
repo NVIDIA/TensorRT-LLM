@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -1254,6 +1254,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
         self.flashinfer_mla_backend = flashinfer_mla_backend
+        # Per-batch MLA decode backend override hook. Maps (statically
+        # configured backend, batch metadata, num_tokens) -> backend name for
+        # the current batch. None (the default) keeps the static
+        # ``flashinfer_mla_backend`` selection unchanged. Model code that
+        # needs batch-dependent selection (e.g. Kimi K3's MLA module)
+        # installs a policy on the attention instances it owns; it lives on
+        # the backend object rather than the FMHA lib instances because
+        # ``create_fmha_libs`` may recreate those after model construction.
+        self.mla_backend_policy: Optional[Callable[
+            [str, "TrtllmAttentionMetadata", int], str]] = None
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
