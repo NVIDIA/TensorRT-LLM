@@ -31,7 +31,7 @@ from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_laguna import LagunaForCausalLM
-from .modeling_llama import LlamaForCausalLM
+from .modeling_llama import LlamaForCausalLM, LlamaForSequenceClassification
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minicpmv4_6 import MiniCPMV4_6Model
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
@@ -90,6 +90,7 @@ __all__ = [
     "HunYuanMoEV1ForCausalLM",
     "KimiK25ForConditionalGeneration",
     "LlamaForCausalLM",
+    "LlamaForSequenceClassification",
     "LlavaNextModel",
     "MiniCPMV4_6Model",
     "Mistral3VLM",
