@@ -120,7 +120,6 @@ class TestVanillaAttention(unittest.TestCase):
         finally:
             manager.shutdown()
 
-
     @patch(
         "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
     )
