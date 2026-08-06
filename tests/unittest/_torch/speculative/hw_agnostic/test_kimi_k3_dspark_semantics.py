@@ -384,6 +384,43 @@ def test_plain_dflash_drafter_keeps_old_gates():
     assert drafter.apply_markov_chain_logits(x, t) is x
 
 
+@needs_gpu
+def test_legacy_causal_dflash_config_constructs():
+    """No-regression: legacy DFlash drafter configs (e.g. Laguna) declare
+    causal=true without any dspark fields; their causality is handled by
+    the legacy decode path, so construction must not raise."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    cfg = _tiny_config(False)
+    cfg.dflash_config = dict(cfg.dflash_config, causal=True)
+    drafter = DFlashForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+    assert drafter._dspark_layer_windows == [(-1, -1)] * 2
+    assert not drafter.has_markov_head
+
+
+@needs_gpu
+def test_dspark_causal_config_rejected():
+    """The dspark block decode only supports the non-causal convention."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    cfg = _tiny_config(True)
+    cfg.dflash_config = dict(cfg.dflash_config, causal=True)
+    with pytest.raises(ValueError, match="non-causal dspark convention"):
+        DFlashForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+
+
+@needs_gpu
+def test_dspark_projector_type_alone_rejects_causal():
+    """projector_type='dspark' marks the dspark convention even when no
+    dspark feature flag is enabled; causal=true must still be rejected."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    cfg = _tiny_config(False)
+    cfg.dflash_config = dict(cfg.dflash_config, projector_type="dspark", causal=True)
+    with pytest.raises(ValueError, match="non-causal dspark convention"):
+        DFlashForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+
+
 def _run_block_decode(drafter, weights, captured, noise_embed):
     dev = "cuda"
     blk = TINY["block_size"]

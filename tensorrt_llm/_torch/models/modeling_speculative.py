@@ -1027,7 +1027,15 @@ class DFlashForCausalLM(nn.Module):
             raise ValueError(
                 "DFlash dspark drafter sets use_swa but swa_window_size="
                 f"{dflash_config.get('swa_window_size')} is invalid.")
-        if dflash_config.get('causal'):
+        # causal=true is only invalid under the dspark convention. Legacy
+        # DFlash drafter configs (e.g. Laguna) also carry a causal field;
+        # their causality is handled by the legacy decode path
+        # (_sliding_layers_causal), so don't reject them here.
+        is_dspark = (str(dflash_config.get('projector_type', '')
+                         or '').lower() == 'dspark' or self._dspark_shift_label
+                     or self._dspark_use_swa or self._dspark_markov_rank > 0
+                     or self._dspark_use_confidence_head)
+        if is_dspark and dflash_config.get('causal'):
             raise ValueError(
                 "DFlash dspark drafter sets causal=true; the block decode "
                 "only supports the non-causal dspark convention.")
