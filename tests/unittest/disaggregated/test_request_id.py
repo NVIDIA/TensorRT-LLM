@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_queue(max_batch_size=128):
     """Create an ExecutorRequestQueue with mocked Distributed."""

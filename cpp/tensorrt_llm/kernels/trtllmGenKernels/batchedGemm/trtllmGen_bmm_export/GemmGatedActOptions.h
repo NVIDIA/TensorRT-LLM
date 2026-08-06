@@ -83,6 +83,13 @@ enum class ActType
     // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
     GeGlu,
+    // For ActType == SiTuGlu, the formula is (gate on x1, matching SwiGlu convention):
+    //    left  = beta  * tanh(x0 / beta)
+    //    right = alpha * tanh(x1 / alpha) * sigmoid(x1)
+    //    gatedAct = left * right
+    // where alpha and beta are the gatedActAlpha and gatedActBeta parameters respectively.
+    // Both alpha and beta must be > 0. Default values are 1.0 for both.
+    SiTuGlu,
     // Placeholder for no activation; not implemented in codegen
     None,
 };
@@ -97,8 +104,9 @@ enum class ActType
         return (type == ActType::actType);                                                                             \
     }
 
-TLLM_ACT_TYPE_FUNCTION(SwiGlu)
 TLLM_ACT_TYPE_FUNCTION(GeGlu)
+TLLM_ACT_TYPE_FUNCTION(SiTuGlu)
+TLLM_ACT_TYPE_FUNCTION(SwiGlu)
 
 #undef TLLM_ACT_TYPE_FUNCTION
 
@@ -110,8 +118,21 @@ inline std::string getActTypeName(ActType type)
     {
     case ActType::SwiGlu: return "SwiGlu";
     case ActType::GeGlu: return "GeGlu";
+    case ActType::SiTuGlu: return "SiTuGlu";
     default: return "Unknown type";
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Returns true for activations where x0 appears only in linear terms (e.g., x0+beta in SwiGlu).
+// Returns false for activations where x0 feeds into nonlinearities (e.g., tanh(x0/beta) in
+// SiTuGlu).
+//
+// Drives: scaleC placement in applyGatedAcc, test harness scaleC/beta computation.
+inline bool isLinearInX0(ActType type)
+{
+    return isGeGlu(type) || isSwiGlu(type);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

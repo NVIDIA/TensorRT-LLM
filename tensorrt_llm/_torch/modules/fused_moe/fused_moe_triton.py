@@ -1436,7 +1436,12 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             if gemm_output.shape[-1] != expected_size:
                 assert gemm_output.shape[
                     -1] % self.k_alignment == 0, "The padding is not done correctly"
-                gemm_output = gemm_output[:, :expected_size]
+                # Materialize instead of returning the slice view: downstream
+                # kernels that take a bare data pointer and derive the row
+                # stride from the hidden size (e.g. lora_grouped_gemm) would
+                # read every row but the first at the wrong offset. The other
+                # MoE backends already emit dense output.
+                gemm_output = gemm_output[:, :expected_size].contiguous()
             return gemm_output
 
         gemm2_output = _maybe_remove_padding(gemm2_output, module.hidden_size)

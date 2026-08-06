@@ -52,7 +52,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
     CacheTransceiverConfig,
     KvCacheConfig,
     MambaStateConfig,
@@ -1677,6 +1679,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     enable_partial_reuse=True,
     block_reuse_policy="all_reusable",
+    max_num_turns=1,
     periodic_snapshot_interval=0,
     additional_snapshot_offsets_from_end=None,
     enable_attention_dp=False,
@@ -1699,7 +1702,10 @@ def _build_v2_hybrid_with_mamba_layer(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=enable_partial_reuse,
-        block_reuse_policy=block_reuse_policy,
+        block_reuse_config=BlockReuseConfig(
+            policy=block_reuse_policy,
+            max_num_turns=max_num_turns,
+        ),
         enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
@@ -1747,6 +1753,39 @@ def _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5):
         tokens_per_gen_step=tokens_per_gen_step,
         spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False),
     )
+
+
+def _make_v2_conversation_request(
+    request_id: int,
+    tokens: list[int],
+    conversation_id: str,
+) -> LlmRequest:
+    request = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+    return request
+
+
+def _run_v2_hybrid_context(
+    manager: MambaHybridCacheManagerV2,
+    request: LlmRequest,
+) -> None:
+    manager.prepare_expect_snapshot_points([request])
+    assert manager.prepare_context(request)
+    num_tokens = request.context_remaining_length
+    assert manager.resize_context(request, num_tokens=num_tokens)
+
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+    manager.prepare_resources(batch)
+    request.context_current_position = request.prompt_len
+    assert request.context_remaining_length == 0
+    manager.update_context_resources(batch)
 
 
 def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
@@ -2014,6 +2053,90 @@ def test_v2_hybrid_preserves_per_conversation_and_disables_periodic_snapshots():
         mgr.prepare_expect_snapshot_points([request])
         assert request.expect_snapshot_points == [150]
     finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_retains_configured_number_of_conversation_turns():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        max_num_turns=2,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    request_a = _make_v2_conversation_request(1, list(range(64)), "conv-1")
+    request_b = _make_v2_conversation_request(2, list(range(100, 164)), "conv-1")
+    # Use fresh conversation IDs so probes query the shared prefix cache
+    # without altering conv-1's retained-turn accounting.
+    # Probe one token past the exact SSM snapshots committed at token 64.
+    request_a_probe = _make_v2_conversation_request(3, list(range(65)), "conv-2")
+    request_b_probe = _make_v2_conversation_request(4, list(range(100, 165)), "conv-3")
+    request_c = _make_v2_conversation_request(5, list(range(200, 264)), "conv-1")
+    request_a_after_eviction = _make_v2_conversation_request(6, list(range(65)), "conv-4")
+    request_b_after_eviction = _make_v2_conversation_request(7, list(range(100, 165)), "conv-5")
+    requests = [
+        request_a,
+        request_b,
+        request_a_probe,
+        request_b_probe,
+        request_c,
+        request_a_after_eviction,
+        request_b_after_eviction,
+    ]
+
+    try:
+        _run_v2_hybrid_context(mgr, request_a)
+        request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]
+        mgr.free_resources(request_a)
+        _run_v2_hybrid_context(mgr, request_b)
+        request_b_state_index = mgr.get_state_indices([request_b.py_request_id], [False])[0]
+        mgr.free_resources(request_b)
+
+        mgr.prepare_expect_snapshot_points([request_a_probe])
+        assert mgr.prepare_context(request_a_probe)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(request_a_probe)
+        mgr.prepare_resources(probe_batch)
+        assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        assert mgr.get_state_indices([request_a_probe.py_request_id], [False]) == [
+            request_a_state_index
+        ]
+        mgr.free_resources(request_a_probe)
+
+        mgr.prepare_expect_snapshot_points([request_b_probe])
+        assert mgr.prepare_context(request_b_probe)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(request_b_probe)
+        mgr.prepare_resources(probe_batch)
+        assert request_b_probe.prepopulated_prompt_len == request_b_probe.prompt_len - 1
+        assert mgr.get_state_indices([request_b_probe.py_request_id], [False]) == [
+            request_b_state_index
+        ]
+        mgr.free_resources(request_b_probe)
+
+        _run_v2_hybrid_context(mgr, request_c)
+        mgr.free_resources(request_c)
+
+        mgr.prepare_expect_snapshot_points([request_a_after_eviction])
+        assert mgr.prepare_context(request_a_after_eviction)
+        assert request_a_after_eviction.prepopulated_prompt_len == 0
+
+        mgr.prepare_expect_snapshot_points([request_b_after_eviction])
+        assert mgr.prepare_context(request_b_after_eviction)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(request_b_after_eviction)
+        mgr.prepare_resources(probe_batch)
+        assert (
+            request_b_after_eviction.prepopulated_prompt_len
+            == request_b_after_eviction.prompt_len - 1
+        )
+        assert mgr.get_state_indices([request_b_after_eviction.py_request_id], [False]) == [
+            request_b_state_index
+        ]
+    finally:
+        for request in requests:
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
         mgr.shutdown()
 
 
