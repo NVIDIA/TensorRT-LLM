@@ -1,24 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Dense MLP helper for the in-tree Kimi K3 MoE block.
+"""Kimi K3 SiTU activation and RMSNorm helpers.
 
 Kimi K3 uses the ``situ`` activation (not SiLU/SwiGLU). ``SituAndMul``
 computes ``beta * tanh(gate / beta) * sigmoid(gate)`` on the gate half
 and optionally applies ``linear_beta * tanh(up / linear_beta)`` on the
-up half, then multiplies. ``KimiK3MLP`` is the fused ``gate_up_proj +
-down_proj`` layout used by the shared expert stack in HF
-``KimiSparseMoeBlock`` — the same shape TRT-LLM's ``GatedMLP`` uses.
+up half, then multiplies.
 
 Two activation paths coexist:
 
-* the eager fp32 ``SituAndMul`` module — the byte-exact HF reference,
-  used by the parity-test MoE block and as the fallback;
+* the eager fp32 ``SituAndMul`` module — the byte-exact HF reference and
+  fallback;
 * the fused Triton ``trtllm::situ_and_mul`` custom op (same fp32 math
   in a single kernel, modeled on ``modules/swiglu.py``'s
-  ``silu_and_mul_kernel``), enabled per ``KimiK3MLP`` instance via
-  ``use_fused_activation=True`` (the runtime model opts in). The op is
-  CUDA-graph-safe: no host synchronization and no data-dependent
-  control flow.
+  ``silu_and_mul_kernel``), enabled on :class:`SituAndMul`. The op is
+  CUDA-graph-safe: no host synchronization and no data-dependent control flow.
 """
 
 from __future__ import annotations
@@ -45,7 +41,9 @@ class SituAndMul(nn.Module):
 
     Byte-identical to HF ``modeling_kimi.py``'s ``SituAndMul`` at
     lines 41-59. Runs the math in fp32 for numerical stability
-    (matches HF), then casts back to the input's dtype.
+    (matches HF), then casts back to the input's dtype. When
+    ``use_fused_activation`` is enabled, CUDA inputs use the fused Triton
+    implementation while CPU and meta inputs keep the eager reference path.
     """
 
     def __init__(
@@ -53,12 +51,19 @@ class SituAndMul(nn.Module):
         *,
         beta: float = 1.0,
         linear_beta: Optional[float] = None,
+        use_fused_activation: bool = False,
     ) -> None:
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
+        self.use_fused_activation = use_fused_activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_fused_activation and x.is_cuda:
+            return torch.ops.trtllm.situ_and_mul(
+                x.reshape(-1, x.shape[-1]), self.beta, self.linear_beta
+            ).reshape(*x.shape[:-1], x.shape[-1] // 2)
+
         d = x.shape[-1] // 2
         gate = x[..., :d].to(torch.float32)
         up = x[..., d:].to(torch.float32)
@@ -158,95 +163,6 @@ def _(x: torch.Tensor, beta: float, linear_beta: Optional[float] = None) -> torc
     return x.new_empty((b, n // 2))
 
 
-class NonSituActivation(nn.Module):
-    """SiLU/SwiGLU activation used as the non-SiTU mutation control.
-
-    Splits the last dim into gate/up, applies SiLU to the gate, and
-    multiplies element-wise. Deliberately does NOT use the SiTU
-    ``beta * tanh(gate/beta) * sigmoid(gate)`` recipe.
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        gate = x[..., :d]
-        up = x[..., d:]
-        return torch.nn.functional.silu(gate) * up
-
-
-class KimiK3MLP(nn.Module):
-    """K3 dense/shared-expert MLP module with TRT-LLM-style fused layout.
-
-    Weight layout:
-
-    * ``gate_up_proj``: ``nn.Linear(hidden_size, 2 * intermediate_size, bias=False)``.
-      Rows ``[:intermediate_size]`` correspond to HF's ``gate`` (KimiMLP.gate_proj
-      or KimiBlockSparseMLP.w1). Rows ``[intermediate_size:]`` correspond to
-      HF's ``up`` (KimiMLP.up_proj or KimiBlockSparseMLP.w3).
-    * ``down_proj``: ``nn.Linear(intermediate_size, hidden_size, bias=False)``.
-      Matches HF ``KimiMLP.down_proj`` or ``KimiBlockSparseMLP.w2``.
-
-    Forward: ``down_proj( activation( gate_up_proj(x) ) )``. Default
-    ``activation`` is :class:`SituAndMul`; pass a different callable to
-    run mutation controls (e.g. :class:`NonSituActivation` for a
-    negative-control test). ``use_fused_activation=True`` routes CUDA
-    inputs through the fused Triton ``trtllm::situ_and_mul`` op instead
-    of the eager module (only valid with the default SiTU activation).
-    """
-
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        intermediate_size: int,
-        situ_beta: float = 4.0,
-        situ_linear_beta: Optional[float] = 25.0,
-        activation: Optional[nn.Module] = None,
-        use_fused_activation: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        super().__init__()
-        if use_fused_activation and activation is not None:
-            raise ValueError(
-                "use_fused_activation only fuses the default SiTU activation; "
-                "drop the custom activation module or the flag"
-            )
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.use_fused_activation = use_fused_activation
-
-        self.gate_up_proj = nn.Linear(
-            hidden_size,
-            2 * intermediate_size,
-            bias=False,
-            dtype=dtype,
-            device=device,
-        )
-        self.down_proj = nn.Linear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            dtype=dtype,
-            device=device,
-        )
-        self.activation = (
-            activation
-            if activation is not None
-            else SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h1 = self.gate_up_proj(x)
-        if self.use_fused_activation and h1.is_cuda:
-            act = self.activation
-            h2 = torch.ops.trtllm.situ_and_mul(
-                h1.reshape(-1, h1.shape[-1]), act.beta, act.linear_beta
-            ).reshape(*h1.shape[:-1], self.intermediate_size)
-        else:
-            h2 = self.activation(h1)
-        return self.down_proj(h2)
-
-
 class KimiK3RMSNorm(nn.Module):
     """RMSNorm matching HF ``KimiRMSNorm`` semantics exactly.
 
@@ -281,12 +197,16 @@ class KimiK3RMSNorm(nn.Module):
         # fp16/bf16 input whose dtype matches the weight; CPU / fp32 parity
         # paths, meta init, and the KIMI_K3_FUSED_RMSNORM=0 rollback keep the
         # exact eager math below.
-        if (_FUSED_RMSNORM and IS_FLASHINFER_AVAILABLE and hidden_states.is_cuda
-                and hidden_states.dtype in (torch.float16, torch.bfloat16)
-                and self.weight.dtype == hidden_states.dtype):
+        if (
+            _FUSED_RMSNORM
+            and IS_FLASHINFER_AVAILABLE
+            and hidden_states.is_cuda
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and self.weight.dtype == hidden_states.dtype
+        ):
             from ...custom_ops import flashinfer_rmsnorm
-            return flashinfer_rmsnorm(hidden_states.contiguous(), self.weight,
-                                      self.eps)
+
+            return flashinfer_rmsnorm(hidden_states.contiguous(), self.weight, self.eps)
         input_dtype = hidden_states.dtype
         h = hidden_states.to(torch.float32)
         variance = h.pow(2).mean(-1, keepdim=True)

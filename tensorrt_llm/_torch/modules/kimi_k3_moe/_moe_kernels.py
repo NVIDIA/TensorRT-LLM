@@ -128,7 +128,7 @@ def pack_routed_expert_weights(
     """Pad + shuffle checkpoint MXFP4 expert weights into the TRTLLM-Gen layout.
 
     Inputs are the per-expert MXFP4 tensors as stored by
-    :class:`KimiK3RoutedExpertBank` (HF layout, group_size=32):
+    the test reference's routed expert bank (HF layout, group_size=32):
 
     * ``w1_packed``/``w3_packed``: ``uint8 [E, I, H // 2]`` (w1 = gate, w3 = up)
     * ``w1_scales``/``w3_scales``: ``uint8 [E, I, H // 32]`` (E8M0 biased exponents)

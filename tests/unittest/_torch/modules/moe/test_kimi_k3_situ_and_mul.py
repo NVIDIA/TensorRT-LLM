@@ -18,8 +18,9 @@ Checks the fused SiTU activation op against the eager fp32
 
 import pytest
 import torch
+from _torch.modules.moe.kimi_k3_mlp_test_utils import KimiK3MLP
 
-from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import KimiK3MLP, SituAndMul
+from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import SituAndMul
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
