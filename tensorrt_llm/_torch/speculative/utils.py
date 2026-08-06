@@ -42,6 +42,81 @@ _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
     "Gemma4ForConditionalGeneration",
 )
 
+# MTP structure fields copied from a separate MTP-head checkpoint onto the
+# target pretrained config when ``speculative_model`` is set.
+_MTP_STRUCTURE_FIELDS_FROM_DRAFT = (
+    "num_nextn_predict_layers",
+    "mtp_hybrid_override_pattern",
+    "mtp_block_configs",
+)
+
+
+def _is_mtp_checkpoint_weight_key(key: str) -> bool:
+    """Return True for checkpoint keys that belong to MTP heads."""
+    return key.startswith("mtp.") or key.startswith("mtp/")
+
+
+def filter_mtp_checkpoint_weights(weights: dict) -> dict:
+    """Drop ``mtp.*`` keys so embedded MTP heads do not override a separate MTP checkpoint."""
+    return {
+        k: v
+        for k, v in weights.items() if not _is_mtp_checkpoint_weight_key(k)
+    }
+
+
+def loads_mtp_from_speculative_model(spec_config) -> bool:
+    """True when one-model MTP should load heads from ``speculative_model``."""
+    if spec_config is None:
+        return False
+    return (spec_config.spec_dec_mode.is_mtp_one_model()
+            and spec_config.speculative_model is not None)
+
+
+def _load_speculative_model_config_dict(spec_config) -> Optional[dict]:
+    """Read ``config.json`` from ``spec_config.speculative_model``, if present."""
+    draft_dir = getattr(spec_config, "speculative_model", None)
+    if not draft_dir:
+        return None
+    try:
+        import json
+        import os
+        cfg_path = os.path.join(str(draft_dir), "config.json")
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path) as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning(
+            "Unable to read speculative_model config from %s: %s",
+            draft_dir,
+            exc,
+        )
+        return None
+
+
+def _merge_mtp_fields_from_speculative_model(spec_config,
+                                             model_config) -> Optional[int]:
+    """Overlay MTP structure fields from ``speculative_model`` onto ``model_config``.
+
+    Returns the MTP layer count from the draft checkpoint when available.
+    """
+    draft_cfg = _load_speculative_model_config_dict(spec_config)
+    if not draft_cfg:
+        return None
+
+    draft_nextn = draft_cfg.get("num_nextn_predict_layers")
+    if draft_nextn is None:
+        draft_nextn = draft_cfg.get("mtp_num_hidden_layers")
+
+    for field in _MTP_STRUCTURE_FIELDS_FROM_DRAFT:
+        if field in draft_cfg and draft_cfg[field] is not None:
+            setattr(model_config, field, draft_cfg[field])
+
+    if draft_nextn is not None:
+        setattr(model_config, "num_nextn_predict_layers", draft_nextn)
+        return int(draft_nextn)
+    return None
+
 
 def _is_effective_dynamic_tree(spec_config) -> bool:
     # At dynamic_tree_max_topK == 1 the tree collapses to a linear chain; route
@@ -557,6 +632,15 @@ def update_spec_config_from_model_config(spec_config, model_config):
             and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
         spec_config._use_shared_kv_cache = (
             spec_config.spec_dec_mode.is_mtp_eagle_one_model())
+
+    # When MTP heads live in a separate checkpoint, prefer that checkpoint's
+    # layer count / pattern over the target model's (which may have no MTP or
+    # an older embedded MTP head that will be overridden at weight load).
+    draft_nextn = None
+    if loads_mtp_from_speculative_model(spec_config):
+        draft_nextn = _merge_mtp_fields_from_speculative_model(
+            spec_config, model_config)
+
     # Read the MTP layer count from the model's pretrained config. This
     # determines the actual MTP layer count in the checkpoint and drives the
     # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
@@ -564,13 +648,16 @@ def update_spec_config_from_model_config(spec_config, model_config):
     # `num_nextn_predict_layers`, while Qwen3Next-style configs (including
     # Qwen3.5) use `mtp_num_hidden_layers`. Fall back to a single shared MTP /
     # EAGLE layer when neither field is present.
-    num_nextn_predict_layers = getattr(model_config, "num_nextn_predict_layers",
-                                       None)
-    if num_nextn_predict_layers is None:
+    if draft_nextn is not None:
+        num_nextn_predict_layers = draft_nextn
+    else:
         num_nextn_predict_layers = getattr(model_config,
-                                           "mtp_num_hidden_layers", None)
-    if num_nextn_predict_layers is None:
-        num_nextn_predict_layers = 1
+                                           "num_nextn_predict_layers", None)
+        if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = getattr(model_config,
+                                               "mtp_num_hidden_layers", None)
+        if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = 1
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 

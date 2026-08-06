@@ -912,7 +912,18 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
-            assert ckpt_nextn > 0, "There are not MTP modules in the checkpoint."
+            has_external_mtp = (
+                model_config.spec_config.speculative_model is not None)
+            assert ckpt_nextn > 0 or has_external_mtp, (
+                "There are not MTP modules in the checkpoint. "
+                "Set speculative_config.speculative_model to a separate MTP "
+                "heads checkpoint, or use a target checkpoint that embeds MTP."
+            )
+            if ckpt_nextn == 0 and has_external_mtp:
+                # Structure fields were merged from speculative_model; treat as
+                # a single shared MTP head unless the draft config said otherwise.
+                ckpt_nextn = model_nextn = max(
+                    getattr(self.config, "num_nextn_predict_layers", 1) or 1, 1)
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -976,6 +987,14 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                      weights: dict,
                      weight_mapper: BaseWeightMapper,
                      allow_partial_loading: bool = False):
+        from tensorrt_llm._torch.speculative.utils import (
+            filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model)
+
+        if loads_mtp_from_speculative_model(self.model_config.spec_config):
+            # Filter before preprocess: mapper remaps mtp.layers.* ->
+            # model.layers.{N}.* and would otherwise load embedded MTP heads.
+            weights = filter_mtp_checkpoint_weights(weights)
+            allow_partial_loading = True
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights,
                              weight_mapper=weight_mapper,

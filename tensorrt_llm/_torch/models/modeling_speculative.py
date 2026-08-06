@@ -2127,6 +2127,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                      weight_mapper: Optional[BaseWeightMapper] = None,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
+        from tensorrt_llm._torch.speculative.utils import (
+            filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model)
+
+        if loads_mtp_from_speculative_model(self.spec_config):
+            # Skip embedded MTP heads; they are loaded from speculative_model.
+            weights = filter_mtp_checkpoint_weights(weights)
+            allow_partial_loading = True
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
                              skip_modules=["draft_model"],
@@ -2136,6 +2143,26 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
+        from tensorrt_llm._torch.speculative.utils import \
+            loads_mtp_from_speculative_model
+
+        if loads_mtp_from_speculative_model(self.spec_config):
+            # One-model MTP with separate heads: MTP modules are attached under
+            # model.layers[N+] (shared with draft_model.mtp_layers). Load via the
+            # parent so family weight mappers (e.g. mtp.layers.* remap) apply.
+            if weight_mapper is not None:
+                preprocess = getattr(weight_mapper, "preprocess_weights", None)
+                if callable(preprocess):
+                    weights = preprocess(weights)
+            DecoderModelForCausalLM.load_weights(
+                self,
+                weights=weights,
+                weight_mapper=weight_mapper,
+                skip_modules=["draft_model"],
+                allow_partial_loading=True,
+            )
+            return
+
         args = inspect.getfullargspec(self.draft_model.load_weights).args
         if "weight_mapper" in args:
             self.draft_model.load_weights(weights=weights,
