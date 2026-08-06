@@ -1019,6 +1019,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{local_ranks} co-located rank(s) on this node, "
                 f"available host memory {mem_available / (1 << 30):.2f}GiB"
             )
+            # Auto sizing reads rank-local host state, so co-scheduled ranks
+            # can get divergent host quotas (observed up to 10x). Divergent
+            # host-tier retention makes per-rank schedulers disagree, which
+            # wedges collectives on non-attention-DP TP. Sync to the fleet
+            # minimum, like the device quota above.
+            if mapping.world_size > 1:
+                host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
