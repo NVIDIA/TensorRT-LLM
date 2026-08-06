@@ -106,6 +106,7 @@ from .sampler_common import (
     DEFAULT_BEAM_IDX,
     DEFAULT_STEP_IDX,
     FinishReasonsList,
+    _get_beam_width_out,
     _get_max_beam_width,
     _request_get_sampling_params,
     add_token,
@@ -2436,7 +2437,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
                     _finalize_beam(req, beam_history)
                 else:
-                    for beam_idx in range(req.py_beam_width):
+                    # Only the leading beam_width_out columns hold real tokens;
+                    # the op pads the rest of the store-width row with
+                    # BEAM_SEARCH_PAD_TOKEN. Appending those would put the
+                    # sentinel into the request's token history, which is
+                    # visible to streaming consumers and to anything reading
+                    # get_tokens() mid-flight (e.g. the token-ban suffix
+                    # matching) even though finalization later rewrites it.
+                    for beam_idx in range(_get_beam_width_out(req)):
                         # Beam search does not support speculative decoding.
                         add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)

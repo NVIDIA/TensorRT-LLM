@@ -7873,9 +7873,17 @@ class PyTorchModelEngine(ModelEngine):
             for request in requests:
                 if is_context_request:
                     beam_width = 1
+                    row_stride = 1
                 else:
+                    # Generation rows are laid out at the static admission
+                    # width, so that is the stride between requests, while
+                    # only the leading beam_width rows hold live beams under
+                    # a variable beam width array. Advancing the offset by the
+                    # narrower width would make every request after the first
+                    # rewrite another request's logits rows in place.
                     beam_width = request.get_beam_width_by_iter(
                         for_next_iteration=False)
+                    row_stride = request.py_beam_width
 
                 logits_processors = getattr(request,
                                             "py_logits_post_processors", None)
@@ -7888,13 +7896,13 @@ class PyTorchModelEngine(ModelEngine):
                     if (is_context_request
                             and request.py_orig_prompt_len < len(token_ids[0])):
                         # Skip as we only need to apply logit processor on the last context request
-                        logits_row_offset += beam_width
+                        logits_row_offset += row_stride
                         continue
 
                     self._apply_logits_processors(request, logits_processors,
                                                   logits_tensor, beam_width,
                                                   token_ids, logits_row_offset)
-                logits_row_offset += beam_width
+                logits_row_offset += row_stride
 
     def wait_for_input_copy(self):
         """

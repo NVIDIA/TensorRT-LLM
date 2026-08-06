@@ -613,6 +613,31 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
     monkeypatch.setattr(LlmRequest, "get_beam_width_by_iter",
                         recording_get_beam_width_by_iter)
 
+    # Inspect the requests right after every update_requests(): the sampling
+    # op pads its output row out to the store's beam width, and appending
+    # those columns would put BEAM_SEARCH_PAD_TOKEN into the request's token
+    # history. Checking only the final outputs cannot see it, because
+    # finalization rewrites every beam from the corrected paths -- but the
+    # padded history is visible to streaming consumers and to anything reading
+    # get_tokens() mid-flight.
+    padded_histories: list[tuple[int, int, list[int]]] = []
+    unwrapped_update_requests = TorchSampler.update_requests
+
+    def recording_update_requests(self: TorchSampler, state, *args, **kwargs):
+        result = unwrapped_update_requests(self, state, *args, **kwargs)
+        for req in state.requests:
+            if req.py_beam_width <= 1:
+                continue
+            for beam_idx in range(req.py_beam_width):
+                tokens = list(req.get_tokens(beam_idx))
+                if BEAM_SEARCH_PAD_TOKEN in tokens:
+                    padded_histories.append(
+                        (req.py_decoding_iter, beam_idx, tokens))
+        return result
+
+    monkeypatch.setattr(TorchSampler, "update_requests",
+                        recording_update_requests)
+
     gc.collect(2)  # force destruction of any other LLM instances
     with _single_process_context():
         llm = LLM(
@@ -671,6 +696,12 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
     assert set(actual) == set(beam_width_array), (
         f"expected every width in {beam_width_array} to be exercised, "
         f"but only saw {sorted(set(actual))}")
+
+    # No step may leave the padding sentinel in a request's token history.
+    assert not padded_histories, (
+        "BEAM_SEARCH_PAD_TOKEN leaked into the request token history; "
+        "update_requests() must append only the beams the step produced, not "
+        f"the full store width. First offenders: {padded_histories[:3]}")
 
 
 ###########################################################################
