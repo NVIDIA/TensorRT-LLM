@@ -31,6 +31,8 @@ from tensorrt_llm.serve.perf_metrics import _PERF_METRICS_HEADER_BUDGET_BYTES, S
 from tensorrt_llm.serve.responses_utils import ResponseHooks
 from tensorrt_llm.serve.router import Router
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _reset_prometheus_registry():
     from prometheus_client.registry import REGISTRY

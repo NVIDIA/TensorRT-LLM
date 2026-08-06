@@ -26,10 +26,9 @@ from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.fused_ops.fused_qk_norm_rope_gate import (
-    fused_qkv_gemma_rmsnorm_rope_gate, fused_sigmoid_mul)
+    fused_qkv_gemma_rmsnorm_rope_gate, fused_sigmoid_mul_inplace)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..utils import is_torch_compiling
 
 
 # Move out from this class
@@ -225,7 +224,7 @@ class QKNormRoPEAttention(Attention):
     def _can_use_fused_qk_norm_rope_gate(
             self, qkv: torch.Tensor,
             position_ids: Optional[torch.Tensor]) -> bool:
-        if not self._fuse_qk_norm_rope_gate or is_torch_compiling():
+        if not self._fuse_qk_norm_rope_gate:
             return False
         if torch.version.hip is not None or qkv.device.type != "cuda":
             return False
@@ -288,14 +287,14 @@ class QKNormRoPEAttention(Attention):
         return qkv, None, None, gate
 
     def apply_output_gate(self, attention_output, gate):
-        if (self._fuse_qk_norm_rope_gate and not is_torch_compiling()
-                and torch.version.hip is None
+        if (self._fuse_qk_norm_rope_gate and torch.version.hip is None
                 and attention_output.device.type == "cuda"
                 and attention_output.dim() == 2
                 and attention_output.stride(-1) == 1 and gate.dim() in (2, 3)
                 and gate.stride(-1) == 1
                 and gate.numel() == attention_output.numel()):
-            return fused_sigmoid_mul(attention_output, gate, inplace=True)
+            fused_sigmoid_mul_inplace(attention_output, gate)
+            return attention_output
         return super().apply_output_gate(attention_output, gate)
 
     def apply_qk_norm(self, q, k):
