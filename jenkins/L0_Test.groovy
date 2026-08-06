@@ -5755,7 +5755,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // match AGENT_FLOW_STAGE in that rule or CBTS Layer 2 will drop it.
     agentFlowTestSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     agentFlowTestConfigs = [
-        "AgentFlow-UnitTest": [agentFlowTestSpec, {
+        "CPU-AgentFlow-UnitTest": [agentFlowTestSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
             runLLMAgentFlowTest(pipeline, "AgentFlow-UnitTest")
         }],
