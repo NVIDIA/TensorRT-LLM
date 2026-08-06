@@ -3513,62 +3513,28 @@ class PyExecutor:
             fitting_disagg_gen_init_requests: List[LlmRequest],
             wait_for_disagg_gen_transfer_progress: bool,
             all_gen_first: bool) -> None:
-        # Disabled: this ran two collectives on every executor iteration --
-        # _sync_disagg_gen_status_entry (WORLD-scoped) and
-        # _sync_disagg_ctx_status_entry (TP/CP) -- purely to vote on whether any
-        # rank should enter a blocking transfer-status wait. Instrumented on a
-        # GLM-5.2 disagg GEN worker they were 3,995 ms of the method's 4,012 ms
-        # over 3,000 calls, i.e. 99% of its cost was the votes themselves. An
-        # NVTX capture of the CTX put the WORLD allreduce at 19.4% of context
-        # wall-clock (18 calls, 211 ms mean) because it spans every rank in the
-        # deployment, so each call waits on the slowest participant anywhere.
-        #
-        # Removal is safe because transfer completion is still reaped at the
-        # other call sites in the executor loop; only the ones inside this
-        # method are dropped. Both replacements are rank-uniform and contain no
-        # collectives, so ranks cannot diverge -- the deadlock the voting
-        # guarded against cannot arise once nothing here is conditional.
-        return
+        del wait_for_disagg_gen_transfer_progress
 
-        local_need_check = (num_fitting_reqs == 0
-                            and not fitting_disagg_gen_init_requests)
-
-        # A synchronous GEN receive is rank-local and blocking. One rank can
-        # still be receiving while another is idle, so entering either the
-        # generation or context progress collective here is unsafe.
-        if not self._uses_async_disagg_gen_transfer():
+        # Transfer admission remains unbounded, but completed CTX sends must
+        # still be reaped when their pinned blocks prevent every forward.  A
+        # forward normally polls completion from _send_kv_async; once no
+        # request fits, that call site is unreachable and retrying the same
+        # schedule cannot release KV capacity.
+        needs_ctx_progress = (
+            num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests
+            and not all_gen_first
+            and self.async_transfer_manager.has_any_inflight_requests())
+        if not needs_ctx_progress:
             return
 
-        local_need_gen_check = (local_need_check
-                                and wait_for_disagg_gen_transfer_progress)
-
-        any_need_gen_check = self._sync_disagg_gen_status_entry(
-            local_need_gen_check)
-        if any_need_gen_check > 0:
-            if local_need_gen_check:
-                logger.debug(
-                    "Waiting for generation KV cache transfer progress to "
-                    "free disagg admission budget")
-            self._check_disagg_gen_cache_transfer_status(1)
-            return
-
-        any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
-        if any_need_check > 0:
-            if local_need_check and not all_gen_first:
-                logger.warning(
-                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                )
-                # Local conditions warrant a blocking wait for at least one
-                # in-flight transfer to complete so KV blocks can be freed.
-                self._check_disagg_ctx_cache_transfer_status(1)
-            else:
-                # Either (a) a peer rank needed the call but we didn't, or
-                # (b) all active requests are gen-first so we don't
-                # actively block. In both cases the non-blocking variant
-                # still runs the internal allgather (keeping all ranks in
-                # sync) and reaps any already-completed transfers without
-                # blocking on un-finished ones.
-                self._check_disagg_ctx_cache_transfer_status(0)
+        # Scheduling is uniform within each model-parallel transfer group, so
+        # the zero-fit predicate is rank-uniform and needs no separate WORLD or
+        # TP/CP vote. check_context_transfer_status performs its own required
+        # model-parallel completion consensus.
+        logger.warning(
+            "No request fits while CTX KV transfers are in flight; waiting "
+            "for transfer completion to release pinned KV blocks")
+        self._check_disagg_ctx_cache_transfer_status(1)
 
     def _sync_gen_only_benchmark_has_insufficient_kv(
             self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],

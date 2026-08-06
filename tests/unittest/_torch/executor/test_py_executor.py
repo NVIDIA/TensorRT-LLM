@@ -25,7 +25,11 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    AsyncTransferManager,
+    DisaggTransferAdmissionController,
+    PyExecutor,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
@@ -636,6 +640,8 @@ class TestDisaggTransferIdleProgress:
     def test_does_not_poll_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = False
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -669,9 +675,11 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
         executor.dist.allreduce.assert_not_called()
 
-    def test_does_not_fall_back_to_context_transfer(self):
+    def test_waits_for_context_transfer_when_no_request_fits(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -683,14 +691,57 @@ class TestDisaggTransferIdleProgress:
             all_gen_first=False,
         )
 
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_not_called()
+
+    def test_zero_fit_context_progress_unpins_completed_transfer(self):
+        request_id = 42
+        block_id = 123
+        request = Mock(py_request_id=request_id)
+        kv_cache_manager = Mock()
+        kv_cache_manager.store_blocks_for_reuse.return_value = block_id
+        resource_manager = Mock(
+            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
+        )
+        transfer_manager = AsyncTransferManager(resource_manager)
+        transfer_manager.start_transfer(request)
+
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = []
+        executor.async_transfer_manager = transfer_manager
+        executor.enable_attention_dp = False
+        executor.force_terminate_ctx_for_partial_reuse = True
+        executor.kv_cache_transceiver = Mock()
+        executor.kv_cache_transceiver.check_context_transfer_status.return_value = (
+            [request_id],
+            [],
+        )
+
+        assert request_id in transfer_manager.requests_in_transfer()
+        kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor.kv_cache_transceiver.check_context_transfer_status.assert_called_once_with(1)
+        assert request_id not in transfer_manager.requests_in_transfer()
+        kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(block_id)
 
     def test_sync_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
         executor.is_benchmark_disagg = True
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = False
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -712,6 +763,8 @@ class TestDisaggTransferIdleProgress:
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
         executor.is_benchmark_disagg = False
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = False
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
