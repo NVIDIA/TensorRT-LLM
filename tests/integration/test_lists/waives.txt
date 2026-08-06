@@ -399,6 +399,7 @@ test_e2e.py::test_multi_nodes_eval[DeepSeek-R1/DeepSeek-R1-0528-FP4-tp16-mmlu] S
 test_e2e.py::test_multi_nodes_eval[Kimi-K2-Thinking-NVFP4-tp16-mmlu] SKIP (https://nvbugs/6276983)
 test_e2e.py::test_multi_nodes_eval[MiniMax-M3-tp16-mmlu] SKIP (https://nvbugs/6373561)
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8] SKIP (https://nvbugs/5836830)
+test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/6568058)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[deepseekv3_mla-gen-bf16-HND-p32-v1] SKIP (https://nvbugs/6507109)
 unittest/_torch/executor/test_overlap_scheduler.py::test_overlap_scheduler_consistency[no_reuse-cpp_scheduler-TorchSampler] SKIP (https://nvbugs/6561559)
 unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_promoted_context_precedes_speculative_overlap_generation SKIP (https://nvbugs/6550803)
