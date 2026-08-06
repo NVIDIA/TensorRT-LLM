@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/kernels/deepseekV4BlockTable.h"
 
+#include <algorithm>
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN

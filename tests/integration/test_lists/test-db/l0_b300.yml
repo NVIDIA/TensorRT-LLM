@@ -20,6 +20,7 @@ l0_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/custom_ops/test_deepseek_v4_metadata_ops.py TIMEOUT (15)
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
