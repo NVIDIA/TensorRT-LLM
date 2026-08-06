@@ -58,6 +58,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
 )
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _client_factory(*_args, **_kwargs):
     return AsyncMock()
@@ -100,6 +102,42 @@ async def test_conditional_disagg_uses_selected_server_match_length():
 
     assert server == "gen:8000"
     assert need_context is False
+
+
+@pytest.mark.asyncio
+async def test_conditional_disagg_bypass_strips_client_disagg_params(monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 64,
+                "num_tokens": 96,
+            },
+        )
+    )
+    service._gen_router = router
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response("ok", finish_reason="stop")
+    )
+    request = CompletionRequest(
+        model="model",
+        prompt=[1] * 96,
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only",
+            ctx_info_endpoint="tcp://attacker:5000",
+            encoded_opaque_state="attacker-state",
+        ),
+    )
+
+    await service._send_disagg_request_ctx_first(request)
+
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    assert gen_req.disaggregated_params is None
 
 
 def _make_completion_response(

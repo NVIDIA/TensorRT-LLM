@@ -34,6 +34,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SerializableSchedulerOutput,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class MockPyExecutor:
     """A mock PyExecutor class for testing request handling logic.

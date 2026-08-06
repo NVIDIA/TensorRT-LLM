@@ -93,6 +93,17 @@ def get_version():
     return version
 
 
+def get_project_urls() -> dict[str, str]:
+    source_commit = os.getenv("TRTLLM_BUILD_SOURCE_COMMIT")
+    if not source_commit:
+        return {}
+
+    return {
+        "Source Commit":
+        f"https://github.com/NVIDIA/TensorRT-LLM/commit/{source_commit}",
+    }
+
+
 def get_license():
     """Get license files for the wheel package.
 
@@ -482,4 +493,5 @@ setup(
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.10, <4")
+    python_requires=">=3.10, <4",
+    project_urls=get_project_urls())
