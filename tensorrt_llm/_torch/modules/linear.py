@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import enum
@@ -33,6 +36,26 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+
+_LOW_M_GEMM_MAX_M = 32
+_LOW_M_GEMM_SHAPE_COLLECTION_ACTIVE = bool(
+    os.environ.get("TRTLLM_LOW_M_GEMM_SHAPE_LOG"))
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
+    """Skip dispatcher overhead outside FlashInfer's supported M domain."""
+
+    if not LOW_M_GEMM_ACTIVE:
+        return False
+    # The debug collector intentionally inventories every BF16 Linear shape,
+    # including normal-path M values above the FlashInfer kernel domain.
+    if _LOW_M_GEMM_SHAPE_COLLECTION_ACTIVE:
+        return True
+    if input.ndim < 1:
+        return False
+    k = int(input.shape[-1])
+    return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
 
 
 class WeightMode(str, enum.Enum):
@@ -543,6 +566,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # The opt-in low-M dispatcher loads decisions produced by an offline
+        # FlashInfer direct/split-K versus cuBLAS sweep. It never benchmarks on
+        # the serving path and returns None for the normal GEMM fallback.
+        if _should_apply_low_m_gemm(input):
+            output = apply_low_m_gemm(module, input, module.weight, bias)
+            if output is not None:
+                return output
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
