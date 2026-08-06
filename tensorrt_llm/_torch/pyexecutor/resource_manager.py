@@ -394,11 +394,11 @@ class KVCacheManager(BaseResourceManager):
         # Kept so prepare_resources can re-validate the per-step token budget
         # (the forward-pass scratch size enforced in _prepare_tp_inputs).
         self.max_num_tokens = max_num_tokens
-        # Whether chunked prefill is enabled for this engine. Gates the re-chunk
-        # path in _fit_token_budget: a context request may only be shrunk into a
+        # Whether chunked prefill is enabled for this engine. Gates the shrink
+        # path in fit_token_budget: a context request may only be shrunk into a
         # partial chunk when the attention backend is set up for chunked context.
-        # Defaults to False (safe: defer instead of re-chunk) and is set to the
-        # finalized value by _create_kv_cache_manager.
+        # Defaults to False (safe: leave the chunk at its scheduled size) and is
+        # set to the finalized value by _create_kv_cache_manager.
         self.enable_chunked_prefill = enable_chunked_prefill
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
