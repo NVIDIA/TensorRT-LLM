@@ -11,7 +11,7 @@ with extra image-conditioning paths from Diffusers
 import math
 import time
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -260,21 +260,6 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
             prompt_embeds_mask = None
         return prompt_embeds, prompt_embeds_mask
 
-    @staticmethod
-    def _validate_ulysses_prompt_masks(
-        ulysses_size: int,
-        *prompt_masks: Optional[torch.Tensor],
-    ) -> None:
-        if ulysses_size <= 1:
-            return
-        if any(mask is not None for mask in prompt_masks):
-            raise ValueError(
-                "Qwen-Image-Edit Ulysses parallelism requires unmasked prompt "
-                "conditioning. The supported single-prompt edit path produces "
-                "all-valid prompt masks; use ulysses_size=1 for padded or "
-                "batched prompt conditioning."
-            )
-
     def _encode_vae_image(
         self,
         image: torch.Tensor,
@@ -427,7 +412,6 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         cfg_size = vgm.cfg_size if vgm else 1
         cfg_rank = vgm.cfg_rank if vgm else 0
         cfg_pg = vgm.cfg_group if vgm else None
-        ulysses_size = vgm.ulysses_size if vgm else 1
         do_cfg_parallel = do_true_cfg and cfg_size > 1
         if do_cfg_parallel:
             if cfg_size != 2:
@@ -460,11 +444,6 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                 max_sequence_length,
                 num_images_per_prompt=1,
             )
-        self._validate_ulysses_prompt_masks(
-            ulysses_size,
-            prompt_embeds_mask,
-            neg_prompt_embeds_mask,
-        )
 
         num_channels_latents = self.transformer.in_channels // 4
         latents, image_latents = self._prepare_edit_latents(
