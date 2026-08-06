@@ -23,26 +23,25 @@ from tensorrt_llm import logger
 
 _MIB = 1024 * 1024
 
-# Test/advanced override for the block-count gate below (users only tune the bounce size). Read on
-# the generation side, so set it there; unset uses the default.
-_MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"
+# Test/advanced overrides for the size gates below (users only tune the bounce size). Read on the
+# generation side, so set them there; unset uses the defaults.
+_MIN_BYTES_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES"  # the operative gate, in bytes
+_MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"  # legacy block-count gate
 
 
-def _env_min_blocks(default: int) -> int:
-    """Read the gate from the env, defensively: unset or malformed falls back to the default (never
+def _env_int_gate(name: str, default: int) -> int:
+    """Read a gate from the env, defensively: unset or malformed falls back to the default (never
     crashing), and the value is clamped to at least 1."""
-    raw = os.environ.get(_MIN_BLOCKS_ENV)
+    raw = os.environ.get(name)
     if raw is None:
         return default
     try:
         value = int(raw)
     except ValueError:
-        logger.warning(f"{_MIN_BLOCKS_ENV}={raw!r} is not an integer; using default {default}")
+        logger.warning(f"{name}={raw!r} is not an integer; using default {default}")
         return default
     if value < 1:
-        logger.warning(
-            f"{_MIN_BLOCKS_ENV}={value} < 1; clamping to 1 (bounce always clears the gate)"
-        )
+        logger.warning(f"{name}={value} < 1; clamping to 1 (bounce always clears the gate)")
         return 1
     return value
 
@@ -103,20 +102,41 @@ def fit_within_free(
     return capacity_bytes
 
 
+# Skip bounce below this many bytes. The cost this gate guards scales with BYTES, not blocks: an
+# earlier block-count gate (96 blocks, calibrated for 128-token blocks) silently skipped a 433 MiB
+# Kimi-K3 transfer (67 blocks of 32 tokens) and dropped it onto the ~0.4 GB/s host-staged fallback,
+# a ~1000x cliff. Break-even is small: bounce adds one gather plus one scatter copy (device-local,
+# ~hundreds of GB/s) and ~0.1 ms of fixed launch/reservation overhead, while the in-place path can
+# be as slow as ~0.4 GB/s inter-node — 2 MiB in-place at that rate is ~5 ms vs well under 1 ms
+# bounced. Below 2 MiB the fixed overhead dominates and arena slots are better kept for large
+# transfers. Heuristic, tunable via TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES.
+DEFAULT_MIN_BYTES = 2 * _MIB
+
+
 @dataclass
 class Config:
     sizing: Sizing = field(default_factory=FixedSizing)  # how much memory to reserve (pluggable)
     chunk_mb: int = 32  # physical chunk size; a large chunk keeps the write to a single descriptor
-    # skip bounce below this many blocks (roughly 12k tokens at 128 per block); heuristic, tunable
-    min_blocks: int = 96
+    # skip bounce below this many bytes (the operative gate; see DEFAULT_MIN_BYTES for the rationale)
+    min_bytes: int = DEFAULT_MIN_BYTES
+    # legacy block-count gate, kept for back-compat (TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS): both gates
+    # must pass, and the default of 1 makes this one vacuous so the byte gate decides
+    min_blocks: int = 1
 
 
-def config_from_size(size_mb: int, min_blocks: Optional[int] = None) -> Optional[Config]:
+def config_from_size(
+    size_mb: int, min_blocks: Optional[int] = None, min_bytes: Optional[int] = None
+) -> Optional[Config]:
     """Build a bounce config from a per-region size in MiB, or None to leave bounce off (size <= 0).
-    Size is both the capacity and the on/off switch. min_blocks is the gate below which a transfer
-    stays on the per-block path; when unset it comes from the env, else the default."""
+    Size is both the capacity and the on/off switch. min_bytes (and the legacy min_blocks) is the
+    gate below which a transfer stays on the per-block path; when unset it comes from the env, else
+    the default."""
     if size_mb is None or size_mb <= 0:
         return None
     if min_blocks is None:
-        min_blocks = _env_min_blocks(Config.min_blocks)
-    return Config(sizing=FixedSizing(capacity_mb=size_mb), min_blocks=min_blocks)
+        min_blocks = _env_int_gate(_MIN_BLOCKS_ENV, Config.min_blocks)
+    if min_bytes is None:
+        min_bytes = _env_int_gate(_MIN_BYTES_ENV, Config.min_bytes)
+    return Config(
+        sizing=FixedSizing(capacity_mb=size_mb), min_bytes=min_bytes, min_blocks=min_blocks
+    )
