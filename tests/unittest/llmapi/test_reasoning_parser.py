@@ -62,6 +62,27 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
+def _stream_parse(parser_key: str, text: str, chunk_size: int = 1):
+    """Apply parse_delta in chunks then finish; return concatenated fields."""
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_key)
+    content, reasoning_context = "", ""
+    if not text:
+        chunks = [""]
+    else:
+        chunks = [
+            text[i:i + chunk_size] for i in range(0, len(text), chunk_size)
+        ]
+    for chunk in chunks:
+        result = reasoning_parser.parse_delta(chunk)
+        content += result.content
+        reasoning_context += result.reasoning_content
+    result = reasoning_parser.finish()
+    content += result.content
+    reasoning_context += result.reasoning_content
+    return content, reasoning_context
+
+
 @pytest.mark.parametrize(
     ("parser_key", "text"),
     [
@@ -70,32 +91,41 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         ("deepseek-r1", "a <"),
         # `finish()` flushes as content: no reasoning block was entered.
         ("qwen3", "a<"),
-        # `finish()` discards: the buffer holds exactly a delimiter. Passes on
-        # `main` too - it guards against a fix that leaks the tag instead.
+        # End delimiter after reasoning body.
         ("deepseek-r1", f"a{R1_END}"),
+        # Issue #17296: preamble before <think> must not become content when
+        # streaming (``parse()`` drops it for reasoning_at_start=False).
+        ("qwen3", f"a{R1_START}b"),
+        ("qwen3", f"a{R1_START}a"),
+        ("qwen3", f"a{R1_END}"),
+        ("qwen3", f"{R1_END}{R1_START}a"),
+        ("qwen3", f"Sure.{R1_START}2+2=4{R1_END}4"),
+        ("qwen3", f"pre{R1_START}{R1_END}post"),
+        # Multi-block interleaved is intentionally richer on the stream path
+        # than one-shot ``parse()`` (single partition); not a #17296 case.
+        # Complete start tag left at EOS must match ``parse()`` (kept as
+        # reasoning when already inside the block).
+        ("deepseek-r1", f"a{R1_START}"),
+        ("deepseek-r1", f"{R1_END}a{R1_END}"),
+        ("laguna", f"a{R1_START}b{R1_END}c"),
+        ("qwen3", "Hello"),
+        ("qwen3", ""),
+        ("qwen3", R1_START),
+        ("deepseek-r1", R1_START),
     ])
 def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
         parser_key: str, text: str) -> None:
-    """Streaming char-by-char then finishing must match a non-streaming parse.
+    """Streaming then finishing must match a non-streaming parse.
 
-    One `(parser_key, text)` pair per branch of `finish()`. This is the
-    contract the missing flush violated, so it subsumes example-based tests
-    of the individual branches.
+    Covers ``finish()`` flush branches and the #17296 stream/non-stream
+    content/reasoning split parity (preamble drop, end-of-stream tags).
     """
     expected = ReasoningParserFactory.create_reasoning_parser(parser_key).parse(
         text)
-    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
-        parser_key)
-    content, reasoning_context = "", ""
-    for char in text:
-        result = reasoning_parser.parse_delta(char)
-        content += result.content
-        reasoning_context += result.reasoning_content
-    result = reasoning_parser.finish()
-    content += result.content
-    reasoning_context += result.reasoning_content
-    assert content == expected.content
-    assert reasoning_context == expected.reasoning_content
+    for chunk_size in (1, 2, 3, max(len(text), 1)):
+        content, reasoning_context = _stream_parse(parser_key, text, chunk_size)
+        assert content == expected.content
+        assert reasoning_context == expected.reasoning_content
 
 
 def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
