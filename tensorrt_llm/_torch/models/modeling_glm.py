@@ -370,9 +370,20 @@ class Glm4MoE(nn.Module):
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
-        )
+        qcd = model_config.quant_config_dict
+        base = f"model.layers.{layer_idx}.mlp.experts"
+        if base in qcd:
+            return qcd[base]
+        # ModelOpt exports MIXED_PRECISION checkpoints with per-expert keys (e.g.
+        # "...mlp.experts.0.gate_proj") rather than a single "...mlp.experts" key. The fused MoE
+        # uses one format for the whole experts block, so derive it from a representative routed
+        # expert linear (all experts in a layer share a format under a serveable recipe).
+        prefix = base + "."
+        for name, cfg in qcd.items():
+            if name.startswith(prefix) and name.endswith(
+                (".gate_proj", ".up_proj", ".down_proj")):
+                return cfg
+        return model_config.quant_config
 
     def compute_routed_output(
         self, hidden_states, hidden_states_fp4, all_rank_num_tokens, do_finalize
@@ -515,11 +526,14 @@ class Glm4DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get("TRTLLM_GLM_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
 
-        # FIXME: incompatible with mixed quantization mode
+        # Per-layer quant config. Under MIXED_PRECISION the layer-level algo is ambiguous, so resolve
+        # the routed experts' format per layer (_get_experts_quant_config) and feed THAT to the MoE.
+        # Eager fusion (gated by is_nvfp4) is conservatively disabled under MIXED_PRECISION.
         quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
-        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
-        assert quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION, (
-            "MIXED_PRECISION is ambiguous"
+        experts_quant_config = Glm4MoE._get_experts_quant_config(model_config, layer_idx)
+        self.is_nvfp4 = (
+            quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION
+            and quant_config.layer_quant_mode.has_nvfp4()
         )
 
         has_tp = mapping.has_tp()
@@ -543,7 +557,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 * self.num_shared_experts,
                 dtype=config.torch_dtype,
                 model_config=model_config,
-                override_quant_config=quant_config,
+                override_quant_config=experts_quant_config,
                 aux_stream_dict=aux_stream_dict,
                 layer_idx=layer_idx,
             )
