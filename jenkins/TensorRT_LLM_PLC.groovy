@@ -323,6 +323,7 @@ def pulseScanContainer(llmRepo, ref) {
 def processScanResults(ref) {
     container("cpu") {
         def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-scan/posting"
+        def ELASTICSEARCH_PREAPPROVED_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-pre-approve/posting"
         def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
         def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
         def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
@@ -338,6 +339,7 @@ def processScanResults(ref) {
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             withEnv([
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
                 "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
                 "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
@@ -375,6 +377,9 @@ def processScanResults(ref) {
                     if (result.needs_manual_review) {
                         needsManualReview = true
                         manualReviewUrl = pipelineUrl
+                        def candidates = result.preapproved_candidates ?: []
+                        writeFile file: '/tmp/preapproved_candidates.json',
+                                  text: groovy.json.JsonOutput.toJson(candidates)
                     }
                     if (result.detected_licenses) {
                         def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17, is_nvidia_proprietary: 17]
@@ -523,6 +528,20 @@ pipeline {
                         )
                     }
                     manuallyApproved = true
+                    container("cpu") {
+                        def ELASTICSEARCH_PREAPPROVED_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-pre-approve/posting"
+                        def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+                        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
+                        def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
+                        withEnv([
+                            "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
+                            "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
+                            "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                            "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
+                        ]) {
+                            sh "venv/bin/python /tmp/pulse_in_pipeline_scanning/submit_preapproved_candidates.py /tmp/preapproved_candidates.json"
+                        }
+                    }
                 }
             }
         }

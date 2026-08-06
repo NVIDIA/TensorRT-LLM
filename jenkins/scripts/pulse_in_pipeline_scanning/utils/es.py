@@ -10,6 +10,7 @@ from elasticsearch import Elasticsearch, RequestsHttpConnection
 ES_QUERY_URL = os.environ.get("TRTLLM_ES_QUERY_URL")
 ES_INDEX_BASE = os.environ.get("TRTLLM_ES_INDEX_BASE") or ""
 ES_INDEX_PREAPPROVED_BASE = os.environ.get("TRTLLM_ES_INDEX_PREAPPROVED_BASE") or ""
+ES_PREAPPROVED_POST_URL = os.environ.get("TRTLLM_ES_PREAPPROVED_POST_URL", "")
 
 if not ES_QUERY_URL:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_QUERY_URL' is not set!")
@@ -54,27 +55,37 @@ def es_post(url, documents):
     return indexed, errors
 
 
-def get_latest_license_preapproved_container_deps(scan_type: str):
-    data = ES_CLIENT.search(
-        index=ES_INDEX_PREAPPROVED_BASE + "-*",
-        body={
-            "size": 1,
-            "sort": [{"ts_created": "desc"}],
-            "query": {
-                "bool": {
-                    "should": [
-                        {"match": {"s_scan_type": scan_type}},
-                    ],
-                    "minimum_should_match": 1,
-                }
-            },
-            "_source": ["nested_preapproved_deps"],
-        },
-    )
-    data_source = data["hits"]["hits"][0]["_source"]
-    if not data_source:
-        return []
-    return data_source["nested_preapproved_deps"]
+def get_preapproved_deps(scan_type: str) -> list[dict]:
+    """Return all preapproved dependency records for the given scan type.
+
+    Each record is an individual ES document with fields s_package_name,
+    s_package_version, and s_package_type. Uses search_after pagination to
+    handle arbitrarily large result sets.
+    """
+    PAGE_SIZE = 1000
+    query = {"bool": {"filter": [{"term": {"s_scan_type": scan_type}}]}}
+    source = ["s_package_name", "s_package_version", "s_package_type"]
+    sort = [{"s_package_name": "asc"}, {"_id": "asc"}]
+
+    results = []
+    search_after = None
+    while True:
+        body = {"size": PAGE_SIZE, "query": query, "_source": source, "sort": sort}
+        if search_after:
+            body["search_after"] = search_after
+        try:
+            resp = ES_CLIENT.search(index=ES_INDEX_PREAPPROVED_BASE + "-*", body=body)
+        except Exception as exc:
+            print(f"Failed to query preapproved deps for {scan_type}: {exc}", file=sys.stderr)
+            break
+        hits = resp["hits"]["hits"]
+        if not hits:
+            break
+        results.extend(hit["_source"] for hit in hits)
+        if len(hits) < PAGE_SIZE:
+            break
+        search_after = hits[-1]["sort"]
+    return results
 
 
 def get_triaged_deps(scan_type: str, branch: str, container: str = "") -> dict:
@@ -141,6 +152,56 @@ def save_triage_records(
     _, errors = es_post(post_url, docs)
     if errors:
         print(f"Failed to save some triage records for {scan_type}", file=sys.stderr)
+
+
+def post_preapproved_deps(risk_docs: list[dict], fallback_package_type: str | None = None) -> bool:
+    """POST each risk doc as an individual preapproved record to the preapproved index.
+
+    Reads s_type, s_package_name, s_package_version, and s_package_type from each doc.
+    When s_package_type is absent, fallback_package_type is used (e.g. "pypi" for source code).
+    Returns True if all records were indexed successfully.
+    """
+    if not ES_PREAPPROVED_POST_URL:
+        print(
+            "TRTLLM_ES_PREAPPROVED_POST_URL not set, skipping preapproved indexing",
+            file=sys.stderr,
+        )
+        return False
+    ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    all_ok = True
+    for doc in risk_docs:
+        record = {
+            "ts_created": ts,
+            "s_scan_type": doc.get("s_type"),
+            "s_package_name": doc.get("s_package_name"),
+            "s_package_version": doc.get("s_package_version") or None,
+            "s_package_type": doc.get("s_package_type") or fallback_package_type or None,
+        }
+        try:
+            resp = requests.post(
+                ES_PREAPPROVED_POST_URL.rstrip("/"),
+                data=json.dumps(record),
+                headers={"Content-Type": "application/json"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            outcome = result.get("status", "").lower()
+            if outcome not in ("created", "updated"):
+                print(
+                    f"Unexpected preapproved result for {record['s_package_name']}: {outcome}",
+                    file=sys.stderr,
+                )
+                all_ok = False
+            else:
+                print(f"Preapproved indexed: {record['s_package_name']} -> {outcome}")
+        except Exception as exc:
+            print(
+                f"Failed to index preapproved dep {record['s_package_name']}: {exc}",
+                file=sys.stderr,
+            )
+            all_ok = False
+    return all_ok
 
 
 def get_dashboard_url(build_number, branch):

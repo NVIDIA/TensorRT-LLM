@@ -68,6 +68,30 @@ SUBMIT_KWARG = {
 }
 
 
+def _risks_to_preapproved_candidates(
+    risks: list, scan_type: str, fallback_package_type: str | None = None
+) -> list:
+    """Extract preapproved index records from risk docs, deduplicating by (name, type)."""
+    seen = set()
+    candidates = []
+    for doc in risks:
+        name = doc.get("s_package_name")
+        pkg_type = doc.get("s_package_type") or fallback_package_type
+        key = (name, scan_type, pkg_type)
+        if key in seen or not name:
+            continue
+        seen.add(key)
+        candidates.append(
+            {
+                "scan_type": scan_type,
+                "package_name": name,
+                "package_version": doc.get("s_package_version"),
+                "package_type": pkg_type,
+            }
+        )
+    return candidates
+
+
 def _license_docs_to_entries(docs: list, scan_type: str, license_info: dict | None = None) -> list:
     """Convert ES risk docs to output entries with dependency_name, license, is_permissive."""
     license_info = license_info or {}
@@ -91,6 +115,7 @@ def _license_docs_to_entries(docs: list, scan_type: str, license_info: dict | No
 def process_result():
     RISKY_DEPENDENCIES = []
     detected_licenses = []
+    preapproved_candidates = []
 
     if not args.skip_source_code:
         if args.scan_mode != "release":
@@ -115,6 +140,11 @@ def process_result():
                 source_licenses, "source_code", source_license_info
             )
             detected_licenses.extend(source_entries)
+            preapproved_candidates.extend(
+                _risks_to_preapproved_candidates(
+                    source_licenses, "source_code_license", fallback_package_type="pypi"
+                )
+            )
             non_permissive = [e for e in source_entries if not e["is_permissive"]]
             if non_permissive:
                 RISKY_DEPENDENCIES.append(
@@ -159,6 +189,12 @@ def process_result():
             arm64_container_licenses, "container_arm64", arm64_license_info
         )
         detected_licenses.extend(container_license_entries)
+        preapproved_candidates.extend(
+            _risks_to_preapproved_candidates(amd64_container_licenses, "container_license")
+        )
+        preapproved_candidates.extend(
+            _risks_to_preapproved_candidates(arm64_container_licenses, "container_license")
+        )
         non_permissive_container = [e for e in container_license_entries if not e["is_permissive"]]
         if non_permissive_container:
             RISKY_DEPENDENCIES.append(
@@ -180,6 +216,7 @@ def process_result():
         }
         if args.scan_mode == "release" and detected_licenses:
             result["needs_manual_review"] = True
+            result["preapproved_candidates"] = preapproved_candidates
         return result
     else:
         return {"status": "success"}
