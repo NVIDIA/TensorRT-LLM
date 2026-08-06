@@ -64,10 +64,11 @@ from _torch.modules.moe.moe_test_utils import (
     skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
-from _torch.modules.moe.quantize_utils import get_test_quant_params
+from _torch.modules.moe.quantize_utils import NVFP4RefMLPFusedMoE, get_test_quant_params
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import check_accuracy as check_tensor_accuracy
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
@@ -1570,6 +1571,56 @@ def test_configurable_moe_single_gpu(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
     )
+
+
+def test_cutedsl_nvfp4_llama4_routing_accuracy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard the pre-SwiGLU BF16 boundary with a compact high-top-k case."""
+    model_config = MoeModelConfig(32, 8, 4096, 2048)
+    skip_reason = get_quick_skip_reason(
+        backend_type=MoeBackendType.CUTEDSL,
+        quant_algo=QuantAlgo.NVFP4,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        routing_method_cls=Llama4RenormalizeMoeRoutingMethod,
+        seq_len=1,
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        torch.bfloat16,
+    )
+
+    strict_check_called = False
+
+    def strict_check_accuracy(
+        _self: NVFP4RefMLPFusedMoE,
+        output: torch.Tensor,
+        ref_output: torch.Tensor,
+    ) -> None:
+        nonlocal strict_check_called
+        strict_check_called = True
+        # The global NVFP4 tolerance would hide this regression. With the fixed
+        # seed, this compact case has about 1.4% mismatch without the BF16
+        # boundary and well below 1% with it, so require fewer than 1% here.
+        check_tensor_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.99)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(NVFP4RefMLPFusedMoE, "check_accuracy", strict_check_accuracy)
+        _test_moe_worker(
+            moe_backend=MoeBackendType.CUTEDSL.value,
+            dtype=torch.bfloat16,
+            quant_algo=QuantAlgo.NVFP4,
+            model_config=model_config,
+            seq_len=1,
+            enable_autotune=True,
+            routing_method_cls=Llama4RenormalizeMoeRoutingMethod,
+        )
+
+    assert strict_check_called
 
 
 # ============================================================================

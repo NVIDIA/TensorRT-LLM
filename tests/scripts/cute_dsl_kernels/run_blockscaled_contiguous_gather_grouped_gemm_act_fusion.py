@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -733,6 +733,10 @@ def run(
             gate_result = gemm_result[
                 0, :, n_block + interleave_granularity : n_block + 2 * interleave_granularity
             ]
+
+            if c_dtype == cutlass.Float4E2M1FN:
+                up_result = up_result.to(torch.bfloat16).to(torch.float32)
+                gate_result = gate_result.to(torch.bfloat16).to(torch.float32)
 
             # SwiGLU clamp
             if swiglu_limit != float("inf"):
