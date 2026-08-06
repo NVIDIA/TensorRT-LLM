@@ -3347,10 +3347,10 @@ class PyExecutor:
         decision. If one rank cannot allocate its dummy, peers that succeeded
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
-        """
-        if not self._enable_dsv4_adp_dummy_fixes:
-            return
 
+        Only paths that register a pending dummy are affected; the others leave
+        ``_pending_adp_dummy_request`` unset and no-op here.
+        """
         dummy_request = self._pending_adp_dummy_request
         self._pending_adp_dummy_request = None
         if dummy_request is None or can_queue:
@@ -6058,10 +6058,10 @@ class PyExecutor:
         dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
         scheduled_batch.generation_requests.append(dummy_request)
-        if self._enable_dsv4_adp_dummy_fixes:
-            # Let `_finalize_adp_dummy_allocation` roll this back if the fleet
-            # still cannot queue.
-            self._pending_adp_dummy_request = dummy_request
+        # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
+        # cannot queue: no forward runs then, so the usual dummy teardown in
+        # `_handle_responses` is not reached this iteration.
+        self._pending_adp_dummy_request = dummy_request
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):

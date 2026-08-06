@@ -1848,6 +1848,45 @@ def test_pad_empty_batch_degrades_on_allocation_error(error):
     assert len(stub.active_requests) == 1
 
 
+@pytest.mark.parametrize("enable_dsv4_adp_dummy_fixes", [False, True])
+def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
+    enable_dsv4_adp_dummy_fixes,
+):
+    # can_queue=False skips the forward, so the usual dummy teardown in
+    # _handle_responses is not reached. Rollback must not depend on the model.
+    stub, scheduled_batch = _unfittable_rank(
+        enable_dsv4_adp_dummy_fixes=enable_dsv4_adp_dummy_fixes
+    )
+    active_request = stub.active_requests[0]
+    spec_resource_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+
+    _run_pad_empty(stub, scheduled_batch)
+    dummy = stub._pending_adp_dummy_request
+    assert dummy is not None
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, False)
+
+    assert stub.active_requests == [active_request]
+    assert stub._pending_adp_dummy_request is None
+    spec_resource_manager.free_resources.assert_called_once_with(dummy)
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+
+
+def test_pad_empty_batch_dummy_kept_when_fleet_can_queue():
+    # Committed dummies are terminated after the forward by _handle_responses.
+    stub, scheduled_batch = _unfittable_rank(enable_dsv4_adp_dummy_fixes=False)
+
+    _run_pad_empty(stub, scheduled_batch)
+    dummy = stub._pending_adp_dummy_request
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, True)
+
+    assert dummy in stub.active_requests
+    assert stub._pending_adp_dummy_request is None
+    stub.kv_cache_manager.free_resources.assert_not_called()
+
+
 def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
     # The dummy joins after scheduling, so its capacity was never grown.
     stub, scheduled_batch = _unfittable_rank()
