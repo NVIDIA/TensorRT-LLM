@@ -167,11 +167,12 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
 # Identity-RoPE table positions for the MLA backends. K3 is NoPE (the table
-# holds cos=1/sin=0 and the rope kernels are skipped), but the backend still
-# allocates a table of this size per instance; the checkpoint's 1M
-# max_position_embeddings would cost ~512MB per backend, so cap it.
+# holds cos=1/sin=0), but the chunked-context path indexes the table by
+# absolute position, so it must cover max_position_embeddings (~512MB per
+# backend for the 1M-position checkpoint); a smaller table is read out of
+# bounds. KIMI_K3_MLA_MAX_POSITIONS overrides the size for short-context
+# deployments.
 _KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
-_KIMI_K3_MLA_MAX_POSITIONS_DEFAULT = 65536
 _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
     ".self_attn.mixer.k_b_proj_trans",
     ".self_attn.mixer.v_b_proj",
@@ -1833,9 +1834,11 @@ class KimiMLARuntime(nn.Module):
 
         from ..modules.kimi_k3_mla import KimiK3MLAAttention
 
-        max_positions = min(
-            cfg.max_position_embeddings,
-            int(os.environ.get(_KIMI_K3_MLA_MAX_POSITIONS_ENV, _KIMI_K3_MLA_MAX_POSITIONS_DEFAULT)),
+        max_positions = int(
+            os.environ.get(
+                _KIMI_K3_MLA_MAX_POSITIONS_ENV,
+                cfg.max_position_embeddings,
+            )
         )
         self.layer_idx = layer_idx
         # The trtllm-gen MLA generation kernels group query heads per CTA and
