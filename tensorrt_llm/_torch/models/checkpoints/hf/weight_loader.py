@@ -16,9 +16,10 @@ import glob
 import multiprocessing
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List
+from typing import Any, Callable, List
 
 import psutil
 import safetensors
@@ -43,6 +44,12 @@ _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 1
 _WEIGHT_CACHE_LOCK = threading.Lock()
 _WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
+
+# Prefetch reads use one bounded buffer per in-flight file (see
+# _prefetch_one_file) and emit a progress log at a fixed cadence so that a
+# slow prefetch produces observable output instead of minutes of silence.
+_PREFETCH_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
+_PREFETCH_LOG_INTERVAL_SEC = 60.0
 
 
 @register_checkpoint_weight_loader("MX")
@@ -331,11 +338,24 @@ class HfWeightLoader(BaseWeightLoader):
         finally:
             return part_weights
 
-    def _prefetch_one_file(self, file_name):
+    def _prefetch_one_file(
+            self,
+            file_name: str,
+            report_progress: Callable[[int], None] | None = None) -> None:
         if os.path.exists(file_name):
             logger.info(f"Prefetching {file_name} to memory...")
+            # Read in fixed-size chunks into a reusable buffer instead of one
+            # whole-file read: a whole-file read pins the entire file in
+            # anonymous memory until it completes, and with up to 16
+            # concurrent multi-GB files per local rank, slow storage lets
+            # those buffers accumulate into hundreds of GB across the local
+            # ranks, which can OOM the host. Chunked reads warm the OS page
+            # cache identically with a constant per-thread footprint.
+            buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
             with open(file_name, 'rb') as f:
-                f.read()
+                while num_read := f.readinto(buffer):
+                    if report_progress is not None:
+                        report_progress(num_read)
             logger.info(f"Finished prefetching {file_name}.")
 
     def prefetch_files(self, file_names: List[str]):
@@ -349,7 +369,36 @@ class HfWeightLoader(BaseWeightLoader):
         if len(local_file_names) == 0:
             return
 
+        total_size = 0
+        for file_name in local_file_names:
+            try:
+                total_size += os.path.getsize(file_name)
+            except OSError:
+                pass  # Missing files are tolerated, as in _prefetch_one_file.
+        progress_lock = threading.Lock()
+        prefetched_size = 0
+        last_log_time = time.monotonic()
+
+        def report_progress(num_bytes: int) -> None:
+            # Periodic heartbeat: on slow storage, prefetching can run for
+            # tens of minutes without completing a single file, and log
+            # silence gets the process killed by output-stall watchdogs.
+            nonlocal prefetched_size, last_log_time
+            with progress_lock:
+                prefetched_size += num_bytes
+                now = time.monotonic()
+                if now - last_log_time < _PREFETCH_LOG_INTERVAL_SEC:
+                    return
+                last_log_time = now
+                current_size = prefetched_size
+            logger.info(
+                f"Prefetch progress: {current_size / (1024**3):.2f}GB / "
+                f"{total_size / (1024**3):.2f}GB (local rank).")
+
         max_workers = min(multiprocessing.cpu_count() * 2, 16,
                           len(local_file_names))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            list(executor.map(self._prefetch_one_file, local_file_names))
+            list(
+                executor.map(
+                    lambda file_name: self._prefetch_one_file(
+                        file_name, report_progress), local_file_names))

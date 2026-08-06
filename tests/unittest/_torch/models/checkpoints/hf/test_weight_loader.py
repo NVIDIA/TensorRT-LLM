@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
 from unittest import mock
 
 import pytest
@@ -282,3 +298,50 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
 
     assert sequences["miss"] == ["allreduce", "barrier"]
     assert sequences["hit"] == sequences["miss"]  # divergence-safe ordering
+
+
+def test_prefetch_one_file_reads_full_file_in_bounded_chunks(tmp_path, monkeypatch):
+    # Prefetch must never hold more than one chunk per thread in memory:
+    # whole-file reads pinned up to hundreds of GB across ranks on slow
+    # storage and OOMed the host. Verify the full file is consumed strictly
+    # chunk by chunk, including a trailing partial chunk.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    file = tmp_path / "model.safetensors"
+    payload = os.urandom(3 * 1024 + 137)  # not a multiple of the chunk size
+    file.write_bytes(payload)
+
+    reported: list[int] = []
+    HfWeightLoader()._prefetch_one_file(str(file), report_progress=reported.append)
+
+    assert sum(reported) == len(payload)
+    assert max(reported) <= 1024
+
+
+def test_prefetch_one_file_missing_file_is_noop():
+    # Missing files must be silently skipped (no exception).
+    HfWeightLoader()._prefetch_one_file("/nonexistent/model.safetensors")
+
+
+def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
+    # The heartbeat is what keeps a slow prefetch observable (and alive under
+    # output-stall watchdogs); with the log interval forced to zero it must
+    # fire for every chunk.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    monkeypatch.setattr(wl, "_PREFETCH_LOG_INTERVAL_SEC", 0.0)
+    files = []
+    for i in range(3):
+        file = tmp_path / f"model-0000{i}-of-00003.safetensors"
+        file.write_bytes(os.urandom(4 * 1024))
+        files.append(str(file))
+
+    with mock.patch.object(wl.logger, "info") as info:
+        HfWeightLoader().prefetch_files(files)
+
+    progress_logs = [call for call in info.call_args_list if "Prefetch progress" in str(call)]
+    # Every chunk logs when the interval is zero: 3 files x 4 KB at a 1 KB
+    # chunk size means at least 12 heartbeats (short reads only add more).
+    assert len(progress_logs) >= 12
