@@ -3463,7 +3463,7 @@ def runLLMDocBuild(pipeline, config)
             script: """
                 cd ${LLM_ROOT}/docs && \
                 pip3 install -r requirements.txt && \
-                pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
+                pip3 install sphinx==7.4.7 && \
                 doxygen Doxygen && \
                 make html && \
                 cd build/html && \
