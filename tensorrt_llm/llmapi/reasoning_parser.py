@@ -226,6 +226,15 @@ class DeepSeekR1Parser(BaseReasoningParser):
         self.reasoning_end = "</think>"
         self.reasoning_at_start = reasoning_at_start
         self.in_reasoning = self.reasoning_at_start
+        self._entered_reasoning = self.reasoning_at_start
+        thinking_disabled = (isinstance(chat_template_kwargs, dict)
+                             and chat_template_kwargs.get("enable_thinking")
+                             is False)
+        # Hold pre-<think> text for qwen3-style parsers so stream matches
+        # parse() drop of the preamble (#17296). Thinking-disabled Nemotron
+        # paths still stream plain content live.
+        self._hold_preamble = (not reasoning_at_start) and (
+            not thinking_disabled)
         self._buffer = ""
 
     def _create_reasoning_end_result(self, content: str,
@@ -255,10 +264,14 @@ class DeepSeekR1Parser(BaseReasoningParser):
                                      reasoning_content=reasoning_content)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        # When ``_hold_preamble`` is set (qwen3-style), text before the first
+        # ``<think>`` is withheld and dropped when the tag arrives (#17296),
+        # matching ``parse()``. After a block ends, later text / ``<think>``
+        # blocks stream normally (interleaved thinking). Thinking-disabled
+        # paths keep live content emission without a start tag.
         self._buffer += delta_text
         delta_text = self._buffer
         reasoning_content = None
-        content = None
         if (self.reasoning_start.startswith(delta_text)
                 or self.reasoning_end.startswith(delta_text)):
             # waiting for more text to determine if it's a reasoning start or end tag
@@ -267,10 +280,15 @@ class DeepSeekR1Parser(BaseReasoningParser):
         if not self.in_reasoning:
             begin_idx = delta_text.find(self.reasoning_start)
             if begin_idx == -1:
+                if self._hold_preamble and not self._entered_reasoning:
+                    self._buffer = delta_text
+                    return ReasoningParserResult()
                 self._buffer = ""
                 return ReasoningParserResult(content=delta_text)
+            # Start tag found: drop text before it on the first open only
+            # (same as ``parse()`` for reasoning_at_start=False).
             self.in_reasoning = True
-            # set reasoning_content, will be processed by the next block
+            self._entered_reasoning = True
             reasoning_content = delta_text[begin_idx +
                                            len(self.reasoning_start):]
 
@@ -298,26 +316,29 @@ class DeepSeekR1Parser(BaseReasoningParser):
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
     def finish(self) -> ReasoningParserResult:
-        """Flush text withheld by `parse_delta` when the stream ends.
+        """Flush text withheld by ``parse_delta`` when the stream ends.
 
-        `parse_delta` holds back a trailing fragment that could still grow
-        into a `<think>` / `</think>` tag. If the stream ends while such a
-        fragment is buffered - because the response was truncated mid-tag, or
-        simply ends with a literal `<` - the fragment is ordinary model output
-        and must still be emitted, otherwise it is silently dropped. The
-        buffered text is attributed to the block it was withheld in: inside a
-        reasoning block it is reasoning content, otherwise it is visible
-        content.
-
-        A buffer holding exactly a complete tag is a delimiter rather than
-        model output, so it is discarded as it would have been had more text
-        followed.
+        Trailing tag prefixes are ordinary model output once the stream ends.
+        A complete end tag while inside reasoning is a delimiter. A complete
+        start tag while not inside reasoning opens an empty block. A complete
+        start tag while already inside reasoning is kept as literal text
+        (``parse()`` parity for deepseek-r1 on ``"a<think>"``).
         """
         remaining = self._buffer
         self._buffer = ""
-        if not remaining or remaining in (self.reasoning_start,
-                                          self.reasoning_end):
+        if not remaining:
             return ReasoningParserResult()
+        if remaining == self.reasoning_end and self.in_reasoning:
+            self.in_reasoning = False
+            return ReasoningParserResult()
+        if remaining == self.reasoning_start and not self.in_reasoning:
+            self.in_reasoning = True
+            self._entered_reasoning = True
+            return ReasoningParserResult()
+        if remaining == self.reasoning_start and self.in_reasoning:
+            return ReasoningParserResult(reasoning_content=remaining)
+        if remaining == self.reasoning_end and not self.in_reasoning:
+            return ReasoningParserResult(content=remaining)
         if self.in_reasoning:
             return ReasoningParserResult(reasoning_content=remaining)
         return ReasoningParserResult(content=remaining)
