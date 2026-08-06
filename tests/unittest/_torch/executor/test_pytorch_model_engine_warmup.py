@@ -308,7 +308,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
             method = MXFP8LinearMethod()
-            self.assertTrue(method.needs_native_autotune)
+            self.assertFalse(method.needs_native_autotune)
 
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=True),

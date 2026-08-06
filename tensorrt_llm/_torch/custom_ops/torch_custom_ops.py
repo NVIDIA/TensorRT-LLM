@@ -552,6 +552,8 @@ def _(
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
 
+# The 8K-input workload produces one-, two-, and three/four-request context
+# batches in these bands; their endpoints are validated on SM100 and SM103.
 _MXFP8_LARGE_M_BUCKETS = (8192, 16384, 32768)
 _MXFP8_LARGE_M_BANDS = ((6553, 8192), (13106, 16384), (19659, 32768))
 _MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"

@@ -3096,7 +3096,11 @@ class MXFP8LinearMethod(LinearMethodBase):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
-        self.use_native_autotuner = True
+        # Only PyTorchModelEngine owns the startup tuning lifecycle. Keep
+        # standalone modules and engine paths that skip warmup (for example,
+        # Helix CP) on the direct native op instead of leaving Python
+        # AutoTuner dispatch armed indefinitely.
+        self.use_native_autotuner = False
         self._native_autotuned = False
         if self.backend not in ("trtllm", "flashinfer", "auto"):
             raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
@@ -3160,6 +3164,9 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def mark_native_autotuned(self) -> None:
         self._native_autotuned = True
+
+    def enable_native_autotune(self) -> None:
+        self.use_native_autotuner = True
 
     def disable_native_autotune(self) -> None:
         self.use_native_autotuner = False

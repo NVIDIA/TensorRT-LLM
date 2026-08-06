@@ -69,7 +69,7 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     method = get_quant_method(qc)
     assert isinstance(method, MXFP8LinearMethod)
     assert method.backend == "trtllm"
-    assert method.use_native_autotuner
+    assert not method.use_native_autotuner
 
 
 def _mock_mxfp8_ops(monkeypatch):
@@ -164,11 +164,14 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     method = MXFP8LinearMethod()
     assert method.enable_flashinfer_auto()
 
-    assert method.apply(module, activation, bias=None) is autotuned_output
-    autotuned_gemm.assert_called_once()
-    native_gemm.assert_not_called()
+    assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+    autotuned_gemm.assert_not_called()
     mm_mxfp8.assert_not_called()
 
+    method.enable_native_autotune()
+    assert method.apply(module, activation, bias=None) is autotuned_output
+    autotuned_gemm.assert_called_once()
     method.mark_native_autotuned()
     method.mark_flashinfer_autotuned()
     with flashinfer_mxfp8_decode_graph_capture():
@@ -177,7 +180,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
 
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
-    native_gemm.assert_called_once()
+    assert native_gemm.call_count == 2
 
 
 def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
@@ -282,17 +285,23 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
 
     method = MXFP8LinearMethod()
+    assert not method.use_native_autotuner
+    assert not method.needs_native_autotune
+    assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+    autotuned_gemm.assert_not_called()
+
+    method.enable_native_autotune()
     assert method.use_native_autotuner
     assert method.needs_native_autotune
     assert method.apply(module, activation, bias=None) is autotuned_output
     autotuned_gemm.assert_called_once()
-    native_gemm.assert_not_called()
 
     method.mark_native_autotuned()
     assert not method.needs_native_autotune
     assert method.apply(module, activation, bias=None) is native_output
     autotuned_gemm.assert_called_once()
-    native_gemm.assert_called_once()
+    assert native_gemm.call_count == 2
 
 
 def test_mxfp8_native_autotuner_syncs_profiles():

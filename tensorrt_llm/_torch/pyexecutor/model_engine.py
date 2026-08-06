@@ -1570,6 +1570,12 @@ class PyTorchModelEngine(ModelEngine):
                 method.disable_flashinfer_auto()
             return
 
+        # This engine owns startup warmup, so it explicitly opts its MXFP8
+        # methods into native tuning. Standalone modules and engine paths that
+        # skip this warmup remain on the direct native op.
+        for method in mxfp8_methods:
+            method.enable_native_autotune()
+
         # Native and FlashInfer tuning are independent. Capture native
         # eligibility before enabling graph-only FlashInfer dispatch.
         native_mxfp8_methods = [

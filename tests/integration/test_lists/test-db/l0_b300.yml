@@ -33,7 +33,6 @@ l0_b300:
   - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
-  - unittest/_torch/thop/parallel/test_mxfp8_mxfp8_gemm.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py

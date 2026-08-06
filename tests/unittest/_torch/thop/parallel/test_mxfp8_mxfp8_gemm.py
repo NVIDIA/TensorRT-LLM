@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from utils.util import getSMVersion
 
 import tensorrt_llm._torch.custom_ops.torch_custom_ops  # noqa: F401
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import _map_to_mxfp8_large_m_bucket
 
 
 @pytest.mark.skipif(
@@ -150,5 +151,40 @@ def test_mxfp8_mxfp8_native_tactic_cache():
             -1,
         )
         torch.testing.assert_close(cached_fallback_output, explicit_fallback_output, rtol=0, atol=0)
+    finally:
+        runner.clear_tactic_cache()
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="MXFP8 tactic cache requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "lower_bound,upper_bound,bucket",
+    [
+        (6553, 8192, 8192),
+        (13106, 16384, 16384),
+        (19659, 32768, 32768),
+    ],
+)
+def test_mxfp8_native_tactic_cache_large_m_bucket_boundaries(
+    lower_bound: int, upper_bound: int, bucket: int
+):
+    """C++ cache bucketing stays aligned with the Python tuning profiles."""
+    n, k = 9216, 6144
+    runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
+
+    try:
+        runner.clear_tactic_cache()
+        runner.register_tactic(bucket, n, k, -1)
+
+        assert _map_to_mxfp8_large_m_bucket(lower_bound) == bucket
+        assert _map_to_mxfp8_large_m_bucket(upper_bound) == bucket
+        assert runner.get_cached_tactic(lower_bound, n, k) == -1
+        assert runner.get_cached_tactic(upper_bound, n, k) == -1
+        assert _map_to_mxfp8_large_m_bucket(lower_bound - 1) == lower_bound - 1
+        assert _map_to_mxfp8_large_m_bucket(upper_bound + 1) == upper_bound + 1
+        assert runner.get_cached_tactic(lower_bound - 1, n, k) == -2
+        assert runner.get_cached_tactic(upper_bound + 1, n, k) == -2
     finally:
         runner.clear_tactic_cache()
