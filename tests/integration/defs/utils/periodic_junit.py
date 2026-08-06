@@ -119,7 +119,13 @@ class PeriodicJUnitXML:
         # plugin, so arming/cancelling it here could clobber (or be clobbered by)
         # theirs. Our own timer owns no shared state.
         self._hang_timer: Optional[threading.Timer] = None
-        self._hang_lock = threading.Lock()
+        # Re-entrant on purpose: the SIGINT/SIGTERM handler runs on the main thread at
+        # an arbitrary bytecode boundary and calls _cancel_hang_timer(). If the signal
+        # lands while that same thread already holds this lock (inside
+        # _cancel_hang_timer() or the arming block of pytest_runtest_setup()), a plain
+        # Lock would deadlock the handler against itself and the process would never
+        # save results nor terminate.
+        self._hang_lock = threading.RLock()
 
         self.completed_tests = 0
         self.last_save_time = time.time()
