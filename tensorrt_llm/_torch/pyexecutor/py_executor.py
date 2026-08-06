@@ -897,6 +897,11 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        # Guards against a control_action() body entering control_action()
+        # again. The two events above are shared, single-slot state, so a
+        # nested entry would clear the outer action's barrier and let the
+        # executor loop resume while the outer body is still running.
+        self._control_action_in_progress = False
         self._active_control_id: Optional[str] = None
         self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
         self._sleep_wakeup_pending_abort_lock = threading.Lock()
@@ -4456,7 +4461,20 @@ class PyExecutor:
                      In-flight requests keep their KV caches across the
                      action; same-batch requests fetched after the sentinel
                      are parked until the ``with`` block exits.
+
+        Not re-entrant: ``control_request_barrier`` and ``control_action_done``
+        are single-slot events, so a nested entry would clear the outer
+        action's barrier and release the executor loop while the outer body is
+        still running. Nesting is rejected rather than allowed to corrupt that
+        handshake.
         """
+
+        if self._control_action_in_progress:
+            raise RuntimeError(
+                "control_action() is already in progress; it is not re-entrant. "
+                "A control action must not invoke another control action - call "
+                "the undecorated operation instead (e.g. self.engine.<op>() "
+                "rather than the @control_action_decorator wrapper).")
 
         if self.dist.rank == 0:
             self.executor_request_queue.enqueue_control_request(
@@ -4464,9 +4482,11 @@ class PyExecutor:
 
         self.control_request_barrier.wait()
 
+        self._control_action_in_progress = True
         try:
             yield self
         finally:
+            self._control_action_in_progress = False
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
