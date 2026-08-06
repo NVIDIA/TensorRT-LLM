@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -756,6 +757,8 @@ def write_filtered_test_db(
     tests are kept (prevents silent skip from typo'd waive ids or granularity
     mismatch). The block itself is still kept either way.
     """
+    # Clear first: a leftover YAML from an earlier run would ship in the artifact.
+    shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     affected_stems = {stem for stem, _ in block_filters}

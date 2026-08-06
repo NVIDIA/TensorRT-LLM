@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import re
+import shutil
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -261,6 +262,8 @@ def write_coverage_test_db(
     src_dir: Path, out_dir: Path, removed: dict[tuple[str, int], set[str]]
 ) -> None:
     """Write narrowed YAMLs with removed entries dropped."""
+    # Clear first: a leftover YAML from an earlier run would ship in the artifact.
+    shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     for stem in sorted({stem for stem, _ in removed}):
         src = src_dir / f"{stem}.yml"

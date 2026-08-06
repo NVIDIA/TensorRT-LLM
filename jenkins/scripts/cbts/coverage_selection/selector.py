@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,6 +67,7 @@ class CoverageSelector:
         min_funcs: int = _MIN_FUNCS,
         untrusted_stage_markers: tuple[str, ...] = _UNTRUSTED_STAGE_MARKERS,
         no_data_policy: str = DEFAULT_NO_DATA_POLICY,
+        read_source: Callable[[str], str | None] | None = None,
     ) -> None:
         self.db = db
         self.repo_root = Path(repo_root)
@@ -75,6 +77,8 @@ class CoverageSelector:
         self._min_funcs = min_funcs
         self._untrusted_stage_markers = untrusted_stage_markers
         self._no_data_policy = no_data_policy
+        # Defaults to the checkout; callers explaining a past commit inject their own.
+        self._read_source = read_source or self._read_head
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -108,7 +112,7 @@ class CoverageSelector:
         for path in residual_files:
             cf = canon(path)
             diff = diffs.get(path) or ""
-            source = self._read_head(path)
+            source = self._read_source(path)
             if not diff.strip() or source is None:
                 # The API omits the patch for binary / renamed / oversized files, so
                 # which qualname changed is unknown; bound it as an import-time one.
@@ -164,9 +168,11 @@ class CoverageSelector:
     def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
         """Decide over residual files; ok=False for non-core, not-in-DB, or unbounded import-time changes."""
         for path in residual_files:
-            cf = canon(path)
-            if not (path.endswith(".py") and cf.startswith("tensorrt_llm/")):
+            # Gate on the repo path, not canon(): canon matches `tensorrt_llm/` anywhere,
+            # so cpp/tensorrt_llm/*.py would otherwise map onto the package namespace.
+            if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
                 return CoverageResult(ok=False, reason=f"non-core-Python residual file: {path}")
+            cf = canon(path)
             if not self.db.file_has_touch_rows(cf):
                 return CoverageResult(
                     ok=False, reason=f"zero-touch residual file (new/uninstrumented): {path}"

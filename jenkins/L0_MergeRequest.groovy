@@ -876,7 +876,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (coverageDb.path) {
             mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-build ${coverageDb.build}"
             if (coverageDb.commit) {
-                mainCmd += " --coverage-db-commit ${coverageDb.commit}"
+                mainCmd += " --coverage-db-commit '${coverageDb.commit}'"
             }
             if (coverageDb.lag != null) {
                 mainCmd += " --coverage-db-lag ${coverageDb.lag}"
