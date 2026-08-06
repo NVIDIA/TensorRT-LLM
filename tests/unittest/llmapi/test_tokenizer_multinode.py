@@ -9,6 +9,8 @@ import pytest
 
 from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer, load_hf_tokenizer
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_trust_remote_code_tokenizer_pickle_roundtrip_multinode():
     """nvbugs/5823783 regression.
