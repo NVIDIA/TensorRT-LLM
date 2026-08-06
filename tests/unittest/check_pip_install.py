@@ -1,8 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import os
 import subprocess
 import sys
 import sysconfig
+from pathlib import Path
+from zipfile import ZipFile
 
 import requests
 
@@ -12,6 +29,30 @@ import requests
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.llm_data import llm_models_root  # noqa: E402
+
+PRIMS_TS_DOCUMENTATION = {
+    "tensorrt_llm/_torch/attention_backend/prims_ts/README.md",
+    "tensorrt_llm/_torch/attention_backend/prims_ts/kernels/fmha_context/README.md",
+    "tensorrt_llm/_torch/attention_backend/prims_ts/kernels/fmha_decode/README.md",
+    "tensorrt_llm/_torch/attention_backend/prims_ts/kernels/mla_decode/README.md",
+}
+
+
+def verify_prims_ts_documentation() -> None:
+    """Verify that the built wheel contains the vendored PrimTS guides."""
+    wheel_files = sorted(Path.cwd().glob("tensorrt_llm-*.whl"))
+    if len(wheel_files) != 1:
+        raise RuntimeError(
+            f"Expected one TensorRT-LLM wheel, found {len(wheel_files)}: "
+            f"{wheel_files}")
+
+    with ZipFile(wheel_files[0]) as wheel:
+        missing_files = PRIMS_TS_DOCUMENTATION.difference(wheel.namelist())
+
+    if missing_files:
+        raise AssertionError(
+            "TensorRT-LLM wheel is missing vendored PrimTS documentation: "
+            f"{sorted(missing_files)}")
 
 
 def get_expected_license_files():
@@ -269,6 +310,7 @@ def test_pip_install(args):
     install_system_libs()
 
     download_wheel(args)
+    verify_prims_ts_documentation()
     install_tensorrt_llm()
 
     run_sanity_check()

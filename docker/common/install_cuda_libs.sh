@@ -1,20 +1,36 @@
 #!/bin/bash
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -ex
 
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
-CUDA_VER="13.2" # 13.2.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-06.html#rel-26-06
+CUDA_VER="13.3" # 13.3.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.22.0.52-1"
+CUDNN_VER="9.23.0.39-1"
+# NGC PyTorch 26.06 retains the CUDA 13.2 build of NCCL 2.30.4.
 NCCL_VER="2.30.4-1+cuda13.2"
-CUBLAS_VER="13.4.1.2-1"
+CUBLAS_VER="13.5.1.27-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.2.78-1"
-CUDA_RUNTIME="13.2.75-1"
-CUDA_DRIVER_VERSION="595.58.03-1.el8"
+NVRTC_VER="13.3.33-1"
+CUDA_RUNTIME="13.3.29-1"
+CUDA_DRIVER_VERSION="610.43.02-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -61,9 +77,10 @@ install_ubuntu_requirements() {
       apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
     fi
 
-    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
-    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
+    CUBLAS_PACKAGE="libcublas-${NVRTC_CUDA_VERSION}"
+    CUBLAS_DEV_PACKAGE="libcublas-dev-${NVRTC_CUDA_VERSION}"
 
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-13=${CUDNN_VER} \
@@ -71,8 +88,8 @@ install_ubuntu_requirements() {
         libcudnn9-headers-cuda-13=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
-        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
-        libcublas${CUBLAS_MAJOR_VER}-dev-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
+        ${CUBLAS_PACKAGE}=${CUBLAS_VER} \
+        ${CUBLAS_DEV_PACKAGE}=${CUBLAS_VER} \
         cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
 
     apt-get clean
@@ -103,8 +120,9 @@ install_ubuntu_requirements() {
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
-    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
     CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
+    CUBLAS_PACKAGE="libcublas-${CUBLAS_CUDA_VERSION}"
+    CUBLAS_DEV_PACKAGE="libcublas-devel-${CUBLAS_CUDA_VERSION}"
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
@@ -118,8 +136,8 @@ install_rockylinux_requirements() {
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
-        "libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}" \
-        "libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}"; do
+        "${CUBLAS_PACKAGE}-${CUBLAS_VER}.${ARCH1}" \
+        "${CUBLAS_DEV_PACKAGE}-${CUBLAS_VER}.${ARCH1}"; do
         wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
@@ -134,8 +152,8 @@ install_rockylinux_requirements() {
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
-        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm \
-        libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm
+        ${CUBLAS_PACKAGE}-${CUBLAS_VER}.${ARCH1}.rpm \
+        ${CUBLAS_DEV_PACKAGE}-${CUBLAS_VER}.${ARCH1}.rpm
 
     # Clean up
     rm -f *.rpm

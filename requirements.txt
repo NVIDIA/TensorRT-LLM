@@ -80,11 +80,9 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-# 4.6.1 rejects FlashAttention 4's sm100 split-KV kernel (TYPE_UNSTABLE_JOIN).
-nvidia-cutlass-dsl[cu13]==4.6.2; python_version >= "3.10" # required by Blackwell CuTe DSL kernels
+nvidia-cutlass-dsl[cu13]==4.7.0; python_version >= "3.10" # required by PrimTS task-scheduled kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
-# quack-kernels pins the CUTLASS DSL by equality, so bump the two together.
-quack-kernels==0.6.4; python_version >= "3.10" # required for MinimaxM3 MSA and FlashAttention 4
+quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; supports CUTLASS DSL 4.7
 jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr
