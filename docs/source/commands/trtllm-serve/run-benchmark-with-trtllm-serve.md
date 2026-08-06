@@ -160,9 +160,11 @@ The requested output length in synthetic benchmarks is a maximum generation
 budget, not a guarantee that every request will generate exactly that many
 tokens. A request can finish earlier if the model emits an EOS token, reaches a
 stop condition, or if the benchmark client/server applies stop-token handling.
-In that case, metrics such as `Output Sequence Length (tokens)` or `Total
-generated tokens` report the actual generated length, so the average and minimum
-can be lower than the configured output length.
+In that case, TensorRT LLM's `benchmark_serving.py` output reports the actual
+generated length as `Total generated tokens`, so the average and minimum can be
+lower than the configured output length. External clients can use different
+labels for the same concept, such as output sequence length; interpret those as
+actual generated tokens rather than the requested token budget.
 
 When benchmarking a fixed output sequence length, make sure EOS handling matches
 the methodology you want to measure. The `benchmark_serving.py` example above
