@@ -507,7 +507,8 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "Resolution bucket for action image sizing. Must be one of "
             f"{list(COSMOS3_ACTION_RESOLUTIONS)}. Inferred from domain_name preset when omitted."
         ),
-        range=(min(COSMOS3_ACTION_RESOLUTIONS), max(COSMOS3_ACTION_RESOLUTIONS)),
+        # No range: the buckets are not an interval, and validation stops at the
+        # literal check anyway.
     ),
     "view_point": ExtraParamSchema(
         type="Literal['ego_view', 'third_person_view', 'wrist_view', 'concat_view']",

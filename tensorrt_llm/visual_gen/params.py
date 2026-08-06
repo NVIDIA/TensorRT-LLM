@@ -186,6 +186,10 @@ def validate_visual_gen_params(
                         f"extra_params['{key}'] expected one of {list(literal_choices)}, "
                         f"got {value!r}"
                     )
+                # Terminal on purpose: membership in the literal set already
+                # decides the value, so the type, validator and range checks
+                # below cannot add anything. A literal spec that also declares
+                # one of those has a redundant declaration, not a skipped check.
                 continue
             # Type check
             expected_types = _TYPE_MAP.get(spec.type)
