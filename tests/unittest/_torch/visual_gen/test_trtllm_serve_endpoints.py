@@ -141,6 +141,7 @@ class MockVisualGen:
         generate_error: Optional[BaseException] = None,
         extra_param_specs: Optional[dict] = None,
         model: str = "test-model",
+        pipeline_class_name: Optional[str] = None,
     ):
         from types import SimpleNamespace
 
@@ -183,6 +184,7 @@ class MockVisualGen:
             },
             extra_param_specs=extra_param_specs
             or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
+            pipeline_class_name=pipeline_class_name,
         )
 
     def _maybe_batch(self, tensor, n):
@@ -709,14 +711,38 @@ class TestImageEdit:
     @pytest.mark.parametrize(
         ("model_id", "expected"),
         [
+            ("black-forest-labs/FLUX.2-dev", True),
             ("Qwen/Qwen-Image-Edit-2511", True),
             ("Qwen/Qwen-Image-Layered", True),
+            ("FLUX.2-dev", False),
             ("Qwen/Qwen-Image", False),
             (None, False),
         ],
     )
     def test_model_supports_image_edit(self, model_id, expected):
         assert _model_supports_image_edit(model_id) is expected
+
+    def test_local_path_flux2_image_edit_uses_pipeline_class(self, tmp_path, monkeypatch):
+        local_model = tmp_path / "FLUX.2-dev"
+        local_model.mkdir()
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model=str(local_model),
+            pipeline_class_name="Flux2Pipeline",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+        client = _create_server(gen, model_name=str(local_model))
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "Make it red",
+                "image": _b64_white_png_1x1(),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
 
     def test_image_edit_returns_not_implemented(self, image_client):
         """Valid request body short-circuits to 501 NotImplemented."""
