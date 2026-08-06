@@ -1307,6 +1307,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 )
                 self.domain_ids_validated = True
             T_action = action_latents.shape[1]
+            # Checked, not cast: bmm in DomainAwareLinear needs the latents to
+            # match the projection weights, and silently converting a whole
+            # stream every step would hide the misconfiguration that produced
+            # the mismatch.
+            if action_latents.dtype != self.action_proj_in.dtype:
+                raise ValueError(
+                    "Cosmos3 action latents must match the action projection dtype: "
+                    f"latents={action_latents.dtype}, projection={self.action_proj_in.dtype}."
+                )
             hidden_action = self.action_proj_in(
                 self.pack_action(action_latents), action_domain_ids_tensor
             )

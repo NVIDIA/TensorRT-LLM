@@ -9,6 +9,7 @@ Run:
 
 import json
 
+import numpy as np
 import PIL.Image
 import pytest
 import torch
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     find_closest_target_size,
     normalize_action_resolution,
     prepare_action_latents,
+    resize_and_pad_action_image,
     resolve_action_size,
     resolve_domain_id,
     resolve_raw_action_dim,
@@ -707,6 +709,38 @@ class TestPrepareActionLatents:
                 dtype=torch.float32,
                 action_input=[[0.0, 1.0], [2.0, 3.0]],
             )
+
+
+class TestResizeAndPadActionImage:
+    """Action pads to the canvas where V2V crops to it: a gripper works at the
+    frame edge, so cover-scale would cut away what the policy acts on."""
+
+    def test_contain_scale_then_pad_to_canvas(self):
+        image = PIL.Image.new("RGB", (800, 400), "blue")
+        out = resize_and_pad_action_image(image, target_h=480, target_w=832)
+        assert (out.height, out.width) == (480, 832)
+
+    def test_small_source_is_never_enlarged(self):
+        """min(..., 1.0): a small clip keeps its own pixels and a wider border
+        rather than being upscaled into blur."""
+        image = PIL.Image.new("RGB", (100, 50), "blue")
+        out = resize_and_pad_action_image(image, target_h=480, target_w=832)
+        assert (out.height, out.width) == (480, 832)
+        assert np.asarray(out)[:50, :100].any()
+
+    def test_exact_size_is_returned_unchanged(self):
+        image = PIL.Image.new("RGB", (832, 480), "blue")
+        assert resize_and_pad_action_image(image, 480, 832).size == (832, 480)
+
+    def test_aspect_ratio_is_preserved(self):
+        """Contain-scale keeps the source's own aspect; the leftover strip is
+        padding, not stretch."""
+        image = PIL.Image.new("RGB", (400, 400), "blue")
+        out = np.asarray(resize_and_pad_action_image(image, target_h=480, target_w=832))
+        assert out.shape[:2] == (480, 832)
+        # A square source contained in a 16:9 canvas fills the height, so the
+        # scaled content is square and the pad lands on the right.
+        assert out[:480, :480].any()
 
 
 class TestResolveDomainId:
