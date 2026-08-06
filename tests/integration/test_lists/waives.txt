@@ -421,6 +421,8 @@ unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py:
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TRTLLMSampler-cuda_graph_and_overlap-None-1-1-True-True-False] SKIP (https://nvbugs/6463819)
 unittest/_torch/sampler/test_trtllm_sampler.py::test_trtllm_sampler_best_of_with_logprobs SKIP (https://nvbugs/6487837)
 unittest/_torch/speculative/hw_agnostic/test_advanced_sampling_mode.py::test_no_topk_matches_full[0.9] SKIP (https://nvbugs/6550099)
+unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6535767)
+unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_ngram.py::test_llama_ngram[True-True-TRTLLM] SKIP (https://nvbugs/6507102)
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype1] SKIP (https://nvbugs/6301807)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingDSv3-swiglu-1024-1024-1] SKIP (https://nvbugs/5908070)

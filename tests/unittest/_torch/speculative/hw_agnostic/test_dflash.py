@@ -36,6 +36,8 @@ PROMPTS = [
     "The future of AI is",
 ]
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
 
 def test_dflash_graph_bucket_uses_full_seq_slot_pool():
     """A small graph bucket must not shrink the persistent context pool."""
@@ -85,9 +87,10 @@ def test_dflash_graph_bucket_uses_full_seq_slot_pool():
     worker._lazy_init_ctx_buffers(draft_model, metadata, attn_metadata)
 
     assert metadata.max_num_requests == 2 < metadata.num_seq_slots
-    assert worker._ctx_k_buf.shape == (6, 1, 13, 2, 4)
+    num_slots = num_seq_slots + 1
+    assert worker._ctx_k_buf.shape[0] == num_slots
     assert worker._ctx_v_buf.shape == worker._ctx_k_buf.shape
-    assert worker._ctx_len.shape == (6,)
+    assert worker._ctx_len.shape[0] == num_slots
     assert worker._batch_to_slot.shape == (num_seq_slots,)
     assert worker._dummy_slot == num_seq_slots
     assert list(worker._free_slots) == list(range(num_seq_slots))

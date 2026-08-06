@@ -220,7 +220,7 @@ class DFlashWorker(SpecWorkerBase):
         # shrunk to the captured graph bucket by create_cuda_graph_metadata,
         # which would pin the pool to whichever bucket drafts first and leave
         # _dummy_slot aliasing a live request's row.
-        max_batch = spec_metadata.num_seq_slots or spec_metadata.max_num_requests
+        max_batch = spec_metadata.num_seq_slots
 
         # Prefer runtime max_seq_len over max_position_embeddings: YaRN
         # models advertise 100k+ positions, which would OOM the ctx buffer
