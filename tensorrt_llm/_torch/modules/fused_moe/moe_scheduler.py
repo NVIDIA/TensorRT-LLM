@@ -638,7 +638,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
 
         # ========== Empty-chunk substitution (DP only) ==========
-        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
+        # Host-only bookkeeping, so keep it in Python state. A tensor here
+        # costs an allocation per call plus a Tensor.__bool__ dispatch per
+        # chunk read below, on a path that runs once per MoE layer per step.
+        # It is also a latent hazard: the tensor only lands on the host
+        # because no device is requested, and a CUDA one would turn each read
+        # into a device-to-host sync that is illegal under CUDA Graph capture.
+        chunked_used = [True] * num_chunks
         if moe.use_dp:
             # The split heuristic guarantees chunk 0 has >= 1 token, so it can
             # stand in for any empty chunk on this rank. Without substitution,
