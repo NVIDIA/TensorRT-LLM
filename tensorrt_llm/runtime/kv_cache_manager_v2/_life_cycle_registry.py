@@ -50,6 +50,27 @@ class AttnLifeCycle(NamedTuple):
             BlockOrdinal(max(start, (history_length + 1 - self.window_size) // tokens_per_block)),
         )
 
+    def sliding_window_floor_blocks(self, tokens_per_block: int) -> int:
+        """Minimum blocks a windowed pool must reserve per request.
+
+        As a sliding window advances during decode it crosses block boundaries and its
+        span oscillates between M-1 and M blocks; the pool must hold the peak
+            M = num_sink_blocks + (window_size + tokens_per_block - 2) // tokens_per_block + 1
+        Full attention (``window_size is None``) has no window and returns 0.
+
+        This is a *floor* on a request's resident-block count, not a cap: a decode
+        request peaks exactly at M, while a prefill request still writing its input
+        blocks needs at least M. Callers take ``max(single_history_snapshot, this)``
+        (capped at the sequence's total blocks) so a windowed pool is never sized below
+        the straddle that a one-shot ``num_blocks - len(get_stale_range(...))`` snapshot
+        can miss.
+        """
+        if self.window_size is None:
+            return 0
+        return (
+            self.num_sink_blocks + (self.window_size + tokens_per_block - 2) // tokens_per_block + 1
+        )
+
 
 class SsmLifeCycle(NamedTuple):
     def get_stale_range(
