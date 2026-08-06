@@ -1,6 +1,6 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.2** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.3** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
@@ -31,9 +31,9 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.2"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.3"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
-| `sessionId` | string | Unique hex UUID per server lifetime. Use this to correlate initial report with heartbeats. |
+| `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
 
 Privacy/identity fields (`osVersion`, `geoInfo`, `deviceGUID`, etc.) are
@@ -44,7 +44,9 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once at server startup. Contains system info and serving configuration.
+Sent once after the first successful LLM initialization. Contains system info
+and the first successfully reported LLM's serving configuration. A process that
+fails earlier can send a terminal report without an initial report.
 
 #### System fields
 
@@ -80,6 +82,7 @@ Sent once at server startup. Contains system info and serving configuration.
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `architectureClassName` | LongString | HuggingFace model architecture class. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"` |
+| `architectureClassHash` | LongString | Reserved for the TRTLLM-411 approved architecture hashing policy. Empty in the exit-code implementation. | `""` |
 | `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
@@ -96,6 +99,20 @@ Sent once at server startup. Contains system info and serving configuration.
 | `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"` |
 | `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
 
+#### Aggregate LLM lifecycle counters
+
+These process-local snapshots are present on the initial report, every
+heartbeat, and the terminal report. Cumulative counters saturate at uint32 max;
+`activeLlmInstances` is a gauge.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `llmInitializationAttempts` | PositiveInt | Number of entries into `LLM.__init__`. |
+| `llmInstancesCreated` | PositiveInt | Number of LLM objects initialized successfully. |
+| `activeLlmInstances` | PositiveInt | Successfully initialized objects not yet shut down. |
+| `maxConcurrentLlmInstances` | PositiveInt | Maximum active objects observed in the process session. |
+| `llmInitializationFailures` | PositiveInt | Initialization attempts that raised a handled Python exception. |
+
 ### `trtllm_heartbeat`
 
 Sent periodically (default: every 600s) to track session duration. Up to 1000
@@ -104,6 +121,40 @@ heartbeats per session.
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `seq` | PositiveInt | Zero-based heartbeat sequence number. | `0`, `1`, `42` |
+| `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
+| `disaggRole` | ShortString | Disaggregated role, including compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |
+
+Every heartbeat also contains the five aggregate LLM lifecycle counters above.
+
+### `trtllm_exit_report`
+
+Sent at most once when TRT-LLM or a surviving observer can classify the session
+outcome. Missing terminal events remain unknown; they are not confirmed crashes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exitCodeKnown` | boolean | Whether an authoritative process-style exit code is available. |
+| `exitCode` | PositiveInt | Exit code, or `0` when unknown. |
+| `signalNumber` | PositiveInt | Signal number, or `0` when not applicable or unknown. |
+| `terminationKind` | enum | `clean`, `exception`, `signal`, `worker_failure`, `timeout`, or `unknown`. |
+| `lifecyclePhase` | enum | `cli_parsing`, `config_validation`, `model_initialization`, `serving`, `shutdown`, or `unknown`. |
+| `component` | enum | `llm`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
+| `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
+| `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
+| `disaggRole` | ShortString | Disaggregated role, or empty when unavailable/not applicable. |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
+
+Every terminal report also contains the five aggregate LLM lifecycle counters
+above. Delivery is best-effort and waits no more than 0.5 seconds; the local
+terminal lock permits at most one delivery attempt per process session.
+
+When a surviving parent observes a subprocess return code such as `-9`, it is
+normalized to shell-style `exitCode=137` with `signalNumber=9`.
+
+Terminal fields are deliberately bounded and categorical. Exception messages,
+stack traces, commands, paths, model identifiers, and configuration text are
+not collected.
 
 ## Type Reference
 
@@ -123,6 +174,7 @@ The `ingressPoint` field identifies which TRT-LLM entry point started the sessio
 | `"cli_bench"` | Started via `trtllm-bench` CLI |
 | `"cli_eval"` | Started via evaluation CLI |
 | `"llm_class"` | Started via `LLM()` Python API directly |
+| `"disaggregated"` | Started as a disaggregated coordinator or fleet worker |
 | `"unknown"` | Entry point not identified |
 
 ## `featuresJson` Keys
@@ -212,7 +264,7 @@ over time.
 | `TRTLLM_USAGE_STATS_SERVER` | `https://events.gfe.nvidia.com/v1.1/events/json` | Override the GXT endpoint URL. Use for staging. |
 | `TRTLLM_USAGE_HEARTBEAT_INTERVAL` | `600` | Heartbeat interval in seconds. |
 | `TRTLLM_USAGE_FORCE_ENABLED` | `0` | Set to `1` to force-enable telemetry in CI/test environments. |
-| `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context` or `generation`). |
+| `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, or compatible legacy values such as `ctx0`/`gen0`). |
 | `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment ID across disaggregated workers. |
 
 ## For Developers: Adding a New Field

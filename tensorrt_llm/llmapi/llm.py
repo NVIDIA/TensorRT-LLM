@@ -17,6 +17,7 @@ import atexit
 import json
 import os
 import socket
+import threading
 import time
 import weakref
 from collections.abc import Mapping
@@ -363,6 +364,31 @@ class BaseLLM:
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
+        self._initialize(
+            model,
+            tokenizer,
+            tokenizer_mode,
+            skip_tokenizer_init,
+            trust_remote_code,
+            tensor_parallel_size,
+            dtype,
+            revision,
+            tokenizer_revision,
+            **kwargs,
+        )
+
+    def _initialize(self,
+                    model: Union[str, Path],
+                    tokenizer: Optional[Union[str, Path, TokenizerBase,
+                                              PreTrainedTokenizerBase]] = None,
+                    tokenizer_mode: Literal['auto', 'slow'] = 'auto',
+                    skip_tokenizer_init: bool = False,
+                    trust_remote_code: bool = False,
+                    tensor_parallel_size: int = 1,
+                    dtype: str = "auto",
+                    revision: Optional[str] = None,
+                    tokenizer_revision: Optional[str] = None,
+                    **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
@@ -494,25 +520,6 @@ class BaseLLM:
                 self.mpi_session.shutdown()
             raise
 
-        # --- Usage telemetry (fail-silent) ---
-        try:
-            import tensorrt_llm.usage as _usage
-            telemetry_config = getattr(self.args, 'telemetry_config', None)
-            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
-            # CLI commands set their specific context before LLM construction,
-            # so this only fires for users calling LLM() directly.
-            if telemetry_config is not None:
-                if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
-                    telemetry_config = telemetry_config.model_copy(
-                        update={"usage_context": _usage.UsageContext.LLM_CLASS})
-            _usage.report_usage(
-                llm_args=self.args,
-                pretrained_config=self._hf_model_config,
-                telemetry_config=telemetry_config,
-            )
-        except Exception as exc:
-            logger.debug("Usage telemetry setup failed: %s", exc)
-
         try:
             if self.args.otlp_traces_endpoint:
                 tracing.init_tracer("trt.llm", self.args.otlp_traces_endpoint)
@@ -524,6 +531,27 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _start_usage_reporting(self) -> None:
+        """Start the success-only initial report and heartbeat stream."""
+        try:
+            import tensorrt_llm.usage as _usage
+
+            telemetry_config = getattr(self.args, 'telemetry_config', None)
+            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
+            # CLI commands set their specific context before LLM construction,
+            # so this only fires for users calling LLM() directly.
+            if (telemetry_config is not None and telemetry_config.usage_context
+                    == _usage.UsageContext.UNKNOWN):
+                telemetry_config = telemetry_config.model_copy(
+                    update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            _usage.report_usage(
+                llm_args=self.args,
+                pretrained_config=self._hf_model_config,
+                telemetry_config=telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug("Usage telemetry setup failed: %s", exc)
 
     @property
     @set_api_status("beta")
@@ -1706,6 +1734,13 @@ class BaseLLM:
 
     @set_api_status("beta")
     def shutdown(self) -> None:
+        try:
+            self._shutdown_resources()
+        finally:
+            self._record_usage_shutdown()
+
+    def _shutdown_resources(self) -> None:
+        """Release executors and any LLM-owned MPI session."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
@@ -1719,6 +1754,23 @@ class BaseLLM:
                 and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+    def _record_usage_shutdown(self) -> None:
+        """Update the process counter at most once for this LLM object."""
+        lifecycle_lock = getattr(self, "_usage_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            return
+        with lifecycle_lock:
+            if not getattr(self, "_usage_lifecycle_active", False):
+                return
+            self._usage_lifecycle_active = False
+
+        try:
+            import tensorrt_llm.usage as _usage
+
+            _usage.record_llm_shutdown()
+        except Exception as exc:
+            logger.debug("Usage telemetry shutdown tracking failed: %s", exc)
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
@@ -1779,22 +1831,68 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        self._usage_lifecycle_active = False
+        self._usage_lifecycle_lock = threading.Lock()
+        telemetry_config = kwargs.get("telemetry_config")
+        usage_attempt_tracked = False
+        _usage = None
+        try:
+            import tensorrt_llm.usage as _usage
+
+            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                telemetry_config,
+                default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+            )
+            _usage.set_lifecycle_phase("model_initialization")
+        except Exception as exc:
+            logger.debug("Usage telemetry initialization tracking failed: %s",
+                         exc)
+
         backend = kwargs.pop("backend", "pytorch")
 
-        # Validate that only arguments supported by the PyTorch backend are passed.
-        self._validate_args_for_torch_backend(kwargs)
+        try:
+            # Validate that only arguments supported by the PyTorch backend are passed.
+            self._validate_args_for_torch_backend(kwargs)
 
-        super().__init__(model,
-                         tokenizer,
-                         tokenizer_mode,
-                         skip_tokenizer_init,
-                         trust_remote_code,
-                         tensor_parallel_size,
-                         dtype,
-                         revision,
-                         tokenizer_revision,
-                         backend=backend,
-                         **kwargs)
+            super().__init__(model,
+                             tokenizer,
+                             tokenizer_mode,
+                             skip_tokenizer_init,
+                             trust_remote_code,
+                             tensor_parallel_size,
+                             dtype,
+                             revision,
+                             tokenizer_revision,
+                             backend=backend,
+                             **kwargs)
+        except Exception:
+            if usage_attempt_tracked:
+                try:
+                    _usage.record_llm_initialization_failure()
+                except Exception as exc:
+                    logger.debug(
+                        "Usage telemetry initialization failure tracking failed: %s",
+                        exc,
+                    )
+            raise
+
+        if not usage_attempt_tracked and _usage is not None:
+            try:
+                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                    getattr(self.args, 'telemetry_config', None),
+                    default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Usage telemetry post-validation tracking failed: %s", exc)
+
+        if usage_attempt_tracked:
+            try:
+                self._usage_lifecycle_active = _usage.record_llm_initialized()
+            except Exception as exc:
+                logger.debug("Usage telemetry success tracking failed: %s", exc)
+
+        self._start_usage_reporting()
 
     @set_api_status("prototype")
     def _collective_rpc(

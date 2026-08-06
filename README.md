@@ -318,6 +318,8 @@ deployment, and not linked to users. The data we collect includes:
 - TRT-LLM version and backend
 - Feature summary flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
 - Disaggregated serving metadata (role and deployment ID)
+- Process-local LLM lifecycle counts (initialization attempts, successful and active instances, peak concurrency, and initialization failures)
+- Bounded terminal status for instrumented processes (known exit code or signal, termination category, lifecycle phase, component, and reporting source)
 - Selected LLM API configuration values: parallelism, dtype, KV cache, scheduler, CUDA graph, and compile settings
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 

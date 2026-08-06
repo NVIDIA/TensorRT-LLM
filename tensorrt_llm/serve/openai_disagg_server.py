@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._telemetry import TelemetryUvicornServer
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
@@ -52,6 +53,7 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
+from tensorrt_llm.usage import record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
@@ -350,6 +352,12 @@ class OpenAIDisaggServer:
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
+            record_termination_observation(
+                termination_kind="worker_failure",
+                component="disagg_worker",
+                reporting_source="supervisor",
+                exit_code_known=False,
+            )
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
@@ -379,7 +387,8 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=keep_alive_timeout)
-        await uvicorn.Server(config).serve(sockets=sockets)
+        server = TelemetryUvicornServer(config)
+        await server.serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
