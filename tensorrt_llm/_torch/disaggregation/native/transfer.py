@@ -62,8 +62,12 @@ from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, per
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+    merge_draft_page_table,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -809,9 +813,13 @@ class Sender(SenderBase):
                     f"src/dst block count mismatch: {src_block_ids.size} vs "
                     f"{dst_block_ids.size} (dst must not exceed src)"
                 )
-            tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
+            # Merged draft groups carry their own page size; fall back to the
+            # table-wide value for regular target groups.
+            tpb = (
+                getattr(lg_info, "tokens_per_block", None) or extractor.page_table.tokens_per_block
+            )
             window_size = getattr(lg_info, "sliding_window_size", None)
 
             # Block lists are the suffix of [..., slice_end); cached prefix
@@ -2242,6 +2250,10 @@ class TransferWorkerConfig:
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
+    # Separate one-model draft KV cache manager whose (small) prompt KV is
+    # transferred alongside the target's. Its layer groups are merged into
+    # the page table with offset global ids and a per-group tokens_per_block.
+    draft_kv_cache_manager: Optional[KVCacheManager] = None
 
 
 class TransferWorker:
@@ -2257,8 +2269,34 @@ class TransferWorker:
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
         )
+        assert self._rank_info.page_table is not None
+        self._num_target_layer_groups = len(self._rank_info.page_table.layer_groups)
+        self._num_target_pool_groups = len(self._rank_info.page_table.pool_groups)
+        if config.draft_kv_cache_manager is not None:
+            if kvm.mapping.pp_size != 1:
+                raise ValueError(
+                    "Draft KV cache transfer is not supported with pipeline "
+                    "parallelism yet (layer_num_per_pp bookkeeping covers "
+                    "target layers only)."
+                )
+            draft_pt = build_page_table_from_manager(config.draft_kv_cache_manager)
+            self._rank_info.page_table = merge_draft_page_table(
+                self._rank_info.page_table, draft_pt
+            )
+            logger.info(
+                "Registered separate draft KV cache for disaggregated transfer: "
+                f"{len(draft_pt.layer_groups)} layer group(s), "
+                f"tokens_per_block={draft_pt.tokens_per_block} "
+                f"(target uses {self._rank_info.attention.tokens_per_block})"
+            )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
+
+    @property
+    def num_target_layer_groups(self) -> int:
+        """Layer groups in the page table that belong to the target manager;
+        indices >= this are merged draft-manager groups."""
+        return self._num_target_layer_groups
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -2300,7 +2338,9 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
+        # Build the extractor from the (possibly draft-merged) page table so
+        # extraction covers every registered pool, not just the target's.
+        self._kv_extractor = KVRegionExtractorV1(self._rank_info.page_table)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):
@@ -2339,13 +2379,36 @@ class TransferWorker:
 
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
-        memory_descs = get_unique_pool_memory_descs(
-            self._rank_info.page_table, self._rank_info.device_id
-        )
-        if memory_descs:
+        pt = self._rank_info.page_table
+        n_target = self._num_target_layer_groups
+        # Pools from different managers can use different VMM chunk sizes
+        # (the V2 manager derives its cuMemCreate granularity from the pool
+        # quota, and a merged draft manager's quota is much smaller). The
+        # NIXL agent requires a uniform chunk size within one registration
+        # batch, while its region bookkeeping is per-region — so register
+        # the target's and the draft's pools as separate batches.
+        sub_tables = [
+            KVCachePageTable(pt.tokens_per_block, pt.layer_groups[:n_target], pt.pool_groups)
+        ]
+        if n_target < len(pt.layer_groups):
+            sub_tables.append(
+                KVCachePageTable(pt.tokens_per_block, pt.layer_groups[n_target:], pt.pool_groups)
+            )
+        for batch_idx, sub_table in enumerate(sub_tables):
+            memory_descs = get_unique_pool_memory_descs(sub_table, self._rank_info.device_id)
+            if not memory_descs:
+                continue
+            if batch_idx > 0:
+                # Keep descriptor names unique across registration batches.
+                memory_descs = [
+                    (ptr, size, dev, f"{name}_draft{batch_idx}")
+                    for ptr, size, dev, name in memory_descs
+                ]
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)
-            logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
+            logger.debug(
+                f"Registered KV cache memory batch {batch_idx} with transfer agent: {memory_descs}"
+            )
             self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):

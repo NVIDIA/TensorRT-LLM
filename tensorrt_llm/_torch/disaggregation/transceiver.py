@@ -66,6 +66,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ):
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
@@ -77,6 +78,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
         self._check_compatible()
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
+        # One-model speculative decoding with a separate draft manager: the
+        # drafter's prompt KV is transferred alongside the target's so the
+        # generation-side drafter does not start from an unwarmed window.
+        self._draft_reuse_adapter: Optional[CacheReuseAdapter] = (
+            create_cache_reuse_adapter(draft_kv_cache_manager)
+            if draft_kv_cache_manager is not None
+            else None
+        )
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
@@ -94,8 +103,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
                 # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         )
+        self._num_target_layer_groups = self._transfer_worker.num_target_layer_groups
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
         self._context_info_endpoint = self._broadcast_context_endpoint()
         self._init_sync_policy()
@@ -177,16 +188,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
-        tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
+        n_target = self._num_target_layer_groups
 
         is_gen_only = req.is_generation_only_request()
+        # Draft groups never participate in prefix reuse (their manager runs
+        # with reuse off and the transfer must cover the full prompt), so
+        # their cached count is pinned to 0.
         cached_per_lg = (
-            adapter.get_cached_token_count_per_layer_group(req, layer_groups)
+            adapter.get_cached_token_count_per_layer_group(req, layer_groups[:n_target])
             if is_gen_only
-            else [0] * len(layer_groups)
-        )
+            else [0] * n_target
+        ) + [0] * (len(layer_groups) - n_target)
 
         token_range = None
         if req.prompt_len > 0:
@@ -206,7 +220,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if isinstance(lg, MambaLayerGroup):
                 groups.append(np.array([], dtype=np.int64))
                 continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
+            # Merged draft groups use the draft manager's block ids (indexed
+            # by the draft manager's own group numbering) and page size.
+            tpb = getattr(lg, "tokens_per_block", None) or adapter.tokens_per_block
+            if idx >= n_target:
+                assert self._draft_reuse_adapter is not None
+                block_ids = self._draft_reuse_adapter.get_block_ids(req, idx - n_target, lg)
+            else:
+                block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
             if block_ids.size > total_blocks:

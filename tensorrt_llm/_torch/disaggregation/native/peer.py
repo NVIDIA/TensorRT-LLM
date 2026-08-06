@@ -342,6 +342,15 @@ class PeerRegistrar:
             pool_idx=peer_pi,
         )
 
+        # Head counts are a per-layer-group property (a merged draft group's
+        # head count differs from the target's); fall back to the rank-level
+        # value for tables that predate per-group head metadata.
+        self_kv_heads = (
+            getattr(self_lg, "kv_head_num_per_rank", 0) or self._ri.attention.kv_heads_per_rank
+        )
+        peer_kv_heads = (
+            getattr(peer_lg, "kv_head_num_per_rank", 0) or peer_ri.attention.kv_heads_per_rank
+        )
         mapper = self._attention_policy.build_kv_mapper(
             peer_ri=peer_ri,
             mapper_kind=self_pv.mapper_kind,
@@ -351,6 +360,8 @@ class PeerRegistrar:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
+            self_kv_heads=self_kv_heads,
+            peer_kv_heads=peer_kv_heads,
         )
 
         self._kv_map_cache[cache_key] = mapper

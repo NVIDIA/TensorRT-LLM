@@ -648,3 +648,55 @@ def build_page_table_from_manager(manager) -> KVCachePageTable:
         return _build_page_table_v2(manager)
     else:
         return build_page_table(manager)
+
+
+# Offset applied to the draft manager's synthetic global layer ids when its
+# layer groups are merged into the target's page table. Keeps them
+# collision-free against every target id scheme (plain pp_layers ids and the
+# virtual-layer encodings alike), and both peers apply the same constant, so
+# peer matching by global-id overlap pairs draft groups with draft groups.
+DRAFT_GLOBAL_LAYER_ID_OFFSET = 1 << 30
+
+
+def merge_draft_page_table(
+    target_pt: KVCachePageTable,
+    draft_pt: KVCachePageTable,
+) -> KVCachePageTable:
+    """Append a separate draft manager's page table to the target's.
+
+    The merged table lets the disaggregated transfer machinery treat draft
+    layers as additional attention layer groups: NIXL registration, peer
+    matching (by offset global ids + pool_role) and the per-pool mappers all
+    operate on the merged table. Draft groups carry their own
+    ``tokens_per_block`` (the draft manager's page size may differ from the
+    target's, e.g. MiniMax-M3's 32 vs 128).
+    """
+    pool_base = len(target_pt.pool_groups)
+    merged_groups: List[LayerGroup] = list(target_pt.layer_groups)
+    for lg in draft_pt.layer_groups:
+        if not isinstance(lg, AttentionLayerGroup):
+            raise ValueError(
+                "merge_draft_page_table supports attention draft layer groups "
+                f"only, got {type(lg).__name__}"
+            )
+        merged_groups.append(
+            AttentionLayerGroup(
+                pool_group_idx=lg.pool_group_idx + pool_base,
+                kv_head_num_per_rank=lg.kv_head_num_per_rank,
+                sliding_window_size=lg.sliding_window_size,
+                local_layers=[
+                    LocalLayer(
+                        local_layer_id=ll.local_layer_id,
+                        global_layer_id=ll.global_layer_id + DRAFT_GLOBAL_LAYER_ID_OFFSET,
+                    )
+                    for ll in lg.local_layers
+                ],
+                pool_views=lg.pool_views,
+                tokens_per_block=draft_pt.tokens_per_block,
+            )
+        )
+    return KVCachePageTable(
+        tokens_per_block=target_pt.tokens_per_block,
+        layer_groups=merged_groups,
+        pool_groups=list(target_pt.pool_groups) + list(draft_pt.pool_groups),
+    )

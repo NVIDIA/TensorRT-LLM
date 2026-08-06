@@ -2711,9 +2711,15 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # A separate one-model draft KV cache manager (e.g. MiniMax-M3's
+    # tokens_per_block=32 Eagle3 cache) joins the transfer so the
+    # generation-side drafter receives the prompt KV computed during
+    # context-side prefill.
+    draft_kv_cache_manager = resources.get(
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        cache_transceiver_config, mamba_cache_manager, draft_kv_cache_manager)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

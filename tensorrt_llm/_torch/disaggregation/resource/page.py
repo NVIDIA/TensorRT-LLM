@@ -254,6 +254,11 @@ class AttentionLayerGroup(LayerGroup):
     sliding_window_size: Optional[int] = None
     local_layers: List[LocalLayer] = field(default_factory=list)
     pool_views: List[PoolView] = field(default_factory=list)
+    # Page size override for groups whose manager uses a different
+    # tokens_per_block than the table default (e.g. a separate one-model
+    # draft KV cache manager merged into the target's table). None means
+    # "use KVCachePageTable.tokens_per_block".
+    tokens_per_block: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -262,16 +267,19 @@ class AttentionLayerGroup(LayerGroup):
             "sliding_window_size": self.sliding_window_size,
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
+            "tokens_per_block": self.tokens_per_block,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "AttentionLayerGroup":
+        tokens_per_block = data.get("tokens_per_block")
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
             sliding_window_size=data.get("sliding_window_size"),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
+            tokens_per_block=int(tokens_per_block) if tokens_per_block is not None else None,
         )
 
 
