@@ -3334,9 +3334,8 @@ class PyExecutor:
         """
         if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
-                # The empty-batch padding dummy joins the batch after
-                # scheduling, so the V2 scheduler never grew its capacity.
-                # Reverting it would shrink a real allocation.
+                # The empty-batch padding dummy joins after scheduling, so its
+                # capacity was never grown; reverting would shrink it.
                 if getattr(req, "py_skip_gen_alloc_revert", False):
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
@@ -3707,10 +3706,8 @@ class PyExecutor:
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
-        # Must run AFTER _schedule(): the condition it repairs -- an empty
-        # scheduled batch on one attention-DP rank, which vetoes the forward
-        # pass on all of them -- does not exist until the capacity scheduler has
-        # returned its verdict.
+        # Must run after _schedule(): the empty scheduled batch it repairs does
+        # not exist until the capacity scheduler has returned its verdict.
         self._pad_empty_attention_dp_batch(scheduled_batch)
 
         if self.drafter is not None and not self.use_spec_decode:
@@ -5979,40 +5976,22 @@ class PyExecutor:
     @nvtx_range("_pad_empty_attention_dp_batch")
     def _pad_empty_attention_dp_batch(
             self, scheduled_batch: ScheduledRequests) -> None:
-        """Guarantee the invariant `_can_queue` actually depends on.
+        """Pad an empty scheduled batch so attention DP can make progress.
 
-        `_can_queue` vetoes the forward pass on **every** attention-DP rank when
-        any rank's *scheduled* batch is empty::
+        `_can_queue` vetoes the forward pass on every rank when any rank's
+        *scheduled* batch is empty. `_pad_attention_dp_dummy_request` cannot
+        prevent that: it guarantees every rank has an *active* request, and runs
+        before `_schedule()`, so a rank whose only active request does not fit
+        the free KV cache is left unpadded and schedules an empty batch. Peers
+        then never advance their context chunks (`_update_request_states` runs
+        under `if can_queue:`), so no KV cache is freed and the rank stays
+        starved -- silently, since nothing on that path raises or times out.
 
-            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
-            can_queue = 0 not in tp_batch_sizes
-
-        `_pad_attention_dp_dummy_request` is meant to prevent that, but it
-        guarantees a different invariant -- "every rank has at least one
-        *active* request" -- and it necessarily runs *before* `_schedule()`, so
-        the capacity scheduler's verdict cannot inform it. A rank whose only
-        active request does not fit the free KV cache therefore counts as one
-        active request, is given no dummy, and schedules an empty batch.
-
-        A rank-local shortage then stalls the whole fleet: the empty rank vetoes
-        `can_queue` everywhere, so peers never execute the context chunks they
-        *did* schedule (`_update_request_states`, the only caller of
-        `move_to_next_context_chunk()`, runs under `if can_queue:`). No chunk
-        completes, so no KV cache is released, so the starved rank stays
-        starved. Nothing on that path raises or times out, so the stall is
-        silent: clients see zero errors and zero progress until enough cache is
-        freed elsewhere -- on a disaggregated context server, where the rank is
-        waiting on its own in-flight cache transfers, that may never happen.
-
-        The padding is deliberately **rank-local**: `_schedule()` performs a
-        `tp_allgather` inside `_balance_adp_requests`, so re-scheduling on only
-        the empty ranks would desynchronize that collective. A *generation*
-        dummy is used rather than the context dummy the pre-schedule path would
-        pick, because a rank that is empty precisely because it is short of KV
-        cache must not be asked for `max_num_tokens` worth of it.
-
-        Not reached by the pipeline-parallel loop, which does not call
-        `_prepare_and_schedule_batch`.
+        Padding is rank-local because `_schedule()` allgathers inside
+        `_balance_adp_requests`. A generation dummy is used rather than the
+        context dummy the pre-schedule path would pick, since this rank is empty
+        precisely because it is short of KV cache. Not reached under pipeline
+        parallelism, which does not call `_prepare_and_schedule_batch`.
         """
         if not self.enable_attention_dp:
             return
@@ -6020,13 +5999,10 @@ class PyExecutor:
             return
         if not self.active_requests or self.expected_num_active_requests <= 0:
             return
-        # `expected_num_active_requests` is capped at max_num_active_requests,
-        # and `_pad_attention_dp_dummy_request` asserts it bounds
-        # len(active_requests). Unlike that path -- which only pads a rank with
-        # no active requests at all -- this one adds to a rank that already has
-        # some, so it must not push the count past the cap. A rank at the cap
-        # has ample work to schedule and is not the starvation case repaired
-        # here.
+        # Unlike the pre-schedule path, this one pads a rank that already holds
+        # active requests, so it must respect the cap that
+        # `_pad_attention_dp_dummy_request` asserts against. A rank at the cap
+        # is not starved anyway.
         if len(self.active_requests) >= self.max_num_active_requests:
             return
         # The fill gate suppresses forwards on purpose; dummies added then are
@@ -6048,11 +6024,9 @@ class PyExecutor:
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
         try:
-            # prepare_resource=True also takes a sequence slot, which can raise
-            # NoFreeSlotsError. Both failures must degrade to today's behaviour
-            # -- an empty batch this iteration -- rather than propagate: all
-            # ranks have yet to agree on can_queue, so a rank-local raise here
-            # would strand its peers in the collectives that follow.
+            # Degrade to an empty batch rather than propagate: the ranks have
+            # yet to agree on can_queue, so a rank-local raise would strand the
+            # peers in the collectives that follow.
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=None,
@@ -6080,15 +6054,13 @@ class PyExecutor:
                 return
 
         dummy_request.is_attention_dp_dummy = True
-        # This dummy bypassed the capacity scheduler, so the V2 scheduler never
-        # grew its KV cache capacity and `_revert_gen_alloc` must leave it alone.
+        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
         dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
         scheduled_batch.generation_requests.append(dummy_request)
         if self._enable_dsv4_adp_dummy_fixes:
-            # Let _finalize_adp_dummy_allocation roll the allocation back if the
-            # fleet still cannot queue (another rank may also be empty and have
-            # failed to pad).
+            # Let `_finalize_adp_dummy_allocation` roll this back if the fleet
+            # still cannot queue.
             self._pending_adp_dummy_request = dummy_request
 
     @nvtx_range("_prepare_disagg_gen_init")

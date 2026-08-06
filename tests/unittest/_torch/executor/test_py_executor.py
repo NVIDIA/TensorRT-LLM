@@ -1732,10 +1732,9 @@ def test_pad_dummy_no_op_when_attention_dp_disabled():
 
 
 # ---------------------------------------------------------------------------
-# Empty *scheduled* batch padding: _pad_attention_dp_dummy_request guarantees
-# every rank has an active request, but _can_queue vetoes the fleet-wide
-# forward pass on an empty *scheduled* batch. A rank whose only active request
-# does not fit the free KV cache satisfies the former and violates the latter.
+# Empty *scheduled* batch padding: a rank whose only active request does not fit
+# the free KV cache is skipped by _pad_attention_dp_dummy_request, yet its empty
+# scheduled batch vetoes the fleet-wide forward pass in _can_queue.
 # ---------------------------------------------------------------------------
 def _run_pad_empty(stub, scheduled_batch):
     for helper in (
@@ -1839,9 +1838,7 @@ def test_pad_empty_batch_degrades_when_kv_cache_cannot_afford_dummy():
 
 @pytest.mark.parametrize("error", [OutOfPagesError("no pages"), NoFreeSlotsError("no slots")])
 def test_pad_empty_batch_degrades_on_allocation_error(error):
-    # All ranks have yet to agree on can_queue, so a rank-local raise here
-    # would strand the peers in the collectives that follow. Degrade to
-    # today's behaviour instead.
+    # A rank-local raise would strand the peers in the collectives that follow.
     stub, scheduled_batch = _unfittable_rank()
     stub.kv_cache_manager.add_dummy_requests.side_effect = error
 
@@ -1852,8 +1849,7 @@ def test_pad_empty_batch_degrades_on_allocation_error(error):
 
 
 def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
-    # The dummy joins the batch after scheduling, so the V2 scheduler never
-    # grew its KV cache capacity; reverting it would shrink a real allocation.
+    # The dummy joins after scheduling, so its capacity was never grown.
     stub, scheduled_batch = _unfittable_rank()
 
     _run_pad_empty(stub, scheduled_batch)
