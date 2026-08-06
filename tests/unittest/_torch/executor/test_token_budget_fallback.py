@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Unit tests for KVCacheManager._fit_token_budget.
+"""Unit tests for KVCacheManager.fit_token_budget.
 
-These exercise the prep-boundary token-budget fallback that defers or
-re-chunks context requests so a scheduled batch cannot overshoot
-``max_num_tokens`` in the forward pass (GitHub issue #13318). The fallback is
-pure scheduling logic and does not touch the GPU, so the tests build a bare
-KVCacheManager via ``__new__`` and drive the method with lightweight fake
-requests.
+These exercise the post-allocation token-budget trim that shrinks over-budget
+context chunks so a scheduled batch cannot overshoot ``max_num_tokens`` in the
+forward pass (GitHub issue #13318). The trim is pure scheduling logic and does
+not touch the GPU, so the tests build a bare KVCacheManager via ``__new__`` and
+drive the method with lightweight fake requests.
+
+The trim runs at the end of ``ResourceManager.prepare_resources``, which is the
+first point where ``context_current_position`` and ``context_chunk_size`` mean
+"forward-pass tokens" -- before ``setPrepopulatedPromptLen`` the chunk still
+spans the reusable KV prefix. ``TestReuseDiscountedChunk`` is the regression
+test for reading it too early.
 """
 
 import unittest
@@ -22,7 +27,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 
 class _FakeRequest:
-    """Minimal stand-in exposing only the attributes _fit_token_budget reads."""
+    """Minimal stand-in exposing only the attributes fit_token_budget reads."""
 
     _next_id = 0
 
@@ -42,15 +47,14 @@ class _FakeRequest:
         self.py_request_id = _FakeRequest._next_id
         # PyExecutor's inflight-set bookkeeping reads ``request_id`` (the C++
         # binding's name) rather than ``py_request_id``; keep them in sync so the
-        # same fake drives both the fallback and TestInflightIdsSurviveTrim.
+        # same fake drives both the trim and TestInflightIdsSurviveTrim.
         self.request_id = self.py_request_id
         self.context_chunk_size = context_chunk_size
         self.context_current_position = context_current_position
         # Mirrors the C++ semantics: is_last_context_chunk is a *computed*
         # property (context_current_position + context_chunk_size == prompt_len),
-        # so shrinking the chunk during re-chunk flips it to False. When
-        # prompt_len is None the flag is a fixed override (for tests that don't
-        # exercise re-chunk re-binning).
+        # so shrinking the chunk flips it to False. When prompt_len is None the
+        # flag is a fixed override (for tests that don't exercise re-binning).
         self._prompt_len = prompt_len
         self._is_last_override = is_last_context_chunk
         self.py_beam_width = py_beam_width
@@ -64,6 +68,14 @@ class _FakeRequest:
             return self._is_last_override
         return self.context_current_position + self.context_chunk_size == self._prompt_len
 
+    @property
+    def context_remaining_length(self):
+        # C++: mPromptLen - getContextCurrentPosition(). With no prompt_len the
+        # chunk is by definition all that is left.
+        if self._prompt_len is None:
+            return self.context_chunk_size
+        return self._prompt_len - self.context_current_position
+
 
 def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True):
     # Skip the heavy (GPU-allocating) __init__; the method under test only
@@ -71,11 +83,11 @@ def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True)
     mgr = KVCacheManager.__new__(KVCacheManager)
     mgr.max_num_tokens = max_num_tokens
     mgr.tokens_per_block = tokens_per_block
-    # Re-chunking is only valid when chunked prefill is enabled; otherwise the
-    # attention backend cannot consume a partial context chunk and the fallback
-    # must defer instead. Default to enabled so the re-chunk tests exercise that
-    # path; the disabled case is covered explicitly below.
+    # Shrinking produces a partial context chunk, which only chunked prefill's
+    # attention path can consume. Default to enabled; the disabled case is
+    # covered explicitly below.
     mgr.enable_chunked_prefill = enable_chunked_prefill
+    mgr.is_draft = False
     return mgr
 
 
@@ -87,11 +99,69 @@ def _make_batch(context_requests=(), generation_requests=()):
     return batch
 
 
+def _forward_tokens(mgr, batch):
+    """What _prepare_tp_inputs will materialize for this batch."""
+    return sum(
+        mgr._request_forward_tokens(r, is_context=False) for r in batch.generation_requests
+    ) + sum(
+        mgr._request_forward_tokens(r, is_context=True)
+        for r in batch.context_requests
+        if not r.is_disagg_generation_init_state
+    )
+
+
+class TestReuseDiscountedChunk(unittest.TestCase):
+    """Regression for the defect this trim shipped with.
+
+    Read before ``prepare_resources``, ``context_chunk_size`` spans the reusable
+    KV prefix: a 19212-token prompt with a 19200-token cache hit still reports
+    ``context_chunk_size == 19212`` while the forward pass will compute 12
+    tokens. Costing it at 19212 makes every reuse hit look 1600x too expensive,
+    so it is endlessly re-chunked (chunked prefill on) or deferred (off).
+
+    Read after ``prepare_resources`` -- where the trim now runs --
+    ``setPrepopulatedPromptLen`` has advanced ``context_current_position`` past
+    the prefix and the same request costs 12.
+    """
+
+    def test_reuse_hit_costs_only_the_uncached_tail(self):
+        mgr = _make_manager(max_num_tokens=8192, tokens_per_block=32)
+        # Post-setPrepopulatedPromptLen state for a 19212-token prompt with a
+        # 19200-token cache hit.
+        req = _FakeRequest(context_chunk_size=12, context_current_position=19200, prompt_len=19212)
+        self.assertEqual(mgr._request_forward_tokens(req, is_context=True), 12)
+
+    def test_reuse_hit_is_not_trimmed(self):
+        mgr = _make_manager(max_num_tokens=8192, tokens_per_block=32)
+        reqs = [
+            _FakeRequest(context_chunk_size=12, context_current_position=19200, prompt_len=19212)
+            for _ in range(4)
+        ]
+        batch = _make_batch(reqs, [_FakeRequest(py_beam_width=1) for _ in range(3)])
+
+        mgr.fit_token_budget(batch)
+
+        self.assertEqual(batch.num_context_requests, 4, "no request may be dropped")
+        for req in reqs:
+            self.assertEqual(req.context_chunk_size, 12, "chunk must be untouched")
+
+    def test_chunk_beyond_prompt_end_is_clamped(self):
+        # _prepare_tp_inputs slices all_prompt_tokens[pos:pos + chunk], and
+        # Python clamps that to the end of the list. A chunk that overhangs the
+        # prompt must be costed at what is actually left, not at its nominal
+        # size.
+        mgr = _make_manager(max_num_tokens=8192, tokens_per_block=32)
+        req = _FakeRequest(
+            context_chunk_size=8160, context_current_position=19200, prompt_len=19212
+        )
+        self.assertEqual(mgr._request_forward_tokens(req, is_context=True), 12)
+
+
 class TestFitTokenBudget(unittest.TestCase):
-    def test_request_forward_tokens_upper_bound(self):
+    def test_request_forward_tokens(self):
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
 
-        # Context: chunk size, plus draft tokens only on the last chunk.
+        # Context: materialized chunk, plus draft tokens only on the last chunk.
         last = _FakeRequest(
             context_chunk_size=10, is_last_context_chunk=True, py_draft_tokens=[1, 2]
         )
@@ -111,204 +181,224 @@ class TestFitTokenBudget(unittest.TestCase):
         gen = _FakeRequest(py_beam_width=100)  # 100 gen tokens
         batch = _make_batch([ctx], [gen])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
         self.assertEqual(batch.num_context_requests, 1)
         self.assertEqual(ctx.context_chunk_size, 16)  # untouched
 
-    def test_overshoot_rechunks_context(self):
+    def test_overshoot_shrinks_context_to_fit(self):
         # 100 gen tokens leave a 28-token budget; a 64-token last chunk does not
-        # fit but can be re-chunked down to a block-aligned 16.
+        # fit and must be shrunk to the largest block-aligned chunk that does.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        ctx = _FakeRequest(context_chunk_size=64, is_last_context_chunk=True)
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
         gen = _FakeRequest(py_beam_width=100)
         batch = _make_batch([ctx], [gen])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        self.assertEqual(batch.num_context_requests, 1)
-        self.assertEqual(ctx.context_chunk_size, 16)  # (28 // 16) * 16
-        total = mgr._request_forward_tokens(ctx, is_context=True) + mgr._request_forward_tokens(
-            gen, is_context=False
+        self.assertEqual(ctx.context_chunk_size, 16)
+        self.assertLessEqual(_forward_tokens(mgr, batch), 128)
+
+    def test_nothing_is_ever_dropped(self):
+        # The defining property of the post-allocation trim: KV is allocated and
+        # sequences are added, so a request may be shrunk but never removed.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        ctxs = [_FakeRequest(context_chunk_size=64, prompt_len=64) for _ in range(3)]
+        gen = _FakeRequest(py_beam_width=100)
+        batch = _make_batch(ctxs, [gen])
+
+        mgr.fit_token_budget(batch)
+
+        self.assertEqual(batch.num_context_requests, 3)
+        for ctx in ctxs:
+            self.assertIn(ctx, batch.context_requests)
+
+    def test_shrink_keeps_chunk_end_block_aligned(self):
+        # setPrepopulatedPromptLen asserts (pos + chunk) % tokens_per_block == 0
+        # for every non-last chunk, to keep the KV cache unfragmented.
+        mgr = _make_manager(max_num_tokens=100, tokens_per_block=16)
+        ctx = _FakeRequest(context_chunk_size=96, context_current_position=32, prompt_len=128)
+        gen = _FakeRequest(py_beam_width=53)
+        batch = _make_batch([ctx], [gen])
+
+        mgr.fit_token_budget(batch)
+
+        self.assertLess(ctx.context_chunk_size, 96)
+        self.assertEqual(
+            (ctx.context_current_position + ctx.context_chunk_size) % 16,
+            0,
+            "chunk end must land on a block boundary",
         )
-        self.assertLessEqual(total, mgr.max_num_tokens)
 
-    def test_rechunk_only_rebins_to_chunking(self):
-        # Regression for the prep-boundary corruption (issue #13318 follow-up):
-        # when the overshoot is absorbed purely by re-chunking the *last*
-        # context request (no deferral), len(kept) is unchanged, but the request
-        # has flipped from last-chunk to non-last and MUST be moved out of the
-        # last-chunk bin. Otherwise downstream treats it as a final chunk and
-        # appends generation/draft tokens, corrupting the forward pass.
+    def test_shrink_never_produces_a_zero_token_chunk(self):
+        # A zero-token chunk leaves the request scheduled but computing nothing,
+        # which never terminates. One block of progress is the floor even when
+        # that overshoots the budget.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        # Full prompt is 64 tokens, processed in one (last) chunk.
         ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
-        self.assertTrue(ctx.is_last_context_chunk)
-        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
+        gen = _FakeRequest(py_beam_width=127)  # leaves a 1-token budget
         batch = _make_batch([ctx], [gen])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        # Re-chunked to (28 // 16) * 16 == 16, now a non-last chunk.
         self.assertEqual(ctx.context_chunk_size, 16)
-        self.assertFalse(ctx.is_last_context_chunk)
-        # Count is unchanged, but it must have been re-binned into chunking.
-        self.assertEqual(batch.num_context_requests, 1)
-        self.assertIn(ctx, batch.context_requests_chunking)
-        self.assertNotIn(ctx, batch.context_requests_last_chunk)
 
-    def test_rechunk_drops_last_chunk_draft_tokens(self):
-        # Same re-chunk regression as above, but with draft tokens, which are
-        # appended only on the *last* chunk (see _request_forward_tokens). If a
-        # re-chunked request were left on the last-chunk path, its draft tokens
-        # would still be counted/materialized and re-introduce the overshoot
-        # this guard prevents. After re-chunking, the request must be a non-last
-        # chunk and its forward-token cost must no longer include the draft.
+    def test_shrink_rebins_to_chunking(self):
+        # Shrinking flips is_last_context_chunk to False, so the request must
+        # move out of context_requests_last_chunk -- otherwise downstream treats
+        # it as a final chunk and appends generation / draft tokens to it.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        # 64-token last chunk + 2 draft tokens; a 28-token budget cannot fit
-        # 64 (+2), but the chunk re-chunks to a block-aligned 16.
-        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64, py_draft_tokens=[1, 2])
-        self.assertTrue(ctx.is_last_context_chunk)
-        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        gen = _FakeRequest(py_beam_width=100)
         batch = _make_batch([ctx], [gen])
+        self.assertEqual(batch.context_requests_last_chunk, [ctx])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        # Re-chunked to (28 // 16) * 16 == 16 and flipped to a non-last chunk.
-        self.assertEqual(ctx.context_chunk_size, 16)
+        self.assertEqual(batch.context_requests_last_chunk, [])
+        self.assertEqual(batch.context_requests_chunking, [ctx])
+
+    def test_shrink_drops_last_chunk_draft_tokens(self):
+        # Draft tokens ride only on the last chunk, so a shrunk request stops
+        # contributing them and the budget must account for that.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64, py_draft_tokens=[1, 2, 3, 4])
+        gen = _FakeRequest(py_beam_width=100)
+        batch = _make_batch([ctx], [gen])
+        self.assertEqual(mgr._request_forward_tokens(ctx, is_context=True), 68)
+
+        mgr.fit_token_budget(batch)
+
         self.assertFalse(ctx.is_last_context_chunk)
-        self.assertIn(ctx, batch.context_requests_chunking)
-        self.assertNotIn(ctx, batch.context_requests_last_chunk)
-        # Cost is now the chunk size alone -- the 2 draft tokens are dropped
-        # because the request is no longer the last chunk.
         self.assertEqual(mgr._request_forward_tokens(ctx, is_context=True), 16)
-        total = mgr._request_forward_tokens(ctx, is_context=True) + mgr._request_forward_tokens(
-            gen, is_context=False
-        )
-        self.assertLessEqual(total, mgr.max_num_tokens)
 
-    def test_overshoot_defers_when_chunked_prefill_disabled(self):
-        # Regression for the CI failures (q.numel()==0 / "Separate quantized
-        # buffer is not provided" / cudaErrorInvalidValue) seen in PR #15187:
-        # when chunked prefill is disabled the attention backend cannot consume
-        # a partial context chunk, so an over-budget request that *would* be
-        # re-chunkable must instead be deferred whole -- never re-chunked.
+    def test_sheds_the_last_chunk_first(self):
+        # context_requests is chunking + last_chunk, so the trim walks last-chunk
+        # requests first. That is the request whose cost the scheduler can have
+        # under-charged (only a last chunk carries a reuse discount), so it is
+        # the right one to repair; mid-prefill chunks are touched only if
+        # trimming it is not enough.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        chunking = _FakeRequest(
+            context_chunk_size=96, prompt_len=256
+        )  # pos 0 + 96 != 256 -> chunking
+        last = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        batch = _make_batch([chunking, last], [])
+        self.assertEqual(batch.context_requests_chunking, [chunking])
+        self.assertEqual(batch.context_requests_last_chunk, [last])
+
+        mgr.fit_token_budget(batch)  # 160 tokens vs a 128 budget
+
+        self.assertEqual(chunking.context_chunk_size, 96, "mid-prefill untouched")
+        self.assertEqual(last.context_chunk_size, 32, "last chunk absorbed the excess")
+        self.assertLessEqual(_forward_tokens(mgr, batch), 128)
+
+    def test_shrinks_multiple_requests_when_one_is_not_enough(self):
+        mgr = _make_manager(max_num_tokens=64, tokens_per_block=16)
+        ctxs = [_FakeRequest(context_chunk_size=64, prompt_len=64) for _ in range(3)]
+        batch = _make_batch(ctxs, [])
+
+        mgr.fit_token_budget(batch)
+
+        self.assertLessEqual(_forward_tokens(mgr, batch), 64)
+        self.assertEqual(batch.num_context_requests, 3)
+
+    def test_no_shrink_when_chunked_prefill_disabled(self):
+        # A partial context chunk is only valid under chunked prefill; forcing
+        # one produces an invalid forward pass. Nothing safe is left to do.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False)
-        # Same shape as test_overshoot_rechunks_context (a 28-token budget and a
-        # 64-token last chunk that is block-aligned re-chunkable to 16), but with
-        # chunked prefill off the request must be deferred, not shrunk.
         ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
-        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
+        gen = _FakeRequest(py_beam_width=100)
         batch = _make_batch([ctx], [gen])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        self.assertEqual(batch.num_context_requests, 0)
-        self.assertEqual(ctx.context_chunk_size, 64)  # not re-chunked
-        self.assertTrue(ctx.is_last_context_chunk)  # still a whole last chunk
+        self.assertEqual(ctx.context_chunk_size, 64)
+        self.assertEqual(batch.num_context_requests, 1)
 
-    def test_overshoot_defers_when_cannot_rechunk(self):
-        # Only an 8-token budget remains -- smaller than one block -- so the
-        # context request cannot be re-chunked and must be deferred entirely.
+    def test_mm_bidirectional_is_not_shrunk(self):
+        # Splitting a bidirectional multimodal block silently breaks attention.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        ctx = _FakeRequest(context_chunk_size=64)
-        gen = _FakeRequest(py_beam_width=120)  # remaining = 8 < tokens_per_block
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64, mm_bidirectional=True)
+        gen = _FakeRequest(py_beam_width=100)
         batch = _make_batch([ctx], [gen])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        self.assertEqual(batch.num_context_requests, 0)
-        self.assertEqual(ctx.context_chunk_size, 64)  # not re-chunked
-
-    def test_mm_bidirectional_is_deferred_not_rechunked(self):
-        # A re-chunkable budget exists, but splitting a bidirectional MM block
-        # would corrupt attention, so the request is deferred whole.
-        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        ctx = _FakeRequest(context_chunk_size=64, mm_bidirectional=True)
-        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
-        batch = _make_batch([ctx], [gen])
-
-        mgr._fit_token_budget(batch)
-
-        self.assertEqual(batch.num_context_requests, 0)
         self.assertEqual(ctx.context_chunk_size, 64)
 
-    def test_defers_all_subsequent_context_requests(self):
-        # ctx1 fits; ctx2 overshoots and cannot re-chunk; ctx3 (small) must
-        # still be deferred to preserve context-progress ordering.
+    def test_disagg_gen_init_requests_are_left_alone(self):
+        # They only allocate/transfer KV cache and contribute no compute tokens.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        ctx1 = _FakeRequest(context_chunk_size=96)
-        ctx2 = _FakeRequest(context_chunk_size=64)
-        ctx3 = _FakeRequest(context_chunk_size=16)
-        gen = _FakeRequest(py_beam_width=16)  # remaining = 112
-        batch = _make_batch([ctx1, ctx2, ctx3], [gen])
+        disagg = _FakeRequest(context_chunk_size=4096, is_disagg_generation_init_state=True)
+        ctx = _FakeRequest(context_chunk_size=16, prompt_len=16)
+        batch = _make_batch([disagg, ctx], [])
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        # ctx1 (96) fits into 112; remaining 16. ctx2 (64) doesn't fit and
-        # (16 // 16) * 16 == 16 but 16 < 64 so it *could* re-chunk to 16...
-        # remaining after is 0, so ctx3 is deferred.
-        kept = batch.context_requests
-        self.assertIn(ctx1, kept)
-        self.assertNotIn(ctx3, kept)
+        self.assertEqual(disagg.context_chunk_size, 4096)
+        self.assertEqual(ctx.context_chunk_size, 16)
 
-    def test_maybe_fit_token_budget_skips_draft_manager(self):
-        # maybe_fit_token_budget is the single entry point driven by the
-        # aggregate ResourceManager. It must apply the fallback for the target
-        # manager only -- the draft-model engine builds inputs with a different
-        # token shape and its budget is handled separately.
-        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
-        gen = _FakeRequest(py_beam_width=120)  # remaining = 8 -> defer ctx
+    def test_gen_only_batch_is_left_alone(self):
+        # Generation cannot be shed, so a batch with no context requests returns
+        # immediately -- keeping the executor loop's hottest path free of an
+        # O(num_generation_requests) scan.
+        mgr = _make_manager(max_num_tokens=8, tokens_per_block=16)
+        batch = _make_batch([], [_FakeRequest(py_beam_width=64)])
 
-        # Non-draft -> defers.
-        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False)
-        mgr.is_draft = False
+        mgr.fit_token_budget(batch)  # must not raise
+
+        self.assertEqual(len(batch.generation_requests), 1)
+
+    def test_generation_alone_over_budget_does_not_raise(self):
+        # There is nothing to shed, but raising here would be rank-local and
+        # would deadlock the surviving ranks under attention DP. Warn and let
+        # the forward pass report it.
+        mgr = _make_manager(max_num_tokens=64, tokens_per_block=16)
+        ctx = _FakeRequest(context_chunk_size=16, prompt_len=16)
+        gen = _FakeRequest(py_beam_width=100)
         batch = _make_batch([ctx], [gen])
-        mgr.maybe_fit_token_budget(batch)
-        self.assertEqual(batch.num_context_requests, 0)
 
-        # Draft manager -> never fits (handled separately).
-        mgr.is_draft = True
-        batch = _make_batch([ctx], [gen])
-        mgr.maybe_fit_token_budget(batch)
+        mgr.fit_token_budget(batch)  # must not raise
+
         self.assertEqual(batch.num_context_requests, 1)
 
-    def test_fallback_runs_before_other_managers(self):
-        # Regression for the emplaceDone double-add (PR #15187): the token-budget
-        # fallback must mutate scheduled_batch BEFORE any resource manager
-        # allocates sequences. A separate draft KV cache manager (MTP) is
-        # invoked before the target KV cache manager (the target is moved to the
-        # end of the manager dict on purpose), so if the fallback ran inside the
-        # target's own prepare_resources the draft manager would already have
-        # added sequences for context requests the fallback then defers --
-        # orphaning them and causing a double-add when they reschedule.
-        #
-        # The executor loop drives the fallback via
-        # ResourceManager.maybe_fit_token_budget before it calls
-        # prepare_resources; build the aggregate ResourceManager with the same
-        # ordering as production (draft-like manager first, KV cache manager
-        # last) and assert the earlier manager observes the *already-deferred*
-        # batch.
-        target = _make_manager(
-            max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False
-        )
-        target.is_draft = False
-        # Don't touch the GPU: only the budget fallback matters for ordering.
-        target.prepare_resources = lambda batch: None
+    def test_maybe_fit_token_budget_skips_draft_manager(self):
+        # The draft-model engine builds inputs with a different token shape and
+        # its budget is handled separately.
+        gen = _FakeRequest(py_beam_width=100)
 
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        mgr.is_draft = False
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        mgr.maybe_fit_token_budget(_make_batch([ctx], [gen]))
+        self.assertEqual(ctx.context_chunk_size, 16)
+
+        mgr.is_draft = True
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        mgr.maybe_fit_token_budget(_make_batch([ctx], [gen]))
+        self.assertEqual(ctx.context_chunk_size, 64)
+
+    def test_trim_runs_after_every_manager(self):
+        # The trim must observe the batch as prepare_resources leaves it: only
+        # after addSequence has run does context_chunk_size mean forward-pass
+        # tokens (setPrepopulatedPromptLen advances context_current_position
+        # past the reusable prefix). Registering the KV cache manager last
+        # mirrors _util.py's move_to_end(KV_CACHE_MANAGER); the trim must still
+        # run after that.
         observed = []
+
+        target = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        target.prepare_resources = lambda batch: observed.append("kv_cache_manager")
 
         class _RecordingManager:
             def prepare_resources(self, batch):
-                observed.append([r.py_request_id for r in batch.context_requests])
+                observed.append("draft_manager")
 
-        ctx_keep = _FakeRequest(context_chunk_size=96)
-        ctx_defer = _FakeRequest(context_chunk_size=64)
-        gen = _FakeRequest(py_beam_width=16)  # remaining = 112
-        batch = _make_batch([ctx_keep, ctx_defer], [gen])
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        gen = _FakeRequest(py_beam_width=100)
+        batch = _make_batch([ctx], [gen])
 
-        # Draft-like manager registered FIRST, KV cache manager LAST (mirrors
-        # _util.py's move_to_end(KV_CACHE_MANAGER)).
         rm = ResourceManager(
             OrderedDict(
                 [
@@ -317,78 +407,33 @@ class TestFitTokenBudget(unittest.TestCase):
                 ]
             )
         )
-        rm.maybe_fit_token_budget(batch)
         rm.prepare_resources(batch)
 
-        # ctx_keep (96) fits into 112; ctx_defer (64) does not and is deferred.
-        # The draft-like manager, though invoked first, must have seen only the
-        # kept request -- proving the fallback ran up front.
-        self.assertEqual(observed, [[ctx_keep.py_request_id]])
-        self.assertEqual(batch.num_context_requests, 1)
+        self.assertEqual(observed, ["draft_manager", "kv_cache_manager"])
+        self.assertEqual(ctx.context_chunk_size, 16, "trim ran after both managers")
 
-    def test_prepare_resources_does_not_trim(self):
-        # The fallback must NOT be reachable from prepare_resources: the
-        # executor loop drives it earlier so that _can_queue's attention-DP
-        # tp_allgather(batch_size) and the PP inflight-set registration both see
-        # the trimmed batch. A second trim here would be redundant at best, and
-        # leaving it as the *only* trim point is what let a rank shed its way to
-        # an empty batch after the ranks had already voted to run.
-        target = _make_manager(
-            max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False
-        )
-        target.is_draft = False
+    def test_prepare_resources_trims(self):
+        # prepare_resources is the only entry point; the executor loops must not
+        # need their own call.
+        target = _make_manager(max_num_tokens=128, tokens_per_block=16)
         target.prepare_resources = lambda batch: None
 
-        ctx_over_budget = _FakeRequest(context_chunk_size=64)
-        gen = _FakeRequest(py_beam_width=100)  # remaining = 28, so ctx cannot fit
-        batch = _make_batch([ctx_over_budget], [gen])
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        gen = _FakeRequest(py_beam_width=100)
+        batch = _make_batch([ctx], [gen])
 
         rm = ResourceManager(OrderedDict([(ResourceManagerType.KV_CACHE_MANAGER, target)]))
         rm.prepare_resources(batch)
 
-        self.assertEqual(batch.num_context_requests, 1)
-
-        # ...and the batch is trimmed only once maybe_fit_token_budget is called.
-        rm.maybe_fit_token_budget(batch)
-        self.assertEqual(batch.num_context_requests, 0)
-
-    def test_generation_alone_over_budget_raises(self):
-        # A context request must be present for the fallback to engage at all
-        # (see test_gen_only_batch_is_left_alone); generation requests that
-        # exceed the budget by themselves leave nothing to shed.
-        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        gen = _FakeRequest(py_beam_width=200)
-        ctx = _FakeRequest(context_chunk_size=16)
-        batch = _make_batch([ctx], [gen])
-
-        with self.assertRaises(RuntimeError):
-            mgr._fit_token_budget(batch)
-
-    def test_gen_only_batch_is_left_alone(self):
-        # Context requests are the only thing the fallback can shed, so a
-        # gen-only batch returns before the generation-token accounting: it
-        # keeps that scan off the executor loop's hottest path, and it avoids
-        # raising on a condition nothing here can fix. An over-budget gen-only
-        # batch stays the concern of the _prepare_tp_inputs assert, which fails
-        # one batch rather than killing the (possibly only rank-local) event
-        # loop.
-        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        gen = _FakeRequest(py_beam_width=200)  # 200 > max_num_tokens
-        batch = _make_batch([], [gen])
-
-        mgr._fit_token_budget(batch)  # must not raise
-
-        self.assertEqual(batch.num_context_requests, 0)
-        self.assertEqual(batch.generation_requests, [gen])
+        self.assertEqual(ctx.context_chunk_size, 16)
 
 
 class TestInflightIdsSurviveTrim(unittest.TestCase):
-    """The fallback must not strand ids in PyExecutor's inflight set.
+    """The trim must not strand ids in PyExecutor's inflight set.
 
     ``_executor_loop_pp`` calls ``_add_inflight_ids`` before
     ``ResourceManager.prepare_resources`` and ``_remove_inflight_ids`` after, so
-    the fallback runs between them and mutates the batch: a deferred context
-    request is dropped from it, and a re-chunked one moves out of
+    the trim runs between them and moves shrunk requests out of
     ``context_requests_last_chunk``. Removal must therefore erase the ids that
     were actually inserted, not re-derive them from the trimmed batch -- an id
     left behind makes the scheduler skip that request forever (scheduler.py's
@@ -406,35 +451,32 @@ class TestInflightIdsSurviveTrim(unittest.TestCase):
         executor.inflight_req_ids = ReqIdsSet()
         return executor
 
-    def test_trimmed_context_requests_leave_no_inflight_ids(self):
+    def test_shrunk_context_requests_leave_no_inflight_ids(self):
         executor = self._bare_executor()
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
 
         gen = _FakeRequest(py_beam_width=100)  # leaves a 28-token budget
-        # Both start as last-chunk requests, so both are registered inflight.
-        # ctx_rechunked shrinks to a block-aligned 16 and flips to a non-last
-        # chunk; ctx_deferred no longer fits and is dropped from the batch.
-        ctx_rechunked = _FakeRequest(context_chunk_size=64, prompt_len=64)
-        ctx_deferred = _FakeRequest(context_chunk_size=64, prompt_len=64)
-        batch = _make_batch([ctx_rechunked, ctx_deferred], [gen])
+        # Starts as a last-chunk request, so it is registered inflight; the trim
+        # then shrinks it to a block-aligned 16 and it stops being a last chunk.
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        batch = _make_batch([ctx], [gen])
 
         executor._add_inflight_ids(batch)
         self.assertEqual(
             sorted(batch.added_inflight_req_ids),
-            sorted([ctx_rechunked.request_id, ctx_deferred.request_id, gen.request_id]),
+            sorted([ctx.request_id, gen.request_id]),
         )
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
 
-        # Preconditions for the regression: the batch really did change shape.
-        self.assertEqual(ctx_rechunked.context_chunk_size, 16)
-        self.assertIn(ctx_rechunked, batch.context_requests_chunking)
+        # Precondition for the regression: the batch really did change shape.
+        self.assertEqual(ctx.context_chunk_size, 16)
+        self.assertIn(ctx, batch.context_requests_chunking)
         self.assertEqual(batch.context_requests_last_chunk, [])
-        self.assertNotIn(ctx_deferred, batch.context_requests)
 
         executor._remove_inflight_ids(batch)
 
-        for req in (ctx_rechunked, ctx_deferred, gen):
+        for req in (ctx, gen):
             self.assertNotIn(
                 req.request_id,
                 executor.inflight_req_ids,
@@ -444,7 +486,7 @@ class TestInflightIdsSurviveTrim(unittest.TestCase):
         self.assertEqual(batch.added_inflight_req_ids, [])
 
     def test_untrimmed_batch_round_trips(self):
-        # The batch the fallback leaves alone must behave exactly as before.
+        # The batch the trim leaves alone must behave exactly as before.
         executor = self._bare_executor()
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
 
@@ -456,7 +498,7 @@ class TestInflightIdsSurviveTrim(unittest.TestCase):
         for req in (ctx, gen):
             self.assertIn(req.request_id, executor.inflight_req_ids)
 
-        mgr._fit_token_budget(batch)
+        mgr.fit_token_budget(batch)
         self.assertEqual(batch.num_context_requests, 1)
 
         executor._remove_inflight_ids(batch)

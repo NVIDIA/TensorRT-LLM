@@ -156,10 +156,11 @@ class ScheduledRequests:
     """Request ids this batch inserted into the executor's inflight set.
 
     Recorded by ``PyExecutor._add_inflight_ids`` so the paired
-    ``_remove_inflight_ids`` erases exactly what was added. The batch can be
-    trimmed between the two calls -- ``ResourceManager.prepare_resources``
-    defers over-budget context requests and re-chunks others -- so the ids are
-    no longer derivable from the request lists at removal time.
+    ``_remove_inflight_ids`` erases exactly what was added. The batch is trimmed
+    between the two calls -- ``ResourceManager.prepare_resources`` shrinks
+    over-budget context chunks at its end, which can move a request out of
+    ``context_requests_last_chunk`` -- so the ids are no longer derivable from
+    the request lists at removal time.
     """
 
     def __init__(self):

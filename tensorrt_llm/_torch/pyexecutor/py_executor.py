@@ -2597,12 +2597,6 @@ class PyExecutor:
                         num_fitting_reqs, fitting_disagg_gen_init_requests,
                         wait_for_disagg_gen_transfer_progress, all_gen_first)
 
-                # Re-validate the per-step token budget and shed deferrable
-                # work here, before the batch is measured, registered in the
-                # inflight set, voted on by _can_queue, or allocated against.
-                # See ResourceManager.maybe_fit_token_budget.
-                self.resource_manager.maybe_fit_token_budget(scheduled_batch)
-
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
@@ -3732,18 +3726,6 @@ class PyExecutor:
                 # client receives an error instead of hanging.
                 self._handle_errors(error_msg, requests=self.active_requests)
                 return None, None
-
-        # Re-validate the per-step token budget and shed deferrable work here,
-        # before the batch is measured, voted on by _can_queue, or allocated
-        # against. See ResourceManager.maybe_fit_token_budget.
-        #
-        # resource_manager is guarded for the same reason model_engine is above:
-        # unit tests drive this method on partially-constructed executors
-        # (object.__new__) that set only the attributes under test. A real
-        # executor always has one -- __init__ assigns it unconditionally.
-        resource_manager = getattr(self, "resource_manager", None)
-        if resource_manager is not None:
-            resource_manager.maybe_fit_token_budget(scheduled_batch)
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -7111,16 +7093,16 @@ class PyExecutor:
 
         The inserted ids are recorded on ``scheduled_requests`` so the paired
         ``_remove_inflight_ids`` erases exactly what was added, rather than
-        re-deriving the set from a batch that may have changed in between. An id
-        left behind is not recoverable: the scheduler skips inflight ids, so the
+        re-deriving the set from a batch that has changed in between. An id left
+        behind is not recoverable: the scheduler skips inflight ids, so the
         request is never scheduled again while still holding its KV blocks and
         sequence slot.
 
-        Callers currently trim the batch before this point (see
-        ``ResourceManager.maybe_fit_token_budget``, which can defer a context
-        request out of the batch entirely or re-chunk one out of
-        ``context_requests_last_chunk``), so the two views agree today. Snapshot
-        anyway: the pairing must not silently depend on that ordering.
+        This is load-bearing, not defensive. In this loop the next step is
+        ``resource_manager.prepare_resources``, which runs
+        ``ResourceManager.maybe_fit_token_budget`` at its end -- and that can
+        shrink a context request out of ``context_requests_last_chunk``. By
+        removal time the batch no longer agrees with what was inserted here.
         """
         added: List[int] = []
         for req in scheduled_requests.context_requests_last_chunk:

@@ -773,64 +773,99 @@ class KVCacheManager(BaseResourceManager):
 
         Mirrors the gate in ``scheduler_v2._align_chunk_to_mm_block``:
         re-chunking a request whose boundary would split a bidirectional
-        multimodal block silently breaks attention, so such requests are
-        deferred whole rather than re-chunked.
+        multimodal block silently breaks attention, so such requests are left
+        at their scheduled chunk size rather than shrunk.
         """
         mm = getattr(req, "py_multimodal_data", None)
         return isinstance(mm, dict) and mm.get("mm_bidirectional_blocks", False)
 
     def _request_forward_tokens(self, req: LlmRequest, *,
                                 is_context: bool) -> int:
-        """Upper bound on the number of position ids ``req`` contributes to a
-        forward pass in ``_prepare_tp_inputs``.
+        """Number of position ids ``req`` contributes to the forward pass.
 
-        This MUST over-estimate. Under-counting would reintroduce the
-        ``total_num_tokens <= max_num_tokens`` assert in ``_prepare_tp_inputs``
-        that this guard exists to prevent.
+        Exact for context requests, but **only once every resource manager has
+        prepared** -- see ``fit_token_budget``. Before that,
+        ``context_chunk_size`` still spans the reusable KV prefix and this
+        over-counts by up to the whole cached prefix.
+
+        Mirrors ``_prepare_tp_inputs``: a context request contributes
+        ``all_prompt_tokens[pos : pos + chunk]``, which Python slicing clamps to
+        what is left of the prompt, plus draft tokens on the last chunk only.
         """
         draft_len = get_draft_token_length(req)
         if is_context:
-            # Context contributes ``context_chunk_size`` positions; draft tokens
-            # are appended only on the last chunk.
-            return req.context_chunk_size + (draft_len if
-                                             req.is_last_context_chunk else 0)
+            materialized = min(req.context_chunk_size,
+                               req.context_remaining_length)
+            return materialized + (draft_len
+                                   if req.is_last_context_chunk else 0)
         # Generation: one position per beam for the new token, plus draft tokens
         # (speculative verification) per beam.
         return req.py_beam_width * (1 + draft_len)
 
-    def _fit_token_budget(self, scheduled_batch: ScheduledRequests) -> None:
-        """Defer or re-chunk context requests so the scheduled batch cannot
-        exceed ``max_num_tokens`` in the forward pass.
+    def _shrink_context_chunk(self, req: LlmRequest, excess: int) -> int:
+        """Shrink ``req``'s chunk by up to ``excess`` tokens. Returns the number
+        of forward-pass tokens actually shed (0 if the request cannot shrink).
 
-        The micro-batch scheduler's token-budget estimate can diverge from the
-        tokens actually materialized by ``_prepare_tp_inputs`` -- for example
-        when a reuse-discounted last context chunk lands next to a near-full
-        generation batch (see GitHub issue #13318). Rather than letting that
-        divergence trip the ``total_num_tokens <= max_num_tokens`` assert in
-        ``_prepare_tp_inputs`` -- which fails every request in the batch and
-        charges the executor's error budget -- re-validate the budget here,
-        before any KV cache is allocated, and gracefully shed only the
-        deferrable work (context chunks), leaving in-flight generation requests
-        untouched.
+        The new chunk must keep ``context_current_position + context_chunk_size``
+        on a block boundary: ``setPrepopulatedPromptLen`` (llmRequest.h) asserts
+        that for every non-last chunk, to keep the KV cache unfragmented. So the
+        chunk is trimmed to the largest block-aligned end that sheds at least
+        ``excess`` tokens, and never below one block of forward progress -- a
+        zero-token chunk would leave the request scheduled but computing
+        nothing, which never terminates.
+        """
+        pos = req.context_current_position
+        current = min(req.context_chunk_size, req.context_remaining_length)
 
-        Deferred context requests are simply dropped from this iteration's
-        ``scheduled_batch``; they remain in the active pool and are rescheduled
-        on a later iteration with a fresh budget.
+        # Smallest chunk that still lands on a block boundary and makes progress.
+        floor_chunk = self.tokens_per_block - (pos % self.tokens_per_block)
+        target_end = ((pos + current - excess) //
+                      self.tokens_per_block) * self.tokens_per_block
+        new_chunk = max(floor_chunk, target_end - pos)
+        if new_chunk >= current:
+            return 0
 
-        An over-budget context request is shrunk (re-chunked) in place only when
-        chunked prefill is enabled; otherwise the attention backend is not set
-        up to consume a partial context chunk and the request is deferred whole
-        instead. Re-chunking with chunked prefill disabled produces an invalid
-        forward pass (empty-query asserts / missing quantized KV buffers /
-        cudaErrorInvalidValue) -- see the regression covered by PR #15187.
+        # Shrinking flips is_last_context_chunk (a computed property:
+        # context_current_position + chunk_size == prompt_len) to False, so the
+        # caller must re-bin the batch afterwards -- otherwise downstream treats
+        # this as a final chunk and appends generation / draft tokens to it.
+        req.context_chunk_size = new_chunk
+        return current - new_chunk
 
-        Context requests are the only work this fallback can shed, so a batch
-        with none scheduled returns immediately -- including before the
-        generation-token accounting below, which cannot change the outcome when
-        there is nothing to defer or re-chunk. That keeps the gen-only batch
-        (the executor loop's hottest, most latency-sensitive path) free of an
-        O(num_generation_requests) scan that costs ~50us at 512 generation
-        requests and ~100us at 1024.
+    def fit_token_budget(self, scheduled_batch: ScheduledRequests) -> None:
+        """Shrink over-budget context chunks so the forward pass cannot exceed
+        ``max_num_tokens``.
+
+        Driven by ``ResourceManager.prepare_resources`` **after** every manager
+        has prepared -- see there for why that is the only correct point. The
+        micro-batch scheduler admits a batch on an estimate: it charges
+        ``reuse_adjusted_compute(chunk, estimated_reusable_tokens, remaining)``
+        (microBatchScheduler.cpp), where ``estimated_reusable_tokens`` is a
+        radix-tree guess made during capacity scheduling. The real figure is
+        ``prepopulated_prompt_len``, computed later inside ``addSequence``. When
+        the real reuse comes in lower than the estimate, the forward pass
+        materializes more tokens than were charged and trips the
+        ``total_num_tokens <= max_num_tokens`` assert in ``_prepare_tp_inputs``
+        -- which fails every request in the batch and charges the executor's
+        error budget (GitHub issue #13318).
+
+        That divergence is not knowable before ``prepare_resources``: the whole
+        point is that the estimate was wrong, and only ``addSequence`` knows by
+        how much. Running here, ``context_current_position`` and
+        ``context_chunk_size`` are final and ``_request_forward_tokens`` is
+        exact.
+
+        Shrink only, never defer. KV cache is already allocated and sequences
+        are already added, so a request cannot be dropped from the batch at this
+        point -- but it does not need to be. Blocks are allocated for the full
+        chunk; the tokens trimmed here are simply computed on the next
+        iteration. Because nothing leaves the batch, this cannot desynchronize
+        the attention-DP ``_can_queue`` vote, the inflight set, or any earlier
+        manager's per-request state.
+
+        Context requests are the only work this can shed, so a batch with none
+        returns immediately -- keeping the gen-only batch (the executor loop's
+        hottest path) free of an O(num_generation_requests) scan.
         """
         # Tested against the two lists rather than the ``context_requests``
         # property, which concatenates them into a fresh list on every access.
@@ -839,110 +874,75 @@ class KVCacheManager(BaseResourceManager):
             return
 
         budget = self.max_num_tokens
-
-        # Generation requests are in-flight and cannot be deferred. If they
-        # alone exceed the budget something is genuinely misconfigured -- fail
-        # this batch loudly rather than overshoot silently.
-        gen_tokens = sum(
+        total = sum(
             self._request_forward_tokens(req, is_context=False)
             for req in scheduled_batch.generation_requests)
-        if gen_tokens > budget:
-            raise RuntimeError(
-                f"In-flight generation requests need {gen_tokens} tokens, "
-                f"exceeding max_num_tokens ({budget}); cannot schedule.")
+        context_requests = scheduled_batch.context_requests
+        total += sum(
+            self._request_forward_tokens(req, is_context=True)
+            for req in context_requests
+            if not req.is_disagg_generation_init_state)
 
-        remaining = budget - gen_tokens
-        kept: RequestList = []
-        deferring = False
-        # Tracks whether we changed the batch at all -- either by dropping a
-        # context request (deferral) or by shrinking one's chunk (re-chunk).
-        # Re-chunking does not change len(kept), so the count alone is not a
-        # sufficient signal that the batch's last-chunk/chunking bins are stale.
-        modified = False
-        for req in scheduled_batch.context_requests:
+        excess = total - budget
+        if excess <= 0:
+            return
+
+        if not self.enable_chunked_prefill:
+            # A shrunk chunk is a partial context chunk, which the attention
+            # backend is only set up to consume under chunked prefill; forcing
+            # one produces an invalid forward pass (empty-query asserts /
+            # missing quantized KV buffers / cudaErrorInvalidValue). Nothing
+            # safe is left to do, so let the assert fire as it does on main.
+            logger.warning(
+                f"Scheduled batch needs {total} forward-pass tokens, exceeding "
+                f"max_num_tokens ({budget}) by {excess}. Cannot trim: chunked "
+                "prefill is disabled. See GitHub issue #13318.")
+            return
+
+        # Shed from the back. ``context_requests`` is
+        # ``context_requests_chunking + context_requests_last_chunk``, so this
+        # trims last-chunk requests first -- which is where the overshoot comes
+        # from: only a last chunk carries a reuse discount
+        # (reuse_adjusted_compute's last-chunk branch) and draft tokens, so it is
+        # the request whose cost the scheduler can have under-charged. Trimming
+        # it converts it back into a chunking request, which is exactly the
+        # repair. Mid-prefill chunks are touched only if that is not enough.
+        shed = 0
+        for req in reversed(context_requests):
+            if excess - shed <= 0:
+                break
             # Disagg generation-init requests only allocate/transfer KV cache
-            # and contribute no compute tokens. The capacity scheduler already
-            # partitions them into a separate fitting_disagg_gen_init_requests
-            # list (capacityScheduler.cpp) handled by _prepare_disagg_gen_init,
-            # so they should never appear in context_requests here -- but if one
-            # ever does, keep it unconditionally and cost-free rather than
-            # accounting, re-chunking, or deferring (shedding) it.
+            # and contribute no compute tokens, so there is nothing to shed.
             if req.is_disagg_generation_init_state:
-                kept.append(req)
                 continue
-            if deferring:
-                modified = True
+            # Re-chunking a request whose boundary would split a bidirectional
+            # multimodal block silently breaks attention.
+            if self._has_mm_bidirectional_block(req):
                 continue
-            cost = self._request_forward_tokens(req, is_context=True)
-            if cost <= remaining:
-                kept.append(req)
-                remaining -= cost
-                continue
+            shed += self._shrink_context_chunk(req, excess - shed)
 
-            # Doesn't fit. Try re-chunking the compute (fewer tokens this step)
-            # before deferring. Re-chunking only reduces compute tokens -- KV is
-            # allocated for the full prompt regardless -- so block accounting is
-            # unaffected. Only safe when chunked prefill is enabled (otherwise
-            # the attention backend is not set up to consume a partial context
-            # chunk -- shrinking the chunk produces an invalid forward pass,
-            # e.g. cudaErrorInvalidValue / empty-query asserts), the request can
-            # be chunked further, the shrunk chunk still holds at least one block
-            # (aligned to block size), and the boundary won't split a
-            # bidirectional multimodal block.
-            new_chunk = (remaining //
-                         self.tokens_per_block) * self.tokens_per_block
-            if (self.enable_chunked_prefill
-                    and new_chunk >= self.tokens_per_block
-                    and new_chunk < req.context_chunk_size
-                    and not self._has_mm_bidirectional_block(req)):
-                # Shrinking context_chunk_size flips is_last_context_chunk (a
-                # computed property: context_current_position + chunk_size ==
-                # prompt_len) to False, so this is now a non-last chunk and must
-                # be re-binned into the chunking list below -- otherwise
-                # downstream treats it as a final chunk and appends generation /
-                # draft tokens to it, corrupting the forward pass.
-                req.context_chunk_size = new_chunk
-                kept.append(req)
-                remaining -= new_chunk
-                modified = True
-            else:
-                # Cannot re-chunk: defer this request entirely.
-                modified = True
-            # remaining budget is now < one block, so no further context
-            # request can fit this iteration.
-            deferring = True
-
-        if modified:
+        if shed:
             logger.debug(
-                f"_fit_token_budget: kept {len(kept)}/"
+                f"fit_token_budget: trimmed {shed} context tokens from "
                 f"{scheduled_batch.num_context_requests} context requests to "
                 f"stay within max_num_tokens={budget}")
-            # Re-bin kept requests into chunking vs last-chunk from each
-            # request's (possibly updated) is_last_context_chunk, and drop any
-            # deferred requests from this iteration's batch.
-            scheduled_batch.reset_context_requests(kept)
+            # Re-bin from each request's (possibly updated)
+            # is_last_context_chunk: a shrunk request is no longer a last chunk.
+            scheduled_batch.reset_context_requests(context_requests)
+
+        if shed < excess:
+            logger.warning(
+                f"Scheduled batch needs {total} forward-pass tokens, exceeding "
+                f"max_num_tokens ({budget}); could only trim {shed}. See "
+                "GitHub issue #13318.")
 
     def maybe_fit_token_budget(self,
                                scheduled_batch: ScheduledRequests) -> None:
-        """Apply the prep-boundary token-budget fallback to ``scheduled_batch``.
-
-        This is a *batch-level* scheduling decision (defer/re-chunk context
-        requests so the forward pass cannot exceed ``max_num_tokens``), so it is
-        driven once by ``ResourceManager.maybe_fit_token_budget`` from the
-        executor loop -- see there for why it has to run that early -- rather
-        than from this manager's own ``prepare_resources``. In particular the
-        target KV cache manager is deliberately invoked *last* (see
-        ``_util.py``'s ``move_to_end(KV_CACHE_MANAGER)``), so running the
-        fallback here would let an earlier manager -- e.g. a separate draft KV
-        cache manager under MTP -- add sequences for context requests the
-        fallback then defers, orphaning those sequences and tripping a
-        double-add (``emplaceDone``, kvCacheManager.cpp) when the deferred
-        requests reschedule.
-        """
+        """Apply the post-allocation token-budget trim to ``scheduled_batch``."""
         if not self.is_draft:
             # The draft-model engine builds inputs with a different token shape;
             # its budget is handled separately.
-            self._fit_token_budget(scheduled_batch)
+            self.fit_token_budget(scheduled_batch)
 
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
@@ -2781,25 +2781,25 @@ class ResourceManager:
 
     @nvtx_range("maybe_fit_token_budget")
     def maybe_fit_token_budget(self, scheduled_batch: ScheduledRequests):
-        """Apply the prep-boundary token-budget fallback (#13318) to the batch.
+        """Apply the post-allocation token-budget trim (#13318) to the batch.
 
-        Defers or re-chunks context requests so the forward pass cannot exceed
-        max_num_tokens, mutating scheduled_batch in place. Driven by the
-        executor loop right after scheduling -- not from prepare_resources --
-        because the batch it produces must be the one every later step sees:
+        Shrinks over-budget context chunks so the forward pass cannot exceed
+        max_num_tokens, mutating scheduled_batch in place. Driven from
+        prepare_resources, after every manager has run, because that is the
+        first point at which the batch's forward-pass token count is knowable:
 
-        - _can_queue all-gathers scheduled_batch.batch_size under attention DP
-          and gates on no rank being empty. Trimming after that vote lets a rank
-          shed its way to an empty batch once the ranks have already agreed to
-          run, which is the exact state that gate exists to prevent.
-        - _add_inflight_ids (PP) registers the batch's last-chunk context
-          requests in the inflight set. Trimming after it registers requests
-          that are no longer in the batch.
-        - Every resource manager keys off the batch's contents, including a
-          separate draft KV cache manager (MTP) invoked before the target one.
-          A manager that adds sequences for a context request the fallback then
-          defers orphans them, tripping a double-add (emplaceDone) when those
-          requests reschedule.
+        - The micro-batch scheduler admits the batch on estimated_reusable_tokens
+          (a radix-tree guess). The real reuse is prepopulated_prompt_len,
+          computed inside addSequence. #13318 is the case where the two differ,
+          so no check running before addSequence can see the divergence.
+        - Until setPrepopulatedPromptLen runs, context_chunk_size still spans the
+          reusable prefix -- it is not a token count, and reading it as one
+          over-charges a reuse hit by the whole cached prefix.
+
+        Trimming this late is only safe because it shrinks rather than defers;
+        nothing leaves the batch, so the attention-DP _can_queue vote, the PP
+        inflight set and every earlier manager's per-request state all stay
+        consistent with the batch they were computed from.
         """
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -2812,6 +2812,9 @@ class ResourceManager:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
+        # After every manager, so context_current_position / context_chunk_size
+        # are final. See maybe_fit_token_budget.
+        self.maybe_fit_token_budget(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(
