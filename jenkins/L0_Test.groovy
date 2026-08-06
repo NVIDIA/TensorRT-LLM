@@ -220,6 +220,24 @@ def isCbtsStage(String stageName) {
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
 }
 
+def freezeCbtsCoverage(String stageDir) {
+    // Stop .cbtscov writes and wait for the dir to settle before the results tar reads it.
+    sh(
+        returnStatus: true,
+        script: """
+            mkdir -p ${stageDir}
+            touch ${stageDir}/${CBTS_STOP_FILE_NAME}
+            prev=\$(stat -c %y ${stageDir} 2>/dev/null || echo unknown)
+            for i in \$(seq 1 15); do
+                sleep 1
+                cur=\$(stat -c %y ${stageDir} 2>/dev/null || echo unknown)
+                [ "\$cur" = "\$prev" ] && break
+                prev=\$cur
+            done
+        """
+    )
+}
+
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
     if (remote.privateKeyPath) {
@@ -354,12 +372,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 sh "mkdir -p ${cbtsLocalDir}"
                 try {
                     timeout(time: 5, unit: 'MINUTES') {
-                        // Pack on the login node; drop a partial archive when nothing matches so the scp fails cleanly.
+                        // Freeze writers, then pack on the login node; an archive with no member is dropped.
                         Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
                                 remote,
-                                "\"cd '${remoteWs}' && tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null || rm -f '${cbtsArchive}'\""
+                                "\"cd '${remoteWs}' && touch '${CBTS_STOP_FILE_NAME}' && sleep 2 && " +
+                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
+                                "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
                             ),
                             returnStatus: true,
                             numRetries: 3,
@@ -1399,6 +1419,7 @@ def getPytestBaseCommandLine(
         extraInternalEnv += " PYTHONPATH=${cbtsScriptDir}:\${PYTHONPATH:-}"
         extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
         extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
+        extraInternalEnv += " CBTS_STOP_FILE=${outputPath}/${CBTS_STOP_FILE_NAME}"
     }
 
     // Container port allocation environment variables for avoiding port conflicts
@@ -2488,6 +2509,9 @@ def CBTS_COVERAGE = "cbts_coverage"
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
+// Sentinel in the stage output dir; while it exists no process writes a .cbtscov file.
+@Field
+def CBTS_STOP_FILE_NAME = "cbts_stop"
 @Field
 def testFilter = [
     (REUSE_TEST): null,
@@ -2929,6 +2953,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             }
             sh "STAGE_NAME=${stageName}"
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
+            if (isCbtsStage(stageName)) {
+                freezeCbtsCoverage(stageName)
+            }
             echo "Upload test results."
             if (suppressTestReporting) {
                 // This attempt is superseded by a planned retry. Keep the tar for
@@ -4326,6 +4353,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (isCbtsStage(stageName)) {
             // K8s runner knows TRTLLM_WHL_PATH here, so all placeholders are substituted at controller time (no worker-side sed).
             sh """
+                # A sentinel left in a reused workspace would suppress this stage's writes.
+                mkdir -p ${WORKSPACE}/${stageName} && rm -f ${WORKSPACE}/${stageName}/${CBTS_STOP_FILE_NAME}
                 cp ${llmSrc}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ${coverageConfigFile}
                 sed -i \\
                     -e 's|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHL_PATH}|g' \\
