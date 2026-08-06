@@ -65,6 +65,8 @@ UBBuffer UserBufferAllocator::allocate(size_t bytes)
 
 void UserBufferAllocator::deallocate(void* addr)
 {
+    // This allocator is intentionally not internally synchronized. Manager-owned buffers reach this method under the
+    // UserBuffersManager mutex; direct callers must serialize access even though the Python binding releases the GIL.
     auto const bufferIter
         = std::find_if(mBuffers.begin(), mBuffers.end(), [addr](auto const& buffer) { return buffer.addr == addr; });
     TLLM_CHECK(bufferIter != mBuffers.end());
