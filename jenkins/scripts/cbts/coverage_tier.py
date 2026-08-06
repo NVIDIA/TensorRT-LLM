@@ -250,6 +250,7 @@ def apply_coverage_tier(
             "dropped_stages": len(dropped),
             "outcome": "narrowed" if narrowed else "nothing_removable",
             "no_data_policy": no_data_policy,
+            "no_diff_files": len(cov.no_diff_files),
             **({"no_data_funcs": list(cov.no_data_funcs)} if cov.no_data_funcs else {}),
         },
     )
