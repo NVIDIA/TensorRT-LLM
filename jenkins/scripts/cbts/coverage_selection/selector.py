@@ -45,6 +45,8 @@ class CoverageResult:
     n_untrusted: int = 0
     # functions with no DB rows (new/uninstrumented); bounded per `no_data_policy`
     no_data_funcs: list[str] = field(default_factory=list)
+    # residual files the forge API returned no patch for (binary / rename / oversized)
+    no_diff_files: list[str] = field(default_factory=list)
 
 
 # Fallback for a changed function with no DB rows: whole file / its importers / nothing.
@@ -98,18 +100,24 @@ class CoverageSelector:
 
     def _impacted_tests(
         self, residual_files: list[str], diffs: dict[str, str]
-    ) -> tuple[set[str], list[str], str | None]:
-        """Return (impacted tests, file::qualname with no DB rows, decline reason or None)."""
+    ) -> tuple[set[str], list[str], list[str], str | None]:
+        """Return (impacted tests, qualnames with no DB rows, files with no diff, decline reason)."""
         impacted: set[str] = set()
         no_data: list[str] = []
+        no_diff: list[str] = []
         for path in residual_files:
             cf = canon(path)
             diff = diffs.get(path) or ""
             source = self._read_head(path)
             if not diff.strip() or source is None:
-                # No diff means an import-executed change cannot be told apart from
-                # a function-body one, and the file row set bounds only the latter.
-                return impacted, no_data, f"no usable diff for residual file: {path}"
+                # The API omits the patch for binary / renamed / oversized files, so
+                # which qualname changed is unknown; bound it as an import-time one.
+                no_diff.append(path)
+                tests = self._import_executed_bound(cf, "<module>")
+                if tests is None:
+                    return impacted, no_data, no_diff, f"no usable diff, no wider row set: {path}"
+                impacted |= tests
+                continue
             lines = iter_diff_post_line_numbers(diff)
             qualnames, ok = qualnames_for_lines(source, lines)
             if not lines or not ok:
@@ -119,9 +127,10 @@ class CoverageSelector:
             import_executed = import_executed_qualnames(source)
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
-                    tests, decline = self._import_executed_impact(cf, qualname, path)
-                    if decline is not None:
-                        return impacted, no_data, decline
+                    tests = self._import_executed_bound(cf, qualname)
+                    if tests is None:
+                        why = f"import-executed scope changed, no wider row set: {path}::{qualname}"
+                        return impacted, no_data, no_diff, why
                     impacted |= tests
                     continue
                 tests = self.db.tests_touching_func(cf, qualname)
@@ -129,16 +138,14 @@ class CoverageSelector:
                 if not tests:
                     no_data.append(f"{cf}::{qualname}")
                     impacted |= self._no_data_fallback(cf)
-        return impacted, no_data, None
+        return impacted, no_data, no_diff, None
 
-    def _import_executed_impact(
-        self, cf: str, qualname: str, path: str
-    ) -> tuple[set[str], str | None]:
-        """Bound an import-time qualname by the file's row set, which under-records it; decline if no wider."""
+    def _import_executed_bound(self, cf: str, qualname: str) -> set[str] | None:
+        """File row set when it is wider than an import-time qualname's, else None (unbounded)."""
         file_tests = self.db.tests_touching_file(cf)
         if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
-            return file_tests, None
-        return set(), (f"import-executed scope changed with no wider row set: {path}::{qualname}")
+            return file_tests
+        return None
 
     def _no_data_fallback(self, cf: str) -> set[str]:
         """Tests to force-run for a changed function the DB never captured."""
@@ -165,9 +172,11 @@ class CoverageSelector:
                     ok=False, reason=f"zero-touch residual file (new/uninstrumented): {path}"
                 )
 
-        impacted_tests, no_data_funcs, decline = self._impacted_tests(residual_files, diffs)
+        impacted_tests, no_data_funcs, no_diff_files, decline = self._impacted_tests(
+            residual_files, diffs
+        )
         if decline is not None:
-            return CoverageResult(ok=False, reason=decline)
+            return CoverageResult(ok=False, reason=decline, no_diff_files=no_diff_files)
 
         impacted: dict[str, set[str]] = {}
         for test in impacted_tests:
@@ -191,6 +200,7 @@ class CoverageSelector:
                 f"{n_untrusted} untrusted (incomplete-capture) test(s) forced to run"
             ),
             impacted=impacted,
+            no_diff_files=no_diff_files,
             skippable=skippable,
             n_untrusted=n_untrusted,
             no_data_funcs=no_data_funcs,

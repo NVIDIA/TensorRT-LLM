@@ -138,6 +138,8 @@ class SelectionResult:
     # Revision the DB was collected at and HEAD's distance from it; None when unknown.
     coverage_db_commit: Optional[str] = None
     coverage_db_lag: Optional[int] = None
+    # Residual files the forge API returned no patch for; they fall back to file level.
+    coverage_no_diff_files: int = 0
 
     def to_json(self) -> str:
         data = {
@@ -155,6 +157,7 @@ class SelectionResult:
             "coverage_db_build": self.coverage_db_build,
             "coverage_db_commit": self.coverage_db_commit,
             "coverage_db_lag": self.coverage_db_lag,
+            "coverage_no_diff_files": self.coverage_no_diff_files,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -455,6 +458,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             result.affected_stages = tier.affected_stages
             result.enable_multi_gpu = True
             result.coverage_dropped_stages = sorted(tier.dropped)
+            result.coverage_no_diff_files = int(tier.detail.get("no_diff_files") or 0)
             if tier.removed:
                 write_coverage_test_db(
                     src_dir=test_db_dir,
