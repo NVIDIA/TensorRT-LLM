@@ -23,6 +23,7 @@ import torch.nn as nn
 from .impl_contract import MoEDeployment, MoEEligibility, MoEEplbBinding, MoEProblem, MoERunContext
 
 if TYPE_CHECKING:
+    from ...utils import Fp4QuantizedTensor
     from .impl_identity import MoEImplDescriptor
 
 
@@ -42,7 +43,7 @@ class MoEImplBase(nn.Module, abc.ABC):
 
     descriptor: "MoEImplDescriptor"  # set by every concrete subclass
 
-    def __init__(self, *, eplb: MoEEplbBinding, **kwargs):
+    def __init__(self, *, eplb: MoEEplbBinding) -> None:
         super().__init__()
         # Layout is known BEFORE create_weights, because weight shapes depend
         # on it. Passing it here is what makes post-hoc setattr unnecessary.
@@ -58,15 +59,17 @@ class MoEImplBase(nn.Module, abc.ABC):
     def create_weights(self) -> None: ...
 
     @abc.abstractmethod
-    def load_weights(self, weights, allow_partial_loading: bool = False) -> None: ...
+    def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None: ...
 
     # ---- execution --------------------------------------------------------
     @abc.abstractmethod
-    def quantize_input(self, x, **kwargs): ...
+    def quantize_input(
+        self, x: "torch.Tensor | Fp4QuantizedTensor", **kwargs: object
+    ) -> "tuple[torch.Tensor, torch.Tensor | None] | dict": ...
 
     @abc.abstractmethod
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
 
     # ---- impl-owned resources: produced here, never passed in -------------
-    def get_workspaces(self, *args, **kwargs):
+    def get_workspaces(self, *args: object, **kwargs: object) -> "list[dict] | None":
         return None

@@ -23,13 +23,17 @@ round-trippable, which is what a persisted tuning result must key on.
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Type
+from typing import Optional, TypeVar
 
 from .impl_contract import MoEInputRequirement, MoEStaticCapability
 from .interface import MoESchedulerKind
 
 _FIELD_RE = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
 _SEP = "."
+
+# Registration is a decorator, so it must hand the CONCRETE class back. A bare
+# ``type`` return would erase the decorated impl down to ``type[Any]``.
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,7 @@ class MoEImplId:
     # kernels collide on one id and the registry refuses to accept the second.
     kernel_name: str  # densegemm | blockscale | blockscale_splitk
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name in ("provider", "technique", "quant", "kernel_name"):
             value = getattr(self, name)
             if not _FIELD_RE.match(value):
@@ -79,7 +83,7 @@ class MoEImplId:
         # untrusted door -- user YAML and persisted tuning results come in here.
         return cls(*parts)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.canonical()
 
 
@@ -106,10 +110,10 @@ class MoEImplDescriptor:
 class MoEImplRegistry:
     """MoEImplId -> implementation class. Duplicate identity is a hard error."""
 
-    def __init__(self):
-        self._store: Dict[MoEImplId, Type] = {}
+    def __init__(self) -> None:
+        self._store: dict[MoEImplId, type] = {}
 
-    def register(self, cls: Type) -> Type:
+    def register(self, cls: type[T]) -> type[T]:
         descriptor = getattr(cls, "descriptor", None)
         if not isinstance(descriptor, MoEImplDescriptor):
             raise TypeError(f"{cls.__name__} must declare a MoEImplDescriptor class attribute")
@@ -124,10 +128,10 @@ class MoEImplRegistry:
         self._store[identity] = cls
         return cls
 
-    def lookup(self, identity: MoEImplId) -> Optional[Type]:
+    def lookup(self, identity: MoEImplId) -> Optional[type]:
         return self._store.get(identity)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._store)
 
 
@@ -136,7 +140,7 @@ class MoEImplRegistry:
 MOE_IMPL_REGISTRY = MoEImplRegistry()
 
 
-def register_moe_impl(cls: Type) -> Type:
+def register_moe_impl(cls: type[T]) -> type[T]:
     """Class decorator registering an impl at class-definition time.
 
     Registration is an import side effect and never happens during

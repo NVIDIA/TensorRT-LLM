@@ -33,7 +33,7 @@ disqualifies an impl, it just tells the scheduler what to prepare.
 import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -205,7 +205,7 @@ class MoEEligibility:
     reject_reason: Optional[MoERejectReason] = None
     detail: str = ""  # human-facing only
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # Kills the "silent False with no reason" anti-pattern at type level.
         if self.eligible and self.reject_reason is not None:
             raise ValueError("eligible=True must not carry a reject_reason")
@@ -270,7 +270,7 @@ class MoERunContext:
     # produced by the outer forward
     output_dtype: Optional[torch.dtype] = None
     do_finalize: bool = True
-    lora_params: Optional[Dict] = None
+    lora_params: Optional[dict] = None
     router_logits: Optional[torch.Tensor] = None
     # scheduling info the impl may need for tuner-visible shapes
     all_rank_num_tokens: Optional[List[int]] = None
