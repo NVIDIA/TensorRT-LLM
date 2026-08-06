@@ -72,9 +72,10 @@ The worker image must contain the components needed by the selected transport:
   `/opt/amazon/efa`.
 - The NIXL LIBFABRIC plugin, `libplugin_LIBFABRIC.so`, available to the process.
   If it is not in the default plugin search path, set `NIXL_PLUGINS_DIR` to the
-  directory that contains the version-matched plugin.
-- Basic process-inspection utilities for the verification commands below, such
-  as `grep` and `ls`, or equivalent tools in minimal images.
+  directory that contains the version-matched plugin. See the
+  [LIBFABRIC Backend Setup](../../../examples/disaggregated/README.md#libfabric-backend-setup)
+  notes for the two supported paths: rebuild NIXL with libfabric and hwloc, or
+  provide a pre-compiled plugin that matches the NIXL version in the image.
 - GDRCopy and GPU Direct RDMA support when GPU memory should be registered
   directly instead of bouncing through CPU memory.
 
@@ -157,27 +158,33 @@ LIBFABRIC and that EFA is visible inside the worker Pod.
 ```bash
 kubectl describe node <node-name> | grep -A3 vpc.amazonaws.com/efa
 kubectl exec <worker-pod> -- ls -l /dev/infiniband
-kubectl logs <worker-pod> | grep -iE "NIXL.*backend|Backend.*instantiated|LIBFABRIC"
+kubectl logs <worker-pod> | grep "NixlTransferAgent::NixlTransferAgent using NIXL backend: LIBFABRIC"
 ```
 
-For a loaded plugin check, inspect the known worker process mappings. Replace
-`<worker-pid>` with the TensorRT LLM or Dynamo worker PID from the container
-entrypoint, supervisor, or runtime logs:
+The backend-selection log line is emitted at INFO level. If the worker logs show
+`Unsupported NIXL backend: ..., fallback to UCX` or a final backend of UCX, the
+backend value was unset, misspelled, used the wrong case, or was set after the
+process started; fix `TRTLLM_NIXL_KVCACHE_BACKEND` and restart the worker.
+
+For a loaded plugin check, inspect worker process mappings without first finding
+the PID. Run the glob through the container shell so it expands inside the Pod:
 
 ```bash
-kubectl exec <worker-pod> -- grep libplugin_LIBFABRIC /proc/<worker-pid>/maps
+kubectl exec <worker-pod> -- sh -c 'grep -l libplugin_LIBFABRIC /proc/*/maps'
 ```
 
-If the logs show UCX instead of LIBFABRIC, check `TRTLLM_NIXL_KVCACHE_BACKEND`,
-`NIXL_PLUGINS_DIR`, and `LD_LIBRARY_PATH`, then restart the worker so NIXL is
-initialized with the corrected environment.
+If the worker aborts with `Failed to create NIXL backend: LIBFABRIC`, the
+LIBFABRIC backend was selected but could not be created. Check
+`NIXL_PLUGINS_DIR`, `LD_LIBRARY_PATH`, and that `libplugin_LIBFABRIC.so` was
+built for the same NIXL version as the runtime image.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Check |
 | --- | --- | --- |
 | Pod cannot schedule | EFA resource is not registered or requested count is too high | `kubectl describe node` and `vpc.amazonaws.com/efa` capacity |
-| Worker falls back to UCX | LIBFABRIC plugin not found or backend env var not set at process start | Worker logs and `NIXL_PLUGINS_DIR` |
+| Worker uses UCX despite intended LIBFABRIC | Backend value is unset, misspelled, wrong-case, or set after process start | Worker log line `Unsupported NIXL backend: ..., fallback to UCX` and final backend-selection log |
+| Worker aborts at startup with `Failed to create NIXL backend: LIBFABRIC` | LIBFABRIC plugin is missing, not discoverable, or version-mismatched | `NIXL_PLUGINS_DIR`, `LD_LIBRARY_PATH`, and plugin/NIXL version match |
 | `/dev/infiniband` is missing | EFA device plugin is absent or another device plugin mounted devices incorrectly | EFA plugin DaemonSet and NVIDIA MOFED setting |
 | Transfer uses CPU bounce buffers | GPU Direct RDMA path is unavailable | EFA/GDRCopy install, driver compatibility, and worker logs |
 | Python signature or native ABI error at startup | Mixed TensorRT LLM Python/native library versions | Rebuild one image from a single TensorRT LLM release |
