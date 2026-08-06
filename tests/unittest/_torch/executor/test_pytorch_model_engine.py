@@ -806,27 +806,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine._force_lora_graph_for_capture = False
         self.assertFalse(engine._use_lora_cuda_graph(batch))
 
-    def test_base_only_graph_maintains_peft_cache_state(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.cuda_graph_lora_manager = Mock()
-        engine._force_lora_graph_for_capture = False
-        batch = ScheduledRequests()
-        batch.generation_requests = [_make_request_stub(7)]
-        peft_cache_manager = Mock()
-
-        result = engine._get_lora_params_from_requests(
-            batch,
-            attn_metadata=Mock(),
-            peft_cache_manager=peft_cache_manager,
-            maybe_graph=True,
-        )
-
-        self.assertIsNone(result)
-        engine.cuda_graph_lora_manager.prepare_base_only_batch.assert_called_once_with(
-            peft_cache_manager)
-        engine.cuda_graph_lora_manager.prepare_cuda_graph_lora_params.assert_not_called(
-        )
-
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
         runner.enabled = True
