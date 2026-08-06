@@ -164,18 +164,6 @@ torch::Tensor fused_qk_norm_rope_to_fp8(torch::Tensor const& qkv, // [num_tokens
     return out;
 }
 
-// Meta (fake) implementation for torch.compile / tracing: only shape+dtype.
-torch::Tensor fused_qk_norm_rope_to_fp8_meta(torch::Tensor const& qkv, int64_t num_heads_q, int64_t num_heads_k,
-    int64_t num_heads_v, int64_t head_dim, int64_t /*rotary_dim*/, double /*eps*/, torch::Tensor const& /*q_weight*/,
-    torch::Tensor const& /*k_weight*/, double /*base*/, bool /*is_neox*/, torch::Tensor const& /*position_ids*/,
-    double /*factor*/, double /*low*/, double /*high*/, double /*attention_factor*/, bool /*is_qk_norm*/,
-    bool /*use_gemma*/, bool /*use_mrope*/, int64_t /*mrope_section1*/, int64_t /*mrope_section2*/)
-{
-    int64_t num_tokens = qkv.size(0);
-    int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-    return torch::empty({num_tokens, total_heads * head_dim}, qkv.options().dtype(torch::kFloat8_e4m3fn));
-}
-
 torch::Tensor minimaxM3Fp8QKNormRopeKVInsert(torch::Tensor const& qkv, torch::Tensor& kvCache,
     torch::Tensor const& outCacheLoc, int64_t numHeadsQ, int64_t numHeadsK, int64_t numHeadsV, int64_t headDim,
     int64_t rotaryDim, double eps, torch::Tensor const& qWeight, torch::Tensor const& kWeight, double base, bool isNeox,
@@ -232,14 +220,6 @@ torch::Tensor minimaxM3Fp8QKNormRopeKVInsert(torch::Tensor const& qkv, torch::Te
         static_cast<int>(rotaryDim), static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(),
         static_cast<float>(base), positionIds.data_ptr<int>(), stream);
     return qOut;
-}
-
-torch::Tensor minimaxM3Fp8QKNormRopeKVInsertMeta(torch::Tensor const& qkv, torch::Tensor& /*kvCache*/,
-    torch::Tensor const& /*outCacheLoc*/, int64_t numHeadsQ, int64_t /*numHeadsK*/, int64_t /*numHeadsV*/,
-    int64_t headDim, int64_t /*rotaryDim*/, double /*eps*/, torch::Tensor const& /*qWeight*/,
-    torch::Tensor const& /*kWeight*/, double /*base*/, bool /*isNeox*/, torch::Tensor const& /*positionIds*/)
-{
-    return torch::empty({qkv.size(0), numHeadsQ, headDim}, qkv.options().dtype(at::ScalarType::Float8_e4m3fn));
 }
 
 std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(torch::Tensor const& packed,
@@ -317,19 +297,6 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
     return {qOut, indexQOut};
 }
 
-std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsertMeta(torch::Tensor const& packed,
-    torch::Tensor& /*kvCache*/, torch::Tensor& /*indexKCache*/, torch::Tensor const& /*outCacheLoc*/, int64_t numHeadsQ,
-    int64_t /*numHeadsKV*/, int64_t numHeadsIndex, int64_t headDim, int64_t /*rotaryDim*/, double /*eps*/,
-    torch::Tensor const& /*qWeight*/, torch::Tensor const& /*kWeight*/, torch::Tensor const& /*indexQWeight*/,
-    torch::Tensor const& /*indexKWeight*/, torch::Tensor const& /*rotaryCosSin*/, torch::Tensor const& /*positionIds*/)
-{
-    auto options = packed.options().dtype(at::ScalarType::Float8_e4m3fn);
-    return {
-        torch::empty({packed.size(0), numHeadsQ, headDim}, options),
-        torch::empty({packed.size(0), numHeadsIndex, headDim}, options),
-    };
-}
-
 // Register the PyTorch operators
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -355,21 +322,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor rotary_cos_sin, Tensor position_ids) -> (Tensor, Tensor)");
 }
 
-// Register the CUDA implementation
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fused_qk_norm_rope", &fused_qk_norm_rope);
     m.impl("fused_qk_norm_rope_to_fp8", &fused_qk_norm_rope_to_fp8);
     m.impl("minimax_m3_fp8_qk_norm_rope_kv_insert", &minimaxM3Fp8QKNormRopeKVInsert);
     m.impl("minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert", &minimaxM3Fp8QKVIndexerNormRopeKVInsert);
-}
-
-// Register the Meta implementation (shape/dtype inference for torch.compile).
-TORCH_LIBRARY_IMPL(trtllm, Meta, m)
-{
-    m.impl("fused_qk_norm_rope_to_fp8", &fused_qk_norm_rope_to_fp8_meta);
-    m.impl("minimax_m3_fp8_qk_norm_rope_kv_insert", &minimaxM3Fp8QKNormRopeKVInsertMeta);
-    m.impl("minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert", &minimaxM3Fp8QKVIndexerNormRopeKVInsertMeta);
 }
 
 } // namespace torch_ext

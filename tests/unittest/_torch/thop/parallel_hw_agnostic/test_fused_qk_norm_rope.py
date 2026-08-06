@@ -440,3 +440,54 @@ def test_fused_qk_norm_rope_to_fp8(
         rtol=0.2,
         atol=0.1,
     )
+
+
+def test_fused_qk_norm_rope_to_fp8_meta_keeps_dynamic_num_tokens():
+    """The fake implementation must propagate a symbolic token dimension.
+
+    Specializing it makes every downstream tensor static, which breaks
+    piecewise CUDA graph partitioning.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    head_dim = 128
+    num_heads_q, num_heads_k, num_heads_v = 8, 1, 1
+    hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+
+    qkv = torch.empty(8, hidden_size, dtype=torch.bfloat16, device="meta")
+    position_ids = torch.empty(8, dtype=torch.int32, device="meta")
+    q_weight = torch.empty(head_dim, dtype=torch.bfloat16, device="meta")
+    k_weight = torch.empty(head_dim, dtype=torch.bfloat16, device="meta")
+
+    with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+        out = torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+            fake_mode.from_tensor(qkv),
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_dim,
+            64,  # rotary_dim
+            1e-5,  # eps
+            fake_mode.from_tensor(q_weight),
+            fake_mode.from_tensor(k_weight),
+            10000.0,  # base
+            True,  # is_neox
+            fake_mode.from_tensor(position_ids),
+            1.0,  # factor
+            0,  # low
+            0,  # high
+            1.0,  # attention_factor
+            True,  # is_qk_norm
+            False,  # use_gemma
+            False,  # use_mrope
+            0,  # mrope_section1
+            0,  # mrope_section2
+        )
+
+    assert isinstance(out.shape[0], torch.SymInt), (
+        f"num_tokens was specialized to {out.shape[0]}; the fake implementation "
+        "must derive the token dimension from qkv.shape[0]"
+    )
+    assert out.shape[1] == hidden_size
+    assert out.dtype == torch.float8_e4m3fn
