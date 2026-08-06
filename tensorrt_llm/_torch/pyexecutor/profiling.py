@@ -41,6 +41,7 @@ keeps ``py_executor.py`` mostly orchestration / thin forwarding while
 isolating the lifecycle logic in this module for review.
 """
 
+import functools
 import os
 import time
 import uuid
@@ -63,6 +64,7 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
 
+@functools.cache
 def load_iteration_indexes(env_var: str):
     """Parse an iteration-range environment variable.
 

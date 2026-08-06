@@ -42,9 +42,8 @@ from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
-from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
-    get_global_profiler, host_profiler_context)
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
+    host_profiler_context
 
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
@@ -101,10 +100,6 @@ _UNBOUNDED_STATS_MAX_LEN = -1
 def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
-
-# Environment variable to specify iteration ranges for profiling start/stop.
-# Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
-PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
@@ -209,32 +204,6 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
     """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
     return _recv_sleep_wakeup_ack_until(comm, source,
                                         time.monotonic() + timeout_s)
-
-
-@functools.cache
-def _load_iteration_indexes(env_var: str):
-    spans = os.environ.get(env_var, None)
-    starts, stops = [], []
-
-    if spans:
-        spans = spans.split(',')
-
-        for span in spans:
-            try:
-                if '-' in span:
-                    start, stop = span.strip().split('-')
-                    starts.append(int(start))
-                    stops.append(int(stop))
-                else:
-                    it = int(span.strip())
-                    starts.append(it)
-                    stops.append(it)
-            except ValueError as e:
-                raise ValueError(
-                    f"Cannot parse span in environment variable `{env_var}`: {e}"
-                ) from None
-
-    return frozenset(starts), frozenset(stops)
 
 
 def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
@@ -1492,6 +1461,12 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
+        # Tear down any profile window an HTTP caller left open (i.e.
+        # /start_profile without a matching /stop_profile).  Runs before the
+        # hang-detector early return below so the leaked window is closed on
+        # every shutdown path.  A no-op when the executor loop already
+        # unwound its own profiling state.
+        self._profile_manager.cleanup()
         if self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
