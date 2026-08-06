@@ -95,7 +95,7 @@ def _cubic_axis(dst_n: int, src_n: int):
     return taps, coef
 
 
-def _check_input(frames: torch.Tensor, op: str, *, layout: str = "[T, H, W, C]") -> None:
+def _check_frames(frames: torch.Tensor, op: str, *, layout: str = "[T, H, W, C]") -> None:
     """Reject anything the kernels cannot address.
 
     Explicit raises rather than ``assert``: assertions vanish under ``python -O``,
@@ -232,7 +232,7 @@ def resize_linear_u8(frames: torch.Tensor, dst_w: int, dst_h: int) -> torch.Tens
 
         dst = (((b0 * (h0 >> 4)) >> 16) + ((b1 * (h1 >> 4)) >> 16) + 2) >> 2
     """
-    _check_input(frames, "resize_linear_u8")
+    _check_frames(frames, "resize_linear_u8")
     T, H, W, C = frames.shape
     dev = frames.device
     xo0, xo1, aa0, aa1 = _linear_tables_x(W, dst_w, C, dev)
@@ -415,7 +415,7 @@ def resize_area_u8(frames: torch.Tensor, factor: int) -> torch.Tensor:
     weights, which are deliberately unimplemented: every supported output
     bucket is a multiple of 16.
     """
-    _check_input(frames, "resize_area_u8")
+    _check_frames(frames, "resize_area_u8")
     T, H, W, C = frames.shape
     if factor not in (2, 4):
         raise ValueError(f"resize_area_u8 factor={factor}, expected one of (2, 4)")
@@ -562,7 +562,7 @@ def resize_cubic_u8(frames: torch.Tensor, dst_w: int, dst_h: int) -> torch.Tenso
     (b3-first mul/add chain, round-half-even) and the row tail uses the
     scalar integer fixed-point cast ``(v + 2^21) >> 22``.
     """
-    _check_input(frames, "resize_cubic_u8")
+    _check_frames(frames, "resize_cubic_u8")
     T, H, W, C = frames.shape
     dev = frames.device
     xt, xc = _cubic_tables_x(W, dst_w, C, dev)

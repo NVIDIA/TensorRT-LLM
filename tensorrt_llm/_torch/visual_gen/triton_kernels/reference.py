@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from .bilateral import circle_offsets, color_lut, reflect_pad
 from .canny import _hysteresis
-from .resize import _COEF_BITS, _COEF_SCALE, _check_input, _cubic_axis, _linear_axis
+from .resize import _COEF_BITS, _COEF_SCALE, _check_frames, _cubic_axis, _linear_axis
 
 _SHIFT = 15
 _TG22 = 13573  # round(tan(22.5deg) * 2**15)
@@ -114,7 +114,7 @@ def bilateral_filter(
 
 def resize_linear_u8(frames: torch.Tensor, dst_w: int, dst_h: int) -> torch.Tensor:
     """Bilinear resize: uint8 ``[T, H, W, C]`` CUDA -> ``[T, dst_h, dst_w, C]``."""
-    _check_input(frames, "resize_linear_u8")
+    _check_frames(frames, "resize_linear_u8")
     T, H, W, C = frames.shape
     dev = frames.device
     sx0, sx1, ax0, ax1 = _linear_axis(dst_w, W, clamp_coeffs=True)
@@ -134,7 +134,7 @@ def resize_linear_u8(frames: torch.Tensor, dst_w: int, dst_h: int) -> torch.Tens
 
 def resize_area_u8(frames: torch.Tensor, factor: int) -> torch.Tensor:
     """Area-average downscale by an integer ``factor`` of 2 or 4."""
-    _check_input(frames, "resize_area_u8")
+    _check_frames(frames, "resize_area_u8")
     T, H, W, C = frames.shape
     dh, dw = H // factor, W // factor
     s = frames.to(torch.int32).reshape(T, dh, factor, dw, factor, C).sum(dim=(2, 4))
@@ -150,7 +150,7 @@ def resize_area_u8(frames: torch.Tensor, factor: int) -> torch.Tensor:
 
 def resize_cubic_u8(frames: torch.Tensor, dst_w: int, dst_h: int) -> torch.Tensor:
     """Bicubic resize: uint8 ``[T, H, W, C]`` CUDA -> ``[T, dst_h, dst_w, C]``."""
-    _check_input(frames, "resize_cubic_u8")
+    _check_frames(frames, "resize_cubic_u8")
     T, H, W, C = frames.shape
     dev = frames.device
     xtaps, xcoef = _cubic_axis(dst_w, W)

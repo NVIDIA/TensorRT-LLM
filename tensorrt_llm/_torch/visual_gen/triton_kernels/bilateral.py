@@ -30,7 +30,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from .resize import _check_input
+from .resize import _check_frames
 
 
 def circle_offsets(radius: int, gauss_space_coeff: float):
@@ -131,7 +131,7 @@ def bilateral_filter(
     frames: torch.Tensor, d: int, sigma_color: float, sigma_space: float
 ) -> torch.Tensor:
     """Bilateral filter over a clip: uint8 ``[T, H, W, 3]`` CUDA -> same shape."""
-    _check_input(frames, "bilateral_filter")
+    _check_frames(frames, "bilateral_filter")
     if frames.shape[-1] != 3:
         raise ValueError(f"bilateral_filter expects [T, H, W, 3], got shape={tuple(frames.shape)}")
     T, H, W, C = frames.shape

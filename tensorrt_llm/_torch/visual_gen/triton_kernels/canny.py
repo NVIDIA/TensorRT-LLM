@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from .resize import _check_input
+from .resize import _check_frames
 
 _BLOCK = 256
 # tl.constexpr, not a bare int: a @triton.jit kernel may only read globals that
@@ -168,7 +168,7 @@ def _hysteresis(strong: torch.Tensor, weak: torch.Tensor) -> torch.Tensor:
 
 def canny_edges(frames: torch.Tensor, low: int, high: int) -> torch.Tensor:
     """Canny over a clip: uint8 ``[C, T, H, W]`` CUDA -> uint8 ``[T, H, W]``."""
-    _check_input(frames, "canny_edges", layout="[C, T, H, W]")
+    _check_frames(frames, "canny_edges", layout="[C, T, H, W]")
     C, T, H, W = frames.shape
     dev = frames.device
 
