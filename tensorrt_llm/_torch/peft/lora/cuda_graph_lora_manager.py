@@ -29,7 +29,7 @@ class CudaGraphLoraManager:
         max_lora_rank: int,
         model: torch.nn.Module,
         lora_model_config: Optional[LoraModelConfig],
-        overlap_lora_and_base: bool = True,
+        overlap_lora_and_base: bool = False,
         device: str = "cuda",
         max_tokens_per_seq: int = 1,
     ):
