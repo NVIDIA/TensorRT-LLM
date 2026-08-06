@@ -464,6 +464,31 @@ class AlltoAllWatchdogCoordinator:
         if watchdog_to_stop is not None:
             watchdog_to_stop.stop()
 
+    @staticmethod
+    def shutdown_shared_watchdog(workspace_state: MutableMapping[str, object]) -> None:
+        """Force-stop the watchdog owned by a workspace being torn down.
+
+        Callers must ensure no new wrappers can acquire the workspace while it
+        is being destroyed. This path intentionally drops all outstanding
+        references so orphaned wrappers cannot leave a daemon thread polling
+        released workspace memory.
+        """
+        state = workspace_state.get(_WORKSPACE_WATCHDOG_STATE_KEY)
+        if state is None:
+            return
+        if not isinstance(state, _WorkspaceWatchdogState):
+            raise TypeError("invalid shared AlltoAll watchdog workspace state")
+
+        watchdog_to_stop: AlltoAllWatchdog | None = None
+        with state.lock:
+            watchdog_to_stop = state.watchdog
+            state.watchdog = None
+            state.config = None
+            state.ref_count = 0
+        if watchdog_to_stop is not None:
+            watchdog_to_stop.stop()
+        workspace_state.pop(_WORKSPACE_WATCHDOG_STATE_KEY, None)
+
     def watch_collective(
         self,
         watchdog: AlltoAllWatchdog | None,
