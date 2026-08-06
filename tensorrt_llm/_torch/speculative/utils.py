@@ -396,14 +396,11 @@ def get_spec_decoder(
         # TorchSampler does the actual sampling (and folds in the d2t vocab
         # mapping). One-model modes below sample inside the worker kernel.
         return TorchSampler(sampler_args)
-    if (spec_dec_mode.is_mtp_eagle_one_model()
-            or spec_dec_mode.is_mtp_vanilla()
-            or spec_dec_mode.is_eagle3_one_model()
-            or spec_dec_mode.is_parallel_draft() or spec_dec_mode.is_sa()
-            or spec_dec_mode.is_draft_target_one_model()):
-        # One sampler for every one-model mode: it only moves the worker's
-        # pre-sampled output around, and its buffer shapes derive from
-        # sampler_args alone.
+    if spec_dec_mode.use_one_engine():
+        # One sampler for every one-model mode (use_one_engine covers MTP,
+        # MTP Eagle, Eagle3, PARD/DFlash/DSpark, DraftTarget and SA): it only
+        # moves the worker's pre-sampled output around, and its buffer shapes
+        # derive from sampler_args alone.
         #
         # WORKAROUND (remove with eagle_choices in release 1.4): the static
         # tree is the one mode where a step can accept more than
