@@ -527,158 +527,6 @@ def beam_candidate_topk(
     return sorted_logprobs, predecessor_beams, tokens
 
 
-def beam_search_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    beam_width_in: int,
-    beam_width_out: int,
-    row_stride: int | None = None,
-    beam_search_args: BeamSearchMetadata,
-    temperature: float | None,
-    length_penalty: "torch.Tensor | float | None" = None,
-    diversity_rate: "torch.Tensor | float | None" = None,
-    return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Sample beam_width tokens for each request in parallel.
-
-    NB: no longer dispatched to. Every early_stopping mode now runs on
-    ``beam_search_sampling_batch_cba``; this pool-free variant freezes a
-    finished beam in its slot instead of vacating it, which diverges from the
-    C++ decoder and from vLLM. Kept as the restore hook referenced by
-    ``_request_uses_cba``, and still exercised directly by unit tests.
-
-    ``length_penalty`` normalizes the beam-selection ranking key as
-    ``cum_log_prob / gen_length**length_penalty``, and ``diversity_rate`` adds
-    ``diversity_rate * source_beam_index`` to it; see ``beam_candidate_topk``. The stored ``cum_log_probs`` remain
-    raw. Both accept a per-request tensor of shape [batch_size] or a scalar;
-    None/0 disables the respective adjustment. When ``length_penalty`` is
-    active, per-beam generated lengths are maintained in place in
-    ``beam_search_args.beam_gen_lengths`` (alongside the other stateful
-    metadata tensors this function updates).
-    """
-    logprobs, softmax, batch_size = _beam_step_preprocess(
-        logits,
-        beam_width_in=beam_width_in,
-        row_stride=row_stride,
-        temperature=temperature,
-        return_probs=return_probs,
-        args=beam_search_args,
-    )
-
-    finished_beams_mask = (
-        beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
-        != FinishReason.NOT_FINISHED.value
-    )
-    finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
-        -1, -1, logprobs.size(-1)
-    )
-    logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
-    logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
-
-    logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-
-    if not isinstance(length_penalty, torch.Tensor) and not length_penalty:
-        length_penalty = None  # scalar 0 (or None) disables normalization
-    if not isinstance(diversity_rate, torch.Tensor) and not diversity_rate:
-        diversity_rate = None  # scalar 0 (or None) disables the adjustment
-    cand_gen_lengths: Optional[torch.Tensor] = None
-    if length_penalty is not None:
-        # Candidate generated length: active beams grow by one token this
-        # step, finished beams keep their frozen length (they only append
-        # pads). The counter is per-beam and cannot be derived from
-        # seq_len - prompt_len, which is shared by all beams of a request.
-        gen_lengths = beam_search_args.beam_gen_lengths[beam_search_args.seq_slots, :beam_width_in]
-        cand_gen_lengths = gen_lengths + (~finished_beams_mask).to(gen_lengths.dtype)
-    # Rank by the (optionally adjusted) score; keep raw cum_log_probs for
-    # storage. The two-stage selection is used even without adjustments: it is
-    # equivalent to a flat top-k there, and faster with the radix backend
-    # (more, shorter rows parallelize better).
-    sorted_logprobs, predecessor_beam, next_tokens = beam_candidate_topk(
-        logprobs,
-        beam_width_out=beam_width_out,
-        length_penalty=length_penalty,
-        cand_gen_lengths=cand_gen_lengths,
-        diversity_rate=diversity_rate,
-        source_beam_indices=beam_search_args.beam_idx_arange,
-    )
-
-    if cand_gen_lengths is not None:
-        # Zero the full configured width first: on a narrowing
-        # variable-beam-width step beam_width_out < beam_width_in, and the
-        # stop criterion reads the full width, so the untouched tail would
-        # otherwise keep the previous step's lengths.
-        beam_search_args.beam_gen_lengths[beam_search_args.seq_slots] = 0
-        beam_search_args.beam_gen_lengths[beam_search_args.seq_slots, :beam_width_out] = (
-            torch.gather(cand_gen_lengths, dim=1, index=predecessor_beam)
-        )
-    beam_search_args.predecessor_beams[beam_search_args.seq_slots, :beam_width_out] = (
-        predecessor_beam
-    )
-    if beam_search_args.stop_past_tokens is not None:
-        # Reorder the finish handler's rolling stop-word window to follow the
-        # beam swap, so multi-token stop-word matching (which appends this
-        # step's tokens to the window after this op) compares against the
-        # correct per-beam history.
-        window = beam_search_args.stop_past_tokens[:, beam_search_args.seq_slots, :beam_width_in]
-        beam_search_args.stop_past_tokens[:, beam_search_args.seq_slots, :beam_width_out] = (
-            torch.gather(
-                window,
-                2,
-                predecessor_beam.long().unsqueeze(0).expand(window.size(0), -1, -1),
-            )
-        )
-
-    finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
-
-    offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
-        : predecessor_beam.size(0)
-    ].unsqueeze(1)
-    finished_beams = finished_beams[offset_predecessor_beam]
-    # Write only the beam_width_out columns produced this step: with variable
-    # beam width it can be smaller than the store width (the stale view() of
-    # the full width crashed on such steps).
-    beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_out] = finished_beams
-
-    cache_indirection = beam_search_args.cache_indirection[
-        beam_search_args.seq_slots, :beam_width_out
-    ]
-    cache_indirection_buffer = beam_search_args.cache_indirection_buffer[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-    torch.gather(
-        cache_indirection_buffer,
-        dim=1,
-        index=predecessor_beam.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
-        out=cache_indirection,
-    )
-
-    index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
-    src = (
-        beam_search_args.beam_idx_arange[:beam_width_out]
-        .view(1, beam_width_out, 1)
-        .expand(batch_size, beam_width_out, 1)
-    )
-    cache_indirection.scatter_(2, index, src)
-
-    beam_search_args.cache_indirection[beam_search_args.seq_slots, :beam_width_out] = (
-        cache_indirection
-    )
-
-    ended_predecessor_mask = torch.gather(dim=1, index=predecessor_beam, input=finished_beams_mask)
-    next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
-
-    old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
-    beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
-        sorted_logprobs[:, :beam_width_out] - old_cum_log_probs[offset_predecessor_beam]
-    )
-    beam_search_args.cum_log_probs[beam_search_args.seq_slots, :beam_width_out] = sorted_logprobs[
-        :, :beam_width_out
-    ]
-    return _pad_next_tokens(next_tokens, beam_search_args.finished_beams.size(1)), softmax
-
-
 class CBAStepResult(NamedTuple):
     """Return of ``_cba_step_math``. A NamedTuple (not a dataclass) so it is a
     valid output of the torch.compile'd fullgraph function while still naming
@@ -1199,21 +1047,6 @@ def _prepare_beam_search(
         cba.cba_caps.index_copy_(0, seq_slots_long, beam_caps_cuda)
 
 
-def _request_uses_cba(request: LlmRequest) -> bool:
-    """Whether this beam-search request runs on the candidate-beams-array path.
-
-    Every early_stopping mode does. The modes differ only in the done verdict
-    computed inside the CBA step (TRUE stops as soon as the pool is full;
-    FALSE / NEVER additionally weigh what is still attainable), matching the
-    C++ decoder, which maintains the pool for all modes.
-
-    Kept as a predicate rather than inlined: it marks the places that depend on
-    the CBA state existing, and it is the hook to restore should a
-    pool-free path be reintroduced.
-    """
-    return True
-
-
 def _prepare_beam_history_cba(
     request: LlmRequest,
     *,
@@ -1421,21 +1254,6 @@ def _finalize_beam(
         )
 
 
-def _check_beam_search_stop_criteria(
-    request: LlmRequest,
-    finish_reasons: torch.Tensor,
-) -> torch.Tensor:
-    """Check if the stop criteria is met for the request.
-
-    NB: only reachable from the pool-free finalize branch, which nothing
-    dispatches to any more -- the CBA path computes its own verdict in
-    ``prepare_cba_group_host``. Kept alongside ``beam_search_sampling_batch``.
-
-    Returns a boolean tensor of shape (), whose value is computed asynchronously.
-    """
-    return (finish_reasons[: request.py_beam_width] > 0).sum() == request.py_beam_width
-
-
 class BeamSearchHandler:
     """Owns the beam-search store and the host-side state the CBA path needs.
 
@@ -1526,7 +1344,8 @@ class BeamSearchHandler:
         which is host-call-count bound; one batched copy per tensor for the
         whole group replaces them (the builders slice the host rows).
         """
-        cba_requests = [request for request in requests if _request_uses_cba(request)]
+        # Every beam-search request runs on this path.
+        cba_requests = list(requests)
         if not cba_requests:
             return None
         store = self._store
@@ -1613,130 +1432,8 @@ class BeamSearchHandler:
                             Shape: (max_tokens, max_beam_width)
             d2h_copier: Callable performing the D2H copy.
         """
-        if _request_uses_cba(request):
-            assert cba_group is not None
-            return _prepare_beam_history_cba(request, cba_group=cba_group)
-
-        # Everything below is the pool-free finalize, unreachable while
-        # _request_uses_cba is unconditionally true. Kept with
-        # beam_search_sampling_batch as the restore path.
-
-        # Gather data used for skipping beam history processing
-        need_finalize_due_to_stop_words = self._has_multi_token_stop_words(request)
-        if need_finalize_due_to_stop_words:
-            need_history = torch.tensor(True)
-        else:
-            should_stop = _check_beam_search_stop_criteria(
-                request,
-                finish_reasons=finish_reasons,
-            )
-            need_history = should_stop
-            # enqueue async D2H copy
-            need_history = self._copy_to_host(need_history)
-
-        num_tokens = request.max_beam_num_tokens + 1  # last token is not yet added
-        prompt_length = request.py_prompt_len
-        num_generated_tokens = num_tokens - prompt_length
-        num_beams = request.py_beam_width
-
-        if num_generated_tokens == 0 or request.state == LlmRequestState.GENERATION_COMPLETE:
-            # early return if no tokens have been generated yet or the request is already finished
-            return None
-
-        beam_search_store = self._store
-        assert beam_search_store is not None
-
-        log_probs_device: _BeamHistoryLogProbsSlices | None = None
-        if request.py_return_log_probs:
-            log_probs_store = self._log_probs_store
-            log_probs_device = _BeamHistoryLogProbsSlices(
-                sampled_log_probs=log_probs_store.sampled_log_probs[
-                    request.py_seq_slot, :num_beams
-                ].view(-1, 1),
-                sampled_logprobs_indices=self._new_tokens[0, request.py_seq_slot, :num_beams].view(
-                    -1, 1
-                ),
-                cum_logprobs=beam_search_store.cum_log_probs[request.py_seq_slot, :num_beams],
-            )
-        device_slices = _BeamHistoryTensors(
-            cache_indirection=beam_search_store.cache_indirection[
-                request.py_seq_slot, :num_beams, prompt_length:num_tokens
-            ],
-            current_path=beam_search_store.original_tokens[
-                request.py_seq_slot, :num_beams, prompt_length:num_tokens
-            ],
-            log_probs=log_probs_device,
-        )
-
-        # In speculative mode, the predictor may skip the copy; otherwise
-        # always copy. `host_snapshot is None` triggers the .cpu() fallback
-        # in `_builder`, which can only happen on a predictor miss.
-        issue_copy = not self._use_speculative_d2h or self.predict_is_likely_finishing(
-            request,
-            num_generated_tokens=num_generated_tokens,
-            num_tokens=num_tokens,
-        )
-
-        host_snapshot: _BeamHistoryTensors | None = None
-        if issue_copy:
-            log_probs_host: _BeamHistoryLogProbsSlices | None = None
-            if device_slices.log_probs is not None:
-                log_probs_host = _BeamHistoryLogProbsSlices(
-                    sampled_log_probs=d2h_copier(device_slices.log_probs.sampled_log_probs),
-                    sampled_logprobs_indices=d2h_copier(
-                        device_slices.log_probs.sampled_logprobs_indices
-                    ),
-                    cum_logprobs=d2h_copier(device_slices.log_probs.cum_logprobs),
-                )
-            host_snapshot = _BeamHistoryTensors(
-                cache_indirection=d2h_copier(device_slices.cache_indirection),
-                current_path=d2h_copier(device_slices.current_path),
-                log_probs=log_probs_host,
-            )
-
-        def _builder() -> BeamHistory | None:
-            if not need_history.item():
-                return None
-
-            if host_snapshot is not None:
-                cache_indirection = host_snapshot.cache_indirection
-                current_path = host_snapshot.current_path
-                log_probs_host = host_snapshot.log_probs
-            else:
-                # Predictor-miss fallback: synchronous .cpu() on the main stream.
-                cache_indirection = device_slices.cache_indirection.cpu()
-                current_path = device_slices.current_path.cpu()
-                log_probs_host = None
-                if device_slices.log_probs is not None:
-                    log_probs_host = _BeamHistoryLogProbsSlices(
-                        sampled_log_probs=device_slices.log_probs.sampled_log_probs.cpu(),
-                        sampled_logprobs_indices=(
-                            device_slices.log_probs.sampled_logprobs_indices.cpu()
-                        ),
-                        cum_logprobs=device_slices.log_probs.cum_logprobs.cpu(),
-                    )
-
-            new_path = _gather_beam_path(
-                current_path=current_path, cache_indirection=cache_indirection
-            )
-            new_logprobs: torch.Tensor | None = None
-            new_logprobs_indices: torch.Tensor | None = None
-            cum_logprobs_out: torch.Tensor | None = None
-            if log_probs_host is not None:
-                new_logprobs, new_logprobs_indices, cum_logprobs_out = _postprocess_beam_logprobs(
-                    request,
-                    cache_indirection=cache_indirection,
-                    log_probs_host=log_probs_host,
-                )
-
-            return BeamHistory(
-                tokens=new_path,
-                logprobs=new_logprobs,
-                logprobs_indices=new_logprobs_indices,
-                cum_logprobs=cum_logprobs_out,
-            )
-
-        return _builder
+        assert cba_group is not None
+        return _prepare_beam_history_cba(request, cba_group=cba_group)
 
     def prepare_beam_histories(
         self,
