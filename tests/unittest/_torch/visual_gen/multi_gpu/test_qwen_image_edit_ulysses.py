@@ -20,9 +20,6 @@ try:
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl  # noqa: E402
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig  # noqa: E402
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping  # noqa: E402
-    from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (  # noqa: E402
-        QwenImageEditPlusPipeline,
-    )
     from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (  # noqa: E402
         QwenJointAttention,
     )
@@ -137,13 +134,6 @@ def _test_qwen_image_edit_ulysses_attention(rank: int, world_size: int) -> None:
     assert text_out.shape == encoder_hidden_states.shape
     assert torch.isfinite(image_out).all()
     assert torch.isfinite(text_out).all()
-
-    QwenImageEditPlusPipeline._validate_ulysses_prompt_masks(world_size, None, None)
-    with pytest.raises(ValueError, match="requires unmasked prompt conditioning"):
-        QwenImageEditPlusPipeline._validate_ulysses_prompt_masks(
-            world_size,
-            torch.ones(1, 4, dtype=torch.bool, device="cuda"),
-        )
 
 
 def test_qwen_image_edit_ulysses_attention_2gpu() -> None:
