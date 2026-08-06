@@ -517,7 +517,7 @@ pipeline {
                         writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
                         sh "curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/slack_payload.json \$PLC_SLACK_WEBHOOK"
                     }
-                    timeout(time: 24, unit: 'HOURS') {
+                    timeout(time: 96, unit: 'HOURS') {
                         input(
                             message: "New licenses detected in release mode. Please review the licenses listed above and confirm they are all approved for release.",
                             ok: "Approve"
