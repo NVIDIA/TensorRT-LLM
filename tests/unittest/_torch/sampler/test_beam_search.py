@@ -955,11 +955,7 @@ def test_beam_search_sampling_batch_diversity_rate():
                                       dtype=torch.float32),
             predecessor_beams=torch.zeros((max_batch_size, beam_width),
                                           dtype=torch.int32),
-            seq_offsets=torch.arange(max_batch_size, dtype=torch.int64) *
-            beam_width,
             beam_idx_arange=torch.arange(beam_width, dtype=torch.int32),
-            beam_gen_lengths=torch.zeros((max_batch_size, beam_width),
-                                         dtype=torch.int32),
         )
 
     logits = torch.full((batch_size * beam_width, vocab_size), -20.0)
@@ -1026,9 +1022,7 @@ def _make_cba_metadata(max_batch, K, attn_len, snap_len, seq_len, prompt_len,
         seq_lens=torch.full((batch, ), seq_len, dtype=torch.int32),
         finished_beams=torch.zeros((max_batch, K), dtype=torch.int32),
         predecessor_beams=torch.zeros((max_batch, K), dtype=torch.int32),
-        seq_offsets=torch.arange(max_batch, dtype=torch.int64) * K,
         beam_idx_arange=torch.arange(K, dtype=torch.int32),
-        beam_gen_lengths=torch.zeros((max_batch, K), dtype=torch.int32),
         cba=CBAState(
             end_ids=torch.full((max_batch, ), end_id, dtype=torch.int32),
             prompt_lens=torch.full((max_batch, ), prompt_len,
@@ -1206,9 +1200,6 @@ def test_beam_search_cba_length_penalty_orders_pool(penalty_as_tensor):
                                batch=1)
         for b in range(K):
             m.cache_indirection[0, b, :] = b
-        # beam0 is the short one: it already finished two tokens ago, so its
-        # frozen length is smaller than beam1's.
-        m.beam_gen_lengths[0] = torch.tensor([1, gen], dtype=torch.int32)
         # Raw scores: beam0 ahead of beam1.
         m.cum_log_probs[0] = torch.tensor([-1.0, -2.0])
 
