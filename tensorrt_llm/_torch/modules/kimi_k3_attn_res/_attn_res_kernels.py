@@ -18,7 +18,7 @@ import torch
 
 try:
     from tensorrt_llm._utils import get_sm_version as _tllm_get_sm_version
-except Exception:  # pragma: no cover — source-loader stub path
+except ImportError:  # pragma: no cover — source-loader stub path
     _tllm_get_sm_version = None
 
 
@@ -39,7 +39,9 @@ def get_attn_res_sm_version() -> int:
     if _tllm_get_sm_version is not None:
         try:
             return int(_tllm_get_sm_version())
-        except Exception:
+        except RuntimeError:
+            # torch raises RuntimeError when no CUDA device is usable;
+            # the property probe below handles that case itself.
             return _default_get_sm_version()
     return _default_get_sm_version()
 

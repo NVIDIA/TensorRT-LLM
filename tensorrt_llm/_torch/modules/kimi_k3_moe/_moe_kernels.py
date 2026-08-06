@@ -67,11 +67,10 @@ def get_moe_sm_version() -> int:
         return -1
     try:
         from tensorrt_llm._utils import get_sm_version as _tllm_get_sm_version
-
-        return int(_tllm_get_sm_version())
-    except Exception:
+    except ImportError:  # pragma: no cover — source-loader stub path
         prop = torch.cuda.get_device_properties(0)
         return prop.major * 10 + prop.minor
+    return int(_tllm_get_sm_version())
 
 
 def is_native_situ_supported() -> bool:

@@ -32,7 +32,7 @@ from . import _kda_decode
 
 try:
     from tensorrt_llm._utils import get_sm_version as _tllm_get_sm_version
-except Exception:  # pragma: no cover — source-loader stub path
+except ImportError:  # pragma: no cover — source-loader stub path
     _tllm_get_sm_version = None
 
 
@@ -54,7 +54,9 @@ def get_kda_sm_version() -> int:
     if _tllm_get_sm_version is not None:
         try:
             return int(_tllm_get_sm_version())
-        except Exception:
+        except RuntimeError:
+            # torch raises RuntimeError when no CUDA device is usable;
+            # the property probe below handles that case itself.
             return _default_get_sm_version()
     return _default_get_sm_version()
 
@@ -69,7 +71,7 @@ def is_kda_optimized_supported() -> bool:
 # ---------------------------------------------------------------------------
 
 _PREFILL_MODULE: Optional[ModuleType] = None
-_PREFILL_IMPORT_ERROR: Optional[BaseException] = None
+_PREFILL_IMPORT_ERROR: Optional[Exception] = None
 
 
 def _load_prefill_module() -> ModuleType:
@@ -83,7 +85,7 @@ def _load_prefill_module() -> ModuleType:
         module = importlib.import_module(
             "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops"
         )
-    except BaseException as exc:  # ImportError when CuTe DSL is unavailable
+    except Exception as exc:  # typically ImportError when CuTe DSL is unavailable
         _PREFILL_IMPORT_ERROR = exc
         raise
     _PREFILL_MODULE = module
@@ -108,7 +110,7 @@ def _load_fla_chunk_kda() -> ModuleType:
 # ---------------------------------------------------------------------------
 
 _MTP_MODULE: Optional[ModuleType] = None
-_MTP_IMPORT_ERROR: Optional[BaseException] = None
+_MTP_IMPORT_ERROR: Optional[Exception] = None
 
 
 def _load_mtp_module() -> ModuleType:
@@ -122,7 +124,7 @@ def _load_mtp_module() -> ModuleType:
         module = importlib.import_module(
             "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops"
         )
-    except BaseException as exc:  # ImportError when CuTe DSL is unavailable
+    except Exception as exc:  # typically ImportError when CuTe DSL is unavailable
         _MTP_IMPORT_ERROR = exc
         raise
     _MTP_MODULE = module
@@ -198,14 +200,14 @@ class KDAKernelDispatch:
             KDAKernelDispatch._selection_logged = True
             try:
                 from tensorrt_llm.logger import logger
-
+            except ImportError:  # pragma: no cover — source-loader stub path
+                pass
+            else:
                 logger.info(
                     f"KDA kernel dispatch: prefill={self.prefill_kernel_path} "
                     f"decode={self.decode_kernel_path} "
                     f"verify={self.verify_kernel_path}"
                 )
-            except Exception:  # pragma: no cover — source-loader stub path
-                pass
 
     def get_prefill_source(self) -> str:
         if self.prefill_kernel_path == "optimized":
