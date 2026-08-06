@@ -85,8 +85,8 @@ class MoEInputRequirement:
     # MoEScheduler.
     requires_sanitized_expert_ids: bool = False
     requires_router_logits: bool = False
-    # Legacy: the bfloat16 combine workspace picked in
-    # ``MoEScheduler._get_nvlink_onesided_moe_output``.
+    # Overrides the NVLink one-sided combine payload dtype; None means the
+    # buffer follows the model output dtype.
     onesided_workspace_dtype: Optional[torch.dtype] = None
 
     # There is deliberately no sentinel field here. Every Communication sets
@@ -242,8 +242,12 @@ class MoEResolutionReport:
 class MoECommPlan:
     """What the comm layer decided for THIS forward. Facts, not capabilities.
 
-    Single producer: the comm strategy builds it at the end of dispatch, and
-    both ``run_moe`` and the following ``comm.combine()`` read the same object.
+    Single producer, so the value ``run_moe`` sees and the value the following
+    ``comm.combine()`` acts on cannot drift apart. That producer is currently
+    ``ExternalCommMoEScheduler._build_comm_plan`` rather than the comm strategy
+    itself; moving it onto the strategy needs ``combine()`` to read
+    ``payload_in_workspace`` off the plan instead of off the strategy, which
+    changes the dispatch and combine signatures and stays with TRTLLM-14972.
     """
 
     input_sf_swizzled: bool  # what quantize_input actually produced
@@ -261,12 +265,14 @@ class MoERunContext:
     than handed to it.
     """
 
-    # produced by routing
-    token_selected_experts: torch.Tensor
-    token_final_scales: Optional[torch.Tensor]
+    # produced by routing. Expert IDs [num_tokens, top_k], or expert slots of
+    # the same shape when EPLB is enabled. None when the impl routes internally
+    # from ``router_logits`` instead.
+    token_selected_experts: Optional[torch.Tensor]
+    token_final_scales: Optional[torch.Tensor]  # routing weights [num_tokens, top_k]
     # produced by quantize_input
-    x: torch.Tensor
-    x_sf: Optional[torch.Tensor]
+    x: torch.Tensor  # activations [num_tokens, hidden_size]
+    x_sf: Optional[torch.Tensor]  # scale factors, when the input is quantized
     # produced by the outer forward
     output_dtype: Optional[torch.dtype] = None
     do_finalize: bool = True
@@ -276,6 +282,31 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+
+
+def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:
+    """The plan for this forward, for impls that cannot run without one.
+
+    ``comm_plan`` is optional on the context because a fused-comm impl owns the
+    EP exchange itself, so nothing outside its kernel decided anything about the
+    forward. Every external-comm impl is the opposite case: it is only reachable
+    through ``ExternalCommMoEScheduler``, which builds a plan on every path.
+
+    Substituting defaults instead of failing is what this guards against. A
+    wrong ``moe_output`` or ``enable_alltoall`` surfaces as a shape or kernel
+    error, but a wrong ``input_sf_swizzled`` does not: the kernel reads scale
+    factors at the stride it was told, so a plan-less default of "swizzled"
+    against unswizzled input returns silently wrong numbers.
+    """
+    if ctx.comm_plan is None:
+        # Not an assert: silently-wrong output is the failure mode this exists
+        # to prevent, so the check must survive ``python -O``.
+        raise ValueError(
+            f"{type(impl).__name__}.run_moe needs ctx.comm_plan, and the scheduler "
+            "that drives it always supplies one. A missing plan means run_moe was "
+            "called without going through ExternalCommMoEScheduler."
+        )
+    return ctx.comm_plan
 
 
 @dataclass(frozen=True)
