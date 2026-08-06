@@ -18,16 +18,11 @@ import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.utils import torch_multi_arange
-from tensorrt_llm._utils import (
-    is_trace_enabled,
-    maybe_pin_memory,
-    nvtx_range,
-    prefer_pinned,
-    release_gc,
-    torch_dtype_to_str,
-    trace_func,
-)
-from tensorrt_llm.bindings.internal import batch_manager as batch_manager_bindings
+from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
+                                 prefer_pinned, release_gc, torch_dtype_to_str,
+                                 trace_func)
+from tensorrt_llm.bindings.internal import \
+    batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
@@ -47,7 +42,8 @@ from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
-from ..attention_backend.interface import AttentionMetadata, AttentionRuntimeFeatures
+from ..attention_backend.interface import (AttentionMetadata,
+                                           AttentionRuntimeFeatures)
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
@@ -61,56 +57,40 @@ from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin, _build_request_multimodal_input
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
+                                                _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
-from ..modules.fused_moe.moe_load_balancer import MoeLoadBalancer, MoeLoadBalancerIterContext
+from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+                                                   MoeLoadBalancerIterContext)
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
-from ..speculative import (
-    SpecMetadata,
-    get_draft_kv_cache_manager,
-    get_num_extra_kv_tokens,
-    get_spec_metadata,
-    prepare_attn_metadata_for_draft_replay,
-    restore_attn_metadata_after_draft_replay,
-    update_spec_config_from_loaded_model,
-)
+from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
+                           get_num_extra_kv_tokens, get_spec_metadata,
+                           prepare_attn_metadata_for_draft_replay,
+                           restore_attn_metadata_after_draft_replay,
+                           update_spec_config_from_loaded_model)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
-from ..utils import (
-    get_model_extra_attrs,
-    set_per_request_piecewise_cuda_graph_flag,
-    set_torch_compiling,
-    with_model_extra_attrs,
-)
+from ..utils import (get_model_extra_attrs,
+                     set_per_request_piecewise_cuda_graph_flag,
+                     set_torch_compiling, with_model_extra_attrs)
 from .config_utils import is_mla
-from .cuda_graph_runner import (
-    ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
-    CUDAGraphRunner,
-    CUDAGraphRunnerConfig,
-    EncoderCUDAGraphRunner,
-    EncoderCUDAGraphRunnerConfig,
-)
+from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
+                                CUDAGraphRunner, CUDAGraphRunnerConfig,
+                                EncoderCUDAGraphRunner,
+                                EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (
-    LlmRequest,
-    LlmRequestState,
-    get_draft_token_length,
-    get_multimodal_embedding_lengths,
-)
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+                          get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .resource_manager import (
-    BaseResourceManager,
-    KVCacheManager,
-    PeftCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
+from .resource_manager import (BaseResourceManager, KVCacheManager,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
@@ -380,11 +360,9 @@ class PyTorchModelEngine(ModelEngine):
             init_pp_comm(mapping)
         # Start with the established pool size. Once the model is loaded we
         # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
-        from ._util import (
-            compute_max_num_sequences,
-            should_enable_dsv4_adp_dummy_fixes,
-            should_enable_dsv4_overlap_headroom,
-        )
+        from ._util import (compute_max_num_sequences,
+                            should_enable_dsv4_adp_dummy_fixes,
+                            should_enable_dsv4_overlap_headroom)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping, self.batch_size, llm_args.disable_overlap_scheduler)
         self.dist = dist
@@ -1438,9 +1416,7 @@ class PyTorchModelEngine(ModelEngine):
             return
         try:
             from tensorrt_llm._torch.attention_backend.sparse.dsa import (
-                _DG_SCHEDULE_BLOCK_KV,
-                DSAtrtllmAttentionMetadata,
-            )
+                _DG_SCHEDULE_BLOCK_KV, DSAtrtllmAttentionMetadata)
         except ImportError:
             return
         if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
@@ -1507,7 +1483,8 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
+            from ..attention_backend.sparse.dsa import \
+                DSAtrtllmAttentionMetadata
         except ImportError:
             return
         if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
@@ -6576,7 +6553,8 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_config, 'sa_config', None) is not None)
         if has_sa_enhancer and resource_manager is not None and self.mapping.is_last_pp_rank(
         ):
-            from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
+            from tensorrt_llm._torch.speculative.suffix_automaton import \
+                SuffixAutomatonManager
             spec_rm = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             sa_manager = None

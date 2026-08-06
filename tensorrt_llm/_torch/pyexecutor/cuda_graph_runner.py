@@ -7,11 +7,9 @@ from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.llmapi.llm_args import (
-    BaseSparseAttentionConfig,
-    DecodingBaseConfig,
-    SeqLenAwareSparseAttentionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
+                                          DecodingBaseConfig,
+                                          SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -26,7 +24,8 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import LlmRequest, get_draft_token_length
-from .resource_manager import BaseResourceManager, ResourceManager, ResourceManagerType
+from .resource_manager import (BaseResourceManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
