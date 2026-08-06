@@ -1107,6 +1107,7 @@ class DFlashForCausalLM(nn.Module):
         # non-causal block attention). Subclasses opt in.
         self._context_input_layernorm = False
         self._sliding_layers_causal = False
+        self._warn_inferred_attention_windows()
 
     @staticmethod
     def _rope_signature(attn):
@@ -1597,6 +1598,29 @@ class DFlashForCausalLM(nn.Module):
             rope_sin = rope_sin.to(dtype)
         return rope_cos, rope_sin
 
+    def _warn_inferred_attention_windows(self) -> None:
+        """Warn once at initialization when checkpoint metadata enables SWA."""
+        if getattr(self.config, 'use_sliding_window', None) is not None:
+            return
+
+        num_hidden_layers = getattr(self.config, 'num_hidden_layers', None)
+        if num_hidden_layers is None:
+            num_hidden_layers = len(self.model.layers)
+        layers_by_window = {}
+        for layer_idx in range(num_hidden_layers):
+            window = get_layer_attention_window(self.config, layer_idx)
+            if window is not None:
+                layers_by_window.setdefault(window, []).append(layer_idx)
+
+        for window, layer_indices in layers_by_window.items():
+            logger.warning(
+                "DFlash inferred pooled-context sliding-window attention from "
+                f"checkpoint config for draft layers {layer_indices}: "
+                f"window={window}. Context attention is truncated to {window} "
+                "tokens for these layers; if the drafter expects full context, "
+                "acceptance rate may drop. Set use_sliding_window explicitly "
+                "to confirm or disable windowing.")
+
     def _get_attention_mask_args(self, layer_idx):
         """Return FlashAttention causal and local-window arguments for a layer."""
         layer_types = getattr(self.config, 'layer_types', None)
@@ -1612,8 +1636,7 @@ class DFlashForCausalLM(nn.Module):
 
         causal = self._sliding_layers_causal or sliding_window is not None
         if sliding_window is None:
-            # Laguna uses causal draft blocks but deliberately retains all
-            # context K/V. Generic legacy drafters also preserve their prior
+            # Legacy drafters without an explicit window preserve their prior
             # non-windowed behavior.
             return causal, (-1, -1)
         # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.

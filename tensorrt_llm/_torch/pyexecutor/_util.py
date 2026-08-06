@@ -442,6 +442,60 @@ def _normalize_attention_windows(
     return normalized
 
 
+def _get_num_pool_groups_for_estimation(
+    model_config: object,
+    max_seq_len: int,
+    fallback_attention_windows: Optional[List[Optional[int]]],
+) -> int:
+    """Infer the number of V2 KV-cache pools needed during estimation.
+
+    Sliding/full-attention hybrids are best distinguished by their effective
+    windows. Hybrid linear-attention models with mixed layer types fall back to
+    their distinct layer types. Unsupported target window metadata must not
+    make estimation fail; in that
+    case preserve the legacy layer-type/window heuristic.
+    """
+    num_layers = getattr(model_config, "num_hidden_layers", None)
+    layer_types = getattr(model_config, "layer_types", None)
+    attention_windows = None
+    if isinstance(num_layers, int) and num_layers > 0:
+        try:
+            inferred_windows = [
+                get_layer_attention_window(model_config, layer_idx)
+                for layer_idx in range(num_layers)
+            ]
+        except (NotImplementedError, ValueError) as error:
+            logger.warning(
+                "Unable to infer target attention windows for KV-cache "
+                f"estimation ({error}); falling back to layer metadata.")
+        else:
+            if any(window is not None for window in inferred_windows):
+                attention_windows = [
+                    max_seq_len if window is None else window
+                    for window in inferred_windows
+                ]
+
+    if attention_windows is not None:
+        normalized_windows = _normalize_attention_windows(
+            attention_windows, max_seq_len)
+        if normalized_windows is None:
+            return 1
+        return len(set(normalized_windows))
+
+    if isinstance(layer_types, (list, tuple)):
+        num_layer_types = len(set(layer_types))
+        if num_layer_types > 1:
+            return num_layer_types
+
+    if fallback_attention_windows is not None:
+        normalized_windows = _normalize_attention_windows(
+            fallback_attention_windows, max_seq_len)
+        if normalized_windows is not None:
+            return len(set(normalized_windows))
+
+    return 1
+
+
 def draft_config_defines_attention_layout(
     draft_pretrained_config: object, ) -> bool:
     """Return whether the draft HF config explicitly defines its attention layout.
@@ -946,47 +1000,19 @@ class KvCacheCreator:
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
 
-        # For VSWA (variable sliding window attention) models such as Gemma4
-        # hybrid, KVCacheManagerV2 creates a separate pool group per distinct
-        # attention window size. The quota passed via max_tokens is split
-        # across pool groups proportionally, so each pool ends up with roughly
-        # num_cache_blocks/num_pool_groups blocks in the worst case. A single
-        # context request of max_seq_len tokens then exceeds the full-attention
-        # pool's block budget and resize_context livelocks on suspend/retry
-        # (observed for Gemma4 multimodal at max_seq_len>=8K, e.g. MMMU Pro).
-        # Scale num_cache_blocks by the number of distinct pool groups so that
-        # each pool has enough blocks for the dummy request even after the
-        # proportional split. Inferred from the model config since the hybrid
-        # max_attention_window hasn't been populated in kv_cache_config yet at
-        # this stage (it's filled in later by _create_kv_cache_manager).
-        # Only V2 has split-pool semantics — Mamba hybrid (which also has
-        # heterogeneous layer_types) uses MambaHybridCacheManager and would
-        # have its max_tokens estimate inflated incorrectly otherwise.
+        # KVCacheManagerV2 divides the quota derived from max_tokens across its
+        # pool groups. Scale the dummy workload by the inferred group count so
+        # each pool can hold a max-length request. This covers both VSWA pools
+        # (distinct attention windows) and hybrid recurrent/attention pools
+        # (distinct layer types without sliding windows).
         num_pool_groups = 1
         if self._is_kv_cache_manager_v2:
             model_cfg = self._model_engine.model.model_config.pretrained_config
-            num_layers = getattr(model_cfg, "num_hidden_layers", None)
-            attention_windows = None
-            if isinstance(num_layers, int) and num_layers > 0:
-                inferred_windows = [
-                    get_layer_attention_window(model_cfg, layer_idx)
-                    for layer_idx in range(num_layers)
-                ]
-                if any(window is not None for window in inferred_windows):
-                    attention_windows = [
-                        self._model_engine.max_seq_len
-                        if window is None else window
-                        for window in inferred_windows
-                    ]
-            if attention_windows is None:
-                attention_windows = self._kv_cache_config.max_attention_window
-            if attention_windows is not None:
-                attention_windows = _normalize_attention_windows(
-                    attention_windows,
-                    self._model_engine.max_seq_len,
-                )
-            if uses_vswa_kv_cache_layout(attention_windows):
-                num_pool_groups = len(set(attention_windows))
+            num_pool_groups = _get_num_pool_groups_for_estimation(
+                model_cfg,
+                self._model_engine.max_seq_len,
+                self._kv_cache_config.max_attention_window,
+            )
         num_cache_blocks *= num_pool_groups
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
