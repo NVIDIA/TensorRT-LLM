@@ -303,6 +303,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml",
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml",
+        "deepseek_v3_lite_fp8_v2_attention_dp_overlap_slot_pressure":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_v2_attention_dp_overlap.yaml",
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml",
         "deepseek_v3_lite_fp8_overlap_cuda_graph":
@@ -936,7 +938,8 @@ def run_disaggregated_test(example_dir,
                            disagg_schedule_style=None,
                            post_client_test=None,
                            assert_gen_log_contains=None,
-                           perf_metrics_output_dir=None):
+                           perf_metrics_output_dir=None,
+                           server_start_timeout=300):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
@@ -957,7 +960,8 @@ def run_disaggregated_test(example_dir,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style,
                              save_log=assert_gen_log_contains is not None,
-                             perf_metrics_output_dir=perf_metrics_output_dir)
+                             perf_metrics_output_dir=perf_metrics_output_dir,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
 
@@ -1993,6 +1997,25 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
                            env=llm_venv._new_env,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_v2_attention_dp_overlap_slot_pressure(
+        llm_venv, disaggregated_example_root, deepseek_v3_model_root):
+    """Exercise V2 overlap slot pressure without DeepSeek-V4 or MTP."""
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_v2_attention_dp_overlap_slot_pressure",
+        num_iters=1,
+        env=llm_venv._new_env,
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200)
 
 
 @skip_no_hopper

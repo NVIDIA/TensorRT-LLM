@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4 seq-slot sizing includes overlap headroom.
+"""Disaggregated attention-DP seq-slot sizing includes overlap headroom.
 
 Under the overlap scheduler, requests finished in the previous iteration
 still hold their sequence slots when the next iteration's
@@ -8,8 +8,7 @@ prepare_resources runs, while the V2 scheduler has already dropped them
 from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and
 backfilled their seats. Transient slot demand is therefore
 2 * max_batch_size, regardless of whether speculative decoding is enabled.
-The headroom is intentionally limited to DeepSeek-V4; other models preserve
-their established sizing pending separate validation.
+The headroom is selected from runtime topology rather than model architecture.
 
 compute_max_num_sequences is the single sizing implementation used both
 for the executor's SeqSlotManager pool (create_py_executor_instance) and
@@ -21,9 +20,10 @@ import pytest
 from tensorrt_llm._torch.pyexecutor._util import (
     compute_max_num_sequences,
     create_torch_sampler_args,
+    should_enable_disagg_adp_overlap_headroom,
     should_enable_dsv4_adp_dummy_fixes,
-    should_enable_dsv4_overlap_headroom,
 )
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 SIZING_CASES = [
@@ -39,18 +39,30 @@ SIZING_CASES = [
 
 
 @pytest.mark.parametrize(
-    "model_type,pp_size,disable_overlap,expected",
+    "enable_attention_dp,is_disagg,pp_size,disable_overlap,expected",
     [
-        ("deepseek_v4", 1, False, True),
-        ("deepseek_v3", 1, False, False),
-        ("deepseek_v4", 2, False, False),
-        ("deepseek_v4", 1, True, False),
+        (True, True, 1, False, True),
+        (False, True, 1, False, False),
+        (True, False, 1, False, False),
+        (True, True, 2, False, False),
+        (True, True, 1, True, False),
     ],
 )
-def test_dsv4_overlap_headroom_gate(model_type, pp_size, disable_overlap, expected):
-    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+def test_disagg_adp_overlap_headroom_gate(
+    enable_attention_dp, is_disagg, pp_size, disable_overlap, expected
+):
+    mapping = Mapping(
+        world_size=pp_size,
+        tp_size=1,
+        pp_size=pp_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+    cache_config = CacheTransceiverConfig(backend="NIXL") if is_disagg else None
 
-    assert should_enable_dsv4_overlap_headroom(model_type, mapping, disable_overlap) is expected
+    assert (
+        should_enable_disagg_adp_overlap_headroom(mapping, cache_config, disable_overlap)
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
