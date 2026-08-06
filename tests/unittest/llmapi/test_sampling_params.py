@@ -31,6 +31,8 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.resource_governor import ResourceGovernor
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
 def test_check_logprobs_limit(field):
@@ -113,6 +115,44 @@ def test_completion_logprobs_assignment_revalidates():
 
     with pytest.raises(ValueError, match=f"less than or equal to {MAX_TOP_LOGPROBS}"):
         request.to_sampling_params(backend="pytorch")
+
+
+@pytest.mark.parametrize("field", ["top_p", "min_p", "temperature"])
+def test_sampling_params_rejects_nan(field):
+    with pytest.raises(ValueError, match=field):
+        SamplingParams(**{field: float("nan")})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("top_p", -0.1),
+        ("top_p", 1.1),
+        ("min_p", -0.1),
+        ("min_p", 1.1),
+        ("temperature", -1.0),
+    ],
+)
+def test_sampling_params_rejects_out_of_range(field, value):
+    with pytest.raises(ValueError, match=field):
+        SamplingParams(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("top_p", 0.0),
+        ("top_p", 0.9),
+        ("top_p", 1.0),
+        ("min_p", 0.0),
+        ("min_p", 0.5),
+        ("min_p", 1.0),
+        ("temperature", 0.0),
+        ("temperature", 1.0),
+    ],
+)
+def test_sampling_params_accepts_in_range_values(field, value):
+    assert getattr(SamplingParams(**{field: value}), field) == value
 
 
 @pytest.mark.parametrize("value", [None, -1])

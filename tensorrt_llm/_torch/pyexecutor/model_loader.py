@@ -416,13 +416,6 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
-        if llm_args.speculative_config is not None:
-            from tensorrt_llm._torch.speculative import \
-                update_spec_config_from_model_config
-
-            update_spec_config_from_model_config(llm_args.speculative_config,
-                                                 config.pretrained_config)
-
         model_cls = AutoModelForCausalLM._resolve_class(config)
         use_kv_cache_manager_v2 = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
@@ -438,6 +431,15 @@ class ModelLoader:
                     logger.info(
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
+
+        if llm_args.speculative_config is not None:
+            from tensorrt_llm._torch.speculative import \
+                update_spec_config_from_model_config
+
+            # Model defaults reconstruct nested Pydantic configs and drop
+            # init=False runtime fields such as num_nextn_predict_layers.
+            update_spec_config_from_model_config(llm_args.speculative_config,
+                                                 config.pretrained_config)
 
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class
@@ -553,7 +555,8 @@ class ModelLoader:
 
             loads_draft_weights = (
                 self.spec_config is not None
-                and self.spec_config.spec_dec_mode.need_load_draft_weights())
+                and (self.spec_config.spec_dec_mode.need_load_draft_weights()
+                     or self.spec_config._use_shared_kv_cache))
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,
@@ -704,8 +707,7 @@ class ModelLoader:
                     self._call_load_weights(model.load_weights, weights,
                                             self.weight_mapper)
 
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights:
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -840,8 +842,7 @@ class ModelLoader:
                                     "commit an unpopulated model to the GMS "
                                     "pool.")
 
-                            if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                            ):
+                            if loads_draft_weights:
                                 draft_weights = checkpoint_loader.load_weights(
                                     self.spec_config.speculative_model,
                                     mapping=self.mapping)
@@ -968,8 +969,7 @@ class ModelLoader:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 initialize_dummy_weights(model)
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights:
                     model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:

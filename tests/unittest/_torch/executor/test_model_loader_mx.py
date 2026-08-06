@@ -272,6 +272,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     return loader
 
 
+@pytest.mark.cpu_only
 def test_construct_checkpoint_loader_passes_mx_config():
     mx_config = SimpleNamespace(
         server_url="http://mx:8001",
@@ -292,6 +293,7 @@ def test_construct_checkpoint_loader_passes_mx_config():
     assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
+@pytest.mark.cpu_only
 def test_public_support_table_matches_qualified_profile_registry() -> None:
     profiles = ModelLoader._POST_TRANSFORM_PROFILE_REGISTRY.profiles
     documentation = (Path(__file__).parents[4] / "docs/source/features/model-express.md").read_text(
@@ -320,6 +322,7 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
         assert any(row.startswith(expected_row_prefix) for row in table_rows)
 
 
+@pytest.mark.cpu_only
 def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -365,6 +368,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert events == ["post_load_weights", "load_weights"]
 
 
+@pytest.mark.cpu_only
 def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
@@ -382,6 +386,7 @@ def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch)
     assert events == ["load_weights"]
 
 
+@pytest.mark.cpu_only
 def test_mx_partial_fallback_merges_returned_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -447,6 +452,7 @@ class _UnsafePostTransformMxLoader(_PostTransformMxLoader):
         return {}
 
 
+@pytest.mark.cpu_only
 def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,6 +508,7 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
     assert_post_transform_lifecycle_equivalent(case)
 
 
+@pytest.mark.cpu_only
 def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -522,6 +529,7 @@ def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
 
 
+@pytest.mark.cpu_only
 def test_one_engine_speculative_mode_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -542,12 +550,12 @@ def test_one_engine_speculative_mode_is_not_qualified_by_target_only_profile(
     assert decision.unsupported_features == frozenset()
 
 
+@pytest.mark.cpu_only
 def test_speculative_mode_name_is_canonical_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warning = MagicMock()
     monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
-
     assert ModelLoader._speculative_mode_name(None) is None
     warning.assert_not_called()
     assert (
@@ -568,6 +576,7 @@ def test_speculative_mode_name_is_canonical_and_fails_closed(
     )
 
 
+@pytest.mark.cpu_only
 def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -623,6 +632,7 @@ def test_load_qualifies_with_preconstruction_identity_after_model_normalization(
     assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
 
 
+@pytest.mark.cpu_only
 def test_mx_rejects_post_transform_preload_after_failed_qualification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -640,6 +650,7 @@ def test_mx_rejects_post_transform_preload_after_failed_qualification(
     checkpoint_loader.post_load_publish.assert_not_called()
 
 
+@pytest.mark.cpu_only
 def test_mx_fallback_runs_standard_weight_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -755,6 +766,7 @@ class _HookModel(_HookRecorder):
         self.removed_child = _HookRecorder("removed_child", events, removed=True)
 
 
+@pytest.mark.cpu_only
 def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
@@ -768,6 +780,7 @@ def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     ]
 
 
+@pytest.mark.cpu_only
 def test_staged_hook_walks_skip_removed_and_transformed_modules():
     events = []
     model = _HookModel(events)
@@ -788,6 +801,7 @@ def test_staged_hook_walks_skip_removed_and_transformed_modules():
     ]
 
 
+@pytest.mark.cpu_only
 def test_reset_weights_transformed_only_resets_existing_flags():
     events = []
     model = _HookModel(events)
@@ -802,6 +816,7 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     assert not hasattr(model.removed_child, "_weights_transformed")
 
 
+@pytest.mark.cpu_only
 def test_mark_weights_transformed_only_sets_existing_flags():
     events = []
     model = _HookModel(events)
@@ -816,6 +831,7 @@ def test_mark_weights_transformed_only_sets_existing_flags():
     assert not hasattr(model.removed_child, "_weights_transformed")
 
 
+@pytest.mark.cpu_only
 def test_linear_transform_weights_is_idempotent():
     linear = Linear(
         1,
@@ -841,6 +857,7 @@ def test_linear_transform_weights_is_idempotent():
     assert linear._weights_transformed is True
 
 
+@pytest.mark.cpu_only
 def test_mla_transform_weights_is_idempotent(monkeypatch):
     monkeypatch.setattr(mla_mod, "get_sm_version", lambda: 120)
     quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)

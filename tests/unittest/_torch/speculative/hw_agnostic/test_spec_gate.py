@@ -144,6 +144,7 @@ def test_spec_gate_e2e(enforce_single_worker):
         llm_spec.shutdown()
 
 
+@pytest.mark.cpu_only
 def test_returns_none_until_window_and_enabled_when_above_threshold():
     gate = SpeculationGate(window=3, threshold=0.5)
 
@@ -161,6 +162,7 @@ def test_returns_none_until_window_and_enabled_when_above_threshold():
     assert gate.disabled is False
 
 
+@pytest.mark.cpu_only
 def test_disables_when_avg_below_threshold_and_stays_disabled():
     gate = SpeculationGate(window=3, threshold=0.3)
 
@@ -182,6 +184,7 @@ def test_disables_when_avg_below_threshold_and_stays_disabled():
     assert gate.disabled is True
 
 
+@pytest.mark.cpu_only
 def test_rolling_window_and_disable_on_drop():
     gate = SpeculationGate(window=3, threshold=0.7)
 

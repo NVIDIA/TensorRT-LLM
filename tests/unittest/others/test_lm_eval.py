@@ -67,6 +67,9 @@ from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ===========================================================================
 # AIME utils — last_boxed_only_string / remove_boxed / is_equiv / strip_string
 # ===========================================================================

@@ -22,6 +22,8 @@ from torch import nn
 from tensorrt_llm._torch.models.modeling_laguna import LagunaHfWeightMapper
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeQuantMode:
     def __init__(self, *, nvfp4: bool = False, fp8_block_scales: bool = False):
