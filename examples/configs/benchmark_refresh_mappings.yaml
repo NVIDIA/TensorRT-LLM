@@ -1,104 +1,73 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Mappings used to refresh recipes from the latest validated benchmark data.
+# Models refreshed from the latest validated benchmark data.
 #
-# Adding a model or GPU:
-# 1. Add one mapping for each source model, accelerator, and precision combination.
-# 2. Set source to the names recorded by the benchmark service.
-# 3. Set target to the public model, architecture, GPU, config directory, and filename template.
-# 4. If log-based config recovery is supported, set artifact_log to the exact tokens
-#    present in that workload's benchmark log filenames. framework_token identifies
-#    the serving framework token (for example, trt); it is not a version or commit.
+# Adding a model:
+# 1. Add one models entry for each source model and precision combination.
+# 2. Set target.model to the public model name used by TensorRT-LLM lookup.yaml.
+# 3. Set target.arch to the TensorRT-LLM model class recorded in lookup.yaml.
+# 4. List the public TensorRT-LLM GPU names to update under gpus.
 #
-# Removing a model or GPU:
-# - Delete every mapping for that public model/GPU combination. To stop updating a
-#   model entirely, delete all mappings whose target.model names that model.
-# - Removing a mapping stops future refreshes. It does not delete existing recipe
-#   files or lookup.yaml entries from the repository.
+# Target fields control where generated recipe YAML files are stored in TensorRT-LLM.
+# By default, config_dir_template produces:
+#   examples/configs/database/<target.model>/<accelerator.directory>
+# filename_template then names each recipe using its ISL, OSL, GPU count,
+# concurrency, and optional latency/balanced/throughput profile. A models entry may
+# override either default under target when a model requires a different layout.
 #
-# A mapping enables discovery of all available GPU-count and ISL/OSL groups for that
-# source. Concurrency and latency/balanced/throughput recipes are selected from each
-# group's Pareto frontier; they are not listed individually in this file.
-version: 1
-mappings:
+# Adding a GPU:
+# 1. Add it to accelerators once. The key is TensorRT-LLM's public GPU name,
+#    source_name is the benchmark service's name, and directory is its config folder.
+# 2. Add that key to the appropriate models entries' gpus lists.
+#
+# Artifact logs are discovered automatically using the runtime dimensions in each
+# Pareto record. If more than one valid log still matches, the record is skipped as
+# ambiguous. Only in that case, artifact_log.match_tokens may be added to a models
+# entry as a list of exact, case-insensitive filename fragments that disambiguate it.
+#
+# Removing a model or GPU stops future refreshes but does not delete existing recipe
+# files or lookup.yaml entries. Delete a models entry to stop updating that model and
+# precision, or remove a GPU from gpus to stop updating only that combination.
+version: 2
+
+defaults:
+  target:
+    config_dir_template: "examples/configs/database/{model}/{gpu_directory}"
+    filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
+
+accelerators:
+  B200_NVL:
+    source_name: NVIDIA B200
+    directory: B200
+  H200_SXM:
+    source_name: NVIDIA H200
+    directory: H200
+
+models:
   - source:
       model: deepseek-r1
-      accelerator: NVIDIA B200
       precision: FP4
-    artifact_log:
-      model_token: dsr1
-      precision_token: fp4
-      accelerator_token: b200
-      framework_token: trt
-      disaggregated: false
     target:
       model: nvidia/DeepSeek-R1-0528-FP4-v2
       arch: DeepseekV3ForCausalLM
-      gpu: B200_NVL
-      config_dir: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200
-      filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
+    gpus:
+      - B200_NVL
   - source:
       model: deepseek-r1
-      accelerator: NVIDIA B200
       precision: FP8
-    artifact_log:
-      model_token: dsr1
-      precision_token: fp8
-      accelerator_token: b200
-      framework_token: trt
-      disaggregated: false
     target:
       model: deepseek-ai/DeepSeek-R1-0528
       arch: DeepseekV3ForCausalLM
-      gpu: B200_NVL
-      config_dir: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200
-      filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
-  - source:
-      model: deepseek-r1
-      accelerator: NVIDIA H200
-      precision: FP8
-    artifact_log:
-      model_token: dsr1
-      precision_token: fp8
-      accelerator_token: h200
-      framework_token: trt
-      disaggregated: false
-    target:
-      model: deepseek-ai/DeepSeek-R1-0528
-      arch: DeepseekV3ForCausalLM
-      gpu: H200_SXM
-      config_dir: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200
-      filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
+    gpus:
+      - B200_NVL
+      - H200_SXM
   - source:
       model: gpt-oss-120b
-      accelerator: NVIDIA B200
       precision: FP4
-    artifact_log:
-      model_token: gptoss
-      precision_token: fp4
-      accelerator_token: b200
-      framework_token: trt
-      disaggregated: false
     target:
       model: openai/gpt-oss-120b
       arch: GptOssForCausalLM
-      gpu: B200_NVL
-      config_dir: examples/configs/database/openai/gpt-oss-120b/B200
-      filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
-  - source:
-      model: gpt-oss-120b
-      accelerator: NVIDIA H200
-      precision: FP4
-    artifact_log:
-      model_token: gptoss
-      precision_token: fp4
-      accelerator_token: h200
-      framework_token: trt
-      disaggregated: false
-    target:
-      model: openai/gpt-oss-120b
-      arch: GptOssForCausalLM
-      gpu: H200_SXM
-      config_dir: examples/configs/database/openai/gpt-oss-120b/H200
-      filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
+    gpus:
+      - B200_NVL
+      - H200_SXM
