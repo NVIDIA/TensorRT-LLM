@@ -216,14 +216,17 @@ def test_get_moe_cls_cutedsl_returns_plain_cutedsl_on_unsupported_sm():
 
 
 @pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
-def test_get_moe_cls_cutedsl_falls_back_to_cutlass_on_supported_sm_with_cuda12(sm_version):
-    """CUTEDSL + NVFP4 + SM12x avoids the CUDA 12 CuTe DSL JIT crash."""
+@pytest.mark.parametrize("cuda_major", [12, None])
+def test_get_moe_cls_cutedsl_falls_back_to_cutlass_on_unavailable_cuda13_runtime(
+    sm_version, cuda_major
+):
+    """CUTEDSL + NVFP4 + SM12x avoids the unsupported CuTe DSL JIT path."""
     cfg = ModelConfig()
     cfg.moe_backend = "CUTEDSL"
     cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     with (
         patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version),
-        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=12),
+        patch.object(CuteDslB12xFusedMoE, "_get_cutlass_dsl_cuda_major", return_value=cuda_major),
     ):
         cls = get_moe_cls(cfg)
     assert cls is CutlassFusedMoE
