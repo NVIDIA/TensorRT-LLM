@@ -301,8 +301,11 @@ Beam search rejects the following combinations, raising an error at admission:
 - **A decreasing `beam_width_array`.** Only non-decreasing schedules are supported; the
   semantics of narrowing mid-decode are not defined.
 - **A `best_of` other than `max_beam_width`.** Every request in an engine runs at the same
-  beam width. Note that mixing widths would fail at forward time rather than per request, so
-  the check happens on admission instead.
+  beam width, which admission enforces so that a mismatch is reported against the offending
+  request. Mixing widths is a forward-time failure that aborts the whole batch: note that
+  admission compares `best_of` against `max_beam_width` only, so requests whose
+  `beam_width_array` puts them at different per-iteration widths in the same step still
+  reach that failure.
 
 The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:
 

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, TypeAlias, cas
 
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
@@ -93,8 +94,14 @@ def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor
     large rows (e.g. vocab-sized logits), while torch.topk wins on small rows
     where the radix kernel's fixed per-call cost dominates. The 10k crossover
     follows flashinfer's own guidance (``flashinfer.top_k`` docstring).
+
+    Beam search is not a flashinfer-gated feature, so fall back to torch.topk
+    when flashinfer is missing: real vocabularies are always past the crossover,
+    which would otherwise make the whole default beam path require it. The two
+    kernels agree on values and on descending order; only the index order among
+    equal values may differ, which torch.topk leaves unspecified anyway.
     """
-    if values.size(-1) > 10000:
+    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000:
         return radix_topk_op(values, k)
     return torch.topk(values, k=k, dim=-1, sorted=True)
 
@@ -607,6 +614,21 @@ def _cba_step_math(
     step_log_probs = slot_cum - cum_log_probs[slots, :beam_width_in].gather(1, slot_pred.long())
 
     # --- CBA insertion: normalized scores of the new end-token candidates.
+    # beam_candidate_topk applies the diversity term for *ranking* only and
+    # returns raw cumulative log-probs, so the CBA insertion score below and
+    # best_attainable further down are both diversity-free. This matches HF,
+    # where diversity is a logits processor (HammingDiversityLogitsProcessor)
+    # applied before log_softmax and so never reaches the accumulated score,
+    # and vLLM, which ranks purely by cum_logprob / seq_len**length_penalty.
+    #
+    # The C++ kernels here diverge from all three: they fold
+    # `diversityRate * source_beam_index` into pLocalLogProbs
+    # (beamSearchKernels.cu), which then flows into normedScoresCBA and
+    # bestAttainableScore (beamSearchKernelsTemplate.h), so with diversity_rate
+    # set they order the pool and reach the done verdict differently. Do not
+    # "fix" this by matching them: a cumulative_logprob carrying
+    # `diversity_rate * beam_index` is no longer a log-probability, and the
+    # offset depends on which slot the beam happened to occupy (TRTLLM-14792).
     new_normed = cand_cum / cand_len.to(cand_cum.dtype).pow(exponent)
     eligible = is_end & (cand_rank < caps)
     new_normed = new_normed.masked_fill(~eligible, neg_inf)
@@ -763,7 +785,24 @@ def beam_search_sampling_batch_cba(
       marking every beam slot finished, which drives the regular stop
       machinery.
 
-    Requires the CBA fields of ``BeamSearchMetadata`` to be set.
+    Execution contract:
+
+    - **Mutates ``beam_search_args`` in place** and returns only the sampled
+      tokens (and probabilities). The updated beam state -- ``cum_log_probs``,
+      ``new_log_probs``, ``finished_beams``, ``predecessor_beams``,
+      ``cache_indirection``, ``original_tokens``/``original_log_probs``, and
+      the CBA fields (``cba_tokens``, ``cba_cum_log_probs``,
+      ``cba_normed_scores``, ``cba_lengths``, ``batch_dones``) -- is read back
+      from the caller's tensors, not from the return value. Only the rows
+      selected by ``seq_slots`` are written.
+    - Requires the CBA fields of ``BeamSearchMetadata`` to be set.
+    - Calls ``mark_dynamic`` on the caller's tensors so a single compiled
+      graph serves every batch size. The caller must not rely on those
+      tensors keeping static shapes afterwards.
+    - Dispatches between a ``torch.compile``d ``_cba_step_math`` and an eager
+      fallback. Both compute the same values; the split exists because the
+      scatter-style write-back does not survive fullgraph tracing, so it runs
+      outside the compiled region (see the write-back comments below).
     """
     args = beam_search_args
     cba = args.cba
@@ -1317,42 +1356,6 @@ class BeamSearchHandler:
             ),
         )
 
-    def _prepare_beam_history(
-        self,
-        request: LlmRequest,
-        *,
-        finish_reasons: torch.Tensor,
-        d2h_copier: Callable[[torch.Tensor], torch.Tensor],
-        cba_group: Optional[CBAGroupHost] = None,
-    ) -> BeamHistoryBuilder | None:
-        """Correct the stored tokens for each beam and return it as a BeamHistory object.
-
-        Beam Search sampling only adds new tokens to the beam.
-        However during beam search, a beam may change its previously sampled tokens.
-        This function corrects the stored tokens for each beam to match the expected tokens.
-        If logprobs are requested, the function also corrects the stored logprobs for each beam.
-        The function returns a BeamHistory object that contains the corrected tokens and logprobs for each beam.
-
-        D2H copies are issued through `d2h_copier`. When
-        `_use_speculative_beam_history_d2h` is set, a host-side predictor
-        decides per step whether to stage copies via `d2h_copier`;
-        predictor misses fall back to a synchronous `.cpu()` inside
-        `_builder`. Otherwise, copies are issued unconditionally.
-
-        Note: To defer the decision whether or not to skip BeamHistory construction until update_requests(), only
-              a builder (BeamHistoryBuilder) is returned here. The builder contains host tensors which are
-              being populated asynchronously. Hence, it can only be invoked after async D2H copies have completed,
-              e.g., after awaiting state.sampler_event in update_requests.
-
-        arguments:
-            request: The request to create the beam history for
-            finish_reasons: The first finish reason encountered for each beam of the request.
-                            Shape: (max_tokens, max_beam_width)
-            d2h_copier: Callable performing the D2H copy.
-        """
-        assert cba_group is not None
-        return _prepare_beam_history_cba(request, cba_group=cba_group)
-
     def prepare_beam_histories(
         self,
         requests: list[LlmRequest],
@@ -1397,15 +1400,7 @@ class BeamSearchHandler:
                 copier.stage_copy_to_host if copier is not None else self._copy_to_host
             )
             cba_group = self.prepare_cba_group_host(requests, finish_reasons, d2h_copier)
-            builders = [
-                self._prepare_beam_history(
-                    req,
-                    finish_reasons=finish_reasons[req.py_seq_slot],
-                    d2h_copier=d2h_copier,
-                    cba_group=cba_group,
-                )
-                for req in requests
-            ]
+            builders = [_prepare_beam_history_cba(req, cba_group=cba_group) for req in requests]
         side_stream_event = copier.event if copier is not None else None
         return builders, side_stream_event
 

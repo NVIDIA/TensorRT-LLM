@@ -856,12 +856,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         which the mismatch starves the request in the micro-batch scheduler
         and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
         pins the agreement.
+
+        An empty array (``[]`` or ``[[]]``) falls through to the base
+        implementation rather than indexing it, matching the two emptiness
+        guards the C++ side checks before reading element 0.
         """
         beam_width_array = self.sampling_config.beam_width_array
-        if beam_width_array is not None:
-            if beam_width_array and isinstance(beam_width_array[0],
-                                               (list, tuple)):
+        if beam_width_array:
+            if isinstance(beam_width_array[0], (list, tuple)):
                 beam_width_array = beam_width_array[0]
+        if beam_width_array:
             iteration = self.decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
             return int(beam_width_array[index])
