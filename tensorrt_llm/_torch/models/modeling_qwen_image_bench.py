@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 
 from ...inputs import (
     ContentFormat,
@@ -40,10 +42,16 @@ _QWEN_IMAGE_BENCH_PLACEHOLDERS = MultimodalPlaceholderMetadata(
 class _QwenImageBenchModelMixin:
     @property
     def multimodal_data_device_paths(self) -> List[str]:
+        # Keep the mrope_config entries in sync with `_Qwen3_5VLModel`
+        # (modeling_qwen3_5.py): the shared Qwen-VL mRoPE seq-slot cache path
+        # consumes `mrope_position_deltas` on the model device, so the engine
+        # must move them H2D along with the rest of the multimodal payload.
         return [
             "image.pixel_values",
             "video.pixel_values_videos",
             "multimodal_embedding",
+            "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas",
         ]
 
     @property
@@ -89,6 +97,19 @@ class _QwenImageBenchModelMixin:
 )
 class QwenImageBenchModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+        if model_config.multimodal_config is not None:
+            # dataclasses.replace() resets init=False fields, so preserve runtime metadata.
+            extra_attrs = model_config.extra_attrs
+            model_config = replace(
+                model_config,
+                multimodal_config=MultimodalConfig(
+                    **model_config.multimodal_config.model_dump(
+                        exclude={"encoder_cache_max_bytes"}
+                    ),
+                    encoder_cache_max_bytes=0,
+                ),
+            )
+            model_config.extra_attrs = extra_attrs
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
         super().__init__(model_config, *args, **kwargs)

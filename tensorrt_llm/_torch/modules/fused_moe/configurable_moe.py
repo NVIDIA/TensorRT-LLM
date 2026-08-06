@@ -275,9 +275,8 @@ class ConfigurableMoE(MoE):
         """Build the MoE backend, mirror EPLB attrs, then create weights.
 
         Why this dance:
-        - ``init_load_balancer=False`` / ``without_comm=True``: the backend
-          would otherwise re-register itself with the load balancer and
-          initialize its own communication; ConfigurableMoE owns both.
+        - ``init_load_balancer=False``: the backend would otherwise
+          re-register itself with the load balancer; ConfigurableMoE owns it.
         - ``layer_idx=None``: the wrapper passes the real ``layer_idx`` to
           ``MoE.__init__`` to drive load-balancer setup. The backend
           receives ``None`` so its own EPLB hooks no-op until we sync the
@@ -324,7 +323,6 @@ class ConfigurableMoE(MoE):
                 swiglu_limit=kwargs.get("swiglu_limit"),
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
-                without_comm=True,
                 activation_type=self.activation_type,
             )
 
@@ -361,6 +359,17 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
+
+    @property
+    def num_fused_shared_expert(self) -> int:
+        """Expose the backend's fused-shared-expert count so model code (e.g.
+        DeepseekV3 post_load_weights / shared-expert TP sizing) sees it through
+        this wrapper. Returns 0 when the backend does not support fusion."""
+        return getattr(self.backend, "num_fused_shared_expert", 0)
+
+    def fuse_shared_expert(self, shared_experts):
+        """Delegate shared-expert fusion to the backend (e.g. TRTLLMGenFusedMoE)."""
+        return self.backend.fuse_shared_expert(shared_experts)
 
     def validate_config(self):
         """

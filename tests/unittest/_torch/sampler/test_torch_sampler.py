@@ -46,19 +46,27 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _BatchedSamplingResult,
     _request_get_sampling_params,
     _request_strategy,
+    _SeedManager,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
     FlashInferGroupedStrategySampler,
     Greedy,
+    MinP,
+    RequestSeeds,
     Strategy,
     StrategyMetadata,
     TemperatureOnly,
     TopK,
     TopKTopP,
     TopP,
-    UtilsSamplingParams,
+    TopPDecayMetadata,
+    resolve_sampling_strategy,
+    sample,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -349,6 +357,88 @@ class TestStrategySelection:
         assert strat[2] == pytest.approx(0.7)
         assert strat[3] == pytest.approx(0.9)
 
+    # --- min_p ---
+    # A min_p strategy is ("min_p", top_k, top_p, min_p, temperature). When
+    # unset, top_k carries the disabled sentinel 0 ("keep all"; sanitized to
+    # vocab_size downstream) and top_p carries 1.0, so min_p composes with any
+    # subset of temperature/top_k/top_p.
+
+    @pytest.mark.parametrize(
+        "trivial_temperature, trivial_top_p, trivial_top_k",
+        [
+            pytest.param(temperature, top_p, top_k)
+            for (temperature, top_k, top_p) in product(
+                TEMPERATURE_NEUTRAL_VALS, TOP_K_NEUTRAL_VALS, TOP_P_NEUTRAL_VALS
+            )
+        ],
+    )
+    def test_min_p_only(
+        self,
+        trivial_temperature: Optional[float],
+        trivial_top_p: Optional[float],
+        trivial_top_k: Optional[int],
+    ):
+        params = SamplingParams(
+            min_p=0.1, temperature=trivial_temperature, top_p=trivial_top_p, top_k=trivial_top_k
+        )
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert len(strat) == 5
+        assert strat[0] == "min_p"
+        assert strat[1] == 0  # top_k disabled sentinel (0 == "keep all")
+        assert strat[2] == pytest.approx(1.0)  # top_p disabled sentinel
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(1.0)  # temperature default
+
+    def test_min_p_with_temperature(self):
+        params = SamplingParams(min_p=0.1, temperature=0.8)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert strat[0] == "min_p"
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(0.8)
+
+    def test_min_p_with_top_k_top_p(self):
+        params = SamplingParams(min_p=0.1, top_k=42, top_p=0.7, temperature=0.8)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert len(strat) == 5
+        assert strat[0] == "min_p"
+        assert strat[1] == 42
+        assert strat[2] == pytest.approx(0.7)
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(0.8)
+
+    def test_min_p_0_not_selected(self):
+        # min_p == 0 disables min_p; a plain temperature strategy is chosen.
+        params = SamplingParams(min_p=0.0, temperature=0.7)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert strat[0] == "temperature"
+
+    def test_min_p_1_is_greedy(self):
+        # min_p == 1 keeps only the row max, i.e. an explicit greedy control
+        # (like top_p == 0), so it must not reach the min_p sampling path.
+        params = SamplingParams(min_p=1.0, temperature=0.7)
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        assert _request_strategy(request, vocab_size=self.VOCAB_SIZE) is GREEDY
+
+    @pytest.mark.parametrize(
+        "greedy_kwargs",
+        [
+            pytest.param({"top_k": 1}, id="top_k_1"),
+            pytest.param({"temperature": 0}, id="temperature_0"),
+        ],
+    )
+    def test_min_p_greedy_triggers_win(self, greedy_kwargs: dict[str, Any]):
+        # An explicit greedy trigger collapses to a single token even with min_p.
+        params = SamplingParams(min_p=0.1, **greedy_kwargs)
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        assert _request_strategy(request, vocab_size=self.VOCAB_SIZE) is GREEDY
+
     def test_param_validation(self):
         with pytest.raises(ValueError, match="require temperature >= 0, got temperature=-1"):
             SamplingParams(temperature=-1)
@@ -361,6 +451,12 @@ class TestStrategySelection:
 
         with pytest.raises(ValueError, match="require top_k >= 0, got top_k=-1"):
             SamplingParams(top_k=-1)
+
+        with pytest.raises(ValueError, match="require 0 <= min_p <= 1, got min_p=-1"):
+            SamplingParams(min_p=-1)
+
+        with pytest.raises(ValueError, match="require 0 <= min_p <= 1, got min_p=2"):
+            SamplingParams(min_p=2)
 
     @pytest.mark.parametrize(
         "top_k, top_p",
@@ -875,11 +971,9 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(FinishReasonsHandler, "_are_stop_words", stop_words_that_raises)
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
-                )
-                patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -931,7 +1025,7 @@ class TestFinishReasons:
         def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -1112,6 +1206,69 @@ class TestFinishReasons:
         run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
 
+@pytest.mark.parametrize("min_p", [0.0, 0.1, 0.5, 0.9])
+def test_min_p_renorm_probs(min_p: float):
+    """min_p_renorm_probs keeps tokens with p >= min_p * max and renormalizes."""
+    torch.manual_seed(0)
+    probs = torch.softmax(torch.randn(4, 16), dim=-1)
+
+    got = min_p_renorm_probs(probs.clone(), min_p)
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    kept = probs >= (min_p * max_probs)
+    expected = torch.where(kept, probs, torch.zeros_like(probs))
+    expected = expected / expected.sum(dim=-1, keepdim=True)
+
+    torch.testing.assert_close(got, expected)
+    # every row still sums to 1 and the argmax token always survives
+    torch.testing.assert_close(got.sum(dim=-1), torch.ones(probs.size(0)))
+    assert (got.gather(1, probs.argmax(dim=-1, keepdim=True)) > 0).all()
+
+
+def test_min_p_renorm_probs_per_request_tensor():
+    """A per-request min_p tensor applies a distinct threshold per row."""
+    torch.manual_seed(1)
+    probs = torch.softmax(torch.randn(3, 16), dim=-1)
+    min_p = torch.tensor([0.0, 0.3, 0.95])
+
+    got = min_p_renorm_probs(probs.clone(), min_p)
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    kept = probs >= (min_p.reshape(-1, 1) * max_probs)
+    expected = torch.where(kept, probs, torch.zeros_like(probs))
+    expected = expected / expected.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(got, expected)
+    # row 0 (min_p=0) keeps everything; row 2 (min_p=0.95) prunes more aggressively
+    assert (got[0] > 0).all()
+    assert (got[2] > 0).sum() <= (got[0] > 0).sum()
+
+
+def test_min_p_sample_top_k_disabled_sentinel():
+    """min_p + unset top_k must survive the standalone sample() dispatch.
+
+    Draft-model rejection sampling resolves strategies with vocab_size=2**31
+    (the greedy probe), so a min_p request with an unset top_k carries the
+    disabled-top_k sentinel 0. That 0 flows straight into sample() ->
+    top_k_top_p_sampling_batch without sanitize_top_k, so the vanilla path must
+    treat it as "keep all" instead of tripping ``assert top_k > 1``. Regression
+    test for min_p under speculative decoding with rejection sampling.
+    """
+    min_p = 0.5
+    # ("min_p", top_k, top_p, min_p, temperature) with the top_k=0 sentinel.
+    strategy: MinP = ("min_p", 0, 1.0, min_p, 1.0)
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 32)
+    # Must not raise (top_k=0 previously hit ``assert top_k > 1``).
+    tokens, _, _ = sample(strategy, logits.clone())
+
+    assert tokens.shape == (4,)
+    # min_p filtering was applied: every sampled token clears the min_p mask.
+    probs = torch.softmax(logits, dim=-1)
+    kept = probs >= (min_p * probs.max(dim=-1, keepdim=True).values)
+    assert kept.gather(1, tokens.unsqueeze(-1)).all()
+
+
 class TestBatchedSampling:
     """Validate batched/mixed sampling.
 
@@ -1142,6 +1299,7 @@ class TestBatchedSampling:
             TopP: SamplingParams(top_p=0.42, temperature=0.2),
             TopK: SamplingParams(top_k=27, temperature=0.5),
             TopKTopP: SamplingParams(top_k=27, top_p=0.6, temperature=0.5),
+            MinP: SamplingParams(min_p=0.02, top_k=40, top_p=0.9, temperature=1.0),
         }
 
         # Check that all relevant strategies are covered
@@ -1256,9 +1414,13 @@ class TestBatchedSampling:
                         temperature = param.temperature
                         if temperature is not None:
                             temperature *= max(rng.random(), 1e-6)
+                        min_p = param.min_p
+                        if min_p is not None:
+                            min_p *= max(rng.random(), 1e-6)
                         return SamplingParams(
                             top_p=top_p,
                             top_k=top_k,
+                            min_p=min_p,
                             temperature=temperature,
                         )
 
@@ -1553,6 +1715,7 @@ class TestBatchedSampling:
                     TopP,
                     TopK,
                     TopKTopP,
+                    MinP,
                 ]
             }
 
@@ -1616,7 +1779,8 @@ class TestBatchedSampling:
                     torch.testing.assert_close(probs, expected_probs_after_temperature)
                 else:
                     if strategy[0] not in [
-                        strategy_tags[strategy_type] for strategy_type in [TopP, TopK, TopKTopP]
+                        strategy_tags[strategy_type]
+                        for strategy_type in [TopP, TopK, TopKTopP, MinP]
                     ]:
                         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -1681,6 +1845,14 @@ class TestBatchedSampling:
                             - probs_sorted_pre_norm_nz.amin(dim=-1),
                             cast(float, top_p),
                         ).all()
+
+                    if strategy[0] == strategy_tags[MinP]:
+                        # Renorm preserves the ratio, so every kept token satisfies
+                        # prob >= min_p * max (holds with top_k/top_p also applied).
+                        min_p_val = cast(float, strategy[3])
+                        kept = probs != 0.0
+                        ratio = probs / probs.amax(dim=-1, keepdim=True)
+                        assert torch.all((ratio >= min_p_val - 1e-6)[kept])
 
                     # All indices not selected must have logits less or equal
                     # to the smallest selected logit.
@@ -1793,6 +1965,7 @@ class TestBatchedSampling:
             generator: Optional[torch.Generator] = None,
             return_probs: bool,
             group_metadata: StrategyMetadata | None = None,
+            seeds: Optional[RequestSeeds] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
             assert generator is sampler.get_generator(logits.device)
             if isinstance(group_key, tuple):
@@ -1811,6 +1984,7 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                     group_metadata=group_metadata,
+                    seeds=seeds,
                 )
             )
             return result
@@ -1862,6 +2036,7 @@ class TestBatchedSampling:
         temperature: Optional[torch.Tensor]
         top_p: Optional[torch.Tensor]
         top_k: Optional[torch.Tensor]
+        min_p: Optional[torch.Tensor] = None
 
     @dataclass(frozen=True, kw_only=True)
     class _MockSamplingLogEntry:
@@ -1923,6 +2098,52 @@ class TestBatchedSampling:
             flashinfer.sampling,
             "top_k_top_p_sampling_from_logits",
             _mock_flashinfer_top_k_top_p,
+        )
+
+        def _mock_flashinfer_top_k_top_p_from_probs(
+            probs: torch.Tensor,
+            *,
+            top_k: torch.Tensor,
+            top_p: torch.Tensor,
+            filter_apply_order: str,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
+        ) -> torch.Tensor:
+            # The min_p strategy terminates its renorm chain here, so the probs
+            # recorded below already have min_p applied; min_p itself never
+            # reaches a flashinfer kernel and thus cannot be captured as a param.
+            # Patching this is not optional: unpatched, the real flashinfer
+            # implementation delegates to the *patched* top_p_sampling_from_probs
+            # with kwargs its mock does not accept.
+            assert filter_apply_order == "top_k_first"
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=top_k[row_idx],
+                        top_p=top_p[row_idx],
+                        temperature=None,
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(
+            flashinfer.sampling,
+            "top_k_top_p_sampling_from_probs",
+            _mock_flashinfer_top_k_top_p_from_probs,
         )
 
         def _mock_flashinfer_from_logits(
@@ -2021,6 +2242,40 @@ class TestBatchedSampling:
 
         patch_ctx.setattr(flashinfer.sampling, "top_p_sampling_from_probs", _mock_flashinfer_top_p)
 
+        def _mock_flashinfer_min_p(
+            probs: torch.Tensor,
+            min_p: torch.Tensor,
+            *,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
+        ) -> torch.Tensor:
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=None,
+                        top_p=None,
+                        temperature=None,
+                        min_p=min_p[row_idx],
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(flashinfer.sampling, "min_p_sampling_from_probs", _mock_flashinfer_min_p)
+
         def _mock_flashinfer_from_probs(
             probs: torch.Tensor,
             *,
@@ -2105,6 +2360,10 @@ class TestBatchedSampling:
             log_entry.sampling_params.top_k is not None
             and log_entry.sampling_params.top_k.item() != vocab_size
         )
+        req_has_min_p = (
+            log_entry.sampling_params.min_p is not None
+            and log_entry.sampling_params.min_p.item() != 0
+        )
         if req_has_top_k:
             assert req_params.top_k is not None
             assert log_entry.sampling_params.top_k is not None
@@ -2113,7 +2372,12 @@ class TestBatchedSampling:
             assert req_params.top_p is not None
             assert log_entry.sampling_params.top_p is not None
             assert np.allclose(req_params.top_p, log_entry.sampling_params.top_p.item())
-        if req_has_top_k or req_has_top_p:
+        if req_has_min_p:
+            assert req_params.min_p is not None
+            assert log_entry.sampling_params.min_p is not None
+            assert np.allclose(req_params.min_p, log_entry.sampling_params.min_p.item())
+        # min_p also filters to a top-prefix subset, so it reuses the validation below.
+        if req_has_top_k or req_has_top_p or req_has_min_p:
             # for top-k and/or top-p _sampling_, probs contains only the top probs,
             # whereas log_entry.probs contains all probs passed to the sampling code.
 
@@ -2563,8 +2827,8 @@ class TestBatchedSampling:
             ).unsqueeze(1)  # Add a dimension for beam width
 
             batched_sampling_result = _BatchedSamplingResult(
-                batch_req_indices=batch_req_indices.clone(),
-                batch_next_tokens_cuda_int=batch_next_tokens_cuda_int.clone(),
+                req_indices=batch_req_indices.clone(),
+                next_tokens_cuda_int=batch_next_tokens_cuda_int.clone(),
             )
             seq_slots_tensor_snapshot = seq_slots_tensor.clone()
 
@@ -2577,6 +2841,11 @@ class TestBatchedSampling:
                 result: Optional[UutResult] = None
 
             res = UutResultWrapper()
+            # Precomputed outside the no-sync region (mirrors the production
+            # resident device copy of seq_slots).
+            seq_slots_tensor_cuda = (
+                seq_slots_tensor.to(torch.int64).pin_memory().to("cuda", non_blocking=True)
+            )
 
             def _uut(res=res):
                 new_tokens_host = sampler._unbatch_sampling_results(
@@ -2584,6 +2853,7 @@ class TestBatchedSampling:
                     new_tokens_cuda=new_tokens_cuda,
                     req_num_generated_tokens=req_num_steps,
                     seq_slots=seq_slots_tensor,
+                    seq_slots_cuda=seq_slots_tensor_cuda,
                 )
                 res.result = UutResult(new_tokens_host=new_tokens_host)
 
@@ -2602,9 +2872,9 @@ class TestBatchedSampling:
                     new_tokens_cuda_snapshot[:, slot], new_tokens_cuda[:, slot]
                 )
             torch.testing.assert_close(
-                batch_next_tokens_cuda_int, batched_sampling_result.batch_next_tokens_cuda_int
+                batch_next_tokens_cuda_int, batched_sampling_result.next_tokens_cuda_int
             )
-            torch.testing.assert_close(batch_req_indices, batched_sampling_result.batch_req_indices)
+            torch.testing.assert_close(batch_req_indices, batched_sampling_result.req_indices)
             torch.testing.assert_close(seq_slots_tensor, seq_slots_tensor_snapshot)
 
             # validate tokens returned
@@ -2618,3 +2888,381 @@ class TestBatchedSampling:
                 input_offset += steps
 
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+
+
+class TestRequestSeed:
+    """Functional guards for per-request ``SamplingParams.seed``.
+
+    The property that matters is reproducibility that does not depend on batch
+    composition: a seeded request must draw the same tokens whether it runs
+    alone or beside unrelated requests, which is exactly what a single
+    batch-wide generator cannot provide.
+    """
+
+    VOCAB_SIZE = 128
+    NUM_STEPS = 8
+
+    @staticmethod
+    def _sampling_params(seed: Optional[int]) -> SamplingParams:
+        # Temperature+top_k keeps sampling stochastic, so matching tokens across
+        # runs indicate the seed is being honored rather than coincidence.
+        return SamplingParams(temperature=1.0, top_k=64, seed=seed)
+
+    def _run(
+        self,
+        sampling_params_list: list[SamplingParams],
+        *,
+        logits: torch.Tensor,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> torch.Tensor:
+        """Sample ``NUM_STEPS`` steps; returns tokens indexed by [step, seq slot]."""
+        harness = TestBatchedSampling()
+        seq_slot_assignment = (list(range(len(sampling_params_list))), len(sampling_params_list))
+        scheduled_requests = harness._build_mock_requests(
+            sampling_params_list=sampling_params_list,
+            seq_slot_assignment=seq_slot_assignment,
+            draft_lens=[0] * len(sampling_params_list),
+        )
+        sampler = TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=321,
+                max_draft_len=42,
+                max_beam_width=1,
+                max_num_sequences=len(sampling_params_list),
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=False,
+            )
+        )
+        return harness._sample(
+            sampler,
+            scheduled_requests,
+            {"logits": logits},
+            num_repeats=self.NUM_STEPS,
+            monkeypatch=monkeypatch,
+        )
+
+    def _logits(self, num_requests: int) -> torch.Tensor:
+        return torch.testing.make_tensor(
+            (num_requests, self.VOCAB_SIZE), dtype=torch.float32, device="cuda"
+        )
+
+    def test_seed_is_independent_of_batch_composition(self, monkeypatch: pytest.MonkeyPatch):
+        """The core guarantee: batching must not perturb a seeded stream."""
+        logits = self._logits(3)
+        seeded = self._sampling_params(1234)
+
+        alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
+
+        # Same seeded request, now in slot 0 of a batch whose other members
+        # draw from the same strategy group and would advance a shared
+        # generator's state.
+        batched = self._run(
+            [seeded, self._sampling_params(None), self._sampling_params(999)],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+
+        torch.testing.assert_close(alone[:, 0], batched[:, 0])
+
+        # Negative control, disabled until FlashInfer honors per-row seeds.
+        #
+        # The assertion above passes even if the seed path is entirely inert,
+        # because slot 0 is the one row whose seed is read either way. This
+        # check would catch that -- but flashinfer-python 0.6.15 reads only
+        # seed[0]/offset[0] for the whole call and distinguishes rows by
+        # blockIdx.x, so rows 1..N sample from row 0's seed and this assertion
+        # fails for reasons outside this code. Re-enable once the pinned
+        # FlashInfer supports per-row seeds -- tracked upstream in
+        # https://github.com/flashinfer-ai/flashinfer/pull/2345 (note it lands
+        # the feature as generator=(seed_arr, offset_arr), so the sampler call
+        # sites change with it).
+        #
+        # assert not torch.equal(batched[:, 0], batched[:, 2])
+
+    def test_draft_batch_does_not_disturb_target_seed_state(self):
+        """Draft slots come from a different SeqSlotManager over the same range.
+
+        Observing a draft batch must not look like a change of occupant for the
+        target request holding that slot number, which would reset its offset
+        and make it replay part of its stream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+
+        target = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=100,
+                py_is_draft=False,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([target])
+        manager.advance([0, 0, 0])
+        assert manager.any_seeded is False  # target carries no user seed
+        offset_before = manager._offsets[0].item()
+
+        # A draft request lands on slot 0, owned by `target` above.
+        draft = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=200,
+                py_is_draft=True,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([draft])
+        assert manager.any_seeded is False  # draft never uses the per-row path
+        assert manager._offsets[0].item() == offset_before
+        assert manager._slot_owner[0] == 100  # still the target request
+
+        # The target is unchanged when it comes back around.
+        manager.observe([target])
+        assert manager._offsets[0].item() == offset_before
+
+    def test_multi_row_offsets_do_not_overlap(self):
+        """Speculative decoding draws several rows per request per step.
+
+        Those rows must be assigned distinct stretches of the request's stream,
+        and the next step must resume past all of them -- otherwise a request
+        would replay the same random numbers across steps.
+
+        This asserts the offsets ``_SeedManager`` produces, not what the kernel
+        does with them: the pinned flashinfer reads only ``offset[0]``, so the
+        per-row values are not yet honored downstream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 1234
+        manager._seeds[1] = 999
+        manager._any_seeded = True
+
+        rows = [0, 0, 0, 1]  # slot 0 draws 3 tokens this step, slot 1 draws 1
+        device = torch.device("cpu")
+
+        first = manager.make_row_seeds(rows, device=device)
+        assert first.seed.tolist() == [1234, 1234, 1234, 999]
+
+        manager.advance(rows)
+        second = manager.make_row_seeds(rows, device=device)
+
+        # Each row reserves a stretch of the stream; the invariant is that no
+        # two stretches overlap, within a step or across steps. Asserted as a
+        # property rather than against OFFSET_STRIDE, so that a stride too small
+        # for the kernel's per-row consumption fails here instead of silently
+        # rescaling the expected values.
+        #
+        # flashinfer 0.6.15 reserves 32 offset units per row for the top-k/top-p
+        # rejection samplers, so a stride below that would replay random values.
+        # Only within a slot: distinct slots carry distinct seeds, so they are
+        # independent streams and may legitimately share offsets.
+        assert _SeedManager.OFFSET_STRIDE >= 32
+        per_slot: dict[int, set[int]] = {}
+        for offsets in (first.offset.tolist(), second.offset.tolist()):
+            for slot, off in zip(rows, offsets):
+                stretch = range(off, off + _SeedManager.OFFSET_STRIDE)
+                used = per_slot.setdefault(slot, set())
+                assert used.isdisjoint(stretch), (
+                    f"slot {slot} reuses offsets {off}..{off + _SeedManager.OFFSET_STRIDE - 1}; "
+                    "the stream is replayed"
+                )
+                used.update(stretch)
+
+
+class TestTopPDecay:
+    """Minimal functional guards for Top-P Decay in TorchSampler.
+
+    Covers strategy routing, the post-sample runtime update (parity with the
+    C++ computeToppDecay recurrence; cases ported from
+    topPSamplingLayerTest.cpp), and per-request rejection of unsupported
+    combinations.
+    """
+
+    VOCAB_SIZE = 1000
+
+    @staticmethod
+    def _params(**kw) -> UtilsSamplingParams:
+        base = dict(temperature=None, top_p=None, top_k=None, use_beam_search=False)
+        base.update(kw)
+        return UtilsSamplingParams(**base)
+
+    @staticmethod
+    def _make_sampler(*, max_draft_len=0):
+        return TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=128,
+                max_draft_len=max_draft_len,
+                max_num_sequences=8,
+                max_beam_width=1,
+                max_total_draft_tokens=max_draft_len,
+                disable_overlap_scheduler=True,
+            )
+        )
+
+    def test_strategy_routing(self):
+        # Active decay (set and < 1.0) forces a top-p-capable strategy even for
+        # an otherwise-greedy request (initial top-p defaults to 1.0), so the
+        # decayed runtime value can take effect on later steps.
+        s = resolve_sampling_strategy(self._params(top_p_decay=0.5), vocab_size=self.VOCAB_SIZE)
+        assert s[0] == "top_p" and s[1] == pytest.approx(1.0)
+        s = resolve_sampling_strategy(
+            self._params(top_k=50, top_p=0.9, top_p_decay=0.8), vocab_size=self.VOCAB_SIZE
+        )
+        assert s[0] == "top_k_top_p"
+        # decay == 1.0 (the C++ default) is a no-op and does not activate...
+        s = resolve_sampling_strategy(self._params(top_p_decay=1.0), vocab_size=self.VOCAB_SIZE)
+        assert s is GREEDY
+        # ...and an explicit greedy control wins over an active decay.
+        s = resolve_sampling_strategy(
+            self._params(top_p_decay=0.5, top_k=1), vocab_size=self.VOCAB_SIZE
+        )
+        assert s is GREEDY
+        # min_p wins the strategy choice, but the request keeps carrying top_p,
+        # so decay stays applicable (see test_decay_metadata_dispatch).
+        s = resolve_sampling_strategy(
+            self._params(min_p=0.1, top_p=0.9, top_p_decay=0.8), vocab_size=self.VOCAB_SIZE
+        )
+        assert s[0] == "min_p"
+
+    # Every strategy a decay-active request can resolve to carries a per-row
+    # top-p, so all of them must be offered the decay metadata. A strategy
+    # missing from the dispatch silently drops decay: the request is still
+    # admitted and its runtime top-p still decays, but sampling keeps reading
+    # the static initial value.
+    @pytest.mark.parametrize(
+        "params",
+        [
+            pytest.param(dict(top_p_decay=0.8), id="top_p"),
+            pytest.param(dict(top_k=50, top_p=0.9, top_p_decay=0.8), id="top_k_top_p"),
+            pytest.param(dict(min_p=0.1, top_p=0.9, top_p_decay=0.8), id="min_p"),
+        ],
+    )
+    def test_decay_metadata_dispatch(self, params):
+        strategy = resolve_sampling_strategy(self._params(**params), vocab_size=self.VOCAB_SIZE)
+        group_key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
+        assert (
+            FlashInferGroupedStrategySampler.get_metadata_type_for_group(group_key)
+            is TopPDecayMetadata
+        )
+
+    # Companion to the dispatch test: the metadata must not just be handed over
+    # but actually override the per-row top-p. Logits are chosen so the static
+    # top_p=1.0 leaves every token samplable (min_p=0.1 keeps them all too),
+    # while the decayed runtime top-p of 0.3 is below the argmax's own
+    # probability and collapses the nucleus onto it.
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            pytest.param(("top_p", 1.0, 1.0), id="top_p"),
+            pytest.param(("top_k_top_p", 5, 1.0, 1.0), id="top_k_top_p"),
+            pytest.param(("min_p", 0, 1.0, 0.1, 1.0), id="min_p"),
+        ],
+    )
+    @pytest.mark.parametrize("return_probs", [True, False], ids=["with_probs", "sample_only"])
+    def test_decay_override_reaches_sampling(self, strategy, return_probs):
+        num_rows, vocab, decayed_top_p = 64, 5, 0.3
+        logits = torch.zeros(num_rows, vocab, device="cuda")
+        logits[:, 0] = 1.0
+        argmax = 0
+
+        def run(is_decay_slot: bool) -> set[int]:
+            metadata = TopPDecayMetadata(
+                # All rows share slot 0, so a single store entry gates them all.
+                slots=torch.zeros(num_rows, dtype=torch.int64, device="cuda"),
+                runtime_top_p=torch.tensor([decayed_top_p], dtype=torch.float32, device="cuda"),
+                is_decay_slot=torch.tensor([is_decay_slot], dtype=torch.bool, device="cuda"),
+            )
+            tokens, _, _ = FlashInferGroupedStrategySampler.sample_grouped_strategies(
+                FlashInferGroupedStrategySampler.strategy_grouping_key(strategy),
+                [cast(Strategy, strategy)] * num_rows,
+                logits,
+                generator=torch.Generator(device="cuda").manual_seed(0),
+                return_probs=return_probs,
+                group_metadata=metadata,
+            )
+            return set(tokens.flatten().tolist())
+
+        # Gate off: the static top-p applies and sampling spreads over the vocab.
+        assert len(run(is_decay_slot=False)) > 1
+        # Gate on: the decayed runtime top-p replaces it and only the argmax survives.
+        assert run(is_decay_slot=True) == {argmax}
+
+    def test_runtime_update_parity(self):
+        # Post-sample update parity with the C++ computeToppDecay recurrence
+        # (a negative reset_id never matches, since token ids are non-negative):
+        #   runtime = initial                    if token == reset_id
+        #           = max(runtime * decay, min)  otherwise
+        sampler = self._make_sampler()
+        store = sampler._top_p_decay.store
+        configs = [
+            dict(initial=0.8, decay=0.3, top_p_min=0.5, reset_id=2),  # decay, then reset
+            dict(initial=0.2, decay=0.9, top_p_min=0.1, reset_id=-1),  # plain decay, floored
+            dict(initial=0.3, decay=0.5, top_p_min=0.6, reset_id=-1),  # min > initial: rises
+        ]
+        token_steps = [[1, 2, 3], [9, 9, 9], [9, 9, 9]]
+        slots = list(range(len(configs)))
+        for slot, cfg in zip(slots, configs):
+            sampler._top_p_decay._slots.add(slot)
+            store.runtime_top_p_decay_cuda[slot] = cfg["initial"]
+            store.initial_top_p_decay_cuda[slot] = cfg["initial"]
+            store.top_p_decay_cuda[slot] = cfg["decay"]
+            store.top_p_decay_min_cuda[slot] = cfg["top_p_min"]
+            store.top_p_decay_reset_ids_cuda[slot] = cfg["reset_id"]
+            store.is_top_p_decay_slot_cuda[slot] = True
+
+        runtime = [cfg["initial"] for cfg in configs]
+        slots_cuda = torch.tensor(slots, dtype=torch.int64, device="cuda")
+        for step in range(3):
+            for slot in slots:
+                sampler.store.new_tokens[0, slot, 0] = token_steps[slot][step]
+            sampler._top_p_decay.update_after_sample(
+                step_tokens=sampler.store.new_tokens[0, :, 0], sampled_slots_cuda=slots_cuda
+            )
+            got = store.runtime_top_p_decay_cuda.cpu()
+            for slot, cfg in zip(slots, configs):
+                tok = token_steps[slot][step]
+                if tok == cfg["reset_id"]:
+                    runtime[slot] = cfg["initial"]
+                else:
+                    runtime[slot] = max(runtime[slot] * cfg["decay"], cfg["top_p_min"])
+                assert got[slot].item() == pytest.approx(runtime[slot], abs=1e-6), (step, slot)
+
+    @staticmethod
+    def _mock_request(params: SamplingParams, *, draft_tokens=None):
+        params._validate()
+        req = SimpleNamespace(
+            sampling_config=SamplingConfig(params._get_sampling_config()),
+            is_context_init_state=False,
+            py_sampling_strategy=None,
+            py_draft_tokens=draft_tokens,
+        )
+        req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
+        return cast(LlmRequest, req)
+
+    @pytest.mark.parametrize(
+        "bad_kwargs",
+        [
+            {"top_p_decay": 1.5},
+            {"top_p_decay": -0.5},
+            {"top_p_decay": 0.0},
+            {"top_p_min": 0.0},
+            {"top_p_min": 1.5},
+            {"top_p_reset_ids": -1},
+        ],
+    )
+    def test_out_of_range_decay_params_rejected(self, bad_kwargs):
+        # Out-of-range decay params raise (mirroring the executor::SamplingConfig
+        # constructor's hard checks) instead of the former warn-and-default.
+        with pytest.raises(ValueError):
+            SamplingParams(**bad_kwargs)
+
+    def test_reject_speculative_draft_tokens(self):
+        # Decay + draft tokens through TorchSampler is rejected per-request at
+        # admission (validate_request), so only the offending request fails.
+        sampler = self._make_sampler(max_draft_len=4)
+        with pytest.raises(ValueError, match="speculative"):
+            sampler.validate_request(
+                self._mock_request(SamplingParams(top_p=0.9, top_p_decay=0.5), draft_tokens=[1, 2])
+            )
+        # Same request without decay is accepted.
+        sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))

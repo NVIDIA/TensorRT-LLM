@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for KV cache token estimation in KvCacheCreator._get_token_num_for_estimation.
 
 Guards the ADP (Attention Data Parallelism) cache-block reduction: when
@@ -601,6 +604,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     )
     model_engine = Mock()
     model_engine.model.model_config.attn_backend = "TRTLLM"
+    # Explicit False: try_prepare_estimation skips estimation for
+    # encoder-decoder models, and a bare Mock attribute is truthy.
+    model_engine.model.model_config.is_encoder_decoder = False
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(
@@ -638,6 +644,12 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
         patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
         patch.object(torch.cuda, "empty_cache"),
         patch.object(torch.cuda, "reset_peak_memory_stats"),
+        # This test exercises inferred pool sizing, not the fp8 context-MLA workspace reserve; the mock
+        # model_config would otherwise walk into the MLA byte-cost path. Neutralize it so no reserve applies.
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_mla_context_workspace_bytes_per_token",
+            return_value=0,
+        ),
     ):
         assert creator.try_prepare_estimation()
         assert kv_cache_config.max_tokens == estimation_max_tokens
@@ -649,3 +661,117 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
     assert kv_cache_config.avg_seq_len == avg_seq_len
+
+
+@pytest.mark.parametrize(
+    ("estimating_kv_cache", "expected_avg_seq_len"),
+    [(True, 2045), (False, 2055)],
+)
+def test_manager_estimation_clamps_only_temporary_avg_seq_len(
+    estimating_kv_cache,
+    expected_avg_seq_len,
+) -> None:
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+
+    captured_configs = []
+
+    class _RecordingKVCacheManagerV2(KVCacheManagerV2):
+        def __init__(self, kv_cache_config, _kv_cache_type, **kwargs) -> None:
+            captured_configs.append(kv_cache_config)
+            self.max_seq_len = kwargs["max_seq_len"]
+
+    pretrained = SimpleNamespace(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=2,
+        vocab_size=32000,
+    )
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+    kv_cache_config = KvCacheConfig(
+        max_tokens=2048,
+        avg_seq_len=2055,
+    )
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=_RecordingKVCacheManagerV2,
+        mapping=Mock(),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=32,
+        max_seq_len=2045,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=2048,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        estimating_kv_cache=estimating_kv_cache,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    assert captured_configs[0].avg_seq_len == expected_avg_seq_len
+    assert kv_cache_config.avg_seq_len == 2055
+
+
+def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+    creator = object.__new__(KvCacheCreator)
+    target_pool_ratio = [0.32, 0.68]
+    creator._kv_cache_config = KvCacheConfig(
+        pool_ratio=target_pool_ratio,
+        max_attention_window=None,
+    )
+    creator._max_seq_len = 9472
+    creator._tokens_per_block = 32
+    creator._max_batch_size = 1024
+    creator._max_num_tokens = 9472
+    creator._max_beam_width = 1
+    creator._kv_connector_manager = None
+    creator._skip_est = False
+    creator._execution_stream = None
+    creator._is_disagg = False
+    creator._mapping = Mock()
+    creator._speculative_config = Mock()
+
+    effective_draft_config = Mock()
+    effective_draft_config.pretrained_config.torch_dtype = "bfloat16"
+    effective_draft_config.sparse_attention_config = None
+
+    with (
+        patch.object(creator, "_get_num_draft_layers", return_value=1),
+        patch.object(creator, "_get_one_model_draft_layer_mask", return_value=[True]),
+        patch.object(
+            creator,
+            "_get_effective_draft_config",
+            return_value=effective_draft_config,
+        ),
+        patch.object(creator, "_enable_kv_cache_stats", return_value=False),
+        patch.object(
+            creator,
+            "_fallback_if_unsupported_kv_cache_manager_v2",
+            return_value=KVCacheManagerV2,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util._derive_draft_max_attention_window",
+            return_value=None,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            return_value=Mock(),
+        ) as create_manager,
+    ):
+        creator._create_one_model_draft_kv_cache_manager()
+
+    draft_config = create_manager.call_args.kwargs["kv_cache_config"]
+    assert draft_config.pool_ratio == [1.0]
+    assert creator._kv_cache_config.pool_ratio == target_pool_ratio

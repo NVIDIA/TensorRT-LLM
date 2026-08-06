@@ -411,10 +411,14 @@ class AttentionMetadata:
         return cuda_graph_metadata
 
     def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0
+        assert len(self._saved_tensors) == 0, (
+            "prepare_for_spec_dec called while fields "
+            f"{list(self._saved_tensors)} are still saved; a previous "
+            "forward likely raised between prepare_for_spec_dec and "
+            "restore_from_spec_dec")
         for f in fields:
             v = getattr(self, f)
-            assert isinstance(v, torch.Tensor)
+            assert isinstance(v, torch.Tensor), f"{f} is not a torch.Tensor"
             self._saved_tensors[f] = v
             setattr(self, f, v.clone())
 
@@ -422,6 +426,11 @@ class AttentionMetadata:
         for f, v in self._saved_tensors.items():
             setattr(self, f, v)
         self._saved_tensors.clear()
+
+    @property
+    def has_spec_dec_saved_state(self) -> bool:
+        """True when prepare_for_spec_dec state has not been restored yet."""
+        return bool(self._saved_tensors)
 
     def update_spec_dec_param(
             self,
@@ -665,6 +674,7 @@ class RopeParams:
         rope_params = RopeParams()
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        normalized_rope_parameters = hf_rope_parameters
         if hf_rope_parameters is not None:
             if set(hf_rope_parameters.keys()).issubset(
                     ALLOWED_ATTENTION_LAYER_TYPES):
@@ -672,17 +682,17 @@ class RopeParams:
                 # Pick "full_attention" as the default; callers override theta
                 # for sliding-window layers independently.
                 if "full_attention" in hf_rope_parameters:
-                    flat = hf_rope_parameters["full_attention"]
+                    normalized_rope_parameters = hf_rope_parameters[
+                        "full_attention"]
                 else:
                     fallback_key = next(iter(hf_rope_parameters))
                     logger.warning(
                         f"Per-layer-type rope_parameters has no 'full_attention' entry; "
                         f"falling back to '{fallback_key}'. Available layer types: "
                         f"{list(hf_rope_parameters.keys())}.")
-                    flat = hf_rope_parameters[fallback_key]
-                config.update(flat)
-            else:
-                config.update(hf_rope_parameters)
+                    normalized_rope_parameters = hf_rope_parameters[
+                        fallback_key]
+            config.update(normalized_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -691,6 +701,8 @@ class RopeParams:
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
+        if rope_scaling is None and normalized_rope_parameters is not None:
+            rope_scaling = normalized_rope_parameters
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)

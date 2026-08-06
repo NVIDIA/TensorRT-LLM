@@ -35,6 +35,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.speculative.interface import (
     FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR,
     SpecWorkerBase,
@@ -44,7 +45,7 @@ from tensorrt_llm._torch.speculative.interface import (
 
 
 class _StubSpecWorker(SpecWorkerBase):
-    """Concrete ``SpecWorkerBase`` that stubs out the only abstract API.
+    """Concrete ``SpecWorkerBase`` that stubs out the abstract API.
 
     Used purely to drive ``_apply_force_accepted_tokens`` in isolation.
     """
@@ -52,6 +53,9 @@ class _StubSpecWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return 8
+
+    def _forward_impl(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
 
 
 def _make_worker(value: Optional[float] = None) -> _StubSpecWorker:
@@ -363,3 +367,28 @@ def test_cuda_graph_replay_advances_rng_state():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class _FailingSpecWorker(_StubSpecWorker):
+    """Stub whose forward saves spec-dec metadata state and then fails."""
+
+    def _forward_impl(self, *args: object, **kwargs: object) -> None:
+        attn_metadata = kwargs["attn_metadata"]
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        raise RuntimeError("simulated draft failure")
+
+
+def test_forward_restores_spec_dec_state_on_failure() -> None:
+    """A failure between prepare_for_spec_dec and restore must not leak saved
+    attn-metadata state; SpecWorkerBase.forward restores it in its cleanup
+    (https://nvbugs/6442074)."""
+    _require_cuda()
+    attn_metadata = AttentionMetadata(max_num_requests=2, max_num_tokens=16)
+    attn_metadata.seq_lens = torch.ones(2, dtype=torch.int32)
+    worker = _FailingSpecWorker()
+    for _ in range(2):
+        # The second iteration would trip the pairing assert inside
+        # prepare_for_spec_dec if the first failure had leaked saved state.
+        with pytest.raises(RuntimeError, match="simulated draft failure"):
+            worker(attn_metadata=attn_metadata, spec_metadata=None)
+        assert not attn_metadata.has_spec_dec_saved_state

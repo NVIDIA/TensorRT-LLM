@@ -78,6 +78,23 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
         return self.iter_reused_blocks / total
 
 
+@dataclass(slots=True)
+class SsmSnapshotIterationStatsDelta(_StatsDeltaMixin):
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+
+    @property
+    def iter_snapshot_hit_rate(self) -> float:
+        if self.iter_snapshot_hits == 0 or self.iter_snapshot_lookups == 0:
+            return 0.0
+        return self.iter_snapshot_hits / self.iter_snapshot_lookups
+
+
 _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
     field.name for field in fields(KVCacheIterationStatsDelta)
 )

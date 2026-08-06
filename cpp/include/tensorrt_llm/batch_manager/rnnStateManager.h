@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -42,8 +43,8 @@ public:
         runtime::WorldConfig const& worldConfig, tensorrt_llm::runtime::BufferManager const& bufferManager);
 
     RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32 numHeads, SizeType32 nGroups, SizeType32 headDim,
-        SizeType32 maxBatchSize, runtime::WorldConfig const& worldConfig, int64_t stream, nvinfer1::DataType dtype,
-        nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers, SizeType32 numLayers);
+        SizeType32 maxBatchSize, runtime::WorldConfig const& worldConfig, int64_t stream, tensorrt_llm::DataType dtype,
+        tensorrt_llm::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers, SizeType32 numLayers);
 
     void getPtrBuffers(TensorMap& inputBuffers, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig) const;
@@ -68,9 +69,9 @@ public:
 
     [[nodiscard]] TensorPtr getSsmStates() const;
 
-    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const noexcept;
+    [[nodiscard]] tensorrt_llm::DataType getConvStateDataType() const noexcept;
 
-    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const noexcept;
+    [[nodiscard]] tensorrt_llm::DataType getSsmStateDataType() const noexcept;
 
     [[nodiscard]] executor::kv_cache::CacheState::RnnModelConfig getRnnCacheStateModelConfig() const noexcept;
 
@@ -111,8 +112,8 @@ private:
     std::vector<SizeType32> mFreeBlocks;
     std::unordered_map<RequestIdType, SizeType32> mCacheIndex;
     std::optional<runtime::BufferManager> mBufferManager;
-    nvinfer1::DataType mDtype{nvinfer1::DataType::kFLOAT};
-    nvinfer1::DataType mSsmCacheDtype{nvinfer1::DataType::kFLOAT};
+    tensorrt_llm::DataType mDtype{tensorrt_llm::DataType::kFLOAT};
+    tensorrt_llm::DataType mSsmCacheDtype{tensorrt_llm::DataType::kFLOAT};
 
     // RNN model config (global values before TP/PP split)
     SizeType32 mDState{0};

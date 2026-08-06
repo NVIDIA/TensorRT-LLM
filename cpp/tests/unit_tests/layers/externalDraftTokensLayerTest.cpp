@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tests/unit_tests/layers/baseSamplingLayerTest.h"
@@ -88,7 +89,7 @@ protected:
             dataType);
 
         mDraftTokenIds = this->mBufferManager->gpu(
-            ITensor::makeShape({this->maxBatchSize(), mMaxDraftLen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({this->maxBatchSize(), mMaxDraftLen}), tensorrt_llm::DataType::kINT32);
         mUseDraftLogits
             = this->mBufferManager->gpu(ITensor::makeShape({this->maxBatchSize()}), TRTDataType<bool>::value);
         mUseDraftLogitsHost

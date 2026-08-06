@@ -119,7 +119,7 @@ CUresult launchBatchedCopyImpl(
     }
     uint32_t const nbSplits = lowBandwidth ? 1 : divUp(nbBytes, grainBytes * ctaSize * 2);
     void* args[] = {(void*) pTasks, (void*) &nbBytes};
-    static CUkernel const kernel = [] -> CUkernel
+    static CUkernel const kernel = []() -> CUkernel
     {
         cudaKernel_t kernel = nullptr;
         TLLM_CUDA_CHECK(cudaGetKernel(&kernel, reinterpret_cast<void const*>(&batchedCopy<N>)));

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -355,6 +356,17 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             except Exception as e:
                 logger.warning(f"Error shutting down: {e}")
 
+            # The engines are already stopped by the shutdown RPC above, so
+            # kill the actor processes explicitly instead of relying on
+            # handle garbage collection. ray.kill() only *initiates* an
+            # asynchronous kill; _wait_for_cluster_resource_release() below
+            # blocks until Ray has reclaimed the workers' resources.
+            for worker in self.workers:
+                try:
+                    ray.kill(worker, no_restart=True)
+                except Exception as e:
+                    logger.warning(f"Error killing worker: {e}")
+
         if hasattr(self, 'rpc_client') and self.rpc_client is not None:
             try:
                 self.rpc_client.close()
@@ -371,9 +383,52 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.placement_group = None
         self.bundle_indices = None
 
+        # ray.kill() and remove_placement_group() above are asynchronous.
+        # Block until Ray has reclaimed the workers' resources so their GPU
+        # cleanup has completed before shutdown() returns.
+        self._wait_for_cluster_resource_release(timeout=30.0)
+
         if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
+
+    def _wait_for_cluster_resource_release(self, timeout: float = 30.0) -> None:
+        """Block until Ray returns the workers' resources to the cluster.
+
+        ray.kill() and remove_placement_group() only initiate an
+        asynchronous teardown; Ray reclaims an actor's logical resources
+        after the raylet has reaped the worker process, by which point the
+        CUDA driver has already destroyed its context (GPU memory and IPC
+        mappings). Waiting here therefore guarantees that a subsequent LLM
+        instance will not race against the dying workers, which can
+        otherwise fail spuriously (e.g. cudaErrorMapBufferObjectFailed when
+        opening CUDA IPC handles). Full availability can only be expected on
+        a cluster dedicated to this executor, so the wait is skipped when
+        attached to an external cluster. Best-effort: logs a warning on
+        timeout instead of raising, since shutdown must not fail.
+        """
+        if not self.has_start_local_cluser or not ray.is_initialized():
+            return
+        deadline = time.monotonic() + timeout
+        busy = {}
+        while time.monotonic() < deadline:
+            try:
+                cluster = ray.cluster_resources()
+                available = ray.available_resources()
+            except Exception as e:
+                logger.debug(f"Could not query Ray resources: {e}")
+                return
+            busy = {
+                key: cluster[key] - available.get(key, 0.0)
+                for key in ("GPU", "CPU") if key in cluster and cluster[key] -
+                available.get(key, 0.0) > 1e-6
+            }
+            if not busy:
+                return
+            time.sleep(0.1)
+        logger.warning(
+            f"Timed out after {timeout}s waiting for Ray to reclaim cluster "
+            f"resources; still in use: {busy}.")
 
     def _get_worker_ready_futures(self):
         return [worker.__ray_ready__.remote() for worker in self.workers]

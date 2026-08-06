@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import weakref
 from typing import List, Optional, Tuple, Union
@@ -633,6 +636,14 @@ class Attention(nn.Module):
                                     key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False
 
+        if (config.kv_cache_compression_config is not None and
+                config.kv_cache_compression_config.changes_physical_kv_length):
+            logger.warning_once(
+                "KV-cache eviction changes the physical cache length; "
+                "setting rope_fusion=False.",
+                key="disable_rope_fusion_for_kv_cache_compression")
+            self.rope_fusion = False
+
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning_once(
                 "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion.",
@@ -695,6 +706,42 @@ class Attention(nn.Module):
         if k is None and v is None:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return q, k, v
+
+    def preprocess_qkv(
+        self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        """Transform the fused QKV projection into attention inputs.
+
+        Splits out the optional attention output gate and applies RoPE (plus
+        any subclass-specific processing such as QK norm, via apply_rope).
+        Subclasses may override this to fuse these steps into a single kernel.
+
+        Returns:
+            tuple: (q, k, v, gate). k and v are None when q holds the fused
+            QKV tensor; gate is None when attn_output_gate is disabled.
+        """
+        gate = None
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+            orig_shape = q_gate.shape[:-1]
+            # Single line: view -> chunk -> reshape both q and gate
+            q, gate = [
+                t.reshape(*orig_shape, -1) for t in torch.chunk(
+                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
+            ]
+        else:
+            q, k, v = qkv, None, None
+        q, k, v = self.apply_rope(q, k, v, position_ids)
+        return q, k, v, gate
+
+    def apply_output_gate(self, attention_output: torch.Tensor,
+                          gate: torch.Tensor) -> torch.Tensor:
+        """Apply the attention output gate."""
+        if gate.shape != attention_output.shape:
+            gate = gate.reshape(attention_output.shape)
+        return attention_output * torch.sigmoid(gate)
 
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
@@ -983,18 +1030,6 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-            orig_shape = q_gate.shape[:-1]
-            # Single line: view -> chunk -> reshape both q and gate
-            q, gate = [
-                t.reshape(*orig_shape, -1) for t in torch.chunk(
-                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
-            ]
-        else:
-            q, k, v = qkv, None, None
-
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
         if (not self.rope_fusion
@@ -1008,7 +1043,7 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
-        q, k, v = self.apply_rope(q, k, v, position_ids)
+        q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
@@ -1034,8 +1069,7 @@ class Attention(nn.Module):
         )
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            attn_output = self.apply_output_gate(attn_output, gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

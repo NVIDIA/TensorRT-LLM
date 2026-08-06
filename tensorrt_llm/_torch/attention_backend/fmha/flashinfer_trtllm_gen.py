@@ -67,26 +67,161 @@ if TYPE_CHECKING:
     )
 
 
-def _clear_multi_ctas_kv_counter_workspace(
-    fmha_workspace: torch.Tensor,
-    num_heads: int,
-    max_num_requests: int,
-    multi_processor_count: Optional[int],
-) -> None:
-    counter_size = _get_multi_ctas_kv_counter_size(
-        num_heads,
-        max_num_requests,
-        multi_processor_count,
-    )
-    fmha_workspace.flatten().narrow(0, 0, counter_size).zero_()
+def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
+    """Work around an autotuner cache pathology on flashinfer 0.6.15's MLA decode path.
+
+    ``flashinfer.mla._core._build_mla_decode_tuning_config`` builds a fresh
+    ``TuningConfig`` — with fresh initializer closures — on every
+    ``trtllm_batch_decode_with_kv_cache_mla`` call. ``DynamicTensorSpec``'s
+    custom ``__hash__`` skips ``tensor_initializers``, but its
+    dataclass-generated ``__eq__`` compares them by value, so each call's
+    config is hash-equal but eq-unequal to all previous ones: the
+    ``lru_cache`` on ``AutoTuner._find_nearest_profile`` accumulates
+    colliding keys up to the cache cap, and every autotuner cache probe on
+    the MLA decode path then walks the entire collision chain in Python
+    ``__eq__`` (tens of milliseconds per attention call, per layer).
+
+    The workaround memoizes the config builder on the scalars that fully
+    determine its output (kv-cache paging geometry, workspace size, runner
+    set, head/rank dims, max_seq_len, device), so repeated calls reuse the
+    same ``TuningConfig`` object. Cache hits then resolve through
+    flashinfer's own unmodified hash/eq — no equality semantics change
+    anywhere, and the scope is exactly the MLA decode path that exhibits the
+    problem.
+
+    MLA decode is the only path that needs this: every other ``TuningConfig``
+    construction site in flashinfer 0.6.15 already reuses its config across
+    calls (module-level constants in ``gemm``, instance-level configs in the
+    cute-dsl MoE tuner, ``functools.cache``-wrapped builders in
+    ``mla/_sparse_mla_sm120.py``), so those specs hit the autotuner caches by
+    object identity and never accumulate collision chains. Memoizing the one
+    per-call builder therefore covers the whole pathology; extending it to
+    other ops would add nothing.
+
+    The bug is upstream in flashinfer; the patch is applied only when a
+    behavioral probe shows the hash/eq inconsistency and the builder still
+    has the expected signature, so a fixed or refactored flashinfer release
+    degrades this to a no-op.
+    """
+    try:
+        import inspect
+
+        from flashinfer.autotuner.autotuner import DynamicTensorSpec
+        from flashinfer.mla import _core as _flashinfer_mla_core
+
+        def _probe_spec() -> DynamicTensorSpec:
+            return DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(1,),
+                map_to_tuning_buckets=_probe_spec,  # any stable callable
+                tensor_initializers=[lambda shapes, dtype, device: None],
+            )
+
+        a, b = _probe_spec(), _probe_spec()
+        if not (hash(a) == hash(b) and a != b):
+            return  # flashinfer without the inconsistency; nothing to do
+
+        orig_build = _flashinfer_mla_core._build_mla_decode_tuning_config
+        if getattr(orig_build, "_trtllm_mla_tuning_config_cache", False):
+            return  # already installed
+
+        expected_params = (
+            "kv_cache",
+            "block_tables",
+            "workspace_buffer",
+            "runner_names",
+            "q_len",
+            "num_heads",
+            "kv_lora_rank",
+            "max_seq_len",
+            "device",
+        )
+        signature = inspect.signature(orig_build)
+        if tuple(signature.parameters) != expected_params:
+            return  # builder was refactored; memo key may no longer be complete
+        try:
+            signature.bind(**dict.fromkeys(expected_params))
+        except TypeError:
+            return  # parameters went positional-only; the keyword call below would fail
+
+        cache: dict = {}
+
+        def _cached_build(
+            kv_cache,
+            block_tables,
+            workspace_buffer,
+            runner_names,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            max_seq_len,
+            device,
+        ):
+            # Everything the builder (and _compute_mla_decode_buckets) reads
+            # from its tensor arguments reduces to these scalars.
+            key = (
+                kv_cache.shape[0],  # num_pages, captured by init_block_tables
+                kv_cache.shape[-2],  # page_size, feeds profile_seq_len
+                block_tables.shape[-1],  # pages per sequence, feeds profile_seq_len
+                workspace_buffer.numel() * workspace_buffer.element_size(),  # cute-dsl bucket cap
+                tuple(runner_names),
+                q_len,
+                num_heads,
+                kv_lora_rank,
+                max_seq_len,
+                device,
+            )
+            config = cache.get(key)
+            if config is None:
+                if len(cache) >= 256:  # backstop; a serving process sees a handful of keys
+                    cache.clear()
+                config = orig_build(
+                    kv_cache=kv_cache,
+                    block_tables=block_tables,
+                    workspace_buffer=workspace_buffer,
+                    runner_names=runner_names,
+                    q_len=q_len,
+                    num_heads=num_heads,
+                    kv_lora_rank=kv_lora_rank,
+                    max_seq_len=max_seq_len,
+                    device=device,
+                )
+                cache[key] = config
+            return config
+
+        _cached_build._trtllm_mla_tuning_config_cache = True
+        _flashinfer_mla_core._build_mla_decode_tuning_config = _cached_build
+        logger.debug(
+            "Memoized flashinfer _build_mla_decode_tuning_config "
+            "(autotuner cache collision-chain workaround)."
+        )
+    except (ImportError, AttributeError, TypeError, ValueError):
+        # A future flashinfer refactor (moved module, changed fields) must not
+        # break attention; it just loses the workaround.
+        # tensorrt_llm's logger.debug(*msg) takes no exc_info/kwargs.
+        logger.debug("Skipping flashinfer MLA decode tuning-config cache workaround.")
+
+
+if IS_FLASHINFER_AVAILABLE:
+    _install_flashinfer_mla_decode_tuning_config_cache()
+
+
+_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 
 def _get_multi_ctas_kv_counter_size(
     num_heads: int,
     max_num_requests: int,
-    multi_processor_count: Optional[int],
+    multi_processor_count: int,
 ) -> int:
-    return max(num_heads * max_num_requests, multi_processor_count or 0) * torch.int32.itemsize
+    num_counters = max(num_heads * max_num_requests, multi_processor_count)
+    aligned_num_counters = (
+        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
+        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
+        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
+    )
+    return aligned_num_counters * torch.int32.itemsize
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -99,6 +234,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_pool: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    multi_ctas_kv_counter_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
@@ -138,6 +274,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         kv_pool,
         kv_pool,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         decode_max_q_len,
@@ -169,6 +306,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_pool: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    multi_ctas_kv_counter_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_q_len: int,
@@ -199,6 +337,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
         kv_pool,
         kv_pool,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         max_q_len,
@@ -420,6 +559,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
+        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
         kv_cache_manager = meta.kv_cache_manager
@@ -802,6 +942,28 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 
+        required_counter_size = _get_multi_ctas_kv_counter_size(
+            attn.num_heads,
+            metadata.max_num_requests,
+            self._multi_processor_count,
+        )
+        counter_buffer = self._multi_ctas_kv_counter_buffer
+        if (
+            counter_buffer is None
+            or counter_buffer.device != q.device
+            or counter_buffer.numel() * counter_buffer.element_size() < required_counter_size
+        ):
+            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "The trtllm-gen multi-CTA KV counter buffer must be allocated "
+                    "before CUDA graph capture."
+                )
+            self._multi_ctas_kv_counter_buffer = torch.zeros(
+                required_counter_size,
+                dtype=torch.uint8,
+                device=q.device,
+            )
+
         num_tokens = q.size(0)
         attention_input_type = forward_args.attention_input_type
         is_gen_only = attention_input_type == AttentionInputType.generation_only
@@ -834,6 +996,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 )
             required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
             workspace.resize_((required_workspace_numel,))
+
+    def _get_multi_ctas_kv_counter_buffer(self) -> torch.Tensor:
+        counter_buffer = self._multi_ctas_kv_counter_buffer
+        if counter_buffer is None:
+            raise RuntimeError("The trtllm-gen multi-CTA KV counter buffer is not initialized.")
+        return counter_buffer
 
     @staticmethod
     def _compute_window_left(
@@ -961,6 +1129,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_processed,  # query
             kv_pool,  # kv_pool
             fmha_workspace,  # workspace_buffer
+            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
             block_tables,  # block_tables
             params.sequence_lengths,  # seq_lens
             max_q_len,  # max_q_len
@@ -1092,22 +1261,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.is_cross,  # is_cross
         )
 
-        # FIXME: Flashinfer trtllm-gen API doesn't support a separate
-        # multi CTAs counter buffer. We have to clear a small buffer
-        # before trtllm_gen_batch_decode_with_kv_cache.
-        #
-        # We must also avoid clearing the workspace only when it is
-        # resized. The warmup phase may have already cached the workspace
-        # pointer; if the capture phase skips the zeroing step, the
-        # CUDA graph will not include the counter initialization. We
-        # have already verified—specifically in the context of the GPTOSS-20B
-        # test graph replay scenario—that this skipping logic is unsafe.
-        #
-        # https://github.com/flashinfer-ai/flashinfer/issues/3433
-        _clear_multi_ctas_kv_counter_workspace(
-            fmha_workspace, attn.num_heads, meta.max_num_requests, self._multi_processor_count
-        )
-
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
         decode_max_q_len = max_q_len if is_multi_token_gen else None
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
@@ -1131,6 +1284,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_processed,  # query
             kv_pool,  # kv_pool
             fmha_workspace,  # workspace_buffer
+            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
             block_tables,  # block_tables
             params.sequence_lengths,  # seq_lens
             max_kv_len,  # max_seq_len
@@ -1233,9 +1387,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
         workspace_buffer = params.workspace.view(-1, 4)
-        _clear_multi_ctas_kv_counter_workspace(
-            workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
-        )
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
@@ -1257,4 +1408,5 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             "trtllm-gen",  # backend
             True,  # is_var_seq
             self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )

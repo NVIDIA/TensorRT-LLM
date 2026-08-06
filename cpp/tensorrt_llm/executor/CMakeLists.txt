@@ -27,9 +27,7 @@ set(SRCS
     contextPhaseParams.cpp
     debugConfig.cpp
     decodingConfig.cpp
-    executor.cpp
     executorConfig.cpp
-    executorImpl.cpp
     executorKVCacheEventManager.cpp
     extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp
@@ -52,7 +50,6 @@ set(SRCS
     response.cpp
     samplingConfig.cpp
     dynamicBatchConfig.cpp
-    dynamicBatchTuner.cpp
     schedulerConfig.cpp
     serialization.cpp
     speculativeDecodingConfig.cpp
@@ -60,7 +57,6 @@ set(SRCS
     types.cpp
     requestUtils.cpp
     contextPhaseParams.cpp
-    disaggServerUtil.cpp
     cacheTransceiverConfig.cpp)
 
 if(NOT WIN32)

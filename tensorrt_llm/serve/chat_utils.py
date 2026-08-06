@@ -424,6 +424,7 @@ def parse_chat_messages_coroutines(
     model_config: AutoConfig,
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    model_type_override: Optional[str] = None,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -470,7 +471,7 @@ def parse_chat_messages_coroutines(
     #    `content_parts` - overwriting any STRING-style placeholders inserted here.
     # See also: `_resolve_content_format` (inputs/utils.py) for the full resolution used downstream.
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
-        type(model_config).model_type)
+        model_type)
     if registry_format is not None:
         content_format = registry_format
     else:
@@ -482,6 +483,9 @@ def parse_chat_messages_coroutines(
 
         # Track placeholders added for this message only.
         msg_placeholder_counts = {}
+        # Snapshot the tracker's item_order length so we can slice off just
+        # the entries this message contributed.
+        item_order_start = len(mm_data_tracker.item_order())
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
                 placeholder = mm_data_tracker.add_data(
@@ -499,20 +503,25 @@ def parse_chat_messages_coroutines(
             # prepend/append according to placeholder_placement.
             content_parts = parsed_msg.get("content_parts")
             interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
-                type(model_config).model_type)
+                model_type)
             if content_parts and interleave:
                 parsed_msg["content"] = interleave_mm_placeholders(
-                    type(model_config).model_type, content_parts,
-                    msg_placeholder_counts,
+                    model_type, content_parts, msg_placeholder_counts,
                     mm_data_tracker.placeholder_modalities())
             else:
+                msg_item_order = mm_data_tracker.item_order()[item_order_start:]
                 parsed_msg["content"] = add_multimodal_placeholders(
-                    type(model_config).model_type, parsed_msg["content"],
-                    msg_placeholder_counts)
+                    type(model_config).model_type,
+                    parsed_msg["content"],
+                    msg_placeholder_counts,
+                    item_order=msg_item_order,
+                )
         mm_placeholder_counts.append(msg_placeholder_counts)
 
-    return conversation, mm_data_tracker.retrieve_all_async(
-    ), mm_placeholder_counts
+    # ``item_order`` is populated synchronously by ``add_data``, so it can
+    # be returned directly (not through the coroutine).
+    return (conversation, mm_data_tracker.retrieve_all_async(),
+            mm_placeholder_counts, mm_data_tracker.item_order())
 
 
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):

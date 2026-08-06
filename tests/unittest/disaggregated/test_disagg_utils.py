@@ -6,10 +6,13 @@ import yaml
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
-    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
-    extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
-    get_local_request_id, get_server_configs_dict, parse_disagg_config_file)
+    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig,
+    disagg_process_id_space, extract_ctx_gen_cfgs, extract_router_config,
+    extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
+    get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
 # isort: on
+
+pytestmark = pytest.mark.cpu_only
 
 
 def get_yaml_config():
@@ -110,9 +113,125 @@ def test_parse_disagg_config_file(sample_yaml_file, sample_yaml_config):
 @pytest.mark.parametrize("sample_yaml_config", ["disagg_cluster", ""],
                          indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
+    sample_yaml_config.update({
+        "gen_tokids_ctxbytes":
+        True,
+        "num_workers":
+        4,
+        "disagg_coordinator_url":
+        "http://coordinator:7999",
+    })
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
     verify_disagg_config(config, sample_yaml_config)
+    assert config.gen_tokids_ctxbytes is True
+    assert config.num_workers == 4
+    assert config.disagg_coordinator_url == "http://coordinator:7999"
+
+
+def test_extract_disagg_metrics_controls():
+    yaml_config = get_yaml_config()
+    yaml_config["context_servers"]["return_perf_metrics"] = False
+    yaml_config["generation_servers"]["return_perf_metrics"] = False
+    config = extract_disagg_cfg(
+        **yaml_config,
+        return_perf_metrics=True,
+        perf_metrics_output_dir="/tmp/perf",
+    )
+
+    assert config.return_perf_metrics is True
+    assert config.perf_metrics_output_dir == "/tmp/perf"
+    assert all("perf_metrics_output_dir" not in server.other_args
+               for server in config.server_configs)
+
+
+@pytest.mark.parametrize("node_id", [-1, 256])
+def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
+    with pytest.raises(ValueError, match="node_id must be in range"):
+        extract_disagg_cfg(node_id=node_id)
+
+
+def test_server_keep_alive_timeout(tmp_path):
+    # Absent key keeps the historical 10s default.
+    assert extract_disagg_cfg(
+        **get_yaml_config()).server_keep_alive_timeout == 10
+
+    # A top-level override reaches the config...
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = 3600
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 3600
+
+    # ...and survives the YAML file parser.
+    yaml_file = tmp_path / "keep_alive_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(cfg, f)
+    assert parse_disagg_config_file(yaml_file).server_keep_alive_timeout == 3600
+
+    # Zero is valid.
+    cfg["server_keep_alive_timeout"] = 0
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 0
+
+
+@pytest.mark.parametrize("value", [None, "10", 10.0, True, False, -1])
+def test_server_keep_alive_timeout_rejects_invalid_values(value):
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = value
+    with pytest.raises(
+            ValueError,
+            match="server_keep_alive_timeout must be a non-negative integer"):
+        extract_disagg_cfg(**cfg)
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_internal_request_auth_key(sample_yaml_config):
+    sample_yaml_config["internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_accepts_matching_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "test-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_rejects_mismatched_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "ctx-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "gen-secret"
+
+    with pytest.raises(ValueError, match="must match"):
+        extract_disagg_cfg(**sample_yaml_config)
+
+
+def test_extract_disagg_cfg_rejects_invalid_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key="")
+
+
+def test_extract_disagg_cfg_rejects_non_string_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key=123)
 
 
 def test_extract_ctx_gen_cfgs():
@@ -177,6 +296,17 @@ def test_extract_router_config_propagates_tokens_per_block():
     }).args
 
 
+def test_extract_router_config_propagates_kv_model_path() -> None:
+    cfg = {
+        "model": "/models/gpt-oss-checkpoint",
+        "router": {
+            "type": "kv_cache_aware"
+        },
+    }
+    router_config = extract_router_config(cfg)
+    assert router_config.args["model_path"] == "/models/gpt-oss-checkpoint"
+
+
 def test_get_server_configs_dict():
     server_configs = [
         CtxGenServerConfig(type="ctx",
@@ -200,29 +330,57 @@ def test_get_server_configs_dict():
                          ids=["multithread", "singlethread"])
 def test_get_global_disagg_request_id(multithread):
     iter = 10000
-    node_ids = list(range(10))
-    thread_num = len(node_ids)
+    # (node_id, process_id) pairs — the pair uniquely identifies a fleet worker.
+    # Mix of distinct nodes and distinct processes on the same node.
+    worker_ids = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (3, 5), (7, 2),
+                  (10, 0), (10, 3), (255, 63)]
+    thread_num = len(worker_ids)
 
-    def get_ids(node_ids):
-        all_node_ids = [[] for _ in range(len(node_ids))]
+    def get_ids(worker_ids):
+        all_ids = [[] for _ in range(len(worker_ids))]
         for i in range(iter):
             if i % (4000 // thread_num) == 0:
                 time.sleep(0.001)
-            for i, node_id in enumerate(node_ids):
-                all_node_ids[i].append(get_global_disagg_request_id(node_id))
-        return all_node_ids
+            for j, (node_id, process_id) in enumerate(worker_ids):
+                all_ids[j].append(
+                    get_global_disagg_request_id(node_id, process_id))
+        return all_ids
 
     if multithread:
-        with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
-            all_node_ids = [
-                ids[0] for ids in executor.map(get_ids, [[i] for i in node_ids])
+        with ThreadPoolExecutor(max_workers=len(worker_ids)) as executor:
+            all_worker_ids = [
+                ids[0]
+                for ids in executor.map(get_ids, [[w] for w in worker_ids])
             ]
     else:
-        all_node_ids = get_ids(node_ids)
+        all_worker_ids = get_ids(worker_ids)
 
-    all_ids = set(i for ids in all_node_ids for i in ids)
-    assert len(all_ids) == iter * len(node_ids)
+    all_ids = set(i for ids in all_worker_ids for i in ids)
+    # Each (node_id, process_id) worker's ids must be globally unique across all.
+    assert len(all_ids) == iter * len(worker_ids)
     assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
+
+
+def test_get_global_disagg_request_id_range_validation():
+    # node_id: 8 bits [0,256); process_id: 6 bits [0,64).
+    with pytest.raises(ValueError):
+        get_global_disagg_request_id(256, 0)
+    with pytest.raises(ValueError):
+        get_global_disagg_request_id(0, 64)
+    # valid extremes
+    assert get_global_disagg_request_id(255, 63) >= MIN_GLOBAL_ID
+    assert get_global_disagg_request_id(0, 0) >= MIN_GLOBAL_ID
+
+
+def test_worker_local_process_id_range_validation(monkeypatch):
+    process_id_space = disagg_process_id_space()
+    monkeypatch.setenv("TRTLLM_DISAGG_WORKER_PROCESS_ID",
+                       str(process_id_space - 1))
+    assert worker_local_process_id() == process_id_space - 1
+
+    monkeypatch.setenv("TRTLLM_DISAGG_WORKER_PROCESS_ID", str(process_id_space))
+    with pytest.raises(ValueError):
+        worker_local_process_id()
 
 
 def test_get_local_request_id():
@@ -236,5 +394,4 @@ def test_get_local_request_id():
     assert len(ids) == 1000
     assert min(ids) == 0
     assert max(ids) == MIN_GLOBAL_ID - 1
-    assert max(ids) - min(ids) > (
-        1 << 40)  # ensure there is enough space for local ids
+    assert max(ids) - min(ids) == MIN_GLOBAL_ID - 1

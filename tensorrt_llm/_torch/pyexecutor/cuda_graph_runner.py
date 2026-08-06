@@ -39,6 +39,27 @@ ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
+def _save_spec_decode_capture_state(
+        attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
+    if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
+        return None
+    return attn_metadata.kv_lens_cuda[:attn_metadata.num_seqs].clone()
+
+
+def _restore_spec_decode_capture_state(
+        attn_metadata: Any, saved_kv_lens_cuda: Optional[torch.Tensor]) -> None:
+    if saved_kv_lens_cuda is None:
+        return
+    # Speculative decoding updates kv_lens_cuda in-place during every forward.
+    # CUDA graph warmup reuses one dummy request for multiple eager forwards, so
+    # letting those updates accumulate would make later warmups/capture advertise
+    # more KV tokens than the dummy request actually allocated. Restore the
+    # single-step input state outside the graph after each forward instead.
+    batch_size = saved_kv_lens_cuda.shape[0]
+    attn_metadata.kv_lens_cuda[:batch_size].copy_(saved_kv_lens_cuda)
+    attn_metadata.on_update_kv_lens()
+
+
 @dataclass
 class CUDAGraphRunnerConfig:
     """Configuration for the CUDAGraphRunner, passed from the ModelEngine."""
@@ -100,7 +121,7 @@ class CUDAGraphRunner:
     and low-level execution (capturing, resource management, replaying) for
     multiple graphs, keyed by (batch size, draft_len, is_first_draft).
     """
-    WARMUP_STEPS = 2
+    WARMUP_STEPS = 1
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -118,6 +139,10 @@ class CUDAGraphRunner:
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
+        # graph_outputs holds only non-owning weak refs, so these strong refs are
+        # what stop the capture-time output storage from returning to the shared
+        # graph pool and being reused while the graph is still replayable.
+        self._graph_output_refs: Dict[KeyType, Any] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
@@ -132,6 +157,7 @@ class CUDAGraphRunner:
         # tensor reallocation from invalidating addresses baked into existing
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
+        self.is_warmup_only = False
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -158,9 +184,17 @@ class CUDAGraphRunner:
                     (max_total_tokens, ), device="cuda", dtype=torch.long)
 
     def _get_seq_len_mode(
-            self,
-            batch: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None):
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> bool:
+        """Select the sparse-attention graph family for the execution view.
+
+        ``promoted_context_request_ids`` contains semantic final-context rows
+        that the model engine temporarily placed in the generation list. It is
+        empty for the existing generation-only path.
+        """
         if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
                 and self.sparse_config.needs_separate_short_long_cuda_graphs()):
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
@@ -180,9 +214,19 @@ class CUDAGraphRunner:
                 is_spec_request = get_draft_token_length(
                     request) > 0 or next_draft_tokens_device is not None
                 num_draft_tokens = self.spec_config.max_draft_len if is_spec_request else 0
+                if request.py_request_id in promoted_context_request_ids:
+                    # A promoted context row may retain overlap bookkeeping
+                    # such as py_batch_idx from an earlier context chunk. That
+                    # state describes the previous batch, not the sequence
+                    # length of the final prompt token executed by this graph.
+                    # Use the authoritative context cursor so graph keying
+                    # matches the decode-shaped input prepared for this row.
+                    total_seq_len = request.context_current_position + 1
                 # First draft
-                if request.py_is_first_draft:
-                    total_seq_len = len(request.get_tokens(0))
+                elif request.py_is_first_draft:
+                    # get_num_tokens is O(1); len(get_tokens(0)) marshals the
+                    # whole O(seq_len) VecTokens into a Python list just for len.
+                    total_seq_len = request.get_num_tokens(0)
                 # With overlap scheduler disabled or dummy request or not assigned to a batch,
                 elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
                     total_seq_len = request.max_beam_num_tokens + num_draft_tokens
@@ -205,15 +249,20 @@ class CUDAGraphRunner:
         return short_seq_len_mode
 
     def get_graph_key(
-            self,
-            batch: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            spec_resource_manager: Optional[BaseResourceManager] = None,
-            spec_metadata: Optional[SpecMetadata] = None):
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        spec_resource_manager: Optional[BaseResourceManager] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> KeyType:
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
-        short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
+        # Keep the graph-key tuple unchanged; promoted IDs only correct the
+        # sequence length observed by sparse short/long graph selection.
+        short_seq_len_mode = self._get_seq_len_mode(
+            batch, new_tensors_device, promoted_context_request_ids)
 
         # Spec one-engine sampler has two code paths (argmax fast-path vs
         # advanced sampling kernel). Include this in the key so we capture
@@ -281,7 +330,8 @@ class CUDAGraphRunner:
         draft_tokens_cuda: Optional[torch.Tensor] = None,
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
-    ) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[int, int, bool]]]:
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+    ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
 
@@ -289,6 +339,10 @@ class CUDAGraphRunner:
         - The attn_metadata for the graph, if applicable.
         - The spec_metadata for the graph, if applicable.
         - The key for the graph, if applicable.
+
+        ``promoted_context_request_ids`` is execution-view metadata. It does
+        not change request state or type and is used only to build a graph key
+        consistent with the final-context token that will be executed.
         """
         # disable when doing statistic
         if ExpertStatistic.should_record():
@@ -318,10 +372,13 @@ class CUDAGraphRunner:
             # do carry a delta must first populate the model-side cache for their
             # current seq slot before graph replay.
             return None, None, None
+        # Propagate the execution-view identity through graph lookup. Existing
+        # callers pass the empty default and retain generation-only behavior.
         key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager, spec_metadata)
+                                 spec_resource_manager, spec_metadata,
+                                 promoted_context_request_ids)
 
-        if key in self.graphs:
+        if key in self.graph_metadata:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
 
@@ -345,6 +402,37 @@ class CUDAGraphRunner:
         else:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
+
+    def clear_capture_only_spec_state(self) -> int:
+        """Clear capture-scoped state from every cached graph SpecMetadata.
+
+        ``create_cuda_graph_metadata`` shallow-copies the live SpecMetadata, so a
+        copy made while ``_run_capture_pass(force_non_greedy=True)`` is active
+        inherits ``_force_non_greedy_for_capture=True``. That copy is cached here
+        and reseated as the live spec_metadata on every later replay of its graph,
+        while the capture pass clears the flag on the base object only. Without
+        this cleanup the copies keep the flag forever and
+        ``_scan_one_model_sampling`` rewrites EVERY serving request's sampling
+        params to the synthetic capture values (temperature 0.7 / top_k 50 /
+        top_p 0.9), silently ignoring what the client asked for.
+
+        The flag must NOT be cleared at copy time instead: it is load-bearing
+        *during* capture. It is what makes the pass-2 populate scan non-greedy on
+        parameter-less warmup requests, so that the advanced-sampling branch (not
+        the argmax fast path, and with the top-k/top-p kernels present) is the one
+        recorded into the graph. Clearing it here -- after the pass has captured
+        every graph -- keeps capture correct and serving clean.
+
+        Returns the number of cached metadata objects cleared.
+        """
+        cleared = 0
+        for stored in self.graph_metadata.values():
+            spec_metadata = stored.get("spec_metadata")
+            if spec_metadata is not None and getattr(
+                    spec_metadata, "_force_non_greedy_for_capture", False):
+                spec_metadata._force_non_greedy_for_capture = False
+                cleared += 1
+        return cleared
 
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs
@@ -378,8 +466,8 @@ class CUDAGraphRunner:
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None):
-        """Captures the forward pass for a given batch size."""
+                postprocess_fn: Optional[Callable] = None) -> Any:
+        """Warm up and/or capture the forward pass for a graph key."""
         batch_size = key[0]
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -407,9 +495,12 @@ class CUDAGraphRunner:
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
+        attn_metadata = capture_inputs["attn_metadata"]
+        saved_kv_lens_cuda = _save_spec_decode_capture_state(
+            attn_metadata, enable_spec_decode)
 
         self.graph_metadata[key] = {
-            "attn_metadata": initial_inputs["attn_metadata"],
+            "attn_metadata": attn_metadata,
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
@@ -422,27 +513,39 @@ class CUDAGraphRunner:
                 capture_inputs['attn_metadata'].use_spec_decoding = True
             return forward_fn(capture_inputs)
 
-        # We have to do warm up runs to initialize PyTorch's
-        # internal states according to the docs:
-        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
-        # This also lets us initialize states in the attn_metadata.
-        graph = torch.cuda.CUDAGraph()
+        output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
+            # We have to do a warmup run to initialize PyTorch's internal
+            # states according to the docs:
+            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+            # This also lets us initialize states in the attn_metadata and
+            # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                _setup_spec_decoding_and_forward(key, forward_fn,
-                                                 capture_inputs)
+                output = _setup_spec_decoding_and_forward(
+                    key, forward_fn, capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
+                _restore_spec_decode_capture_state(attn_metadata,
+                                                   saved_kv_lens_cuda)
 
+            if self.is_warmup_only:
+                return output
+
+            graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
+            _restore_spec_decode_capture_state(attn_metadata,
+                                               saved_kv_lens_cuda)
 
         self.graphs[key] = graph
-        self.graph_outputs[key] = make_weak_ref(output)
+        self._graph_output_refs[key] = output
+        graph_output = make_weak_ref(output)
+        self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
+        return graph_output
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -481,8 +584,6 @@ class CUDAGraphRunner:
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         new_batch_size = batch_size
@@ -501,15 +602,12 @@ class CUDAGraphRunner:
                 or new_batch_size > self.max_supported_batch_size):
             return 0
 
-        # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
-        # as the source of truth and pad the batch size up to the nearest existing graph
-        # for that draft length.
-        if (self.spec_config and self.spec_config.draft_len_schedule
-                and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
-            padded_batch_size = self._round_up_batch_size_with_draft_len(
-                new_batch_size, runtime_draft_len)
-        else:
-            padded_batch_size = self._round_up_batch_size(new_batch_size)
+        # Pad the batch size up to the nearest existing graph for the runtime
+        # draft length. With dynamic draft length (one-model path) the runtime
+        # draft length is the source of truth for which graphs are eligible;
+        # otherwise this reduces to plain batch-size rounding.
+        padded_batch_size = self._round_up_batch_size_with_draft_len(
+            new_batch_size, runtime_draft_len)
 
         if batch_size == padded_batch_size:
             return 0
@@ -520,65 +618,147 @@ class CUDAGraphRunner:
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
+        # No padding if it would create too many concurrent requests.
+        # This is not strictly required, but we should probably
+        # respect the requirement just in case that changes in the future.
+        # Use per-draft-len dummy requests for dynamic draft length support.
+        padding_dummy_request = self._get_or_create_padding_dummy(
+            resource_manager, runtime_draft_len)
+        if padding_dummy_request is None:
+            logger.warning_once(
+                "Failed to allocate the CUDA graph padding dummy request "
+                f"(draft_len={runtime_draft_len}) from a saturated KV cache; "
+                "falling back to eager mode for padded batches.",
+                key=f"cuda_graph_padding_dummy_fallback_{runtime_draft_len}")
+            return 0
+
+        batch.generation_requests.extend([padding_dummy_request] * padding_size)
+        return padding_size
+
+    def _get_or_create_padding_dummy(
+            self, resource_manager: ResourceManager,
+            runtime_draft_len: int) -> Optional[LlmRequest]:
+        """Returns the padding dummy request for the given draft length,
+        allocating it from the KV cache manager on first use.
+
+        Returns None when the KV cache manager cannot allocate the dummy
+        (e.g. saturated cache); the batch cannot be padded until a retry
+        succeeds.
+        """
+        if runtime_draft_len in self.padding_dummy_requests:
+            return self.padding_dummy_requests[runtime_draft_len]
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+
         runtime_tokens_per_gen_step = (
             self.spec_config.get_runtime_tokens_per_gen_step(runtime_draft_len)
             if self.spec_config is not None else 1 + runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
-        # No padding if it would create too many concurrent requests.
-        # This is not strictly required, but we should probably
-        # respect the requirement just in case that changes in the future.
-        # Use per-draft-len dummy requests for dynamic draft length support.
-        if runtime_draft_len not in self.padding_dummy_requests:
-            dummy_encoder_output_len = None
-            if self.is_encoder_decoder:
-                cross_kv_cache_manager = resource_manager.get_resource_manager(
-                    ResourceManagerType.CROSS_KV_CACHE_MANAGER)
-                if cross_kv_cache_manager is None:
-                    return 0
-                dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
-                    cross_kv_cache_manager)
+        dummy_encoder_output_len = None
+        if self.is_encoder_decoder:
+            cross_kv_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+            if cross_kv_cache_manager is None:
+                return None
+            dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
+                cross_kv_cache_manager)
 
-            # Get draft KV cache manager only for one-model speculative decoding.
-            # In two-model mode, each model has its own KV cache manager, so
-            # draft_kv_cache_manager should be None.
-            draft_kv_cache_manager = get_draft_kv_cache_manager(
-                self.spec_config, resource_manager)
+        # Get draft KV cache manager only for one-model speculative decoding.
+        # In two-model mode, each model has its own KV cache manager, so
+        # draft_kv_cache_manager should be None.
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self.spec_config, resource_manager)
 
-            # Use unique dummy request ID per draft length
-            dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
-            dummy_request = kv_cache_manager.add_dummy_requests(
-                [dummy_request_id],
-                token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
-                if self.is_encoder_decoder else None,
-                is_gen=True,
-                max_num_draft_tokens=runtime_draft_token_buffer_width,
-                use_mrope=self.config.use_mrope,
-                max_beam_width=self.config.max_beam_width,
-                encoder_output_lens=[dummy_encoder_output_len]
-                if dummy_encoder_output_len is not None else None,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+        # Use unique dummy request ID per draft length
+        dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
+        dummy_request = kv_cache_manager.add_dummy_requests(
+            [dummy_request_id],
+            token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
+            if self.is_encoder_decoder else None,
+            is_gen=True,
+            max_num_draft_tokens=runtime_draft_token_buffer_width,
+            use_mrope=self.config.use_mrope,
+            max_beam_width=self.config.max_beam_width,
+            encoder_output_lens=[dummy_encoder_output_len]
+            if dummy_encoder_output_len is not None else None,
+            draft_kv_cache_manager=draft_kv_cache_manager)
 
-            if dummy_request is None:
-                return 0
+        if dummy_request is None:
+            return None
+        dummy_request = dummy_request[0]
+        dummy_request.is_cuda_graph_dummy = True
+        if self.is_encoder_decoder:
+            if not self._add_cross_dummy_request(
+                    dummy_request, resource_manager, dummy_encoder_output_len,
+                    draft_kv_cache_manager):
+                return None
+
+        spec_res_mgr = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_res_mgr:
+            spec_res_mgr.add_dummy_requests([dummy_request_id])
+        self.padding_dummy_requests[runtime_draft_len] = dummy_request
+        return dummy_request
+
+    def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
+        """Returns True when _get_padded_batch can pad at least one feasible
+        batch size for the given draft length (mirrors its rounding and
+        capacity guards). For example, with graph batch sizes [1, 2, 4] and
+        max batch size 1, every batch already matches a graph size and no
+        padding dummy is ever needed.
+        """
+        max_unpadded_batch_size = min(self.config.batch_size,
+                                      self.max_supported_batch_size)
+        for batch_size in range(1, max_unpadded_batch_size + 1):
+            padded = self._round_up_batch_size_with_draft_len(
+                batch_size, runtime_draft_len)
+            if batch_size < padded <= self.config.batch_size:
+                return True
+        return False
+
+    def preallocate_padding_dummies(self,
+                                    resource_manager: ResourceManager) -> None:
+        """Eagerly allocates the padding dummies while the KV cache still has
+        free blocks (called at the end of ModelEngine.warmup, after graph
+        capture).
+
+        _get_padded_batch otherwise allocates the dummies lazily at the first
+        padded step; when the KV cache is already saturated by then, the
+        allocation fails on every step and padded batches permanently fall
+        back to eager mode.
+
+        Only the draft lengths of captured graphs are preallocated — those are
+        exactly the ones runtime padding requests — and only when padding can
+        actually occur for that draft length. Anything else would permanently
+        hold KV blocks (and spec/hybrid cache slots) that the lazy path never
+        consumes, regressing tightly-sized deployments.
+        """
+        if not (self.enabled and self.padding_enabled):
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+        if kv_cache_manager is None or getattr(kv_cache_manager,
+                                               'is_estimating_kv_cache', False):
+            # The estimation-phase KV cache is sized with no headroom for
+            # retained dummies; holding blocks there can leave the estimation
+            # requests unschedulable. That executor is discarded anyway, so
+            # preallocation only matters for the final one.
+            return
+        for draft_len in sorted({key[1] for key in self.graphs}):
+            if not self._can_pad_any_batch(draft_len):
+                continue
+            if self._get_or_create_padding_dummy(resource_manager,
+                                                 draft_len) is None:
+                logger.warning(
+                    "Could not pre-allocate the CUDA graph padding dummy "
+                    f"request (draft_len={draft_len}) at warmup; allocation "
+                    "will be retried at the first padded step.")
             else:
-                dummy_request = dummy_request[0]
-            dummy_request.is_cuda_graph_dummy = True
-            if self.is_encoder_decoder:
-                if not self._add_cross_dummy_request(
-                        dummy_request, resource_manager,
-                        dummy_encoder_output_len, draft_kv_cache_manager):
-                    return 0
-
-            spec_res_mgr = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_res_mgr:
-                spec_res_mgr.add_dummy_requests([dummy_request_id])
-            self.padding_dummy_requests[runtime_draft_len] = dummy_request
-
-        padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
-        batch.generation_requests.extend([padding_dummy_request] * padding_size)
-        return padding_size
+                logger.info(
+                    "Pre-allocated the CUDA graph padding dummy request "
+                    f"(draft_len={draft_len}) at warmup.")
 
     def _add_cross_dummy_request(
             self, dummy_request: LlmRequest, resource_manager: ResourceManager,
@@ -629,9 +809,14 @@ class CUDAGraphRunner:
 
     def _round_up_batch_size_with_draft_len(self, batch_size: int,
                                             draft_len: int) -> int:
-        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len."""
+        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
+
+        The dynamic draft length mapping exists exactly when the dynamic draft
+        length feature is active (see _compute_dynamic_draft_len_mapping);
+        without it, this ignores draft_len and reduces to plain batch-size
+        rounding.
+        """
         if not self.dynamic_draft_len_mapping:
-            # Fallback to regular round up if no mapping
             return self._round_up_batch_size(batch_size)
 
         start_idx = bisect.bisect_left(self.supported_batch_sizes, batch_size)
@@ -665,6 +850,9 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        # Drop the output buffers while the pool that backs them is still alive;
+        # freeing them after graph.reset() trips the allocator's use_count check.
+        self._graph_output_refs.clear()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -704,7 +892,7 @@ class EncoderCUDAGraphRunner:
     Restricted to `TrtllmAttentionMetadata` — FlashInfer's per-batch planner state is not compatible with CUDA graph capture/replay.
     """
 
-    WARMUP_STEPS = 2
+    WARMUP_STEPS = 1
 
     def __init__(self, config: EncoderCUDAGraphRunnerConfig):
         self.config = config
@@ -720,6 +908,8 @@ class EncoderCUDAGraphRunner:
         self.graphs: Dict[EncoderKeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[EncoderKeyType, Callable[[],
                                                           Optional[Any]]] = {}
+        # See CUDAGraphRunner._graph_output_refs.
+        self._graph_output_refs: Dict[EncoderKeyType, Any] = {}
         self.graph_metadata: Dict[EncoderKeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
 
@@ -730,6 +920,7 @@ class EncoderCUDAGraphRunner:
         self.cuda_graph_meta_buffers = get_memory_buffers()
 
         self._capture_allowed = False
+        self.is_warmup_only = False
 
         # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
         # prefer_pinned() is false: pageable host buffers are preferred, so the
@@ -916,7 +1107,7 @@ class EncoderCUDAGraphRunner:
                 or not is_padding_successful:
             return None, None
 
-        if key in self.graphs:
+        if key in self.graph_metadata:
             return self.graph_metadata[key]["attn_metadata"], key
 
         # New key not yet captured. Only create metadata if capture is
@@ -980,8 +1171,8 @@ class EncoderCUDAGraphRunner:
         key: EncoderKeyType,
         forward_fn: Callable[[Dict[str, Any]], Any],
         inputs: Dict[str, Any],
-    ) -> None:
-        """Capture a CUDA graph for the given key."""
+    ) -> Any:
+        """Warm up and/or capture the forward pass for a graph key."""
         _, padded_num_tokens, _ = key
 
         sliced_static_tensors = {
@@ -1003,17 +1194,21 @@ class EncoderCUDAGraphRunner:
 
         attn_md = capture_inputs["attn_metadata"]
 
-        self.graph_metadata[key] = {
-            "attn_metadata": attn_md,
-        }
+        self.graph_metadata[key] = {"attn_metadata": attn_md}
 
-        graph = torch.cuda.CUDAGraph()
-        # Warmup runs required by CUDA graph semantics. See
-        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+        output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
+            # Warmup runs required by CUDA graph semantics. See
+            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+            # Warmups initialize PyTorch and attention metadata state, and
+            # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                forward_fn(capture_inputs)
+                output = forward_fn(capture_inputs)
 
+            if self.is_warmup_only:
+                return output
+
+            graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
@@ -1034,8 +1229,11 @@ class EncoderCUDAGraphRunner:
                 "Encoder CUDA graph does not support nested tensor outputs. "
                 "Disable encoder CUDA graphs for models with ragged outputs.")
         self.graphs[key] = graph
-        self.graph_outputs[key] = make_weak_ref(output)
+        self._graph_output_refs[key] = output
+        graph_output = make_weak_ref(output)
+        self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
+        return graph_output
 
     def replay(
         self,
@@ -1103,6 +1301,7 @@ class EncoderCUDAGraphRunner:
         return self.memory_pool
 
     def clear(self):
+        self._graph_output_refs.clear()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()

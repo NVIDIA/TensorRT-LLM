@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import json
 import pathlib
@@ -247,6 +250,34 @@ def test_llm_perf_metrics():
         assert perf_metrics.first_iter is not None
         assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
         assert perf_metrics.last_iter == perf_metrics.iter
+
+
+@skip_ray
+@pytest.mark.part3
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+def test_llm_prefix_cache_reuse(attn_backend):
+    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0,
+                                     max_tokens=5,
+                                     return_perf_metrics=True)
+
+    with LLM(
+            model=model_path,
+            attn_backend=attn_backend,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            cuda_graph_config=None,
+    ) as llm:
+        cold_output = llm.generate(prompt, sampling_params).outputs[0]
+        warm_output = llm.generate(prompt, sampling_params).outputs[0]
+
+    cold_metrics = cold_output.request_perf_metrics
+    warm_metrics = warm_output.request_perf_metrics
+    assert cold_metrics is not None
+    assert warm_metrics is not None
+    assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
+    assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
+    assert cold_output.token_ids == warm_output.token_ids
 
 
 @skip_ray
@@ -1187,7 +1218,7 @@ def test_min_tokens(use_speculative: bool):
 def test_min_tokens_long_prompt():
     """Check min_tokens is respected when prompt is longer than min_tokens.
 
-    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    Regression test for NVBug 5823135: the min-length EOS suppression compared
     total token count (prompt + generated) against the raw min_tokens value
     instead of comparing generated token count only.  When prompt_len >=
     min_tokens the EOS suppression was never activated, allowing early
@@ -1546,18 +1577,22 @@ def test_llm_context_only_timed_out(transceiver_runtime):
                                disaggregated_params=disaggregated_params):
         print(output)
 
+    # Wait until the context-only request has allocated KV cache blocks
     max_retries = 10
+    all_results = []
     for _ in range(max_retries):
         results = llm.get_stats(2)
-        if len(results) == 1:
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] > 0:
             break
         time.sleep(1)
     else:
         pytest.fail(
-            f"Failed to get stats with len==1 after {max_retries} retries")
+            f"Context-only KV cache blocks not allocated after {max_retries} retries"
+        )
+    results = all_results
 
-    assert len(results) == 1
-    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    context_only_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     print(f"Context only used num blocks: {context_only_used_num_blocks}")
 
     # Sleep 5 seconds to allow context only request to time out
@@ -1567,11 +1602,20 @@ def test_llm_context_only_timed_out(transceiver_runtime):
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks
-    results = llm.get_stats(2)
-    assert len(results) == 1
-    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    # Wait until KV cache blocks are released (usedNumBlocks == 0)
+    max_retries = 10
+    all_results = []
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] == 0:
+            break
+        time.sleep(1)
+    else:
+        pytest.fail(f"KV cache blocks not released after {max_retries} retries")
+    results = all_results
 
+    final_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     assert final_used_num_blocks == 0
 
 

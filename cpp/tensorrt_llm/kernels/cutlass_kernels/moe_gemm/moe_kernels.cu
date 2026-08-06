@@ -58,6 +58,7 @@
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
 // NOTE: the grouped-GEMM dispatch (cudaGraph(SplitK)GroupedGemm,
@@ -1685,6 +1686,43 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
         num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales));
 }
 
+template <class T>
+__global__ void padEmptyFp8BlockScaleMoeInputKernel(T* permuted_input, int64_t const* expert_first_token_offset,
+    int64_t* gemm_expert_first_token_offset, int num_experts_per_node, int64_t hidden_size)
+{
+    for (int index = threadIdx.x; index <= num_experts_per_node; index += blockDim.x)
+    {
+        gemm_expert_first_token_offset[index] = expert_first_token_offset[index];
+    }
+
+    if (expert_first_token_offset[num_experts_per_node] != 0)
+    {
+        return;
+    }
+
+    for (int64_t index = threadIdx.x; index < hidden_size; index += blockDim.x)
+    {
+        permuted_input[index] = T(0);
+    }
+    __syncthreads();
+
+    // Assign the zero row to the final local expert. The all-gather/reduce-scatter
+    // finalizer ignores it because that expert was not selected by any real token.
+    if (threadIdx.x == 0)
+    {
+        gemm_expert_first_token_offset[num_experts_per_node] = 1;
+    }
+}
+
+template <class T>
+void padEmptyFp8BlockScaleMoeInput(T* permuted_input, int64_t const* expert_first_token_offset,
+    int64_t* gemm_expert_first_token_offset, int num_experts_per_node, int64_t hidden_size, cudaStream_t stream)
+{
+    constexpr int threads = 256;
+    padEmptyFp8BlockScaleMoeInputKernel<<<1, threads, 0, stream>>>(
+        permuted_input, expert_first_token_offset, gemm_expert_first_token_offset, num_experts_per_node, hidden_size);
+}
+
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)                                   \
     template void expandInputRowsKernelLauncher<InputActivationsType, ExpandedActivationsType>(                        \
         InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,                        \
@@ -2984,6 +3022,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
     size_t const permuted_data_size = permuted_elems * dtype_size;
     size_t const expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t);
+    size_t const gemm_expert_first_token_offset_size
+        = use_deepseek_fp8_block_scale ? expert_first_token_offset_size : 0;
     size_t const permuted_token_final_scales_size = mayHaveFinalizeFused() ? num_moe_inputs * sizeof(float) : 0;
     size_t const glu_inter_size = glu_inter_elems * gemm_output_dtype; // May be an intermediate type for quantization
     size_t const fc1_result_size = interbuf_elems * dtype_size;        // Activation quantizes so back to dtype_size
@@ -3083,6 +3123,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     ADD(blocked_expert_counts_cumsum);
     ADD(blocked_row_to_unpermuted_row);
     ADD(expert_first_token_offset);
+    ADD(gemm_expert_first_token_offset);
     ADD(permuted_token_final_scales);
     ADD(overlapped_gemm1_gemm2_inputs);
     ADD(overlapped_gemm1_gemm2_outputs);
@@ -3144,6 +3185,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     blocked_row_to_unpermuted_row_ = getWsPtr(int{}, "blocked_row_to_unpermuted_row");
 
     expert_first_token_offset_ = getWsPtr(int64_t{}, "expert_first_token_offset");
+    gemm_expert_first_token_offset_ = getWsPtr(int64_t{}, "gemm_expert_first_token_offset");
 
     // We check if the provided config uses fused finalize and disable it if it does not
     bool gemm2_using_finalize_fusion
@@ -3686,7 +3728,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 inline void runMoeLoraGroupedGemmModule(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmModule const& mod,
     int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
     int64_t splitk_slices, void const* input_base, void* output_base,
-    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmRunFn run, nvinfer1::DataType data_type,
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmRunFn run, tensorrt_llm::DataType data_type,
     cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
@@ -3698,25 +3740,25 @@ inline void runMoeLoraGroupedGemmModule(::tensorrt_llm::kernels::cutlass_kernels
         data_type, stream);
 }
 
-// Map the activation/back-bone type to the nvinfer1 enum the
+// Map the activation/back-bone type to the DataType enum the
 // cuda_graph_grouped_gemm wrappers expect. Only fp16/bf16/fp32 are handled;
 // anything else is a compile-time error rather than a silent fall-through.
 template <class ScaleBiasType>
-constexpr nvinfer1::DataType moeLoraNvInferType()
+constexpr tensorrt_llm::DataType moeLoraDataType()
 {
     if constexpr (std::is_same_v<ScaleBiasType, half>)
     {
-        return nvinfer1::DataType::kHALF;
+        return tensorrt_llm::DataType::kHALF;
     }
 #if defined(ENABLE_BF16)
     else if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>)
     {
-        return nvinfer1::DataType::kBF16;
+        return tensorrt_llm::DataType::kBF16;
     }
 #endif
     else if constexpr (std::is_same_v<ScaleBiasType, float>)
     {
-        return nvinfer1::DataType::kFLOAT;
+        return tensorrt_llm::DataType::kFLOAT;
     }
     else
     {
@@ -3925,7 +3967,7 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (lora_params.grouped_gemm.enabled)
     {
         auto const& grouped_gemm = lora_params.grouped_gemm;
-        nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
+        tensorrt_llm::DataType const data_type = moeLoraDataType<ScaleBiasType>();
 
         // The grouped-GEMM GEMM skips rank-0 rows, but the bias/reorder paths
         // read lora_fc1_result_ for every valid row. Zero the buffer first so
@@ -4020,7 +4062,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (lora_params.grouped_gemm.enabled)
     {
         auto const& grouped_gemm = lora_params.grouped_gemm;
-        nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
+        tensorrt_llm::DataType const data_type = moeLoraDataType<ScaleBiasType>();
 
         // As in loraFC1, zero the output so rank-0 rows the GEMM skips do not
         // feed stale data into the downstream add.
@@ -4307,6 +4349,21 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             num_experts_per_node, quant_params, use_per_expert_act_scale, expert_first_token_offset_,
             fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
             (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr, stream);
+
+        int64_t* gemm_expert_first_token_offset = expert_first_token_offset_;
+
+        // The grouped FP8 block-scale GEMM requires at least one local row.
+        // A small EP batch can legitimately route no tokens to this rank. Insert a
+        // zero-valued dummy row and adjust a GEMM-only copy of the offsets for the
+        // all-gather/reduce-scatter path. Real routing metadata remains unchanged,
+        // and finalizeMoeRouting discards the dummy because no token selected it.
+        if (use_deepseek_fp8_block_scale && parallelism_config.ep_size > 1 && !enable_alltoall)
+        {
+            TLLM_CHECK(gemm_expert_first_token_offset_ != nullptr);
+            padEmptyFp8BlockScaleMoeInput(gemm1_input_expand, expert_first_token_offset_,
+                gemm_expert_first_token_offset_, num_experts_per_node, hidden_size, stream);
+            gemm_expert_first_token_offset = gemm_expert_first_token_offset_;
+        }
         auto const* gemm1_input = gemm1_input_expand;
 
         sync_check_cuda_error(stream);
@@ -4348,12 +4405,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         // Match the FC2 act buffer bound to respective TMA desc defined in setupTmaWarpSpecializedInputs()
         T* gemm1_output = fuse_fc2_prequant_scale ? reinterpret_cast<T*>(smoothed_act_) : fc1_result_;
         Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, gemm1_output, glu_inter_result_,
-            expert_first_token_offset_, gemm1_tma_ws_input, fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr,
-            fc1_int_scales, fc1_fp8_dequant, use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
-            fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
-            expected_tokens_per_expert, hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
-            alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr, nullptr,
-            fc2_prequant_scale_ptr);
+            gemm_expert_first_token_offset, gemm1_tma_ws_input, fc1_expert_weights, fc1_expert_biases,
+            num_valid_tokens_ptr, fc1_int_scales, fc1_fp8_dequant,
+            use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant, fc1_fp4_act_scale_, fc2_fp4_act_scale_,
+            quant_params, num_rows, expanded_num_rows, expected_tokens_per_expert, hidden_size, inter_size,
+            num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_,
+            false, nullptr, nullptr, fc2_prequant_scale_ptr);
         sync_check_cuda_error(stream);
 
         if (use_lora)
@@ -4370,11 +4427,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             // Outputs smoothed_act_
             gemm2_input = applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
                 num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream, quant_params,
-                expert_first_token_offset_, num_experts_per_node);
+                gemm_expert_first_token_offset, num_experts_per_node);
             sync_check_cuda_error(stream);
         }
         Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
-            expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases, fc2_int_scales,
+            gemm_expert_first_token_offset, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases, fc2_int_scales,
             fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params, token_topk_unpermuted_scales,
             permuted_token_final_scales_, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
             token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows, expected_tokens_per_expert,
@@ -4750,18 +4807,18 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     size_t k = mK;
     size_t num_expanded_tokens = mMinLatencyMode ? maxM * mNumExpertsPerNode : maxM * k;
 
-    TLLM_CHECK(mDType != nvinfer1::DataType::kINT4);
+    TLLM_CHECK(mDType != tensorrt_llm::DataType::kINT4);
     // nvllm still uses int64 because torch doesn't have fp4 yet.
-    bool is_4bit_act = mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64;
-    bool is_4bit_weight = mWType == nvinfer1::DataType::kINT4 || mWType == nvinfer1::DataType::kFP4
-        || mWType == nvinfer1::DataType::kINT64;
+    bool is_4bit_act = mDType == tensorrt_llm::DataType::kFP4 || mDType == tensorrt_llm::DataType::kINT64;
+    bool is_4bit_weight = mWType == tensorrt_llm::DataType::kINT4 || mWType == tensorrt_llm::DataType::kFP4
+        || mWType == tensorrt_llm::DataType::kINT64;
     TLLM_CHECK_WITH_INFO(!is_4bit_act || is_4bit_weight, "Cannot have 4-bit activation with non-4-bit weight");
     float dtype_bytes = is_4bit_act
         ? 0.5f
-        : static_cast<float>(mWType == nvinfer1::DataType::kINT4 ? getDTypeSize(mOType) : getDTypeSize(mDType));
+        : static_cast<float>(mWType == tensorrt_llm::DataType::kINT4 ? getDTypeSize(mOType) : getDTypeSize(mDType));
     float weight_bytes = is_4bit_weight ? 0.5f : static_cast<float>(getDTypeSize(mWType));
     size_t output_bytes = getDTypeSize(mOType);
-    size_t gemm_output_bytes = (mOType == nvinfer1::DataType::kFP8)
+    size_t gemm_output_bytes = (mOType == tensorrt_llm::DataType::kFP8)
         ? sizeof(TmaWarpSpecializedGroupedGemmInput::OutputTypeAdaptor_t<__nv_fp8_e4m3>)
         : output_bytes;
 
@@ -4803,18 +4860,18 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
 
     // TODO Make quant 2 & 4 bigger for FP8 if we ever change to scaling per expert
     bool is_int_w_quant
-        = (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4) && mGroupSize <= 0;
+        = (mWType == tensorrt_llm::DataType::kINT8 || mWType == tensorrt_llm::DataType::kINT4) && mGroupSize <= 0;
     bool is_int_groupwise_w_quant
-        = (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4) && mGroupSize > 0;
-    bool is_fp8_act_quant = mDType == nvinfer1::DataType::kFP8;
-    bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
+        = (mWType == tensorrt_llm::DataType::kINT8 || mWType == tensorrt_llm::DataType::kINT4) && mGroupSize > 0;
+    bool is_fp8_act_quant = mDType == tensorrt_llm::DataType::kFP8;
+    bool is_fp8_w_quant = mWType == tensorrt_llm::DataType::kFP8;
     // nvllm still uses int64 because torch doesn't have fp4 yet.
-    // bool is_fp4_act_quant = mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64;
-    bool is_fp4_w_quant = mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64;
+    // bool is_fp4_act_quant = mDType == tensorrt_llm::DataType::kFP4 || mDType == tensorrt_llm::DataType::kINT64;
+    bool is_fp4_w_quant = mWType == tensorrt_llm::DataType::kFP4 || mWType == tensorrt_llm::DataType::kINT64;
     bool is_w4afp8_quant = is_int_groupwise_w_quant && is_fp8_act_quant;
     // bool is_wfp4afp8_quant = is_fp4_w_quant && is_fp8_act_quant;
-    bool is_wfp4a16_quant = (mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
-        && mWType == nvinfer1::DataType::kUINT8;
+    bool is_wfp4a16_quant = (mDType == tensorrt_llm::DataType::kHALF || mDType == tensorrt_llm::DataType::kBF16)
+        && mWType == tensorrt_llm::DataType::kUINT8;
 
     // Int sizes
     size_t quant_1_size = is_int_w_quant ? fc1_out_size * num_experts_per_node * dtype_bytes : 0;
@@ -5047,19 +5104,19 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
     GET_WS_PTR(float const*, w4a8_alpha);
 #undef GET_WS_PTR
 
-    if ((mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4
-            || mWType == nvinfer1::DataType::kUINT8)
+    if ((mWType == tensorrt_llm::DataType::kINT8 || mWType == tensorrt_llm::DataType::kINT4
+            || mWType == tensorrt_llm::DataType::kUINT8)
         && mGroupSize < 0)
     {
         TLLM_CHECK(quant_1 && quant_2);
         mQuantParams = QuantParams::Int(quant_1, quant_2);
     }
-    else if (mWType == nvinfer1::DataType::kINT4 || mWType == nvinfer1::DataType::kUINT8)
+    else if (mWType == tensorrt_llm::DataType::kINT4 || mWType == tensorrt_llm::DataType::kUINT8)
     {
         TLLM_CHECK(quant_1 && quant_2);
-        if (mDType == nvinfer1::DataType::kFP8
-            || (mWType == nvinfer1::DataType::kUINT8
-                && (mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)))
+        if (mDType == tensorrt_llm::DataType::kFP8
+            || (mWType == tensorrt_llm::DataType::kUINT8
+                && (mDType == tensorrt_llm::DataType::kHALF || mDType == tensorrt_llm::DataType::kBF16)))
         {
             TLLM_CHECK(w4a8_alpha);
             mQuantParams = QuantParams::GroupWise(
@@ -5070,7 +5127,7 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
             mQuantParams = QuantParams::GroupWise(mGroupSize, quant_1, quant_2, nullptr, nullptr, quant_3, quant_4);
         }
     }
-    else if (mWType == nvinfer1::DataType::kFP8)
+    else if (mWType == tensorrt_llm::DataType::kFP8)
     {
         if (mUseMxfp8WeightScaling)
         {
@@ -5089,8 +5146,8 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
                 static_cast<float const*>(quant_3), static_cast<float const*>(quant_4));
         }
     }
-    else if (mDType == nvinfer1::DataType::kFP8
-        && (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64))
+    else if (mDType == tensorrt_llm::DataType::kFP8
+        && (mWType == tensorrt_llm::DataType::kFP4 || mWType == tensorrt_llm::DataType::kINT64))
     {
         TLLM_CHECK(quant_1 && quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
         mQuantParams = QuantParams::FP8MXFP4(static_cast<float const*>(quant_1),
@@ -5099,8 +5156,8 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
             static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
             static_cast<float const*>(quant_6));
     }
-    else if ((mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64)
-        && (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64))
+    else if ((mDType == tensorrt_llm::DataType::kFP4 || mDType == tensorrt_llm::DataType::kINT64)
+        && (mWType == tensorrt_llm::DataType::kFP4 || mWType == tensorrt_llm::DataType::kINT64))
     {
         // nvllm still uses int64 because torch doesn't have fp4 yet.
         TLLM_CHECK(quant_1 && quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
@@ -5120,9 +5177,9 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
         return;
     }
 
-    bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
-    bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
-        && mWType == nvinfer1::DataType::kUINT8);
+    bool use_w4afp8 = (mDType == tensorrt_llm::DataType::kFP8 && mWType == tensorrt_llm::DataType::kINT4);
+    bool use_wfp4a16 = ((mDType == tensorrt_llm::DataType::kHALF || mDType == tensorrt_llm::DataType::kBF16)
+        && mWType == tensorrt_llm::DataType::kUINT8);
     bool const use_finalize_fusion = fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
     bool const finalize_fusion_not_supported
         = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_wfp4a16 || mGemmToProfile != GemmToProfile::GEMM_2;

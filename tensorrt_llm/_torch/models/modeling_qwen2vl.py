@@ -84,8 +84,8 @@ PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/b
 
 
 def _prepare_qwen_vl_vision_attn_metadata(
-        seq_lens: List[int],
-        attn_metadata: AttentionMetadata) -> AttentionMetadata:
+        seq_lens: List[int], attn_metadata: AttentionMetadata, *,
+        max_seq_len: int) -> AttentionMetadata:
     seq_lens = [int(seq_len) for seq_len in seq_lens]
     if not seq_lens:
         raise ValueError(
@@ -96,6 +96,17 @@ def _prepare_qwen_vl_vision_attn_metadata(
         raise ValueError(
             f"Qwen VL vision attention segment length must be nonnegative, got {min_seq_len}"
         )
+
+    if max_seq_len <= 0:
+        raise ValueError(
+            f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
+        )
+    actual_max_seq_len = max(seq_lens)
+    if actual_max_seq_len > max_seq_len:
+        raise ValueError(
+            "Qwen VL vision attention segment length exceeds the configured "
+            f"maximum: actual={actual_max_seq_len}, maximum={max_seq_len}. "
+            "Increase encoder_max_num_tokens or reduce the input max_pixels.")
 
     num_segments = len(seq_lens)
     seq_lens_torch = torch.tensor(seq_lens,
@@ -114,7 +125,9 @@ def _prepare_qwen_vl_vision_attn_metadata(
                                non_blocking=True)
     attn_metadata.cu_q_seqlens = cu_seqlens
     attn_metadata.cu_kv_seqlens = cu_seqlens
-    attn_metadata.max_seq_len = max(seq_lens)
+    # Keep the native attention-op cache key stable across image resolutions.
+    # Actual segment lengths remain available through seq_lens / cu_seqlens.
+    attn_metadata.max_seq_len = max_seq_len
     # The vision tower runs no-cache, context-only attention and supplies its
     # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
     # prompt_lens / host_request_types setup) is unnecessary host work.
@@ -154,7 +167,14 @@ def _prepare_qwen_vl_mrope_config(
         if len(delta_tensors) != num_seq_slots:
             raise RuntimeError(
                 "Missing MRoPE position deltas for seq-slot cache update")
-        deltas = torch.cat(delta_tensors, dim=0)
+        # `delta_tensors` originate from per-request `multimodal_data` and may
+        # be CPU-resident when the owning model's `multimodal_data_device_paths`
+        # does not cover `mrope_config.*` (or a path skips the engine's H2D
+        # move), while the seq-slot cache and `seq_slots` live on the model
+        # device. `index_copy_` requires all tensors on the same device.
+        deltas = torch.cat(delta_tensors,
+                           dim=0).to(device=mrope_position_deltas_cache.device,
+                                     non_blocking=True)
         mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
 
     if position_ids is not None \
@@ -298,6 +318,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         divided by ``spatial_merge_unit`` (the post-merger placeholder count)."""
         if isinstance(image, torch.Tensor):
             image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        elif isinstance(image, np.ndarray):
+            # HWC uint8 from ImageMediaIO's "np" format.
+            image_h, image_w = int(image.shape[0]), int(image.shape[1])
         else:
             image_h, image_w = image.height, image.width
         encoder_tokens = self._num_vision_tokens(width=image_w,
@@ -313,6 +336,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if isinstance(first_frame, torch.Tensor):
             frame_h = int(first_frame.shape[-2])
             frame_w = int(first_frame.shape[-1])
+        elif isinstance(first_frame, np.ndarray):
+            # HWC uint8 from VideoMediaIO's "np" format.
+            frame_h = int(first_frame.shape[0])
+            frame_w = int(first_frame.shape[1])
         else:
             frame_h, frame_w = first_frame.height, first_frame.width
         encoder_tokens = self._num_vision_tokens(width=frame_w,
@@ -859,18 +886,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         # Text-only fast path: skip the multi-modal HF processor (tokenizer
         # output matches it bit-exactly when `images` / `videos` are `None`)
-        # while still populating mrope_config since the LM is M-RoPE.
+        # and emit no multimodal data at all. Without vision spans the M-RoPE
+        # coordinates degenerate to the scalar token positions on all three
+        # axes and the position delta is zero, which is exactly what the model
+        # engine falls back to for a request carrying no `mrope_config`.
+        # Synthesizing them would cost an O(seq_len) (3, 1, N) tensor per
+        # request that the engine then moves to device, and in disaggregated
+        # serving the prefill worker re-registers that tensor as a CUDA IPC
+        # handle no one ever consumes.
         if not mm_data:
             input_ids = self.tokenizer(text_prompt,
                                        return_tensors="pt").input_ids
-            attention_mask = torch.ones_like(input_ids)
-            mrope_config = self.get_mrope_config(input_ids, None, None,
-                                                 attention_mask, None)
-            return input_ids[0].to(torch.int32).tolist(), {
-                "multimodal_data": {
-                    "mrope_config": mrope_config
-                },
-            }
+            return input_ids[0].to(torch.int32).tolist(), None
 
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs)
@@ -890,7 +917,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "video_grid_thw": processed_inputs.get('video_grid_thw')
             }
 
-        # NOTE: Even on the text-only prompts, we still need 'mrope_position_ids'.
+        # Computed from the fused ids so the vision spans get their per-axis
+        # coordinates; the text-only path above returns before reaching here.
         mrope_config = self.get_mrope_config(
             processed_inputs['input_ids'],
             processed_inputs.get('image_grid_thw', None),
@@ -1160,7 +1188,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
-                cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
+                # flashinfer requires cos_sin_cache in float32; upstream may cache
+                # cos/sin in the vision tower dtype (e.g. bf16) as a perf hint.
+                cos_sin_cache = torch.cat([cos, sin], dim=-1).to(
+                    torch.float32).contiguous()
                 flashinfer_apply_rope_with_cos_sin_cache_inplace(
                     position_ids,
                     q,
@@ -1170,7 +1201,7 @@ class Qwen2_5_VLVisionAttention(Attention):
                     is_neox=True,
                 )
                 return q, k, v
-            except RuntimeError as err:
+            except (RuntimeError, ValueError) as err:
                 logger.warning(
                     "Qwen2.5-VL vision RoPE: FlashInfer failed (%s); "
                     "falling back to PyTorch RotaryEmbedding.apply_rotary_pos_emb.",
@@ -1393,6 +1424,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             self.model_config.attn_backend).Metadata
         self.full_attn_metadata: Optional[AttentionMetadata] = None
         self.window_attn_metadata: Optional[AttentionMetadata] = None
+        self.set_attn_max_seq_len(self.model_config.max_num_tokens)
         # Pre-allocated `arange` for the vision block's `rope_position_ids`;
         # per-call code slices `[:seq_len]` instead of a fresh `(seq_len,) int32`
         # + H->D copy. Sized by `setup_attn_metadata` (engine-driven); `forward`
@@ -1420,11 +1452,24 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                       kv_cache_manager=None)
         self.full_attn_metadata = self.metadata_cls(**kwargs)
         self.window_attn_metadata = self.metadata_cls(**kwargs)
+        self.set_attn_max_seq_len(max_num_tokens)
         # Size the vision-block ``rope_position_ids`` scratch to the encoder
         # token budget; ``forward`` grows it on the rare miss above the budget.
         self._rope_position_ids_buffer = torch.arange(max_num_tokens,
                                                       dtype=torch.int32,
                                                       device=self.device)
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
+            )
+        self._full_attn_max_seq_len = max_seq_len
+        vit_merger_window_size = (self.window_size // self.spatial_merge_size //
+                                  self.patch_size)
+        self._window_attn_max_seq_len = min(
+            self._full_attn_max_seq_len,
+            vit_merger_window_size**2 * self.spatial_merge_unit)
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]
@@ -1586,15 +1631,18 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
-    def prepare_attn_metadata(
-            self,
-            seq_lens: List[int],
-            attn_metadata: Optional[AttentionMetadata] = None):
+    def prepare_attn_metadata(self,
+                              seq_lens: List[int],
+                              attn_metadata: Optional[AttentionMetadata] = None,
+                              *,
+                              max_seq_len: int) -> AttentionMetadata:
         if attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
                 "It must be set up before the encoder forward runs.")
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(seq_lens,
+                                                     attn_metadata,
+                                                     max_seq_len=max_seq_len)
 
     @property
     def device(self) -> torch.device:
@@ -1649,9 +1697,13 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
 
         self.full_attn_metadata = self.prepare_attn_metadata(
-            seq_lens, self.full_attn_metadata)
+            seq_lens,
+            self.full_attn_metadata,
+            max_seq_len=self._full_attn_max_seq_len)
         self.window_attn_metadata = self.prepare_attn_metadata(
-            window_seq_lens, self.window_attn_metadata)
+            window_seq_lens,
+            self.window_attn_metadata,
+            max_seq_len=self._window_attn_max_seq_len)
 
         for layer_num, block in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -1857,8 +1909,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         mrope_config = {}
-        # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts, so we need to separate
-        # the entries that do have multimodal data from those that correspond to text-only prompts.
+        # `multimodal_params` holds one entry per request that carried any
+        # multimodal data, context entries first, followed by the generation
+        # entries that only seed the MRoPE delta cache. The slice bounds the
+        # scan to the context prefix; `_get_requests_with_mm_data` is what
+        # actually selects the entries with encoder input, so this does not
+        # rely on the entries lining up with the context requests.
         if num_context_requests > 0:
             mm_multimodal_params = self._get_requests_with_mm_data(
                 multimodal_params[:num_context_requests])

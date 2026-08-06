@@ -16,7 +16,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -33,6 +33,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 class MockPyExecutor:
@@ -893,6 +895,90 @@ class TestDisaggTransferAdmissionPP:
         assert wait_for_progress
 
 
+def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
+    monkeypatch,
+):
+    class StopLocalSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.device_id = 0
+    profiler = MagicMock()
+    profiler.__enter__.return_value = Mock()
+    executor._profiler = Mock(return_value=profiler)
+    executor.hang_detector = MagicMock()
+    executor.enable_iter_perf_stats = False
+    executor._handle_disagg_cache_errors_synced = Mock()
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = None
+    executor._pad_attention_dp_dummy_request = Mock()
+    scheduled_batch = Mock()
+    executor._pp_schedule_and_propagate = Mock(return_value=(scheduled_batch, [], 0, False))
+    executor._pp_retry_until_can_schedule = Mock()
+    request = Mock()
+    executor.active_requests = [request]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    calls = []
+    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
+        lambda requests: calls.append(("prepare", requests))
+    )
+
+    def stop_after_schedule(requests, inflight_req_ids):
+        calls.append(("schedule", requests, inflight_req_ids))
+        raise StopLocalSchedule
+
+    executor.scheduler.schedule_request.side_effect = stop_after_schedule
+
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", Mock())
+
+    with pytest.raises(StopLocalSchedule):
+        PyExecutor._executor_loop_pp(executor)
+
+    assert calls == [
+        ("prepare", executor.active_requests),
+        ("schedule", executor.active_requests, executor.inflight_req_ids),
+    ]
+
+
+def test_schedule_prepares_snapshot_points_before_scheduling():
+    class StopSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    request = Mock()
+    executor.active_requests = [request]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    calls = []
+    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
+        lambda requests: calls.append(("prepare", requests))
+    )
+
+    def stop_after_schedule(requests, inflight_req_ids):
+        calls.append(("schedule", requests, inflight_req_ids))
+        raise StopSchedule
+
+    executor.scheduler.schedule_request.side_effect = stop_after_schedule
+
+    with pytest.raises(StopSchedule):
+        PyExecutor._schedule(executor)
+
+    assert calls == [
+        ("prepare", executor.active_requests),
+        ("schedule", executor.active_requests, executor.inflight_req_ids),
+    ]
+
+
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 
@@ -1216,6 +1302,8 @@ class _StubADPExecutor:
         enable_attention_dp=True,
         kv_cache_transceiver=object(),
         max_num_tokens=8192,
+        max_seq_len=8192,
+        kv_manager_max_seq_len=None,
         is_warmup=False,
         benchmark_req_queues_size=0,
         enable_dsv4_adp_dummy_fixes=True,
@@ -1234,6 +1322,7 @@ class _StubADPExecutor:
         self._pending_adp_dummy_request = None
         self._enable_dsv4_adp_dummy_fixes = enable_dsv4_adp_dummy_fixes
         self.add_dummy_calls = []
+        self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
         self.dist.tp_size = 1
@@ -1242,6 +1331,11 @@ class _StubADPExecutor:
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
         kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        kv_cache_manager.max_seq_len = (
+            max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
+        )
+        kv_cache_manager.num_extra_kv_tokens = 0
+        kv_cache_manager.tokens_per_block = 128
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -1410,6 +1504,19 @@ def test_pad_dummy_allocation_failure_skips_padding():
 
     assert len(stub.active_requests) == 1
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+def test_disabled_dsv4_gate_checks_full_generation_capacity():
+    stub = _StubADPExecutor(enable_dsv4_adp_dummy_fixes=False)
+    stub.max_total_draft_tokens = 4
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 4
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=5, max_num_draft_tokens=4
+    )
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
 
 
 def test_dsv4_pad_dummy_checks_full_context_capacity():
