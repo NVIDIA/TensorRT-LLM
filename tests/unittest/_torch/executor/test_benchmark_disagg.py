@@ -33,6 +33,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import time
@@ -207,12 +208,24 @@ def launch_disaggregated_llm(
         "generation_servers": num_gen_instances
     }
 
+    internal_request_auth_key = secrets.token_hex(32)
+
     # Inject disagg_cluster into server config (for minimal_instances and is_ready check)
     disaggregated_server_config["disagg_cluster"] = disagg_cluster
+    disaggregated_server_config["internal_request_auth_key"] = (
+        internal_request_auth_key)
 
     # Inject into worker configs
-    ctx_server_config = {**ctx_server_config, "disagg_cluster": disagg_cluster}
-    gen_server_config = {**gen_server_config, "disagg_cluster": disagg_cluster}
+    ctx_server_config = {
+        **ctx_server_config,
+        "disagg_cluster": disagg_cluster,
+        "internal_request_auth_key": internal_request_auth_key,
+    }
+    gen_server_config = {
+        **gen_server_config,
+        "disagg_cluster": disagg_cluster,
+        "internal_request_auth_key": internal_request_auth_key,
+    }
 
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
@@ -2393,7 +2406,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
-    def test_nvfp4_nixl_python(self, use_kv_cache_manager_v2):
+    def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
             "enable_block_reuse": False,
@@ -2401,7 +2414,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
-            "transceiver_runtime": "PYTHON",
         }
         moe_config = {"backend": "CUTEDSL"}
         speculative_config = {

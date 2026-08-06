@@ -49,6 +49,30 @@ def active_page_stats(kv_cache: Any) -> tuple[list[int], list[int]]:
     return counts, unscheduled_evictable
 
 
+def committed_page_is_linked(kv_cache: Any, ordinal: int, lc_id: int) -> bool | None:
+    """Whether the sequence's page at ``(ordinal, lc_id)`` still points at a tree block.
+
+    ``None`` when the slot is empty or holds an uncommitted page. Test hook: in C++ the
+    back-pointer is raw, so a page left pointing at a block that dies first is read after
+    free, and freed-but-mapped memory reads back plausibly enough that only a sanitizer
+    build catches the fault itself.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.committed_page_is_linked(kv_cache, ordinal, lc_id)
+
+    from ._common import DEFAULT_BEAM_INDEX
+    from ._page import CommittedPage
+
+    block_page = kv_cache._page(ordinal, DEFAULT_BEAM_INDEX, lc_id)
+    if block_page is None:
+        return None
+    page = block_page.page
+    if not isinstance(page, CommittedPage):
+        return None
+    return page.block() is not None
+
+
 def all_tree_pages_droppable(manager: Any) -> bool:
     """Return whether every page reachable from the radix tree is droppable."""
     cpp_introspection = _cpp_introspection_module()
@@ -237,8 +261,9 @@ def reuse_match_pages(
     """Match ``tokens`` against the radix tree and report reusable pages per block.
 
     Returns ``(num_tokens, pages)`` where ``pages[i]`` is ``None`` when block ``i``
-    holds no page for lifecycle ``lc_id``, otherwise ``(slot_id, num_tokens_in_block)``
-    with ``num_tokens_in_block`` set only for SSM pages (``None`` for attention pages).
+    holds no page for lifecycle ``lc_id``, otherwise ``(slot_id, num_tokens_in_block)``.
+    See ``CommittedPage.num_tokens_in_block`` for how attention and SSM life cycles
+    interpret the recorded token count.
     """
     cpp_introspection = _cpp_introspection_module()
     if cpp_introspection is not None:
@@ -254,16 +279,13 @@ def reuse_match_pages(
                 pages.append((slot_id, None if num_tokens_in_block < 0 else num_tokens_in_block))
         return num_tokens, pages
 
-    from ._utils import unwrap_rawref
-
     match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
     py_pages: list[tuple[int, int | None] | None] = []
     for block in match.blocks:
-        ref = block.storage[lc_id]
-        if ref is None:
+        page = block.get_page(lc_id)
+        if page is None:
             py_pages.append(None)
         else:
-            page = unwrap_rawref(ref)
             py_pages.append((page.slot_id, getattr(page, "num_tokens_in_block", None)))
     return match.num_tokens, py_pages
 
@@ -286,13 +308,11 @@ def reuse_match_planned_drop_counts(
             manager, reuse_scope, list(tokens), lc_id, enable_partial
         )
 
-    from ._utils import unwrap_rawref
-
     match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
     counts: list[int | None] = []
     for block in match.blocks:
-        ref = block.storage[lc_id]
-        counts.append(None if ref is None else unwrap_rawref(ref).planned_drop_count)
+        page = block.get_page(lc_id)
+        counts.append(None if page is None else page.planned_drop_count)
     return match.num_tokens, counts
 
 
