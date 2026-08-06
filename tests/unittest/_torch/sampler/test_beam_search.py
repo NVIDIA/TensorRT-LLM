@@ -166,7 +166,13 @@ def check_generation_logits(beam: CompletionOutput,
     """Check if the generation logits have the correct shape"""
     if sampling_params.return_generation_logits:
         gen_logits = beam.generation_logits
-        generated_tokens = valid_tokens if valid_tokens is not None else sampling_params.max_tokens
+        # Fall back to this beam's own length rather than max_tokens: under
+        # early_stopping=1 (the default, HF's `True`) the request stops once
+        # best_of candidates are complete, so a beam that never hit a stop
+        # token can be shorter than max_tokens.
+        assert beam.token_ids is not None
+        generated_tokens = (valid_tokens if valid_tokens is not None else len(
+            beam.token_ids))
         assert gen_logits is not None, "generation logits should not be None"
         assert gen_logits.ndim == 2, f"generation logits should have 2 dimensions, but got {gen_logits.ndim}"
         assert gen_logits.shape[
@@ -180,7 +186,13 @@ def check_logprobs(beam: CompletionOutput, sampling_params: SamplingParams,
     """Check if the logprobs have the correct shape"""
     assert beam.logprobs is not None
     if sampling_params.logprobs is not None:
-        generated_tokens = valid_tokens if valid_tokens is not None else sampling_params.max_tokens
+        # Fall back to this beam's own length rather than max_tokens: under
+        # early_stopping=1 (the default, HF's `True`) the request stops once
+        # best_of candidates are complete, so a beam that never hit a stop
+        # token can be shorter than max_tokens.
+        assert beam.token_ids is not None
+        generated_tokens = (valid_tokens if valid_tokens is not None else len(
+            beam.token_ids))
         assert len(
             beam.logprobs
         ) == generated_tokens, f"expected {generated_tokens} logprobs, but got {len(beam.logprobs)}"
@@ -206,7 +218,13 @@ def check_cache_indirection(beam: CompletionOutput,
     assert cache_indirection.shape[
         1] == sampling_params.best_of, f"expected {sampling_params.best_of} entries in dim 1 of cache indirection, but got {cache_indirection.shape[1]}"
 
-    num_generated_tokens = valid_tokens if valid_tokens is not None else sampling_params.max_tokens
+    # Fall back to what this beam actually produced rather than max_tokens: with
+    # early_stopping=1 (the default, HF's `True`) the request stops as soon as
+    # best_of finished candidates exist, so a beam that never hit a stop token
+    # can still be shorter than max_tokens.
+    assert beam.token_ids is not None
+    num_generated_tokens = (valid_tokens if valid_tokens is not None else len(
+        beam.token_ids))
     # We return the cache indirection before the sampling step, therefore cache indirection does not reflect changes during the sampling of the last token
     num_valid_cache_indirection = num_generated_tokens - 1
 
@@ -250,8 +268,16 @@ def validate_output_beam(beam_output: CompletionOutput,
     # Check output similarity
 
     assert valid_tokens is None or valid_tokens > 0
+    # get_expected_outputs walks a fixed number of iterations; it has no notion
+    # of the finished-candidate pool. Under early_stopping=1 the request stops
+    # once best_of candidates are complete, so a beam that never hit a stop
+    # token can end early. Compare the prefix it did produce -- a wrong beam
+    # still diverges, only the unreached tail is dropped.
+    assert beam_output.token_ids is not None
+    num_valid = valid_tokens if valid_tokens is not None else len(
+        beam_output.token_ids)
     expected_valid_token_ids = expected_outputs.outputs[
-        beam_idx, :valid_tokens].tolist()
+        beam_idx, :num_valid].tolist()
     assert beam_output.token_ids == expected_valid_token_ids, f"expected {expected_valid_token_ids} token ids, but got {beam_output.token_ids}"
 
 
