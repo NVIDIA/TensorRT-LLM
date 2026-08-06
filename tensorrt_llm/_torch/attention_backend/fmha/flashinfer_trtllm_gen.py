@@ -1089,7 +1089,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fp8_context_fmha=fp8_context_fmha,
         )
 
-        if is_gen_only and attn.is_mla_enable and self._mla_backend == "cute-dsl":
+        effective_mla_backend = self._get_effective_mla_backend(metadata, num_tokens)
+        if is_gen_only and attn.is_mla_enable and effective_mla_backend == "cute-dsl":
             if metadata.kv_cache_manager is None:
                 raise RuntimeError("CuTeDSL MLA requires a paged KV cache manager.")
             max_batch_size = metadata.max_num_sequences or metadata.max_num_requests
@@ -1130,6 +1131,25 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if counter_buffer is None:
             raise RuntimeError("The trtllm-gen multi-CTA KV counter buffer is not initialized.")
         return counter_buffer
+
+    def _get_effective_mla_backend(self, meta: "TrtllmAttentionMetadata", num_tokens: int) -> str:
+        """Select the MLA decode backend for the current scheduler batch.
+
+        CuTe-DSL reuses one staged page table across MLA layers for a
+        generation-only, one-token-per-request batch. A mixed
+        context/generation batch cannot use that reuse key, so selecting
+        CuTe-DSL would repeat the staging copies in every MLA layer and regress
+        time to first token. K3's 128 padded query heads also restrict the
+        CuTe-DSL kernel to one query token per request. Keep the requested
+        CuTe-DSL fast path for plain decode and use TRTLLM-Gen for mixed batches
+        and speculative multi-token verification.
+        """
+        is_single_token_generation = num_tokens == meta.num_generations
+        if self._mla_backend == "cute-dsl" and (
+            meta.num_contexts > 0 or not is_single_token_generation
+        ):
+            return "trtllm-gen"
+        return self._mla_backend
 
     @staticmethod
     def _compute_window_left(
@@ -1437,6 +1457,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
+        effective_mla_backend = self._get_effective_mla_backend(meta, params.num_tokens)
         if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
             raise NotImplementedError(
                 "Sliding-window attention is not supported by MLA decode path."
@@ -1464,7 +1485,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
 
         pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1 and self._mla_backend != "cute-dsl":
+        if pages_per_superblock > 1 and effective_mla_backend != "cute-dsl":
             # The cute-dsl branch stages the page table into a
             # zero-initialized workspace region already padded to
             # ``padded_num_pages`` below, so padding here would launch a
@@ -1518,7 +1539,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             )
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
-        if self._mla_backend == "cute-dsl":
+        if effective_mla_backend == "cute-dsl":
             padded_num_pages = (
                 math.ceil(block_tables.size(-1) / pages_per_superblock) * pages_per_superblock
             )
@@ -1581,7 +1602,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.attention_sinks,  # sinks
             None,  # skip_softmax_threshold_scale_factor
             self._enable_pdl,  # enable_pdl
-            backend=self._mla_backend,
+            backend=effective_mla_backend,
             is_var_seq=True,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             cute_dsl_impl="monolithic",
@@ -1589,7 +1610,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             # runner is selected; the cute-dsl MLA path must pass None.
             multi_ctas_kv_counter_buffer=(
                 self._get_multi_ctas_kv_counter_buffer()
-                if self._mla_backend != "cute-dsl"
+                if effective_mla_backend != "cute-dsl"
                 else None
             ),
         )
