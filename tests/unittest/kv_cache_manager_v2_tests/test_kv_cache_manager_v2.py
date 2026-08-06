@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, cast, get_type_hints
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast, get_type_hints
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
@@ -821,7 +821,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         prompt_np = np.asarray(prompt, dtype=np.int32)
         assert prompt_np.dtype == np.int32 and prompt_np.flags["C_CONTIGUOUS"]
 
-        def commit_prompt(tokens) -> None:
+        def commit_prompt(tokens: "Sequence[TokenIdExt] | np.ndarray") -> None:
             kv_cache = self.manager.create_kv_cache(None, tokens)
             with TemporaryCudaStream([]) as stream_holder:
                 stream = cast(CudaStream, stream_holder.handle)

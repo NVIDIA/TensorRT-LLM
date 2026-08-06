@@ -211,13 +211,18 @@ TEST(DigestPoolTest, FrontPackAndTailShrinkChurn)
     }
 
     // A fresh allocation must front-pack into a reclaimed low slot.
-    TokenIdExt const refill(distinctDigest(9999));
-    EXPECT_EQ(refill.raw(), reclaimedSlot);
-    EXPECT_EQ(refill.digest(), distinctDigest(9999));
+    {
+        TokenIdExt const refill(distinctDigest(9999));
+        EXPECT_EQ(refill.raw(), reclaimedSlot);
+        EXPECT_EQ(refill.digest(), distinctDigest(9999));
 
-    tokens.clear();
-    // `refill` still alive here.
-    EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
+        tokens.clear();
+        // `refill` still alive here.
+        EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
+    }
+    // `refill` destroyed: its slot must return to the pool, or a leak in the refill
+    // allocation path would go unnoticed and silently raise the baseline for later tests.
+    EXPECT_EQ(detail::digestPoolLiveCount(), baseline);
 }
 
 // A block containing a sparse digest still hashes deterministically; the
