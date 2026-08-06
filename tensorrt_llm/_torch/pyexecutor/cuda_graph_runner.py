@@ -1157,10 +1157,26 @@ class EncoderCUDAGraphRunner:
         self.is_warmup_only = False
         self._staging_retirement_event: Optional[torch.cuda.Event] = None
 
+        # `torch.cuda.graph` falls back to a process-wide singleton capture
+        # stream when `stream=` is omitted, so the encoder graphs would capture
+        # on the same stream as the decoder graphs. Sharing it couples the two
+        # graph sets through stream-keyed cuBLAS/cuBLASLt scratch: a serial
+        # split-K GEMM captured into one graph spins forever in
+        # cutlass::Semaphore::wait() once the other graph's matmuls leave that
+        # region non-zero, because the captured graph has no node that re-zeroes
+        # it. Capture on our own stream instead.
+        self._capture_stream: Optional[torch.cuda.Stream] = None
+
         # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
         # prefer_pinned() is false: pageable host buffers are preferred, so the
         # H2D copies must be issued before graph replay instead of captured.
         self._capture_h2d_copy = prefer_pinned()
+
+    def _get_capture_stream(self) -> torch.cuda.Stream:
+        """Return this runner's dedicated capture stream, creating it lazily."""
+        if self._capture_stream is None:
+            self._capture_stream = torch.cuda.Stream()
+        return self._capture_stream
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest supported num_tokens."""
@@ -1890,6 +1906,7 @@ class EncoderCUDAGraphRunner:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph,
                                   pool=self.memory_pool,
+                                  stream=self._get_capture_stream(),
                                   capture_error_mode="thread_local"):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
@@ -1972,7 +1989,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            with torch.cuda.graph(graph,
+                                  pool=self.memory_pool,
+                                  stream=self._get_capture_stream()):
                 output = forward_fn(capture_inputs)
 
         if self._contains_nested_tensor(output):
