@@ -29,7 +29,7 @@ The following is a table of supported models for the PyTorch backend:
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
 | `HunYuanDenseForCausalLM` [^5]       | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
 | `HunYuanMoEForCausalLM` [^5]         | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
-| `InklingForConditionalGeneration` [^15] | Inkling                         | `thinkingmachines/Inkling-NVFP4`             |
+| `InklingForConditionalGeneration` [^15] | Inkling                         | `thinkingmachines/Inkling-NVFP4`, `thinkingmachines/Inkling-Small-NVFP4` |
 | `InternLM3ForCausalLM` [^5]          | InternLM3                          | `internlm/internlm3-8b-instruct`             |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
@@ -97,7 +97,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
-[^15]: Inkling is an NVFP4 checkpoint (`thinkingmachines/Inkling-NVFP4`) with a RoPE-free hybrid-attention text decoder and BF16 vision and audio towers; video is handled as multi-frame images. Use `--reasoning_parser inkling` for its typed-content thinking blocks. Enforced at load: `moe_expert_parallel_size` must divide 256, and `attn_backend` must stay at the default `INKLING`. KV cache reuse, MTP, LoRA, function calling, constrained/guided decoding, EPD disaggregated serving, and multimodal-hash prefix caching are not supported in this release.
+[^15]: Inkling is an NVFP4 checkpoint (`thinkingmachines/Inkling-NVFP4`, and the smaller `thinkingmachines/Inkling-Small-NVFP4`) with a RoPE-free hybrid-attention text decoder and BF16 vision and audio towers; video is handled as multi-frame images. Use `--reasoning_parser inkling` for its typed-content thinking blocks. Enforced at load: `moe_expert_parallel_size` must divide 256, and `attn_backend` must stay at the default `INKLING`. KV cache reuse, MTP, LoRA, function calling, constrained/guided decoding, EPD disaggregated serving, and multimodal-hash prefix caching are not supported in this release.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 

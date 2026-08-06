@@ -8213,3 +8213,17 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
                     sampling_params=copy.deepcopy(self.sampling_params),
                     extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
                 )
+
+
+class TestInkling_Small_NVFP4(TestInkling_NVFP4):
+    """Text-only accuracy for the Inkling-Small NVFP4 checkpoint.
+
+    Same architecture family as TestInkling_NVFP4 -- RoPE-free hybrid
+    attention, 256-expert MoE, typed-content reasoning output -- at 42 layers /
+    hidden 4096 instead of 66 / 6144, so the evaluation setup is inherited and
+    only the checkpoint changes. The multimodal counterpart lives in
+    test_llm_api_pytorch_multimodal.py.
+    """
+
+    MODEL_NAME = "thinkingmachines/Inkling-Small-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-Small-NVFP4"

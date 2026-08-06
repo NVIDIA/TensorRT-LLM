@@ -440,3 +440,12 @@ Qwen/Qwen3.5-35B-A3B:
 thinkingmachines/Inkling-NVFP4:
   - quant_algo: NVFP4
     accuracy: 85.35
+# Inkling-Small NVFP4 (thinkingmachines/Inkling-Small-NVFP4): the smaller
+# sibling of the above -- same architecture family, 42 layers / hidden 4096
+# against the larger model's 66 / 6144. Measured on the full 14042-sample set
+# (Hendrycks, 5-shot, completion, max_tokens=2) at TP=4 with CUDA graph and the
+# overlap scheduler on. KV cache is unquantized (the checkpoint sets
+# kv_cache_quant_algo=none).
+thinkingmachines/Inkling-Small-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 79.45
