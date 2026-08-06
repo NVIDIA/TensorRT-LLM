@@ -16,6 +16,7 @@ import glob
 import multiprocessing
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
@@ -37,6 +38,14 @@ from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
+# When enabled, safetensors shards are read with ordinary read() syscalls and
+# deserialized from an in-memory buffer instead of being mmap'd. See
+# HfWeightLoader._load_safetensors_file for why this matters on network
+# filesystems (NVBug 6551020).
+_SAFETENSORS_NO_MMAP_ENV = "TRTLLM_HF_SAFETENSORS_NO_MMAP"
+# Bounded retries for the no-mmap read path, guarding against transient
+# network-filesystem read errors (e.g. BrokenPipeError [Errno 108]).
+_SAFETENSORS_READ_RETRIES = 3
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -57,6 +66,11 @@ class HfWeightLoader(BaseWeightLoader):
     @staticmethod
     def _is_weight_cache_enabled() -> bool:
         return os.environ.get(_WEIGHT_CACHE_ENV,
+                              "0").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _is_safetensors_mmap_disabled() -> bool:
+        return os.environ.get(_SAFETENSORS_NO_MMAP_ENV,
                               "0").lower() in ("1", "true", "yes", "on")
 
     @staticmethod
@@ -268,7 +282,11 @@ class HfWeightLoader(BaseWeightLoader):
         num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         enable_prefetch = (prefetch_size
                            < self._get_local_available_host_memory() * 0.9
-                           and num_layers == 0)
+                           and num_layers == 0
+                           # The no-mmap path already reads each shard in full,
+                           # so prefetching (a second full read into page cache)
+                           # is pointless double I/O in that mode.
+                           and not self._is_safetensors_mmap_disabled())
         if enable_prefetch:
             logger.info(
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
@@ -312,7 +330,32 @@ class HfWeightLoader(BaseWeightLoader):
     @staticmethod
     def _load_safetensors_file(file):
         logger.info(f"Start to load safetensor file {file}")
-        return safetensors.torch.load_file(file)
+        if not HfWeightLoader._is_safetensors_mmap_disabled():
+            return safetensors.torch.load_file(file)
+        # No-mmap path. safetensors mmaps the file unconditionally (the library
+        # exposes no mmap toggle), and on a network filesystem such as Lustre a
+        # demand page-fault on that mmap can fail with SIGBUS -- an uncatchable
+        # signal that kills the worker with exit code 135 mid-load, so no
+        # try/except around load_file() could ever help. Instead read the shard
+        # with ordinary read() syscalls and deserialize from the in-memory
+        # buffer; a failed read surfaces a catchable OSError that we can retry
+        # and, ultimately, report cleanly. See NVBug 6551020.
+        last_err = None
+        for attempt in range(1, _SAFETENSORS_READ_RETRIES + 1):
+            try:
+                with open(file, "rb") as f:
+                    data = f.read()
+                return safetensors.torch.load(data)
+            except OSError as err:
+                last_err = err
+                logger.warning(
+                    f"Failed to read safetensors file {file} without mmap "
+                    f"(attempt {attempt}/{_SAFETENSORS_READ_RETRIES}): {err}")
+                if attempt < _SAFETENSORS_READ_RETRIES:
+                    time.sleep(min(2**(attempt - 1), 5))
+        raise RuntimeError(
+            f"Could not read safetensors file {file} after "
+            f"{_SAFETENSORS_READ_RETRIES} attempts") from last_err
 
     @staticmethod
     def _load_bin_or_path_file(file):
