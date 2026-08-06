@@ -226,7 +226,7 @@ class TestTransferControlGeneration:
         frames = _clip(64, 128).permute(3, 0, 1, 2).contiguous()
         assert torch.equal(make_blur_control(frames, "none"), frames)
 
-    def test_blur_reduces_local_variance(self):
+    def test_blur_reduces_variance(self):
         frames = _clip(64, 128).permute(3, 0, 1, 2).contiguous()
         sharp = frames.to(torch.float32)
         for preset in ("low", "medium", "high"):

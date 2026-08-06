@@ -25,7 +25,12 @@ import triton
 import triton.language as tl
 
 _BLOCK = 256
-_TG22 = 13573  # round(tan(22.5deg) * 2**15)
+# tl.constexpr, not a bare int: a @triton.jit kernel may only read globals that
+# are declared this way, and the NMS kernel uses this directly.
+_TG22 = tl.constexpr(13573)  # round(tan(22.5deg) * 2**15)
+# Output rows per NMS program. The launch grid divides by this, so the two
+# must not drift apart -- a mismatch silently mis-strides the row band.
+_NMS_ROWS = 4
 
 
 @triton.jit
@@ -119,7 +124,7 @@ def _nms_kernel(bdx, bdy, mag, out, lo, hi, H, W, R: tl.constexpr, BLOCK: tl.con
             fdy = tl.load(bdy + offs + W, mask=mr1, other=0)
         ax = tl.abs(dx)
         y15 = tl.abs(dy) << 15
-        tg22 = ax * 13573  # round(tan(22.5deg) * 2**15)
+        tg22 = ax * _TG22
         tg67 = tg22 + (ax << 16)
         horiz = y15 < tg22
         vert = (~horiz) & (y15 > tg67)

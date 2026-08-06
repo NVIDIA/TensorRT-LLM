@@ -18,7 +18,7 @@ Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 """
 
 from collections.abc import Mapping
-from typing import Dict, Iterable
+from typing import Any, Dict, Iterable
 
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.inputs.media_io import sniff_media_kind
@@ -148,7 +148,7 @@ def _validate_video_reference(video) -> None:
 # deterministic client mistake into a 400 at enqueue instead of a failure deep
 # in the pipeline, after the request has already been accepted with a 202.
 # ---------------------------------------------------------------------------
-def _transfer_hint_payload(value) -> Mapping:
+def _transfer_hint_payload(value: Any) -> Mapping:
     """Normalize a control hint to its object form, as the worker does.
 
     Normalization first, checks after, so a hint carried as bare bytes and the
@@ -192,7 +192,7 @@ def _transfer_hint_payload(value) -> Mapping:
     return payload
 
 
-def _validate_edge_hint(value) -> None:
+def _validate_edge_hint(value: Any) -> None:
     # Imported at call time: transfer imports this module, so a module-level
     # import would be circular. Specs pickle by name, so this stays picklable.
     from .transfer import EDGE_PRESETS
@@ -206,7 +206,7 @@ def _validate_edge_hint(value) -> None:
         )
 
 
-def _validate_blur_hint(value) -> None:
+def _validate_blur_hint(value: Any) -> None:
     from .transfer import BLUR_PRESETS
 
     payload = _transfer_hint_payload(value)
@@ -217,7 +217,7 @@ def _validate_blur_hint(value) -> None:
         )
 
 
-def _validate_precomputed_control_hint(value) -> None:
+def _validate_precomputed_control_hint(value: Any) -> None:
     """For hints with no on-the-fly generator: a control clip is mandatory."""
     if _transfer_hint_payload(value).get("control") is None:
         raise ValueError(
@@ -226,18 +226,18 @@ def _validate_precomputed_control_hint(value) -> None:
         )
 
 
-def _validate_control_guidance_interval(value) -> None:
+def _validate_control_guidance_interval(value: Any) -> None:
     from .transfer import _as_interval
 
     _as_interval(value)  # reused outright, so preflight cannot drift from the worker
 
 
-def _validate_positive_frames(value) -> None:
+def _validate_positive_frames(value: Any) -> None:
     if int(value) <= 0:
         raise ValueError(f"must be a positive frame count, got {value}.")
 
 
-def _validate_non_negative_frames(value) -> None:
+def _validate_non_negative_frames(value: Any) -> None:
     if int(value) < 0:
         raise ValueError(f"must be a non-negative frame count, got {value}.")
 
