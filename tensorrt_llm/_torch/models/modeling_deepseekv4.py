@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # --------------------------------------------------
+# TensorRT-LLM implementation of DeepSeek-V4 model.
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
 #
