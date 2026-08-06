@@ -5982,6 +5982,16 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
+            # Reporting this mini-batch to the KV connector used to happen
+            # inside KVCacheManager.prepare_resources; it now runs after the
+            # token-budget trim, which this path does not go through. Kept here
+            # so the connector's per-request state advances exactly as before.
+            kv_cache_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
+                kv_cache_manager.publish_connector_scheduler_output(
+                    disagg_gen_init_to_prepare)
+
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 

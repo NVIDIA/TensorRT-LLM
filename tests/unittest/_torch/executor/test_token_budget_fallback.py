@@ -88,6 +88,9 @@ def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True)
     # covered explicitly below.
     mgr.enable_chunked_prefill = enable_chunked_prefill
     mgr.is_draft = False
+    # Read by publish_connector_scheduler_output; most tests run without a
+    # connector attached.
+    mgr.kv_connector_manager = None
     return mgr
 
 
@@ -504,6 +507,87 @@ class TestInflightIdsSurviveTrim(unittest.TestCase):
         executor._remove_inflight_ids(batch)
         for req in (ctx, gen):
             self.assertNotIn(req.request_id, executor.inflight_req_ids)
+
+
+class TestConnectorSeesTheTrimmedBatch(unittest.TestCase):
+    """The KV connector must see the batch that will actually run.
+
+    RequestData.num_scheduled_tokens is documented as "the number of scheduled
+    tokens for the upcoming forward pass" and is built from context_chunk_size,
+    so reporting the batch before the trim over-states it for every chunk the
+    trim shrinks -- and a connector that decides what to save or offload from
+    that count would publish KV for tokens the forward pass never computed.
+    """
+
+    class _RecordingKvManager:
+        """Stands in for KVCacheManager: records when it is asked to publish."""
+
+        def __init__(self, log, batch, shrink_to):
+            self._log = log
+            self._batch = batch
+            self._shrink_to = shrink_to
+
+        def prepare_resources(self, scheduled_batch):
+            self._log.append(("prepare", self._chunks()))
+
+        def maybe_fit_token_budget(self, scheduled_batch):
+            for req in scheduled_batch.context_requests:
+                req.context_chunk_size = self._shrink_to
+            self._log.append(("trim", self._chunks()))
+
+        def publish_connector_scheduler_output(self, scheduled_batch):
+            self._log.append(("publish", self._chunks()))
+
+        def _chunks(self):
+            return [r.context_chunk_size for r in self._batch.context_requests]
+
+    def _resource_manager(self, log, batch, shrink_to):
+        return ResourceManager(
+            OrderedDict(
+                [
+                    (
+                        ResourceManagerType.KV_CACHE_MANAGER,
+                        self._RecordingKvManager(log, batch, shrink_to),
+                    )
+                ]
+            )
+        )
+
+    def test_the_connector_is_told_after_the_trim(self):
+        log = []
+        req = _FakeRequest(context_chunk_size=4096, prompt_len=4096)
+        batch = _make_batch([req])
+
+        self._resource_manager(log, batch, shrink_to=64).prepare_resources(batch)
+
+        self.assertEqual([step for step, _ in log], ["prepare", "trim", "publish"])
+        # The count the connector sees is the trimmed one, not the scheduled one.
+        self.assertEqual(dict(log)["publish"], [64])
+
+    def test_managers_without_a_connector_hook_are_skipped(self):
+        rm = ResourceManager(OrderedDict([(ResourceManagerType.KV_CACHE_MANAGER, object())]))
+        rm.prepare_resources(_make_batch())  # must not raise
+
+    def test_publishing_is_a_no_op_without_a_connector(self):
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        mgr.kv_connector_manager = None
+        mgr.publish_connector_scheduler_output(_make_batch())  # must not raise
+
+    def test_publishing_forwards_the_batch_to_the_connector(self):
+        class _FakeConnector:
+            def __init__(self):
+                self.calls = []
+
+            def build_scheduler_output(self, scheduled_batch, kv_cache_manager):
+                self.calls.append((scheduled_batch, kv_cache_manager))
+
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        mgr.kv_connector_manager = _FakeConnector()
+        batch = _make_batch([_FakeRequest(context_chunk_size=16, prompt_len=16)])
+
+        mgr.publish_connector_scheduler_output(batch)
+
+        self.assertEqual(mgr.kv_connector_manager.calls, [(batch, mgr)])
 
 
 if __name__ == "__main__":
