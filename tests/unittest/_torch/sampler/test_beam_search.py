@@ -40,7 +40,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
-    CBAGroupHost, _finalize_beam, _gather_beam_path, _prepare_beam_history_cba)
+    CBAGroupHost, _gather_beam_path, _prepare_beam_history_cba, finalize_beam)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
     CBAState, _StrategyImpls, beam_search_sampling_batch_cba)
@@ -1942,7 +1942,7 @@ def test_finish_beams():
                     cum_logprobs=cum_logprobs[batch_idx, :beam_width])
                 request.py_return_log_probs = False
 
-                _finalize_beam(request, beam_history)
+                finalize_beam(request, beam_history)
 
                 token_history.append(deepcopy(request.get_tokens()))
 

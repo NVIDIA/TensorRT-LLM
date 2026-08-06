@@ -77,7 +77,16 @@ class BeamSearchEarlyStop(IntEnum):
 
         ``None`` -> ``TRUE`` (the default); ``0`` -> ``FALSE``; every other
         integer -> ``NEVER`` (HF's "never"), matching the CBA path which
-        special-cases only ``FALSE``."""
+        special-cases only ``FALSE``.
+
+        This is deliberately more permissive than the OpenAI-compatible
+        server, whose ``bool | Literal["never"]`` field rejects anything else
+        outright. ``sampling_config.early_stopping`` is a plain int that
+        predates the tri-state and reaches here from the C++ runtime as well,
+        so values outside {0, 1, 2} are folded into the nearest defined mode
+        rather than raising on a path that used to accept them. Tightening it
+        would be an API break for existing callers; the HTTP layer is free to
+        be strict because it is a newer surface."""
         if value is None:
             return cls.TRUE
         if value == cls.FALSE:
@@ -976,13 +985,14 @@ def beam_search_sampling_batch_cba(
     args.new_log_probs[slots, :num_beams] = step_log_probs
     # Record this step's per-slot log-prob at the emission position so path
     # snapshots can recover per-token log-probs (analog of original_tokens).
-    olp = cba.original_log_probs[slots, :num_beams]
-    olp.scatter_(
+    # Advanced indexing copies, so scatter into the copy and write it back.
+    beam_log_probs = cba.original_log_probs[slots, :num_beams]
+    beam_log_probs.scatter_(
         2,
         args.seq_lens.view(-1, 1, 1).expand(-1, num_beams, 1).long(),
         step_log_probs.unsqueeze(-1),
     )
-    cba.original_log_probs[slots, :num_beams] = olp
+    cba.original_log_probs[slots, :num_beams] = beam_log_probs
     args.cum_log_probs[slots, :num_beams] = slot_cum
     return _pad_next_tokens(slot_tok, args.finished_beams.size(1)), softmax
 
@@ -1018,7 +1028,7 @@ class CBAGroupHost:
     """None when no request in the group requests log-probs."""
 
 
-def _prepare_beam_search(
+def prepare_beam_search(
     beam_search_store: BeamSearchStore,
     log_probs_store: LogProbsStore,
     seq_slots_long: torch.Tensor,
@@ -1167,7 +1177,7 @@ def _prepare_beam_history_cba(
     return _builder
 
 
-def _finalize_beam(
+def finalize_beam(
     request: LlmRequest,
     beam_history: BeamHistory,
 ) -> None:
@@ -1238,8 +1248,6 @@ class BeamSearchHandler:
         self,
         *,
         store: Optional[BeamSearchStore],
-        log_probs_store: LogProbsStore,
-        new_tokens: torch.Tensor,
         max_seq_len: int,
         max_num_sequences: int,
         use_speculative_d2h: bool,
@@ -1248,8 +1256,6 @@ class BeamSearchHandler:
         make_side_stream_copier: Callable[[], AbstractContextManager["_SideStreamCopier"]],
     ):
         self._store = store
-        self._log_probs_store = log_probs_store
-        self._new_tokens = new_tokens
         self._max_seq_len = max_seq_len
         self._use_speculative_d2h = use_speculative_d2h
         # Bound methods of the owning sampler: the D2H copies must share its
@@ -1321,7 +1327,8 @@ class BeamSearchHandler:
         store = self._store
         assert store is not None
         # cba_requests is non-empty here, so the tensors were allocated at
-        # admission (see BeamSearchHandler.ensure_cba_for_requests).
+        # admission (see BeamSearchStore.ensure_cba, called from
+        # TorchSampler._sample_batched_by_strategy).
         cba = store.cba
         assert cba is not None, "CBA tensors must be allocated before a CBA step"
         slots = [request.py_seq_slot for request in cba_requests]

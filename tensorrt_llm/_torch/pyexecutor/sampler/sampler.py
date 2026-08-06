@@ -87,7 +87,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .beam_search import BeamHistoryBuilder, BeamSearchHandler, _finalize_beam, _prepare_beam_search
+from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import (
     LogProbsState,
@@ -1570,8 +1570,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # speculative predictor reads, so no separate host mirror is kept here.
         self._beam_search = BeamSearchHandler(
             store=self.store.beam_search_store,
-            log_probs_store=self.store.log_probs_store,
-            new_tokens=self.store.new_tokens,
             max_seq_len=self.max_seq_len,
             max_num_sequences=self.max_num_sequences,
             use_speculative_d2h=self._use_speculative_beam_history_d2h,
@@ -2070,7 +2068,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Allocate the CBA tensors on the first beam-search request: every
             # early_stopping mode runs on that path.
             beam_search_store.ensure_cba()
-            _prepare_beam_search(
+            prepare_beam_search(
                 beam_search_store,
                 self.store.log_probs_store,
                 seq_slots_long=seq_slots_tensor_cuda_long,
@@ -2426,7 +2424,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             if req.py_beam_width > 1:
                 if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
-                    _finalize_beam(req, beam_history)
+                    finalize_beam(req, beam_history)
                 else:
                     # Only the leading beam_width_out columns hold real tokens;
                     # the op pads the rest of the store-width row with
