@@ -45,9 +45,7 @@ _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
     ("tensorrt_llm/executor/executor.py", "GenerationExecutor.generate"),
 )
 _SERVING_PATH_MARKERS: tuple[str, ...] = ("disaggregated/",)
-# Stage-name markers whose capture is structurally partial regardless of footprint:
-# `sitecustomize` opts Ray infra processes out, so a Ray stage's GPU worker lives in
-# an uninstrumented `default_worker.py` and its tests carry only the driver's rows.
+# Stage-name markers whose GPU worker is uninstrumented, so capture is partial.
 _UNTRUSTED_STAGE_MARKERS: tuple[str, ...] = ("-Ray-",)
 _MIN_FUNCS = 30
 
@@ -65,14 +63,7 @@ def split_stage(test: str) -> tuple[str, str]:
 
 
 def stage_family(stage: str) -> str:
-    """Collapse a pytest-split shard name to its family (`A10-PyTorch-2` -> `A10-PyTorch`).
-
-    Coverage is captured per shard, but pytest-split assigns each entry to
-    exactly one shard, so a stage's shards hold disjoint capture sets. Only the
-    family-level union answers "was this entry ever captured on this stage" —
-    and the shard an entry lands on is not stable across runs anyway, since
-    pytest-split rebalances by duration.
-    """
+    """Collapse a pytest-split shard name to its family (`A10-PyTorch-2` -> `A10-PyTorch`)."""
     return _SPLIT_SUFFIX_RE.sub("", stage)
 
 
@@ -201,10 +192,7 @@ class TouchDB:
         return out
 
     def known_by_family(self) -> dict[str, set[str]]:
-        """`{stage family -> {bare nodeid, ...}}` — a stage's shards unioned.
-
-        Selection keys on this rather than `known_by_stage`: see `stage_family`.
-        """
+        """`{stage family -> {bare nodeid, ...}}` — a stage's shards unioned."""
         out: dict[str, set[str]] = {}
         for test in self.known_tests():
             stage, nodeid = split_stage(test)
@@ -231,14 +219,7 @@ class TouchDB:
         min_funcs: int,
         untrusted_stage_markers: tuple[str, ...] = (),
     ) -> set[str]:
-        """Stage-prefixed tests whose per-test capture looks incomplete (must always run).
-
-        Flags a test that drove execution/serving but is missing `worker_file` —
-        matched by a `launch_markers` `(file, qualname_substring)` call or a
-        `serving_path_markers` nodeid substring — that entered fewer than
-        `min_funcs` functions total, or that ran on a stage whose name contains an
-        `untrusted_stage_markers` substring.
-        """
+        """Tests missing `worker_file` after driving execution, near-empty, or on an untrusted stage."""
         drove_execution: set[str] = set()
         for file, qual_substr in launch_markers:
             drove_execution |= {

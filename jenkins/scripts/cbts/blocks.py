@@ -433,12 +433,11 @@ def _classify_map_var(var_name: str) -> Optional[str]:
     return None
 
 
-# Backend name -> mako value. Same patterns as getMakoArgsFromStageName in
-# jenkins/L0_Test.groovy (line ~2079). IMPORTANT: keep this list in sync.
-# Stages CBTS always runs, whatever the decision: their entries stay in the
-# test-db and they are added to every tier's affected_stages.
+# Stages CBTS always runs, whatever the decision.
 ALWAYS_RUN_STAGE_PREFIX = "CPU-"
 
+# Backend name -> mako value. Same patterns as getMakoArgsFromStageName in
+# jenkins/L0_Test.groovy (line ~2079). IMPORTANT: keep this list in sync.
 _BACKEND_PATTERNS = [
     ("-PyTorch-", "pytorch"),
     ("-CPP-", "cpp"),
@@ -493,8 +492,7 @@ def derive_mako_from_stage(stage_name: str) -> dict[str, str]:
         mako["gpu"] = gpu_match.group(1).lower()
     count_match = _GPU_COUNT_RE.search(stage_name)
     mako["system_gpu_count"] = count_match.group(1) if count_match else "1"
-    # CPU stages carry no `N_GPUs` token but run on 0-GPU machines; renderTestDB
-    # (jenkins/L0_Test.groovy:3465) hardcodes system_gpu_count=0 for them.
+    # renderTestDB hardcodes system_gpu_count=0 for CPU- stages (no N_GPUs token).
     if stage_name.startswith("CPU-"):
         mako["system_gpu_count"] = "0"
 

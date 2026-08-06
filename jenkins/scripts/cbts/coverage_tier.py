@@ -95,12 +95,7 @@ def _entry_reason(
     known: dict[str, set[str]],
     untrusted: set[str],
 ) -> str:
-    """Return SAFE or the must-run cause for a candidate YAML entry.
-
-    Keyed by stage family, not by shard: pytest-split puts each entry on
-    exactly one shard, so a per-shard lookup would report `no_data` for every
-    entry of any stage split more than one way.
-    """
+    """Return SAFE or the must-run cause for a candidate YAML entry, keyed by stage family."""
     if entry in keep_rule:
         return _R_RULE_KEPT
     dbk = db_key(entry)
@@ -124,16 +119,8 @@ def _build_narrowing(
     known: dict[str, set[str]],
     untrusted: set[str],
 ) -> tuple[dict[tuple[str, int], set[str]], set[str], Counter]:
-    """Classify every candidate entry; remove only SAFE ones.
-
-    `cov.skippable` / `cov.impacted` / `known` / `untrusted` are keyed by stage
-    family, so each block's served stages are mapped through `stage_family`.
-
-    Returns (removed per block, fully-emptied instrumented stages, must-run tally).
-    """
-    # Always-run families are dropped from `instrumented` rather than filtered
-    # later: the shared-block rule below prunes a block only when every served
-    # stage is instrumented, so this keeps every block they serve intact.
+    """Classify every candidate entry; return (removed per block, emptied stages, must-run tally)."""
+    # Dropping always-run families here keeps every block they serve out of pruning.
     instrumented = {f for f in cov.skippable if not f.startswith(ALWAYS_RUN_STAGE_PREFIX)}
     rule_kept = {
         key: _rule_kept_entries(b, rule_block_filters[key])
