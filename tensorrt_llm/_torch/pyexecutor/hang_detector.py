@@ -86,13 +86,15 @@ class HangDetector:
     When ``timeout`` seconds pass without a ``checkpoint()``, all thread stacks
     are dumped for diagnosis and ``on_detected`` runs (the hard-kill +
     cross-rank propagation path).
+
+    Pass ``timeout <= 0`` to disable hang detection entirely.
     """
 
     def __init__(
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
-        self.timeout = timeout if timeout is not None else 300
-        assert self.timeout > 0, "timeout must be greater than 0"
+        self.timeout = timeout if timeout is not None and timeout > 0 else 300  # unused when disabled
+        self._disabled = self.timeout <= 0
         self.on_detected = on_detected or (lambda: None)
         self.task = None
         self.loop = None
@@ -194,7 +196,8 @@ class HangDetector:
             self.loop_thread = None
 
     def __enter__(self):
-        self.start()
+        if not self._disabled:
+            self.start()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
