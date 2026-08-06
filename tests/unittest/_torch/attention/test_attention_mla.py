@@ -342,7 +342,7 @@ random.seed(0)
 min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
-max_num_contexts = 10
+max_num_contexts = 64
 random_context_sequence_lengths = [
     random.randint(min_context_sequence_length, max_context_sequence_length)
     for _ in range(random.randint(min_num_contexts, max_num_contexts))
@@ -354,6 +354,7 @@ context_sequence_lengths = [
     [100, 300, 20, 10],
     [253, 253, 253, 253],
     [100, 1110, 1000, 1000],
+    [10] * 64,
     random_context_sequence_lengths,
 ]
 # Use MTP by default if seqlen_q > 1.

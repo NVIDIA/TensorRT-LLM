@@ -11,6 +11,8 @@ from tensorrt_llm._torch.peft.lora.validation import (
 )
 from tensorrt_llm.quantization.mode import QuantMode
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeLoraConfig:
     """Minimal stand-in for `LoraConfig` for tests that don't need pydantic."""

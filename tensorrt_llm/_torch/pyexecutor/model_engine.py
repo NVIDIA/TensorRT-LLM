@@ -27,7 +27,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
                                             strip_mm_data_for_generation)
-from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
+                                          BaseMultimodalInputProcessor,
                                           create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -1206,8 +1207,8 @@ class PyTorchModelEngine(ModelEngine):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Autotuner warmup uses context-only requests. Helix CP
-        # is decode-only and runs into issues with autotuner warmup.
+        # Helix CP is decode-only and runs into issues with the
+        # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
@@ -1258,6 +1259,13 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
+
+        # Allocate the CUDA graph padding dummies now, while the KV cache is
+        # empty. Waiting for the first padded step can race KV saturation:
+        # once the cache is full, the lazy allocation in _get_padded_batch
+        # fails every step and padded batches silently run eager.
+        self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
+        log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
@@ -1525,6 +1533,17 @@ class PyTorchModelEngine(ModelEngine):
                         f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
             warmup_requests_configs.append((_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
 
+        if (not self.is_draft_model and self.guided_decoder is None
+                and can_run_general_warmup):
+            # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
+            # One MIXED context+generation batch (1 ctx token + 1 gen request).
+            warmup_requests_configs.append(
+                (1 + self.max_total_draft_tokens + 1, 1))
+        else:
+            logger.debug(
+                "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
+            )
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager,
@@ -1557,7 +1576,7 @@ class PyTorchModelEngine(ModelEngine):
             release_megamoe_scratch()
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
-        """Runs a forward pass to populate the autotuner cache."""
+        """Runs forward passes to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
@@ -1570,18 +1589,26 @@ class PyTorchModelEngine(ModelEngine):
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
 
+        warmup_configs = [(curr_max_num_tokens, 0)]
+        if (not self.is_draft_model and self.guided_decoder is None
+                and not self.mapping.has_pp()):
+            # Add generation request to warmup the autotuner cache.
+            warmup_configs.append((1 + self.max_total_draft_tokens, 1))
+
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with self.no_cuda_graph(), autotune(cache_path=cache_path):
-            warmup_request = self._create_warmup_request(
-                resource_manager, curr_max_num_tokens, 0)
-            with self._release_batch_context(warmup_request,
-                                             resource_manager) as batch:
-                if batch is None and self.mapping.tp_size <= 1:
-                    pass  # Single rank, safe to skip
-                else:
+            ran_forward = False
+            for num_tokens, num_gen_requests in warmup_configs:
+                warmup_request = self._create_warmup_request(
+                    resource_manager, num_tokens, num_gen_requests)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    if batch is None and self.mapping.tp_size <= 1:
+                        continue  # Single rank, safe to skip
                     self._assert_all_tp_ranks_have_warmup_batch(
-                        batch, curr_max_num_tokens)
-                if batch is not None:
+                        batch, num_tokens)
+                    if batch is None:
+                        continue
                     # Reset the flag is_first_draft for the draft model.
                     # This is necessary for overlap scheduler.
                     spec_resource_manager = resource_manager.get_resource_manager(
@@ -1593,16 +1620,17 @@ class PyTorchModelEngine(ModelEngine):
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
-
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
-
                     torch.cuda.synchronize()
+                    ran_forward = True
+
+            if ran_forward:
+                # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
+                # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
+                AutoTuner.get().cache_pp_recv()
+                # Send the cache after the tuning process to the next PP rank
+                AutoTuner.get().cache_pp_send()
+                # Clean the pp flag to avoid deadlock with synchronous send/recv
+                AutoTuner.get().clean_pp_flag()
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
@@ -2229,10 +2257,30 @@ class PyTorchModelEngine(ModelEngine):
         if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
 
-        blocks_to_use = num_full_seqs * math.ceil(
-            max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
-                num_left_over_tokens / kv_cache_manager.tokens_per_block
-            ) + num_gen_requests * self.max_beam_width
+        # Mirror add_dummy_requests' actual allocation: on top of the raw
+        # token count, every sequence gets num_extra_kv_tokens +
+        # num_extra_decoding_steps add_token calls, and generation dummies
+        # additionally reserve max_draft_loop_tokens for the draft loop.
+        # In one-engine spec modes that is (max_draft_len - 1) extra KV
+        # tokens plus max_draft_len draft-loop tokens per gen dummy, i.e.
+        # 2 * max_draft_len - 1 on top of the single prompt token.
+        # Under-counting these let warmup start an allocation that fails
+        # midway and, before the partial-allocation cleanup existed,
+        # permanently leaked most of the estimation-sized KV pool
+        # (TRTLLM-14903).
+        def blocks_for_seq(num_tokens: int) -> int:
+            return math.ceil(num_tokens / kv_cache_manager.tokens_per_block)
+
+        extra_ctx_tokens = (getattr(kv_cache_manager, "num_extra_kv_tokens", 0)
+                            or 0) + num_extra_decoding_steps
+        extra_gen_tokens = extra_ctx_tokens + self.max_draft_loop_tokens
+        blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len +
+                                                       extra_ctx_tokens)
+        if num_left_over_tokens > 0:
+            blocks_to_use += blocks_for_seq(num_left_over_tokens +
+                                            extra_ctx_tokens)
+        blocks_to_use += (num_gen_requests * self.max_beam_width *
+                          blocks_for_seq(1 + extra_gen_tokens))
 
         if blocks_to_use > available_blocks and isinstance(
                 kv_cache_manager, KVCacheManager):
@@ -2638,13 +2686,23 @@ class PyTorchModelEngine(ModelEngine):
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
         by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
         so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's ``__init__``.
+        than being hardcoded inside each encoder's `__init__`. The optional
+        per-segment capacity combines the encoder token budget with the input
+        processor's largest supported item.
         """
+        max_seq_len = self.encoder_max_num_tokens
+        if isinstance(self.input_processor, BaseMultimodalDummyInputsBuilder):
+            max_tokens_per_item = (
+                self.input_processor.get_mm_max_tokens_per_item())
+            max_seq_len = max(max_seq_len,
+                              max(max_tokens_per_item.values(), default=0))
+
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
                     max_num_requests=self.encoder_batch_size,
                     max_num_tokens=self.encoder_max_num_tokens)
+                module.set_attn_max_seq_len(max_seq_len)
 
     def _set_up_spec_metadata(
             self,
