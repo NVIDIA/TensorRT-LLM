@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    ACTION_ASPECT_RATIO_LABELS,
     ACTION_VIEWPOINT_TEMPLATES,
     DEFAULT_ACTION_VIEW_POINT,
     EMBODIMENT_TO_DOMAIN_ID,
@@ -71,7 +72,9 @@ class TestFindClosestTargetSize:
 
     @pytest.mark.parametrize("action_resolution", sorted(VIDEO_RES_SIZE_INFO))
     def test_all_buckets_have_aspect_entries(self, action_resolution):
-        assert VIDEO_RES_SIZE_INFO[action_resolution]
+        # find_closest_target_size picks from whatever entries exist, so a bucket
+        # that lost "9,16" would silently land portrait sources on another canvas.
+        assert set(VIDEO_RES_SIZE_INFO[action_resolution]) == set(ACTION_ASPECT_RATIO_LABELS)
 
 
 class TestResolveActionSize:
@@ -617,6 +620,81 @@ class TestVisionMropeBaseCompressionDefault:
 
 
 class TestPrepareActionLatents:
+    """The CPU half of the action contract: which tokens start clean, what the
+    mask says, and how a caller's trajectory is fitted to the chunk."""
+
+    ACTION_DIM = 8
+    CHUNK = 4
+
+    def _prepare(self, mode, **kwargs):
+        kwargs.setdefault("action_chunk_size", self.CHUNK)
+        kwargs.setdefault("action_dim", self.ACTION_DIM)
+        return prepare_action_latents(
+            mode=mode,
+            generator=torch.Generator(device="cpu").manual_seed(0),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            **kwargs,
+        )
+
+    def test_forward_dynamics_pads_a_short_trajectory_by_holding_the_last_step(self):
+        latents, mask, clean, raw_dim = self._prepare(
+            "forward_dynamics", raw_action_dim=None, action_input=[[1.0, 2.0], [3.0, 4.0]]
+        )
+        assert raw_dim == 2
+        assert latents.shape == (1, self.CHUNK, self.ACTION_DIM)
+        # Steps 2 and 3 repeat the supplied final step rather than going to zero.
+        for step in range(2, self.CHUNK):
+            torch.testing.assert_close(clean[0, step, :2], torch.tensor([3.0, 4.0]))
+
+    def test_forward_dynamics_truncates_a_long_trajectory(self):
+        _, _, clean, _ = self._prepare(
+            "forward_dynamics",
+            raw_action_dim=None,
+            action_input=[[float(i), float(i)] for i in range(self.CHUNK + 3)],
+        )
+        torch.testing.assert_close(clean[0, -1, :2], torch.tensor([3.0, 3.0]))
+
+    def test_forward_dynamics_conditions_every_step(self):
+        """All action tokens are given, so none carries velocity."""
+        latents, mask, clean, _ = self._prepare(
+            "forward_dynamics", raw_action_dim=None, action_input=[[1.0, 2.0]] * self.CHUNK
+        )
+        assert torch.all(mask == 0.0)
+        torch.testing.assert_close(latents, clean)
+
+    @pytest.mark.parametrize("mode", ["policy", "inverse_dynamics"])
+    def test_predicted_modes_start_from_noise_everywhere(self, mode):
+        latents, mask, clean, _ = self._prepare(mode, raw_action_dim=2)
+        assert torch.all(mask == 1.0)
+        assert torch.all(clean == 0.0)
+        assert torch.any(latents[..., :2] != 0.0)
+
+    @pytest.mark.parametrize("mode", ["policy", "forward_dynamics", "inverse_dynamics"])
+    def test_columns_above_raw_action_dim_are_zero(self, mode):
+        """The head is action_dim wide but only raw_action_dim is meaningful;
+        padding must not carry noise into the model or out of it."""
+        kwargs = (
+            {"raw_action_dim": None, "action_input": [[1.0, 2.0]] * self.CHUNK}
+            if mode == "forward_dynamics"
+            else {"raw_action_dim": 2}
+        )
+        latents, _, clean, raw_dim = self._prepare(mode, **kwargs)
+        assert raw_dim == 2
+        assert torch.all(latents[..., raw_dim:] == 0.0)
+        assert torch.all(clean[..., raw_dim:] == 0.0)
+
+    def test_empty_trajectory_raises(self):
+        """Without this the empty slice reaches the mask broadcast and dies with
+        an opaque torch shape error instead of a client-facing one."""
+        with pytest.raises(ValueError, match="at least one timestep"):
+            self._prepare("forward_dynamics", raw_action_dim=None, action_input=torch.zeros(0, 2))
+
+    @pytest.mark.parametrize("raw_action_dim", [0, -1, ACTION_DIM + 1])
+    def test_out_of_range_raw_action_dim_raises(self, raw_action_dim):
+        with pytest.raises(ValueError, match=r"raw_action_dim must be in \[1, \d+\]"):
+            self._prepare("policy", raw_action_dim=raw_action_dim)
+
     def test_forward_dynamics_raw_dim_mismatch_raises(self):
         with pytest.raises(ValueError, match="raw_action_dim must match"):
             prepare_action_latents(

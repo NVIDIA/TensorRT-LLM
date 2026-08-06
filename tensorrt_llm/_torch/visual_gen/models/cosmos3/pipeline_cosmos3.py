@@ -1103,7 +1103,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
             if guidance_scale is None:
                 guidance_scale = COSMOS3_ACTION_PARAMS["guidance_scale"]
-            self._apply_flow_shift(flow_shift)
+            # Restore the checkpoint knobs when unset, like the video branch
+            # below: the pipeline instance outlives the request, and a prior
+            # T2I or V2V request left its own shift and sigma schedule behind
+            # (V2V forces uniform sigmas, which is not inert on any checkpoint).
+            self._apply_flow_shift(
+                flow_shift if flow_shift is not None else self.sampling.checkpoint_flow_shift,
+                use_karras_sigmas=None,
+            )
             enable_audio = False
         else:
             height = height or COSMOS3_720P_PARAMS["height"]

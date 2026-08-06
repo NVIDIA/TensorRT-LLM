@@ -121,6 +121,8 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --action_output_path policy_action.json
 
 # Action — forward dynamics (first frame + action trajectory -> rollout video)
+# action_trajectory.json is a [T, D] list of lists; D is the embodiment's action
+# width (9 for av) and a mismatch is rejected.
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_forward_dynamics.json \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \

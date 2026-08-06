@@ -127,9 +127,7 @@ def _validate_action_args(
             raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
     elif mode == "inverse_dynamics":
         if args.video_path is None:
-            raise SystemExit(
-                f"{mode} requires --video_path (frame directory, .mp4/.avi, or image)."
-            )
+            raise SystemExit(f"{mode} requires --video_path (an .mp4 or .avi file).")
         if args.raw_action_dim is None and args.domain_name is None and args.domain_id is None:
             raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
 
@@ -316,7 +314,7 @@ def main():
         "--action_output_path",
         type=str,
         default=None,
-        help="Path to save predicted action JSON (default: <output_stem>_action.json)",
+        help="Path to save predicted action JSON (default: <output_stem>.action.json)",
     )
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"

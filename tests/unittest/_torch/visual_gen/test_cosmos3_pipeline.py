@@ -858,6 +858,61 @@ class TestCosmos3V2V:
 
         assert token_calls[0] is False
 
+    def test_action_restores_the_checkpoint_flow_shift(self):
+        """set_flow_shift is a no-op when both knobs are None, and the pipeline
+        instance outlives the request. An action request that followed a V2V one
+        would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(
+            device=torch.device("cpu"), num_embodiment_domains=32
+        )
+        pipeline.audio_gen = False
+        pipeline.action_gen = True
+        pipeline.default_use_system_prompt = False
+        calls = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 7.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                calls.append((target, use_karras_sigmas))
+                return scheduler
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            raise StopAfterTokenize
+
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+        pipeline.sampling = FakeSampling()
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="pick up the block",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                num_frames=NUM_FRAMES,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                use_guardrails=False,
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=10,
+                action_chunk_size=NUM_FRAMES - 1,
+            )
+
+        assert calls == [(7.0, None)]
+
     def test_apply_flow_shift_rebuilds_every_stream_scheduler(self):
         """Action denoises in the same loop as video, on its own scheduler
         instance, so a request that shifts the schedule must move all of them."""

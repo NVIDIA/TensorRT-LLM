@@ -363,6 +363,11 @@ def load_action_tensor(action: Any = None) -> torch.Tensor:
         tensor = tensor.squeeze(0)
     if tensor.ndim != 2:
         raise ValueError(f"Cosmos3 action must have shape [T, D], got {tuple(tensor.shape)}.")
+    if tensor.shape[0] == 0:
+        raise ValueError(
+            f"Cosmos3 action trajectory must have at least one timestep, got shape "
+            f"{tuple(tensor.shape)}."
+        )
     return tensor
 
 
