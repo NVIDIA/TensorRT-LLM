@@ -163,14 +163,11 @@ def get_kv_cache_manager_cls(
         # Mixed manager (separate KV / recurrent-state pools) stays the
         # default. SA speculative decoding is validated on the Mixed
         # manager's SpeculativeState scratch path only; reuse + SA is
-        # unvalidated.
-        if is_kimi_linear(config) and not use_v2:
-            if is_disagg:
-                # Fail fast instead of bypassing the disagg transceiver
-                # validation below with an unvalidated route.
-                raise NotImplementedError(
-                    "Disaggregated serving is not supported for Kimi K3 yet "
-                    "(TRTLLM-14815).")
+        # unvalidated. Disaggregated serving (TRTLLM-14815) routes through
+        # the shared hybrid transceiver validation below: the Python NIXL
+        # transceiver selects the Mixed manager, whose KDA recurrent/conv
+        # states transfer through the bounce buffer.
+        if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
                     "Using CppMambaHybridCacheManager for Kimi K3 hybrid "
@@ -591,6 +588,10 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
+        if is_hybrid_linear(model_config.pretrained_config):
+            logger.info_once(
+                f"Selected hybrid KV cache manager: {cls.__name__}",
+                key=f"hybrid_kv_cache_manager_{cls.__name__}")
         # Compatibility managers do not support MTP block reuse. Warn at the
         # routing site so users see the concrete manager selected for the
         # incompatible combination.
