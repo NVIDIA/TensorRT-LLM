@@ -564,14 +564,37 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def triggerTypeBuildDefaults = [
+        "nightly-release": [
+            buildInternalRelease: false,
+            buildCiImage: false,
+            buildNgcRelease: true,
+        ],
+    ]
+    def buildDefaults = triggerTypeBuildDefaults[TRIGGER_TYPE] ?: [:]
+    // params may contain a Declarative default even when the remote parameter was dropped.
+    // env presence indicates that the parameter was attached to the current build.
+    def resolveBuildStageParam = { parameterName ->
+        if (env."${parameterName}" != null) {
+            return params[parameterName]
+        }
+        if (buildDefaults.containsKey(parameterName)) {
+            return buildDefaults[parameterName]
+        }
+        return params[parameterName]
+    }
+    def buildInternalRelease = resolveBuildStageParam("buildInternalRelease")
+    def buildCiImage = resolveBuildStageParam("buildCiImage")
+    def buildNgcRelease = resolveBuildStageParam("buildNgcRelease")
+
     def enabledStages = []
-    if (params.buildInternalRelease) {
+    if (buildInternalRelease) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
-    if (params.buildCiImage) {
+    if (buildCiImage) {
         enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
     }
-    if (params.buildNgcRelease) {
+    if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
     }
     buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
