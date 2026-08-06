@@ -140,6 +140,23 @@ def _register_fake():
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
 
+    @torch.library.register_fake("trtllm::attn_res_fwd")
+    def _(
+        layer_residual: torch.Tensor, block_residual: torch.Tensor,
+        res_weight: torch.Tensor, rms_weight: torch.Tensor, rms_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # layer_residual: [T, B, H] bf16; block_residual: [N - 1, T, B, H].
+        num_candidates = block_residual.shape[0] + 1
+        seq_len, batch_size = layer_residual.shape[0], layer_residual.shape[1]
+        output = torch.empty_like(layer_residual)
+        rsigma = layer_residual.new_empty((num_candidates, seq_len, batch_size),
+                                          dtype=torch.float32)
+        probs = layer_residual.new_empty((num_candidates, seq_len, batch_size),
+                                         dtype=torch.float32)
+        logits = layer_residual.new_empty((num_candidates, seq_len, batch_size),
+                                          dtype=torch.float32)
+        return output, rsigma, probs, logits
+
     @torch.library.register_fake("trtllm::fused_inv_rope_fp8_quant_vllm_port")
     def _(o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor,
           n_groups: int, heads_per_group: int, nope_dim: int, rope_dim: int,
