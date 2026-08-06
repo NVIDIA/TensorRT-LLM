@@ -735,13 +735,7 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
 
 
 class TestInkling_Small_NVFP4(TestInkling_NVFP4):
-    """MMMU accuracy for the Inkling-Small NVFP4 checkpoint.
-
-    Same vision path as TestInkling_NVFP4 -- hMLP tower, one token per patch,
-    single <image> placeholder expanded to num_patches rows -- so the image
-    attach, expansion and fusion coverage is inherited and only the checkpoint
-    changes.
-    """
+    """MMMU accuracy for Inkling-Small; vision path inherited from TestInkling_NVFP4."""
 
     MODEL_NAME = "thinkingmachines/Inkling-Small-NVFP4"
     MODEL_PATH = f"{llm_models_root()}/Inkling-Small-NVFP4"

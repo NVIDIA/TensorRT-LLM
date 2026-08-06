@@ -118,12 +118,9 @@ stepfun-ai/Step-3.7-Flash:
 thinkingmachines/Inkling-NVFP4:
   - quant_algo: NVFP4
     accuracy: 79.72
-# Inkling-Small NVFP4 (thinkingmachines/Inkling-Small-NVFP4): the smaller
-# sibling of the above, same vision path (hMLP tower, one token per patch).
-# Reasoning traces are stripped before MMMU answer extraction. Measured on the
-# full validation pool at TP=4. Gate on aggregate accuracy, not per-item
-# identity -- long-CoT near-ties resolve differently across NVFP4
-# implementations. KV cache is unquantized (kv_cache_quant_algo=none).
+# Inkling-Small NVFP4: smaller sibling of the above, same hMLP vision path.
+# Full validation pool at TP=4. Gate on aggregate accuracy, not per-item
+# identity.
 thinkingmachines/Inkling-Small-NVFP4:
   - quant_algo: NVFP4
     accuracy: 77.95
