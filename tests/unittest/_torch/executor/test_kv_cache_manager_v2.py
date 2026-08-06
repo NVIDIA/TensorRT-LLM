@@ -71,9 +71,7 @@ def _make_cache_config_for_test(
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
-    cache_manager.block_reuse_policy = BlockReusePolicy(
-        kv_cache_config.block_reuse_config.block_reuse_policy
-    )
+    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)
     cache_manager.is_draft = is_draft
     cache_manager.num_local_layers = 1
     cache_manager.pp_layers = [0]
@@ -109,7 +107,7 @@ def test_commit_min_snapshot_follows_block_reuse_policy(
     config = _make_cache_config_for_test(
         KvCacheConfig(
             enable_block_reuse=enable_block_reuse,
-            block_reuse_config=BlockReuseConfig(block_reuse_policy=block_reuse_policy),
+            block_reuse_config=BlockReuseConfig(policy=block_reuse_policy),
             enable_partial_reuse=True,
         ),
         is_draft=is_draft,
@@ -304,7 +302,7 @@ def manager(max_num_turns: int) -> KVCacheManagerV2:
             max_attention_window=[MAX_SEQ_LEN, TOKENS_PER_BLOCK],
             max_util_for_resume=1.0,
             block_reuse_config=BlockReuseConfig(
-                block_reuse_policy="per_conversation",
+                policy="per_conversation",
                 max_num_turns=max_num_turns,
             ),
         ),

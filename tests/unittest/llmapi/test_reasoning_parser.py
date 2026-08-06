@@ -22,6 +22,8 @@ from tensorrt_llm.llmapi.reasoning_parser import (NemotronV3ReasoningParser,
                                                   ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 
+pytestmark = pytest.mark.cpu_only
+
 R1_START, R1_END = "<think>", "</think>"
 
 
@@ -58,6 +60,79 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i]
         assert result.reasoning_content == reasoning_context[i]
+
+
+@pytest.mark.parametrize(
+    ("parser_key", "text"),
+    [
+        # `finish()` flushes as reasoning: the stream starts inside the
+        # reasoning block, so the withheld `<` is reasoning output.
+        ("deepseek-r1", "a <"),
+        # `finish()` flushes as content: no reasoning block was entered.
+        ("qwen3", "a<"),
+        # `finish()` discards: the buffer holds exactly a delimiter. Passes on
+        # `main` too - it guards against a fix that leaks the tag instead.
+        ("deepseek-r1", f"a{R1_END}"),
+    ])
+def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
+        parser_key: str, text: str) -> None:
+    """Streaming char-by-char then finishing must match a non-streaming parse.
+
+    One `(parser_key, text)` pair per branch of `finish()`. This is the
+    contract the missing flush violated, so it subsumes example-based tests
+    of the individual branches.
+    """
+    expected = ReasoningParserFactory.create_reasoning_parser(parser_key).parse(
+        text)
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_key)
+    content, reasoning_context = "", ""
+    for char in text:
+        result = reasoning_parser.parse_delta(char)
+        content += result.content
+        reasoning_context += result.reasoning_content
+    result = reasoning_parser.finish()
+    content += result.content
+    reasoning_context += result.reasoning_content
+    assert content == expected.content
+    assert reasoning_context == expected.reasoning_content
+
+
+def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
+    """A partial tag arriving alongside text must still be flushed.
+
+    Such a delta fills `_buffer` through the `rfind` branch of `parse_delta`,
+    which one-character-at-a-time streaming never reaches - and it is the
+    shape a real stream delivers.
+    """
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1")
+    assert reasoning_parser.parse_delta("a </thin").reasoning_content == "a "
+    assert reasoning_parser.finish().reasoning_content == "</thin"
+
+
+@pytest.mark.parametrize(("chat_template_kwargs", "flushed"), [
+    ({
+        "thinking": True
+    }, "<"),
+    ({
+        "thinking": False
+    }, ""),
+])
+def test_deepseek_v4_reasoning_parser_finish_delegates(
+        chat_template_kwargs: dict[str, bool], flushed: str) -> None:
+    """`finish()` must reach whichever parser the thinking flag selected.
+
+    `DeepSeekV4ReasoningParser` delegates to two different targets:
+    `DeepSeekR1Parser`, which now flushes, and `IdentityReasoningParser`,
+    which withholds nothing to flush.
+    """
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek_v4", chat_template_kwargs)
+    reasoning_parser.parse_delta("a <")
+    result = reasoning_parser.finish()
+    assert result.reasoning_content == flushed
+    assert result.content == ""
 
 
 @pytest.mark.parametrize("chat_template_kwargs", [{

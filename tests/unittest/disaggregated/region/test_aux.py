@@ -5,6 +5,8 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBufferMeta, AuxSlot
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_aux_buffer_meta_construction():
     meta = AuxBufferMeta(

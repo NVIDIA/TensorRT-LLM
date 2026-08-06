@@ -622,16 +622,10 @@ class DecoderModelForCausalLM(nn.Module,
                         # Reset _weights_created so create_weights() in
                         # __post_init__ will re-create this module's weights
                         # with the updated (non-quantized) config. Some
-                        # wrappers (e.g. ConfigurableMoE) expose
-                        # _weights_created as a read-only property that
-                        # delegates to a child backend module — that backend
-                        # is itself an nn.Module child and will be visited
-                        # separately, so swallow the resulting AttributeError.
+                        # Wrappers such as ConfigurableMoE delegate this state
+                        # update to their child backend.
                         if hasattr(module, '_weights_created'):
-                            try:
-                                module._weights_created = False
-                            except AttributeError:
-                                pass
+                            module._weights_created = False
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()
