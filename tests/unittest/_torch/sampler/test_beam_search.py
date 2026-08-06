@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 import gc
 import os
@@ -40,7 +41,8 @@ from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
     CBAGroupHost, _finalize_beam, _gather_beam_path, _prepare_beam_history_cba)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
-    CBAState, _StrategyImpls, beam_search_sampling_batch)
+    CBAState, _StrategyImpls, beam_search_sampling_batch,
+    beam_search_sampling_batch_cba)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import \
     LlmRequest as CppLlmRequest
@@ -983,6 +985,64 @@ def test_beam_search_sampling_batch_basic():
                 torch.tensor(predecessor_beam, dtype=torch.int32))
 
 
+_CBA_NEG_INF = float("-inf")
+
+
+def _with_cba(meta: BeamSearchMetadata,
+              *,
+              max_batch_size: int,
+              beam_width: int,
+              width: int,
+              end_id: int = -1,
+              prompt_len: int = 0) -> BeamSearchMetadata:
+    """Attach a neutral candidate-beams-array state to a metadata object.
+
+    Every beam-search step runs on ``beam_search_sampling_batch_cba``, which
+    needs the pool. Tests that exercise the step's ranking want a pool that
+    starts empty and never wins: all-``-inf`` normalized scores mean no pool
+    entry can outrank a live beam, so what is observed is the selection the
+    live beams produce.
+    """
+    return dataclasses.replace(meta,
+                               cba=CBAState(
+                                   end_ids=torch.full((max_batch_size, ),
+                                                      end_id,
+                                                      dtype=torch.int32),
+                                   prompt_lens=torch.full((max_batch_size, ),
+                                                          prompt_len,
+                                                          dtype=torch.int32),
+                                   original_tokens=torch.zeros(
+                                       (max_batch_size, beam_width, width),
+                                       dtype=torch.int32),
+                                   cba_tokens=torch.full(
+                                       (max_batch_size, beam_width, width),
+                                       BEAM_SEARCH_PAD_TOKEN,
+                                       dtype=torch.int32),
+                                   cba_cum_log_probs=torch.zeros(
+                                       (max_batch_size, beam_width),
+                                       dtype=torch.float32),
+                                   cba_normed_scores=torch.full(
+                                       (max_batch_size, beam_width),
+                                       _CBA_NEG_INF,
+                                       dtype=torch.float32),
+                                   cba_lengths=torch.zeros(
+                                       (max_batch_size, beam_width),
+                                       dtype=torch.int32),
+                                   batch_dones=torch.zeros((max_batch_size, ),
+                                                           dtype=torch.bool),
+                                   cba_caps=torch.full((max_batch_size, ),
+                                                       beam_width,
+                                                       dtype=torch.int32),
+                                   original_log_probs=torch.zeros(
+                                       (max_batch_size, beam_width, width),
+                                       dtype=torch.float32),
+                                   cba_log_probs=torch.zeros(
+                                       (max_batch_size, beam_width, width),
+                                       dtype=torch.float32),
+                                   max_seq_len=width,
+                               ))
+
+
 @_kernel_test
 @pytest.mark.parametrize("penalty_as_tensor", [False, True])
 def test_beam_search_sampling_batch_length_penalty(penalty_as_tensor):
@@ -1322,39 +1382,47 @@ def test_beam_search_sampling_batch_diversity_rate():
     logits[1, 3] = 30.0  # beam1 top: token3, but cum handicap below
 
     def run(diversity_rate):
-        metadata = make_metadata()
+        metadata = _with_cba(make_metadata(),
+                             max_batch_size=max_batch_size,
+                             beam_width=beam_width,
+                             width=seq_len + 1)
         metadata.cum_log_probs[slot] = torch.tensor([0.0, -2.5])
-        tokens, _ = beam_search_sampling_batch(
+        tokens, _ = beam_search_sampling_batch_cba(
             logits=logits,
             beam_width_in=beam_width,
             beam_width_out=beam_width,
             beam_search_args=metadata,
             temperature=1.0,
+            early_stopping=BeamSearchEarlyStop.TRUE,
             diversity_rate=diversity_rate,
             return_probs=False,
         )
         return tokens, metadata
 
-    # No diversity: beam0 contributes both winners (0.0 > -2.0 > -2.5).
+    # Without the adjustment both winners come from beam 0, whose candidates
+    # (0.0 and ~-2.0) outrank beam 1's ~-2.5.
     tokens, meta = run(0.0)
     assert meta.predecessor_beams[slot].tolist() == [0, 0]
-    assert tokens[0].tolist() == [1, 2]
 
-    # rate=1.0: beam1's candidate gets +1.0 => -1.5 beats beam0's -2.0.
-    tokens, meta = run(1.0)
-    assert meta.predecessor_beams[slot].tolist() == [0, 1]
-    assert tokens[0].tolist() == [1, 3]
-    # Stored cum_log_probs are the raw scores, not diversity-adjusted: beam 1's
-    # winner keeps its raw ~-2.5 (with the +1.0 adjustment it would be ~-1.5).
+    # rate=1.0 adds rate * source_beam_index, lifting beam 1's candidate to
+    # ~-1.5 and past beam 0's second one. Assert the effect -- that beam 1 now
+    # contributes -- rather than the exact winning tokens, which also depend on
+    # how the candidate pool is sized.
+    tokens_div, meta_div = run(1.0)
+    assert 1 in meta_div.predecessor_beams[slot].tolist(), (
+        "diversity_rate should let the weaker source beam win a slot")
+    assert tokens_div[0].tolist() != tokens[0].tolist(), (
+        "diversity_rate should change the selected tokens")
+
+    # Stored cum_log_probs are the raw scores, not diversity-adjusted: the
+    # winner descending from beam 1 keeps its raw ~-2.5 (with the +1.0
+    # adjustment it would be ~-1.5).
     expected_b0 = torch.log_softmax(logits[0], dim=-1)[1]
-    torch.testing.assert_close(meta.cum_log_probs[slot, 0], expected_b0)
-    torch.testing.assert_close(meta.cum_log_probs[slot, 1],
+    torch.testing.assert_close(meta_div.cum_log_probs[slot, 0], expected_b0)
+    torch.testing.assert_close(meta_div.cum_log_probs[slot, 1],
                                torch.tensor(-2.5),
                                atol=1e-3,
                                rtol=1e-3)
-
-
-_CBA_NEG_INF = float("-inf")
 
 
 def _make_cba_metadata(max_batch, K, attn_len, snap_len, seq_len, prompt_len,
@@ -1522,6 +1590,100 @@ def test_beam_search_cba_done_bound_by_early_stopping(early_stopping,
 
 
 @_kernel_test
+@_kernel_test
+@pytest.mark.parametrize("penalty_as_tensor", [False, True])
+def test_beam_search_cba_length_penalty_orders_pool(penalty_as_tensor):
+    """length_penalty ranks pool entries by length-normalized score.
+
+    Two beams finish on the same step with different generated lengths. The
+    shorter one has the better raw cumulative log-prob, the longer one the
+    better per-token score, so the penalty decides which entry the pool ranks
+    first -- while both entries keep their raw cum_log_probs, since the
+    normalization applies to the ranking key only.
+
+    This is where length_penalty acts on the CBA path: candidate ranking
+    itself does not use it (see beam_search_sampling_batch_cba), the pool
+    scores and the attainability bound do.
+    """
+    K, vocab, end_id = 2, 5, 4
+    prompt, gen = 2, 3
+    seq_len = prompt + gen
+
+    def run(length_penalty):
+        m = _make_cba_metadata(max_batch=2,
+                               K=K,
+                               attn_len=10,
+                               snap_len=6,
+                               seq_len=seq_len,
+                               prompt_len=prompt,
+                               end_id=end_id,
+                               batch=1)
+        for b in range(K):
+            m.cache_indirection[0, b, :] = b
+        # beam0 is the short one: it already finished two tokens ago, so its
+        # frozen length is smaller than beam1's.
+        m.beam_gen_lengths[0] = torch.tensor([1, gen], dtype=torch.int32)
+        # Raw scores: beam0 ahead of beam1.
+        m.cum_log_probs[0] = torch.tensor([-1.0, -2.0])
+
+        # Both beams emit EOS this step, so both enter the pool.
+        logits = torch.full((K, vocab), -50.0)
+        logits[0, end_id] = 10.0
+        logits[1, end_id] = 10.0
+
+        penalty = (torch.full((1, ), length_penalty, dtype=torch.float32)
+                   if penalty_as_tensor else length_penalty)
+        beam_search_sampling_batch_cba(
+            logits=logits,
+            beam_width_in=K,
+            beam_width_out=K,
+            beam_search_args=m,
+            temperature=1.0,
+            early_stopping=0,
+            length_penalty=penalty,
+            return_probs=False,
+        )
+        return m
+
+    # Both runs put the same two hypotheses in the pool; only the ordering key
+    # differs. Lengths are gen + 1 for the candidate that just ended.
+    m_off = run(0.0)
+    cums_off = sorted(
+        round(v, 3) for v in m_off.cba.cba_cum_log_probs[0].tolist())
+    normed_off = m_off.cba.cba_normed_scores[0].tolist()
+
+    m_on = run(1.0)
+    cums_on = sorted(
+        round(v, 3) for v in m_on.cba.cba_cum_log_probs[0].tolist())
+    normed_on = m_on.cba.cba_normed_scores[0].tolist()
+
+    # Raw pool scores are identical either way: the penalty never touches them.
+    assert cums_off == cums_on, (
+        f"pool cum_log_probs must stay unnormalized, got {cums_off} vs "
+        f"{cums_on}")
+
+    # With the penalty off, the normalized score *is* the raw score.
+    torch.testing.assert_close(torch.tensor(sorted(normed_off)),
+                               torch.tensor(
+                                   sorted(round(v, 3) for v in cums_off)),
+                               atol=1e-3,
+                               rtol=1e-3)
+
+    # With it on, each entry is divided by its own length, so the scores move
+    # apart from the raw ones.
+    assert sorted(normed_on) != sorted(normed_off), (
+        f"length_penalty should renormalize the pool scores; got {normed_on}")
+
+    # And the division is by the entry's recorded length.
+    lengths = m_on.cba.cba_lengths[0].tolist()
+    for cum, normed, length in zip(m_on.cba.cba_cum_log_probs[0].tolist(),
+                                   normed_on, lengths):
+        if normed == _CBA_NEG_INF:
+            continue  # unused pool slot
+        assert abs(normed - cum / length) < 1e-3, (
+            f"normed {normed} != cum {cum} / length {length}")
+
+
 def test_beam_search_cba_replace_min():
     """A better finished path replaces the worst CBA entry when full."""
     K, vocab, end_id = 2, 5, 4
