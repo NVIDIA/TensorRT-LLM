@@ -7969,11 +7969,19 @@ class PyTorchModelEngine(ModelEngine):
         # so the same logit processors can be used across both backends.
         logits_rows = logits_rows.view(beam_width, 1, -1)
         for lp in logits_processors:
-            lp_params = inspect.signature(lp).parameters
-
-            assert 4 <= len(lp_params) <= 5, (
-                "Logit post processor signature must match the `LogitsProcessor` interface "
-                "defined in `tensorrtllm.sampling_params`.")
+            # The signature is a static property of the callable but this runs
+            # once per request per decode step, so memoise it on the processor.
+            n_params = getattr(lp, "_trtllm_lp_param_count", None)
+            if n_params is None:
+                n_params = len(inspect.signature(lp).parameters)
+                assert 4 <= n_params <= 5, (
+                    "Logit post processor signature must match the `LogitsProcessor` interface "
+                    "defined in `tensorrtllm.sampling_params`.")
+                try:
+                    lp._trtllm_lp_param_count = n_params
+                except AttributeError:
+                    # Builtin or __slots__ callable: re-inspect each call.
+                    pass
             lp(request.py_request_id, logits_rows, token_ids, None, None)
 
         # logits_rows is a view into logits_tensor (narrow + view never

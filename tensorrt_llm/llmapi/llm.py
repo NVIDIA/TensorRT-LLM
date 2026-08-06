@@ -149,6 +149,22 @@ class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
         # re-captured at the current length, re-arming begin-suppression
         # mid-sequence.
         self._prompt_len_by_req: Dict[int, Optional[int]] = {}
+        # The suppress lists are static, but indexing logits with a Python list
+        # rebuilds a CPU index tensor and blocking-copies it to the device on
+        # every call - once per request per decode step. Cache the index as a
+        # device tensor, keyed by device.
+        self._suppress_idx: Dict[torch.device, torch.Tensor] = {}
+        self._begin_suppress_idx: Dict[torch.device, torch.Tensor] = {}
+
+    @staticmethod
+    def _cached_index(cache: Dict[torch.device,
+                                  torch.Tensor], token_ids: List[int],
+                      device: torch.device) -> torch.Tensor:
+        index = cache.get(device)
+        if index is None:
+            index = torch.tensor(token_ids, dtype=torch.long, device=device)
+            cache[device] = index
+        return index
 
     def __call__(
         self,
@@ -178,10 +194,18 @@ class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
             if logits.dim() > 1 and logits.shape[0] == len(token_ids):
                 target = logits[beam_idx]
             if self.suppress_token_ids:
-                target[..., self.suppress_token_ids] = float("-inf")
+                target.index_fill_(
+                    -1,
+                    self._cached_index(self._suppress_idx,
+                                       self.suppress_token_ids, target.device),
+                    float("-inf"))
             if (prompt_len is not None and self.begin_suppress_token_ids
                     and len(beam_token_ids) == prompt_len):
-                target[..., self.begin_suppress_token_ids] = float("-inf")
+                target.index_fill_(
+                    -1,
+                    self._cached_index(self._begin_suppress_idx,
+                                       self.begin_suppress_token_ids,
+                                       target.device), float("-inf"))
         if prompt_len is not None and len(token_ids[0]) > prompt_len:
             # Begin-suppress window closed; keep the entry as a tombstone.
             self._prompt_len_by_req[req_id] = None
