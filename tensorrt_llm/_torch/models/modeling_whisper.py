@@ -654,6 +654,14 @@ class WhisperInputProcessor(InputProcessor):
             forced = self.processor.get_decoder_prompt_ids(no_timestamps=True)
         return [int(start_id)] + [int(tok) for _, tok in sorted(forced)]
 
+    def get_decoder_prefix_len(self) -> int:
+        """Tokens every request's decoder prompt starts with.
+
+        Mixed encoder/decoder CUDA graphs capture at this query length, and a
+        mismatch makes every mixed batch miss its graph silently.
+        """
+        return len(self._build_decoder_prompt())
+
     def _resolve_decoder_prompt(self, prompt_text: Optional[str]) -> List[int]:
         """Checkpoint-default forced prompt, or the user's decoder prompt.
 

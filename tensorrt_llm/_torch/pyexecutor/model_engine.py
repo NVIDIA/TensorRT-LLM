@@ -899,7 +899,14 @@ class PyTorchModelEngine(ModelEngine):
             max_cuda_graph_num_tokens=encoder_graph_max_num_tokens,
             max_num_tokens=self.encoder_max_num_tokens,
             max_seq_len=self.max_seq_len,
-            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            # The encoder runner takes its own graph pool. Encoder replay runs
+            # on `encoder_stream`, device-concurrent with decoder replay, and
+            # torch's pool-sharing contract assumes replays from a shared pool
+            # are not concurrent. `_cuda_graph_mem_pool` is None unless
+            # torch.compile is on, so today both runners already end up with
+            # separate pools; passing None makes that independent of the
+            # torch.compile setting rather than incidental to it.
+            cuda_graph_mem_pool=None,
             is_encoder_decoder=self._is_encoder_decoder_model(),
             use_fixed_sequence_slots=(self._is_encoder_decoder_model()
                                       and hasattr(
@@ -2345,10 +2352,20 @@ class PyTorchModelEngine(ModelEngine):
         if max_num_encoder_tokens == 0:
             return
         model_config = self.model.model_config.pretrained_config
-        # BART/mBART prepend a forced BOS token after decoder_start; T5 uses
-        # decoder_start alone. Match the LLM API's decoder-prefix construction.
-        mixed_context_query_len = (2 if getattr(
-            model_config, "model_type", None) in ("bart", "mbart") else 1)
+        # The capture query length must equal the runtime decoder prefix or
+        # every mixed batch misses its graph, silently and with no counter to
+        # show it. Prefer the input processor's actual prefix (Whisper forces
+        # [decoder_start, lang, task, no_timestamps] = 4); fall back to the
+        # token-model heuristic: BART/mBART prepend a forced BOS token after
+        # decoder_start, T5 uses decoder_start alone.
+        prefix_fn = getattr(self.input_processor, "get_decoder_prefix_len",
+                            None)
+        mixed_context_query_len = prefix_fn() if prefix_fn is not None else None
+        if not mixed_context_query_len:
+            mixed_context_query_len = (2 if getattr(
+                model_config, "model_type", None) in ("bart", "mbart") else 1)
+        logger.info("Mixed encoder/decoder graph capture using decoder prefix "
+                    f"length {mixed_context_query_len}.")
         for num_contexts, total_encoder_tokens in sorted(
                 context_shapes, key=lambda shape: shape[1], reverse=True):
             if total_encoder_tokens > num_contexts * max_encoder_output_len:
