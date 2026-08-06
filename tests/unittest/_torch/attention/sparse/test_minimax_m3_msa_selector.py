@@ -109,13 +109,18 @@ def test_fused_selector_128_path_matches_reference_ties_and_forcing(num_blocks):
         [0, 8, 16, num_blocks - 1, num_blocks], device="cuda", dtype=torch.int32
     )
 
-    expected = _reference_select_blocks(
-        scores,
-        topk=16,
-        n_valid_blocks=n_valid_blocks,
-        init_blocks=8,
-        local_blocks=12,
+    expected = torch.tensor(
+        [
+            [-1] * 16,
+            list(range(8)) + [-1] * 8,
+            list(range(16)),
+            list(range(8)) + list(range(num_blocks - 13, num_blocks - 5)),
+            list(range(8)) + list(range(num_blocks - 12, num_blocks - 4)),
+        ],
+        device="cuda",
+        dtype=torch.int32,
     )
+    expected = expected[:, None, :].expand(-1, scores.shape[0], -1)
     actual = select_blocks_from_maxscore(
         scores,
         topk=16,
@@ -173,6 +178,44 @@ def test_fused_selector_head_major_output_is_zero_copy_q2k(num_blocks):
     assert q2k.is_contiguous()
     assert q2k.data_ptr() == actual.data_ptr()
     assert q2k.untyped_storage().data_ptr() == actual.untyped_storage().data_ptr()
+
+
+def test_fused_selector_head_major_output_through_msa_q2k_consumer():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
+    from fmha_sm100.sparse_fmha_adapter import _convert_kv_block_indexes_to_q2k
+
+    total_q, num_kv_heads, num_blocks = 7, 4, 96
+    scores = torch.randn(num_kv_heads, num_blocks, total_q, device="cuda")
+    n_valid_blocks = torch.arange(32, 32 + total_q, device="cuda", dtype=torch.int32)
+    selected = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+        head_major_output=True,
+    )
+    q2k = _convert_kv_block_indexes_to_q2k(
+        selected,
+        num_kv_heads=num_kv_heads,
+        num_qo_heads=num_kv_heads,
+        qhead_per_kv=1,
+    )
+
+    assert q2k.shape == (num_kv_heads, total_q, 16)
+    assert q2k.is_contiguous()
+    assert q2k.data_ptr() == selected.data_ptr()
+    assert q2k.untyped_storage().data_ptr() == selected.untyped_storage().data_ptr()
+    assert torch.equal(q2k.permute(1, 0, 2), selected)
 
 
 @pytest.mark.parametrize(
@@ -237,13 +280,16 @@ def test_fused_selector_matches_reference_equal_score_ties(fill_value):
     scores = torch.full((2, 64, 3), fill_value, device="cuda", dtype=torch.float32)
     n_valid_blocks = torch.tensor([15, 32, 64], dtype=torch.int32)
 
-    expected = _reference_select_blocks(
-        scores,
-        topk=16,
-        n_valid_blocks=n_valid_blocks,
-        init_blocks=20,
-        local_blocks=0,
+    expected = torch.tensor(
+        [
+            list(range(15)) + [-1],
+            list(range(16)),
+            list(range(16)),
+        ],
+        device="cuda",
+        dtype=torch.int32,
     )
+    expected = expected[:, None, :].expand(-1, scores.shape[0], -1)
     actual = select_blocks_from_maxscore(
         scores,
         topk=16,
@@ -331,6 +377,49 @@ def test_fused_selector_supports_strided_scores_and_cuda_validity():
     )
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("case", "match"),
+    [
+        ("scores_dtype", "expects float32 scores"),
+        ("validity_dtype", "expects int32 n_valid_blocks"),
+        ("validity_contiguous", "n_valid_blocks must be contiguous"),
+        ("topk", "supports topk=16"),
+        ("negative_init", "init_blocks must be non-negative"),
+        ("negative_local", "local_blocks must be non-negative"),
+        ("too_many_blocks", "supports at most 65535 blocks"),
+    ],
+)
+def test_fused_selector_rejects_invalid_operator_contracts(case, match):
+    scores = torch.randn(1, 32, 2, device="cuda")
+    n_valid_blocks = torch.tensor([16, 32], device="cuda", dtype=torch.int32)
+    topk, init_blocks, local_blocks = 16, 0, 1
+
+    if case == "scores_dtype":
+        scores = scores.to(torch.bfloat16)
+    elif case == "validity_dtype":
+        n_valid_blocks = n_valid_blocks.to(torch.int64)
+    elif case == "validity_contiguous":
+        n_valid_blocks = torch.tensor([16, 0, 32, 0], device="cuda", dtype=torch.int32)[::2]
+    elif case == "topk":
+        topk = 8
+    elif case == "negative_init":
+        init_blocks = -1
+    elif case == "negative_local":
+        local_blocks = -1
+    elif case == "too_many_blocks":
+        scores = torch.empty(1, 65_536, 2, device="cuda")
+
+    with pytest.raises(RuntimeError, match=match):
+        torch.ops.trtllm.minimax_m3_select_blocks(
+            scores,
+            n_valid_blocks,
+            topk,
+            init_blocks,
+            local_blocks,
+            False,
+        )
 
 
 def test_fused_selector_cuda_graph_replay_updates_inputs():
