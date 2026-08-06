@@ -18,6 +18,32 @@ from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
 
+ZMQ_LINGER_MS_ENV = "TLLM_ZMQ_LINGER_MS"
+ZMQ_LINGER_MS_DEFAULT = 2000
+
+
+def zmq_linger_ms() -> int:
+    """Bounded ZMQ LINGER (ms) for every ZeroMqQueue socket.
+
+    -1 hangs close()/term() once a peer is gone; 0 drops the shutdown message
+    that stop_server_main() only flushes during close. Malformed values fall
+    back and <1 is clamped, since both -1 and 0 would bring the hang back.
+    """
+    raw = os.environ.get(ZMQ_LINGER_MS_ENV)
+    if raw is None:
+        return ZMQ_LINGER_MS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"{ZMQ_LINGER_MS_ENV}={raw!r} is not an integer; "
+                       f"using default {ZMQ_LINGER_MS_DEFAULT}")
+        return ZMQ_LINGER_MS_DEFAULT
+    if value < 1:
+        logger.warning(f"{ZMQ_LINGER_MS_ENV}={value} < 1; clamping to 1 "
+                       "(0 or -1 would reintroduce the teardown hang)")
+        return 1
+    return value
+
 
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
@@ -65,6 +91,8 @@ class ZeroMqQueue:
         self.name = name
         self.socket = self.context.socket(socket_type)
         self.socket.set_hwm(0)
+        # Read per instance so tests can monkeypatch the env var.
+        self.socket.setsockopt(zmq.LINGER, zmq_linger_ms())
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None
@@ -347,6 +375,9 @@ class ZeroMqQueue:
                     raise asyncio.TimeoutError()
 
     def close(self):
+        # No explicit linger: close() honours the socket's LINGER, which
+        # __init__ bounds, so callers that set their own value first
+        # (_torch/visual_gen/executor.py uses 0) keep it.
         if self.socket:
             self.socket.close()
             self.socket = None

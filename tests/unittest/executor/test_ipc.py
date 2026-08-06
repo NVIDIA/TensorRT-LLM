@@ -5,9 +5,58 @@ from threading import Thread
 import pytest
 import zmq
 
-from tensorrt_llm.executor.ipc import ZeroMqQueue
+from tensorrt_llm.executor.ipc import (
+    ZMQ_LINGER_MS_DEFAULT,
+    ZMQ_LINGER_MS_ENV,
+    ZeroMqQueue,
+    zmq_linger_ms,
+)
 
 pytestmark = pytest.mark.cpu_only
+
+
+class TestZmqLinger:
+    """LINGER must stay bounded: -1 hangs teardown, 0 drops shutdown messages."""
+
+    def _server(self):
+        return ZeroMqQueue(
+            address=None,
+            socket_type=zmq.PAIR,
+            is_server=True,
+            name="test_linger",
+            use_hmac_encryption=True,
+        )
+
+    def test_socket_gets_bounded_linger(self):
+        server = self._server()
+        try:
+            assert server.socket.getsockopt(zmq.LINGER) == ZMQ_LINGER_MS_DEFAULT
+        finally:
+            server.close()
+
+    def test_env_override_is_applied(self, monkeypatch):
+        monkeypatch.setenv(ZMQ_LINGER_MS_ENV, "1234")
+        server = self._server()
+        try:
+            assert server.socket.getsockopt(zmq.LINGER) == 1234
+        finally:
+            server.close()
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("not-an-int", ZMQ_LINGER_MS_DEFAULT),
+            ("", ZMQ_LINGER_MS_DEFAULT),
+            ("10s", ZMQ_LINGER_MS_DEFAULT),
+            ("0", 1),
+            ("-1", 1),
+        ],
+    )
+    def test_malformed_and_unbounded_values_are_rejected(self, monkeypatch, raw, expected):
+        # Malformed falls back instead of breaking `import tensorrt_llm`; <1 is
+        # clamped so the unbounded/drop-everything linger cannot come back.
+        monkeypatch.setenv(ZMQ_LINGER_MS_ENV, raw)
+        assert zmq_linger_ms() == expected
 
 
 class TestIpcBasics:
