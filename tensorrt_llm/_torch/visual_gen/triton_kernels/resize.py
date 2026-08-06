@@ -95,18 +95,25 @@ def _cubic_axis(dst_n: int, src_n: int):
     return taps, coef
 
 
-def _check_frames(frames: torch.Tensor, op: str, *, layout: str = "[T, H, W, C]") -> None:
+def _check_frames(
+    frames: torch.Tensor,
+    op: str,
+    *,
+    layout: str = "[T, H, W, C]",
+    allow_outer_stride: bool = False,
+) -> None:
     """Reject anything the kernels cannot address.
 
     Explicit raises rather than ``assert``: assertions vanish under ``python -O``,
     and only ``ValueError`` is classified as a client error by the worker, so an
     ``AssertionError`` would surface as a server fault.
 
-    Contiguity is mandatory. Every kernel here indexes raw storage as a dense
-    ``T*H*W*C`` block and never consults strides, so a strided view is read as
-    if it were dense -- wrong pixels, no error. We reject rather than call
-    ``.contiguous()``: a silent full-clip copy does not belong on an inference
-    path, and the callers already pass dense tensors.
+    Most kernels index raw storage as one dense block and never consult strides,
+    so a strided view would be read as if it were dense -- wrong pixels, no
+    error. ``allow_outer_stride`` relaxes that for kernels that take dim 0's
+    stride as an argument: dim 0 may then sit anywhere, but everything inside it
+    must still be dense. Either way we reject rather than call ``.contiguous()``,
+    since a silent full-clip copy does not belong on an inference path.
     """
     if not frames.is_cuda:
         raise ValueError(f"{op} requires a CUDA tensor, got device={frames.device}")
@@ -114,7 +121,14 @@ def _check_frames(frames: torch.Tensor, op: str, *, layout: str = "[T, H, W, C]"
         raise TypeError(f"{op} requires uint8 frames, got dtype={frames.dtype}")
     if frames.ndim != 4:
         raise ValueError(f"{op} expects {layout}, got shape={tuple(frames.shape)}")
-    if not frames.is_contiguous():
+    if allow_outer_stride:
+        if not frames[0].is_contiguous():
+            raise ValueError(
+                f"{op} takes dim 0's stride but addresses the rest densely, so every "
+                f"slice along dim 0 must be contiguous. Got shape={tuple(frames.shape)} "
+                f"strides={tuple(frames.stride())}."
+            )
+    elif not frames.is_contiguous():
         raise ValueError(
             f"{op} requires a contiguous tensor; the kernels address storage densely and "
             f"would misread a strided view. Got shape={tuple(frames.shape)} "

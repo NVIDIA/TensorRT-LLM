@@ -195,10 +195,30 @@ class TestKernelInputValidation:
             lambda: resize_cubic_u8(view, 48, 32),
             lambda: resize_area_u8(view, 2),
             lambda: bilateral_filter(view, 9, 75.0, 75.0),
-            lambda: canny_edges(chw.permute(1, 0, 2, 3), 100, 200),
         ):
             with pytest.raises(ValueError, match="requires a contiguous tensor"):
                 call()
+
+    def test_canny_rejects_strided_frame_planes(self):
+        # canny takes dim 0's stride, but the [T, H, W] block behind it must
+        # still be dense -- a channel-permuted view is not.
+        g = torch.Generator(device="cuda").manual_seed(0)
+        thw = torch.randint(0, 256, (2, 3, 64, 96), dtype=torch.uint8, device="cuda", generator=g)
+        view = thw.permute(1, 0, 2, 3)
+        assert not view[0].is_contiguous()
+        with pytest.raises(ValueError, match="slice along dim 0 must be contiguous"):
+            canny_edges(view, 100, 200)
+
+    @pytest.mark.parametrize("window", [(0, 8), (8, 24), (24, 32)])
+    def test_canny_reads_a_windowed_clip_in_place(self, window):
+        # Slicing [C, T, H, W] along T leaves dim 0 striding over the *whole*
+        # clip, so this used to need a .contiguous() copy per window. The result
+        # must be bit-identical to materializing it.
+        start, stop = window
+        frames = _clip(64, 96, t=32).permute(3, 0, 1, 2).contiguous()
+        view = frames[:, start:stop]
+        assert not view.is_contiguous() and view.stride(0) == 32 * 64 * 96
+        assert torch.equal(canny_edges(view, 100, 200), canny_edges(view.contiguous(), 100, 200))
 
     def test_rejects_non_uint8(self):
         # Silently casting would be a data copy on the inference path; the

@@ -416,7 +416,7 @@ def make_edge_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
     for start in range(0, frames.shape[1], CONTROL_FRAME_WINDOW):
         stop = min(start + CONTROL_FRAME_WINDOW, frames.shape[1])
         # assigning [t, H, W] into [3, t, H, W] broadcasts the map across RGB
-        edges[:, start:stop] = canny_edges(frames[:, start:stop].contiguous(), lower, upper)
+        edges[:, start:stop] = canny_edges(frames[:, start:stop], lower, upper)
     return edges
 
 

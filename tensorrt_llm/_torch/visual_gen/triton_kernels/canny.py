@@ -36,7 +36,7 @@ _NMS_ROWS = 4
 
 
 @triton.jit
-def _grad_kernel(src, bdx, bdy, mag, T, H, W, C: tl.constexpr, BLOCK: tl.constexpr):
+def _grad_kernel(src, bdx, bdy, mag, SC, H, W, C: tl.constexpr, BLOCK: tl.constexpr):
     # (x-block, y, t) grid: no runtime integer division (idiv dominated the SM
     # in the flat-index variant)
     y = tl.program_id(1)
@@ -53,8 +53,11 @@ def _grad_kernel(src, bdx, bdy, mag, T, H, W, C: tl.constexpr, BLOCK: tl.constex
     best = tl.zeros((BLOCK,), dtype=tl.int32) - 1  # any real mag (>=0) beats it
     dx = tl.zeros((BLOCK,), dtype=tl.int32)
     dy = tl.zeros((BLOCK,), dtype=tl.int32)
+    # SC is dim 0's stride rather than a frame count, so a clip windowed along T
+    # is read in place. c is a static_range constant, so c*SC folds to 0/SC/2*SC
+    # -- the same address arithmetic the dense form compiled to.
     for c in tl.static_range(C):
-        p = src + (c * T + t) * H * W
+        p = src + c * SC + t * H * W
         v00 = tl.load(p + ym1 * W + xm1, mask=m, other=0).to(tl.int32)
         v01 = tl.load(p + ym1 * W + x, mask=m, other=0).to(tl.int32)
         v02 = tl.load(p + ym1 * W + xp1, mask=m, other=0).to(tl.int32)
@@ -167,15 +170,21 @@ def _hysteresis(strong: torch.Tensor, weak: torch.Tensor) -> torch.Tensor:
 
 
 def canny_edges(frames: torch.Tensor, low: int, high: int) -> torch.Tensor:
-    """Canny over a clip: uint8 ``[C, T, H, W]`` CUDA -> uint8 ``[T, H, W]``."""
-    _check_frames(frames, "canny_edges", layout="[C, T, H, W]")
+    """Canny over a clip: uint8 ``[C, T, H, W]`` CUDA -> uint8 ``[T, H, W]``.
+
+    Dim 0 may be strided, so a caller windowing a longer clip along T can pass
+    ``frames[:, start:stop]`` directly instead of materializing it.
+    """
+    _check_frames(frames, "canny_edges", layout="[C, T, H, W]", allow_outer_stride=True)
     C, T, H, W = frames.shape
     dev = frames.device
 
     bdx = torch.empty(T, H, W, dtype=torch.int32, device=dev)
     bdy = torch.empty_like(bdx)
     mag = torch.empty_like(bdx)
-    _grad_kernel[(triton.cdiv(W, _BLOCK), H, T)](frames, bdx, bdy, mag, T, H, W, C=C, BLOCK=_BLOCK)
+    _grad_kernel[(triton.cdiv(W, _BLOCK), H, T)](
+        frames, bdx, bdy, mag, frames.stride(0), H, W, C=C, BLOCK=_BLOCK
+    )
 
     cmap = torch.empty(T, H, W, dtype=torch.uint8, device=dev)
     _nms_kernel[(triton.cdiv(W, _BLOCK), triton.cdiv(H, 4), T)](
