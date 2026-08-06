@@ -1127,7 +1127,11 @@ class _StrategyImpls:
             seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata)
-            temperature = self._temperature.repeat_interleave(self._beam_width_in)
+            # Temperature is applied before the op slices the padding rows off,
+            # so it must cover every row the forward path laid out: the static
+            # admission width, which exceeds beam_width_in while a variable
+            # beam width array is still widening.
+            temperature = self._temperature.repeat_interleave(self._row_stride)
             logits = self._prepare_logits_with_temperature(logits, group_logit_indices, temperature)
             return self._select_and_update(logits, group_metadata)
 
@@ -1340,7 +1344,13 @@ class FlashInferGroupedStrategySampler:
                 case _:
                     raise NotImplementedError("Unsupported strategy key encountered")
         if group_logit_indices is None:
-            assert logits.size(0) == beam_width_in * len(strategies)
+            # Beam-search rows are laid out at the static admission width
+            # (row_stride), which exceeds beam_width_in on a widening
+            # variable-beam-width step; the op slices down to the live beams.
+            rows_per_request = beam_width_in
+            if strategies and strategies[0][0] == "beam_search":
+                rows_per_request = cast(BeamSearch, strategies[0]).row_stride
+            assert logits.size(0) == rows_per_request * len(strategies)
         else:
             assert group_logit_indices.size(0) == beam_width_in * len(strategies)
         strategy_impl = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
