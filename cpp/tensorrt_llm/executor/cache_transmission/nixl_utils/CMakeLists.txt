@@ -41,8 +41,6 @@ if(NIXL_ROOT)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
-  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${TORCH_LIBRARIES}
-                                                       pg_utils)
 
   set(NIXL_ENABLED TRUE)
 else()

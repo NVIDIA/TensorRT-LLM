@@ -22,11 +22,11 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "tensorrt_llm/runtime/utils/pgUtils.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cstdlib>
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -403,24 +403,27 @@ nixl_status_t NixlTransferStatus::queryStatus() const
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
-    if (useMPI())
+    char const* disableMpi = std::getenv("TLLM_DISABLE_MPI");
+    bool const mpiEnabled = disableMpi == nullptr || std::atoi(disableMpi) == 0;
+    TLLM_CHECK_WITH_INFO(config.rank.has_value() == config.worldSize.has_value(),
+        "NIXL agent config fields 'rank' and 'worldSize' must be specified together");
+
+    if (config.rank.has_value())
     {
-        mRank = mpi::MpiComm::world().getRank();
-        mWorldSize = mpi::MpiComm::world().getSize();
+        mRank = config.rank.value();
+        mWorldSize = config.worldSize.value();
+        TLLM_CHECK_WITH_INFO(mWorldSize > 0, "NIXL world size must be positive, got %d", mWorldSize);
+        TLLM_CHECK_WITH_INFO(
+            mRank >= 0 && mRank < mWorldSize, "NIXL rank must be in [0, %d), got %d", mWorldSize, mRank);
     }
-    else
+    else if (config.useListenThread && mpiEnabled)
     {
-        auto const worldPg = pg_utils::get_world_pg();
-        if (worldPg)
-        {
-            mRank = worldPg->getRank();
-            mWorldSize = worldPg->getSize();
-            TLLM_LOG_DEBUG(mRank, "NIXL using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
-        }
-        else
-        {
-            TLLM_LOG_WARNING("Torch process group is not initialized; NIXL defaults to one process");
-        }
+        mRank = mpi::MpiComm::session().getRank();
+        mWorldSize = mpi::MpiComm::session().getSize();
+    }
+    else if (config.useListenThread)
+    {
+        TLLM_LOG_WARNING("NIXL rank parameters are not configured; defaulting to one process");
     }
 
     nixl_status_t status;

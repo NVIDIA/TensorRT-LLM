@@ -395,9 +395,33 @@ AgentConnectionManager::AgentConnectionManager(
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 
+    c10::intrusive_ptr<c10d::ProcessGroup> worldPg;
+    if (useMPI())
+    {
+        mRank = mpi::MpiComm::session().getRank();
+        mWorldSize = mpi::MpiComm::session().getSize();
+    }
+    else
+    {
+        worldPg = get_world_pg();
+        if (worldPg)
+        {
+            mRank = worldPg->getRank();
+            mWorldSize = worldPg->getSize();
+            TLLM_LOG_DEBUG(
+                mRank, "Cache transceiver using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+        }
+        else
+        {
+            TLLM_LOG_WARNING("Torch process group is not initialized; cache transceiver defaults to one process");
+        }
+    }
+
     mAgentName = genUniqueAgentName();
     // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true};
+    config.rank = mRank;
+    config.worldSize = mWorldSize;
     m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     mBufferKinds.reserve(mCacheTransBufferManagers.size());
@@ -421,28 +445,6 @@ AgentConnectionManager::AgentConnectionManager(
     }
     mRegMemDescs = MemoryDescs{MemoryType::kVRAM, memDescs};
     m_Agent->registerMemory(mRegMemDescs);
-
-    c10::intrusive_ptr<c10d::ProcessGroup> worldPg;
-    if (useMPI())
-    {
-        mRank = mpi::MpiComm::session().getRank();
-        mWorldSize = mpi::MpiComm::session().getSize();
-    }
-    else
-    {
-        worldPg = get_world_pg();
-        if (worldPg)
-        {
-            mRank = worldPg->getRank();
-            mWorldSize = worldPg->getSize();
-            TLLM_LOG_DEBUG(
-                mRank, "Cache transceiver using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
-        }
-        else
-        {
-            TLLM_LOG_WARNING("Torch process group is not initialized; cache transceiver defaults to one process");
-        }
-    }
 
     AgentState localAgentState{mAgentName, m_Agent->getLocalConnectionInfo()};
     std::vector<AgentState> agentStates(mWorldSize);
