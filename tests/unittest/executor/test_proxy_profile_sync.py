@@ -44,6 +44,9 @@ def _bare_proxy():
     ``GenerationExecutorProxy.__init__``).
     """
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    # Set by ``GenerationExecutor.__init__`` in production; the profile
+    # handlers reject control once ``pre_shutdown()`` flips it.
+    proxy.doing_shutdown = False
     proxy.request_queue = MagicMock()
     # The fix introduces a ``profile_ack_queue`` attribute. Pre-fix this
     # attribute does not exist; we stub it as MagicMock so old code paths
@@ -198,6 +201,29 @@ def test_profile_control_after_shutdown_raises_runtime_error(kind):
         getattr(proxy, f"{kind}_profile")()
 
     # The ZMQ queues must not be touched once the owning thread is gone.
+    proxy.request_queue.put.assert_not_called()
+    proxy.profile_ack_queue.get.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["start", "stop"])
+def test_profile_control_during_pre_shutdown_raises_runtime_error(kind):
+    """Profile control is rejected as soon as ``pre_shutdown()`` starts.
+
+    ``pre_shutdown()`` sets ``doing_shutdown`` and sends the quit sentinel
+    to the workers, but ``shutdown()`` only clears
+    ``_profile_control_executor`` later. In that window the executor is
+    still live, so a profile call would submit and then block for the full
+    ack timeout against workers that are already exiting.
+    """
+    proxy = _bare_proxy()
+    proxy.doing_shutdown = True
+
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match=f"{kind}_profile"):
+        getattr(proxy, f"{kind}_profile")()
+    # Rejected immediately rather than after the ack timeout.
+    assert time.monotonic() - t0 < 1.0
+
     proxy.request_queue.put.assert_not_called()
     proxy.profile_ack_queue.get.assert_not_called()
 

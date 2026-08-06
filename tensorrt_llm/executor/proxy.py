@@ -645,7 +645,17 @@ class GenerationExecutorProxy(GenerationExecutor):
         request arriving during or after teardown would otherwise fail with
         ``AttributeError`` on ``None``. Raise ``RuntimeError`` instead — the
         HTTP handlers already map it to a controlled response.
+
+        ``pre_shutdown()`` flips ``doing_shutdown`` and sends the quit
+        sentinel to the workers well before ``shutdown()`` clears the
+        executor, so check that first: a request submitted in that window
+        would otherwise block for the whole ack timeout waiting on workers
+        that are already exiting.
         """
+        if self.doing_shutdown:
+            raise RuntimeError(
+                f"{kind}_profile: the executor proxy is shutting down; "
+                "profile control is unavailable.")
         executor = self._profile_control_executor
         if executor is None:
             raise RuntimeError(
