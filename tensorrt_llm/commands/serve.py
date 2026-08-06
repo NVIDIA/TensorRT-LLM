@@ -13,6 +13,7 @@ import subprocess  # nosec B404
 import sys
 import time
 import uuid
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 
@@ -1112,7 +1113,8 @@ def launch_visual_gen_server(
     is_flag=True,
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
+    "Requires the tensorrt_llm[devel] extra.",
     status="prototype")
 @stability_option(
     "--served_model_name",
@@ -1352,13 +1354,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            try:
-                from tensorrt_llm.grpc.smg.server import launch_smg_server
-            except ImportError as e:
+            if find_spec("smg_grpc_proto") is None:
                 raise ValueError(
                     "gRPC serving with the SMG protocol requires the optional "
                     "'smg-grpc-proto' package. Install it with: "
-                    "pip install tensorrt_llm[grpc-smg]") from e
+                    'pip install "tensorrt_llm[devel]"')
+
+            from tensorrt_llm.grpc.smg.server import launch_smg_server
 
             launch_smg_server(host,
                               port,

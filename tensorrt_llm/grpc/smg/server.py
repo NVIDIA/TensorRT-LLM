@@ -50,7 +50,9 @@ def launch_smg_server(
     """
     try:
         from grpc_reflection.v1alpha import reflection
-    except ImportError:
+    except ModuleNotFoundError as e:
+        if e.name != "grpc_reflection":
+            raise
         reflection = None
 
     async def serve_grpc_async() -> None:
@@ -75,58 +77,59 @@ def launch_smg_server(
 
         logger.info("Model loaded successfully")
 
-        request_manager = GrpcRequestManager(llm)
-        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
-
-        server = grpc.aio.server(
-            options=[
-                ("grpc.max_send_message_length", _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.max_receive_message_length", _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.keepalive_time_ms", 30000),
-                ("grpc.keepalive_timeout_ms", 10000),
-                ("grpc.keepalive_permit_without_calls", True),
-                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
-            ]
-        )
-        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(servicer, server)
-
-        if reflection is not None:
-            service_names = (
-                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].full_name,
-                reflection.SERVICE_NAME,
-            )
-            reflection.enable_server_reflection(service_names, server)
-            logger.info("gRPC reflection enabled")
-
-        address = f"{host}:{port}"
-        server.add_insecure_port(address)
-        await server.start()
-        logger.info(f"TensorRT-LLM SMG gRPC server started on {address}")
-        logger.info("Server is ready to accept requests")
-
-        loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event()
-
-        def signal_handler() -> None:
-            logger.info("Received shutdown signal")
-            stop_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
-
+        server = None
         try:
+            request_manager = GrpcRequestManager(llm)
+            servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+
+            server = grpc.aio.server(
+                options=[
+                    ("grpc.max_send_message_length", _GRPC_MAX_MESSAGE_LENGTH_BYTES),
+                    ("grpc.max_receive_message_length", _GRPC_MAX_MESSAGE_LENGTH_BYTES),
+                    ("grpc.keepalive_time_ms", 30000),
+                    ("grpc.keepalive_timeout_ms", 10000),
+                    ("grpc.keepalive_permit_without_calls", True),
+                    ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+                ]
+            )
+            trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(servicer, server)
+
+            if reflection is not None:
+                service_names = (
+                    trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].full_name,
+                    reflection.SERVICE_NAME,
+                )
+                reflection.enable_server_reflection(service_names, server)
+                logger.info("gRPC reflection enabled")
+
+            address = f"{host}:{port}"
+            server.add_insecure_port(address)
+            await server.start()
+            logger.info(f"TensorRT-LLM SMG gRPC server started on {address}")
+            logger.info("Server is ready to accept requests")
+
+            loop = asyncio.get_running_loop()
+            stop_event = asyncio.Event()
+
+            def signal_handler() -> None:
+                logger.info("Received shutdown signal")
+                stop_event.set()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, signal_handler)
+
             await stop_event.wait()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
         finally:
             logger.info("Shutting down TensorRT-LLM SMG gRPC server...")
-            await server.stop(grace=5.0)
-            logger.info("gRPC server stopped")
-
-            if hasattr(llm, "shutdown"):
-                llm.shutdown()
-            logger.info("LLM engine stopped")
-            logger.info("Shutdown complete")
+            try:
+                if server is not None:
+                    await server.stop(grace=5.0)
+                    logger.info("gRPC server stopped")
+            finally:
+                if hasattr(llm, "shutdown"):
+                    llm.shutdown()
+                logger.info("LLM engine stopped")
+                logger.info("Shutdown complete")
 
     uvloop.run(serve_grpc_async())
 

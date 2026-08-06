@@ -130,10 +130,6 @@ devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
 mx_deps = ["modelexpress==0.4.1"]
-# Optional SMG gRPC adapter dependency. Not part of the default install; opt in
-# with `pip install tensorrt_llm[grpc-smg]`. Also kept in requirements-dev.txt so
-# the adapter is present (and tested) in every CI/dev environment.
-grpc_smg_deps = ["smg-grpc-proto>=0.4.2"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -479,7 +475,6 @@ setup(
     extras_require={
         "devel": devel_deps,
         "mx": mx_deps,
-        "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,
     install_requires=required_deps,

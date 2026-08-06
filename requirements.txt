@@ -92,6 +92,8 @@ llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
 etcd-sdk-python==0.0.7
+# etcd-sdk-python imports google.protobuf but omits it from its package metadata.
+protobuf>=5.27.2
 python-multipart
 cache-dit>=1.3.5
 librosa

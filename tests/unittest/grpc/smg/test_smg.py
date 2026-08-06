@@ -27,11 +27,11 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 
 # The SMG adapter depends on the optional 'smg-grpc-proto' package
-# (pip install tensorrt_llm[grpc-smg]). Skip the whole module cleanly when it is
-# absent so collection does not fail in an environment without the extra.
+# (pip install "tensorrt_llm[devel]"). Skip the whole module cleanly when it is
+# absent so collection does not fail in an environment without the dependency.
 pytest.importorskip(
     "smg_grpc_proto",
-    reason="SMG gRPC adapter extra not installed (pip install tensorrt_llm[grpc-smg])",
+    reason='SMG gRPC adapter dependency not installed (pip install "tensorrt_llm[devel]")',
 )
 
 import grpc  # noqa: E402
