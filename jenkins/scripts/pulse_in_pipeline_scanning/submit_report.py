@@ -187,10 +187,7 @@ def submit_source_code_licenses(
                 lid = lic.get("id") or lic.get("name") or ""
                 license_to_components.setdefault(lid, []).append(component)
 
-        print("=== query permissiveness", file=sys.stderr)
         permissiveness = is_permissive(list(license_to_components.keys()), license_check_token)
-        print("=== result query permissiveness", file=sys.stderr)
-        print(f"=== {json.dumps(permissiveness)}", file=sys.stderr)
 
         non_permissive_pkgs = {
             c.get("name")

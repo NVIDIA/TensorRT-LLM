@@ -376,8 +376,8 @@ def processScanResults(ref) {
                         needsManualReview = true
                         manualReviewUrl = pipelineUrl
                         def candidates = result.preapproved_candidates ?: []
-                        writeFile file: '/tmp/preapproved_candidates.json',
-                                  text: groovy.json.JsonOutput.toJson(candidates)
+                        writeJSON file: '/tmp/preapproved_candidates.json',
+                                  json: candidates
                     }
                     if (result.detected_licenses) {
                         def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17, is_nvidia_proprietary: 17]
@@ -513,11 +513,9 @@ pipeline {
                         echo detectedLicensesTable
                     }
                     withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-                        def slackPayload = groovy.json.JsonOutput.toJson([
-                            report      : "New licenses detected in release mode (${params.ref} branch). Manual approval required before release.",
-                            dashboardUrl: manualReviewUrl,
-                        ])
-                        sh "curl -s -X POST -H 'Content-Type: application/json' -d '${slackPayload}' \$PLC_SLACK_WEBHOOK"
+                        def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
+                        writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
+                        sh "curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/slack_payload.json \$PLC_SLACK_WEBHOOK"
                     }
                     timeout(time: 24, unit: 'HOURS') {
                         input(
