@@ -346,6 +346,15 @@ class HfLoraLoader:
                 lora_target_modules.add(trtllm_module)
         return list(lora_target_modules)
 
+    def get_dense_lora_dtype(self) -> Optional[torch.dtype]:
+        """Return the common input/output dtype for dense LoRA modules."""
+        lora_dtypes = set()
+        for key, weight in self.lora_weight.items():
+            match = HF_LORA_PATTERN.match(key)
+            if match is not None and match.group(6) is None and match.group(8) in ("A", "B"):
+                lora_dtypes.add(weight.dtype)
+        return next(iter(lora_dtypes)) if len(lora_dtypes) == 1 else None
+
 
 @lru_cache(maxsize=128)
 def _find_nemo_files_single_path(lora_path: str) -> List[str]:
@@ -454,12 +463,16 @@ class NemoLoraLoader:
         return self.lora_target_modules
 
 
-def load_torch_hf_lora(lora_config: LoraConfig):
+def load_torch_hf_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
     """Load an HF LoRA checkpoint for the PyTorch workflow.
 
     Populates lora_config (trtllm_modules_to_hf_modules and inferred
     lora_target_modules) from the HF adapter directory. The actual weights are
     loaded later by LoraManager when requests arrive with LoRA UIDs.
+
+    Returns:
+        The common dense LoRA weight dtype, or ``None`` when no homogeneous
+        dense LoRA weights are present.
     """
     if not lora_config.trtllm_modules_to_hf_modules:
         lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
@@ -480,9 +493,10 @@ def load_torch_hf_lora(lora_config: LoraConfig):
 
     missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
     lora_config.lora_target_modules.extend(missing_qkv_modules)
+    return lora_loader.get_dense_lora_dtype()
 
 
-def load_torch_nemo_lora(lora_config: LoraConfig):
+def load_torch_nemo_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
     """Load NeMo LoRA checkpoint for PyTorch workflow.
 
     This is a PyTorch-specific loader for NeMo LoRA checkpoints, similar to
@@ -496,6 +510,9 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
 
     Args:
         lora_config: LoRA configuration with lora_ckpt_source="nemo"
+
+    Returns:
+        ``None`` because NeMo LoRA weights use the model compute dtype.
 
     Raises:
         ValueError: If NeMo LoRA directory is invalid or unsupported modules are specified
@@ -524,9 +541,10 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
             f"but got unsupported modules: {unsupported_modules}. "
             f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
         )
+    return None
 
 
-def load_torch_lora(lora_config: LoraConfig):
+def load_torch_lora(lora_config: LoraConfig) -> Optional[torch.dtype]:
     """Load LoRA checkpoint for PyTorch workflow.
 
     This function routes to the appropriate loader based on lora_ckpt_source.
@@ -534,13 +552,16 @@ def load_torch_lora(lora_config: LoraConfig):
     Args:
         lora_config: LoRA configuration with lora_ckpt_source set to "hf" or "nemo"
 
+    Returns:
+        The configured adapter's homogeneous dense weight dtype, if available.
+
     Raises:
         ValueError: If lora_ckpt_source is not supported
     """
     if lora_config.lora_ckpt_source == "nemo":
-        load_torch_nemo_lora(lora_config)
+        return load_torch_nemo_lora(lora_config)
     elif lora_config.lora_ckpt_source == "hf":
-        load_torch_hf_lora(lora_config)
+        return load_torch_hf_lora(lora_config)
     else:
         raise ValueError(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}. "
