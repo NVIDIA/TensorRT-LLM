@@ -19,7 +19,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from qualname_map import import_executed_qualnames, qualnames_for_lines
+from qualname_map import (
+    closure_attributed_qualnames,
+    import_executed_qualnames,
+    qualnames_for_lines,
+)
 from rules._helpers import iter_diff_post_line_numbers
 from touch_db import (
     _LAUNCH_MARKERS,
@@ -117,7 +121,7 @@ class CoverageSelector:
                 # The API omits the patch for binary / renamed / oversized files, so
                 # which qualname changed is unknown; bound it as an import-time one.
                 no_diff.append(path)
-                tests = self._import_executed_bound(cf, "<module>")
+                tests = self._underrecorded_bound(cf, "<module>")
                 if tests is None:
                     return impacted, no_data, no_diff, f"no usable diff, no wider row set: {path}"
                 impacted |= tests
@@ -128,12 +132,17 @@ class CoverageSelector:
                 # Comment-only or unparsable: no qualname to resolve, file-level bound.
                 impacted |= self.db.tests_touching_file(cf)
                 continue
-            import_executed = import_executed_qualnames(source)
+            # Qualnames whose rows do not record the changed code: import-time bodies
+            # (recorded only in whichever process imported under a test context) and
+            # closure attributions (the producer records no `<locals>` frame at all).
+            underrecorded = import_executed_qualnames(source) | closure_attributed_qualnames(
+                source, lines
+            )
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
-                if qualname in import_executed:
-                    tests = self._import_executed_bound(cf, qualname)
+                if qualname in underrecorded:
+                    tests = self._underrecorded_bound(cf, qualname)
                     if tests is None:
-                        why = f"import-executed scope changed, no wider row set: {path}::{qualname}"
+                        why = f"under-recorded qualname, no wider row set: {path}::{qualname}"
                         return impacted, no_data, no_diff, why
                     impacted |= tests
                     continue
@@ -144,8 +153,8 @@ class CoverageSelector:
                     impacted |= self._no_data_fallback(cf)
         return impacted, no_data, no_diff, None
 
-    def _import_executed_bound(self, cf: str, qualname: str) -> set[str] | None:
-        """File row set when it is wider than an import-time qualname's, else None (unbounded)."""
+    def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
+        """File row set when it is wider than an under-recorded qualname's, else None."""
         file_tests = self.db.tests_touching_file(cf)
         if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
             return file_tests
