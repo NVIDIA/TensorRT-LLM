@@ -1005,6 +1005,8 @@ class DFlashForCausalLM(nn.Module):
                 f"{self.dflash_attention_backend!r}.")
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
+        self.register_buffer("_dflash_batch_indices", None, persistent=False)
+        self.register_buffer("_dflash_block_offsets", None, persistent=False)
         self._dflash_trtllm_gen_device = None
         self._dflash_trtllm_gen_sm_count = None
         logger.info(
@@ -1128,11 +1130,12 @@ class DFlashForCausalLM(nn.Module):
 
     def _validate_uniform_rope(self):
         """Check that all draft layers can safely share one RoPE cache."""
+        if len(self.model.layers) == 0:
+            raise ValueError("DFlash requires at least one draft model layer.")
+
         signatures = [
             self._rope_signature(layer.self_attn) for layer in self.model.layers
         ]
-        if not signatures:
-            raise ValueError("DFlash requires at least one draft model layer.")
 
         mismatched_layers = [
             layer_idx
@@ -1705,6 +1708,27 @@ class DFlashForCausalLM(nn.Module):
                                                            dtype=torch.uint8,
                                                            device=device)
 
+        append_batch_indices = self._dflash_batch_indices
+        block_offsets = self._dflash_block_offsets
+        static_indices_need_allocation = (
+            append_batch_indices is None or block_offsets is None
+            or append_batch_indices.device != device
+            or block_offsets.device != device
+            or append_batch_indices.size(0) < max_batch_size
+            or append_batch_indices.size(1) != block_size
+            or block_offsets.numel() != block_size)
+        if static_indices_need_allocation:
+            if is_capturing:
+                raise RuntimeError(
+                    "DFlash TRTLLM-Gen index buffers must be allocated at the "
+                    "required size before CUDA graph capture.")
+            self._dflash_batch_indices = (torch.arange(
+                max_batch_size, dtype=torch.int32,
+                device=device).view(-1, 1).expand(-1, block_size).contiguous())
+            self._dflash_block_offsets = torch.arange(block_size,
+                                                      dtype=torch.int32,
+                                                      device=device)
+
     def dflash_forward(
         self,
         noise_embedding: torch.Tensor,
@@ -1804,12 +1828,11 @@ class DFlashForCausalLM(nn.Module):
             )
             seq_lens_after = cache_seqlens_i32 + block_size
             kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
-            append_batch_indices = (torch.arange(
-                B, dtype=torch.int32, device=hidden_states.device).view(
-                    -1, 1).expand(-1, block_size).reshape(-1).contiguous())
-            append_positions = (cache_seqlens_i32.view(-1, 1) + torch.arange(
-                block_size, dtype=torch.int32,
-                device=hidden_states.device)).reshape(-1).contiguous()
+            batch_indices = self._dflash_batch_indices
+            append_batch_indices = batch_indices[:B].reshape(-1)
+            append_positions = (
+                cache_seqlens_i32.view(-1, 1) +
+                self._dflash_block_offsets).reshape(-1).contiguous()
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
