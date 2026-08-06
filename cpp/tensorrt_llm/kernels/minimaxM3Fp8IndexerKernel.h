@@ -32,9 +32,9 @@ namespace kernels
 // HND cache. The direct cache store removes the standalone cast/scatter launch
 // from the decode graph.
 void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* q_out, void* k_cache, int const* out_cache_loc,
-    int64_t page_stride, int64_t token_stride, int page_size, int num_tokens, int num_heads_q, int head_dim,
-    int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base, int const* position_ids,
-    cudaStream_t stream);
+    int64_t page_stride, int64_t token_stride, int page_size, int64_t num_pages, int num_tokens, int num_heads_q,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base,
+    int const* position_ids, cudaStream_t stream);
 
 } // namespace kernels
 

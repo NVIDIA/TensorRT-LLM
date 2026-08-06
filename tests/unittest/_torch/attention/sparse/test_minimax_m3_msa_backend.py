@@ -198,9 +198,9 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
     captured = {}
 
     class FakeIndexer:
-        def select_blocks(self, idx_q, idx_k, **kwargs):
+        def select_blocks(self, idx_q, idx_k_cache, **kwargs):
             captured["idx_q"] = idx_q
-            captured["idx_k"] = idx_k
+            captured["idx_k_cache"] = idx_k_cache
             captured["kwargs"] = kwargs
             return torch.zeros(2, 4, 16, dtype=torch.int32, device="cuda")
 
@@ -217,7 +217,8 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
 
         def __init__(self):
-            self.cache = torch.empty(2, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+            backing = torch.empty(2 * 7, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+            self.cache = backing[::7]
 
         def msa_write_idx_k(self, layer_idx, idx_k):
             captured["write"] = (layer_idx, idx_k)
@@ -232,8 +233,8 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
 
     assert result.shape == (2, 4, 16)
     assert captured["idx_q"].dtype == torch.float8_e4m3fn
-    assert captured["idx_k"].dtype == torch.float8_e4m3fn
-    assert captured["idx_k"].stride(0) > captured["idx_k"].shape[-1]
+    assert captured["idx_k_cache"].dtype == torch.float8_e4m3fn
+    assert not captured["idx_k_cache"].is_contiguous()
     assert captured["write"][0] == 3
     assert captured["write"][1].data_ptr() == idx_k.data_ptr()
 

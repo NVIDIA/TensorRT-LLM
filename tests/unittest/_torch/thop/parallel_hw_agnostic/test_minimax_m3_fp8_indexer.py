@@ -4,6 +4,12 @@
 import pytest
 import torch
 
+CUDA_AVAILABLE = torch.cuda.is_available()
+FP8_AVAILABLE = CUDA_AVAILABLE and torch.cuda.get_device_capability() >= (8, 9)
+pytestmark = pytest.mark.skipif(
+    not FP8_AVAILABLE, reason="FP8 requires CUDA compute capability >= 8.9"
+)
+
 
 # The specialized and generic paths are separate CUDA kernels.  Compiler
 # specialization of the RoPE transcendental path can place rare final values
@@ -95,6 +101,32 @@ def test_minimax_m3_fp8_indexer_matches_bf16_then_cast(num_tokens):
 
     _assert_fp8_close(q_out, q_ref)
     _assert_fp8_close(k_out, k_ref)
+
+
+def test_minimax_m3_fp8_indexer_skips_invalid_cache_slots():
+    torch.manual_seed(2345)
+    num_tokens = 3
+    num_heads_q = 4
+    qk = torch.randn(
+        num_tokens,
+        (num_heads_q + 1) * 128,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, -1, 128], dtype=torch.int32, device="cuda")
+
+    backing = torch.zeros(3, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    cache = backing[1:2]
+    q_out = _run(qk, cache, slots, q_weight, k_weight, position_ids, num_heads_q)
+    q_ref, k_ref = _reference(qk, num_heads_q, q_weight, k_weight, position_ids)
+
+    _assert_fp8_close(q_out, q_ref)
+    _assert_fp8_close(cache[0, 0, 0], k_ref[0])
+    assert torch.count_nonzero(backing[0].view(torch.uint8)).item() == 0
+    assert torch.count_nonzero(backing[2].view(torch.uint8)).item() == 0
 
 
 def test_minimax_m3_fp8_indexer_cuda_graph_replay_updates_outputs():

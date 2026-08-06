@@ -47,8 +47,8 @@ __device__ __forceinline__ __nv_fp8_e4m3 bf16RoundedToFp8(float value)
 
 __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __nv_fp8_e4m3* q_out,
     __nv_fp8_e4m3* k_cache, int const* out_cache_loc, int64_t page_stride, int64_t token_stride, int page_size,
-    int num_tokens, int num_heads_q, float eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
-    float base, int const* position_ids)
+    int64_t num_pages, int num_tokens, int num_heads_q, float eps, __nv_bfloat16 const* q_weight,
+    __nv_bfloat16 const* k_weight, float base, int const* position_ids)
 {
     int const warps_per_block = blockDim.x / 32;
     int const warp_id = threadIdx.x / 32;
@@ -139,7 +139,15 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
     else
     {
         int const slot = out_cache_loc[token_idx];
+        if (slot < 0)
+        {
+            return;
+        }
         int const page = slot / page_size;
+        if (page >= num_pages)
+        {
+            return;
+        }
         int const within_page = slot % page_size;
         output = k_cache + static_cast<int64_t>(page) * page_stride + static_cast<int64_t>(within_page) * token_stride
             + lane_id * kElemsPerThread;
@@ -150,9 +158,9 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
 } // namespace
 
 void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* q_out, void* k_cache, int const* out_cache_loc,
-    int64_t page_stride, int64_t token_stride, int page_size, int num_tokens, int num_heads_q, int head_dim,
-    int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base, int const* position_ids,
-    cudaStream_t stream)
+    int64_t page_stride, int64_t token_stride, int page_size, int64_t num_pages, int num_tokens, int num_heads_q,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base,
+    int const* position_ids, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(head_dim == kHeadDim, "MiniMax-M3 FP8 indexer requires head_dim=128");
     TLLM_CHECK_WITH_INFO(rotary_dim == kRotaryDim, "MiniMax-M3 FP8 indexer requires rotary_dim=64");
@@ -164,7 +172,7 @@ void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* q_out, void* k_ca
     int const grid_size = common::divUp(total_warps, kWarpsPerBlock);
     minimaxM3Fp8IndexerQKNormRopeKernel<<<grid_size, kBlockSize, 0, stream>>>(static_cast<__nv_bfloat16 const*>(qk),
         static_cast<__nv_fp8_e4m3*>(q_out), static_cast<__nv_fp8_e4m3*>(k_cache), out_cache_loc, page_stride,
-        token_stride, page_size, num_tokens, num_heads_q, eps, static_cast<__nv_bfloat16 const*>(q_weight),
+        token_stride, page_size, num_pages, num_tokens, num_heads_q, eps, static_cast<__nv_bfloat16 const*>(q_weight),
         static_cast<__nv_bfloat16 const*>(k_weight), base, position_ids);
 }
 

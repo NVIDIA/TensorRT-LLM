@@ -65,9 +65,9 @@ torch::Tensor minimaxM3Fp8IndexerQKNormRope(torch::Tensor const& qk, torch::Tens
     }
     auto const stream = at::cuda::getCurrentCUDAStream(qk.get_device());
     tensorrt_llm::kernels::launchMinimaxM3Fp8IndexerQKNormRope(qk.data_ptr(), qOut.data_ptr(), indexKCache.data_ptr(),
-        outCacheLoc.data_ptr<int>(), indexKCache.stride(0), indexKCache.stride(2), indexKCache.size(2), numTokens,
-        numHeadsQ, headDim, rotaryDim, static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(),
-        static_cast<float>(base), positionIds.data_ptr<int>(), stream);
+        outCacheLoc.data_ptr<int>(), indexKCache.stride(0), indexKCache.stride(2), indexKCache.size(2),
+        indexKCache.size(0), numTokens, numHeadsQ, headDim, rotaryDim, static_cast<float>(eps), qWeight.data_ptr(),
+        kWeight.data_ptr(), static_cast<float>(base), positionIds.data_ptr<int>(), stream);
     return qOut;
 }
 
