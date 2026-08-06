@@ -3235,6 +3235,9 @@ class TestTopPDecay:
             is_context_init_state=False,
             py_sampling_strategy=None,
             py_draft_tokens=draft_tokens,
+            # Read by the row_stride query in sampler_common; these tests are
+            # single-beam, so the static admission width is 1.
+            py_beam_width=1,
         )
         req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
         return cast(LlmRequest, req)
