@@ -1074,8 +1074,13 @@ class _StrategyImpls:
             narrowed_strats = cast(list[BeamSearch], strategies)
             (beam_width_in,) = set(strat[1] for strat in narrowed_strats)
             (beam_width_out,) = set(strat[2] for strat in narrowed_strats)
-            # Grouping already keys on the strategy tuple, so a group cannot
-            # mix row strides; assert rather than silently pick one.
+            # row_stride is deliberately NOT part of the grouping key (see
+            # strategy_grouping_key), so nothing in the grouping guarantees a
+            # single value here. It holds because admission pins every request
+            # to max_beam_width, making row_stride == py_beam_width identical
+            # across a group. Unpack rather than pick one, so that the day
+            # narrower requests are admitted this fails loudly instead of
+            # silently strideing one request's logits by another's width.
             (row_stride,) = set(strat.row_stride or beam_width_in for strat in narrowed_strats)
             temperature = _StrategyImpls.BeamSearchStep._make_tensor(
                 [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device

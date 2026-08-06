@@ -178,9 +178,9 @@ class BeamSearchStore:
     """Persistent per-sampler beam-search storage.
 
     The candidate-beams-array tensors live in the optional ``cba`` member,
-    allocated by :meth:`ensure_cba` on the first request using an exhaustive
-    early_stopping mode. Beam search with the default ``early_stopping=TRUE``
-    never touches them, so they are not allocated for it.
+    allocated by :meth:`ensure_cba` on the first beam-search request. Every
+    early_stopping mode runs on that path, so the only sampler that never
+    allocates them is one that never sees a beam-search request.
     """
 
     cache_indirection: torch.Tensor
@@ -583,9 +583,6 @@ def beam_search_sampling_batch(
         diversity_rate = None  # scalar 0 (or None) disables the adjustment
     cand_gen_lengths: Optional[torch.Tensor] = None
     if length_penalty is not None:
-        # Candidate generated length: active beams grow by one token this
-        # step, finished beams keep their frozen length (they only append
-        # pads).
         # Candidate generated length: active beams grow by one token this
         # step, finished beams keep their frozen length (they only append
         # pads). The counter is per-beam and cannot be derived from
