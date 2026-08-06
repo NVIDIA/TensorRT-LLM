@@ -241,7 +241,10 @@ class HfWeightLoader(BaseWeightLoader):
             model_type = json.load(f).get("model_type")
         return model_type in ("kimi_k3", "kimi_linear")
 
-    def _load_lazy_safetensors(self, checkpoint_dir: str) -> dict[str, Any]:
+    def _load_lazy_safetensors(
+            self,
+            checkpoint_dir: str,
+            use_consolidated: bool = False) -> dict[str, Any]:
         """Return a dict of name -> lazy safetensors slices.
 
         Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
@@ -253,6 +256,14 @@ class HfWeightLoader(BaseWeightLoader):
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         if not weight_files:
             raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+        # Same sharded-vs-consolidated selection as the eager path below:
+        # when both flavors are present, keep only the requested one.
+        filtered_weight_files = [
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1]) == use_consolidated
+        ]
+        if len(filtered_weight_files) > 0:
+            weight_files = filtered_weight_files
         weights: dict[str, Any] = {}
         handles = []
         for file_name in weight_files:
@@ -275,7 +286,7 @@ class HfWeightLoader(BaseWeightLoader):
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
         if self._is_kimi_k3_checkpoint(checkpoint_dir):
-            return self._load_lazy_safetensors(checkpoint_dir)
+            return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former unless specified explicitly, as there really is no need

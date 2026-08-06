@@ -169,9 +169,7 @@ _KIMI_K3_FP8_WEIGHT_READ_MLA_ENV = "KIMI_K3_FP8_WEIGHT_READ_MLA"
 # q/k/v/g plus one small BF16 GEMV for [f_a | b]
 # (``finalize_decode_weights_fp8``), so FP8 weight storage and the decode
 # glue savings coexist. Requires the FP8 KDA read to be active; no effect
-# otherwise. Default on ("0" disables): GPU-validated 2026-07-25 — TEP8
-# +14.6/+16.1/+10.4% and DEP16 +8.2/+6.2% tps/user vs control at the five
-# standard anchors, GSM8K strict-match bit-identical to control.
+# otherwise. Default on ("0" disables).
 _KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
 
 # FP8 read for the fused shared-expert gate_up_proj. Default follows the

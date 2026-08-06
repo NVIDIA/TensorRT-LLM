@@ -465,8 +465,8 @@ class MLA(nn.Module):
                 projection. Set to ``False`` for checkpoints that store a
                 separate ``q_a_proj``.
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
-                the pretrained config. If neither source provides a value,
-                initialization fails instead of using a silent fallback.
+                the pretrained config. If neither source provides a value
+                (e.g. config.pretrained_config is None), falls back to 1e-6.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -531,15 +531,16 @@ class MLA(nn.Module):
 
         sparse_algorithm = getattr(sparse_params, "algorithm", None)
         self.is_dsa = sparse_algorithm == "dsa"
-        if self.is_dsa and not fuse_qkv_a_proj:
+        self.is_deepseek_v4 = sparse_algorithm == "deepseek_v4"
+        if (self.is_dsa or self.is_deepseek_v4) and not fuse_qkv_a_proj:
             # forward_dsa_proj assumes the fused [q_a | kv_a | k_pe]
             # projection layout; the separate q_a_proj layout (Kimi K3 MLA)
-            # is not wired into the DSA path.
+            # is not wired into the DSA / DeepSeek-V4 sparse paths.
             raise NotImplementedError(
-                "DSA requires fuse_qkv_a_proj=True; the separate q_a_proj "
-                "layout is not supported with DSA."
+                "DSA and DeepSeek-V4 sparse attention require "
+                "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
+                "supported with them."
             )
-        self.is_deepseek_v4 = sparse_algorithm == "deepseek_v4"
         self._disable_dsv4_epilogue_fusion = self.is_deepseek_v4 and _is_env_truthy(
             "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION"
         )
@@ -604,10 +605,10 @@ class MLA(nn.Module):
         if rms_norm_eps is None:
             rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", None)
         if rms_norm_eps is None:
-            raise ValueError(
-                "MLA requires rms_norm_eps either explicitly or through "
-                "config.pretrained_config.rms_norm_eps"
-            )
+            # No explicit value and pretrained_config is None or lacks
+            # rms_norm_eps (e.g. unit tests constructing MLA directly):
+            # keep the historical default.
+            rms_norm_eps = 1e-6
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 

@@ -624,8 +624,14 @@ def copy_hf_moe_block_weights(
                 )
 
     shared_names: List[str] = []
-    if k3.shared_experts is not None:
-        assert hasattr(hf, "shared_experts"), (
+    hf_shared_experts = getattr(hf, "shared_experts", None)
+    if k3.shared_experts is None:
+        assert hf_shared_experts is None, (
+            "HF block has shared_experts but K3 block has none; "
+            "shared-expert weights would be silently dropped"
+        )
+    else:
+        assert hf_shared_experts is not None, (
             "K3 block has shared_experts but HF block has none; "
             "shared-expert weights would stay randomly initialized"
         )
