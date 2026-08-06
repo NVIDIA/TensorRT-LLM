@@ -7,7 +7,7 @@ asynchronously, with in-flight batching, and without the need to define callback
 
 A software component (referred to as "the client" in the text that follows) can interact
 with the executor using the API defined in the [`executor.h`](source:cpp/include/tensorrt_llm/executor/executor.h) file.
-For details about the API, refer to the {ref}`_cpp_gen/executor.rst`.
+For details about the API, refer to the [`executor.h`](source:cpp/include/tensorrt_llm/executor/executor.h) header file.
 
 The following sections provide an overview of the main classes defined in the Executor API.
 
