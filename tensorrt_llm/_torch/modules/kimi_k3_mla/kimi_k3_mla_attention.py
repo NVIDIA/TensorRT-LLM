@@ -47,6 +47,34 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     return backend
 
 
+def _kimi_k3_mla_decode_backend_policy(
+    requested_backend: str,
+    metadata,
+    num_tokens: int,
+) -> str:
+    """Per-batch MLA decode backend selection for Kimi K3.
+
+    Installed as ``mla_backend_policy`` on K3's generation attention backend
+    (see :class:`KimiK3MLAAttention`); the general attention code applies no
+    such policy on its own.
+
+    CuTe-DSL reuses one staged page table across MLA layers for a
+    generation-only, one-token-per-request batch. A mixed context/generation
+    batch cannot use that reuse key, so selecting CuTe-DSL would repeat the
+    staging copies in every MLA layer and regress time to first token. K3's
+    128 padded query heads also restrict the CuTe-DSL kernel to one query
+    token per request. Keep the requested CuTe-DSL fast path for plain decode
+    and use TRTLLM-Gen for mixed batches and speculative multi-token
+    verification.
+    """
+    is_single_token_generation = num_tokens == metadata.num_generations
+    if requested_backend == "cute-dsl" and (
+        metadata.num_contexts > 0 or not is_single_token_generation
+    ):
+        return "trtllm-gen"
+    return requested_backend
+
+
 def _meta_safe_cast_dtype(module, dtype):
     """``module.to(dtype=dtype)`` that also works under ``MetaInitMode``.
 
@@ -233,6 +261,10 @@ class KimiK3MLAAttention(MLA):
         assert isinstance(self.mqa, TrtllmAttention)
         _install_identity_rope_table(self.mha)
         _install_identity_rope_table(self.mqa)
+        # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
+        # only it needs K3's per-batch fallback policy; mha keeps the
+        # default trtllm-gen selection.
+        self.mqa.mla_backend_policy = _kimi_k3_mla_decode_backend_policy
         self.rotary_emb = None
         self.apply_rotary_emb = False
 

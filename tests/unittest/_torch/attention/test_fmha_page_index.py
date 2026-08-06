@@ -59,30 +59,35 @@ def test_flashinfer_cute_dsl_mla_backend_rejects_fp8_kv_cache() -> None:
         FlashInferTrtllmGenFmha(attn)
 
 
+def _make_fmha(requested_backend: str, mla_backend_policy) -> FlashInferTrtllmGenFmha:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._mla_backend = requested_backend
+    # ``Fmha.attn`` is a read-only property that dereferences ``_attn_ref``
+    # (normally a weakref to the owning TrtllmAttention). SimpleNamespace is
+    # not weak-referenceable, so stand in with a closure of the same shape.
+    attn = SimpleNamespace(mla_backend_policy=mla_backend_policy)
+    fmha._attn_ref = lambda: attn
+    return fmha
+
+
+@pytest.mark.parametrize("requested_backend", ["cute-dsl", "trtllm-gen"])
 @pytest.mark.parametrize(
-    (
-        "requested_backend",
-        "num_contexts",
-        "num_generations",
-        "num_tokens",
-        "expected_backend",
-    ),
+    ("num_contexts", "num_generations", "num_tokens"),
     [
-        ("cute-dsl", 0, 4, 4, "cute-dsl"),
-        ("cute-dsl", 1, 3, 4, "trtllm-gen"),
-        ("cute-dsl", 0, 4, 8, "trtllm-gen"),
-        ("trtllm-gen", 1, 3, 4, "trtllm-gen"),
+        (0, 4, 4),  # generation-only, one token per request
+        (1, 3, 4),  # mixed context/generation batch
+        (0, 4, 8),  # multi-token generation (speculative verification)
     ],
 )
-def test_flashinfer_mla_backend_falls_back_for_mixed_batches(
+def test_flashinfer_mla_backend_default_matches_static_selection(
     requested_backend: str,
     num_contexts: int,
     num_generations: int,
     num_tokens: int,
-    expected_backend: str,
 ) -> None:
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha._mla_backend = requested_backend
+    """Without an installed policy the static backend is used for every batch
+    composition, matching the behavior before the policy hook existed."""
+    fmha = _make_fmha(requested_backend, mla_backend_policy=None)
 
     assert (
         fmha._get_effective_mla_backend(
@@ -92,5 +97,19 @@ def test_flashinfer_mla_backend_falls_back_for_mixed_batches(
             ),
             num_tokens,
         )
-        == expected_backend
+        == requested_backend
     )
+
+
+def test_flashinfer_mla_backend_policy_hook_is_consulted() -> None:
+    calls = []
+
+    def policy(requested_backend: str, meta, num_tokens: int) -> str:
+        calls.append((requested_backend, meta, num_tokens))
+        return "trtllm-gen"
+
+    fmha = _make_fmha("cute-dsl", mla_backend_policy=policy)
+    meta = SimpleNamespace(num_contexts=0, num_generations=4)
+
+    assert fmha._get_effective_mla_backend(meta, 4) == "trtllm-gen"
+    assert calls == [("cute-dsl", meta, 4)]
