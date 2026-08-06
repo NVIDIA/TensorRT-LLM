@@ -105,7 +105,7 @@ def _extract_kda_extra_attrs(layer_idx: str):
 def kda_core_inplace(hidden_states: torch.Tensor, layer_idx: str, output: torch.Tensor) -> None:
     """Run the metadata-dependent KDA core and write it into ``output``."""
     metadata, kda_layer = _extract_kda_extra_attrs(layer_idx)
-    kda_layer.forward(hidden_states, metadata, output=output)
+    kda_layer._forward_impl(hidden_states, metadata, output=output)
 
 
 maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
@@ -339,14 +339,10 @@ class KimiKDALinearAttention(nn.Module):
             self._bfa_proj_weight = bfa_weight
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        """``hidden_states``: flattened ``[num_tokens, hidden]`` (ctx tokens
-        first, then one token per generation request)."""
-        if output is None and self.register_to_config and is_in_breakable_cuda_graph():
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """Select the eager path or breakable-CUDA-graph path."""
+        if self.register_to_config and is_in_breakable_cuda_graph():
             core = hidden_states.new_empty(
                 (hidden_states.shape[0], self.num_heads, self.head_dim),
                 dtype=torch.bfloat16,
@@ -357,6 +353,20 @@ class KimiKDALinearAttention(nn.Module):
                 out = self._o_allreduce(out)
             return out
 
+        return self._forward_impl(hidden_states, attn_metadata)
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Run metadata-dependent KDA prefill/decode/verify dispatch.
+
+        ``output`` is the BCG post-o_norm, pre-o_proj core buffer. When it
+        is supplied, subpaths fill it in place and this method returns None;
+        otherwise it returns the fully projected eager output.
+        """
         mamba_metadata = attn_metadata.mamba_metadata
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
