@@ -170,6 +170,25 @@ def test_qwen3_interleaved_second_think_with_content_prefix_same_delta(
         assert res.reasoning_content == exp_r, (d, res.reasoning_content, exp_r)
 
 
+def test_interleaved_partial_second_think_across_deltas() -> None:
+    """Partial second ``<think>`` must buffer across deltas after first block.
+
+    CodeRabbit follow-up: ``reason1</think>mid<th`` then ``ink>reason2`` must
+    not emit ``ink>reason2`` as content.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("deepseek-r1")
+    r1 = parser.parse_delta(f"reason1{R1_END}mid<th")
+    assert r1.reasoning_content == "reason1"
+    assert r1.content == "mid"
+    r2 = parser.parse_delta("ink>reason2")
+    assert r2.content == ""
+    assert r2.reasoning_content == "reason2"
+    r3 = parser.parse_delta(R1_END)
+    assert r3.reasoning_content == ""
+    r4 = parser.parse_delta("tail")
+    assert r4.content == "tail"
+
+
 def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
     """A partial tag arriving alongside text must still be flushed.
 
