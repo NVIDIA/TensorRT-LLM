@@ -40,7 +40,6 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "coverage_selection"))
 
-from artifact import build_from_url  # noqa: E402
 from blocks import (  # noqa: E402
     ALWAYS_RUN_STAGE_PREFIX,
     Stage,
@@ -131,6 +130,10 @@ class SelectionResult:
     # "latest post-merge tarball" at decision time, so two runs of the same
     # commit can consult different DBs; recording it makes a decision replayable.
     coverage_db_build: Optional[int] = None
+    # Revision the DB was collected at, and how many commits HEAD is ahead of it.
+    # Both None when `build_info.txt` carried no commit for that build.
+    coverage_db_commit: Optional[str] = None
+    coverage_db_lag: Optional[int] = None
 
     def to_json(self) -> str:
         data = {
@@ -146,6 +149,8 @@ class SelectionResult:
             "enable_multi_gpu": self.enable_multi_gpu,
             "coverage_dropped_stages": sorted(self.coverage_dropped_stages),
             "coverage_db_build": self.coverage_db_build,
+            "coverage_db_commit": self.coverage_db_commit,
+            "coverage_db_lag": self.coverage_db_lag,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -344,11 +349,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         "runs on fallbacks and may drop fully-safe single-GPU stages.",
     )
     parser.add_argument(
-        "--coverage-db-url",
+        "--coverage-db-build",
+        type=int,
         default=None,
-        help="Artifactory URL the --coverage-db tarball was fetched from. Only its "
-        "post-merge build number is used, recorded in the decision as "
-        "coverage_db_build so a decision can be traced back to its DB.",
+        help="Post-merge build the --coverage-db came from; recorded in the decision "
+        "so it can be traced back to its DB.",
+    )
+    parser.add_argument(
+        "--coverage-db-commit",
+        default=None,
+        help="Revision the --coverage-db was collected at (from the build's build_info.txt).",
+    )
+    parser.add_argument(
+        "--coverage-db-lag",
+        type=int,
+        default=None,
+        help="Commits HEAD is ahead of --coverage-db-commit; recorded in the decision.",
     )
     parser.add_argument(
         "--no-data-policy",
@@ -405,8 +421,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     selector = Selector(stages)
     result = selector.run(pr, rules)
 
-    if args.coverage_db_url:
-        result.coverage_db_build = build_from_url(args.coverage_db_url)
+    result.coverage_db_build = args.coverage_db_build
+    result.coverage_db_commit = args.coverage_db_commit
+    result.coverage_db_lag = args.coverage_db_lag
 
     if args.coverage_db and result.scope is None:
         note = ""

@@ -869,7 +869,13 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
         if (coverageDb.path) {
-            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-url '${coverageDb.url}'"
+            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-build ${coverageDb.build}"
+            if (coverageDb.commit) {
+                mainCmd += " --coverage-db-commit ${coverageDb.commit}"
+            }
+            if (coverageDb.lag != null) {
+                mainCmd += " --coverage-db-lag ${coverageDb.lag}"
+            }
         }
         def output = sh(script: mainCmd, returnStdout: true)
 
@@ -920,14 +926,21 @@ def _cbtsCoverageAudit(pipeline)
         // All commands run from ${LLM_ROOT}; covDir and the returned path are
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         def covDir = "cbts_cov"
-        def url = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url || true",
+        // Selection is by collected revision, not build number; the JSON also carries
+        // the commit and how far HEAD runs ahead of it, both recorded in the decision.
+        def selJson = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                    "--print-selection --repo-root ${LLM_ROOT} || true",
             returnStdout: true,
         ).trim()
-        if (!url) {
+        if (!selJson) {
             pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
-            return [path: "", url: ""]
+            return [path: "", build: null, commit: "", lag: null]
         }
+        def sel = new groovy.json.JsonSlurper().parseText(selJson)
+        def url = sel.url
+        pipeline.echo("CBTS audit: coverage DB from build ${sel.build}, " +
+                      "commit ${sel.commit ?: 'unknown'}, ${sel.lag == null ? 'lag unknown' : sel.lag + ' commit(s) behind HEAD'}")
         sh "cd ${LLM_ROOT} && mkdir -p ${covDir}"
         // wget the tarball (retrying) and extract the sqlite.
         trtllm_utils.llmExecStepWithRetry(pipeline, script:
@@ -935,14 +948,15 @@ def _cbtsCoverageAudit(pipeline)
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
            "--db ${covDir}/cbts_touchmap.sqlite"
-        // url rides along so main.py can record which post-merge build the DB
-        // came from ("latest" is resolved here, once, per run).
-        return [path: "${covDir}/cbts_touchmap.sqlite", url: url]
+        // build/commit/lag ride along so main.py can record which DB the decision
+        // used (resolved here, once, per run).
+        return [path: "${covDir}/cbts_touchmap.sqlite", build: sel.build,
+                commit: sel.commit ?: "", lag: sel.lag]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
-        return [path: "", url: ""]
+        return [path: "", build: null, commit: "", lag: null]
     }
 }
 

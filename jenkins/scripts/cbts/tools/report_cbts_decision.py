@@ -115,6 +115,11 @@ def build_document(
         "l_cbts_cases": cbts_cases,
         # Post-merge build of the consulted touch DB; 0 when no DB was used.
         "l_coverage_db_build": int(decision.get("coverage_db_build") or 0),
+        "s_coverage_db_commit": decision.get("coverage_db_commit") or "",
+        # Commits HEAD ran ahead of that DB; -1 when the build carried no commit.
+        "l_coverage_db_lag": int(
+            decision["coverage_db_lag"] if decision.get("coverage_db_lag") is not None else -1
+        ),
         "d_case_skip_rate": round(case_skip_rate, 4),
         "flat_detail": {
             "hit_stages": affected,
