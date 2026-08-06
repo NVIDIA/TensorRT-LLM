@@ -16,7 +16,7 @@ from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_awaitable():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
     prompt = "The future of AI is"
@@ -41,7 +41,7 @@ async def test_async_llm_awaitable():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
 
     prompt = "The future of AI is"
@@ -113,9 +113,7 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
         print(f"Placement group ready with bundles {pg.bundle_specs}")
 
         llm = await AsyncLLM(
-            model=os.path.join(
-                str(llm_models_root()), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"
-            ),
+            model=os.path.join(str(llm_models_root()), "llama-3.1-model", "Llama-3.1-8B-Instruct"),
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
             tensor_parallel_size=tp_size,
             placement_groups=[pg],
@@ -141,7 +139,7 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_reset_prefix_cache():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0, max_tokens=5, return_perf_metrics=True)
@@ -182,7 +180,7 @@ async def test_async_llm_reset_prefix_cache():
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_pause_resume():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=10)
 
@@ -209,7 +207,7 @@ async def test_async_llm_pause_resume():
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_pause_aborts_inflight():
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     prompt = "The future of AI is"
     inflight_params = SamplingParams(temperature=0, max_tokens=512)
     normal_params = SamplingParams(temperature=0, max_tokens=10)

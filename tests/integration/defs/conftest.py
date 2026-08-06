@@ -570,8 +570,6 @@ def multimodal_model_root(request, llm_venv):
     if "neva-22b" in tllm_model_name:
         models_root = os.path.join(llm_models_root(), "neva")
         tllm_model_name = tllm_model_name + ".nemo"
-    elif "Llama-3.2" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "llama-3.2-models")
     elif "Mistral-Small" in tllm_model_name:
         models_root = llm_models_root()
 
@@ -699,40 +697,11 @@ def llm_gpt2b_lora_model_root(request):
     return ",".join(model_root_list)
 
 
-@pytest.fixture(scope="module")
-def llama_v2_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_v2_tokenizer_model_root = os.path.join(models_root, "llama-models-v2")
-
-    assert os.path.exists(
-        llama_v2_tokenizer_model_root
-    ), f"{llama_v2_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_v2_tokenizer_model_root
-
-
 @pytest.fixture(scope="function")
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "llama-30b":
-        llama_model_root = os.path.join(models_root, "llama-models",
-                                        "llama-30b-hf")
-    elif request.param == "TinyLlama-1.1B-Chat-v1.0":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-v3-8b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3", "8B")
-    elif request.param == "llama-v3-8b-instruct-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "llama-v3-8b-instruct-hf")
-    elif request.param == "Llama-3-8B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-8B-Instruct-Gradient-1048k")
-    elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-70B-Instruct-Gradient-1048k")
-    elif request.param == "llama-3.1-8b":
+    if request.param == "llama-3.1-8b":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Meta-Llama-3.1-8B")
     elif request.param == "llama-3.1-8b-instruct-hf-fp8":
@@ -744,45 +713,10 @@ def llama_model_root(request):
     elif request.param == "llama-3.1-8b-hf-nvfp4":
         llama_model_root = os.path.join(models_root, "nvfp4-quantized",
                                         "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.2-1b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B")
-    elif request.param == "llama-3.2-1b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B-Instruct")
-    elif request.param == "llama-3.2-3b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B")
-    elif request.param == "llama-3.2-3b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B-Instruct")
-    elif request.param == "llama-3.3-70b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.3-models",
-                                        "Llama-3.3-70B-Instruct")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return llama_model_root
-
-
-@pytest.fixture(scope="function")
-def code_llama_model_root(request):
-    "get CodeLlama model data"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "CodeLlama-7b-Instruct":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-7b-Instruct-hf")
-    elif request.param == "CodeLlama-13b-Instruct":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-13b-Instruct-hf")
-    elif request.param == "CodeLlama-34b-Instruct":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-34b-Instruct-hf")
-    elif request.param == "CodeLlama-70b-hf":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-70b-hf")
-    return codellama_model_root
 
 
 @pytest.fixture(scope="function")

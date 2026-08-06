@@ -1309,8 +1309,7 @@ class TestParameterValidation:
     def model_kwargs() -> dict[str, Any]:
         root = llm_models_root()
         assert root is not None
-        return dict(model=root / "llama-models-v2" /
-                    "TinyLlama-1.1B-Chat-v1.0", )
+        return dict(model=root / "llama-3.1-model" / "Llama-3.1-8B-Instruct", )
 
     # NB: Class-level fixture overrides do not work without this
     @pytest.fixture(scope="module")

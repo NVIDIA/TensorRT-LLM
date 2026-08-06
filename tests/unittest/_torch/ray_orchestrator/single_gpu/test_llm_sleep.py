@@ -7,7 +7,7 @@ from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
 
 def test_llm_sleep(process_gpu_memory_info_available):
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
 
     llm = LLM(
@@ -73,7 +73,7 @@ def test_llm_sleep_discard_weights(process_gpu_memory_info_available):
     are gone (NONE = no backup).  The model should still be able to run a
     forward pass without crashing — output correctness is not expected.
     """
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
 
     sleep_config = SleepConfig(

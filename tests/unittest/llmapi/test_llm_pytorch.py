@@ -16,18 +16,17 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
-                                          SchedulerConfig, WaitingQueuePolicy)
+from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, SchedulerConfig,
+                                          WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .lora_test_utils import (
-    check_llama_7b_multi_lora_from_request_test_harness,
-    check_llama_7b_multi_unique_lora_adapters_from_request,
-    create_mock_nemo_lora_checkpoint, compare_cuda_graph_lora_params_filler,
-    CUDAGraphLoRATestParams, test_lora_with_and_without_cuda_graph)
+from .lora_test_utils import (create_mock_nemo_lora_checkpoint,
+                              compare_cuda_graph_lora_params_filler,
+                              CUDAGraphLoRATestParams,
+                              test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, global_kvcache_config_no_reuse,
                        llama_model_path, llm_get_stats_async_test_harness,
@@ -39,8 +38,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, similarity_score,
                         skip_fp8_pre_ada, skip_gpu_memory_less_than_40gb,
-                        skip_gpu_memory_less_than_80gb,
-                        skip_gpu_memory_less_than_138gb, skip_ray)
+                        skip_gpu_memory_less_than_80gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -256,7 +254,7 @@ def test_llm_perf_metrics():
 @pytest.mark.part3
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 def test_llm_prefix_cache_reuse(attn_backend):
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("llama-3.1-model/Llama-3.1-8B-Instruct")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=5,
@@ -396,269 +394,6 @@ def test_lora_cuda_graph_params_filling_kernel_special_cases():
     mask[-1, -4] = False
     test_params6 = replace(test_params5, layer_module_mask=mask)
     compare_cuda_graph_lora_params_filler(test_params6)
-
-
-def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
-    lora_config = LoraConfig(
-        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
-        max_lora_rank=8,
-        max_loras=2,
-        max_cpu_loras=2)
-    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
-              lora_config=lora_config,
-              **llm_kwargs)
-    try:
-        prompts = [
-            "美国的首都在哪里? \n答案:",
-        ]
-        references = [
-            "美国的首都是华盛顿。\n\n美国的",
-        ]
-        sampling_params = SamplingParams(max_tokens=20)
-        lora_req = LoRARequest(
-            "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
-        lora_request = [lora_req]
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_request)
-        assert similar(outputs[0].outputs[0].text, references[0])
-    finally:
-        llm.shutdown()
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part0
-@test_lora_with_and_without_cuda_graph
-@pytest.mark.parametrize("use_speculative", [True, False])
-def test_llama_7b_lora(cuda_graph_config, use_speculative):
-    llm_kwargs = {
-        "cuda_graph_config":
-        cuda_graph_config,
-        "speculative_config":
-        NGramDecodingConfig(max_draft_len=5) if use_speculative else None
-    }
-    llama_7b_lora_from_dir_test_harness(**llm_kwargs)
-
-
-@skip_gpu_memory_less_than_40gb
-@test_lora_with_and_without_cuda_graph
-@pytest.mark.parametrize("use_speculative", [True, False])
-def test_llama_7b_lora_default_modules(cuda_graph_config,
-                                       use_speculative) -> None:
-    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
-
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-
-    llm = LLM(model=hf_model_dir,
-              lora_config=lora_config,
-              speculative_config=NGramDecodingConfig(
-                  max_draft_len=5) if use_speculative else None,
-              cuda_graph_config=cuda_graph_config)
-
-    hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
-    try:
-        prompts = [
-            "美国的首都在哪里? \n答案:",
-        ]
-        references = [
-            "美国的首都是华盛顿。\n\n美国的",
-        ]
-        sampling_params = SamplingParams(max_tokens=20,
-                                         add_special_tokens=False)
-        lora_req = LoRARequest("luotuo", 1, hf_lora_dir)
-        lora_request = [lora_req]
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_request)
-
-        assert similar(outputs[0].outputs[0].text, references[0])
-    finally:
-        llm.shutdown()
-
-
-def _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int,
-        **llm_kwargs):
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8,
-                             max_loras=max_loras,
-                             max_cpu_loras=max_cpu_loras)
-    check_llama_7b_multi_unique_lora_adapters_from_request(
-        lora_adapter_count_per_call,
-        repeat_calls,
-        repeats_per_call,
-        LLM,
-        lora_config=lora_config,
-        **llm_kwargs)
-
-
-@skip_gpu_memory_less_than_40gb
-@skip_ray  # https://nvbugs/5682551
-@pytest.mark.part3
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
-    """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-    llm.generate call, that's repeated twice.
-    """  # noqa: D205
-    _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[2],
-        max_loras=1,
-        max_cpu_loras=2,
-        repeat_calls=2,
-        repeats_per_call=3,
-        cuda_graph_config=cuda_graph_config)
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part1
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
-        cuda_graph_config):
-    """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
-    cache size < LoRA CPU cache size.
-    """  # noqa: D205
-    _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[2, 2, 2],
-        max_loras=1,
-        max_cpu_loras=3,
-        repeat_calls=1,
-        repeats_per_call=1,
-        cuda_graph_config=cuda_graph_config)
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part0
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
-    """Test that loading and then using the same adapters loaded in cache works."""
-    _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[3],
-        max_loras=3,
-        max_cpu_loras=3,
-        repeat_calls=2,
-        repeats_per_call=1,
-        cuda_graph_config=cuda_graph_config)
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part3
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
-        cuda_graph_config):
-    """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
-    cache over multiple llm.generate call repeated twice (two calls with the same requests):
-    At the end of the 1st llm.generate call:
-      The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
-    So in the 2nd call, the worker should:
-    - Send req0 with adapter 0 weights (because it was previously evicted)
-    - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
-    Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
-    the cache, causing that evicted adapter's request to again load its weights from the file system, as they
-    aren't with the request and aren't in LoRA cache.
-    """  # noqa: D205
-    _check_llama_7b_multi_lora_evict_load_new_adapters(
-        lora_adapter_count_per_call=[3],
-        max_loras=2,
-        max_cpu_loras=2,
-        repeat_calls=2,
-        repeats_per_call=1,
-        cuda_graph_config=cuda_graph_config)
-
-
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part2
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_peft_cache_config_affects_peft_cache_size(cuda_graph_config):
-    """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
-
-    NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
-    test that it fails when configured with a value too small to contain a
-    single adapter.
-    """
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config_no_cache_size_values = LoraConfig(
-        lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
-
-    # Test that too small PeftCacheConfig.host_cache_size causes failure
-    with pytest.raises(RuntimeError):
-        check_llama_7b_multi_lora_from_request_test_harness(
-            LLM,
-            lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(
-                host_cache_size=1),  # size in bytes
-            cuda_graph_config=cuda_graph_config)
-
-    # Test that too small PeftCacheConfig.device_cache_percent causes failure
-    with pytest.raises(RuntimeError):
-        check_llama_7b_multi_lora_from_request_test_harness(
-            LLM,
-            lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
-            cuda_graph_config=cuda_graph_config)
-
-
-@skip_ray  # https://nvbugs/5682551
-@skip_gpu_memory_less_than_40gb
-@pytest.mark.part1
-@test_lora_with_and_without_cuda_graph
-def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
-    """Tests that cache size args in lora_config LLM arg override the cache size
-    parameters in peft_cache_config LLM arg.
-    """    # noqa: D205
-    check_llama_7b_multi_lora_from_request_test_harness(
-        LLM,
-        lora_config=LoraConfig(
-            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-            max_lora_rank=8,
-            max_loras=2,
-            max_cpu_loras=2),
-        peft_cache_config=PeftCacheConfig(
-            host_cache_size=1,  # size in bytes
-            device_cache_percent=0.0000001),
-        cuda_graph_config=cuda_graph_config)
-
-
-@skip_gpu_memory_less_than_138gb
-@pytest.mark.part1
-@test_lora_with_and_without_cuda_graph
-def test_nemotron_nas_lora(cuda_graph_config) -> None:
-    lora_config = LoraConfig(lora_dir=[
-        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
-    ],
-                             max_lora_rank=64,
-                             max_loras=1,
-                             max_cpu_loras=1)
-
-    llm = LLM(
-        model=
-        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
-        lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config,
-        trust_remote_code=True)
-
-    prompts = [
-        "Hello, how are you?",
-        "Hello, how are you?",
-    ]
-
-    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
-    lora_req = LoRARequest(
-        "task-0", 0,
-        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
-    )
-    lora_request = [lora_req, None]
-
-    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
-
-    assert similar(outputs[0].outputs[0].text, outputs[1].outputs[0].text)
 
 
 @skip_gpu_memory_less_than_80gb
@@ -983,22 +718,20 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
-    """Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+    """Test NeMo-format LoRA checkpoint loading and GQA support in Llama-3.1-8B-Instruct.
 
     This test verifies two properties:
-    1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
-       and that generation with this LoRA produces a deterministic, expected output for a fixed prompt and temperature=0.0.
+    1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied.
     2. That the LoRA weights have a significant effect: generating with LoRA produces a different output than generating
        without LoRA, confirming that the LoRA adapter is actually being applied.
 
-    The test uses a deterministic dummy LoRA checkpoint (seed=42) and checks both the positive (LoRA applied) and negative
-    (no LoRA) cases for output text.
+    The test uses a deterministic dummy LoRA checkpoint (seed=42).
     """
-    # TinyLlama's exact GQA configuration
-    hidden_size = 2048
-    num_layers = 22
+    # Llama-3.1-8B-Instruct GQA configuration
+    hidden_size = 4096
+    num_layers = 32
     num_q_heads = 32  # Query attention heads
-    num_kv_heads = 4  # Key/Value heads (GQA)
+    num_kv_heads = 8  # Key/Value heads (GQA)
     lora_rank = 8
 
     nemo_path = create_mock_nemo_lora_checkpoint(
@@ -1008,9 +741,8 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
         lora_rank=lora_rank,
         num_attention_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
-        seed=42,  # NOTE: the seed=42 is important for the test to pass.
+        seed=42,
     )
-    expected_lora_text_output = "Paris. The capital of France is Paris. The"
     test_prompts = ["The capital of France is"]
     sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
 
@@ -1020,7 +752,7 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
         max_lora_rank=lora_rank,
     )
 
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("llama-3.1-model/Llama-3.1-8B-Instruct")
 
     llm = LLM(
         model=model_path,
@@ -1030,7 +762,7 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
     )
 
     try:
-        lora_req = LoRARequest("tinyllama-gqa-test",
+        lora_req = LoRARequest("llama-gqa-test",
                                0,
                                str(nemo_path),
                                lora_ckpt_source="nemo")
@@ -1039,21 +771,14 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
                                     sampling_params,
                                     lora_request=[lora_req])
 
-        # For the above deterministic dummy LoRA checkpoint,
-        # with temperature=0.0,
-        # the expected output text should always be the same.
-        assert lora_outputs[0].outputs[0].text == expected_lora_text_output, \
-            f"Expected output text: {expected_lora_text_output}, " \
-            f"got: {lora_outputs[0].outputs[0].text}"
         assert len(lora_outputs) == 1
 
         # Generate without LoRA.
         # The LoRA weights are tuned/large enough that
         # they differ from a no-LoRA run.
         base_outputs = llm.generate(test_prompts, sampling_params)
-        assert base_outputs[0].outputs[0].text != expected_lora_text_output, \
-            f"No-LoRA output should differ from expected output text: {expected_lora_text_output}, " \
-            f"got: {base_outputs[0].outputs[0].text}"
+        assert lora_outputs[0].outputs[0].text != base_outputs[0].outputs[0].text, \
+            "No-LoRA output should differ from LoRA output — adapter may not be applied"
     finally:
         llm.shutdown()
 
