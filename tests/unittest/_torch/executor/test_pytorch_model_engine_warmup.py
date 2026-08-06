@@ -324,13 +324,17 @@ class TestWarmupCleanup(unittest.TestCase):
                 batch_size=16,
                 max_seq_len=2,
                 original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=1),
+                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 is_draft_model=False,
+                guided_decoder=None,
+                max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(
                     side_effect=[
+                        contextlib.nullcontext(object()),
+                        contextlib.nullcontext(object()),
                         contextlib.nullcontext(object()),
                         contextlib.nullcontext(object()),
                     ]
@@ -364,8 +368,10 @@ class TestWarmupCleanup(unittest.TestCase):
             [
                 "trtllm_autotune_enter",
                 "forward",
+                "forward",
                 "trtllm_autotune_exit",
                 "flashinfer_autotune_enter",
+                "forward",
                 "forward",
                 "flashinfer_autotune_exit",
             ],
@@ -428,13 +434,17 @@ class TestWarmupCleanup(unittest.TestCase):
                 batch_size=16,
                 max_seq_len=2,
                 original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=1),
+                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 is_draft_model=False,
+                guided_decoder=None,
+                max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(
                     side_effect=[
+                        contextlib.nullcontext(None),
+                        contextlib.nullcontext(None),
                         contextlib.nullcontext(None),
                         contextlib.nullcontext(None),
                     ]
@@ -517,9 +527,11 @@ class TestWarmupCleanup(unittest.TestCase):
                 batch_size=16,
                 max_seq_len=2,
                 original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=2),
+                mapping=SimpleNamespace(tp_size=2, has_pp=lambda: False),
                 dist=dist,
                 is_draft_model=False,
+                guided_decoder=None,
+                max_total_draft_tokens=0,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
@@ -552,7 +564,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertTrue(method._native_autotuned)
         self.assertFalse(method._flashinfer_autotuned)
         flashinfer_module.autotune.assert_not_called()
-        engine.forward.assert_called_once()
+        self.assertEqual(engine.forward.call_count, 2)
 
     def test_native_mxfp8_respects_disabled_global_autotuner(self):
         with (
