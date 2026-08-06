@@ -857,6 +857,9 @@ class PyExecutor:
             finally:
                 propagate_hard_kill()
 
+        env_threshold = os.environ.get("TLLM_HANG_DETECTOR_THRESHOLD")
+        if env_threshold is not None:
+            hang_detection_timeout = int(env_threshold)
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
 
