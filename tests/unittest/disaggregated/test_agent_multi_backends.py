@@ -10,6 +10,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 
+@pytest.mark.cpu_only
 def test_load_agent_missing_module():
     """_load_agent returns (None, ImportError) for a non-existent module.
 
@@ -25,6 +26,7 @@ def test_load_agent_missing_module():
     assert "No module named" in str(err) or "_trtllm_nonexistent_module_xyz_" in str(err)
 
 
+@pytest.mark.cpu_only
 def test_load_agent_missing_attributes():
     """_load_agent returns (None, ImportError) and logs a warning when attributes are missing."""
     from tensorrt_llm._torch.disaggregation.nixl.agent import _load_agent
@@ -36,6 +38,7 @@ def test_load_agent_missing_attributes():
     assert "NixlTransferAgent" in str(err)
 
 
+@pytest.mark.cpu_only
 def test_load_agent_success():
     """_load_agent returns (module, None) on success."""
     from tensorrt_llm._torch.disaggregation.nixl.agent import _load_agent
