@@ -96,6 +96,13 @@ def launch_server(
 
         address = f"{host}:{port}"
         bound_port = server.add_insecure_port(address)
+        if bound_port == 0:
+            try:
+                await server.stop(grace=0)
+            finally:
+                if hasattr(llm, "shutdown"):
+                    llm.shutdown()
+            raise RuntimeError(f"Failed to bind SMG gRPC server to {address}")
         await server.start()
         logger.info(f"TensorRT-LLM SMG gRPC server started on {host}:{bound_port}")
         logger.info("Server is ready to accept requests")

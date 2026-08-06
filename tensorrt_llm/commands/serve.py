@@ -1320,9 +1320,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
 
         if grpc:
             if num_serve_frontends != 1:
-                raise ValueError(
-                    "Argument 'num_serve_frontends' must be 1 when running in gRPC mode."
-                )
+                raise click.UsageError(
+                    "--num_serve_frontends must be 1 when --grpc is enabled.")
 
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
@@ -1361,15 +1360,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 try:
                     from tensorrt_llm.grpc.openengine.server import \
                         launch_server as launch_grpc_server
-                except ModuleNotFoundError as error:
-                    if error.name == "grpc" or (
-                            error.name and error.name.startswith("openengine")):
-                        raise click.ClickException(
-                            "OpenEngine support requires the optional Python "
-                            "bindings. Install them with `python -m pip install "
-                            "--extra-index-url https://buf.build/gen/python "
-                            "\"tensorrt_llm[openengine]\"`.") from error
-                    raise
+                except ImportError as error:
+                    raise click.ClickException(
+                        f"Failed to import OpenEngine support: {error}. "
+                        "Install the optional Python bindings with `python -m "
+                        "pip install --extra-index-url "
+                        "https://buf.build/gen/python "
+                        "\"tensorrt_llm[openengine]\"`.") from error
 
                 launch_grpc_server(host, port)
         else:
