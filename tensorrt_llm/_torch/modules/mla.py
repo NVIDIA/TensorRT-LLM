@@ -1057,6 +1057,23 @@ class MLA(nn.Module):
             return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
+    def _is_fused_prologue_active(
+        self, *, num_contexts: int, num_generations: int, rope_specs: list
+    ) -> bool:
+        # The two fusions are coupled: the fused KV kernels leave the RAW latent for
+        # `applyMLARopeAndAssignQKVKernel*` to see, and those kernels' Q region would
+        # read it un-normalized. That is only safe because the fused Q path takes the
+        # Q side over entirely, so require both or neither -- and the Q fold needs the
+        # per-phase launch specs, which `_fused_q_rope_specs` declines to build when
+        # the metadata cannot supply ragged context positions.
+        return (
+            self._is_fused_kv_norm_enabled(num_generations=num_generations)
+            and self._is_fused_q_fp8_quant_enabled(
+                num_generations=num_generations, num_contexts=num_contexts
+            )
+            and bool(rope_specs)
+        )
+
     def _fused_q_rope_specs(
         self, attn_metadata: AttentionMetadata, num_contexts: int, num_generations: int
     ):
@@ -1930,20 +1947,15 @@ class MLA(nn.Module):
         # `mlaKvNormRopeQuantGenerationKernel` -- so skip both the standalone RMSNorm
         # launch and the concat that would only re-materialize its output, and hand
         # the kernels the RAW latent.
-        # The two fusions are coupled: the fused KV kernels leave the RAW latent for
-        # `applyMLARopeAndAssignQKVKernel*` to see, and those kernels' Q region would
-        # read it un-normalized. That is only safe because the fused Q path takes the
-        # Q side over entirely, so require both or neither. Resolved here, ahead of
-        # `_q_branch`, because the KV decision is made before the Q branch runs.
+        # Resolved here, ahead of `_q_branch`, because the KV decision is made before
+        # the Q branch runs.
         self._fused_q_rope_cos_sin, self._fused_q_rope_specs_cached = self._fused_q_rope_specs(
             attn_metadata, num_contexts, num_generations
         )
-        self._fused_kv_norm_active = (
-            self._is_fused_kv_norm_enabled(num_generations=num_generations)
-            and self._is_fused_q_fp8_quant_enabled(
-                num_generations=num_generations, num_contexts=num_contexts
-            )
-            and bool(self._fused_q_rope_specs_cached)
+        self._fused_kv_norm_active = self._is_fused_prologue_active(
+            num_contexts=num_contexts,
+            num_generations=num_generations,
+            rope_specs=self._fused_q_rope_specs_cached,
         )
         self._fused_kv_norm_hoisted = False
 
