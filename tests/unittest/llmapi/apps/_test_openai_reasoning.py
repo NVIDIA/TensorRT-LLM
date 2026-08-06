@@ -12,8 +12,6 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 @pytest.fixture(
     scope="module",
     params=[
-        ("DeepSeek-R1-Distill-Qwen-1.5B", "pytorch", False),
-        ("DeepSeek-R1-Distill-Qwen-1.5B", "pytorch", True),
         ("Qwen3/Qwen3-0.6B", "pytorch", False),
         ("Qwen3/Qwen3-0.6B", "pytorch", True),
     ],

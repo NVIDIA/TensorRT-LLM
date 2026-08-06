@@ -26,8 +26,6 @@ MODEL_PATH_DICT = {
     "llama_v4_scout_17b_16e_instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
     "llama_v4_scout_17b_16e_instruct_fp8": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
     "llama_v4_scout_17b_16e_instruct_fp4": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
-    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
-    "deepseek_r1_distill_llama_70b": "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
