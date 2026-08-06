@@ -637,6 +637,23 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.put(request)
         self._wait_profile_ack(kind, timeout)
 
+    def _submit_profile_control(self, kind: str, request,
+                                timeout: float) -> None:
+        """Dispatch a profile-control request onto the owning thread.
+
+        ``shutdown()`` drains and clears ``_profile_control_executor``, so a
+        request arriving during or after teardown would otherwise fail with
+        ``AttributeError`` on ``None``. Raise ``RuntimeError`` instead — the
+        HTTP handlers already map it to a controlled response.
+        """
+        executor = self._profile_control_executor
+        if executor is None:
+            raise RuntimeError(
+                f"{kind}_profile: the executor proxy is shutting down or "
+                "already shut down; profile control is unavailable.")
+        executor.submit(self._profile_control_call, kind, request,
+                        timeout).result()
+
     def start_profile(self,
                       output_dir=None,
                       num_steps=None,
@@ -661,10 +678,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                                       num_steps=num_steps,
                                       start_step=start_step,
                                       activities=activities)
-        future = self._profile_control_executor.submit(
-            self._profile_control_call, "start", request,
-            self._START_PROFILE_ACK_TIMEOUT_S)
-        future.result()
+        self._submit_profile_control("start", request,
+                                     self._START_PROFILE_ACK_TIMEOUT_S)
 
     def stop_profile(self) -> None:
         """Forward runtime profiling stop to the IPC worker process.
@@ -679,10 +694,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         onto ``_profile_control_executor`` so the calling thread never
         touches the ZMQ sockets.
         """
-        future = self._profile_control_executor.submit(
-            self._profile_control_call, "stop", StopProfileRequest(),
-            self._STOP_PROFILE_ACK_TIMEOUT_S)
-        future.result()
+        self._submit_profile_control("stop", StopProfileRequest(),
+                                     self._STOP_PROFILE_ACK_TIMEOUT_S)
 
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should

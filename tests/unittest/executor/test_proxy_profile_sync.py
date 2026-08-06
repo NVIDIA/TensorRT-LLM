@@ -179,6 +179,29 @@ def test_start_profile_propagates_worker_rejection_as_runtime_error():
         proxy.start_profile()
 
 
+@pytest.mark.parametrize("kind", ["start", "stop"])
+def test_profile_control_after_shutdown_raises_runtime_error(kind):
+    """Profile control after shutdown fails cleanly, not with AttributeError.
+
+    ``shutdown()`` drains ``_profile_control_executor`` and sets it to
+    ``None``. A ``/start_profile`` or ``/stop_profile`` racing teardown
+    would then hit ``None.submit(...)``. ``OpenAIServer`` only catches
+    ``RuntimeError``/``OSError``/``ValueError``/``TimeoutError``, so an
+    ``AttributeError`` escapes to FastAPI instead of producing a
+    controlled response.
+    """
+    proxy = _bare_proxy()
+    proxy._profile_control_executor.shutdown(wait=True)
+    proxy._profile_control_executor = None
+
+    with pytest.raises(RuntimeError, match=f"{kind}_profile"):
+        getattr(proxy, f"{kind}_profile")()
+
+    # The ZMQ queues must not be touched once the owning thread is gone.
+    proxy.request_queue.put.assert_not_called()
+    proxy.profile_ack_queue.get.assert_not_called()
+
+
 def test_stop_profile_timeout_warns_does_not_hang():
     """Timeout produces a warning rather than wedging the event loop.
 
