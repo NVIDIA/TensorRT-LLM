@@ -41,11 +41,11 @@ from pathlib import Path
 from mpi4py import MPI
 
 workspace_lock = None
+rank = "unknown"
 if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
-    workspace_root = Path(sys.argv[1]).expanduser()
-
-    rank = MPI.COMM_WORLD.Get_rank()
     try:
+        workspace_root = Path(sys.argv[1]).expanduser()
+        rank = MPI.COMM_WORLD.Get_rank()
         slot = rank
         slot_stride = MPI.COMM_WORLD.Get_size()
         # Reuse the rank's cache when possible. Concurrent pools with the same
@@ -70,11 +70,14 @@ if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
             str(Path.home() / ".cache" / "flashinfer" / "cubins"),
         )
         os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
-    except OSError as error:
+    # This isolation is only a cache optimization. Any setup failure must fall
+    # back to FlashInfer's shared defaults rather than prevent the MPI worker
+    # from starting.
+    except Exception as error:  # noqa: BLE001
         if workspace_lock is not None:
             try:
                 workspace_lock.close()
-            except OSError as close_error:
+            except Exception as close_error:  # noqa: BLE001
                 print(
                     f"[trtllm] rank {rank} could not close a failed FlashInfer "
                     f"workspace lock ({close_error})",

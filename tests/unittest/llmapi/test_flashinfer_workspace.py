@@ -112,6 +112,24 @@ def test_worker_bootstrap_falls_back_when_isolation_fails(
     assert "falling back to FlashInfer's shared defaults" in capfd.readouterr().err
 
 
+def test_worker_bootstrap_falls_back_on_non_os_setup_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+
+    def raise_home_error(_path: Path) -> Path:
+        raise RuntimeError("home directory unavailable")
+
+    monkeypatch.setattr(Path, "expanduser", raise_home_error)
+    _run_worker_bootstrap(monkeypatch, tmp_path)
+
+    assert _FLASHINFER_WORKSPACE_ENV not in os.environ
+    error = capfd.readouterr().err
+    assert "rank unknown" in error
+    assert "home directory unavailable" in error
+    assert "falling back to FlashInfer's shared defaults" in error
+
+
 def test_worker_bootstrap_warns_when_unlock_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
