@@ -44,6 +44,7 @@ def _license_doc_to_agent_item(doc: dict) -> dict:
     artifact_type = "container" if is_container else "source"
     container = doc.get("s_release_image") or None if is_container else None
     license_ids = doc.get("s_license_ids", "")
+    ticket_url = doc.get("s_ticket_url", "")
     action_detail = f"license: {license_ids}" if license_ids and license_ids != "N/A" else None
     return {
         "dependency_name": pkg,
@@ -53,6 +54,7 @@ def _license_doc_to_agent_item(doc: dict) -> dict:
         "container": container,
         "license": license_ids if license_ids and license_ids != "N/A" else None,
         "action_detail": action_detail,
+        "ticket_url": ticket_url,
     }
 
 
