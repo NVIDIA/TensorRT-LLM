@@ -29,6 +29,15 @@ from tensorrt_llm._torch.disaggregation.native.bounce import config as bcfg
 # core (the BounceTransport contract + the TransferContext state machine) is PURE (no CUDA / NIXL
 # imports), so it is always importable on CPU.
 from tensorrt_llm._torch.disaggregation.native.bounce import core as bcore
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
+    KVCachePageTable,
+    LocalLayer,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
+)
 
 # transport/transfer pull CUDA-binding + torch deps at import; skip gracefully when those are
 # absent (CPU-only env). Catch only ImportError so a genuine bug in the module still fails CI
@@ -87,7 +96,7 @@ class TestSizing:
         # only 32 MiB free -> half/2 = 8 MiB < one chunk -> cannot fit.
         assert bcfg.fit_within_free(64 * _MIB, free_bytes=32 * _MIB, chunk_bytes=chunk) is None
 
-    def test_config_defaults(self):
+    def test_config_defaults(self) -> None:
         cfg = bcfg.Config()
         assert isinstance(cfg.sizing, bcfg.FixedSizing)
         assert cfg.chunk_mb == 32 and cfg.min_blocks == 96
@@ -106,17 +115,16 @@ class TestConfigFromSize:
         assert isinstance(cfg, bcfg.Config)
         assert cfg.sizing.capacity_mb == 2048
 
-    def test_min_blocks_defaults_and_overrides(self, monkeypatch):
+    def test_min_blocks_defaults_and_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
-        assert bcfg.config_from_size(2048).min_blocks == 96  # keeps the Config default
-        assert bcfg.config_from_size(2048, 1).min_blocks == 1  # explicit arg still overrides
+        assert bcfg.config_from_size(2048).min_blocks == 96
+        assert bcfg.config_from_size(2048, 1).min_blocks == 1
         assert bcfg.config_from_size(2048, 250).min_blocks == 250
-        # The gate is lowered for tests via the env override (no user-facing config field).
         monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "1")
-        assert bcfg.config_from_size(2048).min_blocks == 1  # env override
-        assert bcfg.config_from_size(2048, 250).min_blocks == 250  # explicit arg beats env
+        assert bcfg.config_from_size(2048).min_blocks == 1
+        assert bcfg.config_from_size(2048, 250).min_blocks == 250
 
-    def test_min_blocks_env_is_parsed_defensively(self, monkeypatch):
+    def test_min_blocks_env_is_parsed_defensively(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A bad value must not crash setup (falls back to the default); a non-positive value clamps to 1.
         for bad in ("", "auto", "1.5"):
             monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", bad)
@@ -256,22 +264,24 @@ class TestNoBounce:
 class _FakeAlloc:
     """Stand-in for SlotAllocator: hands out a fixed base, records reservations."""
 
-    def __init__(self, capacity_bytes, phys_chunk_size, name="kv_bounce"):
+    def __init__(self, capacity_bytes: int, phys_chunk_size: int, name: str = "kv_bounce") -> None:
         self._cap = capacity_bytes
         self.base = 0x100000
         self.next_id = 0
         self.released = []
         self.quarantined = []
+        self.reserved_sizes = []
 
     @property
     def capacity(self):
         return self._cap
 
-    def reserve(self, size, timeout=None):
+    def reserve(self, size: int, timeout: float | None = None) -> tuple[int, int] | None:
         if size > self._cap:
             return None
         sid = self.next_id
         self.next_id += 1
+        self.reserved_sizes.append(size)
         return sid, self.base
 
     def release(self, slot_id):
@@ -287,7 +297,12 @@ class _FakeAlloc:
         return []
 
 
-def _make_transport(monkeypatch, block_bytes_per_group, capacity=1 << 30, min_blocks=1):
+def _make_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    block_bytes_per_group: list[int],
+    capacity: int = 1 << 30,
+    min_blocks: int = 1,
+) -> "btr.VmmBounceTransport":
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
     monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
     monkeypatch.setattr(
@@ -317,6 +332,38 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
+    def test_reserve_includes_every_pool_in_layer_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        entries = np.array([(0, 0, 1)], dtype=BUFFER_ENTRY_DTYPE)
+        page_table = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[
+                AttentionLayerGroup(
+                    pool_group_idx=0,
+                    local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                    pool_views=[
+                        PoolView(pool_idx=0, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                    ],
+                )
+            ],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(base_address=0x200000, slot_bytes=100, num_slots=8),
+                        PhysicalPool(base_address=0x300000, slot_bytes=25, num_slots=8),
+                    ]
+                )
+            ],
+        )
+        block_bytes = btr.block_bytes_per_group(page_table)
+        assert block_bytes == [125]
+
+        transport = _make_transport(monkeypatch, block_bytes_per_group=block_bytes)
+        assert transport.reserve(_recv_req([4]), num_writers=1) is True
+        assert transport._recv_alloc.reserved_sizes == [500]
+
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200
@@ -355,7 +402,7 @@ class TestFanInReserve:
         req = _recv_req([1])  # total = 3, num_writers=1 -> no even-split requirement
         assert t.reserve(req, num_writers=1) is True
 
-    def test_reserve_too_small_falls_back(self, monkeypatch):
+    def test_reserve_too_small_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
         t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_blocks=96)
         assert t.reserve(_recv_req([4]), num_writers=1) is False  # 4 < 96 blocks
 

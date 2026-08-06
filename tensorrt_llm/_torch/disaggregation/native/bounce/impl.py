@@ -16,9 +16,11 @@
 the contract in core.py. Holds the buffers, the gather and scatter kernels, and the scatter worker,
 and runs the side effects that drive each region's state machine. Never imports transfer.py."""
 
+from __future__ import annotations
+
 import queue
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -29,6 +31,7 @@ except ImportError:
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
+    BaseTransferAgent,
     MemoryDescs,
     MemoryType,
     TransferOp,
@@ -37,9 +40,13 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
 from tensorrt_llm._utils import CUASSERT
 
 from .buffer import SlotAllocator
-from .config import SizingContext, fit_within_free
+from .config import Config, SizingContext, fit_within_free
 from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo
+    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -57,7 +64,12 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: List[int]
+        cls,
+        agent: BaseTransferAgent,
+        cfg: Config,
+        *,
+        device_id: int,
+        block_bytes_per_group: List[int],
     ) -> Optional["VmmBounceTransport"]:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
@@ -88,7 +100,7 @@ class VmmBounceTransport(BounceTransport):
 
     def __init__(
         self,
-        agent,
+        agent: BaseTransferAgent,
         *,
         device_id: int,
         capacity_bytes: int,
@@ -97,7 +109,7 @@ class VmmBounceTransport(BounceTransport):
         min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
         name: str = "kv_bounce",
-    ):
+    ) -> None:
         self._agent = agent
         self._device_id = device_id
         # The byte size of one cache block, listed for each attention layer group.
@@ -217,7 +229,11 @@ class VmmBounceTransport(BounceTransport):
         return False
 
     def reserve(
-        self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = _RESERVE_TIMEOUT_S
+        self,
+        recv_req: RecvReqInfo,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
@@ -525,9 +541,14 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def block_bytes_per_group(page_table) -> list:
-    """Byte size of one cache block for each leading attention layer group, stopping at the first
-    non-attention group."""
+def block_bytes_per_group(page_table: KVCachePageTable) -> list[int]:
+    """Transferred bytes in one cache block for each leading attention layer group.
+
+    A layer group may expose multiple physical pools, such as GLM-5.2's MLA KV
+    pool plus its masked indexer-K pool. The bounce reservation must cover all
+    advertised pools because the sender coalesces every matched pool into the
+    same write.
+    """
     from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
@@ -536,5 +557,10 @@ def block_bytes_per_group(page_table) -> list:
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if not isinstance(lg, AttentionLayerGroup):
             break
-        out.append(int(get_physical_pool(page_table, lg_idx, 0).slot_bytes))
+        out.append(
+            sum(
+                int(get_physical_pool(page_table, lg_idx, pool_view.pool_idx).slot_bytes)
+                for pool_view in lg.pool_views
+            )
+        )
     return out
