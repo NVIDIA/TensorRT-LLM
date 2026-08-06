@@ -414,6 +414,36 @@ def test_fused_forward_without_weights_raises():
 
 
 # ---------------------------------------------------------------------------
+# Latent-tail weight-read selection (CPU-only).
+# ---------------------------------------------------------------------------
+
+
+def test_fp8_conversion_can_preserve_routed_up(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _convert_moe_mlps_to_fp8_weight_read,
+        _Fp8BlockScaleWeightReadLinear,
+    )
+
+    moe = SimpleNamespace(
+        shared_experts=None,
+        routed_expert_down_proj=torch.nn.Linear(8, 4, bias=False),
+        routed_expert_up_proj=torch.nn.Linear(4, 8, bias=False),
+    )
+    model = SimpleNamespace(layers=[SimpleNamespace(block_sparse_moe=moe)])
+    monkeypatch.setattr(
+        _Fp8BlockScaleWeightReadLinear,
+        "from_linear",
+        classmethod(lambda cls, linear: torch.nn.Identity()),
+    )
+
+    count = _convert_moe_mlps_to_fp8_weight_read(model, include_routed_up=False)
+
+    assert count == 1
+    assert isinstance(moe.routed_expert_down_proj, torch.nn.Identity)
+    assert isinstance(moe.routed_expert_up_proj, torch.nn.Linear)
+
+
+# ---------------------------------------------------------------------------
 # Routed MoE TP/EP split selection (CPU-only).
 # ---------------------------------------------------------------------------
 
@@ -496,14 +526,16 @@ def _make_packed_expert_bank(num_experts, intermediate, hidden, seed=101):
 
     bank = []
     for _ in range(num_experts):
-        bank.append({
-            "w1": nibbles(intermediate, hidden // 2),
-            "w1_sf": scales(intermediate, hidden // 32),
-            "w3": nibbles(intermediate, hidden // 2),
-            "w3_sf": scales(intermediate, hidden // 32),
-            "w2": nibbles(hidden, intermediate // 2),
-            "w2_sf": scales(hidden, intermediate // 32),
-        })
+        bank.append(
+            {
+                "w1": nibbles(intermediate, hidden // 2),
+                "w1_sf": scales(intermediate, hidden // 32),
+                "w3": nibbles(intermediate, hidden // 2),
+                "w3_sf": scales(intermediate, hidden // 32),
+                "w2": nibbles(hidden, intermediate // 2),
+                "w2_sf": scales(hidden, intermediate // 32),
+            }
+        )
     return bank
 
 
@@ -521,12 +553,11 @@ def _make_test_gate(num_experts=_TP_EXPERTS, seed=71):
     gate = KimiK3MoEGate(cfg)
     gen = torch.Generator().manual_seed(seed)
     with torch.no_grad():
-        gate.weight.copy_(
-            torch.randn(gate.weight.shape, generator=gen,
-                        dtype=torch.float32) * 0.05)
+        gate.weight.copy_(torch.randn(gate.weight.shape, generator=gen, dtype=torch.float32) * 0.05)
         gate.e_score_correction_bias.copy_(
-            torch.randn(gate.e_score_correction_bias.shape, generator=gen,
-                        dtype=torch.float32) * 0.1)
+            torch.randn(gate.e_score_correction_bias.shape, generator=gen, dtype=torch.float32)
+            * 0.1
+        )
     return gate.cuda()
 
 
@@ -626,23 +657,24 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
         rows = slice(tp_rank * ipp, (tp_rank + 1) * ipp)
         cols_packed = slice(tp_rank * (ipp // 2), (tp_rank + 1) * (ipp // 2))
         cols_sf = slice(tp_rank * (ipp // 32), (tp_rank + 1) * (ipp // 32))
-        manual_bank = [{
-            "w1": e["w1"][rows].contiguous(),
-            "w1_sf": e["w1_sf"][rows].contiguous(),
-            "w3": e["w3"][rows].contiguous(),
-            "w3_sf": e["w3_sf"][rows].contiguous(),
-            "w2": e["w2"][:, cols_packed].contiguous(),
-            "w2_sf": e["w2_sf"][:, cols_sf].contiguous(),
-        } for e in bank]
+        manual_bank = [
+            {
+                "w1": e["w1"][rows].contiguous(),
+                "w1_sf": e["w1_sf"][rows].contiguous(),
+                "w3": e["w3"][rows].contiguous(),
+                "w3_sf": e["w3_sf"][rows].contiguous(),
+                "w2": e["w2"][:, cols_packed].contiguous(),
+                "w2_sf": e["w2_sf"][:, cols_sf].contiguous(),
+            }
+            for e in bank
+        ]
         via_manual = _make_routed_moe(ipp, gate, num_experts=num_experts)
         _load_bank(via_manual, manual_bank)
 
-        for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale",
-                     "w2_weight_scale"):
+        for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale", "w2_weight_scale"):
             a = getattr(via_shard.backend, name).data
             b = getattr(via_manual.backend, name).data
-            assert torch.equal(a, b), (
-                f"{name} mismatch for tp_size={tp_size} tp_rank={tp_rank}")
+            assert torch.equal(a, b), f"{name} mismatch for tp_size={tp_size} tp_rank={tp_rank}"
 
 
 @situ_supported
@@ -663,14 +695,12 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
     _load_bank(whole, bank)
 
     torch.manual_seed(3)
-    x = torch.randn(
-        num_tokens, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+    x = torch.randn(num_tokens, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
     router_logits = gate.compute_logits(x)
 
     out_whole = whole.forward(x, router_logits, all_rank_num_tokens=None)
 
-    partial_sum = torch.zeros(num_tokens, _TP_HIDDEN, dtype=torch.float32,
-                              device="cuda")
+    partial_sum = torch.zeros(num_tokens, _TP_HIDDEN, dtype=torch.float32, device="cuda")
     for tp_rank in range(tp_size):
         shard = _make_routed_moe(ipp, gate)
         _load_bank(shard, bank, tp_size=tp_size, tp_rank=tp_rank)
@@ -679,5 +709,4 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
         del shard
         torch.cuda.empty_cache()
 
-    check_accuracy(partial_sum.to(torch.bfloat16), out_whole,
-                   atol=0.08, rtol=0.08, percent=0.98)
+    check_accuracy(partial_sum.to(torch.bfloat16), out_whole, atol=0.08, rtol=0.08, percent=0.98)

@@ -138,6 +138,11 @@ def _read_fused_finalize_ar_rms_max_tokens() -> int:
 
 _K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS = _read_fused_finalize_ar_rms_max_tokens()
 
+# Experimental decode-only fusion of the latent up projection with the shared
+# expert add. This keeps the up-projection weight in BF16 instead of applying
+# the default FP8 weight-read conversion, so it is opt-in pending B200 data.
+_K3_FUSED_LATENT_UP_ADD = os.environ.get("TLLM_K3_ENABLE_FUSED_LATENT_UP_ADD", "0") == "1"
+
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
@@ -443,7 +448,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
 
 
 def _convert_moe_mlps_to_fp8_weight_read(
-    model: nn.Module, include_fused_gate_up: bool = True
+    model: nn.Module,
+    include_fused_gate_up: bool = True,
+    include_routed_up: bool = True,
 ) -> int:
     """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
 
@@ -487,8 +494,9 @@ def _convert_moe_mlps_to_fp8_weight_read(
             )
             for attr in shared_attrs:
                 _swap(shared, attr)
-        for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
-            _swap(moe, attr)
+        _swap(moe, "routed_expert_down_proj")
+        if include_routed_up:
+            _swap(moe, "routed_expert_up_proj")
 
     # Return the freed BF16 blocks to the driver so the raw (non-caching-
     # allocator) allocations made during executor creation succeed on the
@@ -923,6 +931,13 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
+        fuse_up_add = (
+            _K3_FUSED_LATENT_UP_ADD
+            and not _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
+            and isinstance(self.routed_expert_up_proj, nn.Linear)
+            and hidden_states.dim() == 2
+            and 1 <= hidden_states.shape[0] <= 16
+        )
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -988,6 +1003,8 @@ class KimiK3MoERuntime(nn.Module):
                 if self.routed_experts.comm is None and moe_all_reduce is not None:
                     y = moe_all_reduce(y)
                 y = self.routed_expert_norm(y)
+            if fuse_up_add:
+                return y
             if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(
                 self.routed_expert_up_proj, nn.Linear
             ):
@@ -1011,6 +1028,16 @@ class KimiK3MoERuntime(nn.Module):
             self.aux_stream,
             disable_on_compile=True,
         )
+        if fuse_up_add:
+            # This starts after the MoE backend has returned its combined
+            # latent output. MegaMoE owns/finalizes combine internally, so
+            # neither MegaMoE combine nor RMSNorm is fused here; only the BF16
+            # 3584->7168 up projection and shared-expert add are fused.
+            return torch.ops.trtllm.dsv3_fused_a_gemm_add_op(
+                routed_out,
+                self.routed_expert_up_proj.weight.t(),
+                shared_out.contiguous(),
+            )
         return routed_out + shared_out
 
 
@@ -2712,6 +2739,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV, gate_up_default
                 )
                 != "0",
+                include_routed_up=not _K3_FUSED_LATENT_UP_ADD,
             )
             logger.info(
                 f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "

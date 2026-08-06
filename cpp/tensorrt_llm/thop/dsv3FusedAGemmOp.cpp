@@ -35,22 +35,25 @@ namespace
 // Supported (hd_in, hd_out) shapes must have explicit invokeFusedAGemm instantiations
 // in dsv3FusedAGemm.cu.
 template <int kHdIn, int kHdOut>
-void runFusedAGemm(th::Tensor& out, th::Tensor const& mat_a, th::Tensor const& mat_b, int num_tokens)
+void runFusedAGemm(
+    th::Tensor& out, th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const* residual, int num_tokens)
 {
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
+    auto const* residual_ptr
+        = residual == nullptr ? nullptr : reinterpret_cast<__nv_bfloat16 const*>(residual->data_ptr());
     if (num_tokens <= 8)
     {
         tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
             reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), residual_ptr, num_tokens, stream);
     }
     else
     {
         tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16>(
             reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), residual_ptr, num_tokens, stream);
     }
 }
 
@@ -100,15 +103,15 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
 
     if (dtype_ok && hd_in == 7168 && hd_out == 2112) // DeepSeek-V3 fused q_a/kv_a proj
     {
-        runFusedAGemm<7168, 2112>(out, mat_a, mat_b, num_tokens);
+        runFusedAGemm<7168, 2112>(out, mat_a, mat_b, nullptr, num_tokens);
     }
     else if (dtype_ok && hd_in == 7168 && hd_out == 3584) // Kimi K3 latent MoE down proj
     {
-        runFusedAGemm<7168, 3584>(out, mat_a, mat_b, num_tokens);
+        runFusedAGemm<7168, 3584>(out, mat_a, mat_b, nullptr, num_tokens);
     }
     else if (dtype_ok && hd_in == 3584 && hd_out == 7168) // Kimi K3 latent MoE up proj
     {
-        runFusedAGemm<3584, 7168>(out, mat_a, mat_b, num_tokens);
+        runFusedAGemm<3584, 7168>(out, mat_a, mat_b, nullptr, num_tokens);
     }
     else // fallback to cublas, can be slow
     {
@@ -148,6 +151,46 @@ std::tuple<th::Tensor, th::Tensor> dsv3_fused_a_gemm_mxfp8_op(th::Tensor const& 
     return {out, out_sf};
 }
 
+th::Tensor dsv3_fused_a_gemm_add_op(th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const& residual)
+{
+    TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && residual.dim() == 2, "inputs must be rank-2 tensors");
+    TORCH_CHECK(mat_a.is_cuda() && mat_b.is_cuda() && residual.is_cuda(), "inputs must be CUDA tensors");
+    TORCH_CHECK(mat_a.get_device() == mat_b.get_device() && mat_a.get_device() == residual.get_device(),
+        "inputs must be on the same CUDA device");
+    TORCH_CHECK(mat_a.scalar_type() == torch::kBFloat16 && mat_b.scalar_type() == torch::kBFloat16
+            && residual.scalar_type() == torch::kBFloat16,
+        "dsv3_fused_a_gemm_add_op requires BF16 inputs");
+    TORCH_CHECK(
+        mat_a.strides()[0] == mat_a.sizes()[1] && mat_a.strides()[1] == 1, "mat_a must be contiguous row-major");
+    TORCH_CHECK(
+        mat_b.strides()[0] == 1 && mat_b.strides()[1] == mat_b.sizes()[0], "mat_b must be contiguous column-major");
+    TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+
+    int const num_tokens = mat_a.sizes()[0];
+    int const hd_in = mat_a.sizes()[1];
+    TORCH_CHECK(mat_b.sizes()[0] == hd_in, "mat_a and mat_b reduction dimensions must match");
+    int const hd_out = mat_b.sizes()[1];
+    std::vector<int64_t> output_size = {num_tokens, hd_out};
+    TORCH_CHECK(residual.sizes() == output_size, "residual shape must match GEMM output");
+
+    th::Tensor out = th::empty(output_size, mat_a.options());
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    bool const fused_layout_ok = reinterpret_cast<uintptr_t>(mat_a.const_data_ptr()) % sizeof(float4) == 0
+        && reinterpret_cast<uintptr_t>(mat_b.const_data_ptr()) % sizeof(float4) == 0;
+    bool const use_fused_kernel
+        = num_tokens >= 1 && num_tokens <= 16 && hd_in == 3584 && hd_out == 7168 && sm >= 90 && fused_layout_ok;
+    if (use_fused_kernel)
+    {
+        runFusedAGemm<3584, 7168>(out, mat_a, mat_b, &residual, num_tokens);
+    }
+    else
+    {
+        cublas_mm_out(mat_a, mat_b, std::nullopt, out);
+        out.add_(residual);
+    }
+    return out;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -156,10 +199,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("dsv3_fused_a_gemm_op(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
     m.def("dsv3_fused_a_gemm_mxfp8_op(Tensor mat_a, Tensor mat_b) -> (Tensor out, Tensor out_sf)");
+    m.def("dsv3_fused_a_gemm_add_op(Tensor mat_a, Tensor mat_b, Tensor residual) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("dsv3_fused_a_gemm_op", &tensorrt_llm::torch_ext::dsv3_fused_a_gemm_op);
     m.impl("dsv3_fused_a_gemm_mxfp8_op", &tensorrt_llm::torch_ext::dsv3_fused_a_gemm_mxfp8_op);
+    m.impl("dsv3_fused_a_gemm_add_op", &tensorrt_llm::torch_ext::dsv3_fused_a_gemm_add_op);
 }

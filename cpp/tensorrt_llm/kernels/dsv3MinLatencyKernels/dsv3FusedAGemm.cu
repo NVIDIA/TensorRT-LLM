@@ -368,10 +368,12 @@ struct MmaComputer
     static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
 
     __device__ MmaComputer(bf16_t* gmem_c_local_, uint8_t* gmem_c_mxfp8_local_, uint8_t* gmem_c_sf_local_,
-        bf16_t* smem_a_, bf16_t* smem_b_, uint64_t* smem_barrier_, int warp_idx_, int gemm_n_)
+        bf16_t const* gmem_residual_local_, bf16_t* smem_a_, bf16_t* smem_b_, uint64_t* smem_barrier_, int warp_idx_,
+        int gemm_n_)
         : gmem_c(gmem_c_local_)
         , gmem_c_mxfp8(gmem_c_mxfp8_local_)
         , gmem_c_sf(gmem_c_sf_local_)
+        , gmem_residual(gmem_residual_local_)
         , smem_a(smem_a_)
         , smem_b(smem_b_)
         , smem_barrier(smem_barrier_)
@@ -586,7 +588,14 @@ public:
                     }
                     else
                     {
-                        gmem_c[n_idx * gemm_m + m_idx] = acc_final[reg_idx];
+                        int const output_idx = n_idx * gemm_m + m_idx;
+                        bf16_t output = __float2bfloat16_rn(acc_final[reg_idx]);
+                        if (gmem_residual != nullptr)
+                        {
+                            output = __float2bfloat16_rn(
+                                __bfloat162float(output) + __bfloat162float(gmem_residual[output_idx]));
+                        }
+                        gmem_c[output_idx] = output;
                     }
                 }
             }
@@ -597,6 +606,7 @@ public:
     bf16_t* gmem_c;
     uint8_t* gmem_c_mxfp8;
     uint8_t* gmem_c_sf;
+    bf16_t const* gmem_residual;
     bf16_t* smem_a;
     bf16_t* smem_b;
     uint64_t* smem_barrier;
@@ -618,8 +628,8 @@ public:
 // AB swapped, kernel is k-major, k-major, m-major
 template <bool kQuantizeMxFp8, int batch_size, int gemm_m, int gemm_k, int tile_m, int tile_n, int tile_k,
     int stage_cnt>
-__global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
-    bf16_t* output, uint8_t* output_mxfp8, uint8_t* output_sf, bf16_t const* mat_a, bf16_t const* mat_b, int gemm_n)
+__global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(bf16_t* output, uint8_t* output_mxfp8, uint8_t* output_sf,
+    bf16_t const* mat_a, bf16_t const* mat_b, bf16_t const* residual, int gemm_n)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     constexpr int load_thread_cnt = 128;
@@ -652,6 +662,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     bf16_t* gmem_c_local = output == nullptr ? nullptr : output + cta_n_idx * gemm_m + cta_m_idx;
     uint8_t* gmem_c_mxfp8_local = output_mxfp8 == nullptr ? nullptr : output_mxfp8 + cta_n_idx * gemm_m + cta_m_idx;
     uint8_t* gmem_c_sf_local = output_sf == nullptr ? nullptr : output_sf + cta_n_idx * (gemm_m / 32) + cta_m_idx / 32;
+    bf16_t const* gmem_residual_local = residual == nullptr ? nullptr : residual + cta_n_idx * gemm_m + cta_m_idx;
 
     int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 
@@ -681,8 +692,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     }
     else
     {
-        MmaComputer<kQuantizeMxFp8, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt> mma_computer(
-            gmem_c_local, gmem_c_mxfp8_local, gmem_c_sf_local, smem_a, smem_b, smem_barrier, warp_idx, gemm_n);
+        MmaComputer<kQuantizeMxFp8, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt> mma_computer(gmem_c_local,
+            gmem_c_mxfp8_local, gmem_c_sf_local, gmem_residual_local, smem_a, smem_b, smem_barrier, warp_idx, gemm_n);
         mma_computer.prepare();
         mma_computer.issue_mainloop();
         mma_computer.epi();
@@ -691,7 +702,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 }
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
-void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream)
+void invokeFusedAGemm(
+    T* output, T const* mat_a, T const* mat_b, T const* residual, int num_tokens, cudaStream_t const stream)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     if (sm < 90)
@@ -736,7 +748,7 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
     }
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,
         fused_a_gemm_kernel<false, batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>, output,
-        static_cast<uint8_t*>(nullptr), static_cast<uint8_t*>(nullptr), mat_a, mat_b, gemm_n));
+        static_cast<uint8_t*>(nullptr), static_cast<uint8_t*>(nullptr), mat_a, mat_b, residual, gemm_n));
 }
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
@@ -786,21 +798,21 @@ void invokeFusedAGemmMxFp8(
     }
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,
         fused_a_gemm_kernel<true, batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>,
-        static_cast<bf16_t*>(nullptr), output, output_sf, mat_a, mat_b, gemm_n));
+        static_cast<bf16_t*>(nullptr), output, output_sf, mat_a, mat_b, static_cast<bf16_t const*>(nullptr), gemm_n));
 }
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
-    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
-    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 // Kimi K3 latent MoE projections (hidden 7168 <-> MoE latent 3584).
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 3584, 8>(
-    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 3584, 16>(
-    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 template void invokeFusedAGemmMxFp8<__nv_bfloat16, 7168, 3584, 8>(
     uint8_t*, uint8_t*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
@@ -809,10 +821,10 @@ template void invokeFusedAGemmMxFp8<__nv_bfloat16, 7168, 3584, 16>(
     uint8_t*, uint8_t*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 template void invokeFusedAGemm<__nv_bfloat16, 3584, 7168, 8>(
-    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
 template void invokeFusedAGemm<__nv_bfloat16, 3584, 7168, 16>(
-    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 } // namespace kernels::dsv3MinLatencyKernels
 
 TRTLLM_NAMESPACE_END

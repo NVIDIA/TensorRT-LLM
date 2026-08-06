@@ -109,3 +109,22 @@ def test_fused_a_gemm_mxfp8_rejects_misaligned_storage(operand):
 
     with pytest.raises(RuntimeError, match=message):
         torch.ops.trtllm.dsv3_fused_a_gemm_mxfp8_op(input, weight.t())
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 9, 16])
+def test_fused_a_gemm_add_run(num_tokens):
+    torch.manual_seed(31)
+    torch.cuda.manual_seed(31)
+
+    device = torch.device("cuda")
+    input = torch.randn(num_tokens, 3584, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(7168, 3584, dtype=torch.bfloat16, device=device)
+    residual = torch.randn(num_tokens,
+                           7168,
+                           dtype=torch.bfloat16,
+                           device=device)
+
+    output = torch.ops.trtllm.dsv3_fused_a_gemm_add_op(input, weight.t(),
+                                                       residual)
+    output_ref = torch.matmul(input, weight.t()) + residual
+    assert torch.allclose(output, output_ref, rtol=0.1, atol=0.1)

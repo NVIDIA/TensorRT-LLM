@@ -240,6 +240,12 @@ def _register_fake():
         scale = mat_a.new_empty((shape[0], shape[-1] // 32), dtype=torch.uint8)
         return output, scale
 
+    @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_add_op")
+    def _(mat_a, mat_b, residual):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        return mat_a.new_empty(shape)
+
     @torch.library.register_fake("trtllm::fp4_gemm")
     def _(
         mat1: torch.Tensor,
