@@ -6088,7 +6088,15 @@ class PyExecutor:
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
-        """Update beam sampler state with context-side first-token data."""
+        """Update beam sampler state with context-side first-token data.
+
+        NB: currently unreachable past the beam_width <= 1 guard. Admission
+        rejects beam search under disaggregated serving (see
+        _validate_request), because the finished-candidate pool the context
+        server builds is not part of the handoff. Kept rather than deleted:
+        this is the seeding half of that handoff and becomes live again once
+        the pool is transferred; TRTLLM-14792.
+        """
         if beam_width <= 1:
             return True
 

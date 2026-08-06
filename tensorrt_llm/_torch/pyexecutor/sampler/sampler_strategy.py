@@ -1014,8 +1014,8 @@ class _StrategyImpls:
 
         ``sample`` applies the shared temperature preprocessing and delegates to
         the ``_select_and_update`` hook, implemented per stopping mode by
-        ``RegularBeamSearchStep`` (early_stopping == TRUE) and
-        ``CBABeamSearchStep`` (FALSE / NEVER). With-probs is a constructor flag
+        ``CBABeamSearchStep``, which every stopping mode uses -- the mode only
+        selects the done verdict computed inside it. With-probs is a constructor flag
         (``computes_probs``), not a subclass.
         """
 
@@ -1141,27 +1141,13 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             """Mode-specific candidate selection and state update."""
 
-    class RegularBeamSearchStep(BeamSearchStep):
-        """early_stopping == TRUE: the regular beam-search step."""
-
-        @override
-        def _select_and_update(
-            self, logits: torch.Tensor, group_metadata: BeamSearchMetadata
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            return beam_search_sampling_batch(
-                logits,
-                beam_width_in=self._beam_width_in,
-                beam_width_out=self._beam_width_out,
-                row_stride=self._row_stride,
-                beam_search_args=group_metadata,
-                temperature=None,
-                length_penalty=self._length_penalty,
-                diversity_rate=self._diversity_rate,
-                return_probs=self.computes_probs(),
-            )
-
     class CBABeamSearchStep(BeamSearchStep):
-        """early_stopping in {FALSE, NEVER}: the candidate-beams-array step."""
+        """The candidate-beams-array step, used by every early_stopping mode.
+
+        The mode only selects the done verdict computed inside the op: TRUE
+        stops as soon as the pool is full, FALSE and NEVER additionally weigh
+        what is still attainable.
+        """
 
         def __init__(
             self,
