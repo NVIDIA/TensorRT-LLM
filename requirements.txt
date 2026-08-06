@@ -21,10 +21,10 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.12.0a0.
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-06.html#rel-26-06 uses 2.13.0a0.
 torch>=2.11.0,<=2.13.0a0
 torchvision
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.30.4
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-06.html#rel-26-06 uses 2.30.4
 # torch 2.11.0+cu130 depends on nvidia-nccl-cu13==2.28.9
 nvidia-nccl-cu13>=2.28.9,<=2.30.4
 # NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
@@ -74,7 +74,7 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl[cu13]==4.5.0; python_version >= "3.10"
+nvidia-cutlass-dsl[cu13]==4.7.0; python_version >= "3.10"
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
 quack-kernels>=0.2.10; python_version >= "3.10" # required for MinimaxM3 MSA
 jinja2 # required for MinimaxM3 MSA
@@ -82,7 +82,8 @@ plotly
 numexpr
 partial_json_parser
 mcp<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
-apache-tvm-ffi==0.1.6 # used for reduce nvidia-cutlass-dsl host overhead
+# Minimum version whose make_kwargs_wrapper supports map_dataclass_to_tuple; required by CUTLASS DSL 4.7.
+apache-tvm-ffi==0.1.10
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
 flash-attn-4==4.0.0b11
 mistral-common>=1.10.0
@@ -90,7 +91,7 @@ torchao>=0.14.1,<0.16.0
 cuda-core
 llist
 cuda-tile>=1.0.1
-nvidia-cuda-tileiras>=13.1,<13.2
+nvidia-cuda-tileiras>=13.3,<13.4
 etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2

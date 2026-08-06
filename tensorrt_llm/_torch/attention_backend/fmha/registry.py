@@ -20,6 +20,7 @@ from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
+from .prims_ts import PrimsTSFmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
@@ -27,15 +28,15 @@ FmhaCls: TypeAlias = type[Fmha]
 def init_fmha_libs() -> dict[str, "FmhaCls"]:
     """Build the ordered FMHA library registry.
 
-    Backend classes are imported inside this factory rather than at module
-    scope, so backends can import trtllm attention classes at module scope
-    without an import cycle.
+    MSA is imported inside this factory because it imports TRT-LLM attention
+    classes at module scope and would otherwise create an import cycle.
     """
     from .msa_sparse_gqa import MsaSparseGqaFmha
 
     return {
-        "cute_dsl_mla": CuteDslMlaFmha,
         "msa_sparse_gqa": MsaSparseGqaFmha,
+        "prims_ts": PrimsTSFmha,
+        "cute_dsl_mla": CuteDslMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }

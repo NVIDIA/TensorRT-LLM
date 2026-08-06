@@ -261,7 +261,7 @@ sub_packed_f32x2 = partial(
     cute.arch.calc_packed_f32x2_op,
     src_c=None,
     calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
+    rnd=nvvm.FPRoundingMode.RN,
 )
 
 
@@ -330,7 +330,7 @@ def exp2_emulation_2(
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.FPRoundingMode.RM
     )
     xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
     xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)

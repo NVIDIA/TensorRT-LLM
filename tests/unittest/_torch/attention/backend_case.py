@@ -817,7 +817,13 @@ def _expected_new_k_for_cache(case: BackendCase, inputs, new_k: torch.Tensor, *,
 
 
 def _capture_replay(
-    AttentionCls, case, mgr, make_metadata, static_inputs, forward_fn
+    AttentionCls,
+    case,
+    mgr,
+    make_metadata,
+    static_inputs,
+    forward_fn,
+    before_replay=None,
 ) -> torch.Tensor:
     """Capture a gen-phase graph once and replay it with the case's inputs.
 
@@ -852,6 +858,8 @@ def _capture_replay(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_out = _fwd()
+    if before_replay is not None:
+        before_replay(cg_md, bufs)
     graph.replay()
     torch.cuda.synchronize()
     return graph_out[: case.nnz_q].contiguous().clone()
@@ -866,6 +874,7 @@ def run_backend(
     fuse_rope: bool = False,
     cuda_graph: bool = False,
     kv_layout: str = "NHD",
+    before_cuda_graph_replay=None,
 ) -> torch.Tensor:
     """Run one backend on ``case`` and return ``[nnz_q, num_heads*head_dim]``.
 
@@ -991,6 +1000,7 @@ def run_backend(
                     create_metadata,
                     static,
                     _cg_fwd,
+                    before_replay=before_cuda_graph_replay,
                 )
                 if expected_cache_tokens is not None:
                     _assert_cache_contains_new_tokens(

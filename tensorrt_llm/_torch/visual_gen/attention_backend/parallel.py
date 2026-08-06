@@ -32,10 +32,12 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
 from ...attention_backend.interface import PredefinedAttentionMask
+from .flash_attn4 import _install_cutlass_dsl_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_combine_import_error = None
 try:
+    _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
 except (ImportError, OSError) as e:
     _flash_attn_combine = None

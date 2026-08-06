@@ -76,6 +76,31 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+def _count_prims_ts_phase_calls(mocker):
+    """Count PrimTS phase launches while keeping the real kernels installed."""
+    from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
+
+    calls = {
+        "context": 0,
+        "generation": 0,
+        "mla_generation": 0,
+    }
+
+    def patch_method(method_name, counter_name):
+        original = getattr(PrimsTSFmha, method_name)
+
+        def counted(self, params):
+            calls[counter_name] += 1
+            return original(self, params)
+
+        mocker.patch.object(PrimsTSFmha, method_name, counted)
+
+    patch_method("run_context", "context")
+    patch_method("run_generation", "generation")
+    patch_method("run_mla_generation", "mla_generation")
+    return calls
+
+
 def _get_default_torch_compile_config(torch_compile):
     return TorchCompileConfig(enable_fullgraph=True,
                               enable_piecewise_cuda_graph=True,
@@ -1580,6 +1605,38 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_prims_ts_bfloat16(self, mocker):
+        if not is_sm_100f(get_sm_version()):
+            pytest.skip("PrimTS requires SM100 or SM103")
+
+        calls = _count_prims_ts_phase_calls(mocker)
+        env = {
+            "TLLM_FMHA_LIBS": "prims_ts,fallback",
+            "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
+        }
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            tokens_per_block=32,
+            use_kv_cache_manager_v2=False,
+        )
+        with mock.patch.dict(os.environ, env):
+            with LLM(self.MODEL_PATH,
+                     attn_backend="TRTLLM",
+                     kv_cache_config=kv_cache_config,
+                     disable_overlap_scheduler=True,
+                     enable_chunked_prefill=False,
+                     enable_attention_dp=False,
+                     cuda_graph_config=None,
+                     speculative_config=None,
+                     max_batch_size=1350) as llm:
+                calls.update({name: 0 for name in calls})
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+
+        assert calls["mla_generation"] > 0
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
@@ -4426,6 +4483,37 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    def test_prims_ts_bfloat16(self, mocker):
+        if not is_sm_100f(get_sm_version()):
+            pytest.skip("PrimTS requires SM100 or SM103")
+
+        calls = _count_prims_ts_phase_calls(mocker)
+        env = {
+            # An empty override selects the default registry. This exercises
+            # PrimsTS precedence over the other dense Blackwell libraries.
+            "TLLM_FMHA_LIBS": "",
+            "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
+        }
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            tokens_per_block=32,
+            use_kv_cache_manager_v2=True,
+        )
+        with mock.patch.dict(os.environ, env):
+            with LLM(self.MODEL_PATH,
+                     attn_backend="TRTLLM",
+                     kv_cache_config=kv_cache_config,
+                     disable_overlap_scheduler=True,
+                     cuda_graph_config=None) as llm:
+                calls.update({name: 0 for name in calls})
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+        assert calls["context"] > 0
+        assert calls["generation"] > 0
 
     @pytest.mark.skip(
         reason="TP2 hangs in the AUTO custom allreduce on PCIe-only (all-SYS "
