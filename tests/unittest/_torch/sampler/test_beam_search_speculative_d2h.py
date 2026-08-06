@@ -336,6 +336,59 @@ def test_speculative_d2h_predictor_always_hit(
     _assert_outputs_equal(out_on, out_off)
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_speculative_d2h_skips_only_when_no_request_can_finish(
+    fixed_params: dict[str, Any],
+    input_prompts: list[list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip decision is per group, not per request.
+
+    The snapshot is one batched copy for the whole group, so it cannot be
+    skipped for some requests and taken for others. A step is skipped only when
+    every request is predicted non-terminal; a single possible finisher makes
+    the group pay for the copy it would have cost anyway.
+
+    Pin the predictor to answer True for exactly one request and False for the
+    rest. The mixed verdict must land on "copy", and the outputs must still
+    match the feature-off run -- a per-request reading of the same verdict
+    would drop the histories of the requests that answered False.
+    """
+    seen_verdicts: list[bool] = []
+    first_slot: dict[str, int | None] = {"slot": None}
+
+    def _one_finisher(self, request, *, num_generated_tokens, num_tokens):
+        # Latch onto whichever request is seen first and only ever claim that
+        # one might finish.
+        if first_slot["slot"] is None:
+            first_slot["slot"] = request.py_seq_slot
+        verdict = request.py_seq_slot == first_slot["slot"]
+        seen_verdicts.append(verdict)
+        return verdict
+
+    with monkeypatch.context() as mp_off:
+        out_off = _run_with_env(
+            fixed_params, input_prompts, mp_off, speculative=False, stop_token_ids=None
+        )
+
+    with monkeypatch.context() as mp_on:
+        out_on = _run_with_env(
+            fixed_params,
+            input_prompts,
+            mp_on,
+            speculative=True,
+            stop_token_ids=None,
+            predictor_override=_one_finisher,
+        )
+
+    assert seen_verdicts, "predictor patch was never invoked; the speculative path did not run"
+    assert any(seen_verdicts) and not all(seen_verdicts), (
+        "the test needs a step where the verdicts disagree, so that the group "
+        f"decision is observable; got {set(seen_verdicts)}"
+    )
+    _assert_outputs_equal(out_on, out_off)
+
+
 # ---------------------------------------------------------------------------
 # Validator: speculative path must be rejected when sampler_force_async_worker
 # is also set, since the speculative path bypasses the async D2H worker.

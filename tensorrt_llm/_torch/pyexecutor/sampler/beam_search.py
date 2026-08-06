@@ -1368,6 +1368,26 @@ class BeamSearchHandler:
         forward it to _record_sampler_event so SamplerEvent.synchronize
         awaits the side stream before any builder is invoked.
         """
+        # The snapshot is only ever read when a request finishes on this step,
+        # so in speculative mode skip it entirely on steps where no request can
+        # finish. The predictor is per request but the copy is per group, so
+        # the group is skipped only when every request is predicted
+        # non-terminal; one possible finisher pays for the whole group, which
+        # is the same copy it would have cost anyway.
+        issue_copies = not self._use_speculative_d2h or any(
+            self.predict_is_likely_finishing(
+                req,
+                num_generated_tokens=req.max_beam_num_tokens + 1 - req.py_prompt_len,
+                num_tokens=req.max_beam_num_tokens + 1,
+            )
+            for req in requests
+        )
+        if not issue_copies:
+            # No snapshot. A builder falls back to a synchronous read if the
+            # step turns out to have finished a request after all -- see
+            # _deferred_cba_group.
+            return [self._speculative_builder(req) for req in requests], None
+
         # Single `with` for both modes; nullcontext yields None.
         copier_ctx: AbstractContextManager["_SideStreamCopier | None"] = (
             self._make_side_stream_copier() if self._use_speculative_d2h else nullcontext()
@@ -1388,3 +1408,33 @@ class BeamSearchHandler:
             ]
         side_stream_event = copier.event if copier is not None else None
         return builders, side_stream_event
+
+    def _speculative_builder(self, request: LlmRequest) -> BeamHistoryBuilder:
+        """Builder for a step whose snapshot was skipped.
+
+        Takes the snapshot synchronously when invoked. `should_stop` inside it
+        still decides whether a history is produced, so a prediction that held
+        costs one blocking copy of this request's rows and returns None; a miss
+        costs the same copy and produces the history. Both stall the step,
+        which is what the predictor trades against -- it is only worth enabling
+        when most steps finalize nothing, in which case no builder for a
+        skipped step is ever invoked in the first place.
+
+        NB: deliberately not gated on a host-side finish check. The mirror the
+        finish handler keeps (`_prev_first_finish_reasons`) lags by one step,
+        so a request finishing on this step -- a stop word, say -- would read
+        as unfinished and its history would be dropped.
+        """
+
+        def _builder() -> BeamHistory | None:
+            store = self._store
+            assert store is not None
+            cba_group = self.prepare_cba_group_host(
+                [request], store.first_finish_reasons, self._copy_to_host
+            )
+            if cba_group is None:
+                return None
+            inner = _prepare_beam_history_cba(request, cba_group=cba_group)
+            return inner() if inner is not None else None
+
+        return _builder
