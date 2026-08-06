@@ -128,6 +128,40 @@ def select_mtp_checkpoint_weights(weights: dict) -> dict:
     }
 
 
+def remap_preprocessed_mtp_weights_for_draft_model(
+        weights: dict,
+        num_hidden_layers: int,
+        num_mtp_layers: int,
+) -> dict:
+    """Map ``model.layers.{{N[+h]}}.*`` keys onto ``mtp_layers.{{h}}.*``.
+
+    Nemotron preprocess rewrites ``mtp.layers.*`` onto the target module path
+    ``model.layers.{{num_hidden_layers}}.*``. For a strict draft-only load we
+    re-home those keys under ``draft_model.mtp_layers``.
+    """
+    remapped: dict = {}
+    unused: list[str] = []
+    for key, value in weights.items():
+        matched = False
+        for head_idx in range(num_mtp_layers):
+            prefix = f"model.layers.{num_hidden_layers + head_idx}."
+            if key.startswith(prefix):
+                remapped[f"mtp_layers.{head_idx}.{key[len(prefix):]}"] = value
+                matched = True
+                break
+        if not matched:
+            unused.append(key)
+    if unused:
+        sample = ", ".join(unused[:8])
+        more = "" if len(unused) <= 8 else f" (+{len(unused) - 8} more)"
+        raise ValueError(
+            "After MTP preprocess, expected keys under "
+            f"'model.layers.{{{num_hidden_layers}+h}}.*' for "
+            f"h in [0, {num_mtp_layers}), but found unmatched keys: "
+            f"{sample}{more}")
+    return remapped
+
+
 def loads_mtp_from_speculative_model(spec_config) -> bool:
     """True when one-model MTP should load heads from ``speculative_model``."""
     if spec_config is None:

@@ -115,6 +115,24 @@ def test_update_spec_config_uses_mtp_layers_block_type_when_present(tmp_path):
     assert model_config.mtp_layers_block_type == ["attention", "moe"]
 
 
+def test_remap_preprocessed_mtp_weights_for_draft_model():
+    from tensorrt_llm._torch.speculative.utils import \
+        remap_preprocessed_mtp_weights_for_draft_model
+
+    weights = {
+        "model.layers.52.layers.0.enorm.weight": torch.ones(4),
+        "model.layers.52.layers.1.norm.weight": torch.ones(4),
+    }
+    remapped = remap_preprocessed_mtp_weights_for_draft_model(
+        weights, num_hidden_layers=52, num_mtp_layers=1)
+    assert remapped == {
+        "mtp_layers.0.layers.0.enorm.weight": weights[
+            "model.layers.52.layers.0.enorm.weight"],
+        "mtp_layers.0.layers.1.norm.weight": weights[
+            "model.layers.52.layers.1.norm.weight"],
+    }
+
+
 def test_nemotron_mapper_remaps_mtp_layers_keys():
     mapper = NemotronHHfWeightMapper()
     pretrained = SimpleNamespace(

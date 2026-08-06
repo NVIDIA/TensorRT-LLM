@@ -2143,13 +2143,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            _load_weights_impl_v2
         from tensorrt_llm._torch.speculative.utils import (
-            loads_mtp_from_speculative_model, select_mtp_checkpoint_weights)
+            loads_mtp_from_speculative_model,
+            remap_preprocessed_mtp_weights_for_draft_model,
+            select_mtp_checkpoint_weights)
 
         if loads_mtp_from_speculative_model(self.spec_config):
-            # One-model MTP with separate heads: MTP modules are attached under
-            # model.layers[N+] (shared with draft_model.mtp_layers). Only load
-            # mtp.* tensors — never backbone/embed/lm_head from the draft ckpt.
+            # Load MTP heads into draft_model only, and verify every non-shared
+            # MTP parameter has a matching tensor. The previous parent-model
+            # load used allow_partial_loading=True, which silently left MTP
+            # modules at random init when keys did not bind.
             n_total = len(weights)
             weights = select_mtp_checkpoint_weights(weights)
             if not weights:
@@ -2163,16 +2168,54 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     "Ignoring %d non-mtp.* tensors from speculative_model while "
                     "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
                     len(weights))
-            if weight_mapper is not None:
-                preprocess = getattr(weight_mapper, "preprocess_weights", None)
-                if callable(preprocess):
-                    weights = preprocess(weights)
-            DecoderModelForCausalLM.load_weights(
-                self,
-                weights=weights,
-                weight_mapper=weight_mapper,
-                skip_modules=["draft_model"],
-                allow_partial_loading=True,
+            if weight_mapper is None:
+                raise ValueError(
+                    "weight_mapper is required to load separate MTP heads")
+            preprocess = getattr(weight_mapper, "preprocess_weights", None)
+            if not callable(preprocess):
+                raise ValueError(
+                    "weight_mapper.preprocess_weights is required to load "
+                    "separate MTP heads")
+            weights = preprocess(weights)
+            num_hidden_layers = self.config.num_hidden_layers
+            num_mtp_layers = len(self.draft_model.mtp_layers)
+            weights = remap_preprocessed_mtp_weights_for_draft_model(
+                weights,
+                num_hidden_layers=num_hidden_layers,
+                num_mtp_layers=num_mtp_layers,
+            )
+
+            # Validate a few known leaf tensors bind before loading. Full MoE
+            # param trees often include a ``backend`` path segment that does not
+            # appear in checkpoint keys, so we cannot require an exact set match.
+            required_suffixes = (
+                "layers.0.enorm.weight",
+                "layers.0.hnorm.weight",
+                "layers.0.eh_proj.weight",
+                "layers.1.final_layernorm.weight",
+            )
+            weight_keys = set(weights.keys())
+            missing_required = []
+            for head_idx in range(num_mtp_layers):
+                for suffix in required_suffixes:
+                    key = f"mtp_layers.{head_idx}.{suffix}"
+                    if key not in weight_keys:
+                        missing_required.append(key)
+            if missing_required:
+                sample = ", ".join(missing_required[:12])
+                raise RuntimeError(
+                    "Separate MTP checkpoint is missing required tensors after "
+                    f"remap: {sample}. "
+                    f"speculative_model={self.spec_config.speculative_model!r}")
+
+            # shared_head.norm is not present in Nemotron mtp.* checkpoints
+            # (final_layernorm on the last sublayer is the trained norm).
+            _load_weights_impl_v2(
+                self.draft_model,
+                weights,
+                weight_mapper,
+                skip_modules=["shared_head"],
+                allow_partial_loading=False,
             )
             return
 
