@@ -934,13 +934,21 @@ def beam_search_sampling_batch_cba(
     cba.cba_tokens[slots, :, :snap_len] = merged_tokens
     cba.cba_log_probs[slots, :, :snap_len] = merged_lps
     cba.batch_dones[slots] = done
-    # NOT_FINISHED == 0, so the verdict maps directly onto the finish reason.
-    # Flood the full row: the stop criterion reads the first py_beam_width
-    # (== capacity) entries, which can exceed this step's beam_width_out for
-    # variable-beam-width requests.
-    args.finished_beams[slots] = (
-        done.view(-1, 1).to(torch.int32) * FinishReason.END_ID.value
-    ).expand(-1, args.finished_beams.size(1))
+    # Publish the done verdict by flooding the full row: the stop criterion
+    # reads the first py_beam_width (== capacity) entries, which can exceed
+    # this step's beam_width_out for variable-beam-width requests.
+    #
+    # Only write where the verdict is done. This tensor is the finish handler's
+    # first_finish_reasons, which records the *earliest* reason each beam
+    # finished by and must never be cleared: a beam that ended on a stop word
+    # vacates its slot and keeps generating on this path, so an unconditional
+    # write would erase that STOP_WORDS entry on the next step and the request
+    # would report the reason it eventually stopped for (LENGTH) instead.
+    args.finished_beams[slots] = torch.where(
+        done.view(-1, 1),
+        torch.full_like(args.finished_beams[slots], FinishReason.END_ID.value),
+        args.finished_beams[slots],
+    )
     stop_window = args.stop_past_tokens
     if reordered_window is not None and stop_window is not None:
         stop_window[:, slots, :num_beams] = reordered_window
