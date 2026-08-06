@@ -36,6 +36,8 @@ from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
 
 # yapf: enable
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_native_block_key_hasher_matches_python_v1():
     """Native C++ BlockKeyHasher must be bit-exact with hash_v1_block_key.

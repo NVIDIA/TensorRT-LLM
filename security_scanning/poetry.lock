@@ -274,37 +274,37 @@ trio = ["trio (>=0.32.0)"]
 
 [[package]]
 name = "apache-tvm-ffi"
-version = "0.1.13.post1"
+version = "0.1.13.post2"
 description = "tvm ffi"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "apache_tvm_ffi-0.1.13.post1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:ff63250a34b39c443ca0d52776dfe6edffae9c8007917fec011e43865e72e236"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6150a9ade54a1a92cb6f4c89e8b45bce7ae5363ec1ae5d318260411c4db7b97b"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:312409a5a5b108c38bf7a51201d7d65c89ef6c1b6b8d5082e703f193137f2c1c"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp310-cp310-win_amd64.whl", hash = "sha256:e82662e55eb48afa287c01ac51538232fbe9f62d2390e57da766d9655b02606a"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:2bddbf036e4b18fc0b1918d16172d04aad7babd86bb26afc3805e3ae022e9694"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6f0c4711b4c5503f7b8796a979f7ae67cbc1efc6079adf2125fb32ebb21f3376"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d63c5aeb2f67d9a0907179ef0bb728bcb981f65ff62f17940c78c4d8fac3ba82"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp311-cp311-win_amd64.whl", hash = "sha256:1cc760e889ad4dce79ddf2ce414f5ced671631067e0fcd3c348453aae5723d30"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:b8ad1db343651051b36ba67b2c48b4f21699925d8204c08a4171a5384434a287"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:059e702b1c54e93c7bc5b5fde2909ce69652eeaa430e0d651b0e1ea099b3af4a"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d20f8240d470cb7671f9213a0bb951e5a6844c3ed5d148142dc5b3424005ec6c"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp312-cp312-win_amd64.whl", hash = "sha256:cf2da579a83fc50475c4512d8d446f88f0e4487b6eab48c4928c389ee97b31d5"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:db9f04b7bd543e9581101afb77aa926c19a03bc8c0496329ab2eededd10eb241"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:33e326d3e8f7894870c92b9539c5a6195cc876ba0ea36347c01c919f2604591f"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8280832126901800894aa6181d3a58dffdbfa7444b964da54efdf146ef4fee81"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp313-cp313-win_amd64.whl", hash = "sha256:988ca571dffdd0e9f932cae98aeed8b7221f18f729eb81a05a0b3cfedbadbb5e"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:97f09b61e42f7809e145cdc95d4bee82a2efecd5c28b1fc51ff77ddb015035c4"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:694246514ec9e8b9da1d1d37ba9205cc92a632323c37ef3f27b72f1a94330299"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7b35d8155fffc4a18eaf22a9039e6c2f7eb6c1d8c5bf188693b1036bc6add9e7"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp314-cp314t-win_amd64.whl", hash = "sha256:a7111a574521e11960ef6705c188eedaac29d4db78cc617fa144184456966a0c"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:9f019da3028fd9741794cbb754042e0fe74a1249529b4b6f883593a0e39ba9d2"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp39-cp39-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1d7eb28768660fd8dded7fbd93537eab758d4544cd738c97404eb4d1351435da"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp39-cp39-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:942c93b213fae203466e645c855bbbcaf6ac2cb79250de9375b8e8993db99b38"},
-    {file = "apache_tvm_ffi-0.1.13.post1-cp39-cp39-win_amd64.whl", hash = "sha256:7a2a967cc997c1e982f3a9439e9da8a0e7dab8dfb0ce557303b8b7075e29d246"},
-    {file = "apache_tvm_ffi-0.1.13.post1.tar.gz", hash = "sha256:e88ae7be62a47a4b5038d7b700ccc5864b4a12d70f9c20bb4b129386a3de7f69"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:f5ceb6fb6122078281ac68c8d59fdcab9575b1cbc0773fd03af31957a46ddc25"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d6f77e8c601319a0d43410939212c46e338628b74f133ac298f0e807a13d5021"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:36e27c8c8b38ac061638896cc593e2328a2c04441c28ec51aa5cdf451279d5fd"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp310-cp310-win_amd64.whl", hash = "sha256:1b604ca681a1381f96639cff53d94861e9e4949b52e6f3b3f3252aa28c5b0a60"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:ba333bf376883f8feb6ae1adca24ab65b2b8cd68c11be23085510f4707c1471e"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6146e0adeef8e10679c3cde3efb2062c4fd00601bbd8b4e1c20c63d73e505b6e"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:38dfd42b3af5e23baf95aa5054eca3e23f183b09fa3394b56a5597317fa1fec4"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp311-cp311-win_amd64.whl", hash = "sha256:e581c54e29e96b79facbacd6b3bd3a992f6056b43c95a0bfd3551326db09f9ab"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:db4486a73d8131b12c3ac7160d8f5aa7be5408a84f64425ab603078e1bd7b8d0"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d7f350f14a946ee572b1087f8916a57a20d0c3105f94aafdd600b5f61cdd2905"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4a18d1cb67585952bc9502da6ee428f4c75934c8d3d7c0d03cdd59b82202f2e9"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp312-cp312-win_amd64.whl", hash = "sha256:0e77c79fe84f6221e58e5b820fffd7dc711c5636ff84b828f8977d821a0ef9d6"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:552ff0d059ae20b969d2c96a28e6a0e3e810123cb41f6d81673fc3cdb12c9a40"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c00d083b55d7fcb5b50683ff5c464fe224d1611d93cd5a6218251caa8c605f23"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0284905d97aa5f92a42de2ad61faa7e3c19679d1a0e47caaa3abbe368b0ba303"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp313-cp313-win_amd64.whl", hash = "sha256:6e0df6627ca2652abd175b6da1e4b60877684e67295419287a04ff0ddfb95372"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:0873badc25ec37d0d5b9ad00d95d63476cf2ef95069ec3406ef8c39552aaf3b2"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:057c431d56bfd172ed6795247cb25c144d0e49d8e4b03840055d85e7b662b0e9"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2587cf82d54d9e376ae9368b1ef3403f8e23c8270fa8819d46358ff5923754f1"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp314-cp314t-win_amd64.whl", hash = "sha256:93bdb9ca4e85c88b4a5c9a944d353bd7aaec49d7d2779b110137f2a4543ae033"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:ee176022d4fdbd2acc7a42c3ed604783f79999178967f9061887783bd2057a01"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp39-cp39-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:41db1e7b7db0f0d74728e58a867f29fe747cc6eb7b4d3a28ea2cc70b6afd8582"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp39-cp39-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f6cf7875dab8d77f9e4d46cbf446c0d0e2f35fd8a634ab35fbdc50254d279237"},
+    {file = "apache_tvm_ffi-0.1.13.post2-cp39-cp39-win_amd64.whl", hash = "sha256:619a20d7cbe31b0c14f0d474ff5f54d5c1349c3ccfb4133fadc96d6f545d89bb"},
+    {file = "apache_tvm_ffi-0.1.13.post2.tar.gz", hash = "sha256:7da4ede2392527c122afd36ac717d9a267627901881a38f5d66d214ff68f482e"},
 ]
 
 [package.dependencies]
@@ -1352,14 +1352,14 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.15"
+version = "0.6.16"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.15-py3-none-any.whl", hash = "sha256:da6c339e14db4831ade0d593324f02907d44bd4b86b640faad4727d9e089477b"},
-    {file = "flashinfer_python-0.6.15.tar.gz", hash = "sha256:2a3f1ed47129f9ac9505a26a8f12cadefc0f27d3104fb623ae281032f49eae5f"},
+    {file = "flashinfer_python-0.6.16-py3-none-any.whl", hash = "sha256:059d629cf352dae2d2e17c9b632f1be7c12fd7feb4979d71cdffd96104219e53"},
+    {file = "flashinfer_python-0.6.16.tar.gz", hash = "sha256:0c89970ee42b0640d3dfd65ea4770710e21101ce2b43a09eda3e29cd1874fe48"},
 ]
 
 [package.dependencies]
@@ -1371,7 +1371,7 @@ einops = "*"
 nccl4py = ">=0.3.1"
 ninja = "*"
 numpy = "*"
-nvidia-cudnn-frontend = ">=1.13.0"
+nvidia-cudnn-frontend = ">=1.25.0"
 nvidia-cutlass-dsl = ">=4.5.0"
 nvidia-ml-py = "*"
 packaging = ">=24.2"
@@ -6103,14 +6103,14 @@ test = ["pytest"]
 
 [[package]]
 name = "sse-starlette"
-version = "3.4.6"
+version = "3.4.8"
 description = "SSE plugin for Starlette"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sse_starlette-3.4.6-py3-none-any.whl", hash = "sha256:56217ab4c9a9f9c5db7b21e08732d3e7c2b807f45231ad23de0551a24c4a41f6"},
-    {file = "sse_starlette-3.4.6.tar.gz", hash = "sha256:725f8a1bd6d26ae1b2c9610c0ef5065dfdd496f3988d28adcf8c4b49dc25c627"},
+    {file = "sse_starlette-3.4.8-py3-none-any.whl", hash = "sha256:6e82314c786709a3cd9520f2285cf9fff90e181e598e8a357b0cf80f66afba0d"},
+    {file = "sse_starlette-3.4.8.tar.gz", hash = "sha256:ed89ffbb75cbf78a5fe2f2109cd584792ee7f9dfac96f791db546df8f15f3f9c"},
 ]
 
 [package.dependencies]
@@ -6126,14 +6126,14 @@ uvicorn = ["uvicorn (>=0.34.0)"]
 
 [[package]]
 name = "starlette"
-version = "1.3.1"
+version = "1.4.1"
 description = "The little ASGI library that shines."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "starlette-1.3.1-py3-none-any.whl", hash = "sha256:c7372aae11c3c3f26a42df7bd626cec2f47d03483d261d369516a615a53714c6"},
-    {file = "starlette-1.3.1.tar.gz", hash = "sha256:05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0"},
+    {file = "starlette-1.4.1-py3-none-any.whl", hash = "sha256:7d078e0fbefae0d2cecfb80a799d6fb84b1c0c6acd4f14ac79d17d0e7ec27f19"},
+    {file = "starlette-1.4.1.tar.gz", hash = "sha256:b7332de6e9375593a29ba9eee1e6ecfeb3eb2043e2e19a13b4b71da73ff35540"},
 ]
 
 [package.dependencies]
@@ -7187,4 +7187,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6efb69c9fb5cf45baaebd398f9dc04301991dad63096035bf05152f009334b3d"
+content-hash = "4a5add9776e2a34402b10a4635c87123fc38efb1c580ec4559ae7fb09837a13c"

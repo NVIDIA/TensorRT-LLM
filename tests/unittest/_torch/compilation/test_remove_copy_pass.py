@@ -21,6 +21,9 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 from torch.fx import Graph
 
 import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
+from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
+    fused_sigmoid_mul_inplace,  # noqa: F401
+)
 
 
 def test_remove_copy_for_mutates_args_auto_functionalized_v2(
@@ -54,6 +57,37 @@ def test_remove_copy_for_mutates_args_auto_functionalized_v2(
     assert len(inplace_nodes) == 1
     assert inplace_nodes[0].kwargs == {"src": src, "self": output}
     assert clone.args[0] is output
+    assert all(node.target != auto_functionalized_v2 for node in graph.nodes)
+    graph.lint()
+
+
+def test_remove_copy_for_fused_sigmoid_mul_inplace() -> None:
+    graph = Graph()
+    attention_output = graph.placeholder("attention_output")
+    gate = graph.placeholder("gate")
+    inplace_func = torch.ops.trtllm.fused_sigmoid_mul_inplace.default
+    functionalized = graph.call_function(
+        auto_functionalized_v2,
+        args=(inplace_func,),
+        kwargs={
+            "_all_bases": (attention_output,),
+            "_attention_output_base_index": 0,
+            "gate": gate,
+        },
+    )
+    mutated_output = graph.call_function(getitem, args=(functionalized, 1))
+    clone = graph.call_function(torch.ops.aten.clone.default, args=(mutated_output,))
+    graph.output(clone)
+
+    remove_copy_pass.remove_copy_for_mutates_args(graph)
+
+    inplace_nodes = [node for node in graph.nodes if node.target == inplace_func]
+    assert len(inplace_nodes) == 1
+    assert inplace_nodes[0].kwargs == {
+        "attention_output": attention_output,
+        "gate": gate,
+    }
+    assert clone.args[0] is attention_output
     assert all(node.target != auto_functionalized_v2 for node in graph.nodes)
     graph.lint()
 

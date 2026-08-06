@@ -200,6 +200,40 @@ def test_rms_norm_gated_token_major(num_tokens, heads, N):
     assert torch.equal(y, y_dense)
 
 
+def test_rms_norm_gated_token_major_custom_op_is_functional():
+    """The compile boundary returns fresh storage and mutates no arguments."""
+    from tensorrt_llm._torch.modules.mamba import layernorm_gated  # noqa: F401
+
+    op = torch.ops.trtllm.rms_norm_gated_token_major.default
+    assert all(
+        argument.alias_info is None or not argument.alias_info.is_write
+        for argument in op._schema.arguments
+    )
+    assert op._schema.returns[0].alias_info is None
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("output_fp8", [False, True])
+def test_rms_norm_gated_token_major_compiles_fullgraph(output_fp8):
+    """The functional custom op must remain opaque to torch.compile."""
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+    torch.manual_seed(42)
+    num_tokens, heads, N = 16, 2, 128
+    M = num_tokens * heads
+    x = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    weight = torch.rand(N, dtype=torch.bfloat16, device="cuda") + 0.5
+    wide = torch.randn(num_tokens, heads * N + 64, dtype=torch.bfloat16, device="cuda")
+    z = wide[:, 64:].view(num_tokens, heads, N)
+    fp8_scale = torch.tensor(0.13, device="cuda") if output_fp8 else None
+
+    expected = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale)
+    compiled = torch.compile(rms_norm_gated_token_major, fullgraph=True)
+    actual = compiled(x, z, weight, 1e-6, fp8_scale)
+
+    assert torch.equal(actual, expected)
+
+
 def _ref_gdn_post_conv(
     prefill,
     decode,

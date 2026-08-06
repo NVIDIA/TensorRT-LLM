@@ -129,13 +129,14 @@ _MULTIROW_MAX_N = 256
 
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
+@triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
 def _rms_norm_gated_fwd_multirow_kernel(
     X,  # pointer to the input
     Y,  # pointer to the output
     W,  # pointer to the weights
     Z,  # pointer to the gate branch
-    Rstd,  # pointer to the 1/std
+    Rstd,  # optional pointer to the 1/std
     FP8_SCALE,  # static scale for an optional FP8 output
     stride_x_row,
     stride_y_row,
@@ -145,6 +146,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     N: tl.constexpr,  # row length; power of two, whole row per program
     ROWS: tl.constexpr,  # rows per program
     HEADS_PER_TOK: tl.constexpr,
+    SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
 ):
     """rmsnorm(x) * silu(z), several short rows per program.
@@ -164,7 +166,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
     x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
     rstd = 1.0 / tl.sqrt(var + eps)
-    tl.store(Rstd + rows, rstd, mask=row_mask)
+    if SAVE_RSTD:
+        tl.store(Rstd + rows, rstd, mask=row_mask)
     w = tl.load(W + cols).to(tl.float32)
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
@@ -189,7 +192,14 @@ def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
             and ngroups == 1 and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0)
 
 
-def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
+@torch.library.custom_op("trtllm::rms_norm_gated_token_major", mutates_args=())
+def rms_norm_gated_token_major(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    fp8_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
     """rmsnorm(x) * silu(z) with z read in place from a 3D token-major view.
 
     x: [num_tokens * heads, N] with contiguous rows. z: [num_tokens, heads, N]
@@ -216,16 +226,13 @@ def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
             None,
             eps,
             z=z.reshape(M, N),
-            out=out,
             norm_before_gate=True,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
         )
         return y
-    if out is None:
-        out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
-        out = torch.empty_like(x, dtype=out_dtype)
-    rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
+    out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
+    out = torch.empty_like(x, dtype=out_dtype)
     grid = (triton.cdiv(M, _MULTIROW_ROWS), )
     with torch.cuda.device(x.device.index):
         _rms_norm_gated_fwd_multirow_kernel[grid](
@@ -233,7 +240,7 @@ def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
             out,
             weight,
             z,
-            rstd,
+            None,
             fp8_scale,
             x.stride(0),
             out.stride(0),
@@ -246,6 +253,19 @@ def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
             num_warps=_MULTIROW_NUM_WARPS,
         )
     return out
+
+
+@rms_norm_gated_token_major.register_fake
+def _(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    fp8_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    del z, weight, eps
+    out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
+    return torch.empty_like(x, dtype=out_dtype)
 
 
 def _layer_norm_fwd(

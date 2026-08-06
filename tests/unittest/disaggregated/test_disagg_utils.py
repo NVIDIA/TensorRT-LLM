@@ -12,6 +12,8 @@ from tensorrt_llm.llmapi.disagg_utils import (
     get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
 # isort: on
 
+pytestmark = pytest.mark.cpu_only
+
 
 def get_yaml_config():
     config = {
