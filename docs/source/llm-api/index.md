@@ -74,9 +74,11 @@ The following tips typically assist new LLM API users who are familiar with othe
 ### FlashInfer JIT workspace for dynamically spawned MPI workers
 
 When the LLM API dynamically spawns multiple MPI workers, TensorRT-LLM uses
-persistent, per-worker cache slots for FlashInfer 0.6.15 JIT artifacts. This
-avoids concurrent source-generation races while preserving compiled artifacts
-between launches. Downloaded cubins remain in FlashInfer's shared cache.
+persistent, per-worker cache slots for FlashInfer JIT artifacts. This avoids
+concurrent source-generation races present through FlashInfer 0.6.16 while
+preserving compiled artifacts between launches. Downloaded cubins remain in
+FlashInfer's shared cache. The isolation can be removed once FlashInfer guards
+source generation before writing shared workspace files.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence. To
 disable the automatic isolation for troubleshooting, set

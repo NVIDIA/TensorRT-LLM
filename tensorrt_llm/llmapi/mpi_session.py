@@ -62,9 +62,9 @@ if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
                 workspace_lock = None
                 slot += slot_stride
 
-        # Preserve FlashInfer 0.6.15's default cubin cache before changing its
-        # workspace base. Importing flashinfer.jit.env here would initialize all
-        # of its workspace constants before the isolated base is configured.
+        # Preserve FlashInfer's default cubin cache before changing its workspace
+        # base. Importing flashinfer.jit.env here would initialize all of its
+        # workspace constants before the isolated base is configured.
         os.environ.setdefault(
             "FLASHINFER_CUBIN_DIR",
             str(Path.home() / ".cache" / "flashinfer" / "cubins"),
