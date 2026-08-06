@@ -1105,7 +1105,7 @@ def kda_core_inplace(hidden_states: torch.Tensor, layer_idx: str, output: torch.
     ``o_allreduce``.
     """
     metadata, kda_layer = _extract_kda_extra_attrs(layer_idx)
-    kda_layer.forward(hidden_states, metadata, output=output)
+    kda_layer._forward_impl(hidden_states, metadata, output=output)
 
 
 maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
@@ -1324,25 +1324,22 @@ class KimiKDARuntime(nn.Module):
             self._bfa_proj_weight = bfa_weight
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        """``hidden_states``: flattened ``[num_tokens, hidden]`` (ctx tokens
-        first, then one token per generation request).
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """Entry point: select the eager path or the breakable-CUDA-graph path.
 
-        ``output`` is the breakable-CUDA-graph core buffer
-        (``[num_tokens, H, head_dim]``, pre-``o_proj``). When supplied, each
-        sub-path writes its post-``o_norm`` result into the corresponding slice
-        and this method returns ``None`` — the caller applies ``o_proj`` +
-        ``o_allreduce`` on-graph. When ``None`` this is the eager path that
-        returns the fully projected, reduced output tensor.
+        ``hidden_states``: flattened ``[num_tokens, hidden]`` (ctx tokens first,
+        then one token per generation request).
+
+        Both paths ultimately run the same core (``_forward_impl``); the split
+        is purely eager vs graph. The eager path calls ``_forward_impl``
+        directly (no op, no extra-attrs lookup). The BCG path pre-allocates the
+        pre-``o_proj`` core on-graph and fills it via the eager-on-graph op —
+        which recovers this layer + the live metadata from the extra-attrs
+        registry and calls ``_forward_impl(output=core)`` — then keeps o_proj +
+        o_allreduce on-graph.
         """
-        if output is None and self.register_to_config and is_in_breakable_cuda_graph():
-            # Breakable prefill CUDA graph: pre-allocate the pre-o_proj core on
-            # graph, fill it eagerly via the metadata-dependent op, then keep
-            # o_proj + o_allreduce on-graph.
+        if self.register_to_config and is_in_breakable_cuda_graph():
             core = hidden_states.new_empty(
                 (hidden_states.shape[0], self.mixer.num_heads, self.mixer.head_dim),
                 dtype=torch.bfloat16,
@@ -1353,6 +1350,24 @@ class KimiKDARuntime(nn.Module):
                 out = self._o_allreduce(out)
             return out
 
+        return self._forward_impl(hidden_states, attn_metadata)
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Metadata-dependent KDA core (prefill/decode/verify dispatch).
+
+        This is what the breakable-CUDA-graph op targets, and what the eager
+        ``forward`` calls directly. ``output`` is the BCG core buffer
+        (``[num_tokens, H, head_dim]``, pre-``o_proj``): when supplied, each
+        sub-path writes its post-``o_norm`` result into the corresponding slice
+        and this returns ``None`` (the caller applies o_proj + o_allreduce
+        on-graph). When ``None`` (eager), it returns the fully projected,
+        reduced output tensor.
+        """
         mamba_metadata = attn_metadata.mamba_metadata
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
