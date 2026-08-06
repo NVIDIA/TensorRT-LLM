@@ -31,7 +31,7 @@ import soundfile
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
-    EncDecEncoderCudaGraphConfig,
+    EncodeCudaGraphConfig,
     KvCacheConfig,
     SamplingParams,
     SchedulerConfig,
@@ -43,6 +43,9 @@ _MAX_NEW_TOKENS = 96
 _MIN_GPU_MEMORY_MB = 16_000
 _FREE_GPU_MEMORY_FRACTION = 0.2
 _CROSS_KV_CACHE_FRACTION = 0.5
+# Every Whisper request produces this many encoder positions, whatever the audio
+# length. It sets the cross-KV pool capacity and the encoder graph shapes.
+_ENCODER_OUTPUT_LEN = 1500
 # whisper-tiny fp32 greedy on 1221-135766-0002.wav (matches HF transformers).
 _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
     1939,
@@ -113,19 +116,34 @@ def _make_llm(
     tensor_parallel_size: int = 1,
     encoder_graphs: bool = False,
 ) -> LLM:
-    # CudaGraphConfig captures the decode step; `encoder` opts the enc-dec
-    # encoder step in as well. fp32 enc-dec declines graphs at engine init
-    # (workspace-sizing guard), so requesting them must still work for every
-    # dtype.
+    # CudaGraphConfig captures the decode step; the enc-dec encoder step opts in
+    # separately through `encoder_cuda_graph_config`. fp32 enc-dec declines
+    # graphs at engine init (workspace-sizing guard), so requesting them must
+    # still work for every dtype.
     cuda_graph_config = (
         CudaGraphConfig(
             batch_sizes=cuda_graph_batch_sizes,
             enable_padding=True,
-            encoder=EncDecEncoderCudaGraphConfig() if encoder_graphs else None,
         )
         if cuda_graph_batch_sizes is not None
         else None
     )
+    encoder_kwargs = {}
+    if encoder_graphs:
+        # Whisper is a feature encoder: it emits a fixed `_ENCODER_OUTPUT_LEN`
+        # positions per request, so num_tokens/seq_lens are derived rather than
+        # free. They are still supplied because the config validator requires
+        # the opt-in to be explicit.
+        encoder_batch_sizes = list(cuda_graph_batch_sizes or [1])
+        encoder_kwargs = {
+            "encoder_max_batch_size": max(encoder_batch_sizes),
+            "encoder_cuda_graph_config": EncodeCudaGraphConfig(
+                batch_sizes=encoder_batch_sizes,
+                num_tokens=[_ENCODER_OUTPUT_LEN * bs for bs in encoder_batch_sizes],
+                seq_lens=[_ENCODER_OUTPUT_LEN],
+                enable_padding=True,
+            ),
+        }
     dtype_kwargs = {}
     if torch_dtype is not None:
         # The checkpoint's torch_dtype wins over `dtype` in the PyTorch
@@ -147,10 +165,11 @@ def _make_llm(
         max_beam_width=max_beam_width,
         # Cross-KV pool capacity; the default (1024) is smaller than the
         # 1500 encoder positions every Whisper request produces.
-        max_input_len=1500,
-        max_num_tokens=3000,
+        max_input_len=_ENCODER_OUTPUT_LEN,
+        max_num_tokens=2 * _ENCODER_OUTPUT_LEN,
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
         tensor_parallel_size=tensor_parallel_size,
+        **encoder_kwargs,
         **dtype_kwargs,
     )
 
@@ -259,26 +278,25 @@ def test_whisper_pytorch_beam_search(
 def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = False) -> None:
     """Introspect the in-process engine (single-process mode only).
 
-    `encoder_cuda_graph_runner` is the `llm.encode()` runner and must stay
-    disabled here; the enc-dec encoder step has its own runner, which is only
-    populated when `CudaGraphConfig.encoder` opted in.
+    The enc-dec encoder step shares `encoder_cuda_graph_runner` with the
+    `llm.encode()` path; feature mode is a mode of that one runner, selected by
+    `encoder_cuda_graph_config`, not a second runner.
     """
     model_engine = llm._executor.engine.model_engine
-    assert not model_engine.encoder_cuda_graph_runner.enabled
-    assert not model_engine.encoder_cuda_graph_runner.graphs
     assert model_engine.cuda_graph_runner.enabled == captured
     assert bool(model_engine.cuda_graph_runner.graphs) == captured
 
-    enc_dec_runner = model_engine.enc_dec_encoder_cuda_graph_runner
+    encoder_runner = model_engine.encoder_cuda_graph_runner
     if not encoder_captured:
-        assert enc_dec_runner is None or not enc_dec_runner.graphs
+        assert not encoder_runner.enabled
+        assert not encoder_runner.graphs
         return
     # Capture must actually have happened: a silent fallback to the eager
     # encoder path would otherwise pass every output assertion above.
-    assert enc_dec_runner is not None
-    assert enc_dec_runner.enabled
-    assert enc_dec_runner.graphs
-    assert enc_dec_runner.feature_mode
+    assert encoder_runner.enabled
+    assert encoder_runner.graphs
+    assert encoder_runner.feature_mode
+    assert encoder_runner.is_encoder_decoder
 
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:
