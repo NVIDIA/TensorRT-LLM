@@ -47,11 +47,7 @@ class CoverageResult:
     no_data_funcs: list[str] = field(default_factory=list)
 
 
-# What to do with a changed function that has no rows in the DB — it was never
-# captured, so "which tests exercise it" is unknown rather than empty.
-#   file       fall back to every test that entered any function in the file
-#   importers  fall back to the file's `<module>` touch set (its importers)
-#   ignore     treat as impacting nothing
+# Fallback for a changed function with no DB rows: whole file / its importers / nothing.
 NO_DATA_POLICIES = ("file", "importers", "ignore")
 DEFAULT_NO_DATA_POLICY = "file"
 
@@ -92,10 +88,7 @@ class CoverageSelector:
         return self._untrusted
 
     def untrusted_families(self) -> set[str]:
-        """`untrusted_tests()` re-keyed to `<stage family>/<nodeid>`.
-
-        Untrusted on any shard means untrusted for the family — the entry runs.
-        """
+        """`untrusted_tests()` re-keyed to `<stage family>/<nodeid>`; any shard taints the family."""
         out: set[str] = set()
         for test in self.untrusted_tests():
             stage, nodeid = split_stage(test)
@@ -106,22 +99,21 @@ class CoverageSelector:
     def _impacted_tests(
         self, residual_files: list[str], diffs: dict[str, str]
     ) -> tuple[set[str], list[str], str | None]:
-        """Return (impacted tests, file::qualname symbols with no DB rows, decline reason).
-
-        A non-None decline reason means the change cannot be resolved soundly and
-        the caller must not narrow; see `_import_executed_impact`.
-        """
+        """Return (impacted tests, file::qualname with no DB rows, decline reason or None)."""
         impacted: set[str] = set()
         no_data: list[str] = []
         for path in residual_files:
             cf = canon(path)
-            lines = iter_diff_post_line_numbers(diffs.get(path, ""))
+            diff = diffs.get(path) or ""
             source = self._read_head(path)
-            if not lines or source is None:
-                impacted |= self.db.tests_touching_file(cf)
-                continue
+            if not diff.strip() or source is None:
+                # No diff means an import-executed change cannot be told apart from
+                # a function-body one, and the file row set bounds only the latter.
+                return impacted, no_data, f"no usable diff for residual file: {path}"
+            lines = iter_diff_post_line_numbers(diff)
             qualnames, ok = qualnames_for_lines(source, lines)
-            if not ok:
+            if not lines or not ok:
+                # Comment-only or unparsable: no qualname to resolve, file-level bound.
                 impacted |= self.db.tests_touching_file(cf)
                 continue
             import_executed = import_executed_qualnames(source)
@@ -142,32 +134,14 @@ class CoverageSelector:
     def _import_executed_impact(
         self, cf: str, qualname: str, path: str
     ) -> tuple[set[str], str | None]:
-        """Resolve a changed qualname whose code runs at import time.
-
-        Module and class bodies execute once per process, during import. A test
-        only holds a row for one if its process was already being recorded then,
-        which excludes every test served by a pool worker (those import before
-        capture starts) and every in-process import done at collection time
-        (recorded under the empty context). The rows are therefore a subset of
-        the tests that actually ran the code, and narrowing on them alone drops
-        the difference.
-
-        The file's own row set covers the gap whenever the same process later
-        entered any function in the file. When it does not — a file whose only
-        recorded rows are the import-time ones — no sound impact set exists and
-        the change is declined instead.
-        """
+        """Bound an import-time qualname by the file's row set, which under-records it; decline if no wider."""
         file_tests = self.db.tests_touching_file(cf)
         if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
             return file_tests, None
         return set(), (f"import-executed scope changed with no wider row set: {path}::{qualname}")
 
     def _no_data_fallback(self, cf: str) -> set[str]:
-        """Tests to force-run for a changed function the DB never captured.
-
-        No rows means the function was never observed, not that no test reaches
-        it, so the file's own test set is the tightest sound bound available.
-        """
+        """Tests to force-run for a changed function the DB never captured."""
         if self._no_data_policy == "file":
             return self.db.tests_touching_file(cf)
         if self._no_data_policy == "importers":
@@ -181,11 +155,7 @@ class CoverageSelector:
             return None
 
     def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
-        """Decide over residual files (repo-relative paths no rule claimed).
-
-        Returns ok=False for any non-core-Python file, any file absent from the DB,
-        and any import-executed change `_import_executed_impact` cannot bound.
-        """
+        """Decide over residual files; ok=False for non-core, not-in-DB, or unbounded import-time changes."""
         for path in residual_files:
             cf = canon(path)
             if not (path.endswith(".py") and cf.startswith("tensorrt_llm/")):

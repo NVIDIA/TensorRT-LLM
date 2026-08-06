@@ -91,8 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     core = [f for f in files if f.endswith(".py") and canon(f).startswith("tensorrt_llm/")]
     non_core = [f for f in files if f not in core]
 
-    # `CoverageSelector.decide()` refuses the whole decision when a residual file has
-    # no rows, so a removed list computed past that point would not be reachable.
+    # `decide()` refuses the whole change here, so no removal below would be reachable.
     zero_touch = [f for f in core if not db.file_has_touch_rows(canon(f))]
     if zero_touch:
         print(f"commit {args.sha[:12]} — coverage selection REFUSES this change:")
@@ -101,8 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nNo case is removable; every stage runs in full.")
         return 0
 
-    # Build the change's impact set: function-level (file, qualname), or (file, None)
-    # when a file falls back to file-level. Collect the impacted tests.
+    # Impact set: (file, qualname) per function, or the whole file when it falls back.
     impact_funcs: set[tuple[str, str]] = set()
     impact_files: set[str] = set()  # file-level fallback
     changed_files: set[str] = set()
@@ -127,8 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             impact_funcs.add((cf, q))
             tests = db.tests_touching_func(cf, q)
             impacted |= tests
-            # Mirrors the selector's default no_data_policy="file": a function with no
-            # rows was never observed, so the file's own test set is the bound used.
+            # Mirrors the selector's default no_data_policy="file".
             if not tests and q != "<module>":
                 no_data.append(f"{cf}::{q}")
                 impact_files.add(cf)

@@ -482,8 +482,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"error: cbts main.py not found at {CBTS_MAIN}", file=sys.stderr)
         return 2
 
-    # Coverage tier is opt-in: it needs the post-merge touch DB, which the user
-    # must download separately. Default replays rules only.
+    # Coverage tier is opt-in: it needs a separately downloaded touch DB.
     if args.coverage_db:
         print(f"coverage tier ON (merged with rules) via {args.coverage_db}", file=sys.stderr)
     else:

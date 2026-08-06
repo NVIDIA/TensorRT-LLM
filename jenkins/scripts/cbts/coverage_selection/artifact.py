@@ -43,8 +43,7 @@ from typing import Optional
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
 TARBALL_NAME = "cbts_pystart_report.tar.gz"
 SQLITE_NAME = "cbts_touchmap.sqlite"
-# Per-build metadata the pipeline uploads next to the artifacts; `commit=<sha>`
-# is the revision that build ran, and is absent on some builds.
+# Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
 _URM = "https://urm.nvidia.com/artifactory"
@@ -133,16 +132,7 @@ def select_tarball(
     max_probe: int = _MAX_PROBE,
     repo_root: str = ".",
 ) -> Optional[dict]:
-    """Pick the coverage tarball collected at the newest revision.
-
-    Build numbers do not order revisions: a build can be a re-run of an older
-    commit, so walking numbers down can land on a DB older than a lower-numbered
-    build's. Rank the probe window's tarball-bearing builds by how far their
-    commit trails `repo_root`'s HEAD instead, and keep the build number only as
-    the tie-break for builds whose commit git cannot resolve.
-
-    Returns {url, build, commit, lag} — commit/lag are None when unavailable.
-    """
+    """Tarball of the least-trailing commit as {url, build, commit, lag}; build number breaks ties."""
     build = latest_build_number(jenkins_base)
     if build is None:
         print("[artifact] could not resolve latest build number", file=sys.stderr)

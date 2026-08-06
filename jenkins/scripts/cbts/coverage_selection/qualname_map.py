@@ -87,12 +87,7 @@ def qualnames_for_lines(source: str, lines: set[int]) -> tuple[set[str], bool]:
 
 
 def import_executed_qualnames(source: str) -> set[str]:
-    """Qualnames whose code runs once, at import: `<module>` and every class body.
-
-    A signature or decorator line attributes to its *enclosing* scope (see
-    `_attribute`), so a method's `def` line lands on the class and is covered by
-    this set too. Unparsable source yields just `<module>`.
-    """
+    """Qualnames whose code runs once at import: `<module>` and every class body."""
     out = {"<module>"}
 
     def walk(stmts, prefix: str) -> None:

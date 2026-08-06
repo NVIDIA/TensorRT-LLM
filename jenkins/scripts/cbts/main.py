@@ -69,6 +69,10 @@ from rules.tests_def_rule import TestsDefRule  # noqa: E402
 from rules.visual_gen_rule import VisualGenRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
+# Files the coverage tier maps to qualnames; without their diffs it can only
+# resolve at file level, and cannot tell an import-executed change apart.
+COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
+
 # --- Rule registry -----------------------------------------------------------
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
@@ -129,12 +133,9 @@ class SelectionResult:
     # set by coverage tier; Groovy re-adds multiGpuJobs under MULTI_GPU_FILE_CHANGED gate
     enable_multi_gpu: bool = False
     coverage_dropped_stages: list[str] = field(default_factory=list)
-    # Post-merge build the consulted touch DB came from. The DB is resolved as
-    # "latest post-merge tarball" at decision time, so two runs of the same
-    # commit can consult different DBs; recording it makes a decision replayable.
+    # Post-merge build the consulted touch DB came from; makes a decision replayable.
     coverage_db_build: Optional[int] = None
-    # Revision the DB was collected at, and how many commits HEAD is ahead of it.
-    # Both None when `build_info.txt` carried no commit for that build.
+    # Revision the DB was collected at and HEAD's distance from it; None when unknown.
     coverage_db_commit: Optional[str] = None
     coverage_db_lag: Optional[int] = None
 
@@ -382,7 +383,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list_needed_diffs:
-        patterns: set[str] = set()
+        patterns: set[str] = set(COVERAGE_NEEDS_DIFF_FOR)
         for cls in RULE_CLASSES:
             patterns.update(cls.needs_diff_for)
         for p in sorted(patterns):
@@ -508,9 +509,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             durations=durations,
         )
 
-    # Stages that run whatever the decision. Added before the trigger-mode filter
-    # so a Post-Merge one is still dropped in pre-merge, and left out of the
-    # per-stage counts so Layer 2.5 neither renames nor resizes them.
+    # Added before the trigger-mode filter, and outside the counts Layer 2.5 resizes.
     if result.scope is not None:
         result.affected_stages |= {s for s in stages if s.startswith(ALWAYS_RUN_STAGE_PREFIX)}
 
