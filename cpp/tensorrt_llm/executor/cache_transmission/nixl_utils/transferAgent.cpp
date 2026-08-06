@@ -439,7 +439,13 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
             numWorker, 0, 10000, config.enableTelemetry};
         std::string localIp = common::getLocalIp(common::getEnvNixlInterface(), mRank);
-        mAddress = localIp + "#" + std::to_string(port);
+        // Bracket IPv6 literals (RFC 3986) so the last ':' always separates the port;
+        // IPv4 keeps the legacy "ip:port" format for cross-version compatibility.
+        if (localIp.find(':') != std::string::npos)
+        {
+            localIp = "[" + localIp + "]";
+        }
+        mAddress = localIp + ":" + std::to_string(port);
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
     else
@@ -670,11 +676,15 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
-    auto const separator = connectionInfo.rfind('#');
-    TLLM_CHECK_WITH_INFO(
-        separator != std::string::npos, "Invalid NIXL connection info, missing '#': %s", connectionInfo.c_str());
+    auto const separator = connectionInfo.rfind(':');
+    TLLM_CHECK_WITH_INFO(separator != std::string::npos,
+        "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': %s", connectionInfo.c_str());
     std::string ip = connectionInfo.substr(0, separator);
     std::string port = connectionInfo.substr(separator + 1);
+    if (ip.size() >= 2 && ip.front() == '[' && ip.back() == ']')
+    {
+        ip = ip.substr(1, ip.size() - 2);
+    }
     TLLM_LOG_DEBUG(mRank, "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s",
         connectionInfo.c_str(), name.c_str());
     TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
