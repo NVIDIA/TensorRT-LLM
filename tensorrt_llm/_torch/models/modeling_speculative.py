@@ -1917,22 +1917,17 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                                       count_dspark_stages,
                                       validate_dspark_eplb_layer_base)
 
-        # DeepSpec-released dense drafters (e.g. dspark_qwen3_8b_block7) are
-        # separate checkpoints that declare their own architecture; the
+        # Dense drafters (e.g. dspark_qwen3_8b_block7) are separate checkpoints. The
         # DeepSeek-V4 drafter lives in the target checkpoint's mtp.* namespace.
         draft_arches = getattr(draft_config.pretrained_config, "architectures",
                                None) or []
-        # The drafter's own ModelConfig carries spec_config=None (no recursive
-        # spec-dec), so the validated speculative-config values are passed in
-        # explicitly here.
+        # The drafter's own ModelConfig carries spec_config=None,
+        # so the validated speculative-config values are passed in explicitly here.
         if any("Qwen3DSpark" in arch for arch in draft_arches):
             return Qwen3DSparkForCausalLM(
                 draft_config,
                 block_size=model_config.spec_config.block_size,
                 mask_token_id=model_config.spec_config.mask_token_id)
-        # The DSpark draft reuses the target's aux streams. The draft stage
-        # count (n_mtp_layers) is not in the HF config, so derive it from the
-        # checkpoint's mtp.* namespace.
         num_stages = count_dspark_stages(
             model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)

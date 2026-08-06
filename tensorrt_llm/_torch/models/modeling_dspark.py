@@ -378,10 +378,8 @@ class DSparkDraftModel(nn.Module):
             or getattr(config, "n_mtp_layers", None)
             or config.num_nextn_predict_layers
         )
-        # Production passes the validated speculative-config values explicitly
-        # (the drafter's own ModelConfig carries spec_config=None to avoid
-        # recursive spec-dec, so they cannot be read back off ``spec_cfg``);
-        # direct construction falls back to the checkpoint's trained values.
+        # Production passes the validated speculative-config value explicitly;
+        # direct construction falls back to the checkpoint's trained block size.
         self.block_size = int(
             block_size if block_size is not None else getattr(config, "dspark_block_size", 5)
         )
@@ -1150,14 +1148,9 @@ class DSparkDraftModel(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3 (DeepSpec) DSpark drafter
+# Qwen3 DSpark drafter
 # --------------------------------------------------------------------------- #
 
-# Ring-window length for the per-layer context K/V cache (per request slot).
-# The DeepSpec reference attends over the FULL committed context; a ring
-# window bounds the worker buffer at
-# ``max_batch * num_layers * window * 2 * kv_dim`` bytes while remaining
-# exactly full-context for sequences up to ``window`` tokens.
 _DEFAULT_CTX_WINDOW = 2048
 _CTX_WINDOW_ENV = "TRTLLM_DSPARK_QWEN3_CTX_WINDOW"
 
@@ -1301,10 +1294,6 @@ class Qwen3DSparkDraftModel(nn.Module):
         # Worker-facing stage count (== draft layer count for this drafter).
         self.num_stages = num_layers
 
-        # Production passes the validated speculative-config values explicitly
-        # (the drafter's own ModelConfig carries spec_config=None to avoid
-        # recursive spec-dec, so they cannot be read back off it); direct
-        # construction falls back to the checkpoint's trained values.
         self.block_size = int(
             block_size if block_size is not None else getattr(config, "block_size", 7)
         )
@@ -1338,13 +1327,6 @@ class Qwen3DSparkDraftModel(nn.Module):
         )
 
         self.markov_rank = int(getattr(config, "markov_rank", 0))
-
-        # Weight modules are built normally: the model loader wraps construction
-        # in ``MetaInitMode`` and materializes the parameters itself, and
-        # load_weights() then assigns the checkpoint tensors
-        # (torch load_state_dict(assign=True)). Forcing the meta device here
-        # instead would leave the drafter on meta whenever the loader falls back
-        # to regular init.
         self.fc = nn.Linear(
             self.num_capture_layers * self.hidden_size, self.hidden_size, bias=False
         )
@@ -1372,9 +1354,7 @@ class Qwen3DSparkDraftModel(nn.Module):
         self.confidence_head = None
         if bool(getattr(config, "enable_confidence_head", False)):
             # Inert scaffolding — the worker always passes
-            # ``confidence_threshold=0.0`` — kept for checkpoint
-            # completeness. The DeepSpec Qwen3 drafters store the
-            # confidence ``proj`` WITH a bias (the V4 one is bias-free).
+            # ``confidence_threshold=0.0`` — kept for checkpoint completeness.
             self.confidence_head = DSparkConfidenceHead(
                 hidden_size=self.hidden_size,
                 markov_rank=self.markov_rank,
@@ -1398,12 +1378,7 @@ class Qwen3DSparkDraftModel(nn.Module):
     def _build_rope_tables(self) -> None:
         """Precompute the cos/sin tables as non-persistent buffers.
 
-        Built eagerly at construction rather than lazily on first use: the
-        drafter runs inside the target's CUDA graph, and an allocation made
-        during capture would live in the graph's private memory pool. Buffers
-        ride along with the module's ``.to(device)`` and stay out of
-        ``state_dict`` (``persistent=False``), so the strict checkpoint load is
-        unaffected.
+        Built eagerly at construction rather than lazily on first use.
         """
         inv_freq = 1.0 / (
             self._rope_theta
@@ -1512,11 +1487,7 @@ class Qwen3DSparkDraftModel(nn.Module):
     ) -> tuple:
         """CUDA-graph-safe batched block draft (all gen requests at once).
 
-        Mirrors DeepSpec ``forward_dspark_draft_block`` + ``build_dspark_proposal``:
-        write the newest committed token's context K/V (position ``start_pos-1``),
-        run the ``block_size`` draft queries ``[bonus, mask, ...]`` at positions
-        ``start_pos + [0..block)`` through the Qwen3 layers attending to the ring
-        context + the block (bidirectional), then Markov-refine the block logits.
+        Mirrors DeepSpec ``forward_dspark_draft_block`` + ``build_dspark_proposal``.
 
         Args:
             main_hidden: ``[G, num_capture * hidden]`` captured hidden of the
@@ -1550,14 +1521,11 @@ class Qwen3DSparkDraftModel(nn.Module):
 
         # Bool attention mask [G, 1, B, win + B]: the block attends to itself
         # bidirectionally, and to the ring rows that actually hold a context
-        # row. Ring validity is NOT ``index < min(start_pos, win)``: the worker
-        # zeroes a slot's window when it assigns it and only seeds the positions
+        # row. The worker zeroes a slot's window when it assigns it and only seeds the positions
         # the target actually processed, so under KV-cache prefix reuse (or any
         # partially seeded slot) the rows below the request's first seeded
         # position hold nothing, and attending to them would mix all-zero K/V
-        # into the softmax. Validity is read off the buffer instead — an
-        # unwritten row is exactly zero, and every position from the first
-        # seeded one on is written exactly once, so "non-zero" == "live". All
+        # into the softmax. Validity is read off the buffer instead. All
         # layers are written together, so layer 0 answers for the whole stack.
         blk_valid = torch.ones(G, 1, B, B, dtype=torch.bool, device=device)
         attn_mask = None
@@ -1626,12 +1594,15 @@ class Qwen3DSparkDraftModel(nn.Module):
         With no ``kv_windows`` the request drafts against an empty ring (only
         the newest committed token's row is written, and the all-zero rows are
         masked out); callers that want the prompt's context must seed a buffer
-        with :meth:`write_context_windows` and pass it, as ``DSparkWorker`` does.
+        with `write_context_windows` and pass it, as ``DSparkWorker`` does.
         """
         T = int(main_hidden.shape[0])
         device = main_hidden.device
         if not torch.is_tensor(start_pos):
             start_pos = torch.full((T,), int(start_pos), dtype=torch.long, device=device)
+        # Same precondition as DSparkDraftModel.forward
+        # Checked here (host sync) because this is the eager single-shot path.
+        assert bool((start_pos > 0).all()), "DSpark draft runs at generation (start_pos > 0)"
         if kv_windows is None:
             kv_windows = torch.zeros(
                 (
@@ -1655,8 +1626,6 @@ class Qwen3DSparkDraftModel(nn.Module):
     # --------------------------------------------------------------- loading
 
     def load_weights(self, weights: Dict) -> None:
-        # The loader has already placed the (empty) parameters on their target
-        # device; follow them rather than assuming the current cuda device.
         device = self.fc.weight.device
         if device.type == "meta":
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
