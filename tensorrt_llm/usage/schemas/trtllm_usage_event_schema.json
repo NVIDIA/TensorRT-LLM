@@ -5,11 +5,14 @@
         },
         {
             "$ref": "#/definitions/events/trtllm_heartbeat"
+        },
+        {
+            "$ref": "#/definitions/events/trtllm_exit_report"
         }
     ],
     "$schema": "http://json-schema.org/draft-07/schema#",
     "schemaMeta": {
-        "schemaVersion": "0.2",
+        "schemaVersion": "0.3",
         "clientId": "616561816355034",
         "clientName": "TrtllmTelemetry",
         "definitionVersion": "2.0"
@@ -75,6 +78,9 @@
                     "architectureClassName": {
                         "$ref": "#/definitions/types/LongString"
                     },
+                    "architectureClassHash": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
                     "backend": {
                         "$ref": "#/definitions/types/ShortString"
                     },
@@ -122,6 +128,21 @@
                     },
                     "deploymentId": {
                         "$ref": "#/definitions/types/ShortString"
+                    },
+                    "llmInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "maxConcurrentLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
                     }
                 },
                 "required": [
@@ -135,6 +156,7 @@
                     "gpuMemoryMB",
                     "cudaVersion",
                     "architectureClassName",
+                    "architectureClassHash",
                     "backend",
                     "tensorParallelSize",
                     "pipelineParallelSize",
@@ -149,7 +171,12 @@
                     "llmApiConfigJson",
                     "llmApiConfigMetaJson",
                     "disaggRole",
-                    "deploymentId"
+                    "deploymentId",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures"
                 ]
             },
             "trtllm_heartbeat": {
@@ -157,7 +184,7 @@
                     "service": "telemetry",
                     "gdpr": {
                         "category": "functional",
-                        "description": "TRT-LLM periodic heartbeat for session duration tracking. No payload beyond sequence number."
+                        "description": "TRT-LLM periodic heartbeat with process correlation and aggregate LLM lifecycle counters."
                     }
                 },
                 "additionalProperties": false,
@@ -165,10 +192,145 @@
                 "properties": {
                     "seq": {
                         "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "llmInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "maxConcurrentLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
                     }
                 },
                 "required": [
-                    "seq"
+                    "seq",
+                    "ingressPoint",
+                    "disaggRole",
+                    "deploymentId",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures"
+                ]
+            },
+            "trtllm_exit_report": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM terminal session outcome. Contains only bounded categorical status data and no exception text or PII."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "exitCodeKnown": {
+                        "type": "boolean"
+                    },
+                    "exitCode": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "signalNumber": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "terminationKind": {
+                        "type": "string",
+                        "enum": [
+                            "clean",
+                            "exception",
+                            "signal",
+                            "worker_failure",
+                            "timeout",
+                            "unknown"
+                        ]
+                    },
+                    "lifecyclePhase": {
+                        "type": "string",
+                        "enum": [
+                            "cli_parsing",
+                            "config_validation",
+                            "model_initialization",
+                            "serving",
+                            "shutdown",
+                            "unknown"
+                        ]
+                    },
+                    "component": {
+                        "type": "string",
+                        "enum": [
+                            "llm",
+                            "server",
+                            "engine_worker",
+                            "disagg_worker",
+                            "unknown"
+                        ]
+                    },
+                    "reportingSource": {
+                        "type": "string",
+                        "enum": [
+                            "self",
+                            "supervisor",
+                            "executor_proxy"
+                        ]
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "llmInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "maxConcurrentLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "exitCodeKnown",
+                    "exitCode",
+                    "signalNumber",
+                    "terminationKind",
+                    "lifecyclePhase",
+                    "component",
+                    "reportingSource",
+                    "ingressPoint",
+                    "disaggRole",
+                    "deploymentId",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures"
                 ]
             }
         }

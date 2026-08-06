@@ -25,7 +25,7 @@ Reference:
 
 import platform
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.2"
+EVENT_SCHEMA_VER = "0.3"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -51,7 +51,25 @@ CPU_ARCHITECTURE = platform.uname().machine
 # ---------------------------------------------------------------------------
 
 
-class TrtllmInitialReport(BaseModel):
+class _LlmCounterSnapshot(BaseModel):
+    """Process-local aggregate LLM lifecycle counters."""
+
+    llm_initialization_attempts: int = Field(
+        default=0, ge=0, le=_UINT32_MAX, alias="llmInitializationAttempts"
+    )
+    llm_instances_created: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="llmInstancesCreated")
+    active_llm_instances: int = Field(default=0, ge=0, le=_UINT32_MAX, alias="activeLlmInstances")
+    max_concurrent_llm_instances: int = Field(
+        default=0, ge=0, le=_UINT32_MAX, alias="maxConcurrentLlmInstances"
+    )
+    llm_initialization_failures: int = Field(
+        default=0, ge=0, le=_UINT32_MAX, alias="llmInitializationFailures"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class TrtllmInitialReport(_LlmCounterSnapshot):
     """TRT-LLM initial report event parameters.
 
     Sent once at startup with full environment and configuration details.
@@ -87,6 +105,9 @@ class TrtllmInitialReport(BaseModel):
     # Model info (architecture class name only -- no raw config) (LongString)
     architecture_class_name: str = Field(
         default="", max_length=_LONG_STR, alias="architectureClassName"
+    )
+    architecture_class_hash: str = Field(
+        default="", max_length=_LONG_STR, alias="architectureClassHash"
     )
 
     # TRT-LLM config
@@ -125,14 +146,66 @@ class TrtllmInitialReport(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class TrtllmHeartbeat(BaseModel):
+class TrtllmHeartbeat(_LlmCounterSnapshot):
     """TRT-LLM heartbeat event parameters.
 
     Sent periodically to signal the session is still alive.
-    Contains only a monotonically increasing sequence counter.
+    Contains a monotonically increasing sequence counter, process correlation
+    fields, and the latest aggregate LLM lifecycle counter snapshot.
     """
 
     seq: int = Field(..., ge=0, le=_UINT32_MAX, alias="seq")  # PositiveInt
+    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
+    disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
+    deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
+
+    model_config = {"populate_by_name": True}
+
+
+TerminationKind = Literal[
+    "clean",
+    "exception",
+    "signal",
+    "worker_failure",
+    "timeout",
+    "unknown",
+]
+LifecyclePhase = Literal[
+    "cli_parsing",
+    "config_validation",
+    "model_initialization",
+    "serving",
+    "shutdown",
+    "unknown",
+]
+TerminationComponent = Literal[
+    "llm",
+    "server",
+    "engine_worker",
+    "disagg_worker",
+    "unknown",
+]
+ReportingSource = Literal["self", "supervisor", "executor_proxy"]
+
+
+class TrtllmExitReport(_LlmCounterSnapshot):
+    """TRT-LLM terminal event parameters.
+
+    Sent at most once for a telemetry session when TRT-LLM or a surviving
+    observer can classify the session outcome. Unknown values use explicit
+    sentinels instead of inferred causes.
+    """
+
+    exit_code_known: bool = Field(..., alias="exitCodeKnown")
+    exit_code: int = Field(..., ge=0, le=_UINT32_MAX, alias="exitCode")
+    signal_number: int = Field(..., ge=0, le=_UINT32_MAX, alias="signalNumber")
+    termination_kind: TerminationKind = Field(..., alias="terminationKind")
+    lifecycle_phase: LifecyclePhase = Field(..., alias="lifecyclePhase")
+    component: TerminationComponent = Field(..., alias="component")
+    reporting_source: ReportingSource = Field(..., alias="reportingSource")
+    ingress_point: str = Field(default="", max_length=_SHORT_STR, alias="ingressPoint")
+    disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
+    deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
 
     model_config = {"populate_by_name": True}
 
@@ -238,7 +311,7 @@ def get_iso_timestamp(dt: Optional[datetime] = None) -> str:
 
 
 def build_gxt_payload(
-    event: Union[TrtllmInitialReport, TrtllmHeartbeat],
+    event: Union[TrtllmInitialReport, TrtllmHeartbeat, TrtllmExitReport],
     *,
     session_id: str,
     trtllm_version: str,
@@ -246,7 +319,7 @@ def build_gxt_payload(
     """Build a complete GXT payload dict ready for json.dumps().
 
     Args:
-        event: The TRT-LLM event to send (initial report or heartbeat).
+        event: The TRT-LLM event to send.
         session_id: Ephemeral session UUID (hex string).
         trtllm_version: TRT-LLM package version string.
 
@@ -259,6 +332,8 @@ def build_gxt_payload(
         event_name = "trtllm_initial_report"
     elif isinstance(event, TrtllmHeartbeat):
         event_name = "trtllm_heartbeat"
+    elif isinstance(event, TrtllmExitReport):
+        event_name = "trtllm_exit_report"
     else:
         raise TypeError(f"Unknown event type: {type(event).__name__}")
 
