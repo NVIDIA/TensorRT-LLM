@@ -902,6 +902,7 @@ def update_spec_config_from_model_config(spec_config,
         if num_nextn_predict_layers is None:
             num_nextn_predict_layers = 1
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
+    spec_config._validate_moe_backend_compatibility(model_config_resolved=True)
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 
     # Resolve max_draft_len when the user didn't set it:

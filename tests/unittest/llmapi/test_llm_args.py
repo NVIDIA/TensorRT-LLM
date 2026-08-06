@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           MambaStateConfig, MoeConfig,
                                           MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
-                                          PeftCacheConfig,
+                                          NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
@@ -131,6 +131,90 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     assert explicit_config.max_draft_len == 1
     assert explicit_config.max_total_draft_tokens == 1
     assert "max_draft_len" in explicit_config.model_fields_set
+
+
+@pytest.mark.cpu_only
+class TestDecodingBaseConfigMoeBackend:
+
+    def test_defaults_to_none(self):
+        config = DecodingBaseConfig()
+
+        assert config.moe_backend is None
+        assert config.model_dump()["moe_backend"] is None
+
+    @pytest.mark.parametrize(
+        "moe_backend",
+        [None, *get_args(MoeConfig.model_fields["backend"].annotation)],
+    )
+    def test_accepts_every_moe_backend(self, moe_backend):
+        config = DecodingBaseConfig(moe_backend=moe_backend)
+
+        assert config.moe_backend == moe_backend
+
+    @pytest.mark.parametrize("moe_backend", ["INVALID", "cutlass", 0])
+    def test_rejects_invalid_moe_backend(self, moe_backend):
+        with pytest.raises(ValidationError, match="moe_backend"):
+            DecodingBaseConfig(moe_backend=moe_backend)
+
+    def test_model_dump_and_yaml_parsing(self):
+        config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
+
+        assert config.model_dump()["moe_backend"] == "CUTLASS"
+
+        yaml_config = yaml.safe_load("""
+decoding_type: MTP
+max_draft_len: 1
+moe_backend: TRTLLM
+""")
+        restored = TypeAdapter(SpeculativeConfig).validate_python(yaml_config)
+
+        assert isinstance(restored, MTPDecodingConfig)
+        assert restored.moe_backend == "TRTLLM"
+        assert restored.model_dump()["moe_backend"] == "TRTLLM"
+
+    def test_autodeploy_rejects_override(self):
+        spec_config = MTPDecodingConfig(max_draft_len=1,
+                                        moe_backend="CUTLASS",
+                                        mtp_eagle_one_model=False)
+
+        with pytest.raises(ValidationError,
+                           match="available only with the PyTorch backend"):
+            AutoDeployLlmArgs(model="/target", speculative_config=spec_config)
+
+    def test_rejects_explicit_vanilla_mtp_override(self):
+        spec_config = MTPDecodingConfig(max_draft_len=1,
+                                        moe_backend="CUTLASS",
+                                        use_mtp_vanilla=True)
+
+        with pytest.raises(ValidationError,
+                           match="does not support one-engine MTP"):
+            TorchLlmArgs(model=llama_model_path, speculative_config=spec_config)
+
+    def test_defers_checkpoint_dependent_mtp_eagle_override_validation(self):
+        spec_config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
+
+        llm_args = TorchLlmArgs(model=llama_model_path,
+                                speculative_config=spec_config)
+
+        assert llm_args.speculative_config.moe_backend == "CUTLASS"
+
+    def test_accepts_two_engine_mtp_override(self):
+        spec_config = MTPDecodingConfig(max_draft_len=1,
+                                        moe_backend="CUTLASS",
+                                        mtp_eagle_one_model=False)
+
+        llm_args = TorchLlmArgs(model=llama_model_path,
+                                speculative_config=spec_config)
+
+        assert llm_args.speculative_config.moe_backend == "CUTLASS"
+
+    def test_rejects_override_without_neural_drafter(self):
+        spec_config = NGramDecodingConfig(max_draft_len=1,
+                                          moe_backend="CUTLASS")
+
+        with pytest.raises(ValidationError,
+                           match="requires a neural draft model"):
+            TorchLlmArgs(model=llama_model_path, speculative_config=spec_config)
 
 
 @pytest.mark.cpu_only
