@@ -69,8 +69,7 @@ from rules.tests_def_rule import TestsDefRule  # noqa: E402
 from rules.visual_gen_rule import VisualGenRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
-# Files the coverage tier maps to qualnames; without their diffs it can only
-# resolve at file level, and cannot tell an import-executed change apart.
+# Files the coverage tier maps to qualnames; without their diffs it stays file-level.
 COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
 
 # --- Rule registry -----------------------------------------------------------

@@ -115,11 +115,7 @@ def import_executed_qualnames(source: str) -> set[str]:
 
 
 def closure_attributed_qualnames(source: str, lines: set[int]) -> set[str]:
-    """Qualnames a changed line only reaches by walking out of a `<locals>` scope.
-
-    The producer records no closure frames, so such a qualname's rows are the
-    enclosing function's callers, not the changed code's.
-    """
+    """Qualnames a changed line only reaches by walking out of a `<locals>` scope."""
     try:
         tree = ast.parse(source)
     except SyntaxError:

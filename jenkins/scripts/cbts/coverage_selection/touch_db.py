@@ -210,12 +210,7 @@ class TouchDB:
         ]
 
     def incomplete_capture_tests(self) -> set[str]:
-        """Stage-prefixed tests the DB itself reports as incompletely captured.
-
-        `test_meta` (schema_version 2) records each test's pytest outcome and how
-        many processes saved coverage against how many the coordinator spawned;
-        absent on older DBs, which yield an empty set.
-        """
+        """Tests `test_meta` reports as not passed or short of the spawned process count."""
         try:
             rows = self._conn.execute(
                 "SELECT test FROM test_meta WHERE test != '' AND "
@@ -223,8 +218,7 @@ class TouchDB:
             )
         except sqlite3.OperationalError:
             return set()
-        # Intersect with the touch universe: rows for tests that recorded nothing
-        # are not selection candidates, and would break `untrusted <= known`.
+        # Tests that recorded nothing are not selection candidates.
         return {row[0] for row in rows} & self.known_tests()
 
     # -- coverage-completeness heuristic --
