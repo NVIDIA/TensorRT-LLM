@@ -29,8 +29,7 @@ from typing import Any, Tuple
 import torch
 from torch import nn
 
-from ..fused_moe.routing import (DeepSeekV3MoeRoutingMethod,
-                                 Deepseekv3RoutingImpl)
+from ..fused_moe.routing import DeepSeekV3MoeRoutingMethod, Deepseekv3RoutingImpl
 
 
 class KimiK3MoEGate(nn.Module):
@@ -89,7 +88,9 @@ class KimiK3MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((self.num_experts, self.gating_dim), dtype=weight_dtype)
         )
-        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts))
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty(self.num_experts, dtype=torch.float32)
+        )
 
         self.softmax_routing_mutation = softmax_routing_mutation
         self.biased_weights_mutation = biased_weights_mutation
@@ -145,8 +146,7 @@ class KimiK3MoEGate(nn.Module):
         parameter mapping identity.
         """
         hidden_2d = hidden_states.reshape(-1, self.gating_dim)
-        if (self.weight.dtype == torch.bfloat16
-                and hidden_2d.dtype == torch.bfloat16):
+        if self.weight.dtype == torch.bfloat16 and hidden_2d.dtype == torch.bfloat16:
             # Single bf16xbf16 -> fp32 GEMM (fp32 accumulate); no input
             # upcast kernel, no fp32 splitK-reduce. K3's 896 experts miss
             # the op's specialized 256-expert kernels and take its cublas
@@ -204,7 +204,7 @@ class KimiK3MoEGate(nn.Module):
             # indices (as ``torch.topk`` yields) and fp32 weights -- so every
             # downstream consumer is byte-for-byte unaffected by the swap.
             topk_weight, topk_idx = self._routing_impl.noaux_tc(
-                logits, self.e_score_correction_bias.float()
+                logits, self.e_score_correction_bias
             )
             return topk_idx.to(torch.int64), topk_weight.to(torch.float32)
 
