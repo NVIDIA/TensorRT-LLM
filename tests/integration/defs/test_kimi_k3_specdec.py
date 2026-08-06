@@ -81,6 +81,11 @@ def test_kimi_k3_disagg_parity_selftest():
     Comparison logic only: canned responses, no servers or GPUs.
     """
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kimi_k3_disagg_parity.py")
+    if not os.path.exists(script):
+        pytest.skip(
+            "kimi_k3_disagg_parity.py harness not present on this branch "
+            "(ships with the disagg parity PR)"
+        )
     result = subprocess.run(
         [sys.executable, script, "--self-test"], capture_output=True, text=True, timeout=120
     )

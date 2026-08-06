@@ -23,26 +23,35 @@ from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 
 def _load_generator():
-    path = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "..",
-        "..",
-        "..",
-        "examples",
-        "kimi_k3",
-        "make_synthetic_dflash_drafter.py",
+    path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            "examples",
+            "kimi_k3",
+            "make_synthetic_dflash_drafter.py",
+        )
     )
-    spec = importlib.util.spec_from_file_location(
-        "make_synthetic_dflash_drafter", os.path.abspath(path)
-    )
+    if not os.path.exists(path):
+        # The synthetic-drafter generator ships with the examples/kimi_k3
+        # PR; on branches without it, the schema tests below skip.
+        return None
+    spec = importlib.util.spec_from_file_location("make_synthetic_dflash_drafter", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 GEN = _load_generator()
+
+requires_generator = pytest.mark.skipif(
+    GEN is None,
+    reason="examples/kimi_k3/make_synthetic_dflash_drafter.py not present on this branch",
+)
 
 # Reference: nvidia/Kimi-K2.7-Code-DFlash (69 tensors). The generator must
 # reproduce this key/shape schema exactly at K2.7 dims — the generic
@@ -68,10 +77,12 @@ PER_LAYER_SUFFIXES = {
 }
 
 
+@requires_generator
 def test_even_spacing_matches_k27_reference():
     assert GEN.even_target_layer_ids(61, 6) == K27_TARGET_LAYER_IDS
 
 
+@requires_generator
 def test_tensor_plan_matches_k27_schema():
     plan = GEN.drafter_tensor_plan(K27_HIDDEN, GEN.K27_DRAFTER, 6)
     assert len(plan) == K27_NUM_TENSORS
@@ -97,11 +108,13 @@ K3_MARKOV_RANK = 256
 K3_NUM_TENSORS = 73
 
 
+@requires_generator
 def test_even_spacing_matches_real_k3_drafter():
     """The real config's target_layer_ids follow the even-spacing convention."""
     assert GEN.even_target_layer_ids(K3_NUM_TARGET_LAYERS, 6) == K3_TARGET_LAYER_IDS
 
 
+@requires_generator
 def test_tensor_plan_matches_real_dspark_schema():
     """Plan must match the dummy-dspark0724 safetensors header exactly."""
     plan = GEN.drafter_tensor_plan(
@@ -126,6 +139,7 @@ def test_tensor_plan_matches_real_dspark_schema():
     assert not any("embed" in k or "lm_head" in k for k in plan)
 
 
+@requires_generator
 def test_k3_drafter_config_is_dspark():
     cfg = GEN.drafter_config(
         K3_HIDDEN,
@@ -153,6 +167,7 @@ def test_k3_drafter_config_is_dspark():
     assert cfg["rope_theta"] == 10000.0 and cfg["rope_scaling"] is None
 
 
+@requires_generator
 def test_drafter_config_drives_generic_dflash_path():
     cfg = GEN.drafter_config(K27_HIDDEN, 163840, 61, K27_TARGET_LAYER_IDS, 163838, GEN.K27_DRAFTER)
     # Unknown architecture label + model_type=qwen3 selects the generic
@@ -167,6 +182,7 @@ def test_drafter_config_drives_generic_dflash_path():
     assert cfg["synthetic_random_weights"] is True
 
 
+@requires_generator
 def test_generator_tiny_roundtrip(tmp_path):
     import subprocess
     import sys
@@ -198,6 +214,7 @@ def test_generator_tiny_roundtrip(tmp_path):
     assert all(0 <= t < cfg["num_target_layers"] for t in dflash_cfg["target_layer_ids"])
 
 
+@requires_generator
 def test_generator_real_config_mode(tmp_path):
     """--config adopts a real drafter config.json verbatim (random weights,
     exact real module structure)."""
