@@ -638,7 +638,7 @@ class TestPrepareActionLatents:
         )
 
     def test_forward_dynamics_pads_a_short_trajectory_by_holding_the_last_step(self):
-        latents, mask, clean, raw_dim = self._prepare(
+        latents, _, clean, raw_dim = self._prepare(
             "forward_dynamics", raw_action_dim=None, action_input=[[1.0, 2.0], [3.0, 4.0]]
         )
         assert raw_dim == 2
