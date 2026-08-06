@@ -62,7 +62,9 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
-def _stream_parse(parser_key: str, text: str, chunk_size: int = 1):
+def _stream_parse(parser_key: str,
+                  text: str,
+                  chunk_size: int = 1) -> tuple[str, str]:
     """Apply parse_delta in chunks then finish; return concatenated fields."""
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         parser_key)
@@ -126,6 +128,46 @@ def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
         content, reasoning_context = _stream_parse(parser_key, text, chunk_size)
         assert content == expected.content
         assert reasoning_context == expected.reasoning_content
+
+
+def test_interleaved_second_think_with_content_prefix_same_delta() -> None:
+    """Content before a later <think> in the same delta must not be dropped.
+
+    CodeRabbit #17296 follow-up: after the first reasoning block,
+    ``"y<think>z"`` should keep ``y`` as content and ``z`` as reasoning.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("deepseek-r1")
+    # First block: reason1</think>
+    r1 = parser.parse_delta("reason1")
+    assert r1.reasoning_content == "reason1"
+    r2 = parser.parse_delta(R1_END)
+    assert r2.content == "" and r2.reasoning_content == ""
+    # Interleaved content + second open in one delta
+    r3 = parser.parse_delta(f"y{R1_START}z")
+    assert r3.content == "y"
+    assert r3.reasoning_content == "z"
+    r4 = parser.parse_delta(R1_END)
+    assert r4.content == ""
+    assert r4.reasoning_content == ""
+    r5 = parser.parse_delta("tail")
+    assert r5.content == "tail"
+
+
+def test_qwen3_interleaved_second_think_with_content_prefix_same_delta(
+) -> None:
+    """Same interleaved prefix rule for qwen3 (hold-preamble only first open)."""
+    parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
+    for d, exp_c, exp_r in [
+        (R1_START, "", ""),
+        ("reason1", "", "reason1"),
+        (R1_END, "", ""),
+        (f"mid{R1_START}reason2", "mid", "reason2"),
+        (R1_END, "", ""),
+        ("end", "end", ""),
+    ]:
+        res = parser.parse_delta(d)
+        assert res.content == exp_c, (d, res.content, exp_c)
+        assert res.reasoning_content == exp_r, (d, res.reasoning_content, exp_r)
 
 
 def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
