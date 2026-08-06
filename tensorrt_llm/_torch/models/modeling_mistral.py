@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import dataclasses
 from typing import Any, Dict, List, Sequence, Tuple
@@ -23,7 +26,8 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, PreparedLlmInputs)
+    MultimodalModelMixin, PreparedLlmInputs,
+    make_multimodal_encoder_model_config)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -744,6 +748,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
                              persistent=False)
 
         model_config_cp = copy.deepcopy(model_config)
+        encoder_model_config = make_multimodal_encoder_model_config(
+            model_config_cp)
 
         llm_model_config = self._get_sub_model_config(model_config_cp,
                                                       "text_config")
@@ -759,7 +765,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
 
         # NOTE: current `modelopt` does not support quantizing the vision portion.
         # NOTE: attn_backend: Pixtral head size not always divisible by 128
-        vision_model_config = self._get_sub_model_config(model_config_cp,
+        vision_model_config = self._get_sub_model_config(encoder_model_config,
                                                          "vision_config",
                                                          attn_backend="TRTLLM",
                                                          quant_config=None)
@@ -767,7 +773,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
         self._multi_modal_projector = Mistral3MultiModalProjector(
-            model_config).eval()
+            encoder_model_config).eval()
         self._post_config()
 
     # This is necessary because the executor looks at
