@@ -22,6 +22,7 @@ import triton.language as tl
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...memory_buffer_utils import get_memory_buffers
@@ -31,6 +32,32 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
+
+_DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS = 18688
+
+
+def _configure_deepgemm_moe_max_num_tokens(model_config: ModelConfig) -> None:
+    moe_max_num_tokens = model_config.moe_max_num_tokens
+    if moe_max_num_tokens is None:
+        raise ValueError("moe_max_num_tokens must be set before creating MoE")
+
+    if not model_config._moe_max_num_tokens_is_default:
+        if moe_max_num_tokens > _DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS:
+            logger.warning_once(
+                "DeepGEMM moe_max_num_tokens is explicitly set to "
+                f"{moe_max_num_tokens}, above the conservative default "
+                f"{_DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS}; this may increase "
+                "GPU memory usage.",
+                key="deepgemm_explicit_moe_max_num_tokens")
+        return
+
+    if moe_max_num_tokens <= _DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS:
+        return
+
+    was_frozen = model_config._frozen
+    model_config._frozen = False
+    model_config.moe_max_num_tokens = (_DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS)
+    model_config._frozen = was_frozen
 
 
 @triton.jit
@@ -807,11 +834,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
         # moe_max_num_tokens = max_num_tokens * 2 = 18688
         # It can avoid OOM for 8k/1k cases.
-        default_moe_max_num_tokens = 18688
-        if model_config.moe_max_num_tokens > default_moe_max_num_tokens:
-            model_config._frozen = False
-            model_config.moe_max_num_tokens = default_moe_max_num_tokens
-            model_config._frozen = True
+        # Preserve an explicit deployment value. Only clamp the derived
+        # default, which keeps the existing OOM-safe behavior when the user
+        # does not size the DeepGEMM workspace deliberately.
+        _configure_deepgemm_moe_max_num_tokens(model_config)
 
         super().__init__(
             routing_method=routing_method,

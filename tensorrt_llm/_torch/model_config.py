@@ -157,6 +157,12 @@ class ModelConfig(Generic[TConfig]):
     max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
+    # Preserve whether the value came from the user across dataclasses.replace().
+    # DeepGEMM uses this metadata to apply its conservative default only when
+    # max_num_tokens was not explicitly configured.
+    _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
+                                                           repr=False,
+                                                           compare=False)
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
@@ -257,10 +263,16 @@ class ModelConfig(Generic[TConfig]):
             self.allreduce_strategy = get_all_reduce_strategy(
                 self.allreduce_strategy)
 
-        # Set default moe_max_num_tokens if not specified
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        # Set default moe_max_num_tokens if not specified. The maximum number
+        # of tokens in MoE is multiplied by DP size when attention DP is
+        # enabled.
+        if self._moe_max_num_tokens_is_default is None:
+            self._moe_max_num_tokens_is_default = (self.moe_max_num_tokens
+                                                   is None)
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+        if self.moe_max_num_tokens <= 0:
+            raise ValueError("moe_max_num_tokens must be a positive integer")
 
     @property
     def torch_dtype(self) -> torch.dtype:
