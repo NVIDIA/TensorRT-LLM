@@ -3506,11 +3506,35 @@ class PyExecutor:
         # wall-clock (18 calls, 211 ms mean) because it spans every rank in the
         # deployment, so each call waits on the slowest participant anywhere.
         #
-        # Removal is safe because transfer completion is still reaped at the
-        # other call sites in the executor loop; only the ones inside this
-        # method are dropped. Both replacements are rank-uniform and contain no
-        # collectives, so ranks cannot diverge -- the deadlock the voting
-        # guarded against cannot arise once nothing here is conditional.
+        # The votes are still dropped, but the REAP is not. The original claim
+        # here -- "removal is safe because transfer completion is still reaped
+        # at the other call sites" -- is false: every other reap site sits
+        # behind the attention-DP `_can_queue` gate, so a rank whose scheduled
+        # batch is empty stops reaping entirely. Combined with the ADP
+        # empty-scheduled-batch forward-progress veto that turns a transient
+        # stall into a permanent, silent fleet-wide hang.
+        #
+        # Reproduced and fixed by measurement on the GLM-5.2 AgentX CTX-only
+        # conc32 cell (Lyris GB200, 4 nodes, 512k, tp8), which hangs 3/3 on
+        # this branch: frozen mid-warmup at returned={30,34,26}/37 with exactly
+        # one CTX "Observed timeout on context request". With the two
+        # non-blocking reaps below restored -- same image, same config, this
+        # the only variable -- warmup COMPLETED and the run reached the
+        # measurement phase with 0 transfer timeouts (SLURM 2591522).
+        #
+        # Both calls are non-blocking (atLeastNum=0) and rank-uniform: every
+        # rank enters them unconditionally, and each performs its own internal
+        # consensus, so no vote is needed and ranks cannot diverge. This keeps
+        # the collectives this commit's parent removed for perf, while
+        # restoring the forward-progress property it accidentally removed.
+        # Upstream equivalent: PR #17324.
+        if not self._uses_async_disagg_gen_transfer():
+            # A synchronous GEN receive is rank-local and blocking, so one rank
+            # can still be receiving while another is idle; entering either
+            # progress collective is unsafe in that mode.
+            return
+        self._check_disagg_ctx_cache_transfer_status(0)
+        self._check_disagg_gen_cache_transfer_status(0)
         return
 
         local_need_check = (num_fitting_reqs == 0
