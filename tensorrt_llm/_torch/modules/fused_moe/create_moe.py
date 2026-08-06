@@ -9,7 +9,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from ...model_config import ModelConfig
 from ...peft.lora.validation import check_moe_lora_supported
-from ...utils import ActivationType, AuxStreamType
+from ...utils import ActivationType, ActType_TrtllmGen, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -261,6 +261,9 @@ def create_moe_backend(
     swiglu_limit_scalar: Optional[float] = None,
     init_load_balancer: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
+    trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+    trtllm_gen_activation_alpha: Optional[float] = None,
+    trtllm_gen_activation_beta: Optional[float] = None,
 ) -> MoE:
     """
     Create MoE backend instance with validation.
@@ -284,6 +287,9 @@ def create_moe_backend(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
+        trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
+        trtllm_gen_activation_alpha: Optional backend-local activation alpha
+        trtllm_gen_activation_beta: Optional backend-local activation beta
 
     Returns:
         MoE: MoE backend instance
@@ -369,7 +375,17 @@ def create_moe_backend(
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            trtllm_gen_activation_type=trtllm_gen_activation_type,
+            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
         )
+
+    if any(value is not None for value in (trtllm_gen_activation_type,
+                                           trtllm_gen_activation_alpha,
+                                           trtllm_gen_activation_beta)):
+        raise ValueError(
+            "TRTLLM-Gen backend-local activation options are only supported "
+            f"by TRTLLMGenFusedMoE, got {moe_cls.__name__}")
     elif moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
         # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
         # also subclass CutlassFusedMoE but have narrower constructors, so
@@ -549,6 +565,10 @@ def create_moe(
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+    trtllm_gen_activation_alpha: Optional[float] = None,
+    trtllm_gen_activation_beta: Optional[float] = None,
+    communication_method: Optional[str] = None,
 ) -> MoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -572,6 +592,10 @@ def create_moe(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
+        trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
+        trtllm_gen_activation_alpha: Optional backend-local activation alpha
+        trtllm_gen_activation_beta: Optional backend-local activation beta
+        communication_method: Optional ConfigurableMoE communication method
 
     Returns:
         MoE: MoE instance
@@ -597,6 +621,14 @@ def create_moe(
 
     moe_cls = resolve_moe_cls(model_config, routing_method, dtype,
                               override_quant_config, layer_idx)
+    if (any(value is not None for value in (trtllm_gen_activation_type,
+                                            trtllm_gen_activation_alpha,
+                                            trtllm_gen_activation_beta))
+            and moe_cls is not TRTLLMGenFusedMoE):
+        raise ValueError(
+            "A TRTLLM-Gen backend-local activation requires "
+            "TRTLLMGenFusedMoE without backend fallback, but resolved "
+            f"{moe_cls.__name__}.")
 
     if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                    CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
@@ -620,10 +652,16 @@ def create_moe(
             swiglu_limit=swiglu_limit,
             swiglu_limit_scalar=swiglu_limit_scalar,
             activation_type=activation_type,
+            trtllm_gen_activation_type=trtllm_gen_activation_type,
+            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
+            communication_method=communication_method,
         )
 
     # WideEPMoE, TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
     # and own their communication and forward paths.
+    if communication_method is not None:
+        raise ValueError("communication_method requires ConfigurableMoE.")
     return create_moe_backend(
         moe_cls=moe_cls,
         routing_method=routing_method,
@@ -643,4 +681,7 @@ def create_moe(
         swiglu_limit=swiglu_limit,
         swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
+        trtllm_gen_activation_type=trtllm_gen_activation_type,
+        trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+        trtllm_gen_activation_beta=trtllm_gen_activation_beta,
     )
