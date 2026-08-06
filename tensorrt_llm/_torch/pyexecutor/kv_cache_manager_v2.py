@@ -16,8 +16,8 @@ import hashlib
 import math
 import os
 import sys
-from collections import OrderedDict, defaultdict
-from dataclasses import dataclass, replace
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -60,13 +60,13 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
-    LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -153,13 +153,14 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
-    planned_drop_handle: Optional[PlannedDropHandle] = None
+    planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
 
 
 class ConversationManager:
     """Track the current request and drop plan for each conversation."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_num_turns: int) -> None:
+        self._max_num_turns = max_num_turns
         self._conversation_states: Dict[str, _ConversationState] = {}
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
@@ -180,10 +181,9 @@ class ConversationManager:
                 f"{conversation_id} have been dropped."
             )
         else:
-            previous_handle = state.planned_drop_handle
-            state.planned_drop_handle = drop_handle
-            if previous_handle is not None:
-                previous_handle.drop()
+            state.planned_drop_handles.append(drop_handle)
+            if len(state.planned_drop_handles) > self._max_num_turns:
+                state.planned_drop_handles.popleft().drop()
 
         self.finish_request(request)
 
@@ -215,7 +215,7 @@ class ConversationManager:
             return
 
         state.current_request_id = None
-        if state.planned_drop_handle is None:
+        if not state.planned_drop_handles:
             self._conversation_states.pop(conversation_id)
 
     def clear(self) -> None:
@@ -767,6 +767,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        is_estimating_kv_cache: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -789,12 +790,20 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+
+        # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
+        # can distinguish the throwaway estimation-phase managers from the
+        # final ones: the estimation cache is sized with no headroom for
+        # retained dummy requests.
+        self.is_estimating_kv_cache = is_estimating_kv_cache
+
         # Set True by a compression manager; generation-step resize then leaves history untouched.
         self.kv_compression_manages_history: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
-        self.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
+        block_reuse_config = kv_cache_config.block_reuse_config
+        self.block_reuse_policy = BlockReusePolicy(block_reuse_config.block_reuse_policy)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -1136,7 +1145,11 @@ class KVCacheManagerV2(BaseResourceManager):
             and self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION
             and not self.is_draft
         )
-        self.conversation_manager = ConversationManager() if enable_conversation_manager else None
+        self.conversation_manager = (
+            ConversationManager(block_reuse_config.max_num_turns)
+            if enable_conversation_manager
+            else None
+        )
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1217,24 +1230,39 @@ class KVCacheManagerV2(BaseResourceManager):
             for pool_id in range(self.num_pools):
                 layer_id = self.impl.layer_grouping[pool_id][0]
                 role_a, _ = self._get_pool_roles(pool_id)
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED),
-                        0,
-                    ]
+                key_base_addr = self.impl.get_mem_pool_base_address(
+                    layer_id, role_a, PageIndexMode.SHARED
                 )
+                kv_cache_pool_pointers_list.append([key_base_addr, 0])
                 if self.dtype == DataType.NVFP4:
+                    # The KEY/scale pointers are a (rep-layer, 0-offset) origin
+                    # against which each layer's kv_cache_pool_mapping offset is
+                    # resolved. The block-scale origin must reproduce the SAME
+                    # per-layer offset() as KEY, so mirror the KEY base for the
+                    # same representative layer and shift it back by that layer's
+                    # offset. For the base manager offset(rep) == 0, so this is
+                    # just the rep layer's scale base; for address-ranked
+                    # subclasses (MiniMax-M3) offset(rep) may be non-zero, and the
+                    # shift lands the origin on the pool's slot-0 scale address.
+                    # This keeps block_scale_offset == offset without depending on
+                    # the non-contractual layer_grouping order.
                     block_scale_role = self._get_block_scale_role(role_a)
-                    block_scale_pool_pointers_list.append(
-                        [
+                    if block_scale_role is not None:
+                        rep_offset = self._kv_pool_mapping_offset(layer_id, pool_id, key_base_addr)
+                        scale_stride = (
+                            self.get_layer_bytes_per_token(layer_id, block_scale_role)
+                            * self.kv_factor
+                            * self.tokens_per_block
+                        )
+                        scale_base_addr = (
                             self.impl.get_mem_pool_base_address(
                                 layer_id, block_scale_role, PageIndexMode.SHARED
                             )
-                            if block_scale_role is not None
-                            else 0,
-                            0,
-                        ]
-                    )
+                            - rep_offset * scale_stride
+                        )
+                    else:
+                        scale_base_addr = 0
+                    block_scale_pool_pointers_list.append([scale_base_addr, 0])
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)
@@ -1472,14 +1500,19 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
-        attr = self.impl._storage.get_buffer_attr(layer_id, role)
-        pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
-        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
-        return (
-            f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
-            f"lifecycle_id={int(attr.life_cycle_id)}, "
-            f"lifecycle={lifecycle}"
-        )
+        for pool_group in self.impl.pool_group_descs:
+            for variant in pool_group.slot_desc.variants:
+                for coalesced in variant.coalesced_buffers:
+                    for buffer_id in coalesced.buffer_ids:
+                        if int(buffer_id.layer_id) == int(layer_id) and str(buffer_id.role) == str(
+                            role
+                        ):
+                            return (
+                                f"role={role!s}, "
+                                f"pool_group_id={int(pool_group.pool_group_index)}, "
+                                f"layer_group_id={int(variant.layer_group_id)}"
+                            )
+        return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
@@ -2000,15 +2033,23 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_offset = self.layer_offsets[layer_idx]
         try:
             addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
-            page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
-            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
-            converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
-        except KeyError:
+        except (KeyError, IndexError):
             # INDEX_KEY not registered for this layer (default V2 manager
             # registers only K/V/scale; sparse subclasses register
             # INDEX_KEY only on sparse layers via
             # ``_extra_buffers_per_layer``).
+            #
+            # The python backend raises ``KeyError`` from the missing dict
+            # lookup; the C++ backend's ``getBufferAttr`` throws
+            # ``std::out_of_range`` for an unknown buffer id, which nanobind
+            # maps to ``IndexError``. Catch both so the "role not registered
+            # -> None" contract holds on either backend.
             return None
+        # INDEX_KEY is registered; the remaining lookups must succeed. Keep them
+        # outside the try so genuine failures surface instead of returning None.
+        page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
+        converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
 
         if isinstance(dtype, DataType):
             torch_dtype = binding_to_torch_dtype(dtype)
@@ -2126,15 +2167,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
 
-        For a disagg gen request whose KV transmission just completed
-        (state == DISAGG_GENERATION_TRANS_COMPLETE), py_draft_tokens is
-        still [] when the scheduler asks for capacity, because it gets
-        mirrored from context_phase_params.draft_tokens later in
-        _prepare_disagg_gen_transmission_complete (which runs AFTER the
-        scheduler in the executor loop). Without compensating here, the
-        first gen forward writes 1 + len(ctx_draft_tokens) tokens into
-        KV cache but only +1 was reserved, OOB-ing the KV block table at
-        the next tokens_per_block-aligned boundary.
+        During the context-to-generation transition, ``py_draft_tokens`` is
+        still empty when the scheduler asks for capacity. Prefer transferred
+        context draft tokens; if there are none, reserve the generation
+        worker's configured draft capacity before its first forward pass.
         """
         draft_len = get_draft_token_length(req)
         if (
@@ -2145,6 +2181,8 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
+            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
+                draft_len = self.max_total_draft_tokens
         return draft_len
 
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
@@ -2558,13 +2596,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._stats_window_size(life_cycle.window_size)
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
-        return self.impl._storage.get_statistics(cache_level)
+        return _introspection.storage_statistics(self.impl, cache_level)
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
-        pool_groups_by_life_cycle = [
-            self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
-            for life_cycle_id in range(len(self.impl.layer_grouping))
-        ]
+        # life cycle (== layer group) -> pool group is static structure exposed by
+        # the public pool_group_descs API; no introspection needed.
+        pool_groups_by_life_cycle = {
+            int(variant.layer_group_id): int(pool_group.pool_group_index)
+            for pool_group in self.impl.pool_group_descs
+            for variant in pool_group.slot_desc.variants
+        }
 
         metadata: dict[int, tuple[int, Optional[int], str]] = {}
         for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):

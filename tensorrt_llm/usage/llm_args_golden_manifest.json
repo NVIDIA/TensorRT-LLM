@@ -555,6 +555,47 @@
       "path": "iter_stats_max_iterations"
     },
     {
+      "allowed_values": [
+        "triattention"
+      ],
+      "annotation": "Literal['triattention']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.beta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.budget"
+    },
+    {
+      "allowed_values": [
+        "union",
+        "per_head",
+        "per_layer_perhead"
+      ],
+      "annotation": "Literal['union', 'per_head', 'per_layer_perhead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -577,7 +618,14 @@
       "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
-      "path": "kv_cache_config.block_reuse_policy"
+      "path": "kv_cache_config.block_reuse_config.block_reuse_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.max_num_turns"
     },
     {
       "allowed_values": [],
@@ -655,6 +703,13 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.event_buffer_max_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
     },
     {
       "allowed_values": [],
@@ -1431,6 +1486,13 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.index_n_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_share_for_mtp_iteration"
     },
     {
       "allowed_values": [],
