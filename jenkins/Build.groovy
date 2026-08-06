@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/yuanjingx/split-gb300', 'trtllm-jenkins-shared-lib@main']) _
 
 import groovy.transform.Field
 
