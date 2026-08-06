@@ -845,19 +845,19 @@ def _cba_step_math(
     # `min_kept > neg_inf` means the pool holds `caps` finished hypotheses,
     # i.e. the C++ `numBeamsCBA[slot] >= nBM` test.
     pool_full = min_kept > neg_inf
-    if early_stopping == BeamSearchEarlyStop.TRUE:
-        # HF `True`: stop as soon as `beam_width` finished candidates exist,
-        # without weighing what is still attainable. Matches C++
-        # beamStage3Kernel, which short-circuits to done here.
-        done = pool_full
+    if early_stopping != BeamSearchEarlyStop.FALSE:
+        max_gen = (max_seq_len - prompts.view(-1)).to(cand_len.dtype)
+        bound_len = torch.where(exponent.view(-1) > 0, max_gen, cand_len.view(-1))
     else:
-        if early_stopping != BeamSearchEarlyStop.FALSE:
-            max_gen = (max_seq_len - prompts.view(-1)).to(cand_len.dtype)
-            bound_len = torch.where(exponent.view(-1) > 0, max_gen, cand_len.view(-1))
-        else:
-            bound_len = cand_len.view(-1)
-        best_attainable = cand_cum[:, 0] / bound_len.to(cand_cum.dtype).pow(exponent.view(-1))
-        done = pool_full & (min_kept >= best_attainable)
+        bound_len = cand_len.view(-1)
+    best_attainable = cand_cum[:, 0] / bound_len.to(cand_cum.dtype).pow(exponent.view(-1))
+    # HF `True` stops as soon as `beam_width` finished candidates exist, without
+    # weighing what is still attainable -- C++ beamStage3Kernel short-circuits
+    # to done there. Fold that into the same expression rather than branching on
+    # it: `early_stopping` is a plain int here, so an extra Python branch is an
+    # extra Dynamo guard and recompilation of this fullgraph function.
+    ignore_attainable = early_stopping == BeamSearchEarlyStop.TRUE
+    done = pool_full & (ignore_attainable | (min_kept >= best_attainable))
 
     # Reorder the finish handler's rolling stop-word window to follow the
     # beam swap (matching stays correct across swaps).

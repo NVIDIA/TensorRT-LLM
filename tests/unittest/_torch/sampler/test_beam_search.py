@@ -18,7 +18,6 @@ import os
 import pathlib as _pl
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Generator, cast
 
@@ -33,13 +32,13 @@ from utils.util import assert_no_cuda_sync, force_ampere, run_test_with_warmup
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams, TorchLlmArgs
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                        LlmRequestState,
                                                         SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
-from tensorrt_llm._torch.pyexecutor.sampler.beam_search import _finalize_beam
-from tensorrt_llm._torch.pyexecutor.sampler.logprobs import \
-    convert_logprobs_tensor_to_list
+from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
+    CBAGroupHost, _finalize_beam, _gather_beam_path, _prepare_beam_history_cba)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
     CBAState, _StrategyImpls, beam_search_sampling_batch)
@@ -1996,6 +1995,30 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     assert request.py_beam_width == max(beam_width_array)
 
 
+def test_beam_strategy_grouping_key_tolerates_trailing_fields():
+    """The grouping key must not depend on the BeamSearch tuple's arity.
+
+    strategy_grouping_key() pattern-matches the strategy tuple. It used to
+    match exactly the fields known at the time, so appending row_stride made
+    every beam-search strategy fall through to the "Unsupported strategy"
+    branch and beam search failed for every request. Unit tests missed it
+    because they build the ops and step classes directly, bypassing the
+    grouping layer. Pin that trailing fields are ignored.
+    """
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import \
+        FlashInferGroupedStrategySampler
+
+    strategy = _beam_strategy(early_stopping=BeamSearchEarlyStop.TRUE)
+    key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
+    assert key == ("beam_search", strategy.beam_width_in,
+                   strategy.beam_width_out, BeamSearchEarlyStop.TRUE)
+
+    # row_stride is not part of the key: requests differing only in it still
+    # group together.
+    other = strategy._replace(row_stride=strategy.row_stride + 1)
+    assert FlashInferGroupedStrategySampler.strategy_grouping_key(other) == key
+
+
 def test_vbws_uniform_array_matches_fixed_width():
     """A constant beam_width_array must behave exactly like a fixed width."""
     max_beam_width = 4
@@ -2031,163 +2054,133 @@ def test_vbws_dummy_requests_excluded_from_width_check():
             "the mixed-beam-width check in ModelEngine and abort the batch")
 
 
-def test_create_beam_history():
-    """Test TorchSampler._create_beam_history method.
+def test_gather_beam_path_follows_cache_indirection():
+    """Beam ancestry is reconstructed by following cache_indirection.
 
-    This test verifies that beam history is correctly reconstructed by following
-    the cache_indirection backwards to obtain the correct token sequence.
+    Where C++ walks parent pointers back one step at a time, the Python side
+    keeps cache_indirection as an already-flattened ancestry table and
+    reconstructs a beam's tokens with a single gather. This pins that gather,
+    which both finalization paths share.
+
+    NB: this used to drive _prepare_beam_history end to end. That is now the
+    CBA path, which merges the finished-candidate pool into the active beams
+    and reorders the result by normalized score, so a per-beam expectation
+    computed from cache_indirection alone no longer describes its output. The
+    merge and ordering are covered by
+    test_cba_finalize_merges_pool_and_orders_by_score below.
     """
 
-    @contextmanager
-    def _uut_provider(
-            is_warmup: bool) -> Generator[Callable[[], None], None, None]:
-        test_params = GeneralTestParams()
-        request = create_default_request(test_params)
-        sampler = create_default_sampler(test_params)
+    test_params = GeneralTestParams()
+    beam_width = test_params.beam_width
+    num_generated_tokens = test_params.num_generated_tokens
 
-        # Extract parameters from the test parameters
-        beam_width = test_params.beam_width
-        prompt_len = test_params.prompt_len
-        num_generated_tokens = test_params.num_generated_tokens
-        seq_slot = test_params.seq_slot
-        vocab_size = test_params.vocab_size
-        num_logprobs = test_params.num_logprobs + 1
-        beam_search_store = sampler.store.beam_search_store
-        assert beam_search_store is not None
-        cache_indirection = beam_search_store.cache_indirection
-        assert cache_indirection is not None
-        original_tokens = beam_search_store.original_tokens
-        assert original_tokens is not None
-        original_logprobs = torch.zeros(
-            (beam_width, num_generated_tokens, num_logprobs),
-            dtype=torch.float32,
-            device=original_tokens.device)
-        original_logprob_indices = torch.zeros(
-            (beam_width, num_generated_tokens, num_logprobs),
-            dtype=torch.int32,
-            device=original_tokens.device)
-        original_cum_logprobs = beam_search_store.cum_log_probs
-        assert original_cum_logprobs is not None
+    torch.manual_seed(42)
+    # current_path[beam, t] is the token beam `beam` held at position t before
+    # correction; cache_indirection[beam, t] names the beam it descended from
+    # at that position.
+    current_path = torch.randint(0,
+                                 test_params.vocab_size,
+                                 (beam_width, num_generated_tokens),
+                                 dtype=torch.int32,
+                                 device="cuda")
+    cache_indirection = torch.randint(0,
+                                      beam_width,
+                                      (beam_width, num_generated_tokens),
+                                      dtype=torch.int64,
+                                      device="cuda")
 
-        # Fill the request with some random tokens that will be overwritten by the beam search sampling
-        # Beam history is created before add_token is called
-        request.set_generated_tokens(
-            torch.randint(0,
-                          vocab_size, (beam_width, num_generated_tokens - 1),
-                          dtype=torch.int32).tolist())
-        # random fill
-        torch.manual_seed(42)
-        original_tokens[seq_slot, :beam_width, prompt_len:prompt_len +
-                        num_generated_tokens] = torch.randint(
-                            0,
-                            beam_width, (beam_width, num_generated_tokens),
-                            dtype=torch.int32)
-        assert original_tokens.sum(
-        ) > 0, "Original tokens must not only contain zeros. Otherwise change the seed."
+    corrected = _gather_beam_path(current_path=current_path,
+                                  cache_indirection=cache_indirection)
 
-        original_logprobs[:beam_width] = torch.randn(
-            (beam_width, num_generated_tokens, original_logprobs.shape[-1]),
-            dtype=torch.float32)
-        original_logprob_indices[:beam_width] = torch.randint(
-            0,
-            vocab_size,
-            (beam_width, num_generated_tokens, original_logprobs.shape[-1]),
-            dtype=torch.int32)
-        assert (original_logprobs != 0).sum(
-        ) > 0, "Original log probs must not only contain zeros. Otherwise change the seed."
-        assert (original_logprob_indices).sum(
-        ) > 0, "Original log prob indices must not only contain zeros. Otherwise change the seed."
+    expected = torch.zeros_like(current_path)
+    for beam in range(beam_width):
+        for t in range(num_generated_tokens):
+            expected[beam, t] = current_path[cache_indirection[beam, t], t]
+    torch.testing.assert_close(corrected, expected)
 
-        # set the logprobs in the request:
-        token_logprobs = convert_logprobs_tensor_to_list(
-            original_logprob_indices[:beam_width, :num_generated_tokens - 1],
-            original_logprobs[:beam_width, :num_generated_tokens - 1],
-        )
-        request.py_result.set_log_probs(
-            token_logprobs,
-            cum_log_probs=torch.zeros_like(
-                original_cum_logprobs[seq_slot, :beam_width]).tolist())
+    # An identity table must leave every beam untouched.
+    identity = (torch.arange(beam_width, device="cuda", dtype=torch.int64).view(
+        -1, 1).expand(-1, num_generated_tokens).contiguous())
+    torch.testing.assert_close(
+        _gather_beam_path(current_path=current_path,
+                          cache_indirection=identity), current_path)
 
-        original_cum_logprobs[seq_slot, :beam_width] = torch.randn(
-            (beam_width, ), dtype=torch.float32)
-        assert (original_cum_logprobs != 0).sum(
-        ) > 0, "Original cumulative log probs must not only contain zeros. Otherwise change the seed."
 
-        cache_indirection[seq_slot, :beam_width, prompt_len:prompt_len +
-                          num_generated_tokens] = torch.randint(
-                              0,
-                              beam_width, (beam_width, num_generated_tokens),
-                              dtype=torch.int32)
-        assert cache_indirection[
-            seq_slot, :beam_width,
-            prompt_len:prompt_len + num_generated_tokens].sum(
-            ) > 0, "Deterministic offsets must not only contain zeros. Otherwise change the seed."
+def test_cba_finalize_merges_pool_and_orders_by_score():
+    """CBA finalization ranks pool entries against the live beams.
 
-        # set the new log probs and tokens for the beam search sampling
-        log_probs_store = sampler.store.log_probs_store
-        log_probs_store.sampled_log_probs[
-            seq_slot, :beam_width] = original_logprobs[:beam_width,
-                                                       num_generated_tokens - 1,
-                                                       0:1]
-        sampler.store.new_tokens[
-            0, seq_slot, :
-            beam_width] = original_logprob_indices[:beam_width,
-                                                   num_generated_tokens - 1, 0]
+    _prepare_beam_history_cba concatenates the finished-candidate pool with
+    the active beams, orders the union by normalized score and emits the top
+    num_beams. Pool entries carry their own (shorter) length and are padded to
+    the output width; active beams contribute the full generated window. This
+    pins that selection, which the plain ancestry gather in
+    test_gather_beam_path_follows_cache_indirection does not cover.
+    """
+    num_beams = 3
+    num_generated = 4
+    pad = BEAM_SEARCH_PAD_TOKEN
 
-        @dataclass
-        class UutResult:
-            beam_history_builder: Callable[[], BeamHistory | None] | None
+    request = _vbws_request(None, max_beam_width=num_beams)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.py_decoding_iter = num_generated
+    request.decoding_iter = num_generated
+    request.py_seq_slot = 0
+    prompt_len = request.py_prompt_len
+    # num_generated_tokens is derived from the request's token count, so give
+    # it the generated tokens the beam state below describes. The last token
+    # of the step is not added yet, hence num_generated - 1.
+    request.set_generated_tokens([[0] * (num_generated - 1)] * num_beams)
 
-        @dataclass
-        class UutResultWrapper:
-            result: UutResult | None = None
+    total = prompt_len + num_generated
+    # Identity ancestry: each active beam keeps its own tokens, so the ordering
+    # rather than the gather is what this test observes.
+    cache_indirection = (torch.arange(num_beams,
+                                      dtype=torch.int64).view(-1, 1).expand(
+                                          -1, total).contiguous().unsqueeze(0))
+    original_tokens = torch.zeros((1, num_beams, total), dtype=torch.int32)
+    original_tokens[0, :, prompt_len:] = torch.tensor(
+        [[31, 32, 33, 34], [41, 42, 43, 44], [51, 52, 53, 54]],
+        dtype=torch.int32)
 
-        res = UutResultWrapper()
+    # Pool: entry 0 outranks every live beam, entry 1 sits between them,
+    # entry 2 is an unused (-inf) slot that must never be selected.
+    cba_tokens = torch.full((1, num_beams, total), pad, dtype=torch.int32)
+    cba_tokens[0, 0, :2] = torch.tensor([11, 12], dtype=torch.int32)
+    cba_tokens[0, 1, :3] = torch.tensor([21, 22, 23], dtype=torch.int32)
 
-        # test
-        def _uut(res=res):
-            res.result = UutResult(
-                beam_history_builder=sampler._beam_search._prepare_beam_history(
-                    request,
-                    finish_reasons=torch.ones((beam_width, ), dtype=torch.int),
-                    d2h_copier=sampler._copy_to_host,
-                ), )
+    cba_group = CBAGroupHost(
+        pos={0: 0},
+        should_stop=torch.tensor([True]),
+        cache_indirection=cache_indirection,
+        original_tokens=original_tokens,
+        cum=torch.tensor([[7.0, 5.0, 3.0]]),
+        cba_tokens=cba_tokens,
+        cba_cum=torch.tensor([[90.0, 6.0, 0.0]]),
+        cba_normed=torch.tensor([[90.0, 6.0, float("-inf")]]),
+        cba_lengths=torch.tensor([[2, 3, 0]], dtype=torch.int32),
+        original_log_probs=None,
+        cba_log_probs=None,
+    )
 
-        yield _uut
+    builder = _prepare_beam_history_cba(request, cba_group=cba_group)
+    assert builder is not None
+    history = builder()
+    assert history is not None
 
-        torch.cuda.synchronize()
-        assert res.result is not None
-        beam_history_builder = res.result.beam_history_builder
-        assert beam_history_builder is not None
-        beam_history = beam_history_builder()
-        assert beam_history is not None
-
-        # expected selection:
-        # Currently beam history only contains the generated tokens, not the prompt tokens.
-        expected_tokens = torch.zeros(
-            (sampler.max_beam_width, num_generated_tokens), dtype=torch.int32)
-        expected_logprobs = torch.zeros(
-            (beam_width, num_generated_tokens, original_logprobs.shape[-1]),
-            dtype=torch.float32)
-        for gen_idx in range(num_generated_tokens):
-            token_idx = prompt_len + gen_idx
-            expected_tokens[:, gen_idx] = original_tokens[
-                seq_slot, cache_indirection[seq_slot, :, token_idx], token_idx]
-            expected_logprobs[:, gen_idx] = original_logprobs[cache_indirection[
-                seq_slot, :beam_width, token_idx], gen_idx]
-
-        torch.testing.assert_close(beam_history.tokens[:beam_width],
-                                   expected_tokens[:beam_width])
-        # test logprobs as well
-        assert beam_history.logprobs is not None
-        torch.testing.assert_close(beam_history.logprobs[:beam_width],
-                                   expected_logprobs[:beam_width])
-        assert beam_history.cum_logprobs is not None
-        torch.testing.assert_close(
-            beam_history.cum_logprobs[:beam_width],
-            original_cum_logprobs[seq_slot, :beam_width].to("cpu"))
-
-    run_test_with_warmup(_uut_provider, max_sync_s=1)
+    # Ranking over the union: pool0=90 > active0=7 > pool1=6, so the second
+    # pool entry and the two weaker live beams drop out.
+    torch.testing.assert_close(
+        history.tokens,
+        torch.tensor(
+            [
+                [11, 12, pad, pad],  # pool entry, padded past its length
+                [31, 32, 33, 34],  # best live beam, full window
+                [21, 22, 23, pad],  # next pool entry
+            ],
+            dtype=torch.int32))
+    assert history.cum_logprobs is not None
+    torch.testing.assert_close(history.cum_logprobs,
+                               torch.tensor([90.0, 7.0, 6.0]))
 
 
 def test_finish_beams():

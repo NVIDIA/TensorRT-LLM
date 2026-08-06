@@ -1247,7 +1247,17 @@ class FlashInferGroupedStrategySampler:
                 | ("greedy", None)
             ):
                 return cast(_STRATEGY_KEY_TYPE, strategy[0])
-            case ("beam_search", beam_width_in, beam_width_out, _, _, _, early_stopping):
+            # Trailing wildcard: row_stride is appended after early_stopping.
+            case (
+                "beam_search",
+                beam_width_in,
+                beam_width_out,
+                _,
+                _,
+                _,
+                early_stopping,
+                *_,
+            ):
                 return cast(
                     _STRATEGY_KEY_TYPE,
                     (strategy[0], beam_width_in, beam_width_out, early_stopping),
