@@ -27,6 +27,8 @@ from tensorrt_llm.logger import (
     _parse_module_levels,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def capture_log():

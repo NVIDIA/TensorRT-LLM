@@ -22,14 +22,16 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..gated_mlp import GatedMLP
 from .interface import MoE, MoEWeightLoadingMode
-from .moe_op_backend import MoEOpBackend, get_op_backend
+from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 
 # isort: off
 from .quantization import (
@@ -254,8 +256,44 @@ class TRTLLMGenFusedMoE(MoE):
         # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
         self._weights_created = False
+        self.num_fused_shared_expert = 0
+
+        # Fusing the shared experts into the routed-expert grouped GEMM is opt-in:
+        # set TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1 to enable it. The benefit is
+        # workload-dependent (small decode batches gain, large prefill chunks lose the
+        # aux-stream overlap of the unfused path), and the fused path additionally
+        # restricts tactics to tileN>=32 to avoid a small-tile dynB kernel defect.
+        fusion_enabled = os.environ.get("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION",
+                                        "0") == "1"
+        # Only the trtllm op backend implements fused shared experts
+        on_trtllm_backend = isinstance(self.op_backend, TRTLLMOpBackend)
+        # Expert parallelism (moe_ep_size > 1) is not supported by the fused path yet
+        # (the routing kernel's shared-expert append assumes the full expert set is
+        # local); gate it out here so EP configs fall back to the unfused path instead
+        # of tripping the runtime EP check in the TRTLLM-Gen runner.
+        fusion_supported = (
+            fusion_enabled and on_trtllm_backend
+            and model_config.mapping.dp_size == 1
+            and model_config.mapping.moe_ep_size == 1
+            and self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_fp8_block_scales())
+        if fusion_supported:
+            # Not all models that use this backend define shared experts (e.g. non-DeepSeek
+            # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
+            self.num_fused_shared_expert = getattr(
+                model_config.pretrained_config, "n_shared_experts", 0) or 0
+            if self.num_fused_shared_expert > 0:
+                logger.info_once(
+                    f"Shared-expert fusion enabled: folding "
+                    f"{self.num_fused_shared_expert} shared expert(s) into the "
+                    f"routed-expert grouped GEMM.",
+                    key="trtllm_gen_shared_expert_fusion")
+
+        # create_weights must see the final fused-expert count so the fused shared
+        # slots are allocated when fusion is enabled.
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+        self.layer_idx = layer_idx
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
@@ -419,7 +457,11 @@ class TRTLLMGenFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        ):
+            self.quant_method.create_weights(self, self.num_fused_shared_expert)
+        else:
+            self.quant_method.create_weights(self)
 
         self._weights_created = True
         self._check_configs()
@@ -576,6 +618,11 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor=None,
             )
 
+    def fuse_shared_expert(self, shared_experts: GatedMLP):
+        assert self._weights_created
+        self.quant_method.fuse_shared_expert(self, shared_experts,
+                                             self.num_fused_shared_expert)
+
     def run_moe(
         self,
         x: torch.Tensor,
@@ -677,6 +724,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight_scaling_factor,
                 self.num_slots,
                 top_k,
+                self.num_fused_shared_expert,
                 n_group,
                 topk_group,
                 self.intermediate_size_per_partition,
