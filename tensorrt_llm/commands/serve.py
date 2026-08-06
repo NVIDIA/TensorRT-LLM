@@ -1493,15 +1493,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 try:
                     from tensorrt_llm.grpc.openengine.server import \
                         launch_server as launch_grpc_server
-                except ModuleNotFoundError as error:
-                    if error.name == "grpc" or (
-                            error.name and error.name.startswith("openengine")):
-                        raise click.ClickException(
-                            "OpenEngine support requires the optional Python "
-                            "bindings. Install them with `python -m pip install "
-                            "--extra-index-url https://buf.build/gen/python "
-                            "\"tensorrt_llm[openengine]\"`.") from error
-                    raise
+                except ImportError as error:
+                    raise click.ClickException(
+                        f"Failed to import OpenEngine support: {error}. "
+                        "Install the optional Python bindings with `python -m "
+                        "pip install --extra-index-url "
+                        "https://buf.build/gen/python "
+                        "\"tensorrt_llm[openengine]\"`.") from error
 
                 launch_grpc_server(host, port)
         else:
