@@ -118,13 +118,12 @@ def process_result():
     preapproved_candidates = []
 
     if not args.skip_source_code:
-        if args.scan_mode != "release":
-            source_vulns = submit_source_code_vulns(
-                os.path.join(args.report_directory, "source_code/vulns.json"),
-                **SUBMIT_KWARG,
-            )
-            if len(source_vulns) > 0:
-                RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
+        source_vulns = submit_source_code_vulns(
+            os.path.join(args.report_directory, "source_code/vulns.json"),
+            **SUBMIT_KWARG,
+        )
+        if args.scan_mode != "release" and len(source_vulns) > 0:
+            RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
 
         source_result = submit_source_code_licenses(
             os.path.join(args.report_directory, "source_code/sbom.json"),
@@ -152,22 +151,21 @@ def process_result():
                 )
 
     if not args.skip_container:
-        if args.scan_mode != "release":
-            amd64_container_vulns = submit_container_vulns(
-                os.path.join(args.report_directory, "release_amd64/vulns.json"),
-                os.path.join(args.report_directory, "base_amd64/vulns.json"),
-                "amd64",
-                **SUBMIT_KWARG,
-            )
-            arm64_container_vulns = submit_container_vulns(
-                os.path.join(args.report_directory, "release_arm64/vulns.json"),
-                os.path.join(args.report_directory, "base_arm64/vulns.json"),
-                "arm64",
-                **SUBMIT_KWARG,
-            )
-            count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
-            if count_container_vulns > 0:
-                RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
+        amd64_container_vulns = submit_container_vulns(
+            os.path.join(args.report_directory, "release_amd64/vulns.json"),
+            os.path.join(args.report_directory, "base_amd64/vulns.json"),
+            "amd64",
+            **SUBMIT_KWARG,
+        )
+        arm64_container_vulns = submit_container_vulns(
+            os.path.join(args.report_directory, "release_arm64/vulns.json"),
+            os.path.join(args.report_directory, "base_arm64/vulns.json"),
+            "arm64",
+            **SUBMIT_KWARG,
+        )
+        count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
+        if args.scan_mode != "release" and count_container_vulns > 0:
+            RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
         amd64_container_licenses, amd64_license_info = submit_container_licenses(
             os.path.join(args.report_directory, "release_amd64/licenses.json"),
