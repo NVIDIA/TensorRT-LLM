@@ -109,6 +109,12 @@ struct DataBase
     int32_t mLocalExpertsStartIdx;
     int32_t mLocalExpertsStrideLog2;
     int32_t mNumLocalExperts;
+
+    /// For fused shared expert. Default to 0 (no fusion) so callers that
+    /// construct Data directly (e.g. the routing kernel unit tests) stay valid;
+    /// mTotalExpertsPerToken is derived in routingDeepSeek::run() from mTopK.
+    int32_t mNumFusedSharedExperts{0};
+    int32_t mTotalExpertsPerToken{0};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -145,6 +151,9 @@ struct KernelParamsBase
     int32_t mLocalExpertsStrideLog2 = 0;
     int32_t mNumLocalExperts = 0;
 
+    int32_t mNumFusedSharedExperts = 0;
+    int32_t mTotalExpertsPerToken = 0;
+
     // Public initialization function - make it a template to accept different Data types
     template <typename DataType>
     void setBaseParams(DataType const& data)
@@ -171,6 +180,9 @@ struct KernelParamsBase
         mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
         mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
         mNumLocalExperts = data.mNumLocalExperts;
+
+        mNumFusedSharedExperts = data.mNumFusedSharedExperts;
+        mTotalExpertsPerToken = data.mTotalExpertsPerToken;
     }
 };
 
@@ -364,6 +376,12 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 };
 
 void run(Data const& data, void* stream);
+
+// Individual small-batch launchers, exposed for unit tests that A/B the classic
+// single-block kernel against the cooperative block kernel (bit-identical outputs).
+// Production code should always go through run().
+void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 
 } // namespace routingCustom
 

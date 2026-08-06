@@ -1395,6 +1395,18 @@ class KvCacheCreator:
                 "would not be partitioned from the target's and would overrun "
                 "GPU memory. Derived draft max_attention_window="
                 f"{draft_kv_config.max_attention_window}.")
+        if (draft_kv_config.pool_ratio is not None
+                and len(draft_kv_config.pool_ratio) != 1):
+            # pool_ratio describes one manager's pool-group layout. The
+            # target hybrid manager may have separate recurrent-state and
+            # attention groups, while today's supported one-model draft
+            # manager has one non-VSWA attention group. Reusing the target's
+            # two ratios for that separate manager fails its arity check.
+            logger.info(
+                "Normalizing the separate one-model draft KV cache pool_ratio "
+                f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
+                "pool group.")
+            draft_kv_config.pool_ratio = [1.0]
         if is_vswa_enabled(self._kv_cache_config):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "

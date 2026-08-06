@@ -12,6 +12,8 @@ from tensorrt_llm.llmapi.disagg_utils import (
     get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
 # isort: on
 
+pytestmark = pytest.mark.cpu_only
+
 
 def get_yaml_config():
     config = {
@@ -147,6 +149,37 @@ def test_extract_disagg_metrics_controls():
 def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
     with pytest.raises(ValueError, match="node_id must be in range"):
         extract_disagg_cfg(node_id=node_id)
+
+
+def test_server_keep_alive_timeout(tmp_path):
+    # Absent key keeps the historical 10s default.
+    assert extract_disagg_cfg(
+        **get_yaml_config()).server_keep_alive_timeout == 10
+
+    # A top-level override reaches the config...
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = 3600
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 3600
+
+    # ...and survives the YAML file parser.
+    yaml_file = tmp_path / "keep_alive_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(cfg, f)
+    assert parse_disagg_config_file(yaml_file).server_keep_alive_timeout == 3600
+
+    # Zero is valid.
+    cfg["server_keep_alive_timeout"] = 0
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 0
+
+
+@pytest.mark.parametrize("value", [None, "10", 10.0, True, False, -1])
+def test_server_keep_alive_timeout_rejects_invalid_values(value):
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = value
+    with pytest.raises(
+            ValueError,
+            match="server_keep_alive_timeout must be a non-negative integer"):
+        extract_disagg_cfg(**cfg)
 
 
 @pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
