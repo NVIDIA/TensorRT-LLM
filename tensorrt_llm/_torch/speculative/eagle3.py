@@ -665,12 +665,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._saved_position_offsets = None
         self._saved_position_offsets_cpp = None
         self._saved_generation_lengths = None
+        self._saved_token_counts = None
 
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        self._saved_token_counts = (
+            attn_metadata._num_tokens,
+            attn_metadata._num_ctx_tokens,
+            attn_metadata._num_generations,
+        )
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
 
@@ -700,6 +706,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_token_counts is not None:
+            (attn_metadata._num_tokens, attn_metadata._num_ctx_tokens,
+             attn_metadata._num_generations) = self._saved_token_counts
+            self._saved_token_counts = None
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
             attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
