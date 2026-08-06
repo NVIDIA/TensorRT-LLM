@@ -82,11 +82,8 @@ class MLIRElementwiseFusion(BaseTransform):
             self._log_warning("xDSL not installed, skipping MLIR elementwise fusion")
             return gm, TransformInfo(skipped=True)
 
-        from ...mlir.codegen.kernel_cache import KernelCache
-        from ...mlir.codegen.triton_emitter import generate_kernel_from_subgraph
         from ...mlir.decompose import run_decomposition
-        from ...mlir.fusion.subgraph_discovery import discover_fusible_subgraphs
-        from ...mlir.fusion.subgraph_replace import replace_subgraph_with_fused_op
+        from ...mlir.fusion.fuse import run_fusion
         from ...mlir.fx_to_mlir import FXToMLIRConverter
         from ...mlir.mlir_to_fx import MLIRToFXConverter
 
@@ -104,60 +101,16 @@ class MLIRElementwiseFusion(BaseTransform):
         num_decomposed = run_decomposition(mlir_module)
         self._log_info(f"Decomposed {num_decomposed} high-level ops into primitives")
 
-        # Step 3: Discover fusible subgraphs
-        subgraphs = discover_fusible_subgraphs(mlir_module)
+        # Step 3+4: Discover fusible subgraphs and replace each with a generated
+        # fused op.  Both decomposition and fusion now go through xDSL's
+        # PatternRewriteWalker (see run_decomposition / run_fusion).
+        stats = run_fusion(mlir_module, converter.metadata, log_warning=self._log_warning)
         self._log_info(
-            f"Discovered {len(subgraphs)} fusible subgraphs "
-            f"(total ops: {sum(len(sg.ops) for sg in subgraphs)})"
+            f"Discovered {stats.num_subgraphs} fusible subgraphs; "
+            f"replaced {stats.num_replaced} (skipped {stats.num_skipped_low_rank} low-rank)"
         )
 
-        if not subgraphs:
-            return gm, TransformInfo(
-                skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
-        # Step 4: Generate Triton kernels and replace subgraphs in MLIR.
-        # Skip subgraphs where all inputs are 1D or lower — these are pure
-        # weight-space ops (e.g., weight + 1.0) that don't benefit from fusion
-        # and the row-based Triton kernel can't handle them correctly.
-        from xdsl.dialects.builtin import TensorType as _TT
-
-        def _max_input_rank(sg):
-            return max(
-                (len(inp.type.get_shape()) for inp in sg.inputs if isinstance(inp.type, _TT)),
-                default=0,
-            )
-
-        def _min_output_rank(sg):
-            return min(
-                (len(out.type.get_shape()) for out in sg.outputs if isinstance(out.type, _TT)),
-                default=0,
-            )
-
-        num_replaced = 0
-        num_skipped = 0
-        for sg in subgraphs:
-            if _max_input_rank(sg) < 2 or _min_output_rank(sg) < 2:
-                num_skipped += 1
-                continue
-            try:
-                # Refresh inputs: earlier subgraph replacements may have
-                # redirected operands via SSAValue.replace_by(), making the
-                # inputs list computed at discovery time stale.
-                sg.refresh_inputs()
-                kernel_fn = generate_kernel_from_subgraph(sg)
-                if kernel_fn is not None:
-                    sg_hash = KernelCache.hash_subgraph(sg)
-                    replace_subgraph_with_fused_op(sg, kernel_fn, sg_hash, converter.metadata)
-                    num_replaced += 1
-            except (ValueError, NotImplementedError) as e:
-                self._log_warning(f"Skipping subgraph (unsupported pattern): {e}")
-
-        self._log_info(
-            f"Replaced {num_replaced}/{len(subgraphs)} subgraphs (skipped {num_skipped} low-rank)"
-        )
-
-        if num_replaced == 0:
+        if stats.num_replaced == 0:
             return gm, TransformInfo(
                 skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -174,7 +127,7 @@ class MLIRElementwiseFusion(BaseTransform):
         # happens later at cache_init).
         return new_gm, TransformInfo(
             skipped=False,
-            num_matches=num_replaced,
+            num_matches=stats.num_replaced,
             is_clean=False,
             has_valid_shapes=False,
         )
