@@ -28,6 +28,8 @@ from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
+from .impl_contract import (MoEInputRequirement, MoERunContext,
+                            MoEStaticCapability, require_comm_plan)
 from .interface import MoE
 from .quantization import UnquantizedFusedMoEMethod
 
@@ -84,6 +86,13 @@ class CutlassFusedMoE(MoE):
             routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ fp4_allgather] + FusedMoe Op[no allreduce] + reducescatter, with AttentionDP on
             equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
     """
+
+    # Routed-expert MoE LoRA is fused into this backend's op only; the
+    # subclasses below each restate ``supports_moe_lora=False``.
+    capabilities = MoEStaticCapability(supports_moe_lora=True)
+
+    # Inherited by every subclass, matching the isinstance check this replaces.
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
 
     # Quantization algorithm support table for can_implement()
     # Format: quant_algo -> {sm_constraint, dtypes}
@@ -848,19 +857,30 @@ class CutlassFusedMoE(MoE):
     def supports_moe_output_in_alltoall_workspace(self):
         return True
 
+    def _tuner_shapes(
+        self,
+        ctx: MoERunContext,
+        enable_alltoall: Optional[bool],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Token/top-k shapes the profiling tuner should key on.
+
+        Only meaningful under alltoall: the tuner must see pre-alltoall token
+        counts so tactics cached during the no-alltoall warmup still apply at
+        runtime. Without alltoall the kernel derives both from ``x`` itself.
+        """
+        if not enable_alltoall:
+            return None, None
+        if ctx.all_rank_num_tokens is not None:
+            tuner_num_tokens = sum(ctx.all_rank_num_tokens)
+        else:
+            tuner_num_tokens = ctx.x.shape[0] * self.mapping.tp_size
+        return tuner_num_tokens, self.routing_method.top_k
+
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        is_sf_swizzled: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
-        lora_params: Optional[Dict] = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with Cutlass backend.
@@ -868,22 +888,22 @@ class CutlassFusedMoE(MoE):
         This method encapsulates the core MoE computation logic, handling different
         quantization schemes.
 
-        Args:
-            x: Input hidden states (may be pre-quantized)
-            token_selected_experts: Expert IDs or expert slots [num_tokens, top_k]
-                                   If EPLB is enabled, represents expert slots; otherwise expert IDs
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (optional, for certain quantization schemes)
-            is_sf_swizzled: Whether scaling factors are swizzled
-            output_dtype: Output data type (optional)
-            tuner_num_tokens: Number of tokens for profiling tuner (optional)
-            tuner_top_k: Top-k value for profiling tuner (optional)
-            moe_output: Pre-allocated output buffer (optional)
-            enable_alltoall: Whether alltoall communication is enabled (optional). If None, defaults to self.enable_alltoall.
-
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
+        del workspace  # Cutlass allocates its own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        output_dtype = ctx.output_dtype
+        lora_params = ctx.lora_params
+        is_sf_swizzled = plan.input_sf_swizzled
+        moe_output = plan.moe_output
+        enable_alltoall = plan.enable_alltoall
+        tuner_num_tokens, tuner_top_k = self._tuner_shapes(ctx, enable_alltoall)
+
         # W4A16 NVFP4 fallback (SM<100).
         if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
             return self._run_moe_w4a16_nvfp4(
@@ -902,8 +922,7 @@ class CutlassFusedMoE(MoE):
         if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
             from .fused_moe_triton_fp8_block_scale import \
                 run_triton_fp8_block_scale_moe
-            _use_alltoall = (enable_alltoall if enable_alltoall is not None else
-                             self.enable_alltoall)
+
             # forward_chunk sets token_final_scales=None when
             # apply_router_weight_on_input=True (weights already folded into x);
             # substitute ones so the Triton kernel's per-token scaling is a no-op.
@@ -916,7 +935,7 @@ class CutlassFusedMoE(MoE):
             # (0 .. expert_size_per_partition-1), so remap and zero-scale any
             # non-local token-expert pairs to suppress their contribution.
             local_n = self.expert_size_per_partition
-            if _use_alltoall:
+            if enable_alltoall:
                 # After alltoall dispatch, IDs are already local; padding = local_n
                 local_ids = token_selected_experts.clamp(0, local_n - 1)
                 is_local = token_selected_experts < local_n
@@ -956,9 +975,6 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
-
-        if enable_alltoall is None:
-            enable_alltoall = self.enable_alltoall
 
         use_dynamic_fc2_scale = (self.has_nvfp4 and getattr(
             self, 'force_dynamic_quantization', False)
@@ -1032,16 +1048,20 @@ class CutlassFusedMoE(MoE):
         tuner_num_tokens: Optional[int] = None,
         tuner_top_k: Optional[int] = None,
         moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
+        *,
+        enable_alltoall: bool,
     ) -> torch.Tensor:
         """W4A16 fallback for NVFP4 MoE on SM<100. Active-mask dequant into
         a static [E_total, N, K] bf16 workspace, then bf16 fused_moe with the
         original (global) token_selected_experts. CUDA-graph capturable.
+
+        ``enable_alltoall`` has no default because it picks the expert-id remap
+        below, and either default is silently wrong for half the callers: the
+        ids are local after an alltoall dispatch and global otherwise, so a
+        wrong guess shifts every id by ``slot_start`` without failing.
         """
         assert isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod)
 
-        if enable_alltoall is None:
-            enable_alltoall = self.enable_alltoall
         if output_dtype is None:
             output_dtype = x.dtype
 

@@ -26,6 +26,20 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...distributed.ops import reducescatter
+from .impl_contract import (MoEInputRequirement, MoERunContext,
+                            MoEStaticCapability)
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+#
+# Lives here rather than next to either reader because both need it: the
+# scheduler decides whether to precompute top-k at all, and TRTLLMGenFusedMoE
+# decides whether its kernel may route again.
+FORCE_SEPARATED_ROUTING = os.environ.get(
+    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 
 def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
@@ -226,6 +240,28 @@ class MoE(nn.Module):
     # whose fused kernel owns cross-rank exchange (e.g. MegaMoE-style)
     # override this to ``MoESchedulerKind.FUSED_COMM``.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
+
+    # What this backend can do, read by callers that would otherwise test its
+    # class. A backend deriving from another backend MUST restate every field
+    # rather than inherit it: the exact-class comparisons these fields replace
+    # answered False for subclasses, so a capability picked up through
+    # inheritance would silently widen behaviour.
+    #
+    # That restatement rule is transitional, not the intended end state. It only
+    # has to exist while backends still derive from other backends, which today
+    # they do: CuteDsl, DeepGemm and Marlin derive from Cutlass, B12x from
+    # CuteDsl, and Llama4MinLatency from Cutlass. The per-backend tickets
+    # TRTLLM-14960..14969 cut those inheritance edges as each impl moves its
+    # run_moe into its own leaf class, and once no impl derives from another the
+    # rule has nothing left to guard and should be deleted with it.
+    capabilities: MoEStaticCapability = MoEStaticCapability()
+
+    # What this backend needs the scheduler to hand it. Unlike
+    # ``capabilities``, the checks these fields replace used isinstance, so
+    # inheriting a value is correct here. Overriding is not partial though:
+    # the whole object is replaced, so a subclass that sets one field must
+    # restate the ones it still wants from its parent.
+    input_requirement: MoEInputRequirement = MoEInputRequirement()
 
     # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
     # so backends whose dispatch/combine paths still assume uniform partitioning fail
@@ -927,32 +963,30 @@ class MoE(nn.Module):
     @abstractmethod
     def run_moe(
         self,
-        # ========== Common parameters (all backends use) ==========
-        x: torch.Tensor,
-        token_selected_experts: Optional[torch.Tensor],
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        # ========== Backend-specific parameters (via kwargs) ==========
-        **kwargs
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        Unified MoE computation interface
+        Unified MoE computation interface.
 
-        NOTE: This is a TEMPORARY interface. In the future, this method should be moved
-        to the MoEBackend interface as part of the backend abstraction layer.
+        Every value the caller genuinely produces travels in ``ctx``; every
+        fact the comm layer decided for this forward travels in
+        ``ctx.comm_plan``. Backends read only the fields they need, so adding a
+        backend never requires touching the scheduler.
 
-        This method performs the core MoE computation. Different backends will implement
-        their specific computation logic while following this unified interface.
-
-        Common parameters (all backends use):
-            x: Input activations [num_tokens, hidden_size]
-            token_selected_experts: Expert IDs [num_tokens, top_k] (used by DeepGemm/TRTLLMGen).
-                                    If EPLB is enabled, this represents expert slots [num_tokens, top_k].
-            token_final_scales: Routing weights [num_tokens, top_k]
-            x_sf: Input scale factor (for quantization, if applicable)
-
-        Backend-specific parameters (passed via kwargs, obtained from _get_backend_kwargs()):
-            TODO: This is not finalized, will be updated later.
+        Args:
+            ctx: Inputs for this forward. ``token_selected_experts`` holds
+                expert slots rather than expert IDs when EPLB is enabled.
+            workspace: Scratch buffers owned by the scheduler because they are
+                allocated once per chunk and reused across the aux stream. Only
+                backends declaring ``requires_run_moe_workspace`` receive one.
+                ``MoEImplBase.run_moe`` deliberately omits this parameter: it
+                describes the state after impls allocate their own scratch
+                through ``get_workspaces``, which happens as each impl moves
+                onto that base (TRTLLM-14958, TRTLLM-14960..14969). Keyword-only
+                here so that removing it is a mechanical change to named call
+                sites rather than a silent re-binding of a positional argument.
 
         Returns:
             torch.Tensor: MoE computation result [num_tokens, hidden_size]
