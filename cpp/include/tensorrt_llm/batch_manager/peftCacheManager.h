@@ -129,6 +129,9 @@ public:
 
     [[nodiscard]] tensorrt_llm::DataType getDataType() const;
 
+    //! Configure the homogeneous LoRA weight dtype before inserting an adapter.
+    void configureDataType(tensorrt_llm::DataType dataType);
+
     void resetDeviceCache() override;
 
     void markRequestDone(LlmRequest const& llmReq, bool pause = false) override;
@@ -161,8 +164,6 @@ public:
     void prefetchLoraWeights(std::string const& modelDir, runtime::BufferManager const& bufferManager);
 
 private:
-    void configureDataType(tensorrt_llm::DataType dataType);
-
     std::unique_ptr<runtime::LoraCache> mHostLoraCache;
     std::unique_ptr<runtime::LoraCache> mDeviceLoraCache;
 

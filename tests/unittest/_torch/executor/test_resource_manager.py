@@ -423,6 +423,19 @@ class TestResourceManager(unittest.TestCase):
         self.assertGreaterEqual(peft_cache_manager.impl.max_host_pages, 1)
         self.assertGreaterEqual(peft_cache_manager.impl.max_device_pages, 1)
 
+    def test_initial_fp8_data_type_configures_cache(self):
+        if (not torch.cuda.is_available()
+                or torch.cuda.get_device_capability() != (9, 0)):
+            self.skipTest("Requires SM90 FP8 support")
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=self.create_peft_cache_config(),
+            lora_config=LoraConfig(),
+            model_config=self.model_config,
+            initial_data_type=torch.float8_e4m3fn,
+        )
+
+        self.assertEqual(peft_cache_manager.data_type, torch.float8_e4m3fn)
+
     def test_add_request_peft_empty_weights_config(self):
         """Test adding a request with empty LoRA task."""
         peft_cache_config = self.create_peft_cache_config()

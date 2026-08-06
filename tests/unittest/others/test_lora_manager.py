@@ -29,7 +29,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.lora_manager import HfLoraLoader, LoraManager
 from tensorrt_llm.mapping import Mapping
 
 
@@ -233,6 +233,31 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
     "Native FP8 LoRA requires Hopper (SM90)",
 )
 class TestLoraManagerFp8(unittest.TestCase):
+    def test_hf_loader_reports_dense_fp8_dtype(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=16,
+                num_layers=1,
+                dtype=torch.float8_e4m3fn,
+            )
+
+            loader = HfLoraLoader([str(adapter_dir)])
+
+        self.assertEqual(loader.get_dense_lora_dtype(), torch.float8_e4m3fn)
+
+    def test_hf_loader_ignores_expert_only_fp8_dtype(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            _create_dummy_hf_moe_lora_adapter(adapter_dir)
+
+            loader = HfLoraLoader([str(adapter_dir)])
+
+        self.assertIsNone(loader.get_dense_lora_dtype())
+
     def test_fp8_dora_is_rejected(self):
         model_config = MockModelConfig()
         manager = LoraManager(
@@ -419,6 +444,7 @@ class TestLoraManagerFp8(unittest.TestCase):
                 dtype=torch.float8_e4m3fn,
                 input_dtype=torch.float8_e5m2,
             )
+            self.assertIsNone(HfLoraLoader([str(adapter_dir)]).get_dense_lora_dtype())
 
             with self.assertRaisesRegex(
                 ValueError, "FP8 LoRA input and output weights must have the same dtype"
