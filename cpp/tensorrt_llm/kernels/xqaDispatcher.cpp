@@ -506,7 +506,15 @@ void XqaDispatcher::runImpl(
         }
         else
         {
-            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+            // Pin mMaxSeqLenKv to a static per-layer value so warmup and runtime pick the
+            // same FMHA kernel and avoid the eager-mode NVRTC JIT misses re-introduced by
+            // PR #14851. For PagedKv, strides do not depend on mMaxSeqLenKv and extra KV
+            // CTAs early-exit via seqLensKvPtr (rationale from the original protection that
+            // #14851 reverted). ContiguousKv must keep its true past-kv length because its
+            // strides do depend on it.
+            tllmRunnerParams.mMaxSeqLenKv = (tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv)
+                ? params.max_attention_window_size
+                : params.max_past_kv_length;
         }
         tllmRunnerParams.mJITWarmup = params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllm_gen_jit_warmup_max_num_requests;
