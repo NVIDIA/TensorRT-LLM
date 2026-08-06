@@ -1474,9 +1474,6 @@ def getPytestBaseCommandLine(
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
-    if (ENABLE_UPLOAD_TEST_RESULTS) {
-        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
-    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1709,7 +1706,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
                         "--s3-upload-path=${uploadPath}/${stageName}",
@@ -4370,7 +4367,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Temporarily disable to reduce the log size
         // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def extraArgs = [*clusterDurationsArgs]
-        if (ENABLE_UPLOAD_TEST_RESULTS) {
+        if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
                 "--capture=fd",
                 "--s3-upload-path=${uploadPath}/${stageName}",
