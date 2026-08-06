@@ -108,8 +108,7 @@ class _CBAFields:
     same tensors). Field shapes and semantics are documented here once; both
     subclasses inherit these fields.
 
-    Only maintained for requests using exhaustive early_stopping modes
-    (early_stopping != TRUE); allocated lazily by
+    Maintained for every beam-search request; allocated lazily by
     ``BeamSearchStore.ensure_cba`` on the first such request.
 
     Fields written on every beam-search step regardless of stopping mode
@@ -144,7 +143,7 @@ class _CBAFields:
 @dataclass(kw_only=True)
 class CBAState(_CBAFields):
     """Candidate-Beams-Array (CBA) state, present only for requests using
-    exhaustive early_stopping modes (early_stopping != TRUE); see
+    every beam-search request, whatever its early_stopping mode; see
     beam_search_sampling_batch_cba.
 
     A per-step view over the persistent ``BeamSearchStore`` (shared CBA tensors
@@ -200,7 +199,7 @@ class BeamSearchStore:
     for stop word detection."""
     seq_offsets: torch.Tensor
     """[max_num_sequences] int64, cached ``arange(max_num_sequences) *
-    max_beam_width`` used by ``beam_search_sampling_batch`` to flatten
+    max_beam_width`` used by ``beam_search_sampling_batch_cba`` to flatten
     (batch_idx, beam_idx) pairs."""
     beam_idx_arange: torch.Tensor
     """[max_beam_width] int32, cached ``arange(max_beam_width)`` used as the
@@ -220,7 +219,7 @@ class BeamSearchStore:
     batch_dones: torch.Tensor
     """[max_num_sequences] bool, per-slot beam-search termination verdict."""
     cba: Optional[_CBAFields] = None
-    """CBA tensors; None until the first exhaustive-early_stopping request."""
+    """CBA tensors; None until the first beam-search request."""
 
     @classmethod
     def create(
@@ -255,8 +254,8 @@ class BeamSearchStore:
     def ensure_cba(self) -> _CBAFields:
         """Allocate the CBA tensors on first use and return them.
 
-        Called when a request with an exhaustive early_stopping mode is
-        admitted; idempotent afterwards.
+        Called when the first beam-search request is admitted, whatever its
+        early_stopping mode; idempotent afterwards.
         """
         if self.cba is None:
             shape = self.original_tokens.shape
@@ -325,7 +324,7 @@ def _gather_beam_path(
 
 @dataclass(kw_only=True)
 class BeamSearchMetadata(StrategyMetadata):
-    """Stateful tensors required by beam_search_sampling_batch."""
+    """Stateful tensors required by beam_search_sampling_batch_cba."""
 
     cache_indirection: torch.Tensor
     cache_indirection_buffer: torch.Tensor
@@ -347,8 +346,8 @@ class BeamSearchMetadata(StrategyMetadata):
     skipped — multi-token stop-word matching would then be unreliable across
     beam swaps."""
     cba: Optional[CBAState] = None
-    """Candidate-Beams-Array state, present only for exhaustive early_stopping
-    modes (early_stopping != TRUE); None for the regular beam-search path."""
+    """Candidate-Beams-Array state, present for every beam-search request
+    regardless of its early_stopping mode; None until the first one."""
 
 
 def _update_cache_indirection_buffer(
@@ -413,9 +412,15 @@ def _pad_next_tokens(next_tokens: torch.Tensor, store_width: int) -> torch.Tenso
     """Pad a [batch, beam_width_out] token tensor to the store's beam width.
 
     The batched sampling buffers are allocated at the maximum beam width; on
-    variable-beam-width steps the op produces fewer columns, and the padding
-    (BEAM_SEARCH_PAD_TOKEN) is never consumed — finalization rewrites all
-    beam tokens from the corrected paths.
+    variable-beam-width steps the op produces fewer columns and the rest are
+    filled with BEAM_SEARCH_PAD_TOKEN.
+
+    Consumers must read only the leading ``beam_width_out`` columns. Appending
+    the padded ones puts the sentinel into the request's token history, which
+    finalization does later overwrite from the corrected paths -- but the
+    padded history is visible in the meantime to streaming consumers and to
+    anything reading ``get_tokens()`` mid-flight. See the
+    ``_get_beam_width_out`` bound in ``TorchSampler.update_requests``.
     """
     if next_tokens.size(1) >= store_width:
         return next_tokens
@@ -533,6 +538,12 @@ def beam_search_sampling_batch(
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Sample beam_width tokens for each request in parallel.
+
+    NB: no longer dispatched to. Every early_stopping mode now runs on
+    ``beam_search_sampling_batch_cba``; this pool-free variant freezes a
+    finished beam in its slot instead of vacating it, which diverges from the
+    C++ decoder and from vLLM. Kept as the restore hook referenced by
+    ``_request_uses_cba``, and still exercised directly by unit tests.
 
     ``length_penalty`` normalizes the beam-selection ranking key as
     ``cum_log_prob / gen_length**length_penalty``, and ``diversity_rate`` adds
@@ -902,8 +913,8 @@ def beam_search_sampling_batch_cba(
     diversity_rate: "torch.Tensor | float | None" = None,
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Beam-search step with a candidate-beams array (CBA) for the exhaustive
-    early_stopping modes (``early_stopping != TRUE``):
+    """Beam-search step with a candidate-beams array (CBA). Every
+    early_stopping mode runs here; the mode only selects the done verdict:
 
     - The top ``2 * beam_width`` expansion candidates (ranked by raw
       cumulative log-prob, plus the optional diversity adjustment — the
@@ -933,7 +944,7 @@ def beam_search_sampling_batch_cba(
     """
     args = beam_search_args
     cba = args.cba
-    assert cba is not None, "CBA metadata is required for early_stopping != TRUE"
+    assert cba is not None, "CBA metadata is required for beam search"
     num_beams = beam_width_out
     device = logits.device
     slots = args.seq_slots
@@ -1161,7 +1172,7 @@ def _prepare_beam_search(
     beam_search_store.beam_gen_lengths.index_fill_(0, seq_slots_long, 0)
     beam_search_store.prompt_lens.index_copy_(0, seq_slots_long, prompt_lens_cuda)
     beam_search_store.batch_dones.index_fill_(0, seq_slots_long, False)
-    # The CBA tensors only exist once an exhaustive-early_stopping request has
+    # The CBA tensors only exist once a beam-search request has
     # been admitted; nothing reads them before that, so skip the reset.
     cba = beam_search_store.cba
     if cba is not None:
@@ -1402,6 +1413,10 @@ def _check_beam_search_stop_criteria(
 ) -> torch.Tensor:
     """Check if the stop criteria is met for the request.
 
+    NB: only reachable from the pool-free finalize branch, which nothing
+    dispatches to any more -- the CBA path computes its own verdict in
+    ``prepare_cba_group_host``. Kept alongside ``beam_search_sampling_batch``.
+
     Returns a boolean tensor of shape (), whose value is computed asynchronously.
     """
     return (finish_reasons[: request.py_beam_width] > 0).sum() == request.py_beam_width
@@ -1587,6 +1602,10 @@ class BeamSearchHandler:
         if _request_uses_cba(request):
             assert cba_group is not None
             return _prepare_beam_history_cba(request, cba_group=cba_group)
+
+        # Everything below is the pool-free finalize, unreachable while
+        # _request_uses_cba is unconditionally true. Kept with
+        # beam_search_sampling_batch as the restore path.
 
         # Gather data used for skipping beam history processing
         need_finalize_due_to_stop_words = self._has_multi_token_stop_words(request)

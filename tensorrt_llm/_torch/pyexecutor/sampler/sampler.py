@@ -2269,7 +2269,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     beam_idx_arange=beam_search_store.beam_idx_arange,
                     beam_gen_lengths=beam_search_store.beam_gen_lengths,
                     stop_past_tokens=self._finish_reasons_handler.store.past_tokens_cuda,
-                    # None unless an exhaustive-early_stopping request has been
+                    # None unless a beam-search request has been
                     # admitted; the CBA tensors are not allocated before that.
                     cba=None
                     if beam_search_store.cba is None
