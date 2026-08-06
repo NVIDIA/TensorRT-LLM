@@ -285,15 +285,24 @@ class DeepSeekR1Parser(BaseReasoningParser):
                     return ReasoningParserResult()
                 self._buffer = ""
                 return ReasoningParserResult(content=delta_text)
-            # Start tag found: drop text before it on the first open only
-            # (same as ``parse()`` for reasoning_at_start=False).
+            # Start tag found.
+            # First open: drop text before the tag (same as ``parse()``).
+            # Later opens (interleaved): keep text before the tag as content.
+            content_prefix = ""
+            if begin_idx > 0:
+                if self._entered_reasoning:
+                    content_prefix = delta_text[:begin_idx]
+                # else: initial preamble — drop
             self.in_reasoning = True
             self._entered_reasoning = True
             reasoning_content = delta_text[begin_idx +
                                            len(self.reasoning_start):]
+        else:
+            content_prefix = ""
 
         if self.in_reasoning:
-            delta_text = reasoning_content if reasoning_content is not None else delta_text
+            delta_text = (reasoning_content
+                          if reasoning_content is not None else delta_text)
             end_idx = delta_text.find(self.reasoning_end)
             if end_idx == -1:
                 last_idx = delta_text.rfind(self.reasoning_end[0])
@@ -305,11 +314,24 @@ class DeepSeekR1Parser(BaseReasoningParser):
                     self._buffer = ""
                     reasoning_content = delta_text
                 return ReasoningParserResult(
-                    reasoning_content=reasoning_content)
+                    content=content_prefix, reasoning_content=reasoning_content)
             reasoning_content = delta_text[:end_idx]
-            content = delta_text[end_idx + len(self.reasoning_end):]
+            content_after = delta_text[end_idx + len(self.reasoning_end):]
             self.in_reasoning = False
             self._buffer = ""
+            content = content_prefix + content_after
+            # Remainder may open another reasoning block in the same delta
+            # (e.g. buffered ``</think>`` + ``y<think>z``).
+            if content_after:
+                more = self.parse_delta(content_after)
+                # parse_delta re-appended content_after to the buffer; the
+                # recursive call already consumed it — avoid double count:
+                # we passed content_after both as emitted content_prefix path
+                # and recursively. Fix: only take recursive result, do not
+                # pre-include content_after in content.
+                content = content_prefix + more.content
+                reasoning_content = reasoning_content + (more.reasoning_content
+                                                         or "")
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning_content)
         raise RuntimeError(
