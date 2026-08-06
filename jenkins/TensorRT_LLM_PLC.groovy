@@ -393,14 +393,12 @@ def processScanResults(ref) {
                             rows << "| ${entry.scan_type.toString().padRight(colWidths.scan_type)} | ${entry.dependency_name.toString().padRight(colWidths.dependency_name)} | ${entry.license.toString().padRight(colWidths.license)} | ${entry.corrected_license.toString().padRight(colWidths.corrected_license)} | ${entry.is_permissive.toString().padRight(13)} | ${entry.is_nvidia_proprietary.toString().padRight(colWidths.is_nvidia_proprietary)} |"
                         }
                         rows << sep
-                        echo "Non-permissive licenses detected:\n${rows.join('\n')}"
+                        detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
                     }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    if (not result.needs_manual_review) {
-                        currentBuild.result = 'UNSTABLE'
-                    }
+                    currentBuild.result = 'UNSTABLE'
                 } else {
                     echo "No new risks detected."
                 }
@@ -411,6 +409,7 @@ def processScanResults(ref) {
 
 needsManualReview = false
 manualReviewUrl = ""
+detectedLicensesTable = ""
 
 pipeline {
     agent {
@@ -505,6 +504,9 @@ pipeline {
             }
             steps {
                 script {
+                    if (detectedLicensesTable) {
+                        echo detectedLicensesTable
+                    }
                     withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
                         def slackPayload = groovy.json.JsonOutput.toJson([
                             report      : "New licenses detected in release mode (${params.ref} branch). Manual approval required before release.",
@@ -518,6 +520,7 @@ pipeline {
                             ok: "Approve"
                         )
                     }
+                    currentBuild.result = 'SUCCESS'
                 }
             }
         }
