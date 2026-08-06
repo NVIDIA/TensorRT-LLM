@@ -249,6 +249,7 @@ def _normalize_image_output(image) -> list:
 
 
 _IMAGE_EDIT_PIPELINE_CLASS_NAMES = {
+    "Flux2Pipeline",
     "QwenImageEditPlusPipeline",
     "QwenImageLayeredPipeline",
 }
@@ -271,6 +272,30 @@ def _model_supports_image_edit(model_id: Optional[str]) -> bool:
     pipeline_class_name = _resolve_visual_gen_pipeline_class_name(model_id)
     if pipeline_class_name is None:
         return False
+    return pipeline_class_name in _IMAGE_EDIT_PIPELINE_CLASS_NAMES
+
+
+def _is_local_model_path(model_id: Optional[str]) -> bool:
+    if not model_id:
+        return False
+    return Path(str(model_id)).exists()
+
+
+def _visual_gen_pipeline_class_name(generator: VisualGen) -> Optional[str]:
+    executor = getattr(generator, "executor", None)
+    pipeline_class_name = getattr(executor, "pipeline_class_name", None)
+    if pipeline_class_name:
+        return str(pipeline_class_name)
+
+    pipeline = getattr(executor, "pipeline", None)
+    if pipeline is not None:
+        return pipeline.__class__.__name__
+
+    return None
+
+
+def _pipeline_class_supports_image_edit(
+        pipeline_class_name: Optional[str]) -> bool:
     return pipeline_class_name in _IMAGE_EDIT_PIPELINE_CLASS_NAMES
 
 
@@ -567,6 +592,16 @@ class OpenAIServer(_VideoRoutesMixin):
         if not self._is_visual_gen:
             return False
         args = getattr(self.generator, "args", None)
+        original_model_ids = (
+            getattr(self.generator, "model", None),
+            getattr(args, "model", None),
+        )
+        if any(
+                _is_local_model_path(model_id)
+                for model_id in original_model_ids):
+            return _pipeline_class_supports_image_edit(
+                _visual_gen_pipeline_class_name(self.generator))
+
         model_ids = (
             self.model,
             getattr(self.generator, "model", None),
