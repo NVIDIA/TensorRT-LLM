@@ -897,11 +897,12 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
-        # Guards against a control_action() body entering control_action()
-        # again. The two events above are shared, single-slot state, so a
-        # nested entry would clear the outer action's barrier and let the
-        # executor loop resume while the outer body is still running.
-        self._control_action_in_progress = False
+        # The two events above are a broadcast handshake, not a mutex: set()
+        # releases every waiter, so callers are serialised here instead.
+        self._control_action_lock = threading.Lock()
+        # Holder's thread ident, so a nested call can be rejected rather than
+        # deadlock on the non-reentrant lock above.
+        self._control_action_owner: Optional[int] = None
         self._active_control_id: Optional[str] = None
         self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
         self._sleep_wakeup_pending_abort_lock = threading.Lock()
@@ -4462,33 +4463,41 @@ class PyExecutor:
                      action; same-batch requests fetched after the sentinel
                      are parked until the ``with`` block exits.
 
-        Not re-entrant: ``control_request_barrier`` and ``control_action_done``
-        are single-slot events, so a nested entry would clear the outer
-        action's barrier and release the executor loop while the outer body is
-        still running. Nesting is rejected rather than allowed to corrupt that
-        handshake.
+        Mutually exclusive and not re-entrant: the two events are a broadcast
+        handshake rather than a mutex, so concurrent callers would both pass
+        the barrier and both clear it, releasing the executor loop while one
+        body still runs. Callers therefore serialise on
+        ``_control_action_lock``; a nested call from the holding thread is
+        rejected rather than blocked, which would deadlock.
         """
 
-        if self._control_action_in_progress:
+        # Unsynchronised read is sound: only the owning thread writes its own
+        # ident, and clears it before releasing. So this can match only for a
+        # thread that really holds the lock; any other value falls through to
+        # the lock, which does the actual exclusion.
+        if self._control_action_owner == threading.get_ident():
             raise RuntimeError(
-                "control_action() is already in progress; it is not re-entrant. "
-                "A control action must not invoke another control action - call "
-                "the undecorated operation instead (e.g. self.engine.<op>() "
+                "control_action() is not re-entrant: this thread already holds "
+                "one. A control action must not invoke another control action - "
+                "call the undecorated operation instead (e.g. self.engine.<op>() "
                 "rather than the @control_action_decorator wrapper).")
 
-        if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request(
-                drain=drain, control_id=control_id)
+        with self._control_action_lock:
+            self._control_action_owner = threading.get_ident()
+            try:
+                if self.dist.rank == 0:
+                    self.executor_request_queue.enqueue_control_request(
+                        drain=drain, control_id=control_id)
 
-        self.control_request_barrier.wait()
+                self.control_request_barrier.wait()
 
-        self._control_action_in_progress = True
-        try:
-            yield self
-        finally:
-            self._control_action_in_progress = False
-            self.control_action_done.set()
-            self.control_request_barrier.clear()
+                try:
+                    yield self
+                finally:
+                    self.control_action_done.set()
+                    self.control_request_barrier.clear()
+            finally:
+                self._control_action_owner = None
 
     def _wait_for_model_engine_input_copy(self):
         wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",
