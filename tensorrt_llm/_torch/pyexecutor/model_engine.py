@@ -466,6 +466,11 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
+        from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
+        if LOW_M_GEMM_ACTIVE:
+            prepare_low_m_gemm(self.model,
+                               cuda_graph_enabled=llm_args.cuda_graph_config
+                               is not None)
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -1263,6 +1268,8 @@ class PyTorchModelEngine(ModelEngine):
         # fails every step and padded batches silently run eager.
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
+        from ..modules.low_m_gemm import flush_low_m_gemm_shape_log
+        flush_low_m_gemm_shape_log()
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for

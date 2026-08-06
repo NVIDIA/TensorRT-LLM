@@ -40,7 +40,7 @@ Example:
 
 import math
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -208,6 +208,35 @@ if IS_FLASHINFER_AVAILABLE:
 
 
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
+_TRTLLM_GEN_DECODE_LEGACY_NUM_ARGS = 31
+_TRTLLM_GEN_DECODE_BLOCK_SPARSE_NUM_ARGS = 33
+_trtllm_gen_decode_num_args: Optional[int] = None
+
+
+def _run_trtllm_gen_decode_compat(
+    run_func: Callable[..., None],
+    *args: object,
+) -> None:
+    """Call either the 31- or 33-argument FlashInfer decode FFI."""
+    global _trtllm_gen_decode_num_args
+
+    if _trtllm_gen_decode_num_args == _TRTLLM_GEN_DECODE_BLOCK_SPARSE_NUM_ARGS:
+        run_func(*args, False, None)
+        return
+
+    try:
+        run_func(*args)
+    except TypeError as error:
+        expected_mismatch = (
+            f"Expected {_TRTLLM_GEN_DECODE_BLOCK_SPARSE_NUM_ARGS} but got "
+            f"{_TRTLLM_GEN_DECODE_LEGACY_NUM_ARGS} arguments"
+        )
+        if expected_mismatch not in str(error):
+            raise
+        run_func(*args, False, None)
+        _trtllm_gen_decode_num_args = _TRTLLM_GEN_DECODE_BLOCK_SPARSE_NUM_ARGS
+    else:
+        _trtllm_gen_decode_num_args = _TRTLLM_GEN_DECODE_LEGACY_NUM_ARGS
 
 
 def _get_multi_ctas_kv_counter_size(
@@ -267,7 +296,8 @@ def _trtllm_gen_batch_decode_with_kv_cache(
 
     run_func = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = flashinfer.decode.get_device_sm_count(query.device)
-    run_func(
+    _run_trtllm_gen_decode_compat(
+        run_func,
         out,
         None,  # out_scale_factor
         query,
