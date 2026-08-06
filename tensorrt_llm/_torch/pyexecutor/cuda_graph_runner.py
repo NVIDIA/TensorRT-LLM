@@ -119,7 +119,7 @@ class CUDAGraphRunner:
 
     This unified class handles high-level orchestration (padding, eligibility)
     and low-level execution (capturing, resource management, replaying) for
-    multiple graphs, keyed by batch shape and execution-path specializations.
+    multiple graphs, keyed by (batch size, draft_len, is_first_draft, use_lora).
     """
     WARMUP_STEPS = 1
 
@@ -256,8 +256,8 @@ class CUDAGraphRunner:
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
-        # Promoted IDs only correct the sequence length observed by sparse
-        # short/long graph selection.
+        # Keep the graph-key tuple unchanged; promoted IDs only correct the
+        # sequence length observed by sparse short/long graph selection.
         short_seq_len_mode = self._get_seq_len_mode(
             batch, new_tensors_device, promoted_context_request_ids)
 
