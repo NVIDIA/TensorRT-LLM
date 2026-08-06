@@ -41,6 +41,8 @@ __all__ = [
     "ragged_gather_index_lists",
     "RaggedCaptureShape",
     "choose_ragged_capture_shape",
+    "fill_bucket_device",
+    "build_row_maps_device",
 ]
 
 
@@ -356,6 +358,92 @@ def choose_ragged_capture_shape(
         f"rank (peer stats {list(stats)}, padded_bs {padded_bs}, "
         f"max_verify_len {max_verify_len}); the group falls back to uniform "
         f"together rather than splitting its graph keys")
+
+
+def fill_bucket_device(
+    verify_lens: torch.Tensor,
+    *,
+    num_real: torch.Tensor,
+    graph_num_tokens: int,
+    max_verify_len: int,
+) -> torch.Tensor:
+    """Capture-safe :meth:`RaggedVerifyLayout.fill_bucket`: same allocation,
+    computed entirely on device.
+
+    The host round-robin decomposes into full cycles -- every row with
+    headroom gains one token -- plus one final partial cycle where the first
+    ``spare`` headroom rows in index order gain one. Each cycle is therefore
+    ``grant = headroom & (cumsum(headroom) <= spare)``, and a row's headroom
+    is at most ``max_verify_len - 1``, so a statically-unrolled loop of that
+    many cycles per phase (real rows first, then pad rows) reproduces the
+    host result token-for-token with no ``.item()`` or host sync.
+
+    The device version cannot raise, so feasibility is the caller's contract,
+    checkable from host-known quantities alone before launch:
+    ``padded_bs <= graph_num_tokens <= padded_bs * max_verify_len`` and the
+    scheduled budget small enough that real tokens plus one-per-pad-row fit
+    the bucket. Under those bounds the result sums to exactly
+    ``graph_num_tokens``.
+
+    Args:
+        verify_lens: ``[padded_bs]`` scheduled lengths; entries at or beyond
+            ``num_real`` are ignored (pad rows restart from one token).
+        num_real: 0-d integer tensor on the same device (host-known per step,
+            but not a capture constant -- it changes across replays).
+        graph_num_tokens: the captured token bucket (capture constant).
+        max_verify_len: per-row ceiling (capture constant).
+    Returns:
+        ``[padded_bs]`` int32 filled lengths.
+    """
+    if verify_lens.dim() != 1:
+        raise ValueError(f"verify_lens must be 1-D, got {tuple(verify_lens.shape)}")
+    padded_bs = verify_lens.numel()
+    device = verify_lens.device
+    rows = torch.arange(padded_bs, device=device)
+    is_real = rows < num_real
+    lens = torch.where(
+        is_real,
+        verify_lens.to(torch.int32),
+        torch.ones(padded_bs, dtype=torch.int32, device=device),
+    )
+    spare = graph_num_tokens - lens.sum()
+    for phase_mask in (is_real, ~is_real):
+        for _ in range(max(max_verify_len - 1, 0)):
+            headroom = phase_mask & (lens < max_verify_len)
+            in_cycle = torch.cumsum(headroom.to(torch.int64), dim=0) <= spare
+            grant = (headroom & in_cycle).to(torch.int32)
+            lens = lens + grant
+            spare = spare - grant.sum()
+    return lens
+
+
+def build_row_maps_device(
+    verify_lens: torch.Tensor,
+    *,
+    graph_num_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token ``(req_idx, kv_correction)`` from filled lengths, on device.
+
+    The token-major row maps prepare() stages from host lists decompose into
+    a pure function of the filled ``verify_lens``: token ``t`` of a request
+    with window ``v`` at within-request offset ``o`` attends KV extent
+    ``kv_len - v + 1 + o``, i.e. correction ``o - v + 1``. Composing the
+    returned correction with a ``kv_lens`` gather is exactly
+    ``refresh_ragged_row_kv_lens``, so the caller reuses that op unchanged.
+
+    ``verify_lens`` must already sum to ``graph_num_tokens``
+    (post-:func:`fill_bucket_device`); the explicit total keeps
+    ``repeat_interleave`` sync-free.
+
+    Returns:
+        ``req_idx``: ``[graph_num_tokens]`` int64 owning-row index.
+        ``correction``: ``[graph_num_tokens]`` int32, in ``[1 - v, 0]``.
+    """
+    indptr = build_qo_indptr(verify_lens).to(torch.long)
+    req_idx = row_ids_from_lens(verify_lens, total=graph_num_tokens)
+    offset = torch.arange(graph_num_tokens, device=verify_lens.device) - indptr[req_idx]
+    correction = (offset - verify_lens.to(torch.long)[req_idx] + 1).to(torch.int32)
+    return req_idx, correction
 
 
 def ragged_gather_index_lists(
