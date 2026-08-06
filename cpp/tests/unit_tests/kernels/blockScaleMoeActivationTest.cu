@@ -45,6 +45,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -431,6 +432,37 @@ TEST_F(BlockScaleMoeActivationEquivalenceTest, ZeroScaleBlockProducesIdenticalNa
         ASSERT_EQ(static_cast<uint8_t>(legacy.bytes[idx]), static_cast<uint8_t>(permuted.bytes[idx]))
             << "0/0 encoding differs at element " << elt;
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST(BlockScaleMoeActivationBackingTest, PadsActivationUsingItsOwnRowWidth)
+{
+    // A single-token Qwen-style decode can have only 32 padded rows. FC1 writes
+    // 2 * intermediateSize elements per row, while the gated activation read by
+    // FC2 is half as wide. Reusing FC1's capacity would therefore allocate only
+    // about half of the backing required by Blackwell's TMA-OOB contract.
+    constexpr int32_t maxNumPaddedTokens = 32;
+    constexpr int32_t intermediateSize = 2304;
+    constexpr int64_t minActivationBytes = 128 * 1024;
+    constexpr int64_t minScaleBytes = 4 * 1024;
+    auto const fp8Bits = tg::dtypeGetNumBits(tg::Dtype::E4m3);
+
+    auto const gemm1Capacity = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+        maxNumPaddedTokens, 2 * intermediateSize, fp8Bits);
+    auto const activationCapacity = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+        maxNumPaddedTokens, intermediateSize, fp8Bits);
+
+    auto const activationBytes = static_cast<int64_t>(activationCapacity) * intermediateSize * fp8Bits / 8;
+    auto const activationBytesWithGemm1Capacity = static_cast<int64_t>(gemm1Capacity) * intermediateSize * fp8Bits / 8;
+    auto const scaleBytes = static_cast<int64_t>(activationCapacity) * (intermediateSize / kEltsPerSf) * sizeof(float);
+    auto const scaleBytesWithGemm1Capacity
+        = static_cast<int64_t>(gemm1Capacity) * (intermediateSize / kEltsPerSf) * sizeof(float);
+
+    EXPECT_GE(activationBytes, minActivationBytes);
+    EXPECT_GE(scaleBytes, minScaleBytes);
+    EXPECT_LT(activationBytesWithGemm1Capacity, minActivationBytes);
+    EXPECT_LT(scaleBytesWithGemm1Capacity, minScaleBytes);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
