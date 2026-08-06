@@ -4141,55 +4141,58 @@ class GvrTopKKernel:
                                 # so there is nothing to collect - go straight
                                 # to the rank. No extra candidate walk, no
                                 # staging barrier, nothing riding in registers.
-                                # unroll=1 on the rank loop: the class is tiny,
-                                # so the trip count is 1-2, but an unrolled
-                                # body (plus its remainder ladder) is code
-                                # volume that ONE warp walks cold while every
-                                # other warp waits at the barrier below - the
-                                # fetch latency has nothing to hide behind.
-                                # Keeping it rolled trades a branch per trip
-                                # for a body that fits a cache line or two.
-                                if warp_id == cutlass.Int32(0):
-                                    ie9 = lane
-                                    while ie9 < cnt_strad:
-                                        bi9 = smem_hist[_PAIR_BASE + ie9 + ie9]
-                                        ki9 = f32_order_key(
+                                # Rank the class with the WHOLE BLOCK, not
+                                # one warp. Each warp owns a stride of the
+                                # class and its 32 lanes split the
+                                # comparisons, so the cost is
+                                # ceil(n/num_warps) * ceil(n/32) trips per
+                                # lane plus one warp reduce - 1 trip for the
+                                # class of two that fires today, 8 for a class
+                                # of fifty. The old form had a single warp walk
+                                # n^2/32 steps while the other fifteen waited
+                                # at the barrier below, which is what made a
+                                # larger class unaffordable.
+                                e9 = warp_id
+                                while e9 < cnt_strad:
+                                    be9 = smem_hist[_PAIR_BASE + e9 + e9]
+                                    ke9 = f32_order_key(
+                                        cutlass.Float32(
+                                            llvm.bitcast(cutlass.Float32.mlir_type, be9.ir_value())
+                                        )
+                                    ) ^ cutlass.Int32(-2147483648)
+                                    c9 = cutlass.Int32(0)
+                                    j9 = lane
+                                    while j9 < cnt_strad:
+                                        bj9 = smem_hist[_PAIR_BASE + j9 + j9]
+                                        kj9 = f32_order_key(
                                             cutlass.Float32(
                                                 llvm.bitcast(
-                                                    cutlass.Float32.mlir_type, bi9.ir_value()
+                                                    cutlass.Float32.mlir_type, bj9.ir_value()
                                                 )
                                             )
                                         ) ^ cutlass.Int32(-2147483648)
-                                        r9 = cutlass.Int32(0)
-                                        for j9 in cutlass.range(0, cnt_strad, 1, unroll=1):
-                                            bj9 = smem_hist[_PAIR_BASE + j9 + j9]
-                                            kj9 = f32_order_key(
-                                                cutlass.Float32(
-                                                    llvm.bitcast(
-                                                        cutlass.Float32.mlir_type, bj9.ir_value()
-                                                    )
-                                                )
-                                            ) ^ cutlass.Int32(-2147483648)
-                                            if kj9 > ki9:
-                                                r9 = r9 + cutlass.Int32(1)
-                                            elif kj9 == ki9 and j9 < ie9:
-                                                r9 = r9 + cutlass.Int32(1)
-                                        if r9 < need0:
-                                            pos9 = rank_above_fine + r9
-                                            if pos9 < cutlass.Int32(kK):
-                                                if cutlass.const_expr(self.return_output_values):
-                                                    output_values_row[pos9] = self.dtype(
-                                                        cutlass.Float32(
-                                                            llvm.bitcast(
-                                                                cutlass.Float32.mlir_type,
-                                                                bi9.ir_value(),
-                                                            )
+                                        if kj9 > ke9:
+                                            c9 = c9 + cutlass.Int32(1)
+                                        elif kj9 == ke9 and j9 < e9:
+                                            c9 = c9 + cutlass.Int32(1)
+                                        j9 = j9 + cutlass.Int32(32)
+                                    r9 = self.warp_reduce_sum_i32(c9)
+                                    if lane == cutlass.Int32(0) and r9 < need0:
+                                        pos9 = rank_above_fine + r9
+                                        if pos9 < cutlass.Int32(kK):
+                                            if cutlass.const_expr(self.return_output_values):
+                                                output_values_row[pos9] = self.dtype(
+                                                    cutlass.Float32(
+                                                        llvm.bitcast(
+                                                            cutlass.Float32.mlir_type,
+                                                            be9.ir_value(),
                                                         )
                                                     )
-                                                output_indices_row[pos9] = smem_hist[
-                                                    _PAIR_BASE + ie9 + ie9 + cutlass.Int32(1)
-                                                ]
-                                        ie9 = ie9 + cutlass.Int32(32)
+                                                )
+                                            output_indices_row[pos9] = smem_hist[
+                                                _PAIR_BASE + e9 + e9 + cutlass.Int32(1)
+                                            ]
+                                    e9 = e9 + cutlass.Int32(num_warps)
                                 cute.arch.barrier()
                             else:
                                 # Large class only. Everything below -
