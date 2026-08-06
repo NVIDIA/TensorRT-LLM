@@ -1135,6 +1135,13 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
+      "path": "multimodal_config.encoder_data_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
       "path": "multimodal_config.encoder_side_stream_max_ahead"
     },
     {

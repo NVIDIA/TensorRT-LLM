@@ -602,6 +602,15 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
+    encoder_data_parallel_size: PositiveInt = Field(
+        default=1,
+        description=(
+            "Number of tensor-parallel ranks used to distribute multimodal "
+            "encoder items. The encoder weights are replicated on those ranks."
+        ),
+        status="prototype",
+    )
+
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
@@ -672,6 +681,17 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        if self.encoder_data_parallel_size > 1:
+            if self.encoder_cuda_graph is not None:
+                raise ValueError(
+                    "multimodal_config.encoder_data_parallel_size > 1 and "
+                    "multimodal_config.encoder_cuda_graph are mutually exclusive."
+                )
+            if self.encoder_side_stream_max_ahead > 0:
+                raise ValueError(
+                    "multimodal_config.encoder_data_parallel_size > 1 and "
+                    "multimodal_config.encoder_side_stream_max_ahead > 0 are "
+                    "mutually exclusive.")
         return self
 
 
