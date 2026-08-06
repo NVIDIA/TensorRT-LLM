@@ -7855,9 +7855,17 @@ class PyTorchModelEngine(ModelEngine):
         }
         with runner.pad_batch(graph_inputs,
                               len(encoder_requests)) as padded_inputs:
+            # `pad_batch` extends seq_lens to the captured bucket, and the
+            # metadata takes one request id per sequence. Pad slots carry no
+            # request; the encoder pass runs without a KV cache, so their ids
+            # are never looked up and only have to exist and stay distinct.
+            request_ids = [r.py_request_id for r in encoder_requests]
+            request_ids += [
+                -(i + 1) for i in range(
+                    len(padded_inputs['seq_lens']) - len(request_ids))
+            ]
             eager_attn_metadata = self._make_encoder_attn_metadata(
-                padded_inputs['seq_lens'],
-                [r.py_request_id for r in encoder_requests])
+                padded_inputs['seq_lens'], request_ids)
             graph_attn_metadata, key = runner.maybe_get_cuda_graph(
                 padded_inputs, eager_attn_metadata)
             if key is None:
