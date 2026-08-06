@@ -126,9 +126,9 @@ class TestResizeKernels:
 
     def test_area_rejects_unsupported_geometry(self):
         frames = _clip(64, 64)
-        with pytest.raises(AssertionError, match=r"factor=3, expected one of \(2, 4\)"):
+        with pytest.raises(ValueError, match=r"factor=3, expected one of \(2, 4\)"):
             resize_area_u8(frames, 3)
-        with pytest.raises(AssertionError, match="65x64 not divisible by factor=2"):
+        with pytest.raises(ValueError, match="65x64 not divisible by factor=2"):
             resize_area_u8(_clip(64, 65), 2)
 
 
@@ -176,20 +176,37 @@ class TestBilateralKernel:
 class TestKernelInputValidation:
     def test_rejects_cpu_tensors(self):
         cpu = torch.zeros(1, 8, 8, 3, dtype=torch.uint8)
-        with pytest.raises(AssertionError, match="requires a CUDA tensor, got device=cpu"):
+        with pytest.raises(ValueError, match="requires a CUDA tensor, got device=cpu"):
             bilateral_filter(cpu, 9, 75.0, 75.0)
-        with pytest.raises(AssertionError, match="requires a CUDA tensor, got device=cpu"):
+        with pytest.raises(ValueError, match="requires a CUDA tensor, got device=cpu"):
             resize_linear_u8(cpu, 4, 4)
-        with pytest.raises(AssertionError, match="requires a CUDA tensor, got device=cpu"):
+        with pytest.raises(ValueError, match="requires a CUDA tensor, got device=cpu"):
             canny_edges(torch.zeros(3, 1, 8, 8, dtype=torch.uint8), 100, 200)
+
+    def test_rejects_non_contiguous(self):
+        # The kernels address storage densely and never read strides, so a
+        # strided view used to be accepted and silently produce wrong pixels.
+        g = torch.Generator(device="cuda").manual_seed(0)
+        chw = torch.randint(0, 256, (2, 3, 64, 96), dtype=torch.uint8, device="cuda", generator=g)
+        view = chw.permute(0, 2, 3, 1)  # valid [T, H, W, C] shape, not contiguous
+        assert not view.is_contiguous()
+        for call in (
+            lambda: resize_linear_u8(view, 48, 32),
+            lambda: resize_cubic_u8(view, 48, 32),
+            lambda: resize_area_u8(view, 2),
+            lambda: bilateral_filter(view, 9, 75.0, 75.0),
+            lambda: canny_edges(chw.permute(1, 0, 2, 3), 100, 200),
+        ):
+            with pytest.raises(ValueError, match="requires a contiguous tensor"):
+                call()
 
     def test_rejects_non_uint8(self):
         # Silently casting would be a data copy on the inference path; the
         # kernels require the caller to hand over the dtype they expect.
         f32 = torch.zeros(1, 8, 8, 3, dtype=torch.float32, device="cuda")
-        with pytest.raises(AssertionError, match="requires uint8 frames, got dtype=torch.float32"):
+        with pytest.raises(TypeError, match="requires uint8 frames, got dtype=torch.float32"):
             bilateral_filter(f32, 9, 75.0, 75.0)
-        with pytest.raises(AssertionError, match="requires uint8 frames, got dtype=torch.float32"):
+        with pytest.raises(TypeError, match="requires uint8 frames, got dtype=torch.float32"):
             resize_cubic_u8(f32, 4, 4)
 
 

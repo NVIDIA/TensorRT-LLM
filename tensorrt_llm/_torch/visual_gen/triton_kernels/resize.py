@@ -95,10 +95,31 @@ def _cubic_axis(dst_n: int, src_n: int):
     return taps, coef
 
 
-def _check_input(frames: torch.Tensor, op: str) -> None:
-    assert frames.is_cuda, f"{op} requires a CUDA tensor, got device={frames.device}"
-    assert frames.dtype == torch.uint8, f"{op} requires uint8 frames, got dtype={frames.dtype}"
-    assert frames.ndim == 4, f"{op} expects [T, H, W, C], got shape={tuple(frames.shape)}"
+def _check_input(frames: torch.Tensor, op: str, *, layout: str = "[T, H, W, C]") -> None:
+    """Reject anything the kernels cannot address.
+
+    Explicit raises rather than ``assert``: assertions vanish under ``python -O``,
+    and only ``ValueError`` is classified as a client error by the worker, so an
+    ``AssertionError`` would surface as a server fault.
+
+    Contiguity is mandatory. Every kernel here indexes raw storage as a dense
+    ``T*H*W*C`` block and never consults strides, so a strided view is read as
+    if it were dense -- wrong pixels, no error. We reject rather than call
+    ``.contiguous()``: a silent full-clip copy does not belong on an inference
+    path, and the callers already pass dense tensors.
+    """
+    if not frames.is_cuda:
+        raise ValueError(f"{op} requires a CUDA tensor, got device={frames.device}")
+    if frames.dtype != torch.uint8:
+        raise TypeError(f"{op} requires uint8 frames, got dtype={frames.dtype}")
+    if frames.ndim != 4:
+        raise ValueError(f"{op} expects {layout}, got shape={tuple(frames.shape)}")
+    if not frames.is_contiguous():
+        raise ValueError(
+            f"{op} requires a contiguous tensor; the kernels address storage densely and "
+            f"would misread a strided view. Got shape={tuple(frames.shape)} "
+            f"strides={tuple(frames.stride())} -- call .contiguous() first."
+        )
 
 
 @functools.lru_cache(maxsize=_TABLE_CACHE_ENTRIES)
@@ -396,10 +417,10 @@ def resize_area_u8(frames: torch.Tensor, factor: int) -> torch.Tensor:
     """
     _check_input(frames, "resize_area_u8")
     T, H, W, C = frames.shape
-    assert factor in (2, 4), f"resize_area_u8 factor={factor}, expected one of (2, 4)"
-    assert H % factor == 0 and W % factor == 0, (
-        f"resize_area_u8 source {W}x{H} not divisible by factor={factor}"
-    )
+    if factor not in (2, 4):
+        raise ValueError(f"resize_area_u8 factor={factor}, expected one of (2, 4)")
+    if H % factor or W % factor:
+        raise ValueError(f"resize_area_u8 source {W}x{H} not divisible by factor={factor}")
     dh, dw = H // factor, W // factor
     dst = torch.empty(T, dh, dw, C, dtype=torch.uint8, device=frames.device)
     half_up = factor == 2 and C in (1, 3, 4)

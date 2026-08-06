@@ -30,6 +30,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from .resize import _check_input
+
 
 def circle_offsets(radius: int, gauss_space_coeff: float):
     """Taps of the circular support in row-major order, with space weights.
@@ -129,13 +131,9 @@ def bilateral_filter(
     frames: torch.Tensor, d: int, sigma_color: float, sigma_space: float
 ) -> torch.Tensor:
     """Bilateral filter over a clip: uint8 ``[T, H, W, 3]`` CUDA -> same shape."""
-    assert frames.is_cuda, f"bilateral_filter requires a CUDA tensor, got device={frames.device}"
-    assert frames.dtype == torch.uint8, (
-        f"bilateral_filter requires uint8 frames, got dtype={frames.dtype}"
-    )
-    assert frames.ndim == 4 and frames.shape[-1] == 3, (
-        f"bilateral_filter expects [T, H, W, 3], got shape={tuple(frames.shape)}"
-    )
+    _check_input(frames, "bilateral_filter")
+    if frames.shape[-1] != 3:
+        raise ValueError(f"bilateral_filter expects [T, H, W, 3], got shape={tuple(frames.shape)}")
     T, H, W, C = frames.shape
     dev = frames.device
     radius = max(d // 2, 1)
