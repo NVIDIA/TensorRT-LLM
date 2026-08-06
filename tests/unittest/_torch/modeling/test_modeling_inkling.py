@@ -233,9 +233,7 @@ class _FakeKvManager:
         self.calls = []
 
     def get_batch_cache_indices(self, request_ids, layer_idx):
-        # One row per request id, like the real manager -- returning a fixed
-        # row count regardless of the batch is what made this fake disagree
-        # with production.
+        # One row per request id, like the real manager.
         self.calls.append((tuple(request_ids), layer_idx))
         return self._blocks[layer_idx][: len(request_ids)]
 

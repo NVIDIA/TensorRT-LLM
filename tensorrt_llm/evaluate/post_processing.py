@@ -169,14 +169,12 @@ def strip_thinking_and_extract_mmmu_answer(text: str) -> str:
 #     <|content_thinking|>reasoning<|end_message|>
 #     <|message_model|><|content_text|>visible answer<|end_message|>
 #     <|content_model_end_sampling|>
-# Reasoning must be routed out and only the ``<|content_text|>`` (visible)
-# channel scored — exactly what SGLang's ``InklingDetector`` /
-# ``--reasoning-parser inkling`` does online. For offline lm-eval scoring we
-# need the generation detokenized WITHOUT ``skip_special_tokens`` so these
-# markers survive; ``extract_inkling_content`` then returns only the visible
-# content-text so GSM8K/MMLU flexible-extract scores the answer, not the
-# chain-of-thought (whose trailing numbers otherwise poison last-number
-# extraction, e.g. "**5 cars** ... first 15 minutes" -> wrongly extracts 15).
+# Reasoning must be routed out and only the visible ``<|content_text|>`` channel
+# scored, matching what SGLang's ``--reasoning-parser inkling`` does online. For
+# offline lm-eval the generation is detokenized without ``skip_special_tokens``
+# so these markers survive, and ``extract_inkling_content`` returns only the
+# visible text -- otherwise flexible-extract harvests numbers from the
+# chain-of-thought instead of the answer.
 _INK_CONTENT_THINKING = "<|content_thinking|>"
 _INK_CONTENT_TEXT = "<|content_text|>"
 _INK_END_MESSAGE = "<|end_message|>"
@@ -216,18 +214,13 @@ def extract_inkling_content(text: str) -> str:
     (kept). Concatenates all content-text runs and returns them stripped.
 
     Requires the generation to be detokenized with ``skip_special_tokens=False``
-    so the channel markers are present. If NO Inkling control token at all is
-    found (special tokens were skipped, or a non-Inkling model), the input is
-    returned unchanged so behavior for every other model/benchmark is
-    untouched.
+    so the channel markers are present. If no Inkling control token is found at
+    all, the input is returned unchanged, leaving every other model untouched.
 
-    The passthrough test is deliberately over the whole control-token set, not
-    just the two channel markers. Output that carries only framing -- a
-    ``<|message_model|>`` header with no later ``<|content_text|>``, or a
-    generation truncated right after the header -- has no visible channel, and
-    ``InklingReasoningParser`` drops it. Testing only the channel markers
-    returned such text verbatim, so the evaluator scored raw special tokens, or
-    text sitting outside any visible block, as if it were the answer.
+    That passthrough test covers the whole control-token set, not just the two
+    channel markers: output carrying only framing (a header with no later
+    ``<|content_text|>``) has no visible channel and must yield nothing rather
+    than be scored verbatim.
     """
     if _INK_CONTROL_RE.search(text) is None:
         return text
@@ -255,15 +248,10 @@ def extract_inkling_content(text: str) -> str:
         content_parts.append(text[pos:])
 
     # Mirror SGLang's ``InklingDetector``: the visible channel is the
-    # concatenation of ``<|content_text|>`` runs ONLY. When Inkling markers are
-    # present but no content-text was emitted (e.g. the generation looped or was
-    # truncated inside the ``<|content_thinking|>`` block and never produced an
-    # answer), SGLang routes everything to ``reasoning_text`` and returns an empty
-    # ``normal_text``. We must return the empty visible content here too: falling
-    # back to the stripped reasoning text would let a truncated / looping
-    # chain-of-thought be scored as if it were the model's answer (its trailing
-    # number would be harvested by GSM8K/MMLU flexible-extract) — exactly the
-    # failure the reasoning channel is meant to exclude.
+    # concatenation of ``<|content_text|>`` runs only. If markers are present but
+    # no content-text was emitted (a truncated or looping thinking block), return
+    # empty rather than falling back to the reasoning text, which would let the
+    # chain-of-thought be scored as the answer.
     return "".join(content_parts).strip()
 
 

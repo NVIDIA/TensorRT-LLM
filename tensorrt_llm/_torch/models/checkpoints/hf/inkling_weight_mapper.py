@@ -42,10 +42,9 @@ from tensorrt_llm._torch.configs.inkling import InklingTextConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
-# NVFP4 two-level-scale maxima: E2M1 element max (6.0) and E4M3 block-scale max
-# (448.0). ModelOpt stores the per-tensor activation ``input_scale`` as
-# ``amax / (E2M1_MAX * E4M3_MAX)``; Inkling's checkpoint instead ships the raw
-# ``.input_amax``, so the mapper must apply this conversion (see ``_map_expert``).
+# NVFP4 two-level-scale maxima. ModelOpt stores the per-tensor activation
+# ``input_scale`` as ``amax / (E2M1_MAX * E4M3_MAX)``; Inkling's checkpoint ships
+# the raw ``.input_amax``, so ``_map_expert`` applies the conversion.
 _NVFP4_E2M1_MAX = 6.0
 _NVFP4_E4M3_MAX = 448.0
 
@@ -181,10 +180,8 @@ _SIMPLE_RENAMES = {
 }
 
 # Per-layer renames (regex on the ``layers.N.<rest>`` tail -> TRT name tail).
-# q/k/v map to the standard separate HF names at the ``attn.`` level; the fused
-# ``qkv_proj`` Linear's loader collects attn.q_proj/k_proj/v_proj via its
-# special-handling callback and fuses them. Same for gate_up_proj <- gate_proj +
-# up_proj (the dense w13_dn tensor is pre-fused and is split in _map_dense_w13).
+# q/k/v map to the standard separate HF names; the fused ``qkv_proj`` loader
+# collects and fuses them. Same for gate_up_proj <- gate_proj + up_proj.
 _LAYER_RENAMES = {
     "attn.wq_du.weight": "attn.q_proj.weight",
     "attn.wk_dv.weight": "attn.k_proj.weight",
@@ -283,13 +280,11 @@ class InklingHfWeightMapper(HfWeightMapper):
         for name, tensor in weights.items():
             if name in _SIMPLE_RENAMES:
                 if name == "unembed.weight" and tensor.shape[0] > unpadded_vocab:
-                    # The checkpoint LM-head matrix is padded to vocab_size
-                    # (201024); the text tower emits logits only over the
-                    # unpadded vocab (200058). Dropping the padding rows here is
-                    # exactly the required "slice logits to unpadded" (logit[i]
-                    # = h @ unembed[i]), and lets LMHead(num_embeddings=200058)
-                    # load without a shape mismatch. embed_tokens keeps the full
-                    # matrix (built at vocab_size), so input ids stay in range.
+                    # The checkpoint LM-head matrix is padded to ``vocab_size``
+                    # while the tower emits logits only over the unpadded vocab.
+                    # Dropping the padding rows is the required "slice logits to
+                    # unpadded"; embed_tokens keeps the full matrix so input ids
+                    # stay in range.
                     tensor = tensor[:unpadded_vocab]
                 new_weights[_SIMPLE_RENAMES[name]] = tensor
                 continue
@@ -301,18 +296,17 @@ class InklingHfWeightMapper(HfWeightMapper):
 
             dense_match = _DENSE_W13_RE.search(name)
             if dense_match is not None:
-                # Dense w13_dn is gate/up-INTERLEAVED [g0,u0,...] along the output
-                # (2*inter) dim; split into gate (even rows) / up (odd rows) for
-                # the fused gate_up_proj loader (strided views, no copy).
+                # Dense w13_dn is gate/up-interleaved along the output dim; split
+                # into gate (even rows) / up (odd rows) as strided views.
                 layer_idx = dense_match.group(1)
                 gate, up = _split_interleaved_gate_up(tensor, dim=0)
                 new_weights[f"model.layers.{layer_idx}.mlp.gate_proj.weight"] = gate
                 new_weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"] = up
                 continue
 
-            # shared_experts.shared_w13_weight loads RAW (interleaved) via
-            # _LAYER_RENAMES; the gate/up interleave is undone by the strided split
-            # in InklingSharedExperts.forward (zero-copy, param materialized once).
+            # shared_experts.shared_w13_weight loads raw (interleaved); the
+            # interleave is undone by the strided split in
+            # ``InklingSharedExperts.forward``.
 
             m = re.match(r"layers\.(\d+)\.(.*)$", name)
             if m is not None:
@@ -354,18 +348,12 @@ class InklingHfWeightMapper(HfWeightMapper):
             return
 
         if sidecar == ".input_amax":
-            # Inkling's NVFP4 checkpoint stores the routed-expert activation
-            # calibration as a RAW amax (``.input_amax``). The fused-MoE loader
-            # (``NVFP4FusedMoEMethod.process_weights_after_loading`` ->
-            # ``fc31_input_scale = 1 / max_e(input_scale)``) and
-            # ``torch.ops.trtllm.fp4_quantize`` expect the ModelOpt per-tensor
-            # activation ``input_scale = amax / (E2M1_MAX * E4M3_MAX)``, so the
-            # activation global scale ``1 / max_e(input_scale)`` lands the e4m3
-            # activation block scales in range. Without this conversion the global
-            # scale is (E2M1_MAX*E4M3_MAX)=2688x too small, the activation fp4
-            # block scales underflow e4m3, and every routed expert diverges from
-            # the bf16 ground truth. Weight / block-scale / scale2 layout is
-            # already correct, so ONLY the activation input scale needs this.
+            # The checkpoint stores the routed-expert activation calibration as a
+            # raw amax, but the fused-MoE loader expects the ModelOpt per-tensor
+            # ``input_scale = amax / (E2M1_MAX * E4M3_MAX)``. Without the
+            # conversion the activation block scales underflow e4m3 and every
+            # routed expert diverges. Only the activation input scale needs it --
+            # the weight / block-scale / scale2 layout is already correct.
             tensor = tensor.to(torch.float32) / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
 
         n_experts = int(getattr(self._text_config, "n_routed_experts", tensor.shape[0]))
@@ -375,18 +363,16 @@ class InklingHfWeightMapper(HfWeightMapper):
             for proj, val in zip(projs, vals):
                 out[f"{prefix}.{e}.{proj}.{scale_name}"] = val
 
-        # Three sidecar shapes: per-expert multi-dim weight/block-scale (chunk
-        # w13 into gate/up along the out dim), per-expert scalar weight_scale_2
-        # (same value for gate and up), and a single global input_amax scalar
-        # broadcast to every expert/proj.
+        # Three sidecar shapes: per-expert multi-dim weight/block-scale, per-expert
+        # scalar weight_scale_2 (shared by gate and up), and a single global
+        # input_amax scalar broadcast to every expert/proj.
         if tensor.dim() >= 2 and tensor.shape[0] == n_experts:
             for e in range(n_experts):
                 if which == "w13_weight":
-                    # w13 (packed fp4 weight AND its per-block fp8 scale) is
-                    # gate/up-INTERLEAVED [g0,u0,...] along the per-expert output
-                    # (2*inter) dim; split into w1 (gate = even rows) / w3 (up =
-                    # odd rows) as strided views (no copy). Reorders whole rows, so
-                    # it is correct for both the uint8 weight and the fp8 scale.
+                    # w13 (packed fp4 weight and its per-block fp8 scale) is
+                    # gate/up-interleaved along the per-expert output dim; split
+                    # into w1 (even rows) / w3 (odd rows) as strided views. This
+                    # reorders whole rows, so it holds for weight and scale alike.
                     per = _split_interleaved_gate_up(tensor[e], dim=0)
                 else:
                     per = (tensor[e],)

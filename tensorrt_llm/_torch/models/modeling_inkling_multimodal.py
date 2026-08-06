@@ -113,15 +113,12 @@ DEFAULT_TEMPORAL_PATCH_SIZE = 2  # a static image is temporally duplicated (T=2)
 DEFAULT_RESCALE_IMAGE_FRAC = 2.0
 DEFAULT_RESCALE_MAX_UPSCALED_LONG_EDGE = 2048
 
-# Inkling image placeholder id. One sentinel appears per image in the
-# pre-rendered token stream; the input processor expands it into one token per
-# patch and the vision fusion overwrites those positions with tower embeddings
-# (so its own embedding is never used). The Inkling chat template renders an
-# image content part as ``<|content_image|>(200005) <|unused_200054|>(200054)
-# <|end_message|>(200010)``, so ``<|unused_200054|>`` (id 200054) IS the trained
-# image placeholder token. It MUST be in-vocab: TensorRT-LLM's executor validates
-# request token ids against the vocab and rejects an out-of-range id.
-# ``config.json`` may override via ``image_token_id``.
+# Inkling image placeholder id (``<|unused_200054|>``), the token the chat
+# template renders for an image content part. One sentinel appears per image;
+# the input processor expands it into one token per patch and the vision fusion
+# overwrites those positions. It must be in-vocab, since the executor rejects
+# out-of-range request token ids. ``config.json`` may override via
+# ``image_token_id``.
 DEFAULT_IMAGE_TOKEN_ID = 200054
 
 
@@ -550,13 +547,8 @@ DEFAULT_AUDIO_DMEL_MIN_VALUE = -7.0
 DEFAULT_AUDIO_DMEL_MAX_VALUE = 2.0
 DEFAULT_AUDIO_TOKEN_DURATION_S = 0.05  # 1 dMel frame == 1 audio token (hop/sr)
 
-# Inkling audio placeholder id. Like the image sentinel, one appears per audio
-# clip in the pre-rendered token stream; the input processor expands it into one
-# token per dMel frame and the audio fusion overwrites those positions with tower
-# rows. The Inkling chat template renders an audio content part as
-# ``<|content_audio_input|>(200020) <|unused_200053|>(200053) <|audio_end|>
-# <|end_message|>``, so ``<|unused_200053|>`` (id 200053) IS the trained audio
-# placeholder token -- the direct analogue of the image ``<|unused_200054|>``.
+# Inkling audio placeholder id (``<|unused_200053|>``), the direct analogue of
+# the image sentinel: one per audio clip, expanded to one token per dMel frame.
 # The top-level config may override via ``audio_token_id``.
 DEFAULT_AUDIO_TOKEN_ID = 200053
 
@@ -867,13 +859,10 @@ class InklingAudioModel(nn.Module):
 # ===========================================================================
 # Video tower: frame sampling onto the image path
 # ===========================================================================
-# Inkling has NO separate video tower: a video is decoded to frames, a subset of
-# frames is sampled, and each sampled frame is fed as an ordinary image through
-# the SAME hMLP vision tower (one ``<image>`` placeholder span per frame). So the
-# only genuinely video-specific logic is choosing WHICH frames to keep; the
-# per-frame preprocessing, tower forward, and fusion all reuse the image path
-# (:class:`InklingImagePreprocessor` and :meth:`InklingInputProcessor.assemble`
-# already handle a list of images, i.e. a list of frames, in encounter order).
+# Inkling has no separate video tower: a video is decoded to frames and each
+# sampled frame is fed as an ordinary image through the same hMLP vision tower.
+# The only video-specific logic is choosing which frames to keep; preprocessing,
+# tower forward and fusion all reuse the image path.
 
 
 class DecodedVideo:
@@ -945,17 +934,10 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     ``{"image": "<image>", "audio": "<audio>"}``.
 
     Inherits :class:`BaseMultimodalDummyInputsBuilder` alongside
-    :class:`BaseMultimodalInputProcessor` (the same two-base pattern the in-tree
-    VLM processors use). ``OpenAIServer.__init__`` seeds media-IO defaults by
-    calling ``get_preferred_media_io_kwargs()`` on ANY
-    ``BaseMultimodalInputProcessor``, and the KV-cache encoder profiler calls
-    ``get_mm_max_tokens_per_item()`` / ``get_dummy_mm_data_for_tokens()``; those
-    live on the dummy-inputs builder, not the base processor, so a processor that
-    inherits only the base crashes ``trtllm-serve`` at startup. The builder's
-    defaults are exactly right here: ``get_preferred_media_io_kwargs`` -> ``{}``
-    (no special media-IO decode format) and ``get_mm_max_tokens_per_item`` ->
-    ``{}`` (empty demand -> the profiler's ``total_demand <= 0`` guard returns
-    early and never reaches ``get_dummy_mm_data_for_tokens``).
+    :class:`BaseMultimodalInputProcessor`, the two-base pattern the in-tree VLM
+    processors use: ``trtllm-serve`` and the KV-cache encoder profiler call
+    hooks that live on the builder, so a processor inheriting only the base
+    crashes at startup. The builder's empty defaults are correct here.
 
     Contract:
 
@@ -969,10 +951,9 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         count mismatch, FAILS LOUDLY (never drops or pads media silently).
     """
 
-    # Accept a pre-tokenized ``prompt_token_ids`` stream that already carries one
-    # placeholder per media item plus ``multi_modal_data``, WITHOUT detokenizing
-    # (the checkpoint tokenizer has no ``<image>`` -> placeholder mapping, so
-    # detokenize-and-retokenize would drop it). See ``call_with_token_ids``.
+    # Accept a pre-tokenized ``prompt_token_ids`` stream carrying one placeholder
+    # per media item without detokenizing: the checkpoint tokenizer has no
+    # ``<image>`` -> placeholder mapping, so a round trip would drop it.
     supports_token_id_mm_expansion = True
 
     def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
@@ -994,15 +975,12 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             temporal_patch_size=temporal,
             dtype=self._dtype,
         )
-        # Built unconditionally so an audio request works even for a checkpoint
-        # whose config omits an ``audio_config`` blob (the geometry falls back to
-        # the checkpoint defaults); it is only exercised when the token stream
-        # actually carries an audio placeholder, so it is inert otherwise.
+        # Built unconditionally (geometry falls back to the checkpoint defaults)
+        # so a checkpoint without an ``audio_config`` still serves audio; inert
+        # unless the token stream carries an audio placeholder.
         self._audio_preprocessor = InklingAudioPreprocessor(**_resolve_audio_geometry(config))
-        # Text-only requests must tokenize EXACTLY as the text tower does
-        # (tiktoken special-token handling, add_special_tokens, truncation,
-        # query). Delegate to the stock DefaultInputProcessor so there is zero
-        # drift; the media paths reuse the same tokenization.
+        # Delegate text-only tokenization to the stock DefaultInputProcessor so
+        # it cannot drift from the text tower; the media paths reuse it too.
         self._text_processor = DefaultInputProcessor(
             model_path, config, tokenizer, trust_remote_code
         )
@@ -1025,9 +1003,7 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     @property
     def model_path(self):
         # Concrete impl of the ``BaseMultimodalDummyInputsBuilder`` abstract
-        # ``model_path`` property (the base processor only stores
-        # ``self._model_path`` without exposing it), so the two-base
-        # ``InklingInputProcessor`` is instantiable.
+        # property; the base processor only stores ``self._model_path``.
         return self._model_path
 
     @property
@@ -1042,18 +1018,11 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         return torch.tensor([self.image_token_id, self.audio_token_id], dtype=torch.int32)
 
     # ---- multimodal-hash prefix caching: explicitly unsupported -----------
-    # Inkling expands each <image> placeholder to one token per vision patch and
-    # each <audio> placeholder to one token per dMel frame -- a per-item count
-    # that comes from the preprocessor geometry, not a static HF
-    # ``_get_num_multimodal_tokens`` formula. The multimodal-hash prefix cache
-    # (``inputs.multimodal.find_mm_token_lengths``) needs that count up front and
-    # is not wired to the Inkling preprocessors, so refuse it LOUDLY and the SAME
-    # way for every modality instead of inheriting the base's opaque
-    # ``NotImplementedError`` (image/video) / ``AttributeError`` (audio).
-    # ``process_prompt_maybe_hash`` catches the raise, records
-    # ``multimodal_hashing_supported=False`` once, and serves every multimodal
-    # request through the uncached path -- so this disables only cross-request MM
-    # prefix reuse, never a request itself.
+    # The per-item token count comes from the preprocessor geometry, not a static
+    # HF formula, and the multimodal-hash prefix cache needs it up front. Refuse
+    # it the same way for every modality rather than inheriting the base's opaque
+    # errors; the caller falls back to the uncached path, so only cross-request
+    # MM prefix reuse is lost, never a request itself.
     def _reject_mm_hash_cache(self, modality: str) -> None:
         raise NotImplementedError(
             f"InklingInputProcessor does not support multimodal-hash prefix "

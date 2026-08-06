@@ -201,18 +201,10 @@ class InklingConfig(PretrainedConfig):
         vision_config=None,
         mtp_config=None,
         eos_token_id: int = 200006,
-        # Multimodal placeholder ids. One appears per media item in the
-        # pre-rendered token stream; the input processor expands it to one token
-        # per patch (image) / audio frame and the vision/audio fusion overwrites
-        # those positions. Both placeholders are IN-VOCAB chat-template tokens:
-        # image ``<|unused_200054|>`` (id 200054) and audio ``<|unused_200053|>``
-        # (id 200053) -- exactly the tokens the Inkling chat template renders for
-        # an image / audio content part
-        # (``<|content_image|><|unused_200054|>...`` and
-        # ``<|content_audio_input|><|unused_200053|><|audio_end|>...``).
-        # They MUST be in-vocab: TensorRT-LLM's executor validates request token
-        # ids and rejects an out-of-range id. The checkpoint's config.json omits
-        # these, so the defaults apply unless a config spells them out.
+        # Multimodal placeholder ids: the in-vocab chat-template tokens the
+        # input processor expands to one token per patch / audio frame. They must
+        # be in-vocab, since the executor rejects out-of-range request token ids.
+        # The checkpoint's config.json omits them, so the defaults apply.
         image_token_id: int = 200054,
         audio_token_id: int = 200053,
         tie_word_embeddings: bool = False,
@@ -234,8 +226,7 @@ class InklingConfig(PretrainedConfig):
         self.audio_config = self._as_config(audio_config)
         self.vision_config = self._as_config(vision_config)
         # Retained verbatim so the checkpoint round-trips. MTP / next-N draft
-        # decoding is not supported: nothing builds or loads these layers, and
-        # the draft weights stay in the weight mapper's deferred set.
+        # decoding is not supported -- the draft weights stay deferred.
         self.mtp_config = self._as_config(mtp_config)
 
     @staticmethod

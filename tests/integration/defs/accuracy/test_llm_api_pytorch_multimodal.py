@@ -713,20 +713,11 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
     def test_nvfp4(self):
         """NVFP4 accuracy on the MMMU vision benchmark (Blackwell, TP=4).
 
-        The vision path exercises image attach + placeholder expansion + fusion.
-        The reference is TRT-LLM's own full-pool measurement (see
-        references/mmmu.yaml), which was taken at TP=4 with
-        free_gpu_memory_fraction=0.6; the runtime configuration here has to
-        match it or the number is not comparable. Validation is on aggregate
-        accuracy, not per-item identity: 74 of the 858 pool items score
-        differently from SGLang in both directions, which is inherent to two
-        different NVFP4 implementations resolving near-ties differently deep in
-        a long-CoT decode.
-
-        TP=4 is not a tuning choice. The checkpoint does not fit on one
-        Blackwell GPU at this KV fraction, so the default TP=1 made this test
-        unrunnable while it was listed in l0_b200.yml and the QA function list
-        -- coverage that looked present and was not.
+        Exercises image attach + placeholder expansion + fusion. The reference
+        (references/mmmu.yaml) was taken with this TP size and KV fraction, so
+        the runtime configuration here has to match. TP=4 is also required to
+        fit the checkpoint on Blackwell at this KV fraction. Validation is on
+        aggregate accuracy, not per-item identity.
         """
         with LLM(
             self.MODEL_PATH,

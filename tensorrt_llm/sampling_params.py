@@ -538,17 +538,13 @@ class SamplingParams:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
 
-            # Fall back to the model config's eos_token_id. Some checkpoints
-            # declare their end-of-generation token ONLY in config.json and leave
-            # the tokenizer's standard `eos_token` slot empty: multi-part chat
-            # formats have no single terminator (a message end, an end-of-sampling
-            # marker and a document separator are distinct tokens), so they list
+            # Fall back to the model config's eos_token_id. Checkpoints with
+            # multi-part chat formats have no single terminator, so they list
             # their control tokens under `extra_special_tokens` /
-            # `additional_special_tokens`, neither of which populates
-            # `tokenizer.eos_token_id`. Such a checkpoint also tends to ship no
-            # generation_config.json, so the block below cannot help either.
-            # Without this fallback `end_id` stays None, nothing terminates a
-            # request, and every generation silently runs to `max_tokens`.
+            # `additional_special_tokens` and leave `tokenizer.eos_token_id`
+            # empty; they also tend to ship no generation_config.json. Without
+            # this fallback nothing terminates a request and every generation
+            # runs to `max_tokens`.
             if self.end_id is None:
                 config_eos = getattr(hf_model_config, "eos_token_id", None)
                 if isinstance(config_eos, (list, tuple)):
@@ -558,10 +554,10 @@ class SamplingParams:
                     if config_eos:
                         self.end_id = config_eos[0]
                         for stop_token in config_eos[1:]:
-                            # Skip the primary EOS: a config listing it twice
-                            # (e.g. [7, 7, 8]) would otherwise put 7 in both
-                            # end_id and stop_token_ids. The generation_config
-                            # path below applies the same condition.
+                            # Skip the primary EOS: a config that lists it twice
+                            # would otherwise put it in both end_id and
+                            # stop_token_ids. Same condition as the
+                            # generation_config path below.
                             if stop_token == self.end_id:
                                 continue
                             if self.stop_token_ids is None:
@@ -572,9 +568,9 @@ class SamplingParams:
                     self.end_id = config_eos
 
             if self.end_id is None:
-                # Not fatal -- an explicit stop/stop_token_ids or max_tokens may
-                # still bound the request -- but silently generating to the token
-                # limit on every request is not something to leave undiagnosable.
+                # Not fatal (an explicit stop or max_tokens may still bound the
+                # request), but worth surfacing rather than silently generating
+                # to the token limit every time.
                 logger.warning(
                     "Could not resolve an end-of-generation token: the tokenizer has no "
                     "eos_token_id and the model config has no eos_token_id. Generation will "

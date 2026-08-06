@@ -15,25 +15,13 @@
 """Inkling's KV cache manager: paged KV plus the short-conv state pool.
 
 Lives with the model's attention package rather than under ``pyexecutor``,
-matching ``sparse/minimax_m3/cache_manager.py``. Nothing about it is installed
-into shared framework directories: ``_util`` selects this class the same way it
-selects ``MiniMaxM3KVCacheManagerV2``, and ``InklingAttentionMetadata``
-type-tests it directly.
+matching ``sparse/minimax_m3/cache_manager.py``.
 
-There is deliberately no ``BaseConvStateManager`` protocol. Per-request
-short-conv state is NOT new -- ``BaseMambaCacheManager`` already declares
-``get_conv_states(layer_idx)`` and nemotron_h / qwen3_next / qwen3_5 implement
-it -- but that protocol also mandates ``get_ssm_states``, ``is_speculative``,
-``mamba_layer_cache`` and replay metadata, none of which Inkling can back, and
-its one-tensor-per-layer accessor cannot express Inkling's four convs per layer
-at two different widths (k/v follow the TP-sharded kv split; the post-attention
-and post-MLP convs run replicated on the full residual stream).
-
-A parallel protocol was tried and removed: both of its useful methods returned
-Inkling's own pool and runtime types, so it abstracted nothing while putting an
-Inkling-specific file under ``pyexecutor``. If a second short-conv model ever
-appears, widen the framework's existing hook rather than inventing another one
-beside it.
+There is deliberately no shared conv-state protocol. ``BaseMambaCacheManager``
+is the closest existing one, but it mandates SSM state and replay metadata
+Inkling cannot back, and its one-tensor-per-layer accessor cannot express
+Inkling's four convs per layer at two different widths. If a second short-conv
+model appears, widen that hook rather than adding another beside it.
 """
 
 import torch
@@ -44,26 +32,15 @@ from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 class InklingHybridCacheManager(KVCacheManagerV2):
     """Paged KV (V2, per-layer geometry) + the short-conv state pool.
 
-    The pool used to be a separate ResourceManager registered under its own
-    ResourceManagerType, published from three call sites inside
-    ``PyTorchModelEngine``. Making it part of the cache manager -- the shape
-    ``CppMambaHybridCacheManager`` uses for mamba conv/SSM state -- removes all
-    of that: the pool reaches the model through
-    ``attn_metadata.kv_cache_manager``, which is a standard AttentionMetadata
-    field, and rows are released by the manager's own ``free_resources``, which
-    every caller (including the warmup/estimation dummy-batch path) already
-    invokes.
+    Folding the pool into the cache manager -- the shape
+    ``CppMambaHybridCacheManager`` uses for mamba conv/SSM state -- lets it reach
+    the model through the standard ``attn_metadata.kv_cache_manager`` field and
+    be released by the manager's own ``free_resources``. The conv rows are then
+    freed by the same call that frees the request's KV blocks, so the two views
+    cannot drift apart.
 
-    It also removes a whole class of bug rather than just some code. A pool that
-    lives beside the cache manager can disagree with it about block reuse or
-    request lifetime and nothing forces the two views back together; here the
-    conv rows are freed by the same call that frees the request's KV blocks, so
-    they cannot drift apart.
-
-    Note: because the manager owns the pool, the pool is now also allocated for
-    the throwaway manager built during KV-cache size estimation. That is roughly
-    66 layers x 4 convs x (max_batch+1) rows -- tens of MB, freed with the
-    estimation manager -- and it buys the lifetime coupling above.
+    The cost is that the pool is also allocated for the throwaway manager built
+    during KV-cache size estimation, and freed along with it.
     """
 
     def __init__(self, *args, **kwargs):
@@ -76,22 +53,17 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         pretrained_config = kwargs["pretrained_config"]
         mapping = kwargs["mapping"]
         max_batch_size = kwargs["max_batch_size"]
-        # NOT kwargs["dtype"]: that is the KV cache dtype, a C++
-        # ``tensorrt_llm.bindings.DataType``, and torch.zeros rejects it. The
-        # conv pool holds pre-conv activations, so it takes the model's compute
-        # dtype from the (text) config.
+        # Not kwargs["dtype"] -- that is the KV cache dtype, a C++ binding type
+        # torch.zeros rejects. The conv pool holds pre-conv activations, so it
+        # takes the model's compute dtype from the (text) config.
         text_config = getattr(pretrained_config, "text_config", pretrained_config)
         conv_dtype = getattr(text_config, "torch_dtype", None)
         if not isinstance(conv_dtype, torch.dtype):
             conv_dtype = torch.bfloat16
         # The conv pool's k/v width follows the attention kv-head split, so it
-        # takes the ATTENTION TP, not the global one. Under attention DP every
-        # rank keeps the full kv-head set for its own requests -- the same rule
-        # KVCacheManagerV2 already applies to the paged pool
-        # (``tp_size = 1 if mapping.enable_attention_dp``) and that
-        # InklingAttention applies to the k/v short convs themselves. Dividing
-        # by the global tp_size here would allocate quarter-width conv rows for
-        # full-width convs.
+        # takes the attention TP, not the global one -- the same rule
+        # KVCacheManagerV2 applies to the paged pool. Dividing by the global
+        # tp_size would allocate narrow conv rows for full-width convs.
         attn_tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
         # +1 row for the CUDA-graph padding / dummy-request slot (the mamba
         # pattern): a padded decode batch admits up to max_batch_size real

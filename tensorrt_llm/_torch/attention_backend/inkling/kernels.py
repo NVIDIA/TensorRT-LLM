@@ -15,33 +15,23 @@
 """Inkling Triton attention: paged prefill + decode with a learned relative-bias
 ``score_mod`` and native sliding window.
 
-Why this exists
----------------
-Inkling attention adds a learned per-(query-token, head, relative-distance)
-additive bias INSIDE the attention score, and windows local layers separately.
-No fused/CUDA-graph-safe TensorRT-LLM backend exposes a ``score_mod`` hook:
-``attentionOp.cpp`` disables context FMHA for ``kRELATIVE`` position embedding,
-and the trtllm-gen decode kernel rejects a relative bias. So the production
-attention path for Inkling is a pair of Triton kernels that apply the bias as an
-aux-tensor ``score_mod``.
+Inkling adds a learned per-(query-token, head, relative-distance) additive bias
+inside the attention score, and windows local layers separately. No fused,
+CUDA-graph-safe TensorRT-LLM backend exposes a ``score_mod`` hook, so Inkling's
+production attention path is this pair of Triton kernels.
 
-The bias is precomputed on the torch side as a contiguous ``rel_logits`` aux
-tensor ``[num_query_tokens, num_heads, rel_extent]`` (``einsum('thd,de->the', r,
-proj)`` with the global-layer ``tau`` folded in). The kernels only gather+add:
+The bias is precomputed torch-side into a contiguous ``rel_logits`` aux tensor
+``[num_query_tokens, num_heads, rel_extent]``; the kernels only gather+add:
 
     rel_dist = q_pos - k_pos
-    rel_idx  = clamp(rel_dist, 0, rel_extent - 1)
-    bias     = rel_logits[q_idx, head, rel_idx]   if 0 <= rel_dist < rel_extent else 0
+    bias     = rel_logits[q_idx, head, clamp(rel_dist, 0, rel_extent - 1)]
+               if 0 <= rel_dist < rel_extent else 0
     qk      += bias
 
-This keeps ``rel_logits`` a *static-shape* tensor (``num_query_tokens`` == batch
-in the decode phase), so the decode kernel is CUDA-graph capturable: the launch
-grid ``(batch, num_heads)`` is fixed, and per-request sequence lengths are read
-from a GPU tensor inside the kernel (no host sync, no ``.item()``).
-
-Both kernels read the paged KV cache in the ``KVCacheManagerV2`` HND layout
-(``[num_pages, num_kv_heads, page_size, head_dim]`` after selecting K or V from
-the ``[num_pages, 2, ...]`` pool), addressed through a per-request page table.
+``rel_logits`` keeps a static shape, so the decode kernel is CUDA-graph
+capturable: the launch grid is fixed and sequence lengths are read from a GPU
+tensor (no host sync). Both kernels read the paged KV cache in the
+``KVCacheManagerV2`` HND layout through a per-request page table.
 """
 
 from typing import Optional
@@ -50,11 +40,10 @@ import torch
 import triton
 import triton.language as tl
 
-# Additive value used to drop a masked key from the softmax. Large enough that
-# ``exp(qk - max)`` underflows to 0 in fp32, finite so online-softmax bookkeeping
-# never sees a NaN. (float("-inf") would poison the running max on the first,
-# fully-masked tile of a windowed row.) Inlined as a literal inside the kernels
-# because Triton @jit functions cannot read non-constexpr module globals.
+# Additive value used to drop a masked key from the softmax: large enough that
+# ``exp(qk - max)`` underflows to 0 in fp32, but finite, so a fully-masked tile
+# does not poison the running max. Inlined as a literal inside the kernels,
+# since Triton @jit functions cannot read non-constexpr module globals.
 _NEG = tl.constexpr(-1.0e30)
 
 
@@ -326,11 +315,9 @@ def inkling_prefill_attention(
 
     Returns ``[total_tokens, num_heads, head_dim]`` in q's dtype.
     """
-    # The kernels index the head_dim with an implicit stride-1 last axis, so the
-    # inputs must be contiguous. ``v`` in particular reaches here non-contiguous:
-    # it is the fused-qkv v slice run through the short conv, and (unlike ``k``)
-    # never passes through ``apply_qk_norm``'s reshape, so it keeps the qkv row
-    # stride. ``.contiguous()`` is a no-op for already-contiguous q/k.
+    # The kernels index head_dim with an implicit stride-1 last axis, so the
+    # inputs must be contiguous. ``v`` in particular arrives non-contiguous: it
+    # keeps the fused-qkv row stride, having skipped ``apply_qk_norm``'s reshape.
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()

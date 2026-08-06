@@ -8192,15 +8192,10 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
     def test_nvfp4(self):
         """NVFP4 text accuracy on GSM8K and MMLU (Blackwell, TP=4).
 
-        Both references are the cached SGLang NVFP4 measurements the bring-up
-        paired against; see references/gsm8k.yaml and references/mmlu.yaml for
-        the provenance and the TRT-side measurements. Those were taken at TP=4
-        with free_gpu_memory_fraction=0.6, so the runtime configuration here
-        has to match or the numbers are not comparable.
-
-        TP=4 is not a tuning choice: the checkpoint does not fit on one
-        Blackwell GPU at this KV fraction, so the default TP=1 made this test
-        unrunnable while it was listed in the test-db and QA function lists.
+        See references/gsm8k.yaml and references/mmlu.yaml for the reference
+        provenance. They were taken with this TP size and KV fraction, so the
+        runtime configuration here has to match. TP=4 is also required to fit
+        the checkpoint on Blackwell at this KV fraction.
         """
         with LLM(
                 self.MODEL_PATH,
@@ -8210,9 +8205,8 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             # A fresh SamplingParams per task: AccuracyTask.evaluate sets
-            # truncate_prompt_tokens on the object in place when it is None, so
-            # sharing one instance leaks GSM8K's input budget into MMLU and
-            # MMLU never applies its own.
+            # truncate_prompt_tokens in place, so sharing one instance would
+            # leak GSM8K's input budget into MMLU.
             for task in (GSM8K(self.MODEL_NAME), MMLU(self.MODEL_NAME)):
                 task.evaluate(
                     llm,

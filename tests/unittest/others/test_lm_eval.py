@@ -1584,12 +1584,10 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
 # ===========================================================================
 #
 # ``extract_inkling_content`` is the offline analog of SGLang's
-# ``--reasoning-parser inkling`` (``InklingDetector`` in
-# ``sglang/srt/parser/reasoning_parser.py``). It must return ONLY the visible
-# ``<|content_text|>`` channel and drop the ``<|content_thinking|>`` reasoning
-# channel, so GSM8K/MMLU flexible-extract scores the model's answer rather than
-# the trailing number of its chain-of-thought. These tests pin the extraction to
-# SGLang's ``normal_text`` semantics case-for-case.
+# ``--reasoning-parser inkling``: it must return only the visible
+# ``<|content_text|>`` channel and drop the reasoning channel, so
+# flexible-extract scores the answer rather than the chain-of-thought. These
+# tests pin it to SGLang's ``normal_text`` semantics case-for-case.
 
 _CT = "<|content_text|>"
 _CTH = "<|content_thinking|>"

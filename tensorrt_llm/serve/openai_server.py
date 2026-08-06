@@ -1486,11 +1486,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template_kwargs=request.chat_template_kwargs,
             )
             # Reasoning parsers that key on special-token delimiters (e.g.
-            # Inkling's <|content_text|> / <|content_thinking|> blocks) need the
-            # raw special tokens preserved in the decoded text, exactly like the
-            # tool-parser path below. Without this the delimiters are stripped
-            # before apply_reasoning_parser runs and reasoning cannot be split
-            # from the visible answer.
+            # Inkling's typed content blocks) need the raw special tokens
+            # preserved in the decoded text, like the tool-parser path below;
+            # otherwise the delimiters are stripped before the parser runs.
             if self.generator.args.reasoning_parser:
                 reasoning_entry = ReasoningParserFactory._parsers.get(
                     self.generator.args.reasoning_parser.lower())

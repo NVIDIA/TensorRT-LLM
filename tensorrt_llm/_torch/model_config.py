@@ -393,9 +393,8 @@ class ModelConfig(Generic[TConfig]):
 
         def _algo_or_none(value):
             # modelopt hf_quant_config.json may spell "no quantization" as JSON
-            # null (-> None) OR as the string "none"/"null" (e.g. the Inkling
-            # NVFP4 checkpoint uses ``"kv_cache_quant_algo": "none"``); both must
-            # map to None rather than QuantAlgo("none"), which is not a member.
+            # null or as the string "none"/"null"; both must map to None rather
+            # than QuantAlgo("none"), which is not a member.
             if value is None or (isinstance(value, str) and
                                  value.strip().lower() in ("none", "null", "")):
                 return None

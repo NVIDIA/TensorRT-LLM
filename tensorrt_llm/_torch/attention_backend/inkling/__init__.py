@@ -14,13 +14,10 @@
 # limitations under the License.
 """Inkling attention: Triton kernels, per-step metadata, backend, cache manager.
 
-Split the way ``sparse/minimax_m3`` is -- kernels, metadata, backend and cache
-manager in their own modules -- rather than one flat file. Inkling is NOT under
-``sparse/``: that package is gated on ``sparse_attention_config`` /
-``SparseParams`` and its machinery (index caches, top-k block masks, per-sparse
--layer pools) assumes only part of the KV is scored. Inkling's attention is
-dense -- full causal on global layers, a 512-token sliding window on local ones
--- with a learned relative-bias ``score_mod``.
+Laid out like ``sparse/minimax_m3`` (one module per concern), but deliberately
+not under ``sparse/``: Inkling's attention is dense -- full causal on global
+layers, a sliding window on local ones -- with a learned relative-bias
+``score_mod``.
 """
 
 from .backend import InklingTritonAttention

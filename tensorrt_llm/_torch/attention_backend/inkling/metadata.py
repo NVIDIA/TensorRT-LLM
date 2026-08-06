@@ -27,29 +27,18 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     The decode kernel needs, per generation request, the total KV length
     (``num_cached + 1``) and the physical page table. Building those from host
-    lists inside ``model.forward`` raises ``Cannot copy between CPU and CUDA
-    tensors during CUDA graph capture``, so they live in fixed-pointer GPU
-    buffers that :meth:`prepare` overwrites each step -- the same shape as the
-    base metadata's ``seq_lens_cuda`` in-place ``copy_``, and the same reason
-    :meth:`AttentionMetadata.create_cuda_graph_metadata` exists.
+    lists inside ``model.forward`` is illegal under CUDA-graph capture, so they
+    live in fixed-pointer GPU buffers that :meth:`prepare` overwrites each step,
+    the same way the base metadata refreshes ``seq_lens_cuda``.
 
-    ``prepare()`` is the framework's documented "before the forward step of the
-    model" hook and runs on all three input-preparation paths including the
-    steady-generation fast path, which is exactly the set of places this used to
-    be published from inside ``PyTorchModelEngine``. It runs after the padded
-    batch is assembled (``CUDAGraphRunner.pad_batch`` wraps ``_prepare_inputs``)
-    and after ``super().prepare()`` has re-clamped
-    ``kv_cache_params.num_cached_tokens_per_seq``, so it sees exactly the data
-    the model-engine hook saw.
-
-    Freshness needs no epoch counter: the buffers belong to the metadata object
-    for the step being prepared, and ``ink_num_gen`` is reset at the top of
-    every ``prepare()``, so a step that publishes nothing cannot leave the
-    previous step's page table readable.
+    ``prepare()`` is the framework's "before the forward step" hook and runs on
+    every input-preparation path, after the padded batch is assembled and after
+    ``super().prepare()`` has re-clamped ``num_cached_tokens_per_seq``.
+    ``ink_num_gen`` is reset at the top of each call, so a step that publishes
+    nothing cannot leave the previous step's page table readable.
 
     ``TrtllmAttentionMetadata`` is the base because that is the backend Inkling
-    ran on before this class existed; Inkling reads only base fields, but
-    inheriting keeps every other consumer's expectations intact.
+    ran on before; Inkling reads only base fields.
     """
 
     def __post_init__(self) -> None:
@@ -136,10 +125,9 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         self.ink_conv_cache, self.ink_conv_rt = mgr.prepare_conv_runtime(self)
 
     def _prepare_inkling_decode(self) -> None:
-        # Reset first: a step that returns early below must not leave the
-        # previous step's buffers advertised as current. The same requests
-        # advance num_cached_tokens_per_seq every step, so a page table one step
-        # out of date silently drops a newly allocated page.
+        # Reset first: a step that returns early must not leave the previous
+        # step's buffers advertised as current -- a page table one step out of
+        # date silently drops a newly allocated page.
         self.ink_num_gen = 0
         mgr = self.kv_cache_manager
         if mgr is None or self.request_ids is None or self.kv_cache_params is None:
@@ -163,14 +151,11 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
             sl_np[i] = int(num_cached[i]) + 1
         self.ink_seq_lens[:num_gen].copy_(sl_host, non_blocking=True)
 
-        # Reused pinned staging, ONE ROW PER LAYER. It must not be a single
-        # [cap, max_pages] buffer refilled per layer: the copies below are
-        # non_blocking, so the next layer's fill would overwrite the host bytes
-        # while the previous layer's H2D copy is still in flight, and every
-        # layer past the first would land a torn page table -- attention then
-        # reads the wrong KV pages and decode collapses to repeated tokens.
-        # A fresh pinned allocation per layer is not an option either (66
-        # cudaHostAllocs a token), hence one 3-D buffer indexed by layer.
+        # Reused pinned staging, one row per layer. A single buffer refilled per
+        # layer would be torn by the non-blocking copies below (the next layer's
+        # fill racing the previous layer's H2D), and a fresh pinned allocation
+        # per layer costs one cudaHostAlloc per layer per token -- hence one 3-D
+        # buffer indexed by layer.
         n_layers = len(layers)
         if (
             self._ink_pt_host is None
@@ -209,10 +194,9 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         if md is self or md.kv_cache_manager is None:
             return md
         # Same treatment interface.py gives block_ids_per_seq under
-        # enable_flash_mla: create_cuda_graph_metadata is a SHALLOW copy, so the
-        # graph metadata would otherwise share -- and then resize -- the eager
-        # metadata's buffers, stranding the captured pointers. Allocate at the
-        # padded batch size up front so _ink_ensure never grows under capture.
+        # enable_flash_mla: create_cuda_graph_metadata is a shallow copy, so the
+        # graph metadata would otherwise share and then resize the eager
+        # metadata's buffers, stranding the captured pointers.
         md.ink_max_pages = max(1, int(md.kv_cache_manager.max_blocks_per_seq))
         md.ink_cap = max_batch_size
         md.ink_num_gen = 0

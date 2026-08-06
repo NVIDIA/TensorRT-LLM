@@ -643,12 +643,10 @@ class Gemma4ReasoningParser(BaseReasoningParser):
 #     <|message_model|><|content_text|>visible answer<|end_message|>
 #     <|content_model_end_sampling|>
 # Only ``<|content_text|>`` runs are visible content; ``<|content_thinking|>``
-# runs are reasoning; message headers and end tokens are framing. This mirrors
-# SGLang's ``InklingDetector`` (``--reasoning-parser inkling``) so a trtllm-serve
-# endpoint returns the same thinking-stripped ``message.content`` an SGLang
-# endpoint does -- required for an apples-to-apples GSM8K/MMLU lm_eval
-# comparison. The control-token alphabet is copied verbatim from SGLang's
-# ``inkling_tokenizer.INKLING_CONTROL_TOKENS``.
+# runs are reasoning; message headers and end tokens are framing. Mirrors
+# SGLang's ``InklingDetector`` (``--reasoning-parser inkling``) so trtllm-serve
+# returns the same thinking-stripped ``message.content``. The control-token
+# alphabet is copied verbatim from SGLang's ``INKLING_CONTROL_TOKENS``.
 _INKLING_MESSAGE_MODEL = "<|message_model|>"
 _INKLING_CONTENT_TEXT = "<|content_text|>"
 _INKLING_CONTENT_THINKING = "<|content_thinking|>"

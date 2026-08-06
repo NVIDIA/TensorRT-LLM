@@ -818,10 +818,9 @@ INK_END = "<|content_model_end_sampling|>"
          "The answer is 7", "3+4=7"),
         # Answer-only (no thinking block).
         (f"{INK_CT}42{INK_EM}", "42", ""),
-        # Thinking-only turn (looped / no answer emitted): visible content is EMPTY,
-        # NOT the reasoning text -- a truncated chain-of-thought must not be scored
-        # as the answer (matches SGLang InklingDetector routing everything to
-        # reasoning_text with empty normal_text).
+        # Thinking-only turn (looped / no answer emitted): visible content is
+        # empty, not the reasoning text -- a truncated chain-of-thought must not
+        # be scored as the answer.
         (f"{INK_CH}reasoning only, no answer{INK_EM}{INK_END}", "",
          "reasoning only, no answer"),
         # Truncated mid-thinking (generation hit the token cap): still empty content.
@@ -867,12 +866,9 @@ def test_inkling_reasoning_parser_stream_across_deltas():
     assert content == "ANS 5"
 
 
-# --- HUMAN FEEDBACK #9 Task 3.2: streaming == batch under ANY chunk boundary --------
-# Acceptance line 71 (validation_tier=unit): streaming reasoning parsing must match on
-# chunked typed content blocks, partial control tokens, thinking/text/tool blocks, and
-# end-sampling/end-message tokens. The strong invariant that covers all of these: the
-# streamed result (deltas + finish) equals the full parse for EVERY chunk boundary,
-# including boundaries that split a control token mid-token.
+# --- streaming == batch under any chunk boundary -----------------------------
+# The streamed result (deltas + finish) must equal the full parse for every chunk
+# boundary, including one that splits a control token mid-token.
 _INK_STREAM_CASES = [
     # thinking -> visible answer
     f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",

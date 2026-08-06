@@ -111,15 +111,10 @@ stepfun-ai/Step-3.7-Flash:
     accuracy: 60
 # Inkling NVFP4 (thinkingmachines/Inkling-NVFP4): RoPE-free hybrid-attention
 # reasoning model. Reasoning traces are stripped before MMMU answer extraction
-# (see TestInkling_NVFP4). Measured on the full 858-item pool: 79.72 (684/858).
-# SGLang NVFP4 on the same pool scores 78.32 (672/858), so TRT-LLM is +1.40 pt.
-#
-# The two stacks agree on aggregate accuracy but NOT item-for-item: 74/858
-# (8.6%) of items score differently, in both directions. That is inherent to two
-# different NVFP4 implementations -- on long-CoT items the decode has near-ties
-# that resolve differently deep in generation and flip the graded answer -- so
-# aggregate accuracy, not per-item identity, is the metric to gate on. KV cache
-# is unquantized (the checkpoint's hf_quant_config sets kv_cache_quant_algo=none).
+# (see TestInkling_NVFP4). Measured on the full 858-item pool at TP=4. Gate on
+# aggregate accuracy, not per-item identity -- long-CoT near-ties resolve
+# differently across NVFP4 implementations. KV cache is unquantized (the
+# checkpoint sets kv_cache_quant_algo=none).
 thinkingmachines/Inkling-NVFP4:
   - quant_algo: NVFP4
     accuracy: 79.72
