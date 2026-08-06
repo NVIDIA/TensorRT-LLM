@@ -394,7 +394,7 @@ def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
+def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, request, tmp_path):
     generated_path = tmp_path / "cosmos3_nano_t2i_generated.png"
     golden_path = _golden_media_path(
         tmp_path, "cosmos3_nano_t2i_lpips_golden.png", "Cosmos3-Nano T2I LPIPS golden image"
@@ -407,6 +407,13 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
         COSMOS3_LPIPS_PROMPT,
         golden_path,
         generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_LPIPS_THRESHOLD,
+        generated_path,
+        "cosmos3_nano_t2i_lpips_golden.png",
     )
     _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
 
