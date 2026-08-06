@@ -65,7 +65,6 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_fp4": "multimodals/Phi-4-multimodal-instruct-FP4",
     "phi_4_multimodal_instruct_fp8": "multimodals/Phi-4-multimodal-instruct-FP8",
-    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b",
