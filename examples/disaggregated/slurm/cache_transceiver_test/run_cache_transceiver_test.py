@@ -569,6 +569,13 @@ def main():
             ),
             KVCacheManager,
         )
+        print(
+            f"[{role} rank={rank}] PYTHON+V1 case in matrix: "
+            "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY="
+            f"{os.environ.get('TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY')} "
+            "applies to every case in this run, including C++ transceiver ones",
+            flush=True,
+        )
     req_lens = cfg["test_matrix"]["request_lengths"]
     warmup = cfg["test_matrix"]["warmup_requests"]
     num_req = cfg["test_matrix"]["num_requests_per_length"]

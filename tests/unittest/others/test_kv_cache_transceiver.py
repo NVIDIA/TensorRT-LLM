@@ -51,6 +51,10 @@ KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
         ("PYTHON", KVCacheManager, "0", "0"),
         ("PYTHON", KVCacheManagerV2, None, None),
         ("CPP", KVCacheManager, None, None),
+        # "auto" is resolved to PYTHON/CPP by serving before this helper runs;
+        # callers that construct CacheTransceiverConfig directly must resolve
+        # it first — the helper deliberately leaves "auto" untouched.
+        ("auto", KVCacheManager, None, None),
     ],
 )
 def test_maybe_enable_fabric_memory_for_python_transceiver(

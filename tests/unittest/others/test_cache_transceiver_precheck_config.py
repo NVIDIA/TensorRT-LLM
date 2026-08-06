@@ -402,9 +402,59 @@ def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
         assert tokens.index(assignment) < tokens.index("python3")
 
 
+def test_precheck_commands_split_pytest_common_vars(monkeypatch):
+    # $PYTEST_COMMON_VARS is spliced unquoted on purpose: bash word splitting
+    # must yield separate K=V env-assignment tokens ahead of the executable.
+    # Values containing spaces are unsupported by design — this pins the
+    # expected splitting behavior.
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root="/models",
+    )
+    shell_script = "\n".join(
+        [
+            "CTX_WORKER_ENV_VARS=",
+            "GEN_WORKER_ENV_VARS=",
+            'PYTEST_COMMON_VARS="FOO=1 BAR=two"',
+            "llmSrcNode=/repo",
+            "testOutputDir=/tmp/output",
+            "config=/tmp/config.yaml",
+            *lines,
+            "printf '%s\\n' \"$pytestCommandCTXPrecheck\"",
+        ]
+    )
+
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+    )
+    tokens = shlex.split(result.stdout.splitlines()[0])
+
+    python_index = tokens.index("python3")
+    for assignment in ("FOO=1", "BAR=two"):
+        assert tokens.index(assignment) < python_index
+
+
 def _enabled_line(cfg):
     lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
     return next(x for x in lines if x.startswith("export ctPrecheckEnabled"))
+
+
+def test_precheck_enabled_helper(monkeypatch):
+    # submit.py consults this helper to decide whether a missing model root is
+    # fatal — it must mirror the policy encoded in ctPrecheckEnabled.
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    assert pcfg.precheck_enabled({}) is True
+    assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is False
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "0")
+    assert pcfg.precheck_enabled({}) is False
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "true")
+    assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is True
 
 
 def test_precheck_env_kill_switch_truthy(monkeypatch):
@@ -416,7 +466,7 @@ def test_precheck_env_kill_switch_truthy(monkeypatch):
     cfg = {"cache_transceiver_precheck": {"enabled": True}}
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
     assert _enabled_line(cfg).endswith("=1")  # yaml opt-in
-    assert _enabled_line({}).endswith("=0")  # off by default (waived)
+    assert _enabled_line({}).endswith("=1")  # on by default
     for v in ("1", "true", "on", "YES", " True "):
         monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
         assert _enabled_line(cfg).endswith("=1"), v

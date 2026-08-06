@@ -638,12 +638,20 @@ def _get_pytest_command_env_var(script_prefix_lines, env_name):
     if pytest_command_line is None:
         return None
 
-    command_value = pytest_command_line.split("=", 1)[1]
+    command_value = pytest_command_line.split("=", 1)[1].strip()
     try:
         parts = shlex.split(command_value)
-        # A fully quoted export value is parsed as one token on the first
-        # pass. Parse that token once more to recover its command words.
-        if len(parts) == 1 and any(char.isspace() for char in parts[0]):
+        # A fully quoted export value ("pytest ...") is parsed as one token on
+        # the first pass; parse that token once more to recover its command
+        # words. Only unwrap when the raw value is wrapped in an outer quote
+        # pair — a bare single token with escaped whitespace is already the
+        # final value and must not be re-split.
+        wrapped_in_quotes = (
+            len(command_value) >= 2
+            and command_value[0] in "\"'"
+            and command_value[-1] == command_value[0]
+        )
+        if len(parts) == 1 and wrapped_in_quotes:
             parts = shlex.split(parts[0])
     except ValueError as error:
         raise ValueError(f"Invalid inbound pytestCommand: {error}") from error
@@ -835,11 +843,6 @@ def main():
 
         pytest_common_vars = ""
         llm_models_root = _get_pytest_command_env_var(script_prefix_lines, "LLM_MODELS_ROOT")
-        if not llm_models_root:
-            raise ValueError(
-                "LLM_MODELS_ROOT is missing from the inbound pytestCommand; "
-                "the cache-transceiver precheck cannot resolve model defaults"
-            )
         script_prefix_lines.extend(
             [
                 worker_pytest_command,
@@ -883,6 +886,20 @@ def main():
         # Enable/kill-switch policy and timeouts live in precheck_config
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
+        # The model root is only consumed by the precheck (auto KV-cache-manager
+        # resolution needs the model config). Fail fast only when the precheck
+        # will actually run; otherwise degrade to a warning so stages whose
+        # pytestCommand does not carry LLM_MODELS_ROOT inline keep submitting.
+        if not llm_models_root:
+            if pcfg.precheck_enabled(config):
+                raise ValueError(
+                    "LLM_MODELS_ROOT is missing from the inbound pytestCommand; "
+                    "the cache-transceiver precheck cannot resolve model defaults"
+                )
+            print(
+                "WARNING: LLM_MODELS_ROOT not found in the inbound pytestCommand; "
+                "cache-transceiver precheck is disabled for this config so continuing"
+            )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,

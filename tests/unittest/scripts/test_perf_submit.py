@@ -293,6 +293,18 @@ def test_ci_extracts_model_root_from_inbound_pytest_command(
     )
 
 
+def test_ci_single_token_with_escaped_whitespace_is_not_resplit(ci_submit_module):
+    # A bare (unwrapped) export value that parses to a single token with
+    # embedded whitespace is already final — re-splitting it would corrupt
+    # the value. Only quote-wrapped whole commands get a second parse.
+    prefix_lines = [r"export pytestCommand=LLM_MODELS_ROOT=/models\ with\ spaces"]
+
+    assert (
+        ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT")
+        == "/models with spaces"
+    )
+
+
 def test_ci_missing_model_root_is_detectable(ci_submit_module):
     prefix_lines = ["export pytestCommand='LLM_ROOT=/repo pytest -q'"]
 

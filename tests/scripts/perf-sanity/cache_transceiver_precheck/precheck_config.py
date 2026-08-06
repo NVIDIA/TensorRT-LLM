@@ -128,6 +128,29 @@ def default_step_timeout_s(max_world):
     return 900 + wireup_timeout_s(max_world)
 
 
+def precheck_enabled(cfg):
+    """Resolve the precheck enable/kill-switch policy for a test config.
+
+    On by default; yaml opts out per test; the env var (when set) overrides
+    the yaml either way (global kill switch). Parse the usual boolean spellings
+    so a well-meant TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently
+    read as "off"; reject anything ambiguous instead of guessing.
+    """
+    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
+    if env is not None:
+        val = env.strip().lower()
+        if val in ("1", "true", "on", "yes"):
+            return True
+        if val in ("0", "false", "off", "no"):
+            return False
+        raise ValueError(
+            "TRTLLM_DISAGG_CT_PRECHECK must be a boolean "
+            f"(1/0/true/false/on/off/yes/no), got {env!r}"
+        )
+    knobs = cfg.get("cache_transceiver_precheck", {}) or {}
+    return bool(knobs.get("enabled", True))
+
+
 def precheck_prefix_lines(
     cfg,
     benchmark_mode,
@@ -146,27 +169,7 @@ def precheck_prefix_lines(
     expressions ($llmSrcNode etc.), expanded at sbatch runtime.
     """
     knobs = cfg.get("cache_transceiver_precheck", {}) or {}
-    # Off by default until the gate is validated on the post-merge stages
-    # (the precheck is a launch-script gate, not a pytest case, so it cannot
-    # be waived in waives.txt — this default is the waive). Yaml opts in per
-    # test; the env var (when set) overrides the yaml either way (global kill
-    # switch). Parse the usual boolean spellings so a well-meant
-    # TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently read as
-    # "off"; reject anything ambiguous instead of guessing.
-    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
-    if env is not None:
-        val = env.strip().lower()
-        if val in ("1", "true", "on", "yes"):
-            enabled = True
-        elif val in ("0", "false", "off", "no"):
-            enabled = False
-        else:
-            raise ValueError(
-                "TRTLLM_DISAGG_CT_PRECHECK must be a boolean "
-                f"(1/0/true/false/on/off/yes/no), got {env!r}"
-            )
-    else:
-        enabled = bool(knobs.get("enabled", False))
+    enabled = precheck_enabled(cfg)
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
