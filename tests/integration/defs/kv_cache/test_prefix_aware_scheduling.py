@@ -662,6 +662,11 @@ def _run_lmbenchmark(
     benchmark_debug_context = _stage_debug_context(debug_context, port, server_log, output_csv)
 
     def _popen_lmbenchmark(call_args: list[str], env: Mapping[str, str]) -> subprocess.Popen:
+        # multi-round-qa.py imports its sibling utils.py via the implicit
+        # script-directory sys.path entry. PYTHONSAFEPATH=1 (set by some CI
+        # environments) disables that entry and the script dies at import
+        # time with ModuleNotFoundError: No module named 'utils'.
+        env = {k: v for k, v in env.items() if k != "PYTHONSAFEPATH"}
         return subprocess.Popen(
             call_args,
             stdout=subprocess.PIPE,

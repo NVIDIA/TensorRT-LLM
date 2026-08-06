@@ -18,6 +18,8 @@ import torch
 
 from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import MistralWeightMapper
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def expected_renames():
