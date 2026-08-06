@@ -45,29 +45,47 @@ if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
     workspace_root = Path(sys.argv[1]).expanduser()
 
     rank = MPI.COMM_WORLD.Get_rank()
-    slot = rank
-    slot_stride = MPI.COMM_WORLD.Get_size()
-    # Reuse the rank's cache when possible. Concurrent pools with the same
-    # rank skip locked slots in world-size strides, keeping every worker apart.
-    while True:
-        workspace = workspace_root / f"rank-{slot}"
-        workspace.mkdir(parents=True, exist_ok=True)
-        workspace_lock = (workspace / ".lock").open("a")
-        try:
-            fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            workspace_lock.close()
-            slot += slot_stride
+    try:
+        slot = rank
+        slot_stride = MPI.COMM_WORLD.Get_size()
+        # Reuse the rank's cache when possible. Concurrent pools with the same
+        # rank skip locked slots in world-size strides, keeping every worker apart.
+        while True:
+            workspace = workspace_root / f"rank-{slot}"
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace_lock = (workspace / ".lock").open("a")
+            try:
+                fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                workspace_lock.close()
+                workspace_lock = None
+                slot += slot_stride
 
-    # Preserve FlashInfer 0.6.15's default cubin cache before changing its
-    # workspace base. Importing flashinfer.jit.env here would initialize all
-    # of its workspace constants before the isolated base is configured.
-    os.environ.setdefault(
-        "FLASHINFER_CUBIN_DIR",
-        str(Path.home() / ".cache" / "flashinfer" / "cubins"),
-    )
-    os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
+        # Preserve FlashInfer 0.6.15's default cubin cache before changing its
+        # workspace base. Importing flashinfer.jit.env here would initialize all
+        # of its workspace constants before the isolated base is configured.
+        os.environ.setdefault(
+            "FLASHINFER_CUBIN_DIR",
+            str(Path.home() / ".cache" / "flashinfer" / "cubins"),
+        )
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
+    except OSError as error:
+        if workspace_lock is not None:
+            try:
+                workspace_lock.close()
+            except OSError as close_error:
+                print(
+                    f"[trtllm] rank {rank} could not close a failed FlashInfer "
+                    f"workspace lock ({close_error})",
+                    file=sys.stderr,
+                )
+        workspace_lock = None
+        print(
+            f"[trtllm] rank {rank} could not isolate its FlashInfer workspace "
+            f"({error}); falling back to FlashInfer's shared defaults",
+            file=sys.stderr,
+        )
 
 from mpi4py.futures.server import main
 
@@ -77,8 +95,22 @@ try:
     main()
 finally:
     if workspace_lock is not None:
-        fcntl.flock(workspace_lock, fcntl.LOCK_UN)
-        workspace_lock.close()
+        try:
+            fcntl.flock(workspace_lock, fcntl.LOCK_UN)
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not unlock the FlashInfer "
+                f"workspace ({error})",
+                file=sys.stderr,
+            )
+        try:
+            workspace_lock.close()
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not close the FlashInfer "
+                f"workspace lock ({error})",
+                file=sys.stderr,
+            )
 """
 
 

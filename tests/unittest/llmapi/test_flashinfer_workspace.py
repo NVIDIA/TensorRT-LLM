@@ -97,6 +97,39 @@ def test_worker_bootstrap_preserves_explicit_workspace(
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(explicit_workspace)
 
 
+def test_worker_bootstrap_falls_back_when_isolation_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+
+    def raise_read_only_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "mkdir", raise_read_only_error)
+    _run_worker_bootstrap(monkeypatch, tmp_path)
+
+    assert _FLASHINFER_WORKSPACE_ENV not in os.environ
+    assert "falling back to FlashInfer's shared defaults" in capsys.readouterr().err
+
+
+def test_worker_bootstrap_warns_when_unlock_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+    flock = fcntl.flock
+
+    def fail_unlock(file: object, operation: int) -> None:
+        if operation == fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        flock(file, operation)
+
+    monkeypatch.setattr(fcntl, "flock", fail_unlock)
+    _run_worker_bootstrap(monkeypatch, tmp_path)
+
+    assert os.environ[_FLASHINFER_WORKSPACE_ENV].startswith(str(tmp_path))
+    assert "could not unlock the FlashInfer workspace" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
