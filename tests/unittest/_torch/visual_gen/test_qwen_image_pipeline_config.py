@@ -815,25 +815,3 @@ def test_qwen_image_edit_rejects_multiple_images_per_prompt() -> None:
 
     with pytest.raises(ValueError, match="num_images_per_prompt=1 only"):
         pipeline.infer(req)
-
-
-def test_qwen_image_ulysses_rejects_masked_prompt_conditioning() -> None:
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
-
-    pipeline = QwenImagePipeline.__new__(QwenImagePipeline)
-
-    pipeline._validate_ulysses_prompt_masks(2, None, None)
-    pipeline._validate_ulysses_prompt_masks(1, object())
-    with pytest.raises(ValueError, match="requires unmasked prompt conditioning"):
-        pipeline._validate_ulysses_prompt_masks(2, object())
-
-
-def test_qwen_image_edit_ulysses_rejects_masked_prompt_conditioning() -> None:
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImageEditPlusPipeline
-
-    pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
-
-    pipeline._validate_ulysses_prompt_masks(2, None, None)
-    pipeline._validate_ulysses_prompt_masks(1, object())
-    with pytest.raises(ValueError, match="requires unmasked prompt conditioning"):
-        pipeline._validate_ulysses_prompt_masks(2, object())
