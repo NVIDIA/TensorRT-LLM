@@ -257,13 +257,28 @@ class StatsKeeper:
 class ReportUtility:
     """A utility for reporting statistics."""
 
+    @staticmethod
+    def _format_startup_metrics(
+            startup_metrics: Optional[Dict[str, Any]]) -> str:
+        """Format startup metrics for terminal output."""
+        if not startup_metrics:
+            return ""
+
+        metric_lines = "".join(f"{name}: {value:.4f}\n"
+                               for name, value in startup_metrics.items())
+        return ("===========================================================\n"
+                "= STARTUP METRICS\n"
+                "===========================================================\n"
+                f"{metric_lines}\n")
+
     def __init__(self,
                  statistics: StatsKeeper,
                  dataset_metadata: DatasetMetadata,
                  rt_cfg: RuntimeConfig,
                  logger: Logger,
                  kwargs: Dict[str, Any],
-                 streaming: bool = False) -> None:
+                 streaming: bool = False,
+                 startup_metrics: Optional[Dict[str, Any]] = None) -> None:
         """Initialize the ReportingController.
 
         Args:
@@ -272,6 +287,8 @@ class ReportUtility:
             rt_cfg (RuntimeConfig): Configuration for the run.
             logger (Logger): A logger for logging.
             streaming (bool, optional): Streaming benchmark used. Defaults to False.
+            startup_metrics (Dict[str, Any], optional): Metrics captured while
+                initializing the model.
         """
         self.dataset_metadata = dataset_metadata
         self.rt_cfg = rt_cfg
@@ -282,6 +299,7 @@ class ReportUtility:
             self.get_max_draft_len(),
             self.rt_cfg.settings_config.max_batch_size)
         self.streaming = streaming
+        self.startup_metrics = startup_metrics
 
     def _query_gpu_info(self) -> Dict[str, Any]:
         """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
@@ -402,6 +420,8 @@ class ReportUtility:
                 "version": self.rt_cfg.sw_version,
             },
         }
+        if self.startup_metrics:
+            stats_dict["startup_metrics"] = self.startup_metrics
 
         # Machine / GPU details - query only first GPU (all GPUs must be identical)
         stats_dict["machine"] = self._query_gpu_info()
@@ -636,6 +656,8 @@ class ReportUtility:
         perf = stats_dict["performance"]
         streaming = stats_dict.get("streaming_metrics")
         decoding = stats_dict.get("decoding_stats", None)
+        startup_metrics_info = self._format_startup_metrics(
+            stats_dict.get("startup_metrics"))
 
         backend_info = ""
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
@@ -847,6 +869,7 @@ class ReportUtility:
                 )
 
         logging_info = (f"{backend_info}"
+                        f"{startup_metrics_info}"
                         f"{machine_info}"
                         f"{request_info}"
                         f"{world_info}"

@@ -254,6 +254,7 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         llm_id (str): The unique ID of the LLM instance.
         disaggregated_params (dict): The disaggregated parameters of the LLM instance.
+        startup_metrics (dict): The startup metrics reported by worker rank 0.
 """
 
 
@@ -290,7 +291,9 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
-        self._disaggregated_params: Optional[dict] = None
+        self._disaggregated_params: dict | None = None
+        # dict containing startup metrics like weight loading time
+        self._startup_metrics: dict | None = None
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -473,6 +476,15 @@ class BaseLLM:
             self._disaggregated_params = self._executor.get_disaggregated_params(
             ) if self._executor else {}
         return self._disaggregated_params
+
+    @property
+    @set_api_status("beta")
+    def startup_metrics(self) -> dict:
+        """Return the cached startup metrics reported by worker rank 0."""
+        if self._startup_metrics is None:
+            self._startup_metrics = self._executor.get_startup_metrics(
+            ) if self._executor else {}
+        return self._startup_metrics
 
     @staticmethod
     def _is_token_id_list(value: Any) -> bool:
