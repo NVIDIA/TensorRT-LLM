@@ -128,7 +128,7 @@ def submit_source_code_vulns(
                     or "N/A"
                 ),
                 "s_license_ids": "N/A",
-                "s_ticket_url": triaged_deps.get(package_name, "N/A"),
+                "s_ticket_url": triaged_deps.get(package_name, ""),
             }
             if package_name not in triaged_deps:
                 risks_to_report.append(doc)
@@ -227,7 +227,7 @@ def submit_source_code_licenses(
                 "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
                 "s_component_type": component.get("type"),
-                "s_ticket_url": triaged_deps.get(package_name, "N/A"),
+                "s_ticket_url": triaged_deps.get(package_name, ""),
             }
             if not is_preapproved(map_preapproved, package_name, "pypi"):
                 risks_to_report.append(doc)
@@ -235,11 +235,6 @@ def submit_source_code_licenses(
 
         license_info: dict = {}
         if risks_to_report:
-            print(
-                f"=== risks_to_report ({SCAN_TYPE}, {len(risks_to_report)} items) ===\n"
-                + json.dumps(risks_to_report, indent=2),
-                file=sys.stderr,
-            )
             new_tickets, license_info = _run_triage(
                 risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
             )
@@ -364,11 +359,7 @@ def submit_container_licenses(
         for lid in v.get("licenses", []):
             license_to_deps.setdefault(lid, []).append(v)
 
-    print("=== query permissiveness", file=sys.stderr)
-    print(json.dumps(list(license_to_deps.keys())), file=sys.stderr)
     permissiveness = is_permissive(list(license_to_deps.keys()), license_check_token)
-    print("=== result permissiveness", file=sys.stderr)
-    print(f"=== {json.dumps(permissiveness)}", file=sys.stderr)
 
     non_permissive_pkgs = {
         dep.get("package")
@@ -408,11 +399,6 @@ def submit_container_licenses(
 
     license_info: dict = {}
     if risks_to_report:
-        print(
-            f"=== risks_to_report ({SCAN_TYPE}, {len(risks_to_report)} items) ===\n"
-            + json.dumps(risks_to_report, indent=2),
-            file=sys.stderr,
-        )
         new_tickets, license_info = _run_triage(
             risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
         )
