@@ -25,8 +25,12 @@ object.__new__ and only the attributes control_action() touches.
 
 import threading
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,7 +39,7 @@ pytestmark = pytest.mark.cpu_only
 _TIMEOUT = 10.0
 
 
-def _make_executor():
+def _make_executor() -> "PyExecutor":
     """Build a PyExecutor shell exercising only control_action()'s state.
 
     rank is 1 so the rank-0 enqueue path is skipped, and the barrier starts
@@ -60,7 +64,7 @@ def _make_executor():
 # ---------------------------------------------------------------------------
 
 
-def test_nested_control_action_is_rejected():
+def test_nested_control_action_is_rejected() -> None:
     ex = _make_executor()
 
     with ex.control_action():
@@ -70,7 +74,7 @@ def test_nested_control_action_is_rejected():
                 pytest.fail("nested control_action() should not have yielded")
 
 
-def test_rejected_nesting_leaves_the_outer_handshake_intact():
+def test_rejected_nesting_leaves_the_outer_handshake_intact() -> None:
     """The rejection must not touch the events the outer action still owns.
 
     If a refused nested entry cleared the barrier or set done, the executor
@@ -98,7 +102,7 @@ def test_rejected_nesting_leaves_the_outer_handshake_intact():
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_callers_serialise_and_do_not_raise():
+def test_concurrent_callers_serialise_and_do_not_raise() -> None:
     """A second thread waits its turn rather than being refused.
 
     Rejecting it would be wrong twice over: contention is not re-entrancy, and
@@ -112,7 +116,7 @@ def test_concurrent_callers_serialise_and_do_not_raise():
     release_first = threading.Event()
     second_inside = threading.Event()
 
-    def first():
+    def first() -> None:
         try:
             with ex.control_action():
                 events.append("first-enter")
@@ -122,7 +126,7 @@ def test_concurrent_callers_serialise_and_do_not_raise():
         except BaseException as exc:  # noqa: BLE001 - surfaced via assert below
             errors.append(("first", exc))
 
-    def second():
+    def second() -> None:
         try:
             with ex.control_action():
                 events.append("second-enter")
@@ -157,14 +161,14 @@ def test_concurrent_callers_serialise_and_do_not_raise():
     assert not ex._control_action_lock.locked()
 
 
-def test_owner_is_per_thread_so_a_sibling_thread_is_not_mistaken_for_nesting():
+def test_owner_is_per_thread_so_a_sibling_thread_is_not_mistaken_for_nesting() -> None:
     """The nesting check keys on thread ident, not a global flag."""
     ex = _make_executor()
     seen = {}
     first_inside = threading.Event()
     release_first = threading.Event()
 
-    def first():
+    def first() -> None:
         with ex.control_action():
             first_inside.set()
             release_first.wait(timeout=_TIMEOUT)
@@ -188,7 +192,7 @@ def test_owner_is_per_thread_so_a_sibling_thread_is_not_mistaken_for_nesting():
 # ---------------------------------------------------------------------------
 
 
-def test_sequential_control_actions_are_allowed():
+def test_sequential_control_actions_are_allowed() -> None:
     """The guard rejects nesting, not repeated use."""
     ex = _make_executor()
 
@@ -200,7 +204,7 @@ def test_sequential_control_actions_are_allowed():
         assert ex._control_action_owner is None
 
 
-def test_lock_and_owner_are_released_when_the_body_raises():
+def test_lock_and_owner_are_released_when_the_body_raises() -> None:
     """An exception inside the body must not leave the executor wedged."""
     ex = _make_executor()
 
