@@ -149,7 +149,13 @@ def _assert_lora_changes_output(out_lora, out_base):
     assert any_differ, "LoRA outputs identical to base model (same tokens AND same logprobs)"
 
 
-def _run_lora_test(model_path, target_modules, trtllm_modules, dtype=torch.bfloat16):
+def _run_lora_test(
+    model_path,
+    target_modules,
+    trtllm_modules,
+    dtype=torch.bfloat16,
+    specialize_cudagraph=False,
+):
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_dir = _create_lora_adapter(
@@ -164,6 +170,7 @@ def _run_lora_test(model_path, target_modules, trtllm_modules, dtype=torch.bfloa
             lora_target_modules=trtllm_modules,
             max_lora_rank=16,
             max_loras=2,
+            cudagraph_specialize_lora=specialize_cudagraph,
         )
         out_lora, out_base = _run_with_and_without_lora(
             model_path,
@@ -194,6 +201,14 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             dtype=torch.float8_e4m3fn,
+        )
+
+    def test_qwen3_bf16_lora_cudagraph_specialization(self):
+        _run_lora_test(
+            self.model_path,
+            {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
+            _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            specialize_cudagraph=True,
         )
 
 

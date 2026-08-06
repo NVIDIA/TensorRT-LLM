@@ -1070,6 +1070,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
+        self._force_lora_graph_for_capture: Optional[bool] = None
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -1142,6 +1143,17 @@ class PyTorchModelEngine(ModelEngine):
                 f"Initialized CUDA Graph LoRA manager, "
                 f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
             )
+
+    def _use_lora_cuda_graph(self,
+                             scheduled_requests: ScheduledRequests) -> bool:
+        if self.cuda_graph_lora_manager is None:
+            return False
+        if self._force_lora_graph_for_capture is not None:
+            return self._force_lora_graph_for_capture
+        if not self.llm_args.lora_config.cudagraph_specialize_lora:
+            return True
+        return any(request.lora_task_id is not None
+                   for request in scheduled_requests.generation_requests)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:
@@ -2380,8 +2392,11 @@ class PyTorchModelEngine(ModelEngine):
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
 
-        def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
+        def _run_capture_pass(force_non_greedy: bool, label: str,
+                              force_lora_graph: bool) -> None:
             spec_metadata = self.spec_metadata
+            previous_force_lora_graph = self._force_lora_graph_for_capture
+            self._force_lora_graph_for_capture = force_lora_graph
             if force_non_greedy and spec_metadata is not None:
                 spec_metadata._force_non_greedy_for_capture = True
                 # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
@@ -2427,6 +2442,7 @@ class PyTorchModelEngine(ModelEngine):
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
+                self._force_lora_graph_for_capture = previous_force_lora_graph
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
                     # The base object is not the only holder of the flag: every
@@ -2447,9 +2463,22 @@ class PyTorchModelEngine(ModelEngine):
                             f"{cleared} cached CUDA graph spec metadata "
                             "object(s).")
 
+        if self.cuda_graph_lora_manager is None:
+            lora_graph_cases = [False]
+        elif self.llm_args.lora_config.cudagraph_specialize_lora:
+            # Capture the larger LoRA graph first so the base-only graph can
+            # reuse its CUDA graph memory-pool allocations.
+            lora_graph_cases = [True, False]
+        else:
+            lora_graph_cases = [True]
+
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
-        _run_capture_pass(force_non_greedy=False, label="greedy")
+        for use_lora_graph in lora_graph_cases:
+            label = "greedy"
+            if self.cuda_graph_lora_manager is not None:
+                label += ", LoRA" if use_lora_graph else ", base-only"
+            _run_capture_pass(False, label, use_lora_graph)
         # Pass 2: advanced sampling variant. Required because on-the-fly capture
         # is disabled outside warmup, so any inference batch that contains a
         # non-greedy request would otherwise fall back to eager. Only meaningful
@@ -2460,7 +2489,11 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_config is not None
             and self.spec_config.spec_dec_mode.use_one_engine())
         if needs_non_greedy_capture:
-            _run_capture_pass(force_non_greedy=True, label="advanced sampling")
+            for use_lora_graph in lora_graph_cases:
+                label = "advanced sampling"
+                if self.cuda_graph_lora_manager is not None:
+                    label += ", LoRA" if use_lora_graph else ", base-only"
+                _run_capture_pass(True, label, use_lora_graph)
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
         # The advanced-sampling capture pass above leaves is_all_greedy_sample
@@ -6849,6 +6882,10 @@ class PyTorchModelEngine(ModelEngine):
         use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:
+            if not self._use_lora_cuda_graph(scheduled_requests):
+                self.cuda_graph_lora_manager.prepare_base_only_batch(
+                    peft_cache_manager)
+                return None
             # For spec decode verification (non-extend_ctx), each sequence has
             # runtime_draft_len + 1 tokens in the forward pass.
             tokens_per_seq = 1
@@ -7587,6 +7624,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager=spec_resource_manager,
                 promoted_context_request_ids=promoted_context_request_ids,
                 peft_cache_data_type=peft_cache_data_type,
+                use_lora_graph=self._use_lora_cuda_graph(padded_graph_requests),
             )
 
             can_run_graph = key is not None

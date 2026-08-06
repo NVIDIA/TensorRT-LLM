@@ -186,6 +186,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_mrope_position_delta=None,
         py_return_context_logits=False,
         py_batch_idx=None,
+        lora_task_id=None,
         is_dummy=False,
         max_beam_num_tokens=prompt_len,
         state="context",
@@ -226,6 +227,8 @@ def _make_forward_only_engine(
     engine.forward_pass_callable = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
+    engine.cuda_graph_lora_manager = None
+    engine._force_lora_graph_for_capture = None
 
     semantic_attn_metadata = Mock()
     graph_attn_metadata = Mock()
@@ -741,6 +744,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner._capture_allowed = False
         runner._is_mixed_encoder_decoder_batch.return_value = False
         runner._can_run_cuda_graph_batch.return_value = True
+
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -757,6 +761,71 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         self.assertEqual(result, (None, None, None))
+
+    def test_graph_key_includes_lora_variant(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        key = CUDAGraphRunner.get_graph_key(
+            runner,
+            batch,
+            use_lora_graph=True,
+        )
+
+        self.assertEqual(
+            key,
+            KeyType(batch_size=1,
+                    draft_len=0,
+                    is_first_draft=False,
+                    use_lora_graph=True),
+        )
+
+    def test_lora_graph_variant_selection(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.cuda_graph_lora_manager = object()
+        engine._force_lora_graph_for_capture = None
+        lora_config = SimpleNamespace(cudagraph_specialize_lora=True)
+        engine.llm_args = SimpleNamespace(lora_config=lora_config)
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        self.assertFalse(engine._use_lora_cuda_graph(batch))
+
+        request.lora_task_id = 42
+        self.assertTrue(engine._use_lora_cuda_graph(batch))
+
+        request.lora_task_id = None
+        lora_config.cudagraph_specialize_lora = False
+        self.assertTrue(engine._use_lora_cuda_graph(batch))
+
+        engine._force_lora_graph_for_capture = False
+        self.assertFalse(engine._use_lora_cuda_graph(batch))
+
+    def test_base_only_graph_maintains_peft_cache_state(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.cuda_graph_lora_manager = Mock()
+        engine._force_lora_graph_for_capture = False
+        batch = ScheduledRequests()
+        batch.generation_requests = [_make_request_stub(7)]
+        peft_cache_manager = Mock()
+
+        result = engine._get_lora_params_from_requests(
+            batch,
+            attn_metadata=Mock(),
+            peft_cache_manager=peft_cache_manager,
+            maybe_graph=True,
+        )
+
+        self.assertIsNone(result)
+        engine.cuda_graph_lora_manager.prepare_base_only_batch.assert_called_once_with(
+            peft_cache_manager)
+        engine.cuda_graph_lora_manager.prepare_cuda_graph_lora_params.assert_not_called(
+        )
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
@@ -798,7 +867,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids, None)
+                                                     promoted_ids, None, False)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
@@ -1058,8 +1127,29 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         selector.assert_not_called()
         self.assertIs(runner.maybe_get_cuda_graph.call_args.args[0], batch)
+        self.assertFalse(
+            runner.maybe_get_cuda_graph.call_args.kwargs["use_lora_graph"])
         self.assertIs(engine._prepare_inputs.call_args.args[0], batch)
         self.assertEqual(engine._prepare_inputs.call_args.args[-1], frozenset())
+
+    def test_generation_lora_request_selects_lora_graph(self) -> None:
+        key = (1, 0, False, False, True, True)
+        engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
+        engine.cuda_graph_lora_manager = object()
+        engine.llm_args.lora_config = SimpleNamespace(
+            cudagraph_specialize_lora=True)
+        generation = _make_request_stub(2)
+        generation.lora_task_id = 42
+        batch = ScheduledRequests()
+        batch.generation_requests = [generation]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                return_value=Mock()):
+            engine.forward(batch, resource_manager)
+
+        self.assertTrue(
+            runner.maybe_get_cuda_graph.call_args.kwargs["use_lora_graph"])
 
     def test_global_incompatibilities_bypass_candidate_selection(self) -> None:
         cases = (
