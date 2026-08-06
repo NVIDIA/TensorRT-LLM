@@ -1302,6 +1302,10 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* __restrict__ fuse_buf, 
         kRowVecs % kWarpSize == 0, "Fused kv-norm needs the latent row to split evenly across a warp's 16B vectors.");
     static_assert(kVecsPerLane >= 1, "Latent row is too narrow for one warp.");
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     // The bmm scales the FMHA kernel reads.
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && FP8_CACHE)
     {
@@ -1453,6 +1457,10 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* __restrict__ fuse_buf, 
             }
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, typename KVCacheBuffer>
@@ -1515,13 +1523,13 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
             auto launch_ctx = [&](auto fp8_tag)
             {
                 constexpr bool kFp8Cache = decltype(fp8_tag)::value;
-                mlaKvNormRopeQuantContextKernel<T, kCtxBlockSize, 448, 64, kFp8Cache, KVCacheBuffer>
-                    <<<kv_grid, kCtxBlockSize, 0, stream>>>(params.latent_cache, kv_cache_buffer, params.cos_sin_cache,
-                        kv_norm_w, params.kv_norm_eps, params.latent_row_stride, params.cu_q_seqlens,
-                        params.cache_seq_lens, params.max_input_seq_len, params.quant_scale_kv,
-                        useFusedFp8Q ? params.bmm1_scale : nullptr, useFusedFp8Q ? params.bmm2_scale : nullptr,
-                        params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale,
-                        params.helix_position_offsets);
+                tensorrt_llm::common::launchWithPdlWhenEnabled("mlaKvNormRopeQuantContext",
+                    mlaKvNormRopeQuantContextKernel<T, kCtxBlockSize, 448, 64, kFp8Cache, KVCacheBuffer>, kv_grid,
+                    kCtxBlockSize, 0, stream, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w,
+                    params.kv_norm_eps, params.latent_row_stride, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.quant_scale_kv, useFusedFp8Q ? params.bmm1_scale : nullptr,
+                    useFusedFp8Q ? params.bmm2_scale : nullptr, params.quant_scale_o, params.dequant_scale_q,
+                    params.dequant_scale_kv, params.host_bmm1_scale, params.helix_position_offsets);
             };
             if (params.cache_type == KvCacheDataType::FP8)
             {
@@ -1759,32 +1767,22 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
         }
     }
 
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-
     auto launch = [&](auto block_size_tag)
     {
         constexpr int kBlockSize = decltype(block_size_tag)::value;
         constexpr int kRowsPerBlock = kBlockSize / 32;
-        cudaLaunchConfig_t config;
         // Grid is sized purely by rows -- no coupling to head_num or to the FP8 grid
         // expansion the RoPE kernel needs.
-        config.gridDim = dim3(static_cast<int>(tensorrt_llm::common::divUp(params.acc_q_len, kRowsPerBlock)));
-        config.blockDim = kBlockSize;
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-        config.numAttrs = 1;
-        config.attrs = attrs;
+        dim3 const grid(static_cast<int>(tensorrt_llm::common::divUp(params.acc_q_len, kRowsPerBlock)));
         auto launch_typed = [&](auto fp8_tag)
         {
             constexpr bool kFp8Cache = decltype(fp8_tag)::value;
-            cudaLaunchKernelEx(&config,
-                &mlaKvNormRopeQuantGenerationKernel<T, kBlockSize, 448, 64, kFp8Cache, KVCacheBuffer>,
-                params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w, params.kv_norm_eps, row_stride,
-                params.acc_q_len, seq_len, seq_len_pow2, seq_len_shift, params.cache_seq_lens, params.quant_scale_kv,
-                tile_counter, bmm1_scale, bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
-                params.dequant_scale_kv, params.host_bmm1_scale);
+            tensorrt_llm::common::launchWithPdlWhenEnabled("mlaKvNormRopeQuantGeneration",
+                mlaKvNormRopeQuantGenerationKernel<T, kBlockSize, 448, 64, kFp8Cache, KVCacheBuffer>, grid, kBlockSize,
+                0, stream, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w, params.kv_norm_eps,
+                row_stride, params.acc_q_len, seq_len, seq_len_pow2, seq_len_shift, params.cache_seq_lens,
+                params.quant_scale_kv, tile_counter, bmm1_scale, bmm2_scale, params.quant_scale_o,
+                params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
         };
         // Cache dtype is uniform for the launch, so specialise on it: it drops the
         // per-vector branch and lets the FP8 path skip the bf16 round trip.

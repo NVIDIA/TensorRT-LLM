@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/deepseekV4QNormKernel.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -36,11 +37,13 @@ constexpr int kWarpSize = 32;
 // FP8 is one byte per element, so an N-element vector is an N-byte store.
 template <int BYTES>
 struct Fp8VecStore;
+
 template <>
 struct Fp8VecStore<8>
 {
     using Type = uint2;
 };
+
 template <>
 struct Fp8VecStore<16>
 {
@@ -54,6 +57,7 @@ __device__ inline void storeFp8Vec(__nv_fp8_e4m3* dst, __nv_fp8x2_e4m3 const* pa
     static_assert(sizeof(StoreT) == NUM_ELTS, "FP8 store width mismatch.");
     *reinterpret_cast<StoreT*>(dst) = *reinterpret_cast<StoreT const*>(packed);
 }
+
 constexpr int kWarpsPerBlock = 4;
 constexpr int kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
 
@@ -110,6 +114,10 @@ __global__ void deepseekV4QNormKernel(T const* input, T* output, int totalRows, 
 
     using Vec2 = typename Vec2Traits<T>::Type;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     int const warpId = threadIdx.x / kWarpSize;
     int const laneId = threadIdx.x % kWarpSize;
     int const row = blockIdx.x * kWarpsPerBlock + warpId;
@@ -143,6 +151,10 @@ __global__ void deepseekV4QNormKernel(T const* input, T* output, int totalRows, 
         float2 value{values[i].x * scale, values[i].y * scale};
         outputPair[pairIdx] = Vec2Traits<T>::fromFloat2(value);
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T>
@@ -153,8 +165,8 @@ void dispatchDeepseekV4QNorm(
 
     dim3 const block(kThreadsPerBlock);
     dim3 const grid((totalRows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-    deepseekV4QNormKernel<T, 512>
-        <<<grid, block, 0, stream>>>(static_cast<T const*>(input), static_cast<T*>(output), totalRows, eps);
+    tensorrt_llm::common::launchWithPdlWhenEnabled("deepseekV4QNorm", deepseekV4QNormKernel<T, 512>, grid, block, 0,
+        stream, static_cast<T const*>(input), static_cast<T*>(output), totalRows, eps);
 }
 
 // Fused q-norm + FP8 quant of nope segment. Row layout [nope|rope]; writes FP8
@@ -187,8 +199,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
     T* __restrict__ q_pe_out, float const* __restrict__ quant_scale_qkv_ptr, int totalRows,
     int quantQNopeRowStrideBytes, float eps, float2 const* __restrict__ cos_sin_cache = nullptr,
     int const* __restrict__ cache_seq_lens = nullptr, int num_heads = 0, int seq_len = 0,
-    int const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0, int num_heads_shift = -1,
-    int seq_len_shift = -1)
+    int const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0, int num_heads_shift = -1, int seq_len_shift = -1)
 {
     static_assert(kHeadDim % (2 * kWarpSize) == 0);
     static_assert(kNopeDim > 0 && kNopeDim < kHeadDim);
@@ -224,6 +235,10 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
     static_assert(kWideVec || kRopeDim / 2 == kWarpSize, "Narrow path gives each lane one rope pair.");
 
     using Vec2 = typename Vec2Traits<T>::Type;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
     int const warpId = threadIdx.x / kWarpSize;
     int const laneId = threadIdx.x % kWarpSize;
@@ -329,6 +344,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
             __nv_fp8x2_e4m3 pairs[kPairsPerVec];
             Vec2 raw_pairs[kPairsPerVec];
         };
+
 #pragma unroll
         for (int i = 0; i < kVecsPerLane; ++i)
         {
@@ -358,8 +374,8 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
                     float2 const v = Vec2Traits<T>::toFloat2(srcPairs[j]);
                     float2 const normalized{v.x * normScale, v.y * normScale};
                     float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairBase + j];
-                    float2 const rotated{coef.x * normalized.x - coef.y * normalized.y,
-                        coef.x * normalized.y + coef.y * normalized.x};
+                    float2 const rotated{
+                        coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
                     out.pairs[j] = __nv_fp8x2_e4m3(float2{rotated.x * quantScale, rotated.y * quantScale});
                 }
                 *reinterpret_cast<typename Fp8VecStore<kEltsPerVec>::Type*>(nopeOut + vecIdx * kEltsPerVec)
@@ -408,6 +424,10 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
             }
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T>
@@ -462,7 +482,8 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
         constexpr bool kWide = decltype(wide_tag)::value;
         if constexpr (kFuse)
         {
-            deepseekV4QNormFusedKernel<T, 512, 448, true, kWide><<<grid, block, 0, stream>>>(
+            tensorrt_llm::common::launchWithPdlWhenEnabled("deepseekV4QNormFused",
+                deepseekV4QNormFusedKernel<T, 512, 448, true, kWide>, grid, block, 0, stream,
                 static_cast<T const*>(input), static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
                 static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
                 static_cast<float2 const*>(cos_sin_cache), cache_seq_lens, num_heads, seq_len, cu_q_seqlens, num_seqs,
@@ -470,9 +491,12 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
         }
         else
         {
-            deepseekV4QNormFusedKernel<T, 512, 448, false, kWide><<<grid, block, 0, stream>>>(
+            tensorrt_llm::common::launchWithPdlWhenEnabled("deepseekV4QNormFused",
+                deepseekV4QNormFusedKernel<T, 512, 448, false, kWide>, grid, block, 0, stream,
                 static_cast<T const*>(input), static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
-                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps);
+                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
+                static_cast<float2 const*>(nullptr), static_cast<int const*>(nullptr), 0, 0,
+                static_cast<int const*>(nullptr), 0, -1, -1);
         }
     };
 
