@@ -299,6 +299,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         None,  # lse
         0,  # lse_stride_tokens
         0,  # lse_stride_heads
+        False,  # enable_block_sparse_attention (added in flashinfer 0.6.16, flashinfer-ai/flashinfer#3955)
     )
 
 
