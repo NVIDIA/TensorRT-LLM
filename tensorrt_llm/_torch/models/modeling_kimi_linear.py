@@ -1577,7 +1577,17 @@ class KimiKDARuntime(nn.Module):
 
         if output is not None:
             # Breakable-CUDA-graph core buffer: write the post-o_norm,
-            # pre-o_proj result in place. o_proj runs on-graph in the caller.
+            # pre-o_proj result; o_proj runs on-graph in the caller.
+            #
+            # Unlike decode — where trtllm::kda_decode fuses the gated
+            # RMSNorm and writes the core directly via out= — prefill's
+            # trtllm::kda_prefill produces a *pre*-o_norm result and the gated
+            # RMSNorm (fla FusedRMSNormGated, no out= buffer) sits between it
+            # and the post-o_norm core. So the prefill core write is a copy_
+            # at the o_norm boundary. A true kernel-level prefill out= would
+            # require a pre-o_norm core (unfusing decode's o_norm) plus an
+            # output alias on the CuTe DSL prefill op; deferred. The copy is
+            # [num_ctx_tokens, proj_size], negligible next to the chunk kernel.
             og = self._output_gate(x, o, onorm_g)  # [1, T, H, head_dim]
             output.copy_(og.reshape(output.shape))
             return None
