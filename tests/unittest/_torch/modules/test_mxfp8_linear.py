@@ -182,6 +182,52 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     assert native_gemm.call_count == 2
 
 
+def test_mxfp8_graph_backend_selection_is_an_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "is_flashinfer_mxfp8_cute_dsl_available", lambda: True)
+
+    graph_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    flashinfer_gemm = _mock_flashinfer_mxfp8_op(monkeypatch, graph_output)
+    quantized, activation_scale, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+    graph_quantize = Mock(return_value=(quantized, activation_scale))
+    graph_gemm = Mock(return_value=graph_output)
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_autotuned", graph_quantize)
+    monkeypatch.setattr(linear_module, "flashinfer_mxfp8_gemm_autotuned", graph_gemm)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    method.configure_default_graph_dispatch(enable_backend_tuning=True)
+    assert method.uses_graph_backend_selection
+    assert not method.needs_flashinfer_autotune
+
+    assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+    flashinfer_gemm.assert_not_called()
+
+    with flashinfer_mxfp8_decode_graph_capture(tune_backends=True):
+        assert method.apply(module, activation, bias=None) is graph_output
+    graph_quantize.assert_called_once_with(activation, tune=True)
+    graph_gemm.assert_called_once_with(
+        quantized,
+        activation_scale,
+        module.weight,
+        module.weight_scale,
+        module.dtype,
+        tune=True,
+    )
+    flashinfer_gemm.assert_not_called()
+
+    # Leaving the decode-capture scope restores the eager/native path.
+    assert method.apply(module, activation, bias=None) is native_output
+    assert native_gemm.call_count == 2
+
+
 def test_mxfp8_auto_stays_native_under_torch_compile(monkeypatch):
     """Dynamo cannot trace the context lookups that gate FlashInfer dispatch."""
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
