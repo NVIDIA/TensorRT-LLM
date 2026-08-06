@@ -130,8 +130,11 @@ def weight_dequant(x: torch.Tensor,
     assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
-    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']),
-                         triton.cdiv(N, meta['BLOCK_SIZE']))
+
+    def grid(meta):
+        return (triton.cdiv(M, meta['BLOCK_SIZE']),
+                triton.cdiv(N, meta['BLOCK_SIZE']))
+
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
 
@@ -1133,7 +1136,8 @@ class Deepseekv3MoE(nn.Module):
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
         # TODO: Move this model-agonostic part to MoE
-        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
+        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() in (
+                120, 121):
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states,

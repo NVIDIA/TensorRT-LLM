@@ -1084,7 +1084,9 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         super().create_weights(module, weight_dtype, w3_w1_weight_shape,
                                w2_weight_shape)
 
-        cell_div = lambda x, y: (x + y - 1) // y
+        def cell_div(x, y):
+            return (x + y - 1) // y
+
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
             (module.expert_size_per_partition + n_shared_experts,
              cell_div(module.intermediate_size_per_partition,
@@ -1311,7 +1313,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def _needs_e8m0_resmooth(self):
-        return is_sm_100f() or get_sm_version() == 120
+        return is_sm_100f() or get_sm_version() in (120, 121)
 
     def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
         if self._needs_e8m0_resmooth():

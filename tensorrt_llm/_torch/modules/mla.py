@@ -354,7 +354,7 @@ def fp8_block_scaling_bmm_out(
             mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, output
         )
         out.copy_(output)
-    elif sm_version == 120:
+    elif sm_version in (120, 121):
         mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(mat1, need_permute102=True)
         output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(
@@ -3234,7 +3234,7 @@ class MLA(nn.Module):
                 self.kv_b_proj.quant_config
                 and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
             )
-        is_sm120 = get_sm_version() == 120
+        is_sm120 = get_sm_version() in (120, 121)
         if is_sm120 and has_fp8_block_scales:
             self.k_b_proj_trans, self.k_b_proj_trans_scale = self.resmooth_parameters(
                 self.k_b_proj_trans, self.k_b_proj_trans_scale, recipe=(1, 128, 128)
