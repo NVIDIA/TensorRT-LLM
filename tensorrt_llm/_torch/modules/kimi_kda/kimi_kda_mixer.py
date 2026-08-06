@@ -580,6 +580,10 @@ class KimiKDALinearAttention(nn.Module):
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
         if output is not None:
+            # Prefill produces a pre-o_norm result, while the BCG core stores
+            # the post-o_norm, pre-o_proj result. FusedRMSNormGated has no
+            # out= buffer, so this boundary requires one copy; decode instead
+            # writes its fused post-o_norm result directly through out=.
             gated = self._output_gate(x, o, onorm_g)
             output.copy_(gated.reshape(output.shape))
             return None
