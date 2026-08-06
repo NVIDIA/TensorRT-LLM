@@ -21,7 +21,7 @@ import traceback
 import uuid
 import weakref
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -1122,8 +1122,14 @@ class AwaitResponseHelper:
                 lambda _: _,
                 [self.worker._engine_response_callback(r) for r in responses]))
 
-        while not self.temp_error_responses.empty():
-            responses.append(self.temp_error_responses.get())
+        # Drain with get_nowait(): this may run concurrently from the
+        # ManagedThread and RPC fetch_responses(), and empty()+get() can
+        # block forever if another consumer wins the race.
+        while True:
+            try:
+                responses.append(self.temp_error_responses.get_nowait())
+            except Empty:
+                break
 
         return responses
 
