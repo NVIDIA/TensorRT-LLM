@@ -531,6 +531,14 @@ class MLA(nn.Module):
 
         sparse_algorithm = getattr(sparse_params, "algorithm", None)
         self.is_dsa = sparse_algorithm == "dsa"
+        if self.is_dsa and not fuse_qkv_a_proj:
+            # forward_dsa_proj assumes the fused [q_a | kv_a | k_pe]
+            # projection layout; the separate q_a_proj layout (Kimi K3 MLA)
+            # is not wired into the DSA path.
+            raise NotImplementedError(
+                "DSA requires fuse_qkv_a_proj=True; the separate q_a_proj "
+                "layout is not supported with DSA."
+            )
         self.is_deepseek_v4 = sparse_algorithm == "deepseek_v4"
         self._disable_dsv4_epilogue_fusion = self.is_deepseek_v4 and _is_env_truthy(
             "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION"

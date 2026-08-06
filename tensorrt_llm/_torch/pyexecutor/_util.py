@@ -165,6 +165,12 @@ def get_kv_cache_manager_cls(
         # manager's SpeculativeState scratch path only; reuse + SA is
         # unvalidated.
         if is_kimi_linear(config) and not use_v2:
+            if is_disagg:
+                # Fail fast instead of bypassing the disagg transceiver
+                # validation below with an unvalidated route.
+                raise NotImplementedError(
+                    "Disaggregated serving is not supported for Kimi K3 yet "
+                    "(TRTLLM-14815).")
             if kv_cache_config.enable_block_reuse:
                 logger.info(
                     "Using CppMambaHybridCacheManager for Kimi K3 hybrid "

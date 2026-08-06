@@ -39,6 +39,21 @@ def is_kimi_linear(config):
     return False
 
 
+def unwrap_kimi_text_config(config):
+    """Return the flattened Kimi text config.
+
+    ``is_kimi_linear`` accepts both the flattened text config and the
+    composite "kimi_k3" config with a nested ``text_config``; consumers read
+    text-level fields (``linear_attn_config``, ``num_hidden_layers``, ...),
+    so they must unwrap the composite form first.
+    """
+    if getattr(config, "model_type", None) == "kimi_k3":
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return text_config
+    return config
+
+
 def get_kimi_linear_layer_masks(config):
     """Return (full_attention_layer_mask, kda_layer_mask) for Kimi K3.
 
@@ -46,6 +61,7 @@ def get_kimi_linear_layer_masks(config):
     ``full_attn_layers`` lists; every decoder layer must be exactly one of
     the two.
     """
+    config = unwrap_kimi_text_config(config)
     lin = config.linear_attn_config
     kda_layers = set(lin["kda_layers"])
     full_attn_layers = set(lin["full_attn_layers"])
@@ -344,7 +360,7 @@ def extract_mamba_kv_cache_params(
         # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
         # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
         # window of `short_conv_kernel_size` columns.
-        lin = config.linear_attn_config
+        lin = unwrap_kimi_text_config(config).linear_attn_config
         state_size = lin["head_dim"]
         conv_kernel = lin["short_conv_kernel_size"] + 1
         num_heads = lin["num_heads"]

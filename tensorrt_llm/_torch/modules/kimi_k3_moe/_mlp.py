@@ -277,10 +277,14 @@ class KimiK3RMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # flashinfer's fused RMSNorm does the same fp32-accumulate
         # normalization in one kernel, collapsing the eager
-        # pow/mean/rsqrt/mul/cast launch chain. It is only valid for a CUDA
-        # fp16/bf16 input whose dtype matches the weight; CPU / fp32 parity
-        # paths, meta init, and the KIMI_K3_FUSED_RMSNORM=0 rollback keep the
-        # exact eager math below.
+        # pow/mean/rsqrt/mul/cast launch chain. Rounding differs by one final
+        # cast: flashinfer multiplies by ``weight`` in fp32 and casts once at
+        # the end, while the eager path casts the normalized value to the
+        # input dtype BEFORE the weight multiply — so outputs can differ by
+        # ~1 ulp and byte-exact HF parity requires the eager path. It is only
+        # valid for a CUDA fp16/bf16 input whose dtype matches the weight;
+        # CPU / fp32 parity paths, meta init, and the KIMI_K3_FUSED_RMSNORM=0
+        # rollback keep the exact eager math below.
         if (
             _FUSED_RMSNORM
             and IS_FLASHINFER_AVAILABLE

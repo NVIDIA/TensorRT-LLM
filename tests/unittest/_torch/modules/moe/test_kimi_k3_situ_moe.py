@@ -230,6 +230,13 @@ def test_make_situ_alpha_beta_contract():
             situ_linear_beta=25.0,
             device=torch.device("cuda"),
         )
+    with pytest.raises(RuntimeError, match="must be > 0"):
+        make_situ_alpha_beta(
+            local_num_experts=8,
+            situ_beta=4.0,
+            situ_linear_beta=0.0,
+            device=torch.device("cuda"),
+        )
 
 
 @situ_supported

@@ -304,7 +304,7 @@ class KimiK3SparseMoeBlock(nn.Module):
         else:
             routed_activation = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
-        self.gate = KimiK3MoEGate(config)
+        self.gate = KimiK3MoEGate(config, device=device)
 
         # Routed expert storage — the MXFP4 bank is always the checkpoint
         # quantization source of truth. The fused path derives its packed
@@ -624,7 +624,11 @@ def copy_hf_moe_block_weights(
                 )
 
     shared_names: List[str] = []
-    if k3.shared_experts is not None and hasattr(hf, "shared_experts"):
+    if k3.shared_experts is not None:
+        assert hasattr(hf, "shared_experts"), (
+            "K3 block has shared_experts but HF block has none; "
+            "shared-expert weights would stay randomly initialized"
+        )
         with torch.no_grad():
             gate_up_fused = torch.cat(
                 [

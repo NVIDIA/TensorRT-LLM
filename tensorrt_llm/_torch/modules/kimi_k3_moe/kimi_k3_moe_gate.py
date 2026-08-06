@@ -58,6 +58,7 @@ class KimiK3MoEGate(nn.Module):
         biased_weights_mutation: bool = False,
         omit_renormalize_mutation: bool = False,
         logits_gemm_dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -86,9 +87,9 @@ class KimiK3MoEGate(nn.Module):
         # Default ``None`` keeps the legacy fp32 GEMM (module parity tests).
         weight_dtype = logits_gemm_dtype or torch.float32
         self.weight = nn.Parameter(
-            torch.empty((self.num_experts, self.gating_dim), dtype=weight_dtype)
+            torch.empty((self.num_experts, self.gating_dim), dtype=weight_dtype, device=device)
         )
-        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts))
+        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts, device=device))
 
         self.softmax_routing_mutation = softmax_routing_mutation
         self.biased_weights_mutation = biased_weights_mutation
@@ -189,8 +190,10 @@ class KimiK3MoEGate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        bsz, seq_len, h = hidden_states.shape
         logits = self.compute_logits(hidden_states)
+        # ``compute_logits`` flattens to [num_tokens, num_experts]; derive
+        # the token count from it so any input rank works.
+        num_tokens = logits.shape[0]
 
         # ``trtllm::noaux_tc_op`` is a CUDA-only custom op; CPU inputs
         # (reference / parity tests) fall through to the eager path below,
@@ -207,14 +210,14 @@ class KimiK3MoEGate(nn.Module):
             return topk_idx.to(torch.int64), topk_weight.to(torch.float32)
 
         scores = self._score(logits)
-        scores = scores.view(bsz * seq_len, -1)
+        scores = scores.view(num_tokens, -1)
 
         # Bias is applied for *selection*, not for the returned weight.
         scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
 
         if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
             group_scores = (
-                scores_for_choice.view(bsz * seq_len, self.num_expert_group, -1)
+                scores_for_choice.view(num_tokens, self.num_expert_group, -1)
                 .topk(2, dim=-1)[0]
                 .sum(dim=-1)
             )
@@ -224,11 +227,11 @@ class KimiK3MoEGate(nn.Module):
             score_mask = (
                 group_mask.unsqueeze(-1)
                 .expand(
-                    bsz * seq_len,
+                    num_tokens,
                     self.num_expert_group,
                     self.num_experts // self.num_expert_group,
                 )
-                .reshape(bsz * seq_len, -1)
+                .reshape(num_tokens, -1)
             )
             tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         else:
@@ -251,7 +254,7 @@ class KimiK3MoEGate(nn.Module):
 def copy_hf_moe_gate_weights(
     hf: nn.Module,
     k3: KimiK3MoEGate,
-):
+) -> dict[str, tuple[tuple[int, ...], str]]:
     """Copy parameters from HF ``KimiMoEGate`` into ``k3``.
 
     Identity name mapping (``weight`` + ``e_score_correction_bias``).

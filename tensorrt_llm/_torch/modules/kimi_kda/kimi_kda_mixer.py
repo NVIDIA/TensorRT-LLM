@@ -253,6 +253,12 @@ class KimiKDALinearAttention(nn.Module):
         self.o_norm = _MetaSafeFusedRMSNormGated(head_dim, eps=rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, hidden_size, bias=False)
 
+        # Installed together by the FP8 weight loader (fused [q | k | v | g]
+        # decode GEMM). Declared here so the decode path never sees a
+        # half-installed pair.
+        self.qkvg_proj: Optional[nn.Module] = None
+        self.qkvg_split_sizes: Optional[list[int]] = None
+
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
 
@@ -448,7 +454,7 @@ class KimiKDALinearAttention(nn.Module):
         # projection GEMMs (same activation, same weight slices). The forget
         # gate (f_a/f_b), beta and low-rank output gate stay BF16, so they keep
         # their own calls.
-        fused_qkvg = getattr(self, "qkvg_proj", None)
+        fused_qkvg = self.qkvg_proj if self.qkvg_split_sizes is not None else None
         if fused_qkvg is not None:
             parts = fused_qkvg(hidden_states).split(self.qkvg_split_sizes, dim=-1)
             q_proj_states, k_proj_states, v_proj_states = parts[0], parts[1], parts[2]
