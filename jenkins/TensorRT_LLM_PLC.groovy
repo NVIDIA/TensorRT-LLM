@@ -398,7 +398,7 @@ def processScanResults(ref) {
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    currentBuild.result = 'UNSTABLE'
+                    scanResultUnstable = true
                 } else {
                     echo "No new risks detected."
                 }
@@ -410,6 +410,8 @@ def processScanResults(ref) {
 needsManualReview = false
 manualReviewUrl = ""
 detectedLicensesTable = ""
+scanResultUnstable = false
+manuallyApproved = false
 
 pipeline {
     agent {
@@ -520,9 +522,18 @@ pipeline {
                             ok: "Approve"
                         )
                     }
-                    currentBuild.result = 'SUCCESS'
+                    manuallyApproved = true
                 }
             }
         }
     } // stages
+    post {
+        always {
+            script {
+                if (scanResultUnstable && !manuallyApproved) {
+                    currentBuild.result = 'UNSTABLE'
+                }
+            }
+        }
+    }
 } // pipeline
