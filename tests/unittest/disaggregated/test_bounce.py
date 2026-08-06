@@ -369,6 +369,33 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
+    def test_block_bytes_include_distinct_physical_pools_once(self) -> None:
+        entries = np.array([], dtype=BUFFER_ENTRY_DTYPE)
+        page_table = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[
+                AttentionLayerGroup(
+                    pool_group_idx=0,
+                    local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                    pool_views=[
+                        PoolView(pool_idx=0, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                    ],
+                )
+            ],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(base_address=0x200000, slot_bytes=100, num_slots=8),
+                        PhysicalPool(base_address=0x300000, slot_bytes=25, num_slots=8),
+                    ]
+                )
+            ],
+        )
+
+        assert btr.block_bytes_per_group(page_table) == [125]
+
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200

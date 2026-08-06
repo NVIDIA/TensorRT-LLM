@@ -16,9 +16,11 @@
 the contract in core.py. Holds the buffers, the gather and scatter kernels, and the scatter worker,
 and runs the side effects that drive each region's state machine. Never imports transfer.py."""
 
+from __future__ import annotations
+
 import queue
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -40,6 +42,9 @@ from .buffer import SlotAllocator
 from .config import DEFAULT_MIN_BYTES, SizingContext, fit_within_free
 from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -587,21 +592,28 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def block_bytes_per_group(page_table) -> list:
-    """Byte size of one cache block for each layer group, aligned with the layer-group indices a
-    recv request uses. Non-attention groups (mamba/KDA recurrent state) hold ``None``: they carry
-    no paged blocks (their KVSlice entry is always empty — see ``_create_kv_slice``) and their
-    payload is sized separately via ``MambaPolicy.payload_bytes``. Keeping them as placeholders
-    instead of truncating means a trailing (or hypothetically interleaved) mamba group can never
-    shift an attention group off the end of this list and poison the bounce gate."""
+def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
+    """Return transferred bytes per cache block for each layer group.
+
+    All distinct physical pools exposed by an attention group contribute to its
+    transfer size. Multiple logical views of the same physical pool contribute
+    only once. Non-attention groups retain a ``None`` placeholder so the result
+    remains aligned with receive-request layer-group indices.
+    """
     from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
-    out: list = []
+    out: list[int | None] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if not isinstance(lg, AttentionLayerGroup):
             out.append(None)
             continue
-        out.append(int(get_physical_pool(page_table, lg_idx, 0).slot_bytes))
+        pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
+        out.append(
+            sum(
+                int(get_physical_pool(page_table, lg_idx, pool_idx).slot_bytes)
+                for pool_idx in pool_indices
+            )
+        )
     return out
