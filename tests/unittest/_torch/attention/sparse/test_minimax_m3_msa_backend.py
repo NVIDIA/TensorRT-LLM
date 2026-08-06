@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Structural tests for the MiniMax-M3 MSA sparse attention backend.
 
-These validate backend selection and decode scratch-buffer sizing without
-launching kernels. Numerical parity against the Triton reference is covered
-by the SM100 integration accuracy test.
+These validate backend selection, decode scratch-buffer sizing, and the paged
+HND and sparse block-index stride contracts passed to the packaged MSA kernel.
+Numerical parity against the Triton reference is covered by the SM100
+integration accuracy test.
 """
+
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -74,6 +78,60 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     # Oversized requests are rejected rather than silently corrupting memory.
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
+    from fmha_sm100.cute import interface as sparse_interface
+
+    pages, roles, heads, page_size, head_dim = 5, 2, 2, 128, 128
+    pool = torch.empty(
+        pages,
+        roles,
+        heads,
+        page_size,
+        head_dim,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_buffers.return_value = pool
+
+    k_view, v_view = msa_paged_kv(kv_cache_manager, layer_idx=3)
+
+    kv_cache_manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    for view in (k_view, v_view):
+        assert not view.is_contiguous()
+        prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
+        assert prepared.data_ptr() == view.data_ptr()
+        assert prepared.stride() == view.stride()
+
+    mismatched = sparse_interface._prepare_paged_hnd_input(k_view, page_size // 2)
+    assert mismatched.data_ptr() == k_view.data_ptr()
+    with pytest.raises(ValueError, match="page_size == blk_kv"):
+        sparse_interface._prepare_paged_kv_for_tma(mismatched, mismatched, page_size // 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
+    from fmha_sm100.cute import interface as sparse_interface
+
+    pages, heads, page_size, head_dim = 5, 2, 128, 128
+    outer_stride = heads * page_size * head_dim + 1
+    storage = torch.empty(
+        pages * outer_stride,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    view = storage.as_strided(
+        (pages, heads, page_size, head_dim),
+        (outer_stride, page_size * head_dim, head_dim, 1),
+    )
+
+    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
+
+    assert prepared.is_contiguous()
+    assert prepared.data_ptr() != view.data_ptr()
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():
@@ -223,3 +281,86 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
+
+
+def _run_msa_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    plan: tuple,
+    kv_indices: torch.Tensor,
+    selected: torch.Tensor,
+) -> torch.Tensor:
+    from fmha_sm100.api import fmha_sm100
+
+    out = torch.empty_like(q)
+    returned, _ = fmha_sm100(
+        q,
+        k,
+        v,
+        plan,
+        kv_indices=kv_indices,
+        kv_block_indexes=selected,
+        out=out,
+        sm_scale=128.0**-0.5,
+        output_maxscore=False,
+    )
+    torch.cuda.synchronize()
+    assert returned.data_ptr() == out.data_ptr()
+    assert torch.isfinite(out).all()
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_len", [1, 5])
+@pytest.mark.parametrize("num_kv_splits", [1, 2])
+def test_msa_sparse_attention_honors_noncontiguous_block_indexes(
+    query_len: int,
+    num_kv_splits: int,
+) -> None:
+    from fmha_sm100.api import fmha_sm100_plan
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    total_selector_rows = query_len + 2
+    q = torch.zeros((query_len, 32, 128), dtype=torch.bfloat16, device=device)
+    k = torch.zeros((8, 2, 128, 128), dtype=torch.bfloat16, device=device)
+    v = torch.empty_like(k)
+    for page in range(8):
+        v[page].fill_(page + 1)
+    kv_indices = torch.arange(8, dtype=torch.int32, device=device)
+
+    intended = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    poison = torch.tensor([4, 5, 6, 7], dtype=torch.int32, device=device)
+    logical = intended.expand(total_selector_rows, 2, 4).clone()
+    # These rows are outside the logical slice but occupy addresses reached by
+    # a pointer-only contiguous read for later query/head pairs.
+    logical[:2, 1, :] = poison
+    backing = logical.permute(1, 0, 2).contiguous()
+    selected_strided = backing.permute(1, 0, 2)[-query_len:]
+    selected_contiguous = logical[-query_len:].contiguous()
+
+    assert selected_strided.stride() == (4, total_selector_rows * 4, 1)
+    assert not selected_strided.is_contiguous()
+    assert torch.equal(selected_strided, selected_contiguous)
+
+    plan = fmha_sm100_plan(
+        torch.tensor([query_len], dtype=torch.int32),
+        torch.tensor([1024], dtype=torch.int32),
+        32,
+        num_kv_heads=2,
+        qo_offset=torch.tensor([1024 - query_len], dtype=torch.int32),
+        num_kv_splits=num_kv_splits,
+        page_size=128,
+        output_maxscore=False,
+        kv_block_num=4,
+        causal=True,
+        device=device,
+    )
+    short_plan = plan[3]
+    assert short_plan["MM-SA-Nv"] is False
+    assert short_plan["num_kv_splits"] == num_kv_splits
+
+    expected = _run_msa_sparse_attention(q, k, v, plan, kv_indices, selected_contiguous)
+    actual = _run_msa_sparse_attention(q, k, v, plan, kv_indices, selected_strided)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

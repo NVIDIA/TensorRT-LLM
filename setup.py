@@ -58,6 +58,13 @@ def sanity_check():
             'If you are attempting to use the pip development mode (editable installation), '
             'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
+    if not (Path(__file__).resolve().parent / "3rdparty" /
+            "fmha_sm100").is_dir():
+        raise ImportError(
+            'The `fmha_sm100` package is missing. Please execute '
+            '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
+            '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
+            'from a published wheel.')
 
 
 def get_version():
@@ -304,6 +311,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                     os.makedirs(dst_dir, exist_ok=True)
                 print(f"Copying {rel_path} from local directory.")
                 shutil.copy2(src_file, dst_file)
+
+        source_fmha = os.path.join(precompiled_location, "3rdparty",
+                                   "fmha_sm100")
+        if os.path.isdir(source_fmha):
+            dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+            print(f"Copying fmha_sm100 from local directory: {source_fmha}")
+            if os.path.isdir(dst_fmha):
+                shutil.rmtree(dst_fmha)
+            shutil.copytree(source_fmha, dst_fmha)
         return
 
     # Handle local file or remote URL
@@ -339,6 +355,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         wheel_path = precompiled_path
 
     with zipfile.ZipFile(wheel_path) as wheel:
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        wheel_has_fmha = any(
+            file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
+        if wheel_has_fmha and os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
@@ -347,6 +368,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             # Keep source-owned package data local so Python-only schema edits
             # layer over precompiled wheels.
             if should_skip_precompiled_package_data(file.filename):
+                continue
+
+            # Top-level MSA package in the wheel; stage under 3rdparty for
+            # setuptools package_dir, matching scripts/build_wheel.py.
+            if file.filename.startswith("fmha_sm100/"):
+                print(
+                    f"Extracting and including {file.filename} from precompiled wheel."
+                )
+                wheel.extract(file, path="3rdparty")
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -432,7 +462,9 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
-msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
+# fmha_sm100 is staged under 3rdparty/ by scripts/build_wheel.py from the
+# CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
+msa_package_dir = {"fmha_sm100": "3rdparty/fmha_sm100"}
 packages += ["fmha_sm100"]
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
