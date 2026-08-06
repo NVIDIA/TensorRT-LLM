@@ -443,8 +443,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     // cycles; detaching it would orphan the committed chain of an in-flight
     // sequence.
     while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr
-        && std::all_of(curr->storage.begin(), curr->storage.end(),
-            [](CommittedPage const* page) { return page == nullptr; }))
+        && std::all_of(
+            curr->storage.begin(), curr->storage.end(), [](CommittedPage const* page) { return page == nullptr; }))
     {
         NodeBase* prevNode = curr->prev;
         BlockKey const currKey = curr->key;
