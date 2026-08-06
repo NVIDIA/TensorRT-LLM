@@ -269,11 +269,14 @@ For Kubernetes `LeaderWorkerSet` (LWS), use LWS to allocate the leader and
 worker Pods, then have the leader start the MPI-style benchmark command across
 all Pods. LWS handles Pod placement; the MPI launcher or your entrypoint script
 must still provide one rank per GPU and make the model, dataset, and config file
-available at the same path in every Pod.
+available at the same path in every Pod. LWS injects `LWS_LEADER_ADDRESS` and
+`LWS_GROUP_SIZE`; entrypoint scripts commonly combine those values with the
+stable Pod DNS names from the LWS headless service to generate an MPI hostfile
+with one line per Pod and `slots=<GPUs exposed to that Pod>`.
 
 For a two-node, four-GPU-per-node benchmark (eight total ranks), the benchmark
-command should look like this once the LWS entrypoint has created a hostfile or
-equivalent MPI host list:
+command should look like this after the LWS entrypoint has generated that
+hostfile or an equivalent MPI host list:
 
 ```shell
 # Generated once and shared by all Pods, for example on a mounted volume.
@@ -287,8 +290,8 @@ trtllm-bench --model <model-or-tokenizer> prepare-dataset \
   --output-stdev 0
 
 cat > /workspace/bench/trtllm_bench_extra.yaml <<'EOF'
-# Optional: keep only when the runtime-inferred per-node value differs from
-# the actual GPUs exposed to each Pod.
+# Optional: keep only when torch.cuda.device_count() inside each worker
+# process differs from the GPUs exposed to each Pod.
 gpus_per_node: 4
 cuda_graph_config: null
 EOF
@@ -314,12 +317,14 @@ The important invariants are:
 - `--tp * --pp * cp_size` equals the number of ranks that participate in the
   LLM world; with the default `cp_size=1`, this reduces to `--tp * --pp`. For
   the two-node, four-GPU-per-node case, `--tp 8` is the simplest layout. If a
-  TP/PP split such as `--tp 8 --pp 2` better matches the model and network
-  topology, launch 16 ranks when `cp_size=1`.
+  TP/PP split better matches the model and network topology, `--tp 4 --pp 2`
+  keeps each TP group within one node and still uses eight ranks.
 - Treat `gpus_per_node` as a per-node override. Pass it through `--config` only
-  when the runtime-inferred value from local MPI ranks and visible GPUs differs
-  from the actual GPUs exposed to each Pod. `trtllm-bench` does not expose
-  `gpus_per_node` as a top-level throughput CLI flag.
+  when the number of GPUs visible to the worker process differs from the actual
+  GPUs exposed to each Pod. The default fallback is `torch.cuda.device_count()`
+  (or `tensor_parallel_size` when `RAY_LOCAL_WORLD_SIZE` is set), not the MPI
+  rank layout. `trtllm-bench` does not expose `gpus_per_node` as a top-level
+  throughput CLI flag.
 - Prefer local or pre-mounted model checkpoints for multi-node Kubernetes runs.
   Do not rely on every rank downloading the checkpoint independently.
 - Keep the dataset and YAML config on a shared volume or copy them to identical
