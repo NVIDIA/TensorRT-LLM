@@ -23,6 +23,7 @@ the delta-rule inner loop plus its state update.
 from __future__ import annotations
 
 import importlib
+import os
 from types import ModuleType
 from typing import Optional, Tuple
 
@@ -70,6 +71,14 @@ def is_kda_optimized_supported() -> bool:
 
 _PREFILL_MODULE: Optional[ModuleType] = None
 _PREFILL_IMPORT_ERROR: Optional[BaseException] = None
+_FUSED_PREFILL_PREPROCESS_ENV = "TRTLLM_KDA_USE_FUSED_PREFILL_PREPROCESS"
+
+
+def _use_fused_prefill_preprocess() -> bool:
+    value = os.environ.get(_FUSED_PREFILL_PREPROCESS_ENV, "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"{_FUSED_PREFILL_PREPROCESS_ENV} must be '0' or '1', got {value!r}")
+    return value == "1"
 
 
 def _load_prefill_module() -> ModuleType:
@@ -253,11 +262,11 @@ class KDAKernelDispatch:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
-        On the optimized path this replays the preprocessing that FLA's
-        ``ChunkKDAFunction.forward`` performs when the caller enables
-        ``use_qk_l2norm_in_kernel``, ``use_beta_sigmoid_in_kernel``,
-        ``use_gate_in_kernel``, and ``state_v_first``; then dispatches to
-        the in-tree ``trtllm::kda_prefill`` CuTe DSL op.
+        On the optimized path, ``TRTLLM_KDA_USE_FUSED_PREFILL_PREPROCESS=1``
+        (the default) folds beta sigmoid into the in-tree CuTe DSL op.
+        Q/K L2 normalization remains in the existing FLA host kernels.
+        Setting the variable to ``0`` also restores the legacy beta host
+        launch before dispatching the same op.
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
@@ -274,6 +283,7 @@ class KDAKernelDispatch:
         chunk_indices = None
         if use_optimized and cu_seqlens is not None:
             from fla.ops.utils.index import prepare_chunk_indices
+
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
             # The persistent K123 scheduler needs at least 4 total chunks
             # (cgs_per_head = NT // 4 cooperative groups per head). The
@@ -282,19 +292,22 @@ class KDAKernelDispatch:
             # batches (short-prompt contexts, NT < 4) launch with a
             # zero-size grid -> DSLCudaRuntimeError. Route them to the FLA
             # reference path (negligible perf impact at these sizes). The
-            # check must happen HERE, before the l2norm/beta-sigmoid
-            # pre-transforms below: the FLA path applies both in-kernel.
+            # check must happen before dispatch: the FLA fallback applies
+            # Q/K normalization and beta sigmoid in its own kernels.
             if chunk_indices.shape[0] < 4:
                 use_optimized = False
 
         if use_optimized:
             import torch.nn.functional as F
             from fla.modules.l2norm import l2norm_fwd
-            from fla.ops.common.gate import fused_beta_sigmoid
 
+            use_fused_preprocess = _use_fused_prefill_preprocess()
             q, _ = l2norm_fwd(q)
             k, _ = l2norm_fwd(k)
-            beta = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
+            if not use_fused_preprocess:
+                from fla.ops.common.gate import fused_beta_sigmoid
+
+                beta = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
 
             real_T = q.shape[1]
             if cu_seqlens is not None:
@@ -336,6 +349,7 @@ class KDAKernelDispatch:
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
                 use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=use_fused_preprocess,
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
             )
