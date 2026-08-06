@@ -17,6 +17,7 @@ import functools
 import gc
 import os
 import pathlib as _pl
+import types
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any, Callable, Generator, cast
@@ -34,6 +35,7 @@ from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
@@ -670,15 +672,6 @@ def test_beam_search_vbws_e2e(beam_width_array: list[int],
     monkeypatch.setattr(TorchSampler, "update_requests",
                         recording_update_requests)
 
-    # Each parametrization builds a fresh engine in this same process, and the
-    # CBA step is torch.compile'd with fullgraph=True. Dynamo counts recompiles
-    # per code object across the whole process, so by the last case the default
-    # limit is exhausted and compilation fails hard rather than falling back.
-    # Raise it for the duration of the test; the limit is a guard against
-    # runaway recompilation, not a correctness property.
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit",
-                        max(64, torch._dynamo.config.recompile_limit))
-
     gc.collect(2)  # force destruction of any other LLM instances
     with _single_process_context():
         llm = LLM(
@@ -749,6 +742,24 @@ def test_beam_search_vbws_e2e(beam_width_array: list[int],
 ###########################################################################
 # Unit tests
 ###########################################################################
+
+
+@pytest.fixture(autouse=True)
+def _raise_dynamo_recompile_limit(monkeypatch):
+    """Keep the whole module clear of Dynamo's per-code-object recompile cap.
+
+    Nearly every test here builds a fresh engine or a fresh set of CBA tensors
+    in this same process, and the CBA step is compiled with fullgraph=True.
+    Dynamo counts recompiles per code object across the entire process, so the
+    default cap is exhausted partway through the file and every later case
+    fails to compile -- a hard failure under fullgraph, not a fallback. Each
+    of those tests passes when run alone.
+
+    The cap guards against runaway recompilation; it is not a correctness
+    property, so raising it for the module is safe.
+    """
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit",
+                        max(256, torch._dynamo.config.recompile_limit))
 
 
 def _kernel_test(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -924,6 +935,7 @@ def test_beam_topk_flashinfer_parity():
     assert torch.equal(fi_i[finite], ref_i[finite])
 
 
+@_kernel_test
 def test_beam_search_sampling_batch_diversity_rate():
     """diversity_rate wired through beam_search_sampling_batch changes beam
     selection while stored cum_log_probs stay raw."""
@@ -1007,17 +1019,54 @@ def test_beam_search_sampling_batch_diversity_rate():
                                rtol=1e-3)
 
 
+# Poison value for buffers the op is expected to overwrite wherever it writes
+# at all. Zero is a plausible real value for most of them (a token id, a
+# length, a beam index), so a zero-filled buffer cannot distinguish "written
+# correctly" from "never written"; these can.
+_UNWRITTEN_INT = -7
+_UNWRITTEN_FLOAT = -7.0
+
+
+def _assert_untouched_rows_intact(meta, before, batch, max_batch):
+    """Rows outside seq_slots must come back bit-identical.
+
+    The ops index every buffer with seq_slots, so a slot-agnostic write (a
+    forgotten index, a broadcast over dim 0) still produces correct output for
+    the slots under test and is invisible unless the unused rows are checked.
+    """
+    if batch >= max_batch:
+        return
+    unused = slice(batch, max_batch)
+    for name, orig in before.items():
+        current = _cba_field(meta, name)
+        assert torch.equal(current[unused], orig[unused]), (
+            f"{name} rows [{batch}:{max_batch}] were modified; the op must "
+            "only write the rows selected by seq_slots")
+
+
+def _cba_field(meta, name):
+    return getattr(meta.cba, name) if hasattr(meta.cba, name) else getattr(
+        meta, name)
+
+
+def _snapshot_cba_rows(meta, names):
+    return {name: _cba_field(meta, name).clone() for name in names}
+
+
 def _make_cba_metadata(max_batch, K, attn_len, snap_len, seq_len, prompt_len,
                        end_id, batch):
     slots = torch.arange(batch, dtype=torch.int64)
     m = BeamSearchMetadata(
-        cache_indirection=torch.zeros((max_batch, K, attn_len),
-                                      dtype=torch.int32),
+        cache_indirection=torch.full((max_batch, K, attn_len),
+                                     _UNWRITTEN_INT,
+                                     dtype=torch.int32),
         cache_indirection_buffer=torch.full((max_batch, K, attn_len),
                                             -1,
                                             dtype=torch.int32),
         cum_log_probs=torch.zeros((max_batch, K), dtype=torch.float32),
-        new_log_probs=torch.zeros((max_batch, K), dtype=torch.float32),
+        new_log_probs=torch.full((max_batch, K),
+                                 _UNWRITTEN_FLOAT,
+                                 dtype=torch.float32),
         seq_slots=slots,
         seq_lens=torch.full((batch, ), seq_len, dtype=torch.int32),
         finished_beams=torch.zeros((max_batch, K), dtype=torch.int32),
@@ -1027,22 +1076,29 @@ def _make_cba_metadata(max_batch, K, attn_len, snap_len, seq_len, prompt_len,
             end_ids=torch.full((max_batch, ), end_id, dtype=torch.int32),
             prompt_lens=torch.full((max_batch, ), prompt_len,
                                    dtype=torch.int32),
-            original_tokens=torch.zeros((max_batch, K, attn_len),
-                                        dtype=torch.int32),
+            original_tokens=torch.full((max_batch, K, attn_len),
+                                       _UNWRITTEN_INT,
+                                       dtype=torch.int32),
             cba_tokens=torch.full((max_batch, K, snap_len),
                                   BEAM_SEARCH_PAD_TOKEN,
                                   dtype=torch.int32),
-            cba_cum_log_probs=torch.zeros((max_batch, K), dtype=torch.float32),
+            cba_cum_log_probs=torch.full((max_batch, K),
+                                         _UNWRITTEN_FLOAT,
+                                         dtype=torch.float32),
             cba_normed_scores=torch.full((max_batch, K),
                                          _CBA_NEG_INF,
                                          dtype=torch.float32),
-            cba_lengths=torch.zeros((max_batch, K), dtype=torch.int32),
+            cba_lengths=torch.full((max_batch, K),
+                                   _UNWRITTEN_INT,
+                                   dtype=torch.int32),
             batch_dones=torch.zeros((max_batch, ), dtype=torch.bool),
             cba_caps=torch.full((max_batch, ), K, dtype=torch.int32),
-            original_log_probs=torch.zeros((max_batch, K, attn_len),
-                                           dtype=torch.float32),
-            cba_log_probs=torch.zeros((max_batch, K, snap_len),
-                                      dtype=torch.float32),
+            original_log_probs=torch.full((max_batch, K, attn_len),
+                                          _UNWRITTEN_FLOAT,
+                                          dtype=torch.float32),
+            cba_log_probs=torch.full((max_batch, K, snap_len),
+                                     _UNWRITTEN_FLOAT,
+                                     dtype=torch.float32),
             max_seq_len=attn_len,
         ),
     )
@@ -1170,7 +1226,6 @@ def test_beam_search_cba_done_bound_by_early_stopping(early_stopping,
 
 
 @_kernel_test
-@_kernel_test
 @pytest.mark.parametrize("penalty_as_tensor", [False, True])
 def test_beam_search_cba_length_penalty_orders_pool(penalty_as_tensor):
     """length_penalty ranks pool entries by length-normalized score.
@@ -1210,6 +1265,11 @@ def test_beam_search_cba_length_penalty_orders_pool(penalty_as_tensor):
 
         penalty = (torch.full((1, ), length_penalty, dtype=torch.float32)
                    if penalty_as_tensor else length_penalty)
+        before = _snapshot_cba_rows(
+            m, ("cache_indirection", "cum_log_probs", "new_log_probs",
+                "finished_beams", "predecessor_beams", "original_tokens",
+                "cba_tokens", "cba_cum_log_probs", "cba_normed_scores",
+                "cba_lengths", "batch_dones"))
         beam_search_sampling_batch_cba(
             logits=logits,
             beam_width_in=K,
@@ -1220,6 +1280,7 @@ def test_beam_search_cba_length_penalty_orders_pool(penalty_as_tensor):
             length_penalty=penalty,
             return_probs=False,
         )
+        _assert_untouched_rows_intact(m, before, batch=1, max_batch=2)
         return m
 
     # Both runs put the same two hypotheses in the pool; only the ordering key
@@ -1261,6 +1322,7 @@ def test_beam_search_cba_length_penalty_orders_pool(penalty_as_tensor):
             f"normed {normed} != cum {cum} / length {length}")
 
 
+@_kernel_test
 def test_beam_search_cba_replace_min():
     """A better finished path replaces the worst CBA entry when full."""
     K, vocab, end_id = 2, 5, 4
@@ -1474,18 +1536,19 @@ def _vbws_request(beam_width_array: list[int] | None,
 @pytest.mark.parametrize(
     "beam_width_array, expected",
     [
-        # Widening: index is (iteration - 1), clamped at both ends.
+        # Index is (iteration - 1), clamped at both ends.
         ([2, 3, 4], [2, 2, 3, 4]),
-        # Narrowing: beams are dropped as decoding proceeds.
-        ([4, 3, 2], [4, 4, 3, 2]),
+        ([2, 2, 4], [2, 2, 2, 4]),
     ],
-    ids=["widening", "narrowing"],
+    ids=["widening", "flat_then_widening"],
 )
 def test_vbws_beam_width_by_iter_follows_array(beam_width_array: list[int],
                                                expected: list[int]):
     """get_beam_width_by_iter walks beam_width_array as decoding advances.
 
-    Covers both directions: widening adds beams, narrowing drops them.
+    Only non-decreasing arrays are covered: a narrowing one is rejected at
+    admission (test_vbws_rejects_decreasing_beam_width_array), so pinning the
+    width it would walk through would be pinning unreachable behaviour.
     """
     request = _vbws_request(beam_width_array)
     actual = []
@@ -1504,11 +1567,12 @@ def test_vbws_beam_width_by_iter_follows_array(beam_width_array: list[int],
 def test_vbws_beam_width_by_iter_clamps_past_array_end():
     """Decoding longer than beam_width_array must hold the last width.
 
-    Regression test for the C++ formula, which clamps the iteration index with
-    the global kMaxBeamWidthArrayLength (assuming a padded array) and therefore
-    reads past the end of the raw user array, returning garbage. The Python
-    override clamps with the actual array length instead; see
-    LlmRequest.get_beam_width_by_iter.
+    The C++ formula used to clamp the iteration index with the global
+    kMaxBeamWidthArrayLength (assuming a padded array), reading past the end of
+    the raw user array and returning garbage; llmRequest.cpp now clamps with the
+    array's own length. This pins the Python override, which clamps the same way
+    and is kept so callers do not bind to a prebuilt library from before that
+    fix; see LlmRequest.get_beam_width_by_iter.
     """
     beam_width_array = [2, 3, 4]
     request = _vbws_request(beam_width_array)
@@ -1571,16 +1635,34 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     step. Reject at admission instead of emitting silently stale beams.
     """
 
-    # Mirrors the check in PyExecutor._validate_request.
-    def is_accepted(array: list[int]) -> bool:
-        return not any(b < a for a, b in zip(array, array[1:]))
-
-    assert is_accepted(beam_width_array) == accepted
-
     request = _vbws_request(beam_width_array)
     # The request itself is still constructible; admission is what rejects it,
     # and py_beam_width is the array maximum either way.
     assert request.py_beam_width == max(beam_width_array)
+
+    # Drive the real admission check rather than a local re-implementation:
+    # _validate_request only reads self.max_beam_width, so a stub carrying it
+    # is enough to reach the beam_width_array branch without standing up an
+    # executor. A test that mirrored the predicate would keep passing if the
+    # production check were deleted.
+    # Everything _validate_request touches besides the beam checks runs after
+    # them and needs a live engine/sampler, so stub those two out; the beam
+    # width and beam_width_array branches are reached with the real code.
+    executor = types.SimpleNamespace(
+        max_beam_width=request.py_beam_width,
+        _validate_token_id_range=lambda _request: None,
+        sampler=types.SimpleNamespace(validate_request=lambda _request: None),
+    )
+    validate = functools.partial(
+        PyExecutor._validate_request,
+        executor,  # type: ignore[arg-type]  # stub: only max_beam_width is read
+    )
+
+    if accepted:
+        validate(request)
+    else:
+        with pytest.raises(ValueError, match="decreases"):
+            validate(request)
 
 
 def test_beam_strategy_grouping_key_tolerates_trailing_fields():

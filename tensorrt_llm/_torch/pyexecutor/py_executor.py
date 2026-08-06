@@ -5010,6 +5010,22 @@ class PyExecutor:
                         "only non-decreasing arrays are supported for "
                         "Variable-Beam-Width-Search.")
 
+            # length_penalty is an exponent on the generated length, and the
+            # ranking assumes it only ever shrinks the magnitude of a negative
+            # cum_log_prob. A negative exponent inverts that: dividing by
+            # length**negative multiplies instead, so longer beams score
+            # higher and the beam order is reversed.
+            length_penalty = sampling_config.length_penalty
+            if length_penalty is not None:
+                if isinstance(length_penalty, (list, tuple)):
+                    invalid = [p for p in length_penalty if p < 0]
+                else:
+                    invalid = [length_penalty] if length_penalty < 0 else []
+                if invalid:
+                    raise ValueError(
+                        f"length_penalty {invalid} is negative; only "
+                        "non-negative values are supported.")
+
             # Beam search keeps a pool of finished candidates, which the
             # context server can already populate on its first step. That pool
             # is not part of the disaggregated handoff (ContextPhaseParams
@@ -6496,11 +6512,10 @@ class PyExecutor:
                               dtype=cum_log_probs.dtype)
         cum_log_probs[seq_slot, :beam_width].copy_(values)
 
-        # The handoff carries one token already produced upstream. The
-        # per-beam generated-length counter is reset to zero when the request
-        # is admitted here, so seed it to 1: length_penalty normalizes by this
-        # counter, and leaving it at zero would divide by one less than the
-        # true length for the whole request.
+        # The handoff carries one token already produced upstream, seeded above
+        # at index prompt_len. No generated-length counter needs seeding to
+        # match: length_penalty normalizes by seq_lens - prompt_lens, which
+        # counts that token because it occupies the first generated slot.
         return True
 
     @staticmethod

@@ -38,8 +38,11 @@ from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
     beam_search_sampling_batch_cba,
 )
 
-# These op wrappers are safe to import without flashinfer installed; they are
-# only called on the flashinfer sampler / speculative-worker paths.
+# These op wrappers are safe to import without flashinfer installed; each one
+# resolves the flashinfer symbol only when called. Most are reached only on the
+# flashinfer sampler / speculative-worker paths, but radix_topk_op also backs
+# beam search's wide-row top-k, which guards on IS_FLASHINFER_AVAILABLE and
+# falls back to torch.topk (see beam_search._beam_topk).
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     sampling_from_probs_op,
     sanitize_top_k,
