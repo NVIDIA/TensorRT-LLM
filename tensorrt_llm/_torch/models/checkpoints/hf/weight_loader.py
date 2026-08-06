@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import json
 import multiprocessing
 import os
 import threading
@@ -232,12 +233,12 @@ class HfWeightLoader(BaseWeightLoader):
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):
             return False
-        try:
-            import json
-            with open(config_path) as f:
-                model_type = json.load(f).get("model_type")
-        except (OSError, ValueError):
-            return False
+        # Do not swallow read/parse failures: every rank must take the same
+        # branch here (the non-Kimi path enqueues collectives), so a
+        # rank-local transient error routing one rank differently would
+        # deadlock the job. Propagating fails fast on all ranks instead.
+        with open(config_path) as f:
+            model_type = json.load(f).get("model_type")
         return model_type in ("kimi_k3", "kimi_linear")
 
     def _load_lazy_safetensors(self, checkpoint_dir: str) -> dict[str, Any]:

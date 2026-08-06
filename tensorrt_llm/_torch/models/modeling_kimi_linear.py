@@ -1056,6 +1056,9 @@ class KimiKDARuntime(nn.Module):
         self._A_log_f32 = mixer.A_log.detach().float().contiguous()
         self._dt_bias_f32 = mixer.dt_bias.detach().float().contiguous()
         self._onorm_w_f32 = mixer.o_norm.weight.detach().float().contiguous()
+        # Build the fused-verify conv constants eagerly too, so the first
+        # verify call never allocates (a capture-unsafe lazy allocation).
+        self._get_mtp_conv_weights()
 
     def finalize_decode_weights_fp8(self) -> None:
         """FP8 counterpart of ``finalize_decode_weights()``.
@@ -1604,6 +1607,15 @@ class KimiKDARuntime(nn.Module):
         computed once per runtime instance."""
         cached = getattr(self, "_mtp_conv_weights", None)
         if cached is None:
+            if torch.cuda.is_current_stream_capturing():
+                # Allocating inside CUDA graph capture would bake
+                # capture-pool pointers into the cached tuple; the constants
+                # are normally prebuilt by _build_decode_kernel_constants().
+                raise RuntimeError(
+                    "Kimi K3 fused-verify conv weights were not prebuilt "
+                    "before CUDA graph capture; call finalize_decode_weights"
+                    "() / finalize_decode_weights_fp8() after weight load."
+                )
             mixer = self.mixer
             cached = tuple(
                 conv.weight.detach().squeeze(1).float().contiguous()
@@ -2465,7 +2477,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # open -> copy -> close (unmap) -> fadvise(DONTNEED).
         ckpt_dir = getattr(self.model_config.pretrained_config, "_name_or_path", None)
         index_path = os.path.join(ckpt_dir or "", "model.safetensors.index.json")
-        if expert_jobs and os.path.isfile(index_path):
+        if expert_jobs and ckpt_dir and os.path.isfile(index_path):
             import json as _json
             from contextlib import ExitStack
 

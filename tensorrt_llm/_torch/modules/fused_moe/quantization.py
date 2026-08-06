@@ -5916,6 +5916,11 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                     self.BLOCK_SCALES_DTYPE).reshape(orig_w2_int32_shape))
 
 
+# Serializes the duplicate-check + slot-claim step of
+# ``load_packed_mxfp4_expert`` across the loader thread pool.
+_PACKED_MXFP4_SLOT_CLAIM_LOCK = threading.Lock()
+
+
 class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     weight_dtype = torch.uint8
     block_scales_dtype = torch.uint8
@@ -6272,10 +6277,20 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                     f"{name} must contain packed MXFP4 uint8 data, got "
                     f"{value.dtype}.")
 
-        loaded_slots = getattr(module, "_packed_mxfp4_loaded_slots", set())
-        if local_slot_id in loaded_slots:
-            raise ValueError(
-                f"Packed MXFP4 local slot {local_slot_id} was loaded twice.")
+        # Callers stream experts from a thread pool, so the duplicate check
+        # and slot claim must be one atomic step. The slot is claimed BEFORE
+        # the loaders run: a failed load leaves the destination buffer
+        # partially transformed, and a retry must not transform it again.
+        with _PACKED_MXFP4_SLOT_CLAIM_LOCK:
+            loaded_slots = getattr(module, "_packed_mxfp4_loaded_slots", None)
+            if loaded_slots is None:
+                loaded_slots = set()
+                module._packed_mxfp4_loaded_slots = loaded_slots
+            if local_slot_id in loaded_slots:
+                raise ValueError(
+                    f"Packed MXFP4 local slot {local_slot_id} was loaded twice."
+                )
+            loaded_slots.add(local_slot_id)
 
         self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
                                       module.w3_w1_weight.data[local_slot_id])
@@ -6286,9 +6301,6 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             module.w3_w1_weight_scale.data[local_slot_id])
         self.load_expert_w2_weight_scale_mxfp4(
             module, w2_weight_scale, module.w2_weight_scale.data[local_slot_id])
-
-        loaded_slots.add(local_slot_id)
-        module._packed_mxfp4_loaded_slots = loaded_slots
 
 
 class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
