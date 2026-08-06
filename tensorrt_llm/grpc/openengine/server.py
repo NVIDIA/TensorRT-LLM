@@ -3,6 +3,9 @@
 
 """OpenEngine gRPC server lifecycle for TensorRT-LLM."""
 
+import asyncio
+import signal
+
 import grpc
 import uvloop
 from openengine.v1 import openengine_pb2_grpc
@@ -74,9 +77,23 @@ def launch_server(host: str, port: int) -> None:
 
     async def serve() -> None:
         server = OpenEngineServer(host=host, port=port)
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def signal_handler() -> None:
+            logger.info("Received shutdown signal")
+            stop_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
         try:
+            logger.warning(
+                "OpenEngine protocol support is a stub: no model is loaded and "
+                "all RPCs return UNIMPLEMENTED."
+            )
             await server.start()
-            await server.wait_for_termination()
+            await stop_event.wait()
         finally:
             await server.stop()
 
