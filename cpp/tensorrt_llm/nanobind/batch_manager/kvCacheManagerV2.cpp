@@ -1406,7 +1406,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 // Contract: callers must keep the KvCache alive and must not mutate/resize it
                 // while using this view. The view is intended for read-only use, matching the
                 // practical use of Python's array.array/memoryview index buffers.
-                // TODO(yaoy): switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
+                // TODO: switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
                 // or nb::memoryview for nanobind >= 2.12.0.
                 return nb::ndarray<nb::numpy, int const, nb::ndim<1>>(
                     span.ptr, {static_cast<size_t>(span.len)}, nb::handle());
@@ -1521,6 +1521,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::make_tuple(std::move(counts.raw()), std::move(unscheduledEvictable.raw()));
         },
         nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("committed_page_is_linked", &kv::KvCacheIntrospection::committedPageIsLinked,
+        nb::arg("kv_cache"), nb::arg("ordinal"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
@@ -1609,8 +1611,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     // Returns (num_tokens, pages) where pages[i] is None for a block with no page in
-    // this lifecycle, else (slot_id, num_tokens_in_block) with num_tokens_in_block = -1
-    // for a non-SSM (attention) page.
+    // this lifecycle, else (slot_id, num_tokens_in_block).
     mIntrospection.def(
         "reuse_match_pages",
         [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId, bool enablePartial)
@@ -1627,17 +1628,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 pages.reserve(matchResult.blocks.stdSize());
                 for (auto* block : matchResult.blocks)
                 {
-                    auto* page = block->storage.at(lc);
+                    auto* page = block->getPage(lc);
                     if (page == nullptr)
                     {
                         pages.emplace_back(std::nullopt);
                         continue;
                     }
-                    int const slotId = page->slotId().value();
-                    int numTokensInBlock = -1;
-                    if (auto* ssm = dynamic_cast<kv::SsmCommittedPage*>(page))
-                        numTokensInBlock = ssm->numTokensInBlock;
-                    pages.emplace_back(std::make_pair(slotId, numTokensInBlock));
+                    pages.emplace_back(std::make_pair(page->slotId().value(), page->numTokensInBlock));
                 }
             }
             return std::make_tuple(numTokens, std::move(pages));

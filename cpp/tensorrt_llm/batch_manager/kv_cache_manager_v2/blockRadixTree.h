@@ -234,6 +234,31 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
         return storage[lcIdx];
     }
 
+    // Return the page's recorded token count, or zero if the slot is empty. For attention
+    // this is prefix coverage; for SSM it is an exact checkpoint position.
+    // Mirrors Python's Block.page_coverage().
+    int pageCoverage(LifeCycleId lcIdx) const;
+
+    // True when `page` currently occupies its lifecycle's slot in this block.
+    // Mirrors Python's Block.holds_page().
+    bool holdsPage(CommittedPage const& page) const;
+
+    // Whether a page recording `numTokensInBlock` may take over slot `lcIdx`. A slot
+    // keeps only the page with the largest recorded token count; for SSM that means only
+    // the latest checkpoint, and a rare second endpoint in one block is a reuse miss.
+    // Pure; use replacePage() to install. Mirrors Python's Block.can_replace_page().
+    bool canReplacePage(LifeCycleId lcIdx, int numTokensInBlock) const;
+
+    // Install `page` in slot `lcIdx`, detaching whatever it supersedes. The superseded
+    // page may outlive this call while a request still holds it, so unlinkPage() must
+    // clear its back-pointer — releasePages() walks `storage` and would never see it.
+    // Mirrors Python's Block.replace_page().
+    void replacePage(LifeCycleId lcIdx, CommittedPage* page);
+
+    // Move `other`'s pages into this block without changing their recorded token counts.
+    // Mirrors Python's Block._adopt_pages_from().
+    void adoptPagesFrom(Block& other);
+
     // Clear stale tree nodes after a lifecycle page has been unlinked.
     // Returns detached blocks that must stay alive until cleanup completes.
     static std::vector<SharedPtr<Block>> clearStaleBlocksAfterPageUnlink(

@@ -106,7 +106,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `kv_cache_config.block_reuse_policy` | `Literal['all_reusable', 'per_request', 'per_conversation']` | `categorical` |  | `all_reusable`, `per_request`, `per_conversation` |
+| `kv_cache_config.block_reuse_config.block_reuse_policy` | `Literal['all_reusable', 'per_request', 'per_conversation']` | `categorical` |  | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import numpy as np
+import pytest
 
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
@@ -26,6 +27,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPoolGroup,
     PoolView,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_buffer_entries():

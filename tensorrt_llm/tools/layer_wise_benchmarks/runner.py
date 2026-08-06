@@ -614,6 +614,26 @@ class Runner:
             sparse_metadata_params=sparse_metadata_params,
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
+        # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
+        # serving the executor announces that via update_spec_dec_param(), the only
+        # place max_draft_tokens is set. Without it the DSA indexer's context_lens
+        # buffer stays one column wide and DeepGEMM aborts on the next_n mismatch.
+        # Shapes only -- spec-dec masking stays off.
+        #
+        # Gate on kv_lens_cuda_2d, not on the method: update_spec_dec_param() is on
+        # the base metadata class, so hasattr() would let every backend in, and the
+        # base sets max_total_draft_tokens unconditionally -- which reaches the
+        # attention op cache key and FMHA kernel selection. kv_lens_cuda_2d exists
+        # only on DSA metadata, which is the backend that needs this.
+        if run_type == "GEN" and seq_len_q > 1 and hasattr(attn_metadata, "kv_lens_cuda_2d"):
+            attn_metadata.update_spec_dec_param(
+                batch_size=batch_size,
+                is_spec_decoding_enabled=False,
+                is_spec_dec_tree=False,
+                is_spec_dec_dynamic_tree=False,
+                max_draft_len=seq_len_q - 1,
+                max_total_draft_tokens=seq_len_q - 1,
+            )
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(
