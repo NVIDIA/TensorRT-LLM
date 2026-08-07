@@ -416,6 +416,12 @@ def chat_response_post_processor(
                                   tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
+        if disaggregated_params is not None and args.chat_template_kwargs:
+            # Relay the mode we resolved from the rendered prompt; the
+            # generation worker never renders and so cannot resolve it.
+            resolved = args.chat_template_kwargs.get("enable_thinking")
+            if resolved is not None:
+                disaggregated_params.resolved_thinking = resolved
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
