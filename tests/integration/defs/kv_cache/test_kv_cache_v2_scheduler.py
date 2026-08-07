@@ -119,6 +119,25 @@ _EVICT_HOST_CACHE_SIZE = 32 * 1024 * 1024  # 32 MiB
 _EVICT_MAX_BATCH_SIZE = 12
 
 
+@pytest.fixture
+def trace_executor_loop(monkeypatch):
+    """Line-trace the PyExecutor event loop to stdout for one test only.
+
+    Both tests using this fixture are unwaived flaky failures (nvbugs 6428002
+    and 6462303) whose only symptom in CI is "Test terminated unexpectedly" --
+    the session dies with no indication of where. ``TLLM_TRACE_EXECUTOR_LOOP``
+    makes ``trace_func`` (tensorrt_llm/_utils.py) print every executed line of
+    the event loop, so the last line before the process dies pinpoints the hang.
+
+    The tracing overhead is very large, so this is opted into per test rather
+    than set for the module or the stage. ``monkeypatch`` restores the
+    environment afterwards, keeping the rest of the session unaffected; the
+    value is read when the executor starts, i.e. after ``LLM()`` is built here,
+    and is inherited by the spawned MPI workers.
+    """
+    monkeypatch.setenv("TLLM_TRACE_EXECUTOR_LOOP", "ALL")
+
+
 def _assert_all_completed(outputs, expected_count=None):
     """Assert all outputs have non-empty generated text."""
     if expected_count is not None:
@@ -247,7 +266,8 @@ class TestKVCacheV2Llama:
         self._compare(SHORT_PROMPTS, max_num_tokens=64)
 
     # Chunked prefill — V2 matches V1
-    def test_chunked_prefill(self):
+    # Traced while nvbugs 6428002 ("Test terminated unexpectedly") is open.
+    def test_chunked_prefill(self, trace_executor_loop):
         self._compare([LONG_PROMPT], max_tokens=64, enable_chunked_prefill=True, max_num_tokens=128)
 
     # Chunked prefill multi-request — V2 matches V1
@@ -319,7 +339,8 @@ class TestKVCacheV2Llama:
         )
 
     # Eviction + block reuse — V2 matches V1
-    def test_eviction_with_block_reuse(self):
+    # Traced while nvbugs 6462303 ("Test terminated unexpectedly") is open.
+    def test_eviction_with_block_reuse(self, trace_executor_loop):
         _run_eviction_test(
             self.MODEL_PATH,
             EVICTION_PROMPTS_SHORT,
