@@ -2453,20 +2453,20 @@ def _create_kv_cache_manager(
                 "MTP path")
             use_replay = False
 
-        # Replay is opt-in because its end-to-end benefit is workload-dependent.
+        # Replay is enabled by default for eligible GDN MTP workloads.
         if not is_gdn_replay_enabled():
-            logger.info("GDN replay kernel is disabled; set "
-                        "TRTLLM_USE_GDN_REPLAY=1 to enable it")
             use_replay = False
 
-        # Upstream GDN replay commits all local layer checkpoints through the
-        # contiguous C++ manager state view. V2 exposes per-layer state views,
-        # so enabling the same path there would fail for partitioned batches.
-        if (use_replay and issubclass(kv_cache_manager_cls,
-                                      MambaHybridCacheManagerV2)):
-            logger.info(
-                "GDN replay is not supported by MambaHybridCacheManagerV2; "
-                "using the legacy MTP path")
+        # GDN replay supports the contiguous C++ V1 state pool and the indirect
+        # per-layer state views exposed by V2. Mixed/Python does not expose an
+        # all-layer commit, so keep that manager but use non-replay MTP.
+        replay_manager_types = (CppMambaHybridCacheManager,
+                                MambaHybridCacheManagerV2)
+        if use_replay and not issubclass(kv_cache_manager_cls,
+                                         replay_manager_types):
+            logger.info("GDN replay requires C++ V1 or V2 Mamba cache manager; "
+                        f"{kv_cache_manager_cls.__name__} was selected, so the "
+                        "non-replay MTP path will be used")
             use_replay = False
         logger.info("GDN replay state update: " +
                     ("ENABLED" if use_replay else "DISABLED"))
@@ -2637,17 +2637,31 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
+# Model types whose disaggregated attention-DP path has been measured against
+# the ADP dummy fixes. The gate stays an explicit list rather than a capability
+# check (``enable_attention_dp and kv_cache_transceiver is not None``) so that
+# each entry is added only after its disagg ADP behavior has been exercised.
+_ADP_DUMMY_FIX_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+
+
 def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
                                        mapping: Mapping) -> bool:
-    """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
-    return model_type == "deepseek_v4" and not mapping.has_pp()
+    """Gate the ADP dummy fixes while PP remains follow-up scope."""
+    return model_type in _ADP_DUMMY_FIX_MODEL_TYPES and not mapping.has_pp()
 
 
 def should_enable_dsv4_overlap_headroom(
         model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
         mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
-    return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
+    """Gate extra sequence slots to the validated DSv4 MTP overlap path.
+
+    Deliberately NOT routed through ``should_enable_dsv4_adp_dummy_fixes``.
+    That gate now covers more model types, while this one doubles
+    ``max_num_sequences`` (see ``compute_max_num_sequences``) and therefore
+    changes the memory envelope; it must stay pinned to the one path it was
+    measured on.
+    """
+    return (model_type == "deepseek_v4" and not mapping.has_pp()
             and spec_config is not None
             and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
             and not disable_overlap_scheduler)
