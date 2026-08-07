@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import bisect
 import contextlib
 from dataclasses import dataclass
@@ -681,6 +684,9 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -1821,6 +1827,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph,
                                   pool=self.memory_pool,
                                   capture_error_mode="thread_local"):
