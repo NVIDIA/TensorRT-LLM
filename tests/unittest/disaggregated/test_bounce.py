@@ -104,9 +104,9 @@ class TestSizing:
         cfg = bcfg.Config()
         assert isinstance(cfg.sizing, bcfg.FixedSizing)
         assert cfg.chunk_mb == 32
-        # The operative gate is the byte one; the legacy block gate defaults to 1 (vacuous).
+        # Byte gate for recurrent-state payloads; block gate for plain-KV payloads.
         assert cfg.min_bytes == bcfg.DEFAULT_MIN_BYTES == 2 * _MIB
-        assert cfg.min_blocks == 1
+        assert cfg.min_blocks == 96
 
 
 # --------------------------------------------------------------------------- #
@@ -132,21 +132,21 @@ class TestConfigFromSize:
         assert bcfg.config_from_size(2048).min_bytes == 1  # env override
         assert bcfg.config_from_size(2048, min_bytes=250).min_bytes == 250  # arg beats env
 
-    def test_min_blocks_backcompat_defaults_and_overrides(self, monkeypatch):
-        # The legacy block-count gate is kept for back-compat; it defaults to 1 (vacuous, so the
-        # byte gate decides) and still honors the explicit arg and the env override.
+    def test_min_blocks_defaults_and_overrides(self, monkeypatch):
+        # The block-count gate (plain-KV payloads) keeps its original default of 96 and honors
+        # the explicit arg and the env override.
         monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
-        assert bcfg.config_from_size(2048).min_blocks == 1  # keeps the Config default
+        assert bcfg.config_from_size(2048).min_blocks == 96  # keeps the Config default
         assert bcfg.config_from_size(2048, 250).min_blocks == 250  # explicit arg still overrides
-        monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "96")
-        assert bcfg.config_from_size(2048).min_blocks == 96  # env override
+        monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "48")
+        assert bcfg.config_from_size(2048).min_blocks == 48  # env override
         assert bcfg.config_from_size(2048, 250).min_blocks == 250  # explicit arg beats env
 
     @pytest.mark.parametrize(
         "env,attr,default",
         [
             ("TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES", "min_bytes", 2 * _MIB),
-            ("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "min_blocks", 1),
+            ("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "min_blocks", 96),
         ],
     )
     def test_gate_env_is_parsed_defensively(self, monkeypatch, env, attr, default):
@@ -408,31 +408,37 @@ class TestFanInReserve:
         assert t.reserve(req, num_writers=1) is True
 
     def test_reserve_below_min_bytes_falls_back(self, monkeypatch):
-        # The gate is in BYTES: 4 blocks x 100B = 400B < 1000B falls back, regardless of how many
-        # blocks that is (the old block-count gate silently skipped huge small-block transfers).
+        # Recurrent-state payloads gate on BYTES: 4 blocks x 100B + 100B state = 500B < 1000B
+        # falls back, regardless of how many blocks that is.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
         req = _recv_req([4])
-        assert t.reserve(req, num_writers=1) is False
+        assert t.reserve(req, num_writers=1, extra_bytes=100) is False
         assert req.bounce_dst_base is None
 
     def test_reserve_at_min_bytes_bounces(self, monkeypatch):
-        # exactly at the threshold (10 x 100B = 1000B >= 1000B) the transfer bounces
+        # exactly at the threshold (9 x 100B + 100B state = 1000B >= 1000B) the transfer bounces
         t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
-        req = _recv_req([10])
-        assert t.reserve(req, num_writers=1) is True
+        req = _recv_req([9])
+        assert t.reserve(req, num_writers=1, extra_bytes=100) is True
         assert req.bounce_dst_base == 0x100000
 
-    def test_reserve_few_large_blocks_bounce(self, monkeypatch):
-        # The K3 regression shape: FEW but LARGE blocks must clear a byte gate that a block-count
-        # gate of 96 would have silently failed (67 blocks x 6.5 MiB = 433 MiB).
+    def test_reserve_recurrent_payload_ignores_block_gate(self, monkeypatch):
+        # The K3 regression shape: FEW but LARGE blocks plus recurrent state must clear the byte
+        # gate even though a block-count gate of 96 fails (67 blocks x 6.5 MiB = 433 MiB).
         t = _make_transport(
-            monkeypatch, block_bytes_per_group=[int(6.5 * _MIB)], min_bytes=2 * _MIB
+            monkeypatch,
+            block_bytes_per_group=[int(6.5 * _MIB)],
+            min_bytes=2 * _MIB,
+            min_blocks=96,
         )
-        assert t.reserve(_recv_req([67]), num_writers=1) is True
+        assert t.reserve(_recv_req([67]), num_writers=1, extra_bytes=1024) is True
 
-    def test_reserve_legacy_min_blocks_backcompat(self, monkeypatch):
-        # the legacy block-count gate still applies when raised explicitly (back-compat)
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_blocks=96)
+    def test_reserve_plain_kv_uses_block_gate(self, monkeypatch):
+        # Plain-KV payloads (no recurrent state) keep the original block-count gate, and the byte
+        # gate does not apply to them (96 x 100B = 9600B passes despite min_bytes far above it).
+        t = _make_transport(
+            monkeypatch, block_bytes_per_group=[100], min_blocks=96, min_bytes=1 << 20
+        )
         assert t.reserve(_recv_req([4]), num_writers=1) is False  # 4 < 96 blocks
         assert t.reserve(_recv_req([96]), num_writers=1) is True
 

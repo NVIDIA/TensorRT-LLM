@@ -117,8 +117,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
-                # Size 0 turns bounce off; the byte-size gate is internal (tuned via env:
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES, plus the legacy ..._MIN_BLOCKS).
+                # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
+                # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
             )
         )

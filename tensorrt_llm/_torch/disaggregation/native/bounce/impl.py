@@ -96,7 +96,7 @@ class VmmBounceTransport(BounceTransport):
         phys_chunk_size: int,
         block_bytes_per_group: List[int],
         min_bytes: int = DEFAULT_MIN_BYTES,
-        min_blocks: int = 1,
+        min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
         name: str = "kv_bounce",
     ):
@@ -104,9 +104,10 @@ class VmmBounceTransport(BounceTransport):
         self._device_id = device_id
         # The byte size of one cache block, listed for each attention layer group.
         self._block_bytes_per_group = list(block_bytes_per_group)
-        # Below this many bytes, skip bounce: coalescing only pays off once the transfer is large
-        # enough to beat the gather+scatter overhead (see config.DEFAULT_MIN_BYTES for the
-        # rationale). min_blocks is the legacy block-count gate, vacuous at its default of 1.
+        # Size gates below which bounce is skipped: coalescing only pays off once the transfer is
+        # large enough to beat the gather+scatter overhead (see config.DEFAULT_MIN_BYTES for the
+        # rationale). min_bytes applies to payloads carrying recurrent (mamba/KDA) state;
+        # min_blocks applies to plain-KV payloads (see the gate in reserve()).
         self._min_bytes = min_bytes
         self._min_blocks = min_blocks
         # how long an orphaned region is held out of reuse; must outlast the worst in-flight write
@@ -263,20 +264,28 @@ class VmmBounceTransport(BounceTransport):
             return self._skip_bounce(
                 f"computed transfer size {total} <= 0", warn_key="kv-bounce-nonpositive-size"
             )
-        # The size gate is expressed in BYTES: the cost it guards (falling back to the slow
-        # per-fragment path) scales with bytes, not blocks, and blocks vary ~20x in size across
-        # models. min_blocks is the legacy gate, vacuous by default.
+        # Which size gate applies depends on the payload. Payloads carrying recurrent (mamba/KDA)
+        # state gate on BYTES: the cost the gate guards (falling back to the slow per-fragment
+        # path) scales with bytes, and a block count is meaningless for the non-paged state (the
+        # Kimi-K3 regression: a 433 MiB transfer of 67 small blocks plus KDA state failed a
+        # 96-block gate and fell onto the ~0.4 GB/s host-staged path). Plain-KV payloads keep the
+        # original block-count gate so pre-existing bounce deployments (opted in via
+        # kv_cache_bounce_size_mb) see no change in which transfers use the arena.
+        # TODO(TRTLLM followup, ticket to be filed): investigate whether the byte-only gate is
+        # safe (or better) for plain-KV payloads too, so this special case can be removed and
+        # both payload kinds share one gate.
         nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
-        if total < self._min_bytes:
+        if extra_bytes > 0:
+            if total < self._min_bytes:
+                return self._skip_bounce(
+                    f"{total}B ({nblocks} blocks + recurrent state) < min {self._min_bytes}B "
+                    f"(too small; tune TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES)",
+                    warn_key="kv-bounce-below-min-bytes",
+                )
+        elif nblocks < self._min_blocks:
             return self._skip_bounce(
-                f"{total}B ({nblocks} blocks) < min {self._min_bytes}B (too small; tune "
-                f"TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES)",
-                warn_key="kv-bounce-below-min-bytes",
-            )
-        if nblocks < self._min_blocks:
-            return self._skip_bounce(
-                f"{nblocks} blocks < min {self._min_blocks} (too small; legacy "
-                f"TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS gate)",
+                f"{nblocks} blocks < min {self._min_blocks} (too small; tune "
+                f"TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS)",
                 warn_key="kv-bounce-below-min-blocks",
             )
         if num_writers > 1 and total % num_writers != 0:
