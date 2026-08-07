@@ -200,6 +200,9 @@ def append_mla_latent_cache_generation_cuda_graph_safe(
                                                   num_ctx:num_ctx + n_gen, 0]
     encoded = block_table.gather(1, block_slot)  # [n_gen, q_len]
     # Placeholder entries are negative; clamp so warmup rows stay in bounds.
+    # TODO(TRTLLM-15199): clamping to block 0 means a padded/warmup row
+    # scatters into a real request's block 0. Exclude invalid rows (or
+    # reserve a scratch block) instead of clamping.
     dest_block = encoded.to(
         torch.int64).clamp_(min=0) // (num_pool_layers * kv_factor)
     src = latent_cache.to(kv_cache.dtype).reshape(n_gen, q_len,
