@@ -264,6 +264,20 @@ def _pick_dsl_expand(
     return factor, eff
 
 
+def build_req_idx_per_token(seq_lens: torch.Tensor,
+                            num_tokens: int) -> torch.Tensor:
+    """Map each flattened-batch token to its request index.
+
+    Capture-safe device counterpart of prepare_for_indices_conversion()'s
+    host repeat_interleave; right=True keeps zero-length rows equivalent.
+    """
+    cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+    token_idx = torch.arange(num_tokens,
+                             device=seq_lens.device,
+                             dtype=torch.int32)
+    return torch.searchsorted(cu_seq_lens, token_idx, right=True)
+
+
 def _compute_slot_mappings(
     global_positions: torch.Tensor,
     block_offsets: torch.Tensor,
@@ -831,13 +845,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if not self.in_mtp_draft_loop:
             self.shared_topk_indices = None
 
+        # prepare()'s map is stale once the draft loop rewrites seq_lens.
+        # Unconditional so subclasses (DeepSeek-V4) can reuse the buffer.
+        if self.num_tokens > 0:
+            self.req_idx_per_token[:self.num_tokens] = build_req_idx_per_token(
+                self.seq_lens_cuda[:self.num_seqs],
+                self.num_tokens).to(self.req_idx_per_token.dtype)
+
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
 
-            # Reuse request-per-token mapping prepared in metadata.prepare().
-            # This avoids repeat_interleave in graph-capture mode.
             req_indices = self.req_idx_per_token[:self.num_tokens].to(
                 dtype=torch.int64)
             seq_starts = torch.cumsum(

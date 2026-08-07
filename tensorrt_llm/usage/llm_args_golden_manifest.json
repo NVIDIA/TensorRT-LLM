@@ -522,6 +522,16 @@
     {
       "allowed_values": [
         "auto",
+        "trtllm"
+      ],
+      "annotation": "Literal['auto', 'trtllm']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "generation_config"
+    },
+    {
+      "allowed_values": [
+        "auto",
         "rw",
         "ro"
       ],
