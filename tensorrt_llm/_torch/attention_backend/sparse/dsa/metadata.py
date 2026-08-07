@@ -299,6 +299,33 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             return self.kv_cache_manager.max_seq_len
         return max(1, self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
 
+    def warmup_top_k(self, next_n: int) -> None:
+        """Warm up the configured decode Top-K implementation."""
+        sparse_params = self.sparse_metadata_params
+        use_gvr = sparse_params.enable_heuristic_topk and get_sm_version() >= 100
+        if use_gvr:
+            if self.use_cute_dsl_topk:
+                # The regular eager attention warmup compiles CuTe DSL GVR.
+                return
+            from tensorrt_llm._torch.custom_ops.cpp_custom_ops import warmup_cuda_gvr_topk_decode
+
+            warmup_cuda_gvr_topk_decode(top_k=self.num_sparse_topk)
+            return
+
+        if not self.use_cute_dsl_topk or (self._indexer_compress_ratio > 1 and next_n > 1):
+            return
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            warmup_cute_dsl_radix_topk_decode,
+        )
+
+        warmup_cute_dsl_radix_topk_decode(
+            top_k=self.num_sparse_topk,
+            num_cols=self.get_indexer_max_seq_len(),
+            next_n=next_n,
+            dtype=torch.float32,
+            num_sms=self.num_sms,
+        )
+
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.

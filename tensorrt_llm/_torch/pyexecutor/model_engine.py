@@ -1507,6 +1507,13 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
+    def _warmup_sparse_top_k(self) -> None:
+        """Warm up DSA Top-K kernels before any model forward or graph capture."""
+        from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
+
+        if isinstance(self.attn_metadata, DSAtrtllmAttentionMetadata):
+            self.attn_metadata.warmup_top_k(1 + self.original_max_draft_len)
+
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
         every 32-aligned batch bucket the runtime can produce.

@@ -122,6 +122,64 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata._tokens_per_block == 64
 
 
+@pytest.mark.parametrize(
+    "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,expected",
+    [
+        (True, False, 100, 1, 1, "cuda_gvr"),
+        (True, True, 100, 1, 1, None),
+        (False, True, 100, 1, 1, "cute_dsl_radix"),
+        (True, True, 90, 1, 1, "cute_dsl_radix"),
+        (False, True, 100, 4, 2, None),
+        (False, False, 100, 1, 1, None),
+    ],
+)
+def test_metadata_warmup_top_k_dispatches_configured_implementation(
+    enable_heuristic,
+    use_cute_dsl,
+    sm_version,
+    compress_ratio,
+    next_n,
+    expected,
+):
+    metadata = SimpleNamespace(
+        sparse_metadata_params=SimpleNamespace(enable_heuristic_topk=enable_heuristic),
+        use_cute_dsl_topk=use_cute_dsl,
+        num_sparse_topk=512,
+        _indexer_compress_ratio=compress_ratio,
+        get_indexer_max_seq_len=Mock(return_value=32768),
+        num_sms=148,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(
+            "tensorrt_llm._torch.custom_ops.cpp_custom_ops.warmup_cuda_gvr_topk_decode"
+        ) as cuda_gvr,
+        patch(
+            "tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops.warmup_cute_dsl_radix_topk_decode"
+        ) as cute_dsl_radix,
+    ):
+        DSAtrtllmAttentionMetadata.warmup_top_k(metadata, next_n)
+
+    if expected == "cuda_gvr":
+        cuda_gvr.assert_called_once_with(top_k=512)
+    else:
+        cuda_gvr.assert_not_called()
+    if expected == "cute_dsl_radix":
+        cute_dsl_radix.assert_called_once_with(
+            top_k=512,
+            num_cols=32768,
+            next_n=next_n,
+            dtype=torch.float32,
+            num_sms=148,
+        )
+    else:
+        cute_dsl_radix.assert_not_called()
+
+
 def test_shared_topk_lifecycle():
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=1,
