@@ -3542,6 +3542,15 @@ class PyExecutor:
 
         uses_async_gen_transfer = self._uses_async_disagg_gen_transfer()
 
+        # A synchronous GEN receive is rank-local and blocking. One rank can
+        # still be receiving while another is idle, so entering either the
+        # generation or context progress collective here is unsafe. The
+        # gen-only-no-context benchmark skips KV transfer entirely, so its
+        # ranks remain aligned and may safely poll context progress.
+        if (not uses_async_gen_transfer
+                and not self._is_disagg_gen_only_no_context_benchmark()):
+            return
+
         local_need_gen_check = (uses_async_gen_transfer and local_needs_progress
                                 and wait_for_disagg_gen_transfer_progress)
 
@@ -3562,8 +3571,8 @@ class PyExecutor:
         if any_need_check > 0:
             if local_need_ctx_check and not all_gen_first:
                 logger.warning(
-                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                )
+                    "Executor is idle or no disaggregated generation request "
+                    "fits; waiting for context KV cache transfer progress")
                 # Local conditions warrant a blocking wait for at least one
                 # in-flight transfer to complete so KV blocks can be freed.
                 self._check_disagg_ctx_cache_transfer_status(1)

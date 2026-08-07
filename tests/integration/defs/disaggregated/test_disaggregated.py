@@ -47,6 +47,8 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
+MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
+
 
 @dataclass
 class TestConfig:
@@ -1074,7 +1076,7 @@ def _verify_mamba_bs1_concurrency2(server_url: str) -> None:
 
         async def send(session: aiohttp.ClientSession, prompt: str) -> None:
             payload = {
-                "model": "NVIDIA-Nemotron-Nano-9B-v2",
+                "model": MAMBA_BS1_CONCURRENCY2_MODEL,
                 "prompt": prompt,
                 "max_tokens": 16,
                 "temperature": 0,
@@ -1097,7 +1099,7 @@ def _verify_mamba_bs1_concurrency2(server_url: str) -> None:
 @pytest.mark.timeout(900)
 def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
                                               llm_venv):
-    model_path = f"{llm_models_root()}/NVIDIA-Nemotron-Nano-9B-v2"
+    model_path = f"{llm_models_root()}/{MAMBA_BS1_CONCURRENCY2_MODEL}"
     env = llm_venv._new_env.copy()
     repo_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "../../../.."))
