@@ -7904,7 +7904,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         max_draft_len = 3
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
         # The runtime forces tokens_per_block per implementation (128 MSA / 32
         # reference).
@@ -7968,8 +7968,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
             # Chat-format acceptance — the drafter's training distribution
-            # (Inferact/MiniMax-M3-EAGLE3 card: 0.839 / 3.518). Reuses the
-            # live engine and the cached dataset; ~20 s under CUDA graphs.
+            # (Inferact/MiniMax-M3-EAGLE3-GQA). Reuses the live engine and
+            # the cached dataset; ~20 s under CUDA graphs.
             questions = [
                 r["question"]
                 for r in load_dataset("gsm8k", "main", split="test")
@@ -7990,12 +7990,18 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # Published reference (Inferact/MiniMax-M3-EAGLE3 drafter card):
-            # rate 0.839, length 3.518. Our testing thresholds: rate > 0.78,
-            # length > 3.3.
+            # The GQA drafter card (Inferact/MiniMax-M3-EAGLE3-GQA) publishes
+            # MT-Bench 2.668 / 55.62% and SPEED-Bench 2.561 / 52.04% (vLLM,
+            # MXFP8 target, draft_len=3) but no chat-GSM8K figures. The head
+            # is retrained on the same data as the MHA head with only the
+            # attention changed (64 -> 4 KV heads), so the MHA-derived
+            # references (its card: rate 0.839, length 3.518) and thresholds
+            # (rate > 0.78, length > 3.3) are carried over pending
+            # calibration on the first GQA CI run.
             ref_rate, ref_length = 0.839, 3.518
-            ref_source = "the Inferact/MiniMax-M3-EAGLE3 drafter model card"
-            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
+            ref_source = ("the Inferact/MiniMax-M3-EAGLE3 (MHA) drafter "
+                          "card; provisional for the GQA head")
+            print(f"MiniMax-M3 Eagle3-GQA chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
             assert chat_rate > 0.78, \
