@@ -5870,7 +5870,18 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        # Disagg KV-transfer-error requests can transiently linger in
+        # active_requests (len > the ADP-consensus expected count) before cleanup
+        # drains them. It self-corrects and the padding below keys on the
+        # schedulable count, so warn rather than assert -- a hard assert here
+        # would crash the gen loop on every ADP rank.
+        if self.expected_num_active_requests < len(self.active_requests):
+            logger.warning_once(
+                "expected_num_active_requests "
+                f"({self.expected_num_active_requests}) < active_requests "
+                f"({len(self.active_requests)}); transient disagg-error "
+                "overshoot, continuing",
+                key="adp_dummy_active_overshoot")
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
