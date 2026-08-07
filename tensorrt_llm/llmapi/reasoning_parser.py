@@ -303,6 +303,16 @@ class DeepSeekR1Parser(BaseReasoningParser):
         out_reasoning = ""
 
         while text:
+            # If the *entire* remaining buffer is still a prefix of a tag
+            # (including a complete tag alone), wait for more input or
+            # finish(). This is the original early-hold rule and is required
+            # so a lone ``</think>`` is not flushed mid-stream when thinking
+            # is off (nano-v3). It does *not* hold free-form content.
+            if (self.reasoning_start.startswith(text)
+                    or self.reasoning_end.startswith(text)):
+                self._buffer = text
+                break
+
             if not self.in_reasoning:
                 begin_idx = text.find(self.reasoning_start)
                 if begin_idx == -1:
