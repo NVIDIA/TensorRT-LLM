@@ -142,13 +142,6 @@ uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
     return port;
 }
 
-uint16_t getIncrmentPort(uint16_t basePort, int rank, int worldSize)
-{
-    static uint16_t times = 0;
-    return basePort + rank + (times++) * worldSize;
-    // just for test
-}
-
 [[nodiscard]] nixl_mem_t NixlHelper::convert(MemoryType type)
 {
     switch (type)
@@ -434,8 +427,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         {
             TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
         }
-        auto envPort = common::getEnvNixlPort();
-        uint16_t port = envPort > 0 ? getIncrmentPort(envPort, mRank, mWorldSize) : getAvailablePort();
+        uint16_t port = getAvailablePort();
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
