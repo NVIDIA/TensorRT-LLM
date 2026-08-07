@@ -75,11 +75,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> attn_res_fwd(
     int const B = static_cast<int>(layer_residual.size(1));
     int const H = static_cast<int>(layer_residual.size(2));
     int const N = static_cast<int>(block_residual.size(0)) + 1;
-    check_attn_res_contract(N, T, B, H);
-    c10::cuda::CUDAGuard device_guard(layer_residual.device());
-
     TORCH_CHECK(layer_residual.is_cuda() && block_residual.is_cuda() && res_weight.is_cuda() && rms_weight.is_cuda(),
         "attn_res_fwd: all input tensors must be CUDA tensors");
+    // Set the device before check_attn_res_contract: is_sm100_family() reads
+    // the current device, which must match the tensors' device.
+    c10::cuda::CUDAGuard device_guard(layer_residual.device());
+    check_attn_res_contract(N, T, B, H);
+
     TORCH_CHECK(layer_residual.scalar_type() == at::kBFloat16, "attn_res_fwd: layer_residual must be bf16");
     TORCH_CHECK(block_residual.scalar_type() == at::kBFloat16, "attn_res_fwd: block_residual must be bf16");
     TORCH_CHECK(res_weight.scalar_type() == at::kBFloat16, "attn_res_fwd: res_weight must be bf16");

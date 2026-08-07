@@ -18,6 +18,13 @@ Persistent scheduler (GDNTileScheduler) with 3D tensor layout, TensorMapManager
 for per-tile TMA descriptor updates, and domain_offset+flat_divide for per-chunk
 addressing. Supports variable-length sequences via cu_seqlens.
 
+Precondition: every sequence in cu_seqlens must have length > 0. A zero-length
+sequence yields num_chunks = 0, so its scheduler tile skips the chunk loop and
+never commits the per-chunk mbarriers the other warp groups wait on (deadlock).
+The prefill runtime never produces zero-length sequences, so this is not
+checked on the device or in the launch path (cu_seqlens lives on the GPU; a
+host-side check would force a sync on the hot path).
+
 K4 chunk loop with 6 MMAs per chunk:
   MMA1: W = AB @ KS          (K-MN, K=64)
   MMA2: U = AB @ V           (K-MN, K=64)
@@ -60,6 +67,10 @@ from cutlass.cute.nvgpu.tcgen05 import Field, OperandMajorMode, OperandSource
 from cutlass.cutlass_dsl import Int32, T, dsl_user_op
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 
+# Compatibility shim, global effect: flashinfer's gated_delta_net_tile_scheduler
+# imports CuteExperimentalDSL from cutlass.cutlass_dsl, which older CUTLASS DSL
+# releases do not define. Install an inert placeholder so the import below
+# succeeds; other modules in the process see the same attribute.
 if not hasattr(_dsl_mod, "CuteExperimentalDSL"):
 
     class _DummyExperimentalDSL:
@@ -426,6 +437,20 @@ NUM_REGS_WG2 = 232
 MAX_REGS = 168
 
 try:
+    from tensorrt_llm.logger import logger as _logger
+except ImportError:  # standalone kernel use outside the full package
+    import logging as _logging
+
+    _logger = _logging.getLogger(__name__)
+
+# Monkey-patch, GLOBAL effect: CuTeDSL._get_pipeline is class-level state, so
+# every CuTe DSL kernel compiled in this process after this import (not just
+# K4) gets ptxas --uumn (unified uniform register allocation, needed here to
+# keep WG0 under its 40-register budget). The DSL exposes no per-compile
+# ptx-options hook at the cute.compile call sites, hence the patch. The extra
+# flag is benign for the other kernels in this package. Idempotent: skips
+# pipelines that already carry ptx-options.
+try:
     from cutlass.cutlass_dsl.cutlass import CuTeDSL as _CuTeDSL
 
     _orig_get_pipeline = _CuTeDSL._get_pipeline
@@ -439,17 +464,23 @@ try:
                 result = result.replace("cubin-format=bin", "cubin-format=bin ptx-options='--uumn'")
                 _patch_applied = True
             else:
-                print(
-                    f"  [WARN] monkey-patch: 'cubin-format=bin' not found in pipeline: {result[:200]}"
+                _logger.warning(
+                    f"k4_persistent ptx-options patch: 'cubin-format=bin' not found "
+                    f"in pipeline: {result[:200]}"
                 )
         elif result and "ptx-options=" in result:
-            print("  [INFO] monkey-patch: ptx-options already present")
+            _logger.debug("k4_persistent ptx-options patch: ptx-options already present")
             _patch_applied = True
         return result
 
     _CuTeDSL._get_pipeline = _patched_get_pipeline
+# Workaround for a CuTe DSL parser bug: the nvidia-cutlass-dsl 4.5.0 AST
+# preprocessor cannot parse tuple except handlers anywhere in a kernel
+# module ("'Tuple' object has no attribute 'id'"), which breaks every
+# cute.compile of this file. Keep a single bare Exception until the DSL
+# pin moves past the bug.
 except Exception as e:
-    print(f"  [WARN] monkey-patch failed: {e}")
+    _logger.warning(f"k4_persistent ptx-options patch failed: {e}")
     _patch_applied = False
 
 
@@ -1453,7 +1484,6 @@ def make_host_fn(num_sm=148):
             o_out,
             tm_workspace,
             scheduler_params,
-        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True,
-                 stream=stream)
+        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True, stream=stream)
 
     return host_fn
