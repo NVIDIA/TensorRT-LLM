@@ -235,7 +235,7 @@ class MockVisualGen:
         seeds request params from this, so it must return a fresh instance."""
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        return VisualGenParams()
+        return VisualGenParams(**self.executor.default_generation_params)
 
     @property
     def extra_param_specs(self):
@@ -806,6 +806,31 @@ class TestImageEdit:
         assert body["output_format"] == "webp"
         assert body["size"] == "4x4"
         assert len(body["data"]) == 2
+
+    @pytest.mark.parametrize(
+        ("size", "expected_dimensions"),
+        [
+            ("auto", (None, None)),
+            ("32x48", (32, 48)),
+        ],
+    )
+    def test_image_edit_auto_size_allows_reference_size_derivation(
+        self, tmp_path, monkeypatch, size, expected_dimensions
+    ):
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "use reference dimensions",
+                "image": _b64_white_png_1x1(),
+                "size": size,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert (gen.last_params.width, gen.last_params.height) == expected_dimensions
 
     def test_image_edit_default_url_returns_fetchable_output(self, tmp_path, monkeypatch):
         """The default edit response writes a fetchable image content URL."""
