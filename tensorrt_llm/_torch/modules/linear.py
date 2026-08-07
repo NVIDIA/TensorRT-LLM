@@ -3663,11 +3663,16 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
-            lora_result = self.lora(input, lora_params, layer_idx)
-            if lora_result is not None:
-                output = output + lora_result
+            output = LoraLayer.forward_with_base(
+                lambda: self.quant_method.apply(self, input, bias),
+                (self.lora, ),
+                input,
+                lora_params,
+                layer_idx,
+            )
+        else:
+            output = self.quant_method.apply(self, input, bias)
         return output
 
     def apply_linear_allreduce(self,
