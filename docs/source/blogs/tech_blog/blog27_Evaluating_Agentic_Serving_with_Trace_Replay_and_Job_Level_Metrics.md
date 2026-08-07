@@ -44,43 +44,13 @@ Because a single agent job runs for minutes, both are measured over a steady-sta
 
 ## Trace Format
 
-Each agent run produces one compact JSON file holding an ordered `events` list. Because token content does not affect serving performance, a trace records only structure and sizes, never the underlying text. The listing below is the opening of the Coder trace `matplotlib__matplotlib-23412`, which ships with the repository as a ready-to-run example:
-
-```json
-{
-  "trace_id": "ee41c788-de9a-451c-8d9d-696cdb4b9c2b",
-  "events": [
-    { "event_type": "message", "role": "system", "conversation_id": 0,
-      "message_index": 0, "system_prompt_id": "c124a9b6-...", "tokens": 2827 },
-    { "event_type": "message", "role": "user", "conversation_id": 0,
-      "message_index": 1, "tokens": 1493 },
-    { "event_type": "message", "role": "assistant", "conversation_id": 0,
-      "message_index": 2, "tool_calls": ["read_file"], "prompt_tokens": 4320,
-      "completion_tokens": 176, "reasoning_tokens": 55, "finish_reason": "tool_calls" },
-    { "event_type": "tool_call", "tool_name": "read_file",
-      "tool_call_id": "tooluse_hc5n...", "duration_ms": 152.8 },
-    { "event_type": "message", "role": "tool", "conversation_id": 0,
-      "message_index": 3, "tokens": 306 },
-    ...
-  ]
-}
-```
+Each agent run produces one compact JSON file holding an ordered `events` list. Because token content does not affect serving performance, a trace records only structure and sizes, never the underlying text.
 
 Every event is one of three kinds: a **`message`** (one conversation turn, with role, conversation membership, token counts, and — for assistant turns — prompt/completion/reasoning token splits and issued tool calls), a **`tool_call`** (tool name plus measured `duration_ms`), or a **`parallel_start`/`parallel_end`** boundary marking fan-out and synchronization of concurrent branches. A `system_prompt_id` marks which messages share a cacheable prefix, so replay reproduces prefix-cache behavior faithfully.
 
 ## Implementation
 
-Tracing attaches to an existing Scaffolding agent with two decorators — no change to the agent's logic:
-
-```python
-from tensorrt_llm.scaffolding import with_execution_tracing, tokenize_trace_scope
-
-if enable_tracing:
-    coder_type = with_execution_tracing(coder_name)(coder_type)
-    coder_type = tokenize_trace_scope()(coder_type)
-```
-
-The example agents already wire this up behind a flag, so collecting a trace is one CLI switch (`--enable_tracing`). Replay then follows a few fixed rules: each call keeps its recorded ISL/OSL but is filled with random token IDs; all replay copies share the same synthetic system-prompt prefix, so prefix caching is exercised rather than bypassed; tool calls become timed sleeps of the recorded duration; and concurrency is created by replaying many copies of the same trace at once. Internally, the `ReplayEngine` runs one queue per branch path so parallel sections and join points run concurrently rather than serialized.
+Tracing attaches to an existing Scaffolding agent through two decorators, with no change to the agent's own logic; the example agents already wire this up behind a flag, so collecting a trace is one CLI switch. Replay then follows a few fixed rules: each call keeps its recorded ISL/OSL but is filled with random token IDs; all replay copies share the same synthetic system-prompt prefix, so prefix caching is exercised rather than bypassed; tool calls become timed sleeps of the recorded duration; and concurrency is created by replaying many copies of the same trace at once. Internally, the `ReplayEngine` runs one queue per branch path so parallel sections and join points run concurrently rather than serialized.
 
 A bundled example trace replays against any running `trtllm-serve` endpoint; the runnable scripts and their usage live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
@@ -170,8 +140,11 @@ Fan-out also makes the serving behavior harder to reason about in general. A sin
 - **Trace-and-replay makes agentic serving measurable.** Recording each agent run once and replaying it structure-faithfully preserves the behaviors fixed-shape benchmarks miss — prefix reuse, tool-call gaps, and parallel branching — and job-level Pareto metrics report serving performance as completed work: jobs per hour per user and per GPU.
 - **Token-level and job-level metrics can disagree** on both the best parallel strategy and the best batch size; only the job-level view follows the end-to-end latency a user actually experiences.
 - **Prefix caching sets the ceiling for multi-turn serving.** The hit rate holds at its optimum until the cache overflows, then job-level throughput drops in lockstep with it; host offloading (`kv_cache_config.host_cache_size`) pushes the cliff back.
-- **Configure batch size by branching structure**: near B = C for single-branch agents, B several times C for fan-out agents. Fan-out widens the configuration space and makes a good setting harder to find, which is precisely where reproducible replay pays off.
+- **Configure batch size by branching structure**: near B = C for single-branch agents, B several times C for fan-out agents.
+- **Fan-out makes serving performance harder to reason about.** A session no longer maps to one in-flight request, so the load the server sees swings with how many branches are open; the best configuration leaves the B = C diagonal and moves with the branching structure, widening the search space and making a good setting hard to find by intuition. This is precisely where reproducible replay pays off.
 
 ## Future Work
 
-Agent workloads keep changing, and with them the shapes that reach the serving system. We will continue to track the workload characteristics of real agentic scenarios, so that our performance optimizations land where they matter in real deployments.
+Agent workloads keep changing, and with them the shapes that reach the serving system: agent architectures evolve, context-management strategies such as compaction alter how much prefix survives across turns, and tool usage shifts the balance between waiting and computing. Any of these can move where the bottleneck sits, and a configuration tuned for today's traces may not hold for tomorrow's.
+
+We will therefore continue to track the workload characteristics of real agentic scenarios — extending the trace dataset as new agent patterns appear and re-measuring the job-level behavior they produce — so that our performance optimizations are driven by what deployments actually run, and land where they matter in the real world.
