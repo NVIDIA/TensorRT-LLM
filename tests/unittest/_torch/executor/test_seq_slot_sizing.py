@@ -22,8 +22,10 @@ import pytest
 from tensorrt_llm._torch.pyexecutor._util import (
     compute_max_num_sequences,
     create_torch_sampler_args,
-    should_enable_dsv4_adp_dummy_fixes,
+    should_enable_adp_dummy_fixes,
     should_enable_dsv4_overlap_headroom,
+    should_enable_non_overlap_adp_forward_intent,
+    should_enable_scheduler_aware_adp_dummy,
 )
 from tensorrt_llm.mapping import Mapping
 
@@ -48,9 +50,6 @@ SIZING_CASES = [
         ("deepseek_v4", True, False, 1, False, False),
         ("deepseek_v4", True, True, 2, False, False),
         ("deepseek_v4", True, True, 1, True, False),
-        # The widened ADP dummy gate must not leak into the headroom gate:
-        # doubling max_num_sequences changes the memory envelope and has only
-        # been validated on the DSv4 MTP overlap path.
         ("qwen3_5_moe", True, True, 1, False, False),
     ],
 )
@@ -69,20 +68,38 @@ def test_dsv4_overlap_headroom_gate(
     )
 
 
+@pytest.mark.parametrize("pp_size,expected", [(1, True), (2, False)])
+def test_adp_dummy_fix_gate(pp_size, expected):
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    assert should_enable_adp_dummy_fixes(mapping) is expected
+
+
 @pytest.mark.parametrize(
-    "model_type,pp_size,expected",
+    "model_type,pp_size,disable_overlap,expected",
     [
-        ("deepseek_v4", 1, True),
-        ("deepseek_v3", 1, False),
-        ("deepseek_v4", 2, False),
-        ("qwen3_5_moe", 1, True),
-        ("qwen3_5_moe", 2, False),
-        ("llama", 1, False),
+        ("kimi_k2", 1, True, True),
+        ("kimi_k2", 1, False, False),
+        ("deepseek_v4", 1, False, True),
+        ("qwen3_5_moe", 1, False, True),
+        ("deepseek_v4", 2, True, False),
     ],
 )
-def test_dsv4_adp_dummy_fix_gate(model_type, pp_size, expected):
+def test_scheduler_aware_adp_dummy_scope(model_type, pp_size, disable_overlap, expected):
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
-    assert should_enable_dsv4_adp_dummy_fixes(model_type, mapping) is expected
+    assert should_enable_scheduler_aware_adp_dummy(model_type, mapping, disable_overlap) is expected
+
+
+@pytest.mark.parametrize(
+    "pp_size,disable_overlap,expected",
+    [
+        (1, True, True),
+        (1, False, False),
+        (2, True, False),
+    ],
+)
+def test_non_overlap_adp_forward_intent_scope(pp_size, disable_overlap, expected):
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    assert should_enable_non_overlap_adp_forward_intent(mapping, disable_overlap) is expected
 
 
 @pytest.mark.parametrize(

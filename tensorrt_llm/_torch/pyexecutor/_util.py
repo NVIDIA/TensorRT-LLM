@@ -2637,31 +2637,36 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
-# Model types whose disaggregated attention-DP path has been measured against
-# the ADP dummy fixes. The gate stays an explicit list rather than a capability
-# check (``enable_attention_dp and kv_cache_transceiver is not None``) so that
-# each entry is added only after its disagg ADP behavior has been exercised.
-_ADP_DUMMY_FIX_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
+    """Enable transactional ADP dummy handling while PP remains follow-up."""
+    return not mapping.has_pp()
 
 
-def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
-                                       mapping: Mapping) -> bool:
-    """Gate the ADP dummy fixes while PP remains follow-up scope."""
-    return model_type in _ADP_DUMMY_FIX_MODEL_TYPES and not mapping.has_pp()
+_VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+
+
+def should_enable_scheduler_aware_adp_dummy(
+        model_type: Optional[str], mapping: Mapping,
+        disable_overlap_scheduler: bool) -> bool:
+    """Enable scheduler-aware padding for validated lifecycle configurations."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and (disable_overlap_scheduler
+                 or model_type in _VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES))
+
+
+def should_enable_non_overlap_adp_forward_intent(
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Enable fresh cross-rank dummy intent for the generic non-overlap path."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and disable_overlap_scheduler)
 
 
 def should_enable_dsv4_overlap_headroom(
         model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
         mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to the validated DSv4 MTP overlap path.
-
-    Deliberately NOT routed through ``should_enable_dsv4_adp_dummy_fixes``.
-    That gate now covers more model types, while this one doubles
-    ``max_num_sequences`` (see ``compute_max_num_sequences``) and therefore
-    changes the memory envelope; it must stay pinned to the one path it was
-    measured on.
-    """
-    return (model_type == "deepseek_v4" and not mapping.has_pp()
+    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
+    return (model_type == "deepseek_v4"
+            and should_enable_adp_dummy_fixes(mapping)
             and spec_config is not None
             and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
             and not disable_overlap_scheduler)
@@ -2990,8 +2995,12 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
-        mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
+        mb_scheduler = BindMicroBatchScheduler(
+            max_batch_size,
+            max_num_tokens,
+            ctx_chunk_config,
+            no_schedule_until_state=no_schedule_until_state,
+        )
 
         reorder_policy_config = llm_args.reorder_policy_config
         if reorder_policy_config is not None:

@@ -360,8 +360,10 @@ class PyTorchModelEngine(ModelEngine):
         # Start with the established pool size. Once the model is loaded we
         # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
         from ._util import (compute_max_num_sequences,
-                            should_enable_dsv4_adp_dummy_fixes,
-                            should_enable_dsv4_overlap_headroom)
+                            should_enable_adp_dummy_fixes,
+                            should_enable_dsv4_overlap_headroom,
+                            should_enable_non_overlap_adp_forward_intent,
+                            should_enable_scheduler_aware_adp_dummy)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping, self.batch_size, llm_args.disable_overlap_scheduler)
         self.dist = dist
@@ -447,11 +449,16 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        # Keep the scheduler/dummy fix model-scoped, while the larger slot pool
-        # is restricted to the validated MTP overlap configuration. PP remains
-        # on its established path for follow-up changes.
-        self._enable_dsv4_adp_dummy_fixes = (should_enable_dsv4_adp_dummy_fixes(
-            model_type, mapping))
+        # Apply transactional dummy handling to every non-PP disaggregated ADP
+        # model. The larger slot pool remains restricted to the validated
+        # DeepSeek-V4 MTP overlap configuration.
+        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
+        self._enable_scheduler_aware_adp_dummy = (
+            should_enable_scheduler_aware_adp_dummy(
+                model_type, mapping, llm_args.disable_overlap_scheduler))
+        self._enable_non_overlap_adp_forward_intent = (
+            should_enable_non_overlap_adp_forward_intent(
+                mapping, llm_args.disable_overlap_scheduler))
         self._enable_dsv4_overlap_headroom = (
             should_enable_dsv4_overlap_headroom(
                 model_type, spec_config, mapping,

@@ -216,6 +216,25 @@ class ScheduledRequests:
 
 
 class RequestScheduler(ABC):
+    @property
+    @abstractmethod
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        """Return the half-open state range admitted to a forward batch."""
+        raise NotImplementedError
+
+    def is_request_in_schedulable_state(self, request: LlmRequest) -> bool:
+        """Return whether request state permits admission to a forward batch."""
+        if is_decoder_context_request_waiting_for_encoder_output(request):
+            return False
+        if request.state in (
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        ):
+            return False
+        schedule_from, schedule_to = self.scheduling_state_range
+        return schedule_from.value <= request.state_value < schedule_to.value
+
     @abstractmethod
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -392,10 +411,14 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
@@ -403,7 +426,12 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
 
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config_cpp, max_num_tokens)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config=ctx_chunk_config_cpp,
+            max_context_length=max_num_tokens,
+            no_schedule_until_state=no_schedule_until_state,
+            no_schedule_after_state=no_schedule_after_state,
+        )
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -426,6 +454,13 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
+        )
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -1865,6 +1900,13 @@ class SimpleUnifiedScheduler(RequestScheduler):
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config,
             no_schedule_until_state=no_schedule_until_state,
+        )
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
         )
 
     def schedule_request(
