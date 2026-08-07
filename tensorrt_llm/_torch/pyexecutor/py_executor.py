@@ -155,6 +155,14 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# How many executor iterations between KV pool rebalance checks.  The V2
+# auto-tuner rate-limits itself to one adjustment per 120s, so a check every
+# iteration is pure overhead -- and under TP each check costs a broadcast (see
+# PyExecutor._agreed_need_adjustment).  At typical iteration times this adds a
+# fraction of a second of latency to a rebalance that happens at most twice a
+# minute, while cutting the collective rate by an order of magnitude.
+KV_POOL_REBALANCE_CHECK_INTERVAL = 10
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -580,6 +588,10 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
+        # Iteration throttle for the KV pool rebalance check.  See
+        # _can_pause_for_rebalance / _agreed_need_adjustment.
+        self._rebalance_check_interval = KV_POOL_REBALANCE_CHECK_INTERVAL
+        self._rebalance_check_counter = 0
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -4364,9 +4376,17 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the v1 hook supports.
 
-        MVP scope: single-GPU aggregated, no in-flight disagg transfer,
+        MVP scope: no pipeline parallelism, no in-flight disagg transfer,
         no beam search, no drafter, not during warmup or shutdown.
         Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
+
+        Every condition below must be rank-uniform, because a ``True`` here is
+        what puts a TP rank into ``_agreed_need_adjustment``'s collective, and
+        ranks entering that collective on different iterations would deadlock.
+        The config checks are identical by construction; ``is_warmup`` and
+        ``is_shutdown`` are phase flags the executor loop already has to keep in
+        lockstep for the many other per-iteration collectives it runs, so
+        relying on them here adds no new requirement.
         """
         if not self.enable_kv_pool_rebalance:
             return False
@@ -4382,7 +4402,50 @@ class PyExecutor:
             return False
         if self.drafter is not None:
             return False
+
+        # Throttle the check itself.  Rebalance is rate-limited to once per
+        # 120s by the V2 auto-tuner's own cooldown, so polling every iteration
+        # buys nothing and costs a collective per iteration in the TP case
+        # (see _agreed_need_adjustment).  At typical iteration times this
+        # delays a rebalance by a couple of seconds at most.
+        self._rebalance_check_counter += 1
+        if self._rebalance_check_counter < self._rebalance_check_interval:
+            return False
+        self._rebalance_check_counter = 0
         return True
+
+    def _agreed_need_adjustment(self) -> bool:
+        """Decide whether to rebalance, identically on every TP rank.
+
+        Every input to ``need_adjustment`` is a deterministic function of the
+        request stream -- the sample counters and the moving averages that
+        produce the target ratios are all fed from request-derived values with
+        no randomness -- **except** the 120s cooldown, which compares against a
+        per-rank ``steady_clock`` reading (``kvCacheManager.cpp:855``, stamped
+        per rank at ``:126`` and ``:873``).
+
+        Two TP ranks can therefore straddle the cooldown boundary on different
+        iterations and rebalance one iteration apart.  That window is enough to
+        break TP: ``_prepare_and_schedule_batch`` runs ``_schedule()`` on every
+        rank independently with no broadcast, so ranks holding different pool
+        geometry can admit different requests and issue mismatched collectives.
+
+        So rank 0 of the TP group decides and broadcasts.  Only the *trigger*
+        needs agreement -- the resulting ratios do not, because they are pure
+        functions of statistics that are already identical across TP ranks, and
+        those statistics keep being maintained on every rank regardless (they
+        are updated from the KvCache close path, not from this read).
+
+        Attention DP is excluded for the same reason the scheduler's own
+        ``tp_broadcast`` excludes it: ADP ranks own independent request streams
+        and independent KV caches, so they legitimately need different pool
+        ratios at different times.  Forcing rank 0's decision on them would
+        starve a rank that needs to rebalance when rank 0 does not.
+        """
+        need = self.kv_cache_manager.impl.need_adjustment
+        if self.dist.tp_size == 1 or self.enable_attention_dp:
+            return need
+        return self.dist.tp_broadcast(need, root=0)
 
     def _consume_previous_batch_for_rebalance(self) -> None:
         """Drain ``previous_batch`` so its _KVCache instances are quiescent.
@@ -4423,7 +4486,7 @@ class PyExecutor:
         uses today after eviction.
         """
         mgr = self.kv_cache_manager
-        if not mgr.impl.need_adjustment:
+        if not self._agreed_need_adjustment():
             return
 
         torch.cuda.current_stream().synchronize()
