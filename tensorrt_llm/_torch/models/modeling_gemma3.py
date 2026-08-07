@@ -285,6 +285,21 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        return {
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
+            },
+        }
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config=None,
+    ):
+        return "PYTHON"
+
     def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
         device = image_token_mask.device
         sequence_length = len(image_token_mask)

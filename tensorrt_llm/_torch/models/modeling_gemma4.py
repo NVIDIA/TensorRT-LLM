@@ -1259,7 +1259,17 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """
         return {
             "attn_backend": "FLASHINFER",
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
+            },
         }
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config=None,
+    ):
+        return "PYTHON"
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.
