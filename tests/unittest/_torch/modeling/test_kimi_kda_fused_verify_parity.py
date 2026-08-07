@@ -96,19 +96,14 @@ def _make_runtime(seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for name, p in rt.named_parameters():
         if name.endswith("A_log"):
-            p.copy_(
-                torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5
-            )
+            p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5)
         elif name.endswith("dt_bias"):
-            p.copy_(
-                torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1
-            )
+            p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1)
         else:
             p.copy_(
-                (
-                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32)
-                    * 0.03
-                ).to(p.dtype)
+                (torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.03).to(
+                    p.dtype
+                )
             )
     return rt
 
