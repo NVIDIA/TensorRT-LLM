@@ -4063,5 +4063,15 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
         )
 
 
+def test_gemma4_model_defaults_select_v2():
+    defaults = Gemma4ForCausalLM.get_model_defaults(object())
+    assert defaults["attn_backend"] == "FLASHINFER"
+    assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+
+
+def test_gemma4_prefers_python_transceiver():
+    assert Gemma4ForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
 if __name__ == "__main__":
     unittest.main()
