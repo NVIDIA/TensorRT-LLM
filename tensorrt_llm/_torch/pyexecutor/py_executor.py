@@ -3354,8 +3354,7 @@ class PyExecutor:
                 self._check_disagg_ctx_cache_transfer_status(0)
 
     def _sync_gen_only_benchmark_has_insufficient_kv(
-            self,
-            fitting_disagg_gen_init_requests: List[LlmRequest]) -> bool:
+            self, fitting_disagg_gen_init_requests: List[LlmRequest]) -> bool:
         """Return whether benchmark fill has terminal KV exhaustion.
 
         Model-parallel ranks can make different local scheduling decisions.

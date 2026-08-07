@@ -27,11 +27,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.scheduler import (
-    FCFSWaitingQueue,
-    ScheduledRequests,
-    SerializableSchedulerOutput,
-)
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
 
