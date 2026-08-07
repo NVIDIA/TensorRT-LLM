@@ -121,3 +121,8 @@ tests/integration/defs/stress_test/artifacts/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
 .claude/settings.json
+
+# Kimi K3 eval harness per-job runtime configs
+# (run_eval_kimi_k3.sbatch --parallel tep and --dflash rewrites)
+examples/kimi_k3/.eval_tep_runtime.*.yaml
+examples/kimi_k3/.eval_dflash_runtime.*.yaml

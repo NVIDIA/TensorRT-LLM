@@ -228,7 +228,14 @@ esac
 # default mode the batch bump also rewrites the YAML's own max_batch_size and
 # the nested cuda_graph_config max_batch_size so graph coverage follows.
 if [[ "$PARALLEL" == tep ]]; then
+    # The per-job copy must live under $REPO: that is the only path guaranteed
+    # to be container-mounted at the same location on every rank
+    # ($SLURM_SUBMIT_DIR only coincides with it by default, and a node-local
+    # mktemp file would be invisible to the other nodes). Removed when this
+    # batch script exits; also gitignored in case the job dies before the
+    # trap fires.
     TEP_CONFIG=$REPO/examples/kimi_k3/.eval_tep_runtime.$SLURM_JOB_ID.yaml
+    trap 'rm -f "$TEP_CONFIG"' EXIT
     if [[ "$MODE" == default ]]; then
         MAX_BATCH_SIZE=128
         sed -e 's/^enable_attention_dp: true$/enable_attention_dp: false/' \

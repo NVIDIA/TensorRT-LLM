@@ -48,6 +48,7 @@ from ...inputs import (
     MultimodalPlaceholderPlacement,
     register_input_processor,
 )
+from ...logger import logger  # noqa: E402
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
@@ -76,9 +77,6 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
-
-from ...logger import logger  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Native MoonViT3d Vision Encoder Components (K3 deltas)
@@ -142,7 +140,12 @@ class K3EncoderLayer(nn.Module):
         super().__init__()
         # Reference uses torch.nn.RMSNorm(hidden_dim) with default eps for the
         # per-layer norms; match it exactly (created in fp32, cast with the rest
-        # of the vision tower to the model dtype in load_weights()).
+        # of the vision tower to the model dtype in load_weights()). NOTE:
+        # eps=None resolves at *runtime* to torch.finfo(input.dtype).eps
+        # (~7.8e-3 for bf16 vs ~1.2e-7 for fp32), so exact parity with the
+        # reference holds only while both towers run in the same dtype (bf16
+        # today). If the vision tower dtype ever changes, pin eps explicitly on
+        # both sides together. Same applies to final_layernorm below.
         self.norm0 = nn.RMSNorm(hidden_dim)
         self.norm1 = nn.RMSNorm(hidden_dim)
         # head_dim is taken from model_config.pretrained_config.head_dim, which
@@ -204,6 +207,8 @@ class K3MoonViT3dEncoder(MoonViT3dEncoder):
                 for layer_idx in range(num_layers)
             ]
         )
+        # Default-eps RMSNorm to match the reference; the eps value is
+        # runtime-dtype-dependent — see the note on K3EncoderLayer.norm0.
         self.final_layernorm = nn.RMSNorm(hidden_dim)
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         self.attn_metadata: Optional[AttentionMetadata] = None
@@ -223,13 +228,14 @@ class PatchMergerMLPV2(nn.Module):
         model_config: ModelConfig,
         mm_hidden_size: int,
         text_hidden_size: int,
+        num_heads: int,
         merge_kernel_size: Tuple[int, int] = (2, 2),
         ln_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         kh, kw = merge_kernel_size
         self.merged_dim = mm_hidden_size * kh * kw
-        mapping = _get_vision_tp_mapping(model_config)
+        mapping = _get_vision_tp_mapping(model_config, num_heads)
         self.proj = nn.Sequential(
             Linear(
                 self.merged_dim,
@@ -292,13 +298,28 @@ class KimiK3VisionModel(KimiK25VisionModel):
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
         )
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
+
+        # Extract vision config dict (num_heads is resolved here, with this
+        # model's default of 12 heads, because the TP-replication decision
+        # below must use the same head count the tower is built with).
+        vision_cfg = getattr(self.model_config.pretrained_config, "vision_config", {})
+        if vision_cfg is None:
+            vision_cfg = {}
+        if not isinstance(vision_cfg, dict):
+            vision_cfg = (
+                vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
+            )
+        num_heads = vision_cfg.get(
+            "vt_num_attention_heads", vision_cfg.get("num_attention_heads", 12)
+        )
+
         # The MoonViT tower cannot be tensor-parallel sharded when its attention
         # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
         # 12 heads under TP16); run the whole tower replicated (tp=1) in that
         # case so module construction and weight loading agree. Attention-DP
         # already replicates the vision tower via its own path, so leave it be.
         if not model_config.mapping.enable_attention_dp:
-            self.model_config.mapping = _get_vision_tp_mapping(model_config)
+            self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
         model_dtype = (
             getattr(pretrained_config, "torch_dtype", None)
@@ -309,19 +330,8 @@ class KimiK3VisionModel(KimiK25VisionModel):
             model_dtype = getattr(torch, model_dtype, torch.bfloat16)
         pretrained_config.torch_dtype = model_dtype
 
-        vision_cfg = getattr(pretrained_config, "vision_config", {})
-        if vision_cfg is None:
-            vision_cfg = {}
-        if not isinstance(vision_cfg, dict):
-            vision_cfg = (
-                vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
-            )
-
         hidden_dim = vision_cfg.get("vt_hidden_size", vision_cfg.get("hidden_size", 1024))
         num_layers = vision_cfg.get("vt_num_hidden_layers", vision_cfg.get("num_hidden_layers", 27))
-        num_heads = vision_cfg.get(
-            "vt_num_attention_heads", vision_cfg.get("num_attention_heads", 12)
-        )
         # K3 delta: the attention head_dim is qkv_hidden_size // num_heads (128),
         # NOT vt_hidden_size // num_heads. wqkv projects hidden_dim -> 3*qkv and
         # wo projects qkv -> hidden_dim, so q/k/v live in the qkv space.
@@ -374,6 +384,7 @@ class KimiK3VisionModel(KimiK25VisionModel):
             self.model_config,
             mm_hidden_size,
             self.text_hidden_size,
+            num_heads,
             self.merge_kernel_size,
             ln_eps,
         )
