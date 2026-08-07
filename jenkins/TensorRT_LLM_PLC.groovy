@@ -390,7 +390,7 @@ def processScanResults(ref) {
                             colWidths.corrected_license     = Math.max(colWidths.corrected_license,     entry.corrected_license.toString().length())
                             colWidths.is_nvidia_proprietary = Math.max(colWidths.is_nvidia_proprietary, entry.is_nvidia_proprietary.toString().length())
                         }
-                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 11}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
+                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 13}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
                         def rows = [sep,
                                     "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | ${'CORRECTED LICENSE'.padRight(colWidths.corrected_license)} | IS PERMISSIVE | ${'IS NV PROPRIETARY'.padRight(colWidths.is_nvidia_proprietary)} |",
                                     sep]
