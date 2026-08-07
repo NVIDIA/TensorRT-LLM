@@ -102,10 +102,13 @@ def _make_stub(transformer):
     - transformer: accessed via __dict__, so no nn.Module submodule registration
     - pipeline_config: WanPipeline.dtype reads self.pipeline_config.torch_dtype
     - rank: read-only property on BasePipeline — returns 0 when MPI is disabled
+    - _is_warmup: _denoise iterates via self._profile_denoise_steps(); setting
+      warmup mode routes it to a plain enumerate() so no profiler is required.
     """
     pipe = object.__new__(WanDMDPipeline)
     pipe.__dict__["transformer"] = transformer
     pipe.__dict__["pipeline_config"] = type("_Config", (), {"torch_dtype": torch.bfloat16})()
+    pipe.__dict__["_is_warmup"] = True
     return pipe
 
 
