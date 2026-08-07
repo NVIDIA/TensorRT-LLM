@@ -4062,21 +4062,39 @@ class PyTorchModelEngine(ModelEngine):
             getattr(request, "py_verify_cap", None)
             for request in generation_requests
         ]
+        worker = self._get_spec_worker()
+        mode = getattr(worker, "ragged_verify_mode", None) if worker else None
+        cap_accept_mode = (mode is not None and mode.computes_windows
+                           and not mode.trims_submitted_tokens)
         if not caps or any(cap is None for cap in caps):
-            # Partial caps are neither mode: drop them all, but warn, because
-            # the step then silently runs as `static`.
-            if caps and any(cap is not None for cap in caps):
-                if not getattr(self, "_warned_partial_accept_caps", False):
-                    self._warned_partial_accept_caps = True
-                    logger.warning(
-                        "DSpark cap-accept: %d of %d generation requests carry "
-                        "no verify cap, so caps were dropped for the whole "
-                        "batch and this step ran as 'static'. The mode is "
-                        "measuring nothing on steps like this one.",
-                        sum(1 for cap in caps if cap is None), len(caps))
-            spec_metadata.accept_caps = None
-            spec_metadata.accept_cap_trim = None
-            return
+            if cap_accept_mode and caps:
+                # cap-accept mode: NEVER publish None. `apply_accept_caps`
+                # reads `spec_metadata.accept_caps` as a Python attribute at
+                # CAPTURE time, so a None on the capture step (warmup batches
+                # carry no caps) bakes a no-op into the graph and every replay
+                # silently skips the clamp -- the zero-trim positive-control
+                # failure. Capless requests get the full block: numerically a
+                # no-op clamp, but the ops and buffer address stay captured.
+                caps = [
+                    self.spec_config.max_draft_len if cap is None else cap
+                    for cap in caps
+                ]
+            else:
+                # Any other mode: partial caps are meaningless; drop them all,
+                # but warn, because the step then silently runs as `static`.
+                if caps and any(cap is not None for cap in caps):
+                    if not getattr(self, "_warned_partial_accept_caps", False):
+                        self._warned_partial_accept_caps = True
+                        logger.warning(
+                            "DSpark cap-accept: %d of %d generation requests "
+                            "carry no verify cap, so caps were dropped for "
+                            "the whole batch and this step ran as 'static'. "
+                            "The mode is measuring nothing on steps like "
+                            "this one.",
+                            sum(1 for cap in caps if cap is None), len(caps))
+                spec_metadata.accept_caps = None
+                spec_metadata.accept_cap_trim = None
+                return
 
         n = len(caps)
         # Persistent buffer: acceptance runs inside the captured graph, so a
