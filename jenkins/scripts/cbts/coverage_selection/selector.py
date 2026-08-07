@@ -50,7 +50,7 @@ class CoverageResult:
     n_untrusted: int = 0
     # functions with no DB rows (new/uninstrumented); bounded per `no_data_policy`
     no_data_funcs: list[str] = field(default_factory=list)
-    # residual files the forge API returned no patch for (binary / rename / oversized)
+    # residual file the forge API returned no patch for (binary / rename / oversized); declines
     no_diff_files: list[str] = field(default_factory=list)
 
 
@@ -118,28 +118,27 @@ class CoverageSelector:
             diff = diffs.get(path) or ""
             source = self._read_source(path)
             if not diff.strip() or source is None:
-                # Patch omitted (binary / renamed / oversized): bound as import-time.
+                # Patch omitted (binary / renamed / oversized): the changed scope is unknown.
                 no_diff.append(path)
-                tests = self._underrecorded_bound(cf, "<module>")
-                if tests is None:
-                    return impacted, no_data, no_diff, f"no usable diff, no wider row set: {path}"
-                impacted |= tests
-                continue
+                return impacted, no_data, no_diff, f"no usable diff: {path}"
             lines = iter_diff_post_line_numbers(diff)
             qualnames, ok = qualnames_for_lines(source, lines)
-            if not lines or not ok:
-                # Comment-only or unparsable: no qualname to resolve, file-level bound.
+            if not ok:
+                return impacted, no_data, no_diff, f"unparsable source: {path}"
+            if not lines:
+                # Comment-only: nothing executable changed, so any set covers it.
                 impacted |= self.db.tests_touching_file(cf)
                 continue
-            # Qualnames whose rows do not record the changed code.
-            underrecorded = import_executed_qualnames(source) | closure_attributed_qualnames(
-                source, lines
-            )
+            import_executed = import_executed_qualnames(source)
+            closures = closure_attributed_qualnames(source, lines)
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
-                if qualname in underrecorded:
+                if qualname in import_executed:
+                    why = f"import-executed change, no sound bound: {path}::{qualname}"
+                    return impacted, no_data, no_diff, why
+                if qualname in closures:
                     tests = self._underrecorded_bound(cf, qualname)
                     if tests is None:
-                        why = f"under-recorded qualname, no wider row set: {path}::{qualname}"
+                        why = f"closure change, no wider row set: {path}::{qualname}"
                         return impacted, no_data, no_diff, why
                     impacted |= tests
                     continue
@@ -151,7 +150,7 @@ class CoverageSelector:
         return impacted, no_data, no_diff, None
 
     def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
-        """File row set when it is wider than an under-recorded qualname's, else None."""
+        """File row set when it is wider than a closure's enclosing qualname's, else None."""
         file_tests = self.db.tests_touching_file(cf)
         if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
             return file_tests
@@ -172,7 +171,7 @@ class CoverageSelector:
             return None
 
     def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
-        """Decide over residual files; ok=False for non-core, not-in-DB, or unbounded import-time changes."""
+        """Decide over residual files; ok=False for non-core, not-in-DB, or import-executed changes."""
         for path in residual_files:
             # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
             if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):

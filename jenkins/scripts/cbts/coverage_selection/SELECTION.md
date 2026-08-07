@@ -38,7 +38,7 @@ DB qualnames come from `co_qualname`, so they match what the AST derives (`Class
 comprehensions, lambdas and closures are skipped during collection, so those names do not exist
 in the DB at all.
 
-## 3. The three decline gates
+## 3. The decline gates
 
 `CoverageSelector.decide()` returns `ok=False` — Tier 2 stands down and the run is full — on any
 of:
@@ -47,58 +47,56 @@ of:
 |---|---|
 | Non-core file | `path` is not a `.py` under `tensorrt_llm/` (checked on the **repo path**, not `canon()`) |
 | File absent from the DB | `file_has_touch_rows(cf)` is false — new or uninstrumented, so "who touches it" is unknown rather than empty |
-| Under-recorded with no wider bound | see the next section |
+| **Import-executed change** | a changed line lands on a module body, a class body, or a signature / decorator line |
+| No usable patch | the forge API omitted the diff (binary / rename / oversized), so the changed scope is unknown |
+| Unparsable source | the AST walk failed, so lines cannot be mapped to qualnames |
+| Closure change with no wider row set | see the next section |
 
-## 4. Core: handling an under-recorded qualname
+## 4. Why import-executed changes fail closed
 
-Two kinds of qualname have DB rows that **do not cover the changed code's executions**:
+Import-phase rows are recorded only by the tests that spawn subprocesses (`../coverage_utils/COLLECTION.md`
+§5.2), so a `<module>` or `ClassName` row set is missing the tests served by MPI pool workers. Widening
+to the file's row set recovers some of them but is a **recovery heuristic, not an upper bound**: a test
+that imports the file and never enters any function in it records nothing there at all, so it is absent
+from the file set too. Measured on `llmapi/llm_args.py`, the widening goes from 509 holders to 735 while
+about 746 tests import the file — the gap does not close.
 
-| Kind | Attributed qualname | Collection-side problem |
-|---|---|---|
-| Import-time (module body / class body / signature line) | itself | only recorded by tests that spawn subprocesses; a pool worker's import precedes activation |
-| Closure | the enclosing function | **not recorded at all**; a closure can outlive the call that created it |
+Since the missing tests cannot be enumerated from the data, these changes decline outright until the
+producer records the pool workers' import phase. Ordinary function-body changes are unaffected and keep
+precise narrowing.
 
-Both go through `_underrecorded_bound(cf, qualname)`:
+### 4.1 Closures
+
+A closure body is not recorded at all, so a changed closure is attributed to its nearest recorded
+enclosing scope and put through `_underrecorded_bound(cf, qualname)`:
 
 ```
 file rows > that qualname's rows  →  use the file rows (the wider bound)
 otherwise                        →  decline, run in full
 ```
 
-### 4.1 What the comparison asks
-
-Whether falling back to file level actually recovers the tests that were missed.
-
 `tests_touching_func(f, q)` is by construction a subset of `tests_touching_file(f)`, so a strictly
-larger file set means it contains tests the qualname set does not. Those extra tests are the ones
-that recorded some *other* function in the same file — evidence that the file is exercised beyond
-import time, which is what makes the file set a usable bound. When the two are equal the file is
-only ever recorded at import time (`__init__.py` and similar, 881 of 1149 files), nothing is
-recovered, and no sound bound exists.
+larger file set contains tests the qualname set does not — tests that recorded some *other* function
+in the same file, which is what makes the file exercised beyond import time. When the two are equal
+the file is only ever recorded at import time (`__init__.py` and similar, 881 of 1149 files) and no
+bound exists.
 
-### 4.2 The bound is not complete
-
-A test that imports a file but never calls any function in it records nothing there, so even the
-file set misses it. The bound is the widest one available from the data, not a proof; eliminating
-the remainder means recording the pool workers' import phase — see
-`../coverage_utils/COLLECTION.md` §5.2.
-
-### 4.3 When no diff is available
-
-The forge API omits the patch for binary, renamed and oversized files. The changed qualname is
-then unknown, so the worst case is assumed and `<module>` is put through the same test; the count
-of such files is reported as `coverage_no_diff_files`.
+This bound carries the same incompleteness as the one removed above. It is narrower in blast radius
+(4.3% of core-Python commits touch a closure, against 82.6% for import-executed lines) but it is not
+sound either: a decorator's `wrapper` is created at import time, so the enclosing scope it attributes
+to can itself be import-only.
 
 ## 5. Full impact resolution
 
 ```
 for each residual file:
-  ├ no usable diff        → _underrecorded_bound(cf, "<module>")   bound or decline
-  ├ diff has no lines     → whole file (the change was comments only)
+  ├ no usable diff / unparsable → decline
+  ├ diff has no lines           → whole file (the change was comments only)
   └ for each changed qualname:
-       ├ import-time or closure → _underrecorded_bound(cf, q)      bound or decline
-       ├ has DB rows            → tests_touching_func(cf, q)       precise
-       └ no DB rows             → no_data_policy fallback (file by default)
+       ├ import-executed → decline
+       ├ closure         → _underrecorded_bound(cf, q)      bound or decline
+       ├ has DB rows     → tests_touching_func(cf, q)       precise
+       └ no DB rows      → no_data_policy fallback (file by default)
 ```
 
 Comments and blank lines are stripped upstream by `strip_noop_diff_lines` (`^\s*#` and empty
