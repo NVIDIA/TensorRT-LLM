@@ -138,9 +138,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
     auto permuted_token_selected_experts_tensor
         = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    auto permuted_data_tensor = torch::empty({num_moe_inputs, hidden_size}, input.options().requires_grad(false));
+    auto permuted_data_tensor = torch::empty({0, hidden_size}, input.options().requires_grad(false));
     auto permuted_token_final_scales_tensor
-        = torch::empty({num_moe_inputs}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+        = torch::empty({0}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+    if (!skip_data_expand)
+    {
+        permuted_data_tensor = torch::empty({num_moe_inputs, hidden_size}, input.options().requires_grad(false));
+        permuted_token_final_scales_tensor
+            = torch::empty({num_moe_inputs}, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+    }
     auto expert_first_token_offset_tensor = torch::empty(
         {num_experts_per_node + 1}, torch::dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
     auto unpermuted_row_to_permuted_row_tensor = torch::empty({static_cast<int64_t>(experts_per_token * num_rows)},
