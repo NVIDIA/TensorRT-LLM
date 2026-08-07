@@ -524,7 +524,7 @@ class MpiPoolSession(MpiSession):
         }
         env.update(self._env_overrides)
         isolate_workspace = (self.n_workers > 1 and env.get(
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "0") == "1"
                              and "FLASHINFER_WORKSPACE_BASE" not in env)
         python_args = ([
             "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT

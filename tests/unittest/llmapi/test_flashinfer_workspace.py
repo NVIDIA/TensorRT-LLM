@@ -151,18 +151,26 @@ def test_worker_bootstrap_warns_when_unlock_fails(
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
-        (1, {}, None),
+        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, None),
+        (4, {}, None),
         (
             4,
-            {},
+            {_FLASHINFER_ISOLATION_ENV: "1"},
             [
                 "-c",
                 mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
                 mpi_session._FLASHINFER_WORKSPACE_ROOT,
             ],
         ),
-        (4, {"TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS": "0"}, None),
-        (4, {_FLASHINFER_WORKSPACE_ENV: "/explicit"}, None),
+        (4, {_FLASHINFER_ISOLATION_ENV: "0"}, None),
+        (
+            4,
+            {
+                _FLASHINFER_ISOLATION_ENV: "1",
+                _FLASHINFER_WORKSPACE_ENV: "/explicit",
+            },
+            None,
+        ),
     ],
 )
 def test_mpi_pool_configures_worker_bootstrap(
@@ -202,6 +210,7 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+    monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "1")
     monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
     workspace_root = tmp_path / "workspaces"
     monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(workspace_root))
