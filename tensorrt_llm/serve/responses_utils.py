@@ -40,7 +40,8 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             ToolDescription, load_harmony_encoding)
 from transformers import AutoProcessor, PretrainedConfig
 
-from tensorrt_llm.bindings import steady_clock_now
+from tensorrt_llm._utils import \
+    get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
@@ -111,10 +112,6 @@ def _decode_tokens(
     if tokenizer is not None:
         return tokenizer.decode(tokens)
     return _get_encoding().decode(tokens)
-
-
-def get_steady_clock_now_in_seconds() -> float:
-    return steady_clock_now().total_seconds()
 
 
 def _parse_response_input(
