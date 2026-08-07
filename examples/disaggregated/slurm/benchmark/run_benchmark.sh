@@ -10,7 +10,9 @@ trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 # Allow the launcher config to prepend entries from inside the container.
 # The client_cmds srun passes these via --export with single-quoted values
 # (submit.py convert_envs_to_str), and srun keeps the quotes literal — strip them.
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND:-}"
 TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND#\'}"; TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND%\'}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND:-}"
 TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND#\'}"; TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND%\'}"
 if [ -n "${TRTLLM_PATH_PREPEND:-}" ]; then
     export PATH="${TRTLLM_PATH_PREPEND}:${PATH}"
