@@ -24,10 +24,17 @@ import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
 
 from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
-                                      TRTOpenaiWorker, UserMessage)
+                                      TRTLLMWorker, TRTOpenaiWorker,
+                                      UserMessage)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from llmapi.test_llm import get_model_path
+from utils.llm_data import llm_models_root
+
+
+@pytest.fixture(scope="module")
+def trtllm_model_path():
+    return llm_models_root() / "gpt_oss/gpt-oss-20b"
 
 
 @pytest.fixture(scope="module")
@@ -61,6 +68,10 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
     remote_server = RemoteOpenAIServer(model_path, args)
     yield remote_server
     remote_server.terminate()
+
+
+def create_trtllm_worker(model_path):
+    return TRTLLMWorker.init_with_new_llm(str(model_path), backend="pytorch")
 
 
 def create_trtoai_worker(model_name, async_client):
