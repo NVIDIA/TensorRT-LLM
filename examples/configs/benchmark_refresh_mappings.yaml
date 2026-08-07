@@ -10,11 +10,17 @@
 # 4. List the public TensorRT-LLM GPU names to update under gpus.
 #
 # Target fields control where generated recipe YAML files are stored in TensorRT-LLM.
-# By default, config_dir_template produces:
-#   examples/configs/database/<target.model>/<accelerator.directory>
-# filename_template then names each recipe using its ISL, OSL, GPU count,
-# concurrency, and optional latency/balanced/throughput profile. A models entry may
-# override either default under target when a model requires a different layout.
+# The defaults below are:
+# - config_dir_template: Directory where recipe files are written. {model} is
+#   target.model, {gpu} is the public GPU name, and {gpu_directory} is the directory
+#   from the matching accelerators entry. The default produces:
+#     examples/configs/database/<target.model>/<accelerator.directory>
+# - filename_template: Filename for each generated recipe. {isl_short} and
+#   {osl_short} are abbreviated sequence lengths, {num_gpus} is the GPU count,
+#   {concurrency} is the benchmark concurrency, and {profile_suffix} is empty unless
+#   latency/balanced/throughput variants are needed.
+# A models entry may override either variable under target when it requires a
+# different directory layout or filename convention.
 #
 # Adding a GPU:
 # 1. Add it to accelerators once. The key is TensorRT-LLM's public GPU name,
