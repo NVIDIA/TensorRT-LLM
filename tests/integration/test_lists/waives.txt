@@ -163,7 +163,6 @@ full:B200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpu
 full:B200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_reuse[ADP4_MTP] SKIP (https://nvbugs/6525008)
 full:B200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_reuse[TEP4] SKIP (https://nvbugs/6474894)
 full:B200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format SKIP (https://nvbugs/6525059)
-full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-deepseek_r1_v2_fp4_stress] SKIP (https://nvbugs/6472256)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-glm5_nvfp4_tp4_ep4_dp_stress] SKIP (https://nvbugs/6544407)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress] SKIP (https://nvbugs/6472256)
 full:B200/llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] SKIP (https://nvbugs/6475623)

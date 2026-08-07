@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -129,6 +129,49 @@ def scan_logs_for_fatal_errors(processes):
     return findings
 
 
+def print_first_fatal_log_context(processes, context_lines=20):
+    """Print the lines around the FIRST fatal-pattern match in each log.
+
+    The last-N-lines tail printed on failure usually shows only post-crash
+    shutdown spam ("LLM is shutting down" storms); the root cause — e.g. the
+    OOM traceback with the allocation site — is at the first match, often
+    thousands of lines earlier. Streams each log to avoid loading multi-GB
+    worker logs into memory.
+    """
+    for proc in processes:
+        log_path = getattr(proc, "log_path", None)
+        if not log_path or not os.path.exists(log_path):
+            continue
+        before = deque(maxlen=context_lines)
+        after = []
+        matched = None
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if matched is None:
+                        pat = next(
+                            (p for p in _FATAL_LOG_PATTERNS if p in line), None)
+                        if pat is None:
+                            before.append(line)
+                            continue
+                        matched = (lineno, pat)
+                        after.append(line)
+                    else:
+                        after.append(line)
+                        if len(after) > context_lines:
+                            break
+        except OSError:
+            continue
+        if matched is None:
+            continue
+        lineno, pat = matched
+        logger.error(f"-------- {log_path}: first fatal pattern '{pat}' at "
+                     f"line {lineno} (+/-{context_lines} lines) --------")
+        for line in [*before, *after]:
+            if line.strip():
+                logger.error(line.rstrip())
+
+
 def _crashed_workers(workers):
     return [
         w for w in workers
@@ -163,6 +206,20 @@ def get_default_disagg_cluster_config():
         "heartbeat_interval_sec": 1,
         "inactive_timeout_sec": 2
     }
+
+
+# Production service-discovery timings, matching the DisaggClusterConfig
+# defaults in tensorrt_llm/llmapi/disagg_utils.py. The tight 1s/2s defaults
+# above keep short functional tests snappy, but at stress-level concurrency
+# they leave <1s of heartbeat slack while the worker heartbeat task, the
+# cluster-storage /expire handler, and the expiry sweep all share event loops
+# saturated by request traffic — so workers get spuriously expired and the
+# router flaps "Cluster is not ready" (nvbugs/6472256). Stress runners must
+# use these production values instead.
+PRODUCTION_CLUSTER_TIMINGS = {
+    "heartbeat_interval_sec": 5,
+    "inactive_timeout_sec": 10,
+}
 
 
 def build_worker_config(base_config: dict[str, Any],
@@ -657,6 +714,7 @@ def setup_disagg_cluster(
     startup_callback=None,
     startup_tick: int = 30,
     perf_metrics_output_dir: str | None = None,
+    disagg_cluster_overrides: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -667,6 +725,9 @@ def setup_disagg_cluster(
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
+        disagg_cluster_overrides: Entries merged over
+            get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
+            for stress runs (cluster_uri/minimal_instances are still derived below)
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -689,6 +750,8 @@ def setup_disagg_cluster(
                 speculative_model)
 
     disagg_cluster = get_default_disagg_cluster_config()
+    if disagg_cluster_overrides:
+        disagg_cluster.update(disagg_cluster_overrides)
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
     if save_log:
@@ -2308,6 +2371,69 @@ def get_config_for_benchmark(model_root, backend):
     return serve_config
 
 
+def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
+    """Fail if the fraction of non-cancellation request errors exceeds max_error_rate.
+
+    aiperf exits 0 and counts HTTP 500s as completed requests, so without this
+    gate a mid-run server error storm (e.g. "Cluster is not ready" readiness
+    flapping, nvbugs/6472256) passes silently. Reads aiperf's per-record export
+    (profile_export.jsonl in artifact_dir), where each line carries an optional
+    "error" object with code/type/message. Intentional client-side cancellations
+    (HTTP 499 / RequestCancellationError) are excluded from both the numerator
+    and the denominator — stress tests cancel a fraction of requests on purpose.
+    """
+    export_path = os.path.join(artifact_dir, "profile_export.jsonl")
+    assert os.path.exists(export_path), (
+        f"aiperf per-record export not found at {export_path}; cannot enforce "
+        "the request error-rate gate. If this aiperf version/export level does "
+        "not produce it, pass max_error_rate=None explicitly.")
+    total = 0
+    cancelled = 0
+    # (code, type) -> [count, example message]
+    error_counts: dict[tuple, list] = {}
+    with open(export_path, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            total += 1
+            error = record.get("error")
+            if not error:
+                continue
+            code = error.get("code")
+            err_type = error.get("type")
+            if code == 499 or err_type == "RequestCancellationError":
+                cancelled += 1
+                continue
+            entry = error_counts.setdefault((code, err_type),
+                                            [0, error.get("message", "")])
+            entry[0] += 1
+    considered = total - cancelled
+    if considered <= 0:
+        return
+    errors = sum(count for count, _ in error_counts.values())
+    error_rate = errors / considered
+    print(
+        f"[aiperf-gate] non-cancellation errors: {errors}/{considered} "
+        f"({error_rate:.2%}), cancelled: {cancelled}, "
+        f"threshold: {max_error_rate:.2%}",
+        flush=True)
+    if error_rate > max_error_rate:
+        breakdown = "\n".join(
+            f"  code={code} type={err_type}: {count} (e.g. {message[:200]})"
+            for (code, err_type), (count, message) in sorted(
+                error_counts.items(), key=lambda kv: -kv[1][0]))
+        raise AssertionError(
+            f"aiperf request error rate {error_rate:.2%} exceeds threshold "
+            f"{max_error_rate:.2%} ({errors} non-cancellation errors out of "
+            f"{considered} requests; {cancelled} intentional cancellations "
+            f"excluded). Error breakdown:\n{breakdown}")
+
+
 def run_disaggregated_aiperf(config_file,
                              model_path,
                              server_start_timeout=1200,
@@ -2325,6 +2451,7 @@ def run_disaggregated_aiperf(config_file,
                              threshold=0.8,
                              cancellation_rate=None,
                              cancellation_delay=None,
+                             max_error_rate=0.05,
                              env=None,
                              cwd=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
@@ -2343,6 +2470,8 @@ def run_disaggregated_aiperf(config_file,
         random_seed: Random seed for reproducibility
         accuracy_test: Whether to run accuracy test
         threshold: Threshold for accuracy test
+        max_error_rate: Fail if the fraction of non-cancellation request
+            errors recorded by aiperf exceeds this (None disables the gate)
         env: Environment variables dict
         cwd: Working directory
     """
@@ -2354,7 +2483,8 @@ def run_disaggregated_aiperf(config_file,
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
-                             save_log=True)
+                             save_log=True,
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
@@ -2453,6 +2583,13 @@ def run_disaggregated_aiperf(config_file,
                 "Fatal error patterns detected in disaggregated worker/server "
                 f"logs:\n{summary}")
 
+        # Gate on the per-request error rate from aiperf's record export:
+        # aiperf exits 0 even when the server returns 500s for a large share
+        # of requests, so this is the only check that catches a mid-run error
+        # storm on this path (the fatal-pattern scan above is hang/OOM only).
+        if max_error_rate is not None:
+            enforce_aiperf_error_rate(artifact_dir, max_error_rate)
+
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
@@ -2489,14 +2626,17 @@ def run_disaggregated_aiperf(config_file,
                     f"worker/server logs after accuracy run:\n{summary}")
 
     except Exception:
-        # Print tail of each captured worker/server log to aid triage.
+        # Print the context around the first fatal-pattern match (the root
+        # cause, e.g. an OOM traceback) and the tail of each captured
+        # worker/server log to aid triage.
+        print_first_fatal_log_context(
+            [*ctx_workers, *gen_workers, disagg_server])
         for proc in [*ctx_workers, *gen_workers, disagg_server]:
             log_path = getattr(proc, "log_path", None)
             if not log_path or not os.path.exists(log_path):
                 continue
             logger.error(f"-------- {log_path} (last 30 lines) --------")
             try:
-                from collections import deque
                 with open(log_path, "r", errors="replace") as f:
                     for line in deque(f, maxlen=30):
                         if line.strip():
@@ -2676,13 +2816,20 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
 
-    run_disaggregated_aiperf(config_file=config_file,
-                             model_path=llama4_model_root,
-                             server_start_timeout=1200,
-                             input_tokens=128000,
-                             output_tokens=100,
-                             env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(
+        config_file=config_file,
+        model_path=llama4_model_root,
+        server_start_timeout=1200,
+        input_tokens=128000,
+        output_tokens=100,
+        # This repro intentionally degrades the KV
+        # transfer path (tiny max_tokens_in_buffer vs
+        # 128k inputs), so sporadic request errors are
+        # by-design; keep the test scoped to its
+        # original crash/fatal-log checks.
+        max_error_rate=None,
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_blackwell
@@ -3446,9 +3593,10 @@ async def _warmup_requests(server_url: str, profiles: list, count: int,
     The first request of each shape pays a one-time autotuner/compile cost
     (~20s host-steps observed on B200). Running those here, before the measured
     run, keeps them out of the accuracy/incomplete accounting and out of the
-    heartbeat-eviction path (a worker stuck in a 20s step misses the 2s cluster
-    heartbeat and gets evicted under a high-concurrency flood). Failures are
-    ignored — the only goal is to trigger the autotuner across the profile mix.
+    heartbeat-eviction path (a worker stuck in a 20s step exceeds even the 10s
+    PRODUCTION_CLUSTER_TIMINGS inactive timeout and gets evicted under a
+    high-concurrency flood). Failures are ignored — the only goal is to
+    trigger the autotuner across the profile mix.
     """
     import random
 
@@ -3523,7 +3671,8 @@ def run_disaggregated_mixed_stress(example_dir: str,
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
-                             save_log=True, startup_callback=startup_callback)
+                             save_log=True, startup_callback=startup_callback,
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
     print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
           flush=True)
 
@@ -3540,9 +3689,10 @@ def run_disaggregated_mixed_stress(example_dir: str,
         # Pay the one-time autotuner cost before the measured run. The first
         # request of each shape triggers a ~20s autotuner host-step; left in
         # the measured run at high concurrency, a worker stuck in that step
-        # misses the 2s cluster heartbeat and is evicted mid-run, causing
-        # "Cluster is not ready" 500s. Default count = ~20s at the ~6 req/s
-        # observed in the 5k B200 run; results are discarded.
+        # exceeds even the 10s PRODUCTION_CLUSTER_TIMINGS inactive timeout
+        # and is evicted mid-run, causing "Cluster is not ready" 500s.
+        # Default count = ~20s at the ~6 req/s observed in the 5k B200 run;
+        # results are discarded.
         if warmup_request_count is None:
             warmup_request_count = 120
         print(
