@@ -844,6 +844,9 @@ class MLA(nn.Module):
         self.dsv4_compressor_start_event = torch.cuda.Event()
         self.dsv4_compressor_event = torch.cuda.Event()
         self.dsv4_indexer_event = torch.cuda.Event()
+        # The hoisted fused kv-norm launch spans the whole Q branch, which itself
+        # uses ln_events on some paths, so it needs its own pair.
+        self.kv_gen_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
@@ -1065,23 +1068,116 @@ class MLA(nn.Module):
             q, self.num_heads_tp, self.qk_head_dim, float(self.q_b_layernorm.variance_epsilon)
         )
 
-    def _is_fused_q_fp8_quant_enabled(self, num_generations: int = 0) -> bool:
-        # Context-only batches: the fused path leaves a placeholder bf16 q_buf
-        # that forward_generation_sparse_mla would read uninitialized, so
-        # mixed/gen batches must take the legacy unfused path.
-        # `TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1` opts back into the legacy
-        # two-kernel Q-quant path as a kill switch.
-        if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") == "1":
-            return False
+    def _is_fused_q_fp8_quant_enabled(
+        self, num_generations: int = 0, num_contexts: int = 0
+    ) -> bool:
+        # The fused path leaves a placeholder bf16 q_buf, so consumers read the FP8
+        # buffer and `_fused_q_pe`: context takes the prefix rows, generation the
+        # suffix. A mixed batch launches once per phase over those disjoint ranges.
         if not self.is_deepseek_v4:
             return False
         if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
             return False
-        if num_generations > 0:
+        return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
+
+    def _is_fused_kv_norm_enabled(self, num_generations: int = 0) -> bool:
+        # Mirrors `_is_fused_q_fp8_quant_enabled`. Two kernels, same warp-per-row shape:
+        #   context    -> `mlaKvNormRopeQuantContextKernel`
+        #   generation -> `mlaKvNormRopeQuantGenerationKernel`
+        # Mixed batches are fine -- both read the same raw latent view.
+        if not self.is_deepseek_v4:
+            return False
+        # The kernels describe the latent row with their K_DIM/ROPE_DIM template
+        # constants, so these must be the 448/64 instantiation.
+        if self.kv_lora_rank != 448 or self.qk_rope_head_dim != 64:
+            return False
+        # V4 normalizes the whole 512-wide latent; the weight must span it.
+        if self.kv_a_layernorm.weight.shape[0] != self.kv_lora_rank + self.qk_rope_head_dim:
             return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
-    def _deepseek_v4_q_b_layernorm_fused_fp8(self, q_proj: torch.Tensor):
+    def _is_fused_prologue_active(
+        self, *, num_contexts: int, num_generations: int, rope_specs: list
+    ) -> bool:
+        # Coupled by correctness: the fused KV kernels leave the RAW latent, which the
+        # un-fused RoPE kernels' Q region would read un-normalized. Safe only because
+        # the fused Q path owns Q entirely -- so require both or neither. The Q fold in
+        # turn needs the per-phase specs, which `_fused_q_rope_specs` withholds when the
+        # metadata cannot supply ragged context positions.
+        return (
+            self._is_fused_kv_norm_enabled(num_generations=num_generations)
+            and self._is_fused_q_fp8_quant_enabled(
+                num_generations=num_generations, num_contexts=num_contexts
+            )
+            and bool(rope_specs)
+        )
+
+    def _fused_q_rope_specs(
+        self, attn_metadata: AttentionMetadata, num_contexts: int, num_generations: int
+    ):
+        """(cos_sin, specs) for the fused Q RoPE, one spec per phase in the batch.
+
+        Each spec is `(rows, cache_lens, seq_len, cu_q_seqlens)` where `rows` is the
+        row range of the batch it covers. Context rows take positions from a ragged
+        token cumsum, generation rows from a uniform query length, so one launch
+        cannot serve both -- a mixed batch yields two specs and the caller issues one
+        launch per spec over disjoint row ranges of the same output buffers.
+
+        Returns `(None, [])` when the batch does not qualify.
+        """
+        cache_lens = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+        if cache_lens is None:
+            return None, []
+
+        num_ctx_tokens = attn_metadata.num_ctx_tokens
+        num_tokens = attn_metadata.num_tokens
+        specs = []
+
+        if num_contexts > 0:
+            # Context is ragged: positions come from a token-wise cumsum, not a uniform
+            # seq_len. Deliberately NOT `ctx_uncached_token_indptr` -- it holds the same
+            # values but only exists under `enable_context_mla_with_cached_kv`, so this
+            # path would silently no-op without chunked prefill or block reuse. Paired
+            # with the cache lengths, it recovers each row's cached offset.
+            prep_ctx = getattr(attn_metadata, "mla_prepare_ctx_cu_seqlens", None)
+            if prep_ctx is None:
+                return None, []
+            cu_q_seqlens = prep_ctx()
+            if cu_q_seqlens is None:
+                return None, []
+            specs.append((slice(0, num_ctx_tokens), cache_lens[:num_contexts], 0, cu_q_seqlens))
+
+        if num_generations > 0:
+            num_gen_tokens = num_tokens - num_ctx_tokens
+            if num_gen_tokens <= 0 or num_gen_tokens % num_generations != 0:
+                return None, []
+            specs.append(
+                (
+                    slice(num_ctx_tokens, num_tokens),
+                    cache_lens[num_contexts:],
+                    num_gen_tokens // num_generations,
+                    None,
+                )
+            )
+
+        if not specs:
+            return None, []
+
+        # The table must already cover every position these rows will read.
+        ensure = getattr(self.mqa, "_ensure_rope_table_size", None)
+        if ensure is not None:
+            ensure(attn_metadata.max_seq_len)
+        cos_sin = getattr(self.mqa, "rotary_cos_sin", None)
+        if cos_sin is None:
+            return None, []
+        return cos_sin, specs
+
+    def _deepseek_v4_q_b_layernorm_fused_fp8(
+        self,
+        q_proj: torch.Tensor,
+        rope_cos_sin: Optional[torch.Tensor] = None,
+        rope_specs: Optional[list] = None,
+    ):
         # Returns (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv).
         # `placeholder_q` keeps the [num_tokens, num_heads*head_dim] bf16 layout
         # the downstream `forward_absorption_context` needs for its `q.shape[0]`
@@ -1103,16 +1199,26 @@ class MLA(nn.Module):
             (num_tokens, self.num_heads_tp * self.qk_head_dim), dtype=torch.float8_e4m3fn
         )
         q_pe = q_proj.new_empty((num_tokens, self.num_heads_tp, rope_dim))
-        torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
-            q_proj,
-            quant_q_buffer,
-            q_pe.view(num_tokens, self.num_heads_tp * rope_dim),
-            self.num_heads_tp,
-            self.qk_head_dim,
-            self.kv_lora_rank,
-            float(self.q_b_layernorm.variance_epsilon),
-            self._quant_scale_qkv,
-        )
+        q_pe_flat = q_pe.view(num_tokens, self.num_heads_tp * rope_dim)
+        # With rope inputs the kernel also rotates the rope segment into
+        # `quant_q_buffer` as FP8, leaving `q_pe` untouched. One spec per phase; the
+        # row ranges are disjoint, so launches never overlap.
+        launches = rope_specs if rope_specs else [(slice(None), None, 0, None)]
+        for rows, cache_seq_lens, seq_len, cu_q_seqlens in launches:
+            torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+                q_proj[rows],
+                quant_q_buffer[rows],
+                q_pe_flat[rows],
+                self.num_heads_tp,
+                self.qk_head_dim,
+                self.kv_lora_rank,
+                float(self.q_b_layernorm.variance_epsilon),
+                self._quant_scale_qkv,
+                rope_cos_sin,
+                cache_seq_lens,
+                seq_len,
+                cu_q_seqlens,
+            )
         # Both buffers must be live for the fused path; the downstream
         # absorption-context op switches on `quant_scale_qkv is not None`
         # to enable the C++ fusion (see trtllm.py `thop.attention` call).
@@ -1828,21 +1934,30 @@ class MLA(nn.Module):
             and self.indexer is not None
             and self.indexer_stream is not None
         )
+        # The compressor reads only hidden_states + attn_metadata, so nothing forces it
+        # to wait for the kv_a_proj -> LN -> split chain. Left inside the
+        # `maybe_execute_in_parallel` below it started ~27 us into the prologue (HCA
+        # layers, where no indexer overlap applies); pre-launching on compressor_stream
+        # runs it underneath the kv_a_proj GEMM instead.
+        _prelaunch_compressor = _use_indexer_overlap or (
+            _v4_extra_overlap and do_multi_stream() and self.compressor_stream is not None
+        )
 
-        # Pre-launch the outer compressor on compressor_stream BEFORE
-        # kv_a_proj_with_mqa. The compressor only reads hidden_states +
-        # attn_metadata, so it has no data dependency on the kv_a_proj GEMM or
-        # the downstream q_a/kv_a LN split. A dedicated stream (not aux_stream)
-        # keeps kv_a_layernorm free to run on aux_stream in parallel.
-        # _q_branch will be queued onto this same stream further down so it
-        # runs strictly serial after the compressor; dsv4_compressor_event is
-        # recorded only at the end of _q_branch, gating the caller's downstream
-        # waits on both compressor + _q_branch completion.
-        if _use_indexer_overlap:
+        # Pre-launch the outer compressor before kv_a_proj_with_mqa: it reads only
+        # hidden_states + attn_metadata, so it depends on neither the GEMM nor the
+        # q_a/kv_a LN split. A dedicated stream (not aux_stream) leaves aux_stream
+        # free for kv_a_layernorm.
+        # _q_branch is queued onto this same stream below, so it runs serially after
+        # the compressor and dsv4_compressor_event (recorded at the end of _q_branch)
+        # gates both. On HCA layers nothing follows, so the event is recorded here and
+        # joined after _q_branch.
+        if _prelaunch_compressor:
             self.dsv4_compressor_start_event.record()
             with torch.cuda.stream(self.compressor_stream):
                 self.dsv4_compressor_start_event.wait()
                 self.compressor(hidden_states, attn_metadata)
+                if not _use_indexer_overlap:
+                    self.dsv4_compressor_event.record()
 
         # Pre-launch the qr-independent half of the indexer prepare phase
         # (weights_proj + internal compressor + k_cache_update) on the
@@ -1861,16 +1976,53 @@ class MLA(nn.Module):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
         )
 
-        q, kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
+        # Fused kv-norm: the KV kernels apply kv_a_layernorm themselves, so skip the
+        # standalone RMSNorm and the concat and hand them the RAW latent.
+        # Resolved here, ahead of `_q_branch`, because the KV decision is made before
+        # the Q branch runs.
+        self._fused_q_rope_cos_sin, self._fused_q_rope_specs_cached = self._fused_q_rope_specs(
+            attn_metadata, num_contexts, num_generations
         )
+        self._fused_kv_norm_active = self._is_fused_prologue_active(
+            num_contexts=num_contexts,
+            num_generations=num_generations,
+            rope_specs=self._fused_q_rope_specs_cached,
+        )
+        self._fused_kv_norm_hoisted = False
+
+        if self._fused_kv_norm_active:
+            # Launched ahead of q_a_layernorm, not after: the KV kernel needs only the
+            # raw latent, so recording the gating event first lets the two run
+            # concurrently on their own streams. The join stays before the generation
+            # half. Pure-decode only -- with contexts the context half writes the same
+            # cache first, and decode is where the idle span exists.
+            if num_generations > 0 and num_contexts == 0:
+                self._fused_kv_norm_hoisted = self._launch_fused_kv_norm_gen(
+                    kv[num_ctx_tokens:, ...], attn_metadata
+                )
+            q = self.q_a_layernorm(q)
+        else:
+            q, kv = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(q),
+                lambda: self.kv_a_layernorm(kv),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
         compressed_kv, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
         qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        if self._fused_kv_norm_active:
+            # `kv` is already the [compressed_kv | k_pe] layout the kernels read as
+            # `fuse_buf`; the `compressed_kv`/`k_pe` views above are dead on V4 (the
+            # DSA compressor and indexer read `hidden_states`/`qr`, not the latent).
+            #
+            # It is a last-dim slice, so its row stride is q_lora_rank + 512, not 512.
+            # The kernel reads stride(0) off the tensor -- calling .contiguous() would
+            # reintroduce the copy this fusion removes.
+            assert kv.stride(-1) == 1, "fused kv-norm needs a unit-stride latent row"
+            latent_cache = kv
+        else:
+            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
         # CuTe DSL path for q_b_proj (hardware-default cluster count).
         # Restricted to DSv4 CSA layers with compress_ratio=4 so the kernel
@@ -1890,9 +2042,9 @@ class MLA(nn.Module):
             # would never apply anyway, but assert to make the contract
             # explicit and catch any future config drift).
             if _use_q_b_cute:
-                assert not self._is_fused_q_fp8_quant_enabled(num_generations=num_generations), (
-                    "CuTe DSL q_b_proj path is incompatible with the fused FP8 q-quant branch"
-                )
+                assert not self._is_fused_q_fp8_quant_enabled(
+                    num_generations=num_generations, num_contexts=num_contexts
+                ), "CuTe DSL q_b_proj path is incompatible with the fused FP8 q-quant branch"
                 q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
                 # Cross-iter cleanup: forward_absorption_* downstream gates
                 # the fused-FP8 attention path on these attrs being non-None.
@@ -1900,18 +2052,29 @@ class MLA(nn.Module):
                 # them so stale buffers cannot silently re-enable fusion.
                 self._fused_quant_q_buffer = None
                 self._fused_q_pe = None
+                self._fused_q_rope_done = False
                 return self._deepseek_v4_q_b_layernorm(q_proj)
             q_proj = self.q_b_proj(q)
-            if self._is_fused_q_fp8_quant_enabled(num_generations=num_generations):
+            if self._is_fused_q_fp8_quant_enabled(
+                num_generations=num_generations, num_contexts=num_contexts
+            ):
+                # The Q RoPE folds in here too: one lane already owns exactly one
+                # rotary pair, so it is register-local, and it leaves the whole FP8 Q
+                # row complete -- which is what lets the RoPE kernels be skipped
+                # entirely below.
+                rope_cos_sin = self._fused_q_rope_cos_sin
+                rope_specs = self._fused_q_rope_specs_cached
                 placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv = (
-                    self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj)
+                    self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj, rope_cos_sin, rope_specs)
                 )
                 self._fused_quant_q_buffer = quant_q_buffer
                 self._fused_q_pe = q_pe
                 self._quant_scale_qkv = quant_scale_qkv
+                self._fused_q_rope_done = rope_cos_sin is not None
                 return placeholder_q
             self._fused_quant_q_buffer = None
             self._fused_q_pe = None
+            self._fused_q_rope_done = False
             return self._deepseek_v4_q_b_layernorm(q_proj)
 
         def _compressor_branch():
@@ -1962,6 +2125,21 @@ class MLA(nn.Module):
                     q.record_stream(cur_stream)
                 if topk_indices is not None:
                     topk_indices.record_stream(cur_stream)
+                # Same for the fused FP8-Q buffers _q_branch allocated on that stream.
+                for _t in (
+                    getattr(self, "_fused_quant_q_buffer", None),
+                    getattr(self, "_fused_q_pe", None),
+                ):
+                    if _t is not None:
+                        _t.record_stream(cur_stream)
+            elif _prelaunch_compressor:
+                # Compressor already in flight on compressor_stream since before
+                # kv_a_proj; the caller stream only has to run the Q branch and
+                # join. Nothing between here and FMHA reads what the compressor
+                # writes, so the join could be deferred further -- it is kept here
+                # to match the pre-existing control flow.
+                q = _q_branch()
+                self.dsv4_compressor_event.wait()
             else:
                 q, _ = maybe_execute_in_parallel(
                     _q_branch,
@@ -2028,6 +2206,10 @@ class MLA(nn.Module):
                 assert gen_position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
 
+            if self._fused_kv_norm_hoisted:
+                # FMHA below reads the KV cache the hoisted kernel wrote.
+                self.kv_gen_events[1].wait()
+
             self.forward_generation_sparse_mla(
                 q_gen,
                 compressed_kv_gen,
@@ -2040,6 +2222,18 @@ class MLA(nn.Module):
                 enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
                 dsv4_epilogue_output=dsv4_epilogue_output,
             )
+
+        # Both halves have consumed the fused FP8-Q buffers; drop them here rather
+        # than in either half, which in a mixed batch would pull them out from under
+        # the other one (context runs first and generation would then see None).
+        self._fused_quant_q_buffer = None
+        self._fused_q_pe = None
+        self._fused_q_rope_done = False
+        # Both halves have consumed the flag; drop it so a later forward that
+        # reaches forward_absorption_* by another route cannot see a stale True
+        # (the fused branch above is the only place it is ever set).
+        self._fused_kv_norm_active = False
+        self._fused_kv_norm_hoisted = False
 
     def forward_context_default(
         self,
@@ -2551,6 +2745,87 @@ class MLA(nn.Module):
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
+    def _mla_gen_scheduler_scalars(self, device: torch.device, has_fp8_kv_cache: bool):
+        """Persistent per-layer FMHA scheduler scalars for the generation path.
+
+        `fmha_tile_counter` (the persistent-CTA tile dispenser) plus the bmm1/bmm2
+        scales. All three are written from scratch by the RoPE kernel -- or, on the
+        fused kv-norm path, by `mlaKvNormRopeQuantGenerationKernel` -- before the
+        FMHA kernel reads them, so nothing carries across launches and a single
+        buffer per layer is enough.
+        """
+        counter = getattr(self, "_mla_fmha_tile_counter", None)
+        if counter is None or counter.device != device:
+            counter = torch.empty(1, dtype=torch.uint32, device=device)
+            self._mla_fmha_tile_counter = counter
+        if not has_fp8_kv_cache:
+            return counter, None, None
+        bmm1 = getattr(self, "_mla_bmm1_scale", None)
+        if bmm1 is None or bmm1.device != device:
+            bmm1 = torch.empty(2, dtype=torch.float32, device=device)
+            self._mla_bmm1_scale = bmm1
+            self._mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        return counter, bmm1, self._mla_bmm2_scale
+
+    def _launch_fused_kv_norm_gen(
+        self,
+        latent_cache_gen: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        """Run the fused kv-norm/RoPE/quant KV kernel ahead of the Q branch.
+
+        The kernel reads the raw `kv_a_proj` latent and writes the paged KV cache;
+        it never touches q_pe or `fused_q`. Nothing between here and FMHA reads the
+        KV cache either, so it runs on `aux_stream` concurrently with
+        q_a_layernorm -> q_b_proj -> q_b_layernorm, which is where the standalone
+        `kv_a_layernorm` it replaced used to run.
+
+        Returns True when the launch happened, so the later `mla_rope_generation`
+        knows to run Q-only instead of doing the KV half again.
+        """
+        if self.aux_stream is None or not do_multi_stream():
+            return False
+        # The cu_seqlens buffers are Q-kernel state; the KV kernel never reads them.
+        # Only the precomputing metadata exposes them at this point, so without the
+        # hook the hoist is skipped rather than allocating here.
+        if getattr(attn_metadata, "mla_prepare_scheduler_buffers", None) is None:
+            return False
+
+        has_fp8_kv_cache = getattr(self.mqa, "has_fp8_kv_cache", False)
+        counter, bmm1_scale, bmm2_scale = self._mla_gen_scheduler_scalars(
+            latent_cache_gen.device, has_fp8_kv_cache
+        )
+        cu_q_seqlens, cu_kv_seqlens = attn_metadata.mla_prepare_scheduler_buffers(self.num_heads_tp)
+
+        # The latent is produced on the caller stream; gate the aux stream on it.
+        self.kv_gen_events[0].record()
+        with torch.cuda.stream(self.aux_stream):
+            self.kv_gen_events[0].wait()
+            # Keeps the allocator from recycling the latent while the aux stream
+            # still reads it.
+            latent_cache_gen.record_stream(self.aux_stream)
+            self.mqa.mla_rope_generation(
+                None,
+                None,
+                latent_cache_gen,
+                attn_metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                counter,
+                bmm1_scale,
+                bmm2_scale,
+                None,
+                kv_norm_weight=self.kv_a_layernorm.weight,
+                kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
+                precomputed_cu_seqlens=True,
+                precomputed_fmha_scheduler=(
+                    has_fp8_kv_cache and bmm1_scale is not None and bmm2_scale is not None
+                ),
+                kv_only=True,
+            )
+            self.kv_gen_events[1].record()
+        return True
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -2569,23 +2844,66 @@ class MLA(nn.Module):
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
+        # Fused FP8-Q path: `q` is the placeholder q_b_proj output, so the views above
+        # are un-normalized and must not be used. q_b_layernorm already emitted the
+        # normalized rope segment (`_fused_q_pe`) and the FP8 nope segment of
+        # `_fused_quant_q_buffer`; the RoPE kernel then only rotates q_pe into that
+        # buffer's rope slots and drops its q_nope quantize region entirely.
+        # `q_nope` is dead on the DSv4 branch -- it feeds only the non-DSv4 bmm below.
+        fused_q_fp8_pe = getattr(self, "_fused_q_pe", None)
+        fused_q_fp8_buf = getattr(self, "_fused_quant_q_buffer", None)
+        fused_q_fp8_scale = getattr(self, "_quant_scale_qkv", None)
+        use_fused_q_fp8 = (
+            self.is_deepseek_v4
+            and fused_q_fp8_pe is not None
+            and fused_q_fp8_buf is not None
+            and fused_q_fp8_scale is not None
+        )
+        if use_fused_q_fp8:
+            # Suffix slice: `_q_branch` ran over the whole batch. Decode-only batches
+            # today, so this is the whole buffer, but keep the offset explicit.
+            gen_offset = fused_q_fp8_pe.shape[0] - num_tokens
+            q_pe = fused_q_fp8_pe[gen_offset:]
+
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
         num_seqs = attn_metadata.num_seqs
 
-        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
-        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
-        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
+        # Cumulative Q/KV seqlens are layer-invariant: the metadata fills fixed-address
+        # buffers once per iteration and the kernel skips its per-layer recomputation.
+        # Metadata without the hook falls back to per-layer allocation + in-kernel fill.
+        _mla_prep = getattr(attn_metadata, "mla_prepare_scheduler_buffers", None)
+        if _mla_prep is not None:
+            cu_q_seqlens, cu_kv_seqlens = _mla_prep(self.num_heads_tp)
+            precomputed_cu_seqlens = True
+        else:
+            cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+            cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
+            precomputed_cu_seqlens = False
         has_fp8_kv_cache = (
             self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
         )
 
-        mla_bmm1_scale = None
-        mla_bmm2_scale = None
+        # Shape-invariant (one tile counter + three floats, rewritten every launch), so
+        # they are layer state rather than per-forward allocations, and fixed addresses
+        # suit CUDA graph capture. Created lazily on the first forward, which warmup
+        # runs before capture.
+        fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale = self._mla_gen_scheduler_scalars(
+            q.device, has_fp8_kv_cache
+        )
+
         quant_q_buffer = None
-        if has_fp8_kv_cache:
-            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
-            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
+        quant_scale_qkv = None
+        if use_fused_q_fp8:
+            # Already allocated and half-filled by q_b_layernorm; reusing it also drops
+            # a per-layer num_tokens x heads x 512 allocation from the decode step.
+            quant_q_buffer = fused_q_fp8_buf[gen_offset:].view(
+                num_tokens,
+                self.num_heads_tp,
+                (self.kv_lora_rank + self.qk_rope_head_dim),
+            )
+            quant_scale_qkv = fused_q_fp8_scale
+        elif has_fp8_kv_cache:
             quant_q_buffer = torch.empty(
                 num_tokens,
                 self.num_heads_tp,
@@ -2596,18 +2914,54 @@ class MLA(nn.Module):
 
         if self.is_deepseek_v4:
             fused_q = q
-            self.mqa.mla_rope_generation(
-                fused_q,
-                q_pe,
-                latent_cache,
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
+            # Fused kv-norm: `latent_cache` is the RAW kv_a_proj slice, so pass the norm
+            # weight. The op then runs `mlaKvNormRopeQuantGenerationKernel` for the KV
+            # half. None keeps the un-fused path.
+            _fused_kv_norm = getattr(self, "_fused_kv_norm_active", False)
+            # Already ran on aux_stream, overlapped with the Q branch; the op still has
+            # to be told the KV half is done.
+            _kv_hoisted = getattr(self, "_fused_kv_norm_hoisted", False)
+            # q_b_layernorm already rotated the rope segment into the FP8 Q buffer, so no
+            # Q work is left -- but the KV half still runs, hence kv_only.
+            _q_rope_done = getattr(self, "_fused_q_rope_done", False) and _fused_kv_norm
+            assert not (_q_rope_done and not precomputed_cu_seqlens), (
+                "fused Q RoPE drops the kernel that fills cu_q_seqlens; "
+                "attention metadata must precompute them"
             )
+            # Both halves already done elsewhere -> nothing left to launch at all.
+            _skip_rope_op = _q_rope_done and _kv_hoisted
+            if not _skip_rope_op:
+                self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    kv_norm_weight=(
+                        self.kv_a_layernorm.weight if _fused_kv_norm and not _kv_hoisted else None
+                    ),
+                    kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
+                    kv_done_elsewhere=_kv_hoisted,
+                    # Non-None tells the launcher q_nope is already FP8, so it drops the
+                    # q_nope quantize rows (1024 of 1161 at head_num 128) from the grid.
+                    quant_scale_qkv=quant_scale_qkv,
+                    kv_only=_q_rope_done and not _kv_hoisted,
+                    precomputed_cu_seqlens=precomputed_cu_seqlens,
+                    # `_deepseek_v4_local_to_global_kernel` emits the tile counter and bmm
+                    # scales here -- last kernel before FMHA, a better home than block
+                    # (0,0) of the RoPE kernels. Same condition as the sparse_attn_predict
+                    # branch that writes them.
+                    precomputed_fmha_scheduler=(
+                        has_fp8_kv_cache
+                        and mla_bmm1_scale is not None
+                        and mla_bmm2_scale is not None
+                    ),
+                )
         else:
             fused_q = torch.empty(
                 [num_tokens, self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim)],
@@ -2898,13 +3252,26 @@ class MLA(nn.Module):
             q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
             quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
             quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
+            # q_b_layernorm already rotated the rope segment into quant_q_buffer; the
+            # bf16 q_pe it left behind is stale.
             topk_indices=topk_indices,  # used by DSA attention
             dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
             enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
+            # fused kv-norm path only: `latent_cache` above is the RAW kv_a_proj
+            # output, so the kernel must apply the norm before RoPE/quant/write.
+            kv_norm_weight=(
+                self.kv_a_layernorm.weight
+                if getattr(self, "_fused_kv_norm_active", False)
+                else None
+            ),
+            kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
         )
         fused_q = None
-        self._fused_quant_q_buffer = None
-        self._fused_q_pe = None
+        # Do NOT clear the fused FP8-Q buffers or `_fused_kv_norm_active` here. In a
+        # mixed batch this runs before `forward_absorption_generation`, which reads the
+        # flag to decide whether to pass the norm weight -- clearing it made the
+        # generation half write UN-normalized rows into the KV cache.
+        # `forward_impl_with_deepseek_v4` clears it once both halves are done.
 
         if enable_dsv4_epilogue_fusion:
             return attn_out_latent

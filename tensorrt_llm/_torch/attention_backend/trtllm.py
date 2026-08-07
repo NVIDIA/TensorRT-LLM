@@ -303,6 +303,49 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
+        # FMHA prologue buffers for the MLA generation path. The values are
+        # layer-invariant, so compute them once per iteration in `prepare()` instead of
+        # per layer in the RoPE kernel. Fixed addresses keep captured CUDA graphs valid.
+        #   `mla_cu_q_seqlens`  cumulative Q ROWS  = cumsum(q_lens) * num_heads
+        #   `mla_cu_kv_seqlens` cumulative KV lens = cumsum(kv_lens)
+        # `+ 1` because both are exclusive-prefix arrays over num_seqs.
+        self.mla_cu_q_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_cu_q_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        self.mla_cu_kv_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_cu_kv_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        self.mla_cu_q_seqlens_cpu = torch.empty_like(self.mla_cu_q_seqlens,
+                                                     device='cpu',
+                                                     pin_memory=prefer_pinned())
+        self.mla_cu_kv_seqlens_cpu = torch.empty_like(
+            self.mla_cu_kv_seqlens, device='cpu', pin_memory=prefer_pinned())
+        # Token-wise cumulative Q seqlens over CONTEXT sequences, for folding the Q RoPE
+        # into q_b_layernorm. Own copy because `ctx_uncached_token_indptr` holds the same
+        # values but only exists under `enable_context_mla_with_cached_kv`.
+        # Counts TOKENS, unlike `mla_cu_q_seqlens` which counts Q rows.
+        self.mla_ctx_cu_q_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_ctx_cu_q_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        self.mla_ctx_cu_q_seqlens_cpu = torch.empty_like(
+            self.mla_ctx_cu_q_seqlens, device='cpu', pin_memory=prefer_pinned())
+        self.mla_ctx_cu_seqlens_valid = False
+        # Filled lazily by `mla_prepare_scheduler_buffers`, which needs num_heads
+        # from the attention layer.
+        self.mla_scheduler_buffers_valid = False
+
         if self.workspace is None:
             self.workspace = torch.empty(
                 (0, ),
@@ -517,8 +560,62 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = prompt_lens_cpu
         self.host_request_types_runtime = host_request_types
 
+    def mla_prepare_scheduler_buffers(
+            self, num_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cumulative Q/KV sequence lengths for the MLA generation FMHA kernel.
+
+        These are layer-invariant, so they are computed once per iteration instead of
+        once per layer inside `applyMLARopeAndAssignQKVKernelGeneration`. The values
+        match what that kernel produced:
+          seqQOffset[b+1]  = num_heads * cumsum(q_lens)[b]   (Q ROWS, not tokens)
+          seqKVOffsets[b+1] = cumsum(kv_lens)[b]
+
+        Computed on the host from tensors that are already there -- no device readback,
+        so no per-iteration D2H sync -- then copied into fixed-address device buffers so
+        a captured CUDA graph keeps reading the same pointers. `cu_kv` is filled in
+        `prepare()` (it needs the pre-extra-tokens kv_lens that only exists there);
+        this call adds `cu_q`, which needs num_heads.
+        """
+        num_ctx = self.num_contexts
+        n_gen = self.num_seqs - num_ctx
+        if not self.mla_scheduler_buffers_valid:
+            # `cu_kv` was filled in prepare(); only `cu_q` needs num_heads.
+            q_lens = self.seq_lens[num_ctx:self.num_seqs].to(torch.int64)
+            self.mla_cu_q_seqlens_cpu[0] = 0
+            if n_gen > 0:
+                self.mla_cu_q_seqlens_cpu[1:n_gen +
+                                          1] = (torch.cumsum(q_lens, 0) *
+                                                num_heads).to(torch.int)
+            self.mla_cu_q_seqlens[:n_gen + 1].copy_(
+                self.mla_cu_q_seqlens_cpu[:n_gen + 1], non_blocking=True)
+            self.mla_scheduler_buffers_valid = True
+        return (self.mla_cu_q_seqlens[:n_gen + 1],
+                self.mla_cu_kv_seqlens[:n_gen + 1])
+
+    def mla_prepare_ctx_cu_seqlens(self) -> Optional[torch.Tensor]:
+        """Token-wise cumulative Q seqlens over the context sequences.
+
+        Layer-invariant, so it is built once per iteration into a fixed-address
+        buffer, on the host from tensors already present (no device readback).
+        Returns None when the batch has no context sequences.
+        """
+        num_ctx = self.num_contexts
+        if num_ctx <= 0:
+            return None
+        if not self.mla_ctx_cu_seqlens_valid:
+            self.mla_ctx_cu_q_seqlens_cpu[0] = 0
+            self.mla_ctx_cu_q_seqlens_cpu[1:num_ctx + 1] = torch.cumsum(
+                self.seq_lens[:num_ctx].to(torch.int64), 0).to(torch.int)
+            self.mla_ctx_cu_q_seqlens[:num_ctx + 1].copy_(
+                self.mla_ctx_cu_q_seqlens_cpu[:num_ctx + 1], non_blocking=True)
+            self.mla_ctx_cu_seqlens_valid = True
+        return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
+
     def prepare(self) -> None:
         super().prepare()
+        # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
+        self.mla_scheduler_buffers_valid = False
+        self.mla_ctx_cu_seqlens_valid = False
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -574,6 +671,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
             kv_lens[:self.num_seqs]),
                                                 non_blocking=True)
+        # Cumulative KV lengths for the MLA generation FMHA kernel, hoisted out of the
+        # per-layer RoPE kernel. Must come from `kv_lens` (what the kernel's
+        # `cache_seq_lens` scan used), NOT `self.kv_lens`, which adds
+        # `num_extra_kv_tokens`.
+        _n_gen = self.num_seqs - self.num_contexts
+        self.mla_cu_kv_seqlens_cpu[0] = 0
+        if _n_gen > 0:
+            self.mla_cu_kv_seqlens_cpu[1:_n_gen + 1] = torch.cumsum(
+                kv_lens[self.num_contexts:self.num_seqs].to(torch.int64),
+                0).to(torch.int)
+        self.mla_cu_kv_seqlens[:_n_gen + 1].copy_(
+            self.mla_cu_kv_seqlens_cpu[:_n_gen + 1], non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1999,8 +2108,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def mla_rope_generation(
         self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         cu_q_seqlens: torch.Tensor,
@@ -2010,6 +2119,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm2_scale: torch.Tensor,
         quant_q_buffer: torch.Tensor,
         out_scale: Optional[torch.Tensor] = None,
+        kv_norm_weight: Optional[torch.Tensor] = None,
+        kv_norm_eps: float = 1e-6,
+        precomputed_cu_seqlens: bool = False,
+        precomputed_fmha_scheduler: bool = False,
+        kv_only: bool = False,
+        kv_done_elsewhere: bool = False,
+        quant_scale_qkv: Optional[torch.Tensor] = None,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2075,4 +2191,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.qk_rope_head_dim,
             self.v_head_dim,
             self.rope_append,
+            kv_norm_weight,
+            kv_norm_eps,
+            precomputed_cu_seqlens,
+            precomputed_fmha_scheduler,
+            kv_only,
+            kv_done_elsewhere,
+            quant_scale_qkv,
         )

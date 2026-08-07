@@ -1628,6 +1628,37 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             block_table_compressed = None
             compressed_local_indices = None
 
+        # FMHA scheduler prologue: this kernel is the last one before FMHA, so it owns
+        # the tile-counter reset and bmm scale derivation the MLA RoPE kernels used to
+        # do two launches earlier. Generation only -- context uses the attention
+        # workspace.
+        sched_kwargs = {}
+        if (
+            forward_args.attention_input_type == AttentionInputType.generation_only
+            and has_fp8_kv_cache
+            and forward_args.fmha_scheduler_counter is not None
+            and forward_args.mla_bmm1_scale is not None
+            and forward_args.mla_bmm2_scale is not None
+        ):
+            sched_kwargs = dict(
+                fmha_tile_counter=forward_args.fmha_scheduler_counter,
+                bmm1_scale=forward_args.mla_bmm1_scale,
+                bmm2_scale=forward_args.mla_bmm2_scale,
+                # Mirrors attentionOp.cpp: quant_scale_o is the attention-output
+                # quant scale, and both dequant scales are the KV cache scale.
+                quant_scale_o=(
+                    forward_args.out_scale
+                    if forward_args.out_scale is not None
+                    else self.kv_scale_quant_orig
+                ),
+                dequant_scale_q=self.kv_scale_quant_orig,
+                dequant_scale_kv=self.kv_scale_quant_orig,
+                host_bmm1_scale=1.0
+                / (
+                    self.q_scaling * math.sqrt(float(self.qk_nope_head_dim + self.qk_rope_head_dim))
+                ),
+            )
+
         global_indices = deepseek_v4_local_to_global_indices(
             req_id=req_id,
             block_table_swa=block_table_swa,
@@ -1642,6 +1673,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self.compress_ratio,
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
+            **sched_kwargs,
         )
 
         return global_indices, None
