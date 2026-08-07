@@ -126,9 +126,7 @@ class CoverageSelector:
             if not ok:
                 return impacted, no_data, no_diff, f"unparsable source: {path}"
             if not lines:
-                # Comment-only: nothing executable changed, so any set covers it.
-                impacted |= self.db.tests_touching_file(cf)
-                continue
+                continue  # comment / blank only: nothing executable changed, so nothing runs
             import_executed = import_executed_qualnames(source)
             closures = closure_attributed_qualnames(source, lines)
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
