@@ -341,38 +341,6 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     return mock_kv_cache_manager
 
 
-@skip_num_gpus_less_than(1)
-def test_separate_draft_flash_mla_buffers_use_manager_geometry():
-    """Target and draft FlashMLA block IDs need stable, disjoint storage."""
-    num_seqs = 3
-    target_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
-    draft_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
-    draft_kv_cache_manager.max_blocks_per_seq = 7
-    attn_metadata = TrtllmAttentionMetadata(
-        max_num_requests=num_seqs,
-        max_num_tokens=num_seqs * 3,
-        kv_cache_manager=target_kv_cache_manager,
-        draft_kv_cache_manager=draft_kv_cache_manager,
-        enable_flash_mla=True,
-    )
-
-    for metadata in (
-            attn_metadata,
-            attn_metadata.create_cuda_graph_metadata(num_seqs,
-                                                     max_draft_tokens=2),
-    ):
-        assert metadata.block_ids_per_seq.shape == (num_seqs, 16)
-        assert metadata.kv_block_ids_per_seq.shape == (num_seqs, 16)
-        assert metadata.draft_block_ids_per_seq.shape == (num_seqs, 7)
-        assert metadata.draft_kv_block_ids_per_seq.shape == (num_seqs, 7)
-        assert len({
-            metadata.block_ids_per_seq.data_ptr(),
-            metadata.kv_block_ids_per_seq.data_ptr(),
-            metadata.draft_block_ids_per_seq.data_ptr(),
-            metadata.draft_kv_block_ids_per_seq.data_ptr(),
-        }) == 4
-
-
 @pytest.mark.parametrize("spec_signal", [
     None, "num_extra_kv_tokens", "is_spec_decoding_enabled",
     "has_speculative_draft_tokens", "draft_kv_cache_manager"

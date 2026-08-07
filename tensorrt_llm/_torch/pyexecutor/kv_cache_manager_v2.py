@@ -1200,15 +1200,6 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return Role.KEY_BLOCK_SCALE
 
-    def _get_pool_layer_id(self, pool_id: int, role: DataRole) -> LayerId:
-        """Return a stable config-order representative for a pool role."""
-        try:
-            return self._pool_layer_ids_by_role[(pool_id, role)]
-        except KeyError as error:
-            raise ValueError(
-                f"Logical layer group {pool_id} has no layer with role {role}"
-            ) from error
-
     def _build_pool_mapping_tensors(self):
         """Build the (kv_cache_pool_pointers, kv_cache_pool_mapping) tensors.
 
@@ -1246,7 +1237,7 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             for pool_id in range(self.num_pools):
                 role_a, _ = self._get_pool_roles(pool_id)
-                layer_id = self._get_pool_layer_id(pool_id, role_a)
+                layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
                 key_base_addr = self.impl.get_mem_pool_base_address(
                     layer_id, role_a, PageIndexMode.SHARED
                 )
@@ -1360,7 +1351,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         for pool_id in range(self.num_pools):
             role_a, role_b = self._get_pool_roles(pool_id)
-            layer_id = self._get_pool_layer_id(pool_id, role_a)
+            layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
             self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, role_a)
             if role_b is not None:
                 self.kv_offset[pool_id] = exact_div(

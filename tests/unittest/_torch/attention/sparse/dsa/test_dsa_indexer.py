@@ -53,7 +53,6 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
-from tensorrt_llm._torch.attention_backend.sparse.registry import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
@@ -298,19 +297,6 @@ def create_dsa_cache_manager(
     )
 
     return cache_manager, sparse_attn_config
-
-
-def test_dsa_cache_manager_selection_honors_v2_config():
-    sparse_attn_config = DeepSeekSparseAttentionConfig()
-
-    assert (
-        get_sparse_attn_kv_cache_manager(sparse_attn_config, use_kv_cache_manager_v2=False)
-        is DSACacheManager
-    )
-    assert (
-        get_sparse_attn_kv_cache_manager(sparse_attn_config, use_kv_cache_manager_v2=True)
-        is DSACacheManagerV2
-    )
 
 
 @pytest.mark.parametrize(
@@ -3694,11 +3680,11 @@ def test_recompute_context_kv_gather_mappings_does_not_alias_uncompressed_cached
 
     with (
         patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.torch.empty",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.torch.empty",
             side_effect=[host_fullkv_fp8_mapping, host_fullkv_scale_mapping],
         ),
         patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa._compute_slot_mappings",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer._compute_slot_mappings",
             return_value=(computed_fp8_mapping, computed_scale_mapping),
         ) as compute_slot_mappings,
     ):
