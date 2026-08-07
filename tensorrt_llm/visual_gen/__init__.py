@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         CudaGraphConfig,
         ParallelConfig,
         QuantAttentionConfig,
+        RuntimeLoRAConfig,
         SkipSoftmaxAttentionConfig,
         SparseAttentionConfig,
         TeaCacheConfig,
@@ -70,6 +71,7 @@ _LAZY_ATTRS = {
     "CudaGraphConfig": "tensorrt_llm.visual_gen.args",
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
     "QuantAttentionConfig": "tensorrt_llm.visual_gen.args",
+    "RuntimeLoRAConfig": "tensorrt_llm.visual_gen.args",
     "SkipSoftmaxAttentionConfig": "tensorrt_llm.visual_gen.args",
     "SparseAttentionConfig": "tensorrt_llm.visual_gen.args",
     "TeaCacheConfig": "tensorrt_llm.visual_gen.args",
@@ -104,7 +106,6 @@ def __getattr__(name):
 def __dir__():
     return sorted(set(__all__) | set(globals()))
 
-
 __all__ = [
     # Entry-point classes (also top-level re-exports)
     "VisualGen",
@@ -121,6 +122,7 @@ __all__ = [
     "ParallelConfig",
     "AttentionConfig",
     "QuantAttentionConfig",
+    "RuntimeLoRAConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",

@@ -515,6 +515,55 @@ class CompilationConfig(StrictBaseModel):
     )
 
 
+class RuntimeLoRAConfig(StrictBaseModel):
+    """Startup-preloaded LoRA adapter applied in transformer forward passes."""
+
+    path: str = Field(
+        "",
+        status="prototype",
+        description="Local safetensors file or directory containing LoRA adapter weights.",
+    )
+    scale: float = Field(
+        1.0,
+        status="prototype",
+        description="LoRA adapter strength multiplier applied on top of alpha/rank scaling.",
+    )
+    target_components: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Transformer component names to patch. Empty means all transformer "
+            "components exposed by the pipeline."
+        ),
+    )
+    strip_prefixes: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description="Extra LoRA key prefixes to strip before matching transformer module names.",
+    )
+    key_map: Dict[str, str] = Field(
+        default_factory=dict,
+        status="prototype",
+        description="Prefix map from LoRA checkpoint module names to TRTLLM module names.",
+    )
+    fuse_qkv: bool = Field(
+        True,
+        status="prototype",
+        description="Map to_q/to_k/to_v LoRA tensors onto fused qkv_proj modules when present.",
+    )
+    strict: bool = Field(
+        True,
+        status="prototype",
+        description="Raise when adapter tensors do not match any target module or expected shapes.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_path(self) -> "RuntimeLoRAConfig":
+        if not self.path:
+            raise ValueError("runtime_lora_config.path must be non-empty")
+        return self
+
+
 # =============================================================================
 # VisualGenArgs - User-facing configuration (CLI / YAML)
 # =============================================================================
@@ -583,6 +632,14 @@ class VisualGenArgs(StrictBaseModel):
         status="prototype",
     )
     cache_config: Optional[CacheConfig] = Field(None, status="prototype")
+    runtime_lora_config: Optional[RuntimeLoRAConfig] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Startup-preloaded LoRA adapter applied dynamically in "
+            "VisualGen transformer forward passes."
+        ),
+    )
 
     pipeline_config: Dict[str, Any] = Field(
         default_factory=dict,
@@ -675,5 +732,6 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "RuntimeLoRAConfig",
     "VisualGenArgs",
 ]
