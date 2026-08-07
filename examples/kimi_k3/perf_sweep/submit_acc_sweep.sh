@@ -45,7 +45,11 @@ submit() {
     if (( DRY_RUN )); then
         echo "DRY RUN: sbatch ${opts[*]} $SBATCH_SCRIPT ${args[*]}"
     else
-        echo "$mode: $(sbatch "${opts[@]}" "$SBATCH_SCRIPT" "${args[@]}")"
+        # Checked assignment so a failed sbatch stops the sweep (set -e);
+        # echo "$(sbatch ...)" would discard the failure.
+        local result
+        result=$(sbatch "${opts[@]}" "$SBATCH_SCRIPT" "${args[@]}")
+        echo "$mode: $result"
     fi
 }
 

@@ -4,6 +4,10 @@ cuda_graph_config:
   max_batch_size: 32
 enable_chunked_prefill: true
 kv_cache_config:
+  # Explicit for clarity: block reuse defaults to on, and
+  # run_gsm8k_kimi_k3.sbatch --reuse drops --disable_kv_cache_reuse so
+  # this setting takes effect.
+  enable_block_reuse: true
   # Leave runtime headroom for the AUTO-selected NVLinkOneSided workspace
   # and the largest 8192-token prefill allocation, matching
   # eval_extra_llm_options.yaml. At 0.6 the hybrid cache manager's extra

@@ -44,7 +44,7 @@ python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_whe
 .venv-3.12/bin/python -m pip install -e .
 ```
 
-`build_wheel.py` creates the `.venv-3.12` virtual environment at the repository root (named after the container's Python version). Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300). The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
+`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300). The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
 
 Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-place environment (these dependencies might be removed in future releases, replaced by other kernels):
 
@@ -116,7 +116,7 @@ srun -N 4 \
     --mpi=pmix --gpus-per-node=4 \
     --container-image=/path/to/tensorrt-llm-container.sqsh \
     --container-mount-home \
-    --container-mounts=${REPO}:${REPO},${MODEL}:${MODEL} \
+    --container-mounts=${REPO}:${REPO},${MODEL}:${MODEL},${EXTRA_LLM_API_FILE}:${EXTRA_LLM_API_FILE}:ro \
     bash -c "
         ulimit -n 65536
 

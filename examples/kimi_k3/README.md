@@ -21,9 +21,12 @@ other GPU architectures may be added in a future release.
   [build from source](../../docs/source/installation/build-from-source.md)
   for details.
 
-  `build_wheel.py` creates the `.venv-3.12` virtual environment at the
-  repository root (named after the container's Python version). Adjust
-  `--cuda_architectures` to the target GPUs (`103-real` for GB300).
+  `build_wheel.py` creates the virtual environment at the repository
+  root, named after the container's Python version: `.venv-3.12` for the
+  current containers (Python 3.12). If your container ships a different
+  Python, substitute the matching `.venv-<major>.<minor>` path in the
+  commands on this page. Adjust `--cuda_architectures` to the target
+  GPUs (`103-real` for GB300).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem
