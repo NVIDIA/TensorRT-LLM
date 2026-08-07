@@ -329,7 +329,6 @@ def _synthetic_rank_info(tp: int, adp: bool):
         pp_rank=0,
         layer_num_per_pp=[_NUM_TOTAL_LAYERS],
         sender_endpoints=[],
-        server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(
