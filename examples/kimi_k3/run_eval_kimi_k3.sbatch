@@ -2,13 +2,48 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Kimi K3 GSM8K evaluation on 16 NVIDIA Blackwell GPUs.
+# Kimi K3 accuracy evaluation (GSM8K or MMMU) on 16 NVIDIA Blackwell GPUs.
 #
 # Submit the job with the checkpoint and container paths:
 #
-#   sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+#   sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
 #       --model /path/to/kimi-k3-checkpoint \
-#       --image /path/to/tensorrt-llm-container.sqsh
+#       --image /path/to/tensorrt-llm-container.sqsh \
+#       [--task gsm8k|mmmu] [--parallel dep|tep]
+#
+# --task selects the benchmark (default: gsm8k, identical behavior to the
+# former run_gsm8k_kimi_k3.sbatch).
+#
+# --parallel selects the 16-GPU attention layout (default: dep).
+#
+#   * dep: attention data-parallel + MoE EP16 (DEP16) — the layout the
+#     checked-in eval YAMLs pin and the reference scores were measured with.
+#   * tep: attention tensor-parallel + MoE EP16 (TEP16). Rewrites a per-job
+#     copy of the selected YAML with enable_attention_dp: false. Every rank
+#     then serves the same global batch instead of its own, so in the default
+#     mode max_batch_size is raised 32 -> 128 to recover eval concurrency
+#     (the spec-dec modes keep their own batch limits). Note: with
+#     attention-DP off the MoE router gate defaults to its bf16 fast path,
+#     which can flip borderline expert picks; export KIMI_K3_ROUTER_BF16=0
+#     for apples-to-apples accuracy comparison against DEP16 references.
+#
+# --task mmmu evaluates the multimodal path (KimiK3ForConditionalGeneration
+# with the vision tower; point --model at a K3 VL checkpoint). It passes
+# --post_process_fn kimi_k3_mmmu so the MMMU letter answer is read from K3's
+# <|open|>response<|sep|> channel, and keeps a 16384-token generation budget
+# via --preserve_caller_max_tokens: lm-eval's MMMU default of 512 tokens
+# truncates the chain-of-thought before the response channel opens, silently
+# degrading the score. --max_seq_len is raised to 24576 (8192 input + 16384
+# output) for this task; explicitly passed trtllm-eval CLI flags override the
+# --config YAML's max_seq_len.
+#
+# MMMU downloads its images from the HF hub on first use, so compute nodes
+# need network access — or pre-fetch the dataset into a shared cache and
+# export HF_HOME before submitting (sbatch propagates the environment):
+#
+#   HF_HOME=/shared/hf_home python3 -c "from huggingface_hub import \
+#       snapshot_download; snapshot_download('MMMU/MMMU', repo_type='dataset')"
+#   export HF_HOME=/shared/hf_home
 #
 # Pass --sa to evaluate with suffix-automaton speculative decoding
 # (selects eval_extra_llm_options_sa.yaml and the SA-required
@@ -29,23 +64,25 @@
 # must contain the built TensorRT-LLM checkout. Provide scheduler-specific
 # options on the sbatch command line as needed.
 #
-#SBATCH --job-name=kimi-k3-gsm8k
+#SBATCH --job-name=kimi-k3-eval
 #SBATCH --partition=batch
 #SBATCH --account=${account}
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --time=02:00:00
-#SBATCH --output=kimi-k3-gsm8k-%j.log
+#SBATCH --output=kimi-k3-eval-%j.log
 
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--sa | --reuse | --dflash DRAFTER_PATH]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--task gsm8k|mmmu] [--parallel dep|tep] [--sa | --reuse | --dflash DRAFTER_PATH]"
 }
 
 MODEL=""
 CONTAINER_IMAGE=""
+TASK=gsm8k
+PARALLEL=dep
 MODE=default
 SPEC_STATS_DEFAULT=0
 DFLASH_DRAFTER=""
@@ -67,6 +104,24 @@ while [[ $# -gt 0 ]]; do
             [[ "$MODE" == default ]] || { echo "error: --sa, --reuse, and --dflash are mutually exclusive" >&2; usage >&2; exit 2; }
             MODE=dflash
             DFLASH_DRAFTER=${1#*=}
+            shift
+            ;;
+        --task)
+            [[ $# -ge 2 ]] || { echo "error: --task requires a value" >&2; usage >&2; exit 2; }
+            TASK=$2
+            shift 2
+            ;;
+        --task=*)
+            TASK=${1#*=}
+            shift
+            ;;
+        --parallel)
+            [[ $# -ge 2 ]] || { echo "error: --parallel requires a value" >&2; usage >&2; exit 2; }
+            PARALLEL=$2
+            shift 2
+            ;;
+        --parallel=*)
+            PARALLEL=${1#*=}
             shift
             ;;
         --model)
@@ -103,6 +158,14 @@ done
 [[ -n "$CONTAINER_IMAGE" ]] || { echo "error: --image is required" >&2; usage >&2; exit 2; }
 [[ -e "$MODEL" ]] || { echo "error: model path does not exist: $MODEL" >&2; exit 2; }
 [[ -e "$CONTAINER_IMAGE" ]] || { echo "error: image path does not exist: $CONTAINER_IMAGE" >&2; exit 2; }
+case "$TASK" in
+    gsm8k|mmmu) ;;
+    *) echo "error: unknown --task: $TASK (expected gsm8k or mmmu)" >&2; usage >&2; exit 2 ;;
+esac
+case "$PARALLEL" in
+    dep|tep) ;;
+    *) echo "error: unknown --parallel: $PARALLEL (expected dep or tep)" >&2; usage >&2; exit 2 ;;
+esac
 
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
@@ -146,6 +209,46 @@ case "$MODE" in
         ;;
 esac
 
+# Per-task eval settings (see the header for the mmmu rationale). The task
+# subcommand string is expanded into the container command below, so keep it
+# on a single line. Per-sample MMMU outputs land next to the job log.
+MAX_SEQ_LEN=8192
+case "$TASK" in
+    gsm8k)
+        TASK_CMD="gsm8k"
+        ;;
+    mmmu)
+        MAX_SEQ_LEN=24576
+        TASK_CMD="mmmu --post_process_fn kimi_k3_mmmu --max_input_length 8192 --max_output_length 16384 --preserve_caller_max_tokens --output_path '$REPO/kimi-k3-mmmu-results-$SLURM_JOB_ID.json'"
+        ;;
+esac
+
+# Per-parallel-layout adjustments (see the header). The TEP rewrite happens on
+# a per-job copy so the checked-in YAMLs stay canonical for DEP16. In the
+# default mode the batch bump also rewrites the YAML's own max_batch_size and
+# the nested cuda_graph_config max_batch_size so graph coverage follows.
+if [[ "$PARALLEL" == tep ]]; then
+    # The per-job copy must live under $REPO: that is the only path guaranteed
+    # to be container-mounted at the same location on every rank
+    # ($SLURM_SUBMIT_DIR only coincides with it by default, and a node-local
+    # mktemp file would be invisible to the other nodes). Removed when this
+    # batch script exits; also gitignored in case the job dies before the
+    # trap fires.
+    TEP_CONFIG=$REPO/examples/kimi_k3/.eval_tep_runtime.$SLURM_JOB_ID.yaml
+    trap 'rm -f "$TEP_CONFIG"' EXIT
+    if [[ "$MODE" == default ]]; then
+        MAX_BATCH_SIZE=128
+        sed -e 's/^enable_attention_dp: true$/enable_attention_dp: false/' \
+            -e "s/^max_batch_size: .*/max_batch_size: $MAX_BATCH_SIZE/" \
+            -e "s/^  max_batch_size: .*/  max_batch_size: $MAX_BATCH_SIZE/" \
+            "$EVAL_CONFIG" > "$TEP_CONFIG"
+    else
+        sed -e 's/^enable_attention_dp: true$/enable_attention_dp: false/' \
+            "$EVAL_CONFIG" > "$TEP_CONFIG"
+    fi
+    EVAL_CONFIG=$TEP_CONFIG
+fi
+
 # Mount every input at its host path so the paths are valid inside too.
 # EXTRA_MOUNTS (comma-separated src:dst:flags) lets git-worktree submits
 # also mount the built main checkout that the worktree's artifact
@@ -167,6 +270,12 @@ srun --mpi=pmix \
         set -x
         ulimit -n 65536
 
+        # Ignore \$HOME/.local site-packages, which --container-mount-home
+        # leaks into the container: a user-site torch there shadows the
+        # container's torch and breaks bindings symbol resolution
+        # (libth_common.so: undefined symbol).
+        export PYTHONNOUSERSITE=1
+
         # Node-local Triton cache: ~/.triton on shared NFS races across
         # ranks during autotune JIT (stale file handles).
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
@@ -174,9 +283,7 @@ srun --mpi=pmix \
 
         # Node-local flashinfer cache: the default (\$HOME) is shared NFS and
         # races across ranks during cubin download (stale file handles).
-        # These caches are cold on every run (~minutes of JIT per rank);
-        # the GSM8K dataset cache is \$HOME/.cache/huggingface, provided by
-        # --container-mount-home above.
+        # These caches are cold on every run (~minutes of JIT per rank).
         export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-rank\${SLURM_PROCID:-0}
 
         # Node-local HF remote-code modules cache: all ranks share \$HOME
@@ -188,10 +295,16 @@ srun --mpi=pmix \
         # node-local; the dataset/hub cache stays shared for reuse.
         export HF_MODULES_CACHE=/tmp/hf-modules-rank\${SLURM_PROCID:-0}
 
+        # HF hub/datasets cache. Defaults to the shared \$HOME cache provided
+        # by --container-mount-home; export HF_HOME before submitting to use
+        # a pre-fetched location instead (recommended for the MMMU images —
+        # see the header).
+        export HF_HOME=\"${HF_HOME:-\$HOME/.cache/huggingface}\"
+
         # Run trtllm-eval from the in-place installation created in the
         # README Prerequisites section (build_wheel.py creates .venv-3.12).
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
-        
+
         # Log a running partial score every N completed responses (0 = off).
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
         # Cap in-flight requests: may cost some throughput vs submit-all, but yields steady partial scores (early failure signal) instead of one burst at the end (0 = off).
@@ -211,11 +324,11 @@ srun --mpi=pmix \
             --backend pytorch \
             --tp_size 16 \
             --max_batch_size $MAX_BATCH_SIZE \
-            --max_seq_len 8192 \
+            --max_seq_len $MAX_SEQ_LEN \
             --max_num_tokens $MAX_NUM_TOKENS \
             --kv_cache_free_gpu_memory_fraction $KV_FRAC \
             $KV_REUSE_ARG \
             --trust_remote_code \
             --config '$EVAL_CONFIG' \
-            gsm8k
+            $TASK_CMD
     "
