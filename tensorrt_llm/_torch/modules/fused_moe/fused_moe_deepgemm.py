@@ -642,7 +642,7 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
 
     Only the number of permuted (expanded) tokens is needed here, not the
     permuted activations themselves. Callers that run moe_permute_op with
-    skip_data_expand=True leave permuted_data_tensor uninitialized, so the count
+    skip_data_expand=True return an empty permuted_data_tensor, so the count
     must come from a populated tensor (e.g. permuted_row_to_unpermuted_row_tensor.shape[0]).
     """
     total_tokens = num_permuted_tokens
@@ -989,23 +989,26 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         assert token_selected_experts is not None
         assert token_final_scales is not None
 
-        # Permutation.
-        # skip_data_expand=True computes the permutation maps but skips the
-        # data-copy step (expandInputRowsKernel), so permuted_data_tensor and
-        # permuted_token_final_scales_tensor are returned with UNINITIALIZED
-        # contents (still full-size, just never written). The fused expand+quant
-        # kernel re-derives the activations from x via
+        # Permutation. With skip_data_expand=True, the operator needs the input
+        # row count and dtype but never reads its hidden dimension. Use a
+        # zero-width view so older operator libraries, which still size an
+        # unused expanded return from input.shape[1], allocate no activation
+        # storage. The fused expand+quant kernel reads the original x below.
+        # Newer operator libraries return the unused activation and scale
+        # tensors empty as well.
+        #
+        # The fused expand+quant kernel re-derives the activations from x via
         # permuted_row_to_unpermuted_row_tensor instead, so all unused outputs are
         # discarded with `_`.
         (
             permuted_row_to_unpermuted_row_tensor,
             _,  # permuted_token_selected_experts_tensor (unused)
-            _,  # permuted_data_tensor (uninitialized under skip_data_expand)
+            _,  # permuted_data_tensor (unused and allocation-free)
             expert_first_token_offset_tensor,
-            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
+            _,  # permuted_token_final_scales_tensor (unused)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
-            x,
+            x[:, :0],
             token_selected_experts,
             token_final_scales,
             None,  # w3_w1_weight.view(weight_dtype),

@@ -69,6 +69,9 @@ class ExpandQuantShape:
 SHAPES = [
     ExpandQuantShape("anchor", num_source_tokens=32, hidden=4096, num_experts=128, top_k=8),
     ExpandQuantShape("anchor_h7168", num_source_tokens=32, hidden=7168, num_experts=128, top_k=8),
+    ExpandQuantShape(
+        "large_h8192_topk10", num_source_tokens=32, hidden=8192, num_experts=512, top_k=10
+    ),
     ExpandQuantShape("small", num_source_tokens=1, hidden=512, num_experts=8, top_k=4),
     ExpandQuantShape("medium_batch", num_source_tokens=64, hidden=7168, num_experts=128, top_k=8),
     ExpandQuantShape("topk4", num_source_tokens=16, hidden=4096, num_experts=64, top_k=4),
@@ -94,6 +97,45 @@ def _alloc_outputs(num_experts: int, m_max: int, hidden: int, *, device: str):
         (num_experts, scale_k_padded // 4, m_padded), dtype=torch.int32, device=device
     )
     return output_q, output_s
+
+
+@skip_unsupported
+def test_skip_data_expand_omits_unused_outputs() -> None:
+    num_rows, hidden, num_experts, top_k = 4, 512, 8, 4
+    x = torch.randn((num_rows, hidden), device="cuda", dtype=torch.float32)
+    token_selected_experts = torch.arange(top_k, device="cuda", dtype=torch.int32).repeat(
+        num_rows, 1
+    )
+    token_final_scales = torch.full(
+        (num_rows, top_k), 1.0 / top_k, device="cuda", dtype=torch.float32
+    )
+
+    outputs = torch.ops.trtllm.moe_permute_op(
+        x,
+        token_selected_experts,
+        token_final_scales,
+        None,
+        None,
+        None,
+        input_sf=None,
+        num_experts_on_rank=num_experts,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        cluster_size=1,
+        cluster_rank=0,
+        min_latency_mode=False,
+        use_fp8_block_scaling=False,
+        skip_data_expand=True,
+    )
+
+    permuted_row_to_unpermuted_row_tensor = outputs[0]
+    permuted_data_tensor = outputs[2]
+    permuted_token_final_scales_tensor = outputs[4]
+    assert permuted_row_to_unpermuted_row_tensor.numel() == num_rows * top_k
+    assert permuted_data_tensor.shape == (0, hidden)
+    assert permuted_token_final_scales_tensor.shape == (0,)
 
 
 @skip_unsupported
@@ -156,6 +198,54 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
     # hold; moe_permute_op produces it in fp32.
     assert permuted_data_tensor.dtype == torch.float32
 
+    # The fused path needs only the permutation maps. Verify that skipping the
+    # expand copy preserves those maps without retaining the top-k-materialized
+    # activation and scale buffers.
+    (
+        fused_permuted_row_to_unpermuted_row_tensor,
+        _fused_permuted_token_selected_experts_tensor,
+        skipped_permuted_data_tensor,
+        fused_expert_first_token_offset_tensor,
+        skipped_permuted_token_final_scales_tensor,
+        _fused_unpermuted_row_to_permuted_row_tensor,
+    ) = torch.ops.trtllm.moe_permute_op(
+        x[:, :0],
+        token_selected_experts,
+        token_final_scales,
+        None,
+        None,
+        None,
+        input_sf=None,
+        num_experts_on_rank=num_experts_per_node,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        cluster_size=cluster_size,
+        cluster_rank=cluster_rank,
+        min_latency_mode=False,
+        use_fp8_block_scaling=False,
+        skip_data_expand=True,
+    )
+
+    assert skipped_permuted_data_tensor.numel() == 0
+    # Newer operator libraries omit the unused scales too. Older libraries may
+    # retain this small 1-D return, but the top-k activation storage must be
+    # empty in either case.
+    assert skipped_permuted_token_final_scales_tensor.dim() == 1
+    torch.testing.assert_close(
+        fused_permuted_row_to_unpermuted_row_tensor,
+        permuted_row_to_unpermuted_row_tensor,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        fused_expert_first_token_offset_tensor,
+        expert_first_token_offset_tensor,
+        rtol=0,
+        atol=0,
+    )
+
     _masked_m, token_to_expert_map = preprocess_after_permute(
         expert_first_token_offset_tensor, permuted_data_tensor.shape[0]
     )
@@ -179,8 +269,8 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
         out_q_new,
         out_s_new,
         x,
-        permuted_row_to_unpermuted_row_tensor,
-        expert_first_token_offset_tensor,
+        fused_permuted_row_to_unpermuted_row_tensor,
+        fused_expert_first_token_offset_tensor,
         token_to_expert_map,
         experts_per_token=top_k,
         group_size=GROUP_SIZE,
