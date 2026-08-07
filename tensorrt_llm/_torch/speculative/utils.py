@@ -99,8 +99,7 @@ def _pattern_to_mtp_layers_block_type(pattern: str) -> list:
     except KeyError as exc:
         raise ValueError(
             f"Invalid mtp_hybrid_override_pattern {pattern!r}: "
-            f"expected characters in {sorted(_MTP_PATTERN_TO_LAYER)}"
-        ) from exc
+            f"expected characters in {sorted(_MTP_PATTERN_TO_LAYER)}") from exc
 
 
 def _is_mtp_checkpoint_weight_key(key: str) -> bool:
@@ -130,9 +129,9 @@ def select_mtp_checkpoint_weights(weights: dict) -> dict:
 
 
 def remap_preprocessed_mtp_weights_for_draft_model(
-        weights: dict,
-        num_hidden_layers: int,
-        num_mtp_layers: int,
+    weights: dict,
+    num_hidden_layers: int,
+    num_mtp_layers: int,
 ) -> dict:
     """Map ``model.layers.{{N[+h]}}.*`` keys onto ``mtp_layers.{{h}}.*``.
 

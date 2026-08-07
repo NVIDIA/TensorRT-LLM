@@ -553,8 +553,9 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
-            loads_draft_weights = (self.spec_config is not None
-                                   and self.spec_config.needs_separate_draft_weights)
+            loads_draft_weights = (
+                self.spec_config is not None
+                and self.spec_config.needs_separate_draft_weights)
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,
@@ -1108,7 +1109,7 @@ class ModelLoader:
             draft_weight_mapper = AutoCheckpointMapper.get(
                 checkpoint_loader.checkpoint_format, draft_model_arch)
             draft_weight_mapper.init_model_and_config(model.draft_model,
-                                                     model.draft_config)
+                                                      model.draft_config)
         else:
             # MTP one-model + separate MTP checkpoint: no draft HF architecture.
             draft_weight_mapper = self.weight_mapper

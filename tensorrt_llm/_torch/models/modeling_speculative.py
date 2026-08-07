@@ -2135,8 +2135,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             return []
         head_ids = {id(layer) for layer in mtp_layers}
         return [
-            name
-            for name, module in self.named_modules(remove_duplicate=False)
+            name for name, module in self.named_modules(remove_duplicate=False)
             if name and id(module) in head_ids
         ]
 
