@@ -1613,12 +1613,19 @@ class PyTorchModelEngine(ModelEngine):
             if method.needs_flashinfer_autotune
         ]
 
-        # Every TP rank must make the same backend decision before any rank
-        # returns or enters a tuning forward with TP collectives.
-        if self.mapping.tp_size > 1:
+        # Every TP and PP rank must make the same backend decision before any
+        # rank returns or enters a tuning forward with model collectives.
+        if self.mapping.tp_size > 1 or self.mapping.has_pp():
             local_flashinfer_enabled = int(bool(flashinfer_mxfp8_methods))
-            all_flashinfer_enabled = list(
-                self.dist.tp_allgather(local_flashinfer_enabled))
+            all_flashinfer_enabled = [local_flashinfer_enabled]
+            if self.mapping.tp_size > 1:
+                all_flashinfer_enabled = list(
+                    self.dist.tp_allgather(local_flashinfer_enabled))
+            if self.mapping.has_pp():
+                all_flashinfer_enabled = [
+                    enabled for stage_flags in self.dist.pp_allgather(
+                        all_flashinfer_enabled) for enabled in stage_flags
+                ]
             if any(all_flashinfer_enabled) and not all(all_flashinfer_enabled):
                 forced_flashinfer = any(method.backend == "flashinfer"
                                         for method in mxfp8_methods)
@@ -1628,9 +1635,9 @@ class PyTorchModelEngine(ModelEngine):
                 if forced_flashinfer:
                     raise RuntimeError(
                         "FlashInfer MXFP8 was explicitly requested but is not "
-                        "available on every TP rank")
+                        "available on every TP/PP rank")
                 logger.warning(
-                    "FlashInfer MXFP8 availability differs across TP ranks; "
+                    "FlashInfer MXFP8 availability differs across TP/PP ranks; "
                     "using the native TensorRT-LLM GEMM backend on every rank.")
 
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)

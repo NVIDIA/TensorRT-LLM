@@ -489,7 +489,7 @@ class TestWarmupCleanup(unittest.TestCase):
         engine.forward.assert_not_called()
 
     def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
-        """TP ranks agree on native fallback before entering the tuning forward."""
+        """TP and PP ranks agree on fallback before the tuning forward."""
         flashinfer_module = ModuleType("flashinfer")
         flashinfer_module.mm_mxfp8 = Mock()
         flashinfer_module.autotune = Mock(return_value=contextlib.nullcontext())
@@ -501,7 +501,10 @@ class TestWarmupCleanup(unittest.TestCase):
             profiling_cache={},
             print_profiling_cache=Mock(),
         )
-        dist = SimpleNamespace(tp_allgather=Mock(return_value=[1, 0]))
+        dist = SimpleNamespace(
+            tp_allgather=Mock(return_value=[1, 1]),
+            pp_allgather=Mock(return_value=[[1, 1], [1, 0]]),
+        )
 
         with (
             patch.dict(sys.modules, {"flashinfer": flashinfer_module}),
@@ -527,7 +530,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 batch_size=16,
                 max_seq_len=2,
                 original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=2, has_pp=lambda: False),
+                mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
                 is_draft_model=False,
                 guided_decoder=None,
@@ -560,6 +563,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
 
         dist.tp_allgather.assert_called_once_with(1)
+        dist.pp_allgather.assert_called_once_with([1, 1])
         self.assertEqual(method.backend, "trtllm")
         self.assertTrue(method._native_autotuned)
         self.assertFalse(method._flashinfer_autotuned)

@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import sys
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -305,6 +307,7 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
 
 
 def test_mxfp8_native_autotuner_syncs_profiles():
+    initial_cache_count = len(MXFP8GemmRunner.synced_cache_keys)
     runner = object.__new__(MXFP8GemmRunner)
     runner.output_dtype = torch.bfloat16
     runner.sm_version = 100
@@ -322,13 +325,29 @@ def test_mxfp8_native_autotuner_syncs_profiles():
         str(runner.unique_id()),
         profile,
     )
-    profiling_cache = Mock()
+    profiling_cache = Mock(generation=0)
     profiling_cache.get_specific_custom_op.return_value = {cache_key: (0, 17, 0.25)}
 
-    runner.sync_tactic_cache(SimpleNamespace(profiling_cache=profiling_cache))
-    runner.sync_tactic_cache(SimpleNamespace(profiling_cache=profiling_cache))
+    tuner = Mock(profiling_cache=profiling_cache)
+    runner.sync_tactic_cache(tuner)
+    runner.sync_tactic_cache(tuner)
 
     runner.mxfp8_gemm_runner.register_tactic.assert_called_once_with(8192, 9216, 6144, 17)
+    profiling_cache.generation = 1
+    runner.sync_tactic_cache(tuner)
+    assert runner.mxfp8_gemm_runner.register_tactic.call_count == 2
+
+    replacement_cache = Mock(generation=0)
+    replacement_cache.get_specific_custom_op.return_value = {cache_key: (0, 17, 0.25)}
+    tuner.profiling_cache = replacement_cache
+    runner.sync_tactic_cache(tuner)
+    assert runner.mxfp8_gemm_runner.register_tactic.call_count == 3
+
+    cache_ref = weakref.ref(profiling_cache)
+    del profiling_cache
+    gc.collect()
+    assert cache_ref() is None
+    assert len(MXFP8GemmRunner.synced_cache_keys) == initial_cache_count + 1
 
 
 def test_mxfp8_rejects_unknown_backend(monkeypatch):

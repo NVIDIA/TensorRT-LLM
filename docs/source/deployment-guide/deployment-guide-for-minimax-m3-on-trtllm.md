@@ -106,8 +106,9 @@ For MXFP8 checkpoints, TensorRT LLM selects the GEMM backend automatically.
 performance experiments:
 
 * `trtllm` uses the native TensorRT LLM GEMM for eager execution and CUDA graphs.
-* `flashinfer` forces FlashInfer for both eager execution and CUDA graphs; it
-  requires the pinned `flashinfer-python` package and Blackwell MXFP8 support.
+* `flashinfer` forces FlashInfer for eligible captured decode CUDA graphs; eager,
+  context/prefill, and piecewise CUDA-graph execution remain on the native GEMM.
+  It requires the pinned `flashinfer-python` package and Blackwell MXFP8 support.
 * `auto` keeps eager execution on the native GEMM and uses FlashInfer in
   captured decode CUDA graphs after startup tuning.
 

@@ -19,6 +19,7 @@ import threading
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
+from weakref import WeakKeyDictionary
 
 import torch
 import triton  # type: ignore[import]
@@ -32,9 +33,9 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+from ..autotuner import (AutoTuner, AutoTunerProfilingCache, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -582,9 +583,17 @@ def _mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
 
 
 class MXFP8GemmRunner(TunableRunner):
+    """Autotunable native MXFP8 GEMM runner with a serving tactic cache.
+
+    Args:
+        output_dtype: Output element type. Supported types are FP16, BF16, and
+            FP32.
+    """
+
     runner_dict = dict()
-    synced_cache_keys: ClassVar[dict[tuple[torch.dtype, int, int], set[tuple]]]
-    synced_cache_keys = {}
+    synced_cache_keys: ClassVar[WeakKeyDictionary[AutoTunerProfilingCache, dict[
+        tuple[torch.dtype, int], tuple[int,
+                                       set[tuple]]]]] = WeakKeyDictionary()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, _get_mxfp8_large_m_tuning_buckets,
         _map_to_mxfp8_large_m_bucket), ),
@@ -592,7 +601,7 @@ class MXFP8GemmRunner(TunableRunner):
                                      1, 0, _mxfp8_scale_infer_shape), ),
                                  use_cuda_graph=False)
 
-    def __init__(self, output_dtype: torch.dtype):
+    def __init__(self, output_dtype: torch.dtype) -> None:
         self.output_dtype = output_dtype
         self.sm_version = get_sm_version()
         instance_key = (output_dtype, self.sm_version)
@@ -615,10 +624,16 @@ class MXFP8GemmRunner(TunableRunner):
         """Register newly profiled tactics in the native serving cache."""
         runner_name = self.__class__.__name__
         unique_id = str(self.unique_id())
-        cache = tuner.profiling_cache.get_specific_custom_op(
-            _MXFP8_AUTOTUNED_OP)
-        sync_key = (*self.unique_id(), id(tuner.profiling_cache))
-        synced_cache_keys = self.synced_cache_keys.setdefault(sync_key, set())
+        profiling_cache = tuner.profiling_cache
+        cache = profiling_cache.get_specific_custom_op(_MXFP8_AUTOTUNED_OP)
+        runner_sync_state = self.synced_cache_keys.setdefault(
+            profiling_cache, {})
+        generation, synced_cache_keys = runner_sync_state.get(
+            self.unique_id(), (-1, set()))
+        if generation != profiling_cache.generation:
+            generation, synced_cache_keys = profiling_cache.generation, set()
+            runner_sync_state[self.unique_id()] = (generation,
+                                                   synced_cache_keys)
         for cache_key, (_runner_id, tactic, _min_time) in cache.items():
             if cache_key in synced_cache_keys:
                 continue
@@ -662,6 +677,21 @@ def mxfp8_mxfp8_gemm_autotuned(
     global_scale: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Run an autotuned native MXFP8-by-MXFP8 matrix multiplication.
+
+    Args:
+        act: Row-major MXFP8 activation tensor with shape ``[M, K]``.
+        act_scale: Swizzled UE8M0 activation scales.
+        weight: MXFP8 weight tensor with logical shape ``[N, K]`` and the
+            column-major storage expected by CUTLASS.
+        weight_scale: Swizzled UE8M0 weight scales.
+        global_scale: FP32 scalar tensor applied by the GEMM epilogue.
+        output_dtype: Output element type. Supported types are FP16, BF16, and
+            FP32.
+
+    Returns:
+        Output tensor with shape ``[M, N]`` and dtype ``output_dtype``.
+    """
     tuner = AutoTuner.get()
     runner = MXFP8GemmRunner(output_dtype)
     inputs = [act, act_scale, weight, weight_scale, global_scale]

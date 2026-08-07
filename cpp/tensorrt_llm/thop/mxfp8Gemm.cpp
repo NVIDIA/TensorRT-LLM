@@ -240,9 +240,12 @@ at::Tensor mxfp8_mxfp8_gemm(at::Tensor const& act, at::Tensor const& actScale, a
         /*useTacticCache=*/true);
 }
 
+//! Profiles native MXFP8 GEMM tactics and registers selected tactics in the serving cache.
 class MXFP8GemmRunner : public torch::CustomClassHolder
 {
 public:
+    //! Constructs a runner for the requested output element type.
+    //! \param outputDtype Output type; supported values are FP16, BF16, and FP32.
     explicit MXFP8GemmRunner(at::ScalarType outputDtype)
         : mOutputDtype(outputDtype)
     {
@@ -251,6 +254,14 @@ public:
         mConfigs = CutlassFp4GemmRunner<half, FP4GemmType::W8A8_MXFP8_MXFP8>{}.getConfigs();
     }
 
+    //! Runs one MXFP8 GEMM with a selected compiled tactic.
+    //! \param act Row-major MXFP8 activation tensor with shape [M, K].
+    //! \param actScale Swizzled UE8M0 activation scales.
+    //! \param weight MXFP8 weight tensor with logical shape [N, K].
+    //! \param weightScale Swizzled UE8M0 weight scales.
+    //! \param globalScale FP32 scalar tensor applied by the epilogue.
+    //! \param configIdx Compiled tactic index, or -1 for the generic fallback.
+    //! \return Output tensor with shape [M, N].
     at::Tensor runGemm(at::Tensor const& act, at::Tensor const& actScale, at::Tensor const& weight,
         at::Tensor const& weightScale, at::Tensor const& globalScale, int64_t configIdx) const
     {
@@ -259,23 +270,27 @@ public:
             act, actScale, weight, weightScale, globalScale, mOutputDtype, &config, /*useTacticCache=*/false);
     }
 
+    //! Registers a compiled tactic for a serving shape.
     void registerTactic(int64_t const m, int64_t const n, int64_t const k, int64_t const configIdx) const
     {
         tkc::CutlassGemmConfig const config = configIdx == -1 ? getDefaultMxfp8GemmConfig() : getConfig(configIdx);
         cacheMxfp8Tactic(m, n, k, mOutputDtype, config, configIdx);
     }
 
+    //! Returns the registered tactic for a serving shape, or the cache-miss sentinel.
     int64_t getCachedTactic(int64_t const m, int64_t const n, int64_t const k) const
     {
         auto const entry = findMxfp8TacticCacheEntry(m, n, k, mOutputDtype);
         return entry.has_value() ? entry->tactic : kMxfp8TacticCacheMiss;
     }
 
+    //! Removes every registered MXFP8 serving tactic.
     void clearTacticCache() const
     {
         clearMxfp8CachedTactics();
     }
 
+    //! Returns the number of compiled native tactics available for profiling.
     int64_t getNumConfigs() const
     {
         return static_cast<int64_t>(mConfigs.size());
