@@ -2,11 +2,13 @@
 
 ## Overview
 
-In previous tech blogs, we introduced the [Scaffolding framework](https://nvidia.github.io/TensorRT-LLM/latest/blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html) for inference-time compute and showed how it enables [joint optimization of agent applications and TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/latest/blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html). This blog addresses the question that naturally comes next: **how do we measure whether a serving system is actually good at agentic workloads?**
+**How do we measure whether a serving system is actually good at agentic workloads?**
 
 Conventional benchmarks issue independent requests with fixed input and output lengths (ISL/OSL). A real agent task instead unfolds as a long-lived *job*: a shared system prompt is reused across many turns, the conversation grows as the agent reasons and invokes tools, sub-agents may run in parallel, and branches synchronize before the job completes. These behaviors — prefix reuse, tool-call gaps, parallel branching — are exactly what govern serving efficiency, and none of them is visible to a fixed-shape benchmark. Nor can such a benchmark answer the question practitioners actually ask: how many agent tasks does a GPU complete per hour?
 
 We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate the result with **job-level metrics** that complement conventional token-level ones. The framework code lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with runnable examples under [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
+
+Benchmarking practice for agentic scenarios is still taking shape, and the industry will gradually converge on a common methodology — efforts such as Agent Perf are already moving in that direction. We do not claim a standard here. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
 
 ## The Trace-Replay Framework
 
@@ -59,20 +61,9 @@ if enable_tracing:
 
 The example agents already wire this up behind a flag, so collecting a trace is one CLI switch (`--enable_tracing`). Replay then follows a few fixed rules: each call keeps its recorded ISL/OSL but is filled with random token IDs; all replay copies share the same synthetic system-prompt prefix, so prefix caching is exercised rather than bypassed; tool calls become timed sleeps of the recorded duration; and concurrency is created by replaying many copies of the same trace at once. Internally, the `ReplayEngine` runs one queue per branch path so parallel sections and join points run concurrently rather than serialized.
 
-Replaying the bundled example trace against a running `trtllm-serve` endpoint takes one command:
-
-```bash
-python examples/scaffolding/trace_replay/run_trace_replay.py \
-  examples/scaffolding/trace_replay/trace_example/matplotlib__matplotlib-23412/matplotlib__matplotlib-23412.trace.json \
-  --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
-  --openai-base-url http://127.0.0.1:8000/v1
-```
+A bundled example trace replays against any running `trtllm-serve` endpoint; the runnable scripts and their usage live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
 The framework also includes an offline analyzer that needs no GPU: it walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**, which we compare against engine-measured hit rates below.
-
-```bash
-python examples/scaffolding/trace_replay/analysis/compute_cache_hit_trace.py path/to/dataset/
-```
 
 ## Trace Dataset and Setup
 
@@ -96,7 +87,7 @@ Inference systems are conventionally compared with token-level Pareto curves (to
 
 The two axes are:
 
-- **Job-level interactivity — jobs/h/user**: 3600 divided by the mean end-to-end job latency.
+- **Job-level interactivity — jobs/h/user**: 3600 s divided by the mean end-to-end job latency in seconds.
 - **Job-level throughput — jobs/h/GPU**: completed jobs per hour, normalized by GPU count.
 
 Because a single agent job runs for minutes, both are measured over a steady-state window: the shared system prompt is preloaded so it is a cache hit from the first call, session starts are staggered with a jittered ramp-up so identical copies do not stay phase-aligned, and a job is credited only if it completes inside the window.
@@ -152,6 +143,8 @@ Single-request benchmarks conventionally set C = B and fill every batch slot. Ag
 - **Single-branch agents (Coder): stay near B = C.** Tool-call gaps mean fewer than C requests are on the server at any instant, so the batch runs underfilled at C = B (averaging ~51 of 64 slots in our sweep). But raising C above B to fill the batch adds more queuing delay than the underfill costs — especially since CUDA-graph batch padding makes a slightly underfilled batch nearly free. Figure 6 sweeps the full (B, C) grid for the Coder trace: the job-level frontier stays close to the B = C diagonal.
 - **Fan-out agents (Open Deep Research): B well above C.** One session issues multiple concurrent requests during its fan-out phase, so the server sees more requests in flight than sessions. Figure 7 repeats the sweep for the Open Deep Research trace, and the contrast with Figure 6 is stark: the frontier sits not on the diagonal but mostly at B = 2C and B = 4C. The branch multiplicity, not the session count, sets the batch size the server needs.
 
+Fan-out also makes the serving behavior harder to reason about in general. A single session no longer maps to a single in-flight request, so the load a server actually sees depends on how many branches are open at each moment — which varies within a job and across agent architectures. The best (B, C) point therefore leaves the diagonal and moves with the branching structure, and the configuration space to search grows accordingly. Finding a good configuration by intuition or by a fixed-shape benchmark is unlikely; it takes a reproducible replay of the real branching structure, which is what the trace-replay framework provides.
+
 <div align="center">
     <img src="../media/tech_blog26_coder_bc_frontier.png" alt="Job-level Pareto frontier over a (B, C) sweep for the Coder trace" width="900px">
 </div>
@@ -167,11 +160,13 @@ Single-request benchmarks conventionally set C = B and fill every batch slot. Ag
 - **Trace-and-replay makes agentic serving measurable.** Recording each agent run once and replaying it structure-faithfully preserves the behaviors fixed-shape benchmarks miss — prefix reuse, tool-call gaps, and parallel branching — and job-level Pareto metrics report serving performance as completed work: jobs per hour per user and per GPU.
 - **Token-level and job-level metrics can disagree** on both the best parallel strategy and the best batch size; only the job-level view follows the end-to-end latency a user actually experiences.
 - **Prefix caching sets the ceiling for multi-turn serving.** The hit rate holds at its optimum until the cache overflows, then job-level throughput drops in lockstep with it; host offloading (`kv_cache_config.host_cache_size`) pushes the cliff back.
-- **Configure batch size by branching structure**: near B = C for single-branch agents, B several times C for fan-out agents.
+- **Configure batch size by branching structure**: near B = C for single-branch agents, B several times C for fan-out agents. Fan-out widens the configuration space and makes a good setting harder to find, which is precisely where reproducible replay pays off.
 
 ## Future Work
 
-We plan to extend the trace dataset with more agent architectures, publish traces for community benchmarking, and use the framework as a reproducible testbed for agent-aware serving features — KV-cache-aware routing, proactive cache management, and agent-aware scheduling introduced in [our previous blog](https://nvidia.github.io/TensorRT-LLM/latest/blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html) — evaluated directly on job-level metrics. We invite the community to collect traces from their own Scaffolding agents with `--enable_tracing`, replay them against their deployments, and share findings.
+Agent workloads are still moving fast: architectures, context-management strategies, and tool usage all keep changing, and with them the shapes that reach the serving system. We will therefore keep tracking the workload characteristics of real agentic scenarios, and let those measurements drive what we optimize — so that TensorRT-LLM's performance work lands where it matters in real deployments rather than only on synthetic benchmarks.
+
+Concretely, we plan to extend the trace dataset with more agent architectures, publish traces for community benchmarking, and use the framework as a reproducible testbed for agent-aware serving features — KV-cache-aware routing, proactive cache management, and agent-aware scheduling introduced in [our previous blog](https://nvidia.github.io/TensorRT-LLM/latest/blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html) — evaluated directly on job-level metrics. We invite the community to collect traces from their own Scaffolding agents with `--enable_tracing`, replay them against their deployments, and share findings.
 
 ## Acknowledgements
 
