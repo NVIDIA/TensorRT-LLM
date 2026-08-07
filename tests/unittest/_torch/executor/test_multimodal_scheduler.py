@@ -937,7 +937,23 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
 
 def test_mm_encoder_state_enforces_lengths_slot_invariant():
     with pytest.raises(ValueError, match="one entry per item slot"):
-        MultimodalEncoderRequestState(embedding_lengths=[2], recorded=[False, False])
+        MultimodalEncoderRequestState(
+            embedding_lengths=[2], encoder_token_lengths=[4], recorded=[False, False]
+        )
+
+
+def test_mm_encoder_state_copies_validated_scheduler_costs_at_admission():
+    request = _request(1, [4, 7])
+
+    assert request.py_mm_encoder_state.encoder_token_lengths == [4, 7]
+
+    metadata = request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    metadata.encoder_token_lengths[0] = 100
+    assert request.py_mm_encoder_state.encoder_token_lengths == [4, 7]
+
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=11)
+    output = scheduler.schedule_request([request], set())
+    assert output.scheduled_mm_encoder_items == {1: [0, 1]}
 
 
 def test_mm_encoder_state_progress_and_pending_transitions():

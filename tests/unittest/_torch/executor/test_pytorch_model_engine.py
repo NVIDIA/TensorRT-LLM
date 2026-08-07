@@ -1411,14 +1411,14 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 self.setup_args = None
                 self.max_seq_len = None
 
-            def setup_attn_metadata(self, max_num_requests: int,
+            def setup_attn_metadata(self, max_num_items: int,
                                     max_num_tokens: int) -> None:
-                self.setup_args = (max_num_requests, max_num_tokens)
+                self.setup_args = (max_num_items, max_num_tokens)
 
             def set_attn_max_seq_len(self, max_seq_len: int) -> None:
                 self.max_seq_len = max_seq_len
 
-        encoder_batch_size = 32
+        encoder_max_num_items = 32
         encoder_max_num_tokens = 16384
         processor_max_num_tokens = 65536
         cases = [
@@ -1436,8 +1436,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 encoder = CapturingEncoder()
                 model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
                 model_engine.model = torch.nn.Sequential(encoder)
-                model_engine.encoder_batch_size = encoder_batch_size
+                model_engine.encoder_max_num_items = encoder_max_num_items
                 model_engine.encoder_max_num_tokens = encoder_max_num_tokens
+                model_engine.mm_encoder_attention_metadata_capacity = None
                 if max_tokens_per_item is None:
                     model_engine.input_processor = Mock()
                 else:
@@ -1447,8 +1448,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
                 model_engine._set_up_multimodal_encoder_attn_metadata()
 
-                self.assertEqual(encoder.setup_args,
-                                 (encoder_batch_size, encoder_max_num_tokens))
+                self.assertEqual(
+                    encoder.setup_args,
+                    (encoder_max_num_items, encoder_max_num_tokens))
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
 
     def test_pad_generation_requests(self) -> None:

@@ -121,6 +121,13 @@ class MultimodalEncoderRequestState:
     """Declared embedding row count of each atomic item, in prompt order.
     `record()` validates incoming tensors against these."""
 
+    encoder_token_lengths: List[int]
+    """Validated encoder attention-token cost of each atomic item.
+
+    Admission copies these values from the request metadata so scheduling
+    never has to re-validate user input inside the scheduler loop.
+    """
+
     recorded: List[bool]
     """Whether each atomic item has been written into `embeddings`, in prompt
     order."""
@@ -141,9 +148,15 @@ class MultimodalEncoderRequestState:
 
     @classmethod
     def from_embedding_lengths(
-            cls,
-            embedding_lengths: List[int]) -> "MultimodalEncoderRequestState":
+        cls,
+        embedding_lengths: List[int],
+        *,
+        encoder_token_lengths: Optional[List[int]] = None
+    ) -> "MultimodalEncoderRequestState":
+        if encoder_token_lengths is None:
+            encoder_token_lengths = embedding_lengths
         return cls(embedding_lengths=list(embedding_lengths),
+                   encoder_token_lengths=list(encoder_token_lengths),
                    recorded=[False] * len(embedding_lengths))
 
     @classmethod
@@ -166,9 +179,10 @@ class MultimodalEncoderRequestState:
         return state.embeddings
 
     def __post_init__(self) -> None:
-        if len(self.embedding_lengths) != len(self.recorded):
-            raise ValueError("MM encoder embedding lengths must have exactly "
-                             "one entry per item slot")
+        if not (len(self.embedding_lengths) == len(self.encoder_token_lengths)
+                == len(self.recorded)):
+            raise ValueError("MM encoder token and embedding lengths must have "
+                             "exactly one entry per item slot")
         # Row offsets are fixed once the declared lengths are known, so derive
         # them here rather than re-summing the prefix on every `record()`
         # (quadratic in the item count, and every caller now routes through
@@ -1471,7 +1485,7 @@ def initialize_multimodal_encoder_request(
                     ))
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
-                embedding_lengths))
+                embedding_lengths, encoder_token_lengths=token_lengths))
 
 
 def is_multimodal_encoder_ready(request: LlmRequest) -> bool:

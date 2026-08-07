@@ -22,7 +22,6 @@ from ..llm_request import (
     LlmRequest,
     LlmRequestState,
     format_multimodal_encoder_output_budget_error,
-    get_multimodal_encoder_token_lengths,
     is_multimodal_encoder_ready,
 )
 
@@ -637,18 +636,11 @@ class MultimodalScheduler(RequestScheduler):
                 llm_eligible.append(request)
                 continue
 
-            token_lengths = get_multimodal_encoder_token_lengths(request)
-            if token_lengths is None:
-                raise ValueError(
-                    f"Multimodal request {request.py_request_id} is missing "
-                    "multimodal_encoder_item_metadata"
-                )
-            if len(token_lengths) != state.num_items:
-                raise ValueError(
-                    f"Multimodal request {request.py_request_id} has "
-                    f"{state.num_items} item slots but {len(token_lengths)} "
-                    "encoder token lengths"
-                )
+            # Admission validates user-provided item metadata and stores an
+            # owned copy on the request state. Reading only that state here
+            # keeps malformed-input failures scoped to the affected request
+            # instead of raising from the scheduler loop.
+            token_lengths = state.encoder_token_lengths
 
             pending = state.pending_item_indices()
             # The first item scheduled for a request allocates the storage for

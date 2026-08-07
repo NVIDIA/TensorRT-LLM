@@ -97,11 +97,8 @@ class MultimodalEncoderItemMetadata(NamedTuple):
         if not all(isinstance(values, list) for values in self):
             raise TypeError(
                 "Multimodal encoder item metadata fields must be lists")
-        if not all(
-                isinstance(length, int)
-                for lengths in (self.encoder_token_lengths,
-                                self.output_embedding_lengths)
-                for length in lengths):
+        lengths = (self.encoder_token_lengths + self.output_embedding_lengths)
+        if not all(isinstance(length, int) for length in lengths):
             raise TypeError(
                 "Multimodal encoder item lengths must contain only integers")
         if not (len(self.item_refs) == len(self.encoder_token_lengths) == len(
