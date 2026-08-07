@@ -1080,11 +1080,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._get_event_layer_group_ids(),
             )
 
+        # Both backends build layer_grouping on demand, and the layer order
+        # within a group is not part of its contract. Cache a stable
+        # config-order representative for each role in each logical group.
         self.num_pools = len(self.impl.layer_grouping)
-        # num_pools is the physical pool count owned by the KV cache manager.
-        # With SWA scratch reuse, scratch slot IDs are only valid with
-        # per-layer page indices, so the attention op sees one virtual pool per
-        # local layer while the underlying manager can still group layers.
+        self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
+        for layer in config.layers:
+            pool_id = int(self.impl.get_layer_group_id(layer.layer_id))
+            for buffer in layer.buffers:
+                self._pool_layer_ids_by_role.setdefault((pool_id, buffer.role), layer.layer_id)
+        # num_pools is the logical layer-group count. With SWA scratch reuse,
+        # scratch slot IDs are only valid with per-layer page indices, so the
+        # attention op sees one virtual pool per local layer while the
+        # underlying manager can still group layers.
         if self.enable_swa_scratch_reuse:
             self.num_attention_op_pools = self.num_local_layers
         else:
@@ -1192,6 +1200,15 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return Role.KEY_BLOCK_SCALE
 
+    def _get_pool_layer_id(self, pool_id: int, role: DataRole) -> LayerId:
+        """Return a stable config-order representative for a pool role."""
+        try:
+            return self._pool_layer_ids_by_role[(pool_id, role)]
+        except KeyError as error:
+            raise ValueError(
+                f"Logical layer group {pool_id} has no layer with role {role}"
+            ) from error
+
     def _build_pool_mapping_tensors(self):
         """Build the (kv_cache_pool_pointers, kv_cache_pool_mapping) tensors.
 
@@ -1228,8 +1245,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache_pool_mapping_list.append([int(layer_id), 0])
         else:
             for pool_id in range(self.num_pools):
-                layer_id = self.impl.layer_grouping[pool_id][0]
                 role_a, _ = self._get_pool_roles(pool_id)
+                layer_id = self._get_pool_layer_id(pool_id, role_a)
                 key_base_addr = self.impl.get_mem_pool_base_address(
                     layer_id, role_a, PageIndexMode.SHARED
                 )
@@ -1342,8 +1359,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
         for pool_id in range(self.num_pools):
-            layer_id = self.impl.layer_grouping[pool_id][0]
             role_a, role_b = self._get_pool_roles(pool_id)
+            layer_id = self._get_pool_layer_id(pool_id, role_a)
             self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, role_a)
             if role_b is not None:
                 self.kv_offset[pool_id] = exact_div(

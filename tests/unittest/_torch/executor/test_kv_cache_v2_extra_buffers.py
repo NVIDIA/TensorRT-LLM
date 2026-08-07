@@ -12,6 +12,7 @@
 
 import gc
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -20,7 +21,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -185,6 +186,64 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
                     self.assertEqual(roles, [Role.KEY, Role.VALUE])
                     self.assertNotIn(Role.INDEX_KEY, roles)
         finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_pool_role_representative_uses_first_config_layer_with_role(self):
+        mgr = _IndexKeyOnSparseLayersV2(sparse_layer_ids=[2, 3], **_make_kwargs(num_layers=4))
+        try:
+            pool_id = int(mgr.impl.get_layer_group_id(2))
+            self.assertEqual(int(mgr.impl.get_layer_group_id(0)), pool_id)
+
+            layer_zero = mgr.kv_cache_manager_py_config.layers[0]
+            self.assertNotIn(Role.INDEX_KEY, [buffer.role for buffer in layer_zero.buffers])
+            self.assertEqual(
+                int(mgr._get_pool_layer_id(pool_id, Role.INDEX_KEY)),
+                2,
+                "the representative must be the first config-order layer that owns the role",
+            )
+        finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_pool_mapping_ignores_reordered_layer_grouping(self):
+        mgr = KVCacheManagerV2(**_make_kwargs(num_layers=4))
+        real_impl = mgr.impl
+        try:
+            self.assertEqual(mgr.num_pools, 1)
+            pool_id = 0
+            expected_layer_id = mgr._get_pool_layer_id(pool_id, Role.KEY)
+            config_group = tuple(
+                layer.layer_id
+                for layer in mgr.kv_cache_manager_py_config.layers
+                if int(real_impl.get_layer_group_id(layer.layer_id)) == pool_id
+            )
+            self.assertGreater(len(config_group), 1)
+            reordered_grouping = (config_group[1:] + config_group[:1],)
+            reordered_first_layer_id = reordered_grouping[pool_id][0]
+            self.assertNotEqual(expected_layer_id, reordered_first_layer_id)
+
+            expected_base_address = real_impl.get_mem_pool_base_address(
+                expected_layer_id, Role.KEY, PageIndexMode.SHARED
+            )
+
+            impl_proxy = Mock(wraps=real_impl)
+            impl_proxy.layer_grouping = reordered_grouping
+            mgr.impl = impl_proxy
+            mgr._prepare_page_table_tensor(index_mapper_capacity=1)
+
+            self.assertEqual(
+                impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
+                (expected_layer_id, Role.KEY, PageIndexMode.SHARED),
+                "the pool pointer origin must use the config-order representative",
+            )
+            self.assertEqual(
+                int(mgr.kv_cache_pool_pointers[pool_id, 0]),
+                int(expected_base_address),
+            )
+            impl_proxy.get_page_index_scale.assert_called_once_with(expected_layer_id, Role.KEY)
+        finally:
+            mgr.impl = real_impl
             mgr.shutdown()
             del mgr
 

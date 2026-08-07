@@ -3985,3 +3985,40 @@ class TestDeepseekTransceiverPreference:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.parametrize(
+    "architecture,user_setting,expected",
+    [
+        ("DeepseekV32ForCausalLM", "auto", True),
+        ("DeepseekV32ForCausalLM", False, False),
+        ("DeepseekV3ForCausalLM", "auto", True),
+        ("GlmMoeDsaForCausalLM", "auto", True),
+        ("MistralLarge3ForCausalLM", "auto", True),
+    ],
+)
+def test_deepseek_v3_family_kv_cache_manager_v2_default(architecture,
+                                                        user_setting, expected):
+    """Models backed by the shared V3 implementation select V2 by default."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    checkpoint_loader = MagicMock()
+    checkpoint_loader.load_config.return_value = SimpleNamespace(
+        pretrained_config=PretrainedConfig(architectures=[architecture]),
+        mm_encoder_only=False,
+        spec_config=None,
+    )
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting),
+    )
+
+    ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", llm_args,
+                                               checkpoint_loader)
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected
