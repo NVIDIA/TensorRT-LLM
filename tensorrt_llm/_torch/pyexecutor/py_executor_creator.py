@@ -854,6 +854,14 @@ def create_py_executor(
                 "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
             )
 
+        if spec_config is not None and not spec_config.is_linear_tree:
+            raise NotImplementedError(
+                "KV cache connector with non-linear-tree speculative decoding "
+                "(e.g. Eagle) is not supported yet. The connector's per-request "
+                "block bookkeeping is not trimmed after rewind, which can cause "
+                "hangs in get_finished. See "
+                "https://github.com/NVIDIA/TensorRT-LLM/issues/16448")
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
