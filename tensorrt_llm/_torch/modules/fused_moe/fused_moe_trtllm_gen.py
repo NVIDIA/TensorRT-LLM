@@ -338,6 +338,21 @@ class TRTLLMGenFusedMoE(MoE):
     def is_situ_activation(self) -> bool:
         return self.trtllm_gen_activation_type == ActType_TrtllmGen.SiTu
 
+    @property
+    def _gemm1_activation_params(
+            self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Per-expert (alpha, beta) for the shared gemm1 op slot.
+
+        SiTu and SwiGLU are mutually exclusive (see
+        ``_validate_backend_local_activation``) and feed the same
+        ``gemm1_alpha``/``gemm1_beta`` op arguments, so route both through one
+        accessor. SiTu's values live in the ``situ_alpha``/``situ_beta``
+        buffers; SwiGLU's in ``swiglu_alpha``/``swiglu_beta``.
+        """
+        if self.is_situ_activation:
+            return self.situ_alpha, self.situ_beta
+        return self.swiglu_alpha, self.swiglu_beta
+
     def _validate_backend_local_activation(self) -> None:
         if self.trtllm_gen_activation_type is None:
             if (self.trtllm_gen_activation_alpha is not None
@@ -594,6 +609,13 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             self.quant_method.create_weights(self)
 
+        # TODO(TRTLLM-15177 item 1.2(b)): fully merge these SiTu buffers into
+        # the swiglu_alpha/swiglu_beta storage so the gemm1 slot has a single
+        # backing parameter and _gemm1_activation_params can drop the branch.
+        # Deferred: `swiglu_alpha is not None` currently gates quant-method
+        # selection and validation (create_moe.py, this file's _get_quant_method
+        # / _check_configs), so reusing that storage for SiTu changes control
+        # flow on the numeric path and needs GPU parity revalidation first.
         if self.is_situ_activation:
             situ_alpha = nn.Parameter(torch.full(
                 (self.expert_size_per_partition, ),
@@ -901,10 +923,7 @@ class TRTLLMGenFusedMoE(MoE):
             ] else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
-            gemm1_alpha = (self.situ_alpha
-                           if self.is_situ_activation else self.swiglu_alpha)
-            gemm1_beta = (self.situ_beta
-                          if self.is_situ_activation else self.swiglu_beta)
+            gemm1_alpha, gemm1_beta = self._gemm1_activation_params
 
             output1_scale_scalar = self._get_data_or_none("fc31_scale_c")
             output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
