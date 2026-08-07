@@ -18,10 +18,36 @@ These exercise the pure-Python wiring only (timeout resolution and the watchdog
 that writes output-dir/hang_traceback.txt); they need no GPU or model access.
 """
 
+import faulthandler
 import os
+import signal
 import time
 
+import pytest
+
 from .periodic_junit import PeriodicJUnitXML
+
+# Bounds a stalled CI worker, not the expected latency: every wait below polls
+# for a condition that normally becomes true in milliseconds.
+_POLL_TIMEOUT = 20.0
+_POLL_INTERVAL = 0.02
+
+
+def _wait_until(predicate, timeout=_POLL_TIMEOUT):
+    """Poll ``predicate`` until it is truthy or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = predicate()
+        if result or time.monotonic() >= deadline:
+            return result
+        time.sleep(_POLL_INTERVAL)
+
+
+def _read(path):
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
 
 
 class _Marker:
@@ -56,19 +82,44 @@ class _Report:
         self.nodeid = nodeid
 
 
-def _make(tmp_path, dump_hang_traceback=True, **kwargs):
-    reporter = PeriodicJUnitXML(
-        xmlpath=os.path.join(tmp_path, "results.xml"),
-        dump_hang_traceback=dump_hang_traceback,
-        **kwargs,
-    )
-    if dump_hang_traceback:
-        reporter._setup_hang_dump()
-    return reporter
+def _release(reporter):
+    """Undo the process-wide state that ``_setup_hang_dump()`` installs.
+
+    It registers C-level SIGINT/SIGTERM handlers and keeps the sidecar file open
+    for the whole process lifetime, so without this the next test in the session
+    would inherit a handler writing to a closed file.
+    """
+    reporter._cancel_hang_timer()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            faulthandler.unregister(signum)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    if reporter._hang_file is not None:
+        reporter._hang_file.close()
+        reporter._hang_file = None
 
 
-def test_effective_timeout_resolution(tmp_path):
-    reporter = _make(str(tmp_path))
+@pytest.fixture
+def make_reporter(tmp_path, request):
+    """Build a reporter whose signal handlers and sidecar file are cleaned up."""
+
+    def _make(dump_hang_traceback=True, **kwargs):
+        reporter = PeriodicJUnitXML(
+            xmlpath=os.path.join(str(tmp_path), "results.xml"),
+            dump_hang_traceback=dump_hang_traceback,
+            **kwargs,
+        )
+        if dump_hang_traceback:
+            reporter._setup_hang_dump()
+            request.addfinalizer(lambda: _release(reporter))
+        return reporter
+
+    return _make
+
+
+def test_effective_timeout_resolution(make_reporter):
+    reporter = make_reporter()
     # positional marker, keyword marker, and the global --timeout all resolve.
     assert reporter._effective_timeout(_Item(marker=_Marker(args=(90,)))) == 90.0
     assert reporter._effective_timeout(_Item(marker=_Marker(kwargs={"timeout": 45}))) == 45.0
@@ -77,49 +128,59 @@ def test_effective_timeout_resolution(tmp_path):
     assert reporter._effective_timeout(_Item()) is None
 
 
-def test_hang_dumps_traceback(tmp_path):
-    reporter = _make(str(tmp_path), hang_dump_fraction=0.5)
-    # timeout 2s * 0.5 -> dump after ~1s.
+def test_hang_dumps_traceback(make_reporter):
+    reporter = make_reporter(hang_dump_fraction=0.1)
+    # timeout 2s * 0.1 -> dump after ~0.2s.
     reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
-    time.sleep(1.4)
-    content = open(reporter._hang_traceback_path(), encoding="utf-8").read()
-    assert "hang watchdog fired for pkg/test_x.py::test_y" in content
+    path = reporter._hang_traceback_path()
+    assert _wait_until(lambda: "hang watchdog fired for pkg/test_x.py::test_y" in _read(path))
+    content = _read(path)
     assert "Thread" in content or 'File "' in content
 
 
-def test_subsecond_timeout_dumps_before_the_kill(tmp_path):
-    # pytest-timeout accepts fractional seconds, so the watchdog must not floor the
-    # delay at 1s -- that would arm it after such a test had already been killed.
-    reporter = _make(str(tmp_path), hang_dump_fraction=0.5)
+def test_subsecond_timeout_arms_before_the_kill(make_reporter):
+    # pytest-timeout accepts fractional seconds, so the delay must not be floored
+    # at 1s -- that would arm the watchdog only after such a test was killed.
+    # Asserting on the armed interval keeps this independent of worker load.
+    reporter = make_reporter(hang_dump_fraction=0.5)
     reporter.pytest_runtest_setup(_Item(timeout_opt=0.5))
-    time.sleep(0.4)  # still inside the 0.5s timeout window
-    content = open(reporter._hang_traceback_path(), encoding="utf-8").read()
-    assert "hang watchdog fired for pkg/test_x.py::test_y" in content
+    assert reporter._hang_timer.interval == pytest.approx(0.25)
+    assert reporter._hang_timer.interval < 0.5
+    assert _wait_until(lambda: "hang watchdog fired" in _read(reporter._hang_traceback_path()))
 
 
-def test_completed_test_is_not_dumped(tmp_path):
+def test_completed_test_is_not_dumped(make_reporter):
     # The teardown report arrives after every fixture finalizer, so it must disarm
-    # the watchdog; nothing may be dumped for an item that already finished.
-    reporter = _make(str(tmp_path), hang_dump_fraction=0.5)
-    reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
-    time.sleep(0.2)
-    for when in ("setup", "call", "teardown"):
+    # the watchdog; nothing may be dumped for an item that already finished. The
+    # timeout is far longer than this test body, so the timer cannot fire while the
+    # reports are fed in even on a heavily loaded worker.
+    reporter = make_reporter(hang_dump_fraction=0.5)
+    reporter.pytest_runtest_setup(_Item(timeout_opt=600.0))
+    timer = reporter._hang_timer
+    assert timer is not None
+
+    for when in ("setup", "call"):
         reporter.pytest_runtest_logreport(_Report(when))
+        assert reporter._hang_timer is timer  # armed through setup, call, teardown
+
+    reporter.pytest_runtest_logreport(_Report("teardown"))
     assert reporter._hang_timer is None
-    time.sleep(1.2)  # past the would-be dump point
+    # cancel() is what actually prevents the dump, so assert the timer thread died
+    # rather than waiting out the (deliberately long) interval.
+    assert _wait_until(lambda: not timer.is_alive())
     assert os.path.getsize(reporter._hang_traceback_path()) == 0
 
 
-def test_no_watchdog_without_timeout(tmp_path):
-    reporter = _make(str(tmp_path))
+def test_no_watchdog_without_timeout(make_reporter):
+    reporter = make_reporter()
     reporter.pytest_runtest_setup(_Item())  # no timeout -> nothing armed
     assert reporter._hang_timer is None
 
 
-def test_hang_traceback_off_by_default(tmp_path):
+def test_hang_traceback_off_by_default(make_reporter):
     # --periodic-hang-traceback defaults to False; the reporter must then arm no
     # watchdog and leave no sidecar file behind.
-    reporter = _make(str(tmp_path), dump_hang_traceback=False)
+    reporter = make_reporter(dump_hang_traceback=False)
     assert reporter.dump_hang_traceback is False
     reporter.pytest_runtest_setup(_Item(timeout_opt=1.0))
     assert reporter._hang_timer is None
