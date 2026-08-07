@@ -211,10 +211,27 @@ class IdentityReasoningParser(BaseReasoningParser):
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
     """
-    Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
-    Since the latest official tokenizer_config.json initially adds "<think>\\n" at the end of the prompt
-    (https://huggingface.co/deepseek-ai/DeepSeek-R1/blob/main/tokenizer_config.json),
-    treat all the text before the </think> tag as `reasoning_content` and the text after as `content`.
+    Reasoning parser for DeepSeek-R1 style tags: ``<think>...</think>``.
+
+    Non-streaming ``parse()`` keeps a single partition: with
+    ``reasoning_at_start=False``, text before the first ``<think>`` is dropped
+    and only the first reasoning block is extracted. With
+    ``reasoning_at_start=True`` (e.g. deepseek-r1 prompt prefix), output is
+    treated as already inside the reasoning block until ``</think>``.
+
+    Streaming (``parse_delta`` / ``finish``) prioritizes live emission:
+
+    * Only a trailing suffix that is still a proper prefix of ``<think>`` or
+      ``</think>`` is buffered (bounded by tag length). Tag-free model output
+      streams token-by-token; the buffer cannot grow without bound.
+    * Already-emitted text cannot be retracted. A multi-delta preamble before
+      the first ``<think>`` may appear as ``content`` even though ``parse()``
+      would drop it. Unreleased (still-buffered) text before the first open
+      is dropped so same-delta cases match ``parse()`` when possible.
+    * After the first block, further ``<think>`` / ``</think>`` pairs stream as
+      interleaved reasoning; text before a later open is kept as content.
+      ``parse()`` only partitions once, so multi-block stream totals can
+      differ from ``parse()``.
     """
 
     def __init__(self,
@@ -226,16 +243,27 @@ class DeepSeekR1Parser(BaseReasoningParser):
         self.reasoning_end = "</think>"
         self.reasoning_at_start = reasoning_at_start
         self.in_reasoning = self.reasoning_at_start
+        # True after the first reasoning block has been entered (including
+        # reasoning_at_start). Used to drop only the first still-buffered
+        # preamble; later opens keep their content prefix (interleaved).
         self._entered_reasoning = self.reasoning_at_start
-        thinking_disabled = (isinstance(chat_template_kwargs, dict)
-                             and chat_template_kwargs.get("enable_thinking")
-                             is False)
-        # Hold pre-<think> text for qwen3-style parsers so stream matches
-        # parse() drop of the preamble (#17296). Thinking-disabled Nemotron
-        # paths still stream plain content live.
-        self._hold_preamble = (not reasoning_at_start) and (
-            not thinking_disabled)
         self._buffer = ""
+
+    @staticmethod
+    def _partial_tag_suffix_len(text: str, *tags: str) -> int:
+        """Longest suffix of ``text`` that is a proper prefix of any tag.
+
+        A complete tag is never held here (length is at most ``len(tag) - 1``)
+        so full delimiters are always handled by ``find`` in ``parse_delta``.
+        """
+        best = 0
+        for tag in tags:
+            max_n = min(len(text), len(tag) - 1)
+            for n in range(max_n, 0, -1):
+                if tag.startswith(text[-n:]):
+                    best = max(best, n)
+                    break
+        return best
 
     def _create_reasoning_end_result(self, content: str,
                                      reasoning_content: str):
@@ -264,106 +292,76 @@ class DeepSeekR1Parser(BaseReasoningParser):
                                      reasoning_content=reasoning_content)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        # When ``_hold_preamble`` is set (qwen3-style), text before the first
-        # ``<think>`` is withheld and dropped when the tag arrives (#17296),
-        # matching ``parse()``. After a block ends, later text / ``<think>``
-        # blocks stream normally (interleaved thinking). Thinking-disabled
-        # paths keep live content emission without a start tag.
-        self._buffer += delta_text
-        delta_text = self._buffer
-        reasoning_content = None
-        if (self.reasoning_start.startswith(delta_text)
-                or self.reasoning_end.startswith(delta_text)):
-            # waiting for more text to determine if it's a reasoning start or end tag
-            return ReasoningParserResult()
+        """Incrementally split deltas into content / reasoning_content.
 
-        if not self.in_reasoning:
-            begin_idx = delta_text.find(self.reasoning_start)
-            if begin_idx == -1:
-                if self._hold_preamble and not self._entered_reasoning:
-                    self._buffer = delta_text
-                    return ReasoningParserResult()
-                # After the first reasoning block, a trailing suffix may be a
-                # partial ``<think>`` split across deltas (``mid<th`` + ``ink>``).
-                partial_start_idx = delta_text.rfind(self.reasoning_start[0])
-                if (partial_start_idx != -1 and self.reasoning_start.startswith(
-                        delta_text[partial_start_idx:])):
-                    self._buffer = delta_text[partial_start_idx:]
-                    return ReasoningParserResult(
-                        content=delta_text[:partial_start_idx])
-                self._buffer = ""
-                return ReasoningParserResult(content=delta_text)
-            # Start tag found.
-            # First open: drop text before the tag (same as ``parse()``).
-            # Later opens (interleaved): keep text before the tag as content.
-            content_prefix = ""
-            if begin_idx > 0:
-                if self._entered_reasoning:
-                    content_prefix = delta_text[:begin_idx]
-                # else: initial preamble — drop
-            self.in_reasoning = True
-            self._entered_reasoning = True
-            reasoning_content = delta_text[begin_idx +
-                                           len(self.reasoning_start):]
-        else:
-            content_prefix = ""
+        Consumes ``self._buffer + delta_text`` in a loop so multiple
+        reasoning blocks in one delta need no recursion.
+        """
+        text = self._buffer + delta_text
+        self._buffer = ""
+        out_content = ""
+        out_reasoning = ""
 
-        if self.in_reasoning:
-            delta_text = (reasoning_content
-                          if reasoning_content is not None else delta_text)
-            end_idx = delta_text.find(self.reasoning_end)
+        while text:
+            if not self.in_reasoning:
+                begin_idx = text.find(self.reasoning_start)
+                if begin_idx == -1:
+                    # Outside reasoning: hold only a possible partial tag
+                    # suffix (start or end). Everything else streams as content.
+                    hold = self._partial_tag_suffix_len(text,
+                                                        self.reasoning_start,
+                                                        self.reasoning_end)
+                    if hold:
+                        out_content += text[:-hold]
+                        self._buffer = text[-hold:]
+                    else:
+                        out_content += text
+                    break
+
+                # Start tag found. First open: drop still-buffered preamble.
+                # Later opens (interleaved): keep the prefix as content.
+                if begin_idx > 0 and self._entered_reasoning:
+                    out_content += text[:begin_idx]
+                self.in_reasoning = True
+                self._entered_reasoning = True
+                text = text[begin_idx + len(self.reasoning_start):]
+                continue
+
+            end_idx = text.find(self.reasoning_end)
             if end_idx == -1:
-                last_idx = delta_text.rfind(self.reasoning_end[0])
-                if last_idx != -1 and self.reasoning_end.startswith(
-                        delta_text[last_idx:]):
-                    self._buffer = delta_text[last_idx:]
-                    reasoning_content = delta_text[:last_idx]
+                hold = self._partial_tag_suffix_len(text, self.reasoning_end)
+                if hold:
+                    out_reasoning += text[:-hold]
+                    self._buffer = text[-hold:]
                 else:
-                    self._buffer = ""
-                    reasoning_content = delta_text
-                return ReasoningParserResult(
-                    content=content_prefix, reasoning_content=reasoning_content)
-            reasoning_content = delta_text[:end_idx]
-            content_after = delta_text[end_idx + len(self.reasoning_end):]
+                    out_reasoning += text
+                break
+
+            out_reasoning += text[:end_idx]
             self.in_reasoning = False
-            self._buffer = ""
-            content = content_prefix + content_after
-            # Remainder may open another reasoning block in the same delta
-            # (e.g. buffered ``</think>`` + ``y<think>z``).
-            if content_after:
-                more = self.parse_delta(content_after)
-                # parse_delta re-appended content_after to the buffer; the
-                # recursive call already consumed it — avoid double count:
-                # we passed content_after both as emitted content_prefix path
-                # and recursively. Fix: only take recursive result, do not
-                # pre-include content_after in content.
-                content = content_prefix + more.content
-                reasoning_content = reasoning_content + (more.reasoning_content
-                                                         or "")
-            return ReasoningParserResult(content=content,
-                                         reasoning_content=reasoning_content)
-        raise RuntimeError(
-            "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
+            text = text[end_idx + len(self.reasoning_end):]
+            # Remainder may be content or another <think> block; loop again.
+
+        return ReasoningParserResult(content=out_content,
+                                     reasoning_content=out_reasoning)
 
     def finish(self) -> ReasoningParserResult:
         """Flush text withheld by ``parse_delta`` when the stream ends.
 
-        Trailing tag prefixes are ordinary model output once the stream ends.
-        A complete end tag while inside reasoning is a delimiter. A complete
-        start tag while not inside reasoning opens an empty block. A complete
-        start tag while already inside reasoning is kept as literal text
-        (``parse()`` parity for deepseek-r1 on ``"a<think>"``).
+        Partial tag prefixes become ordinary model output at end-of-stream.
+        A complete end tag while inside reasoning is a delimiter (discarded).
+        A complete start tag while outside opens an empty reasoning block.
+        A complete start tag while already inside reasoning is kept as literal
+        text (``parse()`` parity for deepseek-r1 on ``"a<think>"``). A complete
+        end tag while outside is literal content.
         """
         remaining = self._buffer
         self._buffer = ""
         if not remaining:
             return ReasoningParserResult()
         if remaining == self.reasoning_end and self.in_reasoning:
-            self.in_reasoning = False
             return ReasoningParserResult()
         if remaining == self.reasoning_start and not self.in_reasoning:
-            self.in_reasoning = True
-            self._entered_reasoning = True
             return ReasoningParserResult()
         if remaining == self.reasoning_start and self.in_reasoning:
             return ReasoningParserResult(reasoning_content=remaining)
