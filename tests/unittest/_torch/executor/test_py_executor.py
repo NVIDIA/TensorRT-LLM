@@ -1728,8 +1728,11 @@ class _StubADPExecutor:
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
+            state = (
+                _STATE_GENERATION_IN_PROGRESS if kwargs["is_gen"] else LlmRequestState.CONTEXT_INIT
+            )
             req = _make_adp_request(
-                _STATE_GENERATION_IN_PROGRESS,
+                state,
                 request_id=kwargs["request_ids"][0],
                 is_dummy_request=True,
             )
@@ -2176,6 +2179,7 @@ def test_pad_dummy_ctx_pads_to_max_num_tokens():
     call = stub.add_dummy_calls[0]
     assert call["token_nums"] == [4096]
     assert call["is_gen"] is False
+    assert stub.active_requests[-1].state == LlmRequestState.CONTEXT_INIT
 
 
 def test_pad_dummy_gen_keeps_default_token_nums():
@@ -2189,6 +2193,7 @@ def test_pad_dummy_gen_keeps_default_token_nums():
     call = stub.add_dummy_calls[0]
     assert call["token_nums"] is None
     assert call["is_gen"] is True
+    assert stub.active_requests[-1].state == _STATE_GENERATION_IN_PROGRESS
 
 
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
