@@ -1243,10 +1243,6 @@ class DeepSeekV4Hooks(MLASparseHooks):
     def create_weights(self, mla: MLA) -> None:
         create_sparse_attn_weights(mla)
 
-    def prepare(self, mla: MLA, attn_metadata: AttentionMetadata) -> None:
-        if mla.indexer is not None:
-            mla.indexer.prepare(attn_metadata)
-
     def prepare_outputs(
         self,
         mla: MLA,

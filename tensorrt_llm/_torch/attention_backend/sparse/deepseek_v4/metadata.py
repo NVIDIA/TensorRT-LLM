@@ -576,7 +576,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Prepare metadata for indexer (only needed when sparse layers exist)
         if has_sparse_layers:
-            DeepseekV4Indexer.prepare_metadata(metadata=self)
+            DeepseekV4Indexer.prepare(metadata=self)
 
         # --- Per-ratio metadata ---
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)

@@ -136,7 +136,7 @@ def _compute_slot_mappings(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute flat byte indices for FP8/FP4 data and scales from global token positions.
 
-    Shared by Indexer.prepare_metadata() (CPU) and on_update_kv_lens() (GPU) to avoid
+    Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
     duplicating the slot mapping arithmetic.
 
     Args:
@@ -641,15 +641,15 @@ class Indexer(nn.Module):
             decode_top_k_implementation = (
                 TopKImplementation.CUTE_DSL_GVR
                 if self._enable_heuristic_topk
-                else TopKImplementation.CUTE_DSL_PREFERRED
+                else TopKImplementation.CUTE_DSL_RADIX
             )
         elif self._enable_heuristic_topk:
-            decode_top_k_implementation = TopKImplementation.TRTLLM_HEURISTIC
+            decode_top_k_implementation = TopKImplementation.CUDA_GVR
         else:
-            decode_top_k_implementation = TopKImplementation.TRTLLM
+            decode_top_k_implementation = TopKImplementation.CUDA_RADIX
         self.top_k = TopK(
             self.index_topk,
-            prefill_implementation=TopKImplementation.TRTLLM,
+            prefill_implementation=TopKImplementation.CUDA_RADIX,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
         )
@@ -668,19 +668,6 @@ class Indexer(nn.Module):
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()
-
-    def prepare(self, metadata: DSAtrtllmAttentionMetadata) -> None:
-        """Prepare this indexer's Top-K state before model forward."""
-        if metadata.kv_cache_manager is None:
-            return
-        self.top_k.prepare(
-            device=metadata.kv_lens_cuda.device,
-            max_num_columns=metadata.get_indexer_max_seq_len(),
-            next_n=1 + metadata.max_draft_tokens,
-            input_dtype=torch.float32,
-            num_sms=metadata.num_sms,
-            max_num_requests=metadata.max_num_sequences,
-        )
 
     @staticmethod
     def prepare_one_prefill_chunk(
@@ -1097,7 +1084,7 @@ class Indexer(nn.Module):
             )
 
     @staticmethod
-    def prepare_metadata(metadata: DSAtrtllmAttentionMetadata):
+    def prepare(metadata: DSAtrtllmAttentionMetadata) -> None:
         """
         Prepare indexer for the forward pass.
         This should be called during metadata.prepare() stage.
@@ -1158,6 +1145,16 @@ class Indexer(nn.Module):
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
             Indexer.prepare_scheduler_metadata(metadata)
+
+        for indexer in getattr(metadata, "indexers", ()):
+            indexer.top_k.prepare(
+                device=metadata.kv_lens_cuda.device,
+                max_num_columns=metadata.get_indexer_max_seq_len(),
+                next_n=1 + metadata.max_draft_tokens,
+                input_dtype=torch.float32,
+                num_sms=metadata.num_sms,
+                max_num_requests=metadata.max_num_sequences,
+            )
 
     def _update_k_cache(
         self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: DSAtrtllmAttentionMetadata
@@ -1530,8 +1527,8 @@ class Indexer(nn.Module):
                 :num_ctx_tokens, :
             ]
 
-        # Seed finishing prefill requests after the active generation slots.
-        if self._enable_heuristic_topk and has_prefill and not metadata.skip_indexer_for_ctx_reqs:
+        # Seed GVR state after the active generation slots.
+        if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             self.top_k.seed_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
                 metadata.seq_lens[:num_contexts],
@@ -1605,7 +1602,7 @@ class Indexer(nn.Module):
             if self.use_cute_dsl_paged_mqa_logits:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
-                # is `scheduler_metadata_buffer` — built in `Indexer.prepare_metadata()`
+                # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
                 # with a (num_gen, 1) input shape, which makes DeepGEMM's wrapper
                 # compute `num_next_n_atoms = 1`. (DeepGEMM uses the same buffer
                 # for its own next_n=1 kernel; DSL piggy-backs on it for all
@@ -1720,10 +1717,6 @@ class Indexer(nn.Module):
             scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
             assert scan_lengths is not None
 
-            heuristic_values = None
-            if self._enable_heuristic_topk and not metadata.use_cute_dsl_topk:
-                heuristic_values = metadata.heuristic_scratch_values[:num_gen_tokens]
-
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1731,10 +1724,8 @@ class Indexer(nn.Module):
                 sequence_lengths=gen_kv_lens_cuda,
                 scan_lengths=scan_lengths,
                 next_n=next_n,
-                heuristic_values=heuristic_values,
                 radix_indices=metadata.radix_aux_indices,
                 radix_values=metadata.radix_aux_logits,
-                max_num_columns=indexer_max_seq_len,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:

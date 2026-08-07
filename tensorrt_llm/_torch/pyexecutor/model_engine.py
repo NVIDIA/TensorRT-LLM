@@ -3156,23 +3156,6 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_is_first_draft = True
                     req.py_draft_tokens = []
 
-    def _prepare_sparse_attention_modules(
-            self, attn_metadata: AttentionMetadata) -> None:
-        """Prepare sparse module state before any model forward uses metadata."""
-        prepared_metadata_ids = getattr(
-            self, "_prepared_sparse_attention_metadata_ids", None)
-        if prepared_metadata_ids is None:
-            prepared_metadata_ids = set()
-            self._prepared_sparse_attention_metadata_ids = prepared_metadata_ids
-        metadata_id = id(attn_metadata)
-        if metadata_id in prepared_metadata_ids:
-            return
-        for module in self.model.modules():
-            prepare = getattr(module, "prepare_sparse_attn", None)
-            if callable(prepare):
-                prepare(attn_metadata)
-        prepared_metadata_ids.add(metadata_id)
-
     def _set_up_attn_metadata(
         self,
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
@@ -3247,6 +3230,13 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
+        if hasattr(self.attn_metadata, "indexers"):
+            indexers = {}
+            for module in self.model.modules():
+                indexer = getattr(module, "indexer", None)
+                if indexer is not None and hasattr(indexer, "top_k"):
+                    indexers[id(indexer)] = indexer
+            self.attn_metadata.indexers = tuple(indexers.values())
         return self.attn_metadata
 
     @property
@@ -7517,8 +7507,6 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_resource_manager = None
             spec_metadata = None
-
-        self._prepare_sparse_attention_modules(attn_metadata)
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)

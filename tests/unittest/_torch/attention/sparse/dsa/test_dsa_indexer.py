@@ -250,26 +250,37 @@ def test_indexer_configures_one_top_k_module():
     indexer = create_indexer(sparse_config)
 
     assert isinstance(indexer.top_k, TopK)
-    assert indexer.top_k.prefill_implementation == TopKImplementation.TRTLLM
-    assert indexer.top_k.decode_implementation == TopKImplementation.TRTLLM
+    assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
+    assert indexer.top_k.decode_implementation == TopKImplementation.CUDA_RADIX
     assert not hasattr(indexer, "prefill_top_k")
     assert not hasattr(indexer, "decode_top_k")
 
 
-def test_indexer_prepare_delegates_to_top_k_before_forward():
+def test_indexer_prepare_keeps_metadata_and_top_k_preparation_together():
     top_k = Mock()
     indexer = SimpleNamespace(top_k=top_k)
     metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(),
+        indexers=(indexer,),
+        num_contexts=0,
+        num_generations=0,
+        num_ctx_tokens=0,
+        seq_lens=torch.empty(0, dtype=torch.int32),
+        compress_ratios=[1],
         kv_lens_cuda=torch.empty(0),
         get_indexer_max_seq_len=Mock(return_value=4096),
         max_draft_tokens=3,
         num_sms=148,
         max_num_sequences=32,
     )
+    indexer_params = SimpleNamespace(new_kv_tokens=torch.empty(0, dtype=torch.int32))
 
-    Indexer.prepare(indexer, metadata)
+    with (
+        patch.object(Indexer, "build_indexer_params", return_value=indexer_params),
+        patch.object(Indexer, "prepare_for_update_k_cache") as prepare_metadata,
+    ):
+        Indexer.prepare(metadata)
 
+    prepare_metadata.assert_called_once_with(metadata, indexer_params)
     top_k.prepare.assert_called_once_with(
         device=metadata.kv_lens_cuda.device,
         max_num_columns=4096,
@@ -278,6 +289,36 @@ def test_indexer_prepare_delegates_to_top_k_before_forward():
         num_sms=148,
         max_num_requests=32,
     )
+
+
+def test_draft_width_change_reprepares_indexer():
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.max_draft_tokens = 0
+    metadata.max_num_sequences = 2
+    metadata.is_cuda_graph = False
+    metadata.kv_lens_cuda_2d = torch.empty((2, 1))
+    metadata.kv_lens_expanded_host = torch.empty(2)
+    metadata._create_kv_lens_2d_buffer = Mock()
+    metadata.create_expanded_buffers = Mock()
+    metadata._create_radix_aux_buffers = Mock()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata."
+            "TrtllmAttentionMetadata.update_spec_dec_param"
+        ),
+        patch.object(Indexer, "prepare") as prepare,
+    ):
+        metadata.update_spec_dec_param(
+            batch_size=2,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=False,
+            is_spec_dec_dynamic_tree=False,
+            max_draft_len=3,
+            max_total_draft_tokens=3,
+        )
+
+    prepare.assert_called_once_with(metadata=metadata)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -817,7 +858,7 @@ def _create_mock_metadata(
             # so allocate a separate buffer for the full-next_n schedule.
             # DeepGEMM expects the full-next_n schedule in
             # `scheduler_metadata_buffer` itself (the alias makes
-            # `Indexer.prepare_metadata()`'s second populate overwrite the first).
+            # `Indexer.prepare()`'s second populate overwrite the first).
             if use_cute_dsl_paged_mqa_logits:
                 self.scheduler_metadata_buffer_full_next_n = torch.zeros(
                     (self.num_sms + 1, 2), device="cuda", dtype=torch.int32
@@ -1050,7 +1091,7 @@ def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
-    """Recompute slot mappings without re-running full Indexer.prepare_metadata()."""
+    """Recompute slot mappings without re-running full Indexer.prepare()."""
     head_dim = 128
     block_size = 64
     request_ids = [0, 1]
@@ -1084,7 +1125,7 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata)
+    Indexer.prepare(metadata)
     expected_fp8 = metadata.slot_mapping_fp8[:num_tokens].clone()
     expected_scale = metadata.slot_mapping_scale[:num_tokens].clone()
 
@@ -1153,7 +1194,7 @@ def test_indexer_k_cache_scatter_custom_op():
 
     from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
 
-    Indexer.prepare_metadata(metadata)
+    Indexer.prepare(metadata)
 
     # Generate test data
     k_original = torch.randn((num_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -1314,7 +1355,7 @@ def test_fp8_k_cache_roundtrip():
         num_tokens=total_tokens,
         indexer_head_dim=head_dim,
     )
-    Indexer.prepare_metadata(metadata)
+    Indexer.prepare(metadata)
 
     # Generate unique patterns for each request and quantize
     k_original = torch.randn((total_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -1471,7 +1512,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         compress_ratio=compress_ratio,
         indexer_head_dim=head_dim,
     )
-    Indexer.prepare_metadata(metadata_context)
+    Indexer.prepare(metadata_context)
 
     k_context_fp8, k_context_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_context_bf16)
 
@@ -1497,7 +1538,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         compress_ratio=compress_ratio,
         indexer_head_dim=head_dim,
     )
-    Indexer.prepare_metadata(metadata_gen)
+    Indexer.prepare(metadata_gen)
 
     k_gen_fp8, k_gen_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_gen_bf16)
     indexer._update_k_cache(k_gen_fp8, k_gen_scale, metadata_gen)
@@ -1833,7 +1874,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     )
     if not use_dsl:
         _force_direct_path(metadata_context)
-    Indexer.prepare_metadata(metadata_context)
+    Indexer.prepare(metadata_context)
 
     # Real path: split K at head_dim//2 + fused_cat_fp4 (mirrors
     # Indexer._prep_q_or_k at dsa.py:2046-2050).
@@ -1867,7 +1908,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         # >1 = atom-split). Mirrors dsa.py's `if expand_for_dsl and
         # num_generations > 0` block which runs for any next_n ≥ 2.
         _force_dsl_expand_setup(metadata_gen)
-    Indexer.prepare_metadata(metadata_gen)
+    Indexer.prepare(metadata_gen)
 
     k_gen_fp4, k_gen_scale = torch.ops.trtllm.fused_cat_fp4(
         k_gen_bf16[:, :pe_dim].contiguous(),
@@ -2553,7 +2594,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
         compress_ratio=compress_ratio,
     )
 
-    Indexer.prepare_metadata(metadata_chunked)
+    Indexer.prepare(metadata_chunked)
 
     assert metadata_chunked.indexer_prefill_chunks is not None
     num_chunks = len(metadata_chunked.indexer_prefill_chunks)
@@ -2594,7 +2635,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
         compress_ratio=compress_ratio,
     )
 
-    Indexer.prepare_metadata(metadata_baseline)
+    Indexer.prepare(metadata_baseline)
 
     if metadata_baseline.indexer_prefill_chunks is not None:
         num_baseline_chunks = len(metadata_baseline.indexer_prefill_chunks)
@@ -2806,7 +2847,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
         max_draft_tokens=next_n - 1,
         indexer_head_dim=head_dim,
     )
-    Indexer.prepare_metadata(metadata_context)
+    Indexer.prepare(metadata_context)
     indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
 
     # Generate decode phase test data
@@ -2832,7 +2873,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
         max_draft_tokens=next_n - 1,
         indexer_head_dim=head_dim,
     )
-    Indexer.prepare_metadata(metadata_gen_write)
+    Indexer.prepare(metadata_gen_write)
     indexer._update_k_cache(k_fp8, k_scale, metadata_gen_write)
 
     # Test with custom CUDA kernel
@@ -2852,7 +2893,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata_custom)
+    Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
 
     try:
@@ -2879,7 +2920,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata_fallback)
+    Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
     _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
@@ -2905,7 +2946,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
             indexer_head_dim=head_dim,
         )
 
-        Indexer.prepare_metadata(metadata_skip)
+        Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
 
         try:
@@ -3008,7 +3049,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
             kv_lens.sum().item(),
             max_draft_tokens=md,
         )
-        Indexer.prepare_metadata(meta_ctx)
+        Indexer.prepare(meta_ctx)
         indexer._update_k_cache(ctx_k_fp8, ctx_k_scale, meta_ctx)
 
         step0_tokens = batch_size * step0_next_n
@@ -3026,7 +3067,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
             max_model_len,
             max_draft_tokens=md,
         )
-        Indexer.prepare_metadata(meta0)
+        Indexer.prepare(meta0)
         # indexer_topk_decode needs caller-owned radix aux buffers for small gen batches.
         _radix_bp = 10
         meta0.radix_aux_indices = torch.zeros(
@@ -3051,7 +3092,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
             max_model_len,
             max_draft_tokens=md,
         )
-        Indexer.prepare_metadata(meta0)
+        Indexer.prepare(meta0)
         # context stash branch reads seq_lens_cuda (a read-only property); set its backing field.
         meta0._seq_lens_cuda = kv_lens.clone().cuda()
 
@@ -3093,7 +3134,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
             max_model_len,
             max_draft_tokens=md,
         )
-        Indexer.prepare_metadata(meta)
+        Indexer.prepare(meta)
         meta.in_mtp_draft_loop = True
         meta.shared_topk_indices = stash
         meta.indexer_skip_topk = True
@@ -3178,7 +3219,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata_custom)
+    Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
 
     assert metadata_custom.indexer_prefill_chunks is not None
@@ -3206,7 +3247,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata_fallback)
+    Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
     _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
@@ -3287,7 +3328,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata_custom)
+    Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_custom.indexer_prefill_chunks = None
@@ -3315,7 +3356,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         indexer_head_dim=head_dim,
     )
 
-    Indexer.prepare_metadata(metadata_fallback)
+    Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_fallback.indexer_prefill_chunks = None
@@ -3341,7 +3382,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         enable_indexer_skip=True,
         indexer_head_dim=head_dim,
     )
-    Indexer.prepare_metadata(metadata_skip)
+    Indexer.prepare(metadata_skip)
     indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
     metadata_skip.indexer_prefill_chunks = None
 
@@ -3478,7 +3519,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
             enable_indexer_skip=True,
             indexer_head_dim=head_dim,
         )
-        Indexer.prepare_metadata(metadata_skip)
+        Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(
             metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
@@ -3726,7 +3767,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
         index_topk=index_topk,
         use_cute_dsl_paged_mqa_logits=True,
     )
-    Indexer.prepare_metadata(metadata)
+    Indexer.prepare(metadata)
 
     kv_cache = cache_manager.get_indexer_k_cache_buffers(0)
     q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(

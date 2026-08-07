@@ -803,7 +803,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         """Allocate fixed manager-lifetime TopK inputs and outputs."""
         self._selection_top_k = TopK(
             self.budget,
-            decode_implementation=TopKImplementation.CUTE_DSL_PREFERRED,
+            decode_implementation=TopKImplementation.CUTE_DSL_RADIX,
         )
         request_capacity = self._request_capacity
         selection_width = self._selection_width_capacity

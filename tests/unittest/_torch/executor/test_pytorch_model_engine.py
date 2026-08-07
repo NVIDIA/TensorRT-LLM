@@ -91,17 +91,49 @@ class DummyModel(torch.nn.Module):
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
 
 
-def test_sparse_attention_modules_are_prepared_once_per_metadata():
-    sparse_module = Mock()
-    sparse_module.prepare_sparse_attn = Mock()
-    engine = SimpleNamespace(model=Mock())
-    engine.model.modules.return_value = [object(), sparse_module]
-    attn_metadata = SimpleNamespace()
+def test_setup_attn_metadata_registers_unique_topk_indexers():
 
-    PyTorchModelEngine._prepare_sparse_attention_modules(engine, attn_metadata)
-    PyTorchModelEngine._prepare_sparse_attention_modules(engine, attn_metadata)
+    class SparseMetadata:
+        indexers = ()
 
-    sparse_module.prepare_sparse_attn.assert_called_once_with(attn_metadata)
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    indexer = SimpleNamespace(top_k=object())
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(
+            pretrained_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                num_attention_heads=8,
+                num_key_value_heads=2,
+            ),
+            enable_flash_mla=False,
+        ),
+        modules=lambda: [
+            SimpleNamespace(indexer=indexer),
+            SimpleNamespace(indexer=indexer),
+            SimpleNamespace(indexer=None),
+        ],
+    )
+    engine = SimpleNamespace(
+        model=model,
+        attn_runtime_features=SimpleNamespace(cache_reuse=False,
+                                              chunked_prefill=False),
+        cache_indirection_attention=None,
+        attn_backend=SimpleNamespace(Metadata=SparseMetadata),
+        sparse_attention_config=None,
+        encoder_attn_metadata=None,
+        attn_metadata=None,
+        batch_size=4,
+        max_num_tokens=32,
+        max_beam_width=1,
+        mapping=Mock(),
+    )
+    cache_manager = Mock()
+
+    metadata = PyTorchModelEngine._set_up_attn_metadata(engine, cache_manager)
+
+    assert metadata.indexers == (indexer, )
 
 
 class DummyMultimodalIndexModel(torch.nn.Module):

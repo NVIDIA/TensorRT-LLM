@@ -48,6 +48,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     sparse_metadata_params: Optional[DSAMetadataParams] = None
+    indexers: tuple[Indexer, ...] = ()
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
@@ -203,7 +204,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.prepare_for_spec_decode(kv_lens)
 
         # Prepare metadata for indexer
-        Indexer.prepare_metadata(metadata=self)
+        Indexer.prepare(metadata=self)
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
@@ -617,7 +618,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
-        # Allocate these buffers dynamically in Indexer.prepare_metadata()
+        # Allocate these buffers dynamically in Indexer.prepare()
         # based on the actual total_kv_len to save memory.
         if self.enable_context_mla_with_cached_kv:
             self.slot_mapping_fp8_fullkv = None
@@ -709,20 +710,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        self.enable_heuristic_topk = (
-            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
-        if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
-            # Shared C++ heuristic scratch; per-layer history lives in TopK.
-            max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-            self.heuristic_scratch_values = self.get_empty(
-                self.cuda_graph_buffers,
-                (max_gen_tokens, self.num_sparse_topk),
-                cache_name="heuristic_scratch_values",
-                dtype=torch.float32,
-                capture_graph=capture_graph,
-            )
-
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays
         # large enough for the MTP generation-row count.
@@ -816,6 +803,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         num_contexts: int = 0,
     ):
         """Update speculative decoding parameters and create expanded buffers."""
+        previous_max_draft_tokens = self.max_draft_tokens
         super().update_spec_dec_param(
             batch_size,
             is_spec_decoding_enabled,
@@ -835,16 +823,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
-            # Resize heuristic scratch buffer for new max_draft_tokens.
-            if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
             # The Radix-split-work scratch (radix_aux_*) is sized the same way
             # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
             # unconditionally, so it must be resized here too -- otherwise the
@@ -852,6 +830,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # ("radix_aux_* must hold at least num_rows*blocks_per_row*index_topk
             # elements").
             self._create_radix_aux_buffers(capture_graph=capture_graph)
+        if self.max_draft_tokens != previous_max_draft_tokens:
+            Indexer.prepare(metadata=self)
 
     def _update_indexer_k_cache_block_offsets(self) -> torch.Tensor:
         """Refresh INDEX_KEY offsets and return their physical pool slots."""

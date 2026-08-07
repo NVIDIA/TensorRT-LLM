@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the reusable sparse index-selection Top-K module."""
 
-from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -92,7 +91,7 @@ def test_one_module_dispatches_prefill_and_decode() -> None:
     assert output.item() == 1
 
 
-def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> None:
+def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
     cute_dsl = Mock()
     trtllm = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_indexer_topk_decode", cute_dsl)
@@ -100,7 +99,7 @@ def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> No
 
     top_k = TopK(
         2,
-        decode_implementation=TopKImplementation.CUTE_DSL_PREFERRED,
+        decode_implementation=TopKImplementation.CUTE_DSL_RADIX,
         compress_ratio=4,
     )
     logical_lengths = torch.tensor([16], dtype=torch.int32)
@@ -170,8 +169,8 @@ def test_gvr_owns_prior_state_and_updates_it(monkeypatch) -> None:
         num_sms=16,
         max_num_requests=1,
     )
-    assert top_k._prior_indices is not None
-    top_k._prior_indices.copy_(prior)
+    assert top_k._gvr_prior_indices is not None
+    top_k._gvr_prior_indices.copy_(prior)
     gvr.side_effect = lambda *args, **kwargs: output.copy_(torch.tensor([[5, 3]]))
 
     top_k(
@@ -181,12 +180,11 @@ def test_gvr_owns_prior_state_and_updates_it(monkeypatch) -> None:
         sequence_lengths=logical_lengths,
         scan_lengths=scan_lengths,
         next_n=1,
-        max_num_columns=8,
     )
 
     args, kwargs = gvr.call_args
     assert args[0] is scores
-    assert args[1].data_ptr() == top_k._prior_indices.data_ptr()
+    assert args[1].data_ptr() == top_k._gvr_prior_indices.data_ptr()
     assert args[2] is logical_lengths
     assert args[3] is output
     assert args[4] == 2
@@ -196,7 +194,7 @@ def test_gvr_owns_prior_state_and_updates_it(monkeypatch) -> None:
         "max_seq_len": 8,
         "order_row": None,
     }
-    assert top_k._prior_indices.tolist() == [[5, 3]]
+    assert top_k._gvr_prior_indices.tolist() == [[5, 3]]
 
 
 def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
@@ -222,7 +220,6 @@ def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
         sequence_lengths=lengths,
         scan_lengths=lengths,
         next_n=next_n,
-        max_num_columns=8,
     )
 
     row_order = gvr.call_args.kwargs["order_row"]
@@ -248,80 +245,94 @@ def test_seed_from_prefill_uses_last_request_rows() -> None:
         request_offset=1,
     )
 
-    assert top_k._prior_indices is not None
-    assert top_k._prior_indices.tolist() == [[0, 0], [2, 3], [4, 5], [0, 0]]
+    assert top_k._gvr_prior_indices is not None
+    assert top_k._gvr_prior_indices.tolist() == [[0, 0], [2, 3], [4, 5], [0, 0]]
 
 
-@pytest.mark.parametrize("top_k", [0, -1])
-def test_top_k_must_be_positive(top_k: int) -> None:
-    with pytest.raises(ValueError, match="top_k must be positive"):
-        TopK(top_k, prefill_implementation=TopKImplementation.TORCH)
+def test_implementations_are_named_by_backend_and_algorithm() -> None:
+    assert {implementation.value for implementation in TopKImplementation} == {
+        "torch",
+        "cuda_radix",
+        "cute_dsl_radix",
+        "cuda_gvr",
+        "cute_dsl_gvr",
+    }
 
 
-def test_top_k_requires_an_implementation() -> None:
-    with pytest.raises(ValueError, match="at least one Top-K implementation"):
-        TopK(1)
+def test_none_implementations_use_cuda_radix_defaults() -> None:
+    top_k = TopK(1)
+
+    assert top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
+    assert top_k.decode_implementation == TopKImplementation.CUDA_RADIX
 
 
-def test_decode_validates_workspace_pairs() -> None:
-    top_k = TopK(2, decode_implementation=TopKImplementation.TRTLLM)
-    with pytest.raises(ValueError, match="must be provided together"):
-        top_k(
-            torch.randn(1, 4),
-            torch.empty(1, 2, dtype=torch.int32),
-            is_prefill=False,
-            sequence_lengths=torch.tensor([4], dtype=torch.int32),
-            scan_lengths=torch.tensor([4], dtype=torch.int32),
-            next_n=1,
-            radix_indices=torch.empty(1, 10, 2, dtype=torch.int32),
-        )
+def test_cuda_gvr_owns_scratch_and_updates_prior(monkeypatch) -> None:
+    top_k_module._warmup_decode_top_k.cache_clear()
+    decode = Mock(side_effect=lambda *args, **kwargs: args[2].copy_(torch.tensor([[3, 1]])))
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
+    top_k.prepare(
+        device=torch.device("cpu"),
+        max_num_columns=8,
+        next_n=1,
+        input_dtype=torch.float32,
+        max_num_requests=2,
+        num_sms=4,
+    )
+    scores = torch.randn(1, 8)
+    lengths = torch.tensor([8], dtype=torch.int32)
+    output = torch.empty(1, 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+    )
+
+    runtime_call = decode.call_args_list[-1]
+    assert runtime_call.kwargs["pre_idx"].data_ptr() == top_k._gvr_prior_indices.data_ptr()
+    assert runtime_call.kwargs["heuristic_scratch"].data_ptr() == top_k._cuda_gvr_scratch.data_ptr()
+    assert top_k._gvr_prior_indices.tolist() == [[3, 1], [0, 0]]
 
 
-def test_prepare_deduplicates_success_for_full_key(monkeypatch) -> None:
-    prepared: set[tuple[object, ...]] = set()
-    monkeypatch.setattr(top_k_module, "_PREPARED_DECODE_TOP_K", prepared)
-    monkeypatch.setattr(top_k_module, "_cuda_device", lambda _: torch.device("cuda:3"))
-    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
-
-    top_k = TopK(32, decode_implementation=TopKImplementation.TRTLLM_HEURISTIC)
-    warmup = Mock()
-    monkeypatch.setattr(top_k, "_warmup_trtllm_heuristic", warmup)
+def test_prepare_deduplicates_warmup(monkeypatch) -> None:
+    top_k_module._warmup_decode_top_k.cache_clear()
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
 
     prepare_args = dict(
-        device=torch.device("cuda:3"),
+        device=torch.device("cpu"),
         max_num_columns=4096,
         next_n=1,
-        input_dtype=torch.bfloat16,
+        input_dtype=torch.float32,
+        max_num_requests=2,
         num_sms=148,
     )
-    top_k.prepare(**prepare_args)
-    top_k.prepare(**prepare_args)
+    TopK(32, decode_implementation=TopKImplementation.CUDA_GVR).prepare(**prepare_args)
+    TopK(32, decode_implementation=TopKImplementation.CUDA_GVR).prepare(**prepare_args)
 
-    warmup.assert_called_once_with(torch.bfloat16)
-    assert len(prepared) == 1
+    decode.assert_called_once()
 
 
 def test_prepare_does_not_cache_failure(monkeypatch) -> None:
-    prepared: set[tuple[object, ...]] = set()
-    monkeypatch.setattr(top_k_module, "_PREPARED_DECODE_TOP_K", prepared)
-    monkeypatch.setattr(top_k_module, "_cuda_device", lambda _: torch.device("cuda:0"))
-    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
-
-    top_k = TopK(16, decode_implementation=TopKImplementation.TRTLLM_HEURISTIC)
-    warmup = Mock(side_effect=RuntimeError("warmup failed"))
-    monkeypatch.setattr(top_k, "_warmup_trtllm_heuristic", warmup)
+    top_k_module._warmup_decode_top_k.cache_clear()
+    decode = Mock(side_effect=RuntimeError("warmup failed"))
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(16, decode_implementation=TopKImplementation.CUDA_GVR)
     prepare_args = dict(
-        device=torch.device("cuda:0"),
+        device=torch.device("cpu"),
         max_num_columns=1024,
         next_n=1,
         input_dtype=torch.float32,
+        max_num_requests=1,
     )
 
     with pytest.raises(RuntimeError, match="warmup failed"):
         top_k.prepare(**prepare_args)
-    assert not prepared
 
-    warmup.side_effect = None
+    decode.side_effect = None
     top_k.prepare(**prepare_args)
-    assert warmup.call_count == 2
-    assert len(prepared) == 1
+    assert decode.call_count == 2
