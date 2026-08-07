@@ -165,7 +165,7 @@ class WanDMDPipeline(WanPipeline):
         nh = latents.shape[3] // ph
         nw = latents.shape[4] // pw
         start = time.time()
-        for i, t in enumerate(timesteps):
+        for i, t in self._profile_denoise_steps(timesteps):
             t_tensor = torch.full((latents.shape[0], nf * nh * nw), float(t), device=latents.device)
 
             pred_noise = self.transformer(
