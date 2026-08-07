@@ -147,14 +147,55 @@ omitted here and re-added by Groovy under the `MULTI_GPU_FILE_CHANGED` gate.
 
 ## 8. Where the DB comes from
 
-`artifact.py` picks among the post-merge artifacts: it reads each build's `build_info.txt` for
-`commit=` and takes the one whose commit trails the current checkout least, keeping the build
-number only as a tie-break when the commit cannot be resolved — build numbers do not order
-revisions, since a build can be a re-run of an older commit.
+Only one producer exists: the `LLM/main/L0_PostMerge` job, which uploads
+`<build>/cbts-coverage/cbts_pystart_report.tar.gz`. Every DB therefore describes some revision of
+`main` (`artifact.COVERAGE_BRANCH`), and picking one means picking **which revision of `main`**
+the selection reasons about.
 
-The chosen build, its commit and its distance from HEAD are recorded in the decision
-(`coverage_db_build` / `coverage_db_commit` / `coverage_db_lag`). **These are recorded, not
-gated**: observed lag varies widely even in healthy operation, so a threshold needs data first.
+### 8.1 Resolution
+
+```
+Jenkins REST lastBuild                     → newest build number N
+for b in N .. N-9:                           (_MAX_PROBE)
+   ranged GET the tarball                  → skip b if absent
+   GET build_info.txt, parse `commit=`     → sha, or None
+   lag(sha)                                → how far main moved past it
+rank by (lag known, lag ascending, build descending)
+```
+
+Ranking is by **revision, not build number**: a post-merge build can be a re-run of an older
+commit, so the highest build number is not necessarily the newest code. The build number is only
+the tie-break, and when no candidate's lag can be measured the ranking degenerates to exactly that
+tie-break — which is the pre-existing behaviour, not a regression.
+
+### 8.2 Measuring the lag
+
+Two sources, in order; `artifact.db_lag()` falls through:
+
+| Source | Answers when | Fails when |
+|---|---|---|
+| `git rev-list --count <sha>..HEAD` | the checkout has history — local runs, dev tooling | **always in CI**: `trtllm_utils.checkoutSpec` clones `depth: 1, noTags: true` with a single-SHA refspec, so no candidate revision is in the object store |
+| GitHub compare `<sha>...main` → `ahead_by` | a token is bound and the revision is public | the revision has not reached the public mirror yet (404); no token (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is routinely already spent) |
+
+Both failing leaves `lag: null`. Each failure prints its own reason to stderr — a missing working
+directory, git's own `fatal: bad object <sha>`, or the HTTP status — so the CI log distinguishes a
+wiring mistake from a shallow checkout from a rate limit.
+
+The token comes from the `github-cred-trtllm-ci` credential, bound around the `--print-selection`
+call in `_cbtsCoverageAudit` and read from `GITHUB_API_TOKEN`. `compare_distance` is cached per
+revision, so probing ten builds costs one API call per *distinct* revision.
+
+### 8.3 What happens with the result
+
+The tarball is downloaded (retried), the sqlite extracted, and `coverage_audit.py` run over it;
+any failure in this whole path is caught and non-fatal — `coverageDb.path` stays empty, Tier 2
+never runs, and the PR gets a full run.
+
+The chosen build, its commit and its lag ride into `main.py` and are recorded in the decision
+(`coverage_db_build` / `coverage_db_commit` / `coverage_db_lag`; an unmeasurable lag is `null`
+here and `-1` in the OpenSearch record).
+**These are recorded, not gated**: observed lag varies widely even in healthy operation, so a
+threshold needs data first.
 
 ## 9. Decision output
 

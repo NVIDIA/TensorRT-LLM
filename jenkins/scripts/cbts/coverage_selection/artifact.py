@@ -17,12 +17,16 @@ The tarball is uploaded per post-merge run to
 `<ARTIFACT_BASE>/<build>/cbts-coverage/cbts_pystart_report.tar.gz` (sqlite at
 the tar root plus `cbts_report/`).
 
-`latest_tarball_url()` reads the newest build number from the Jenkins REST API,
-then walks builds down, probing Artifactory with a 1-byte ranged GET until it
-finds one whose tarball exists.
+`select_tarball()` reads the newest build number from the Jenkins REST API, walks
+builds down probing Artifactory with a 1-byte ranged GET, and ranks the ones that
+exist by how far `COVERAGE_BRANCH` has moved past the revision each collected
+(`build_info.txt`), since a build can be a re-run of an older commit. That
+distance comes from local git, or from the forge compare API when the CI
+checkout is too shallow to answer; the build number is only a tie-break.
 
-Two entry points for the Groovy wiring:
+Three entry points for the Groovy wiring:
   * `--print-url` — resolve and print the tarball URL only (no download).
+  * `--print-selection` — print `{url, build, commit, lag}` as JSON.
   * `--dest DIR` — download + extract, printing the local sqlite path.
 """
 
@@ -30,12 +34,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tarfile
 import urllib.error
 import urllib.request
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -46,7 +52,13 @@ SQLITE_NAME = "cbts_touchmap.sqlite"
 # Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
+# Branch the DB is collected from; must match ARTIFACT_BASE.
+COVERAGE_BRANCH = "main"
+# Read by `compare_distance`; the anonymous quota is unusable from shared CI egress IPs.
+GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
+
 _URM = "https://urm.nvidia.com/artifactory"
+_GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Max builds to walk back when recent builds have no tarball.
 _MAX_PROBE = 10
@@ -54,9 +66,10 @@ _MAX_PROBE = 10
 _TIMEOUT = 15
 
 
-def _get(url: str) -> tuple[Optional[int], Optional[bytes]]:
+def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
+    req = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         return e.code, None
@@ -126,6 +139,36 @@ def commit_distance(commit: str, repo_root: str = ".", ref: str = "HEAD") -> Opt
     return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
 
 
+@lru_cache(maxsize=None)
+def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int]:
+    """Commits `branch` gained since `commit`, from the forge compare API, or None."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get(GITHUB_TOKEN_ENV)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    status, data = _get(f"{_GITHUB_COMPARE}/{commit}...{branch}", headers)
+    if status != 200 or not data:
+        # 403 without a token means the shared egress IP burned the 60/h anonymous quota.
+        hint = " (no token: anonymous quota)" if status == 403 and not token else ""
+        print(
+            f"[artifact] compare {commit[:10]}...{branch} failed: HTTP {status}{hint}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        # `ahead_by` counts the full range; only the `commits` array is truncated at 250.
+        return int(json.loads(data)["ahead_by"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"[artifact] compare {commit[:10]}...{branch}: bad response: {e}", file=sys.stderr)
+        return None
+
+
+def db_lag(commit: str, repo_root: str = ".") -> Optional[int]:
+    """How far `COVERAGE_BRANCH` moved past `commit`: local git first, then the compare API."""
+    lag = commit_distance(commit, repo_root)
+    return lag if lag is not None else compare_distance(commit)
+
+
 def select_tarball(
     artifact_base: str = ARTIFACT_BASE,
     jenkins_base: str = _JENKINS_BASE,
@@ -143,7 +186,7 @@ def select_tarball(
         if not _exists(url):
             continue
         commit = build_commit(b, artifact_base)
-        lag = commit_distance(commit, repo_root) if commit else None
+        lag = db_lag(commit, repo_root) if commit else None
         candidates.append({"url": url, "build": b, "commit": commit, "lag": lag})
     if not candidates:
         print(f"[artifact] no tarball in the last {max_probe} builds", file=sys.stderr)
@@ -235,7 +278,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "url": url,
                 "build": args.build,
                 "commit": commit,
-                "lag": commit_distance(commit, args.repo_root) if commit else None,
+                "lag": db_lag(commit, args.repo_root) if commit else None,
             }
         else:
             best = select_tarball(repo_root=args.repo_root)
