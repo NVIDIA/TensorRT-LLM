@@ -1134,11 +1134,21 @@ class SweepConfig:
     enable_attention_dp: bool = False
     max_draft_len: int = 5
     input_len: int = 1024
-    warmup_steps: int = 16
+    # 128, not a token gesture: autotuner cache misses ("using the fallback
+    # tactic") and allocator growth are still visible well past step 16 on a
+    # fresh engine, and a cell that starts on the cool side biases theta UP
+    # for exactly the small-M cells the argmax is most sensitive to.
+    warmup_steps: int = 128
     measure_steps: int = 64
     repeats: int = 1
     min_samples: int = 16
     max_seq_len: int = 4096
+    # Frac sweeps only: override the engine's DERIVED tier ladder (cost-table
+    # shelf edges, typically [1,3,5]). A denser ladder makes the frac knob
+    # quantise to more rungs, so one sweep measures more M columns per bs --
+    # the dense-tier experiments need the odd ratios {3,5} the default ladder
+    # cannot execute.
+    engine_tiers: Optional[List[int]] = None
     max_num_tokens: int = 8192
     kv_cache_fraction: float = 0.5
     #: Fitted STS temperatures. Not used to decide anything while the pin is on;
@@ -1414,7 +1424,10 @@ def _build_llm(config: SweepConfig, verify_len: int, *,
             # derived from it, and a one-rung ladder would collapse every
             # captured bucket to the full block -- the sweep would then only
             # ever measure M = bs * (block + 1) regardless of the frac.
-            (None if not pin_verify_len else [int(verify_len)])
+            # ``engine_tiers`` overrides the derived ladder for dense grids.
+            (([int(t) for t in config.engine_tiers]
+              if config.engine_tiers else None)
+             if not pin_verify_len else [int(verify_len)])
             if config.enable_confidence_scheduling else None
         ),
     )
@@ -1867,6 +1880,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "per-step M measured from the group's agreed bucket). Mutually "
         "exclusive with --verify-lens and --block-follows-verify-len.",
     )
+    sweep.add_argument(
+        "--engine-tiers",
+        default=None,
+        help="Frac sweeps only: comma-separated tier ladder for the SWEEP "
+        "engine (e.g. 2,3,4,5), overriding the cost-table-derived default. "
+        "A denser ladder quantises the frac knob to more rungs, so one sweep "
+        "measures more M columns per batch size.",
+    )
     sweep.add_argument("--input-len", type=int, default=1024, help="Prompt length in tokens.")
     sweep.add_argument("--block-follows-verify-len", action="store_true",
                        help="Shrink the drafted block with the verify window "
@@ -1886,7 +1907,7 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Fitted STS temperatures. Required with confidence "
                             "scheduling: ragged verification will not validate "
                             "without either this or the cost table being built.")
-    sweep.add_argument("--warmup-steps", type=int, default=16)
+    sweep.add_argument("--warmup-steps", type=int, default=128)
     sweep.add_argument("--measure-steps", type=int, default=64)
     sweep.add_argument("--min-samples", type=int, default=16)
     sweep.add_argument("--seed", type=int, default=1234)
@@ -2456,6 +2477,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pin_acceptance=BONUS_TOKEN_ONLY_ACCEPTANCE if args.pin_acceptance else 0.0,
             seed=args.seed,
             extra_llm_api_options=extra,
+            engine_tiers=(_int_list(args.engine_tiers)
+                          if args.engine_tiers else None),
         )
         if fracs:
             samples = run_frac_sweep(config)
