@@ -213,6 +213,68 @@ def run_reject_single_rank(tensor_parallel_size, single_rank_forward_func,
     return True
 
 
+def mnnvl_checkpoint_graph_forward(tensor_parallel_size: int,
+                                   tensor_parallel_rank: int,
+                                   num_tokens: int) -> bool:
+    torch.cuda.set_device(tensor_parallel_rank)
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    MPI.COMM_WORLD.barrier()
+
+    mapping = Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    )
+    with torch.inference_mode():
+        allreduce = AllReduce(
+            mapping=mapping,
+            strategy=AllReduceStrategy.MNNVL,
+            dtype=torch.bfloat16,
+        )
+        input_ = torch.full((num_tokens, 128),
+                            tensor_parallel_rank + 1,
+                            dtype=torch.bfloat16,
+                            device="cuda")
+        output = allreduce(input_)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = allreduce(input_)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 3))
+
+    workspace = allreduce.mnnvl_allreduce.allreduce_mnnvl_workspaces[mapping]
+    uc_address = workspace["uc_buffer"].data_ptr()
+    mc_address = workspace["handle"].get_mc_buffer((1, ), torch.float32,
+                                                   0).data_ptr()
+
+    for cycle in range(3):
+        allreduce.mnnvl_allreduce.checkpoint_prepare()
+        allreduce.mnnvl_allreduce.checkpoint_prepare()
+        assert not workspace["handle"].is_mapped()
+        with pytest.raises(RuntimeError, match="handles are not attached"):
+            allreduce(input_)
+
+        fresh_comm = MPI.COMM_WORLD.Split(0, tensor_parallel_rank)
+        allreduce.mnnvl_allreduce.checkpoint_restore(fresh_comm)
+        allreduce.mnnvl_allreduce.checkpoint_restore(fresh_comm)
+        assert workspace["handle"].is_mapped()
+        assert workspace["uc_buffer"].data_ptr() == uc_address
+        assert workspace["handle"].get_mc_buffer((1, ), torch.float32,
+                                                 0).data_ptr() == mc_address
+
+        with torch.inference_mode():
+            input_.fill_(tensor_parallel_rank + 2 + cycle)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output,
+                                   torch.full_like(output, 5 + 2 * cycle))
+    return True
+
+
 @torch.inference_mode()
 def mnnvl_quant_fusion_forward(
     input: torch.Tensor,
@@ -500,6 +562,25 @@ def test_mnnvl_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype,
     _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype,
                                          AllReduceStrategy.MNNVL, fusion,
                                          mpi_pool_executor)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRTLLM_TEST_MNNVL_CHECKPOINT") != "1",
+    reason="requires fabric-backed MNNVL checkpoint test hardware",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("num_tokens", [1, 4096], ids=["oneshot", "twoshot"])
+def test_mnnvl_checkpoint_preserves_cuda_graph_addresses(
+        mpi_pool_executor, num_tokens) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_checkpoint_graph_forward,
+        [tensor_parallel_size] * tensor_parallel_size,
+        range(tensor_parallel_size),
+        [num_tokens] * tensor_parallel_size,
+    )
+    for result in results:
+        assert result is True
 
 
 def _make_quant_scale(reference_norm: torch.Tensor,

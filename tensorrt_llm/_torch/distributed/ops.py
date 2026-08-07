@@ -1,8 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 import os
 import platform
 import threading
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
@@ -33,6 +47,23 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
 _thread_local = threading.local()
+
+
+class _MpiCommProtocol(Protocol):
+
+    def py2f(self) -> int:
+        ...
+
+    def Barrier(self) -> None:
+        ...
+
+
+class _MnnvlWorkspace(TypedDict):
+    handle: McastGPUBuffer
+    uc_buffer: torch.Tensor
+    buffer_flags: torch.Tensor
+    buffer_size_bytes: int
+    mpi_comm: _MpiCommProtocol
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -67,11 +98,28 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace) -> None:
+    """Reset Lamport buffers and control flags after allocation or restore."""
+    buffer_size_bytes = workspace["buffer_size_bytes"]
+    num_bytes_to_clear = [0] * 4
+    # FlashInfer #3950: these tensors may have been created during CUDA graph
+    # warmup under inference mode, so reset them under inference mode as well.
+    with torch.inference_mode():
+        workspace["uc_buffer"].fill_(-0.0)
+        workspace["buffer_flags"].copy_(
+            torch.tensor(
+                [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                dtype=torch.uint32,
+                device=workspace["buffer_flags"].device,
+            ))
+    torch.cuda.synchronize()
+    workspace["mpi_comm"].Barrier()
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
-    mapping: Mapping,
-    dtype: torch.dtype,
-    buffer_size_bytes: Optional[int] = None
-) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+        mapping: Mapping,
+        dtype: torch.dtype,
+        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
@@ -81,6 +129,11 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+
+    if mapping in allreduce_mnnvl_workspaces:
+        workspace = allreduce_mnnvl_workspaces[mapping]
+        if not workspace["handle"].is_mapped():
+            raise RuntimeError("MNNVL workspace handles are not attached")
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
@@ -132,18 +185,12 @@ def get_or_scale_allreduce_mnnvl_workspace(
                                                 (workspace_size_bytes //
                                                  (torch.float32.itemsize), ),
                                                 torch.float32, 0)
-        buffer.fill_(-0.0)
-        # Wait until the initialization is done
-        torch.cuda.synchronize()
-        comm.Barrier()
-
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
         # The flag should be binded to each buffer allocation
         # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        num_bytes_to_clear = [0] * 4
         buffer_flags = torch.tensor(
-            [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+            [0] * 9,
             dtype=torch.uint32,
             device=torch.device("cuda", mapping.local_rank),
         )
@@ -155,6 +202,8 @@ def get_or_scale_allreduce_mnnvl_workspace(
             "buffer_size_bytes": buffer_size_bytes,
             "mpi_comm": comm,
         }
+        _initialize_allreduce_mnnvl_protocol(
+            allreduce_mnnvl_workspaces[mapping])
     return allreduce_mnnvl_workspaces[mapping]
 
 
@@ -531,7 +580,7 @@ class MNNVLAllReduce(nn.Module):
     fast path that keeps the local value in registers and volatile-loads only peers
     from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
-    allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+    allreduce_mnnvl_workspaces: dict[Mapping, _MnnvlWorkspace] = {}
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -589,6 +638,27 @@ class MNNVLAllReduce(nn.Module):
             workspace_size = 2 * math.ceil(
                 num_tokens / group_size) * group_size * hidden_dim * elem_size
         return workspace_size
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach fabric handles while retaining workspace virtual addresses."""
+        workspace = self.allreduce_mnnvl_workspaces[self.mapping]
+        workspace["handle"].checkpoint_prepare()
+
+    def checkpoint_restore(self, comm: _MpiCommProtocol) -> None:
+        """Collectively recreate fabric handles using a fresh communicator.
+
+        This follows FlashInfer #3745 and requires a communicator created
+        after process restore for the fresh handle exchange.
+
+        Args:
+            comm: Communicator newly created after process restore.
+        """
+        workspace = self.allreduce_mnnvl_workspaces[self.mapping]
+        if workspace["handle"].is_mapped():
+            return
+        workspace["handle"].checkpoint_restore(comm.py2f())
+        workspace["mpi_comm"] = comm
+        _initialize_allreduce_mnnvl_protocol(workspace)
 
     def forward(
         self,

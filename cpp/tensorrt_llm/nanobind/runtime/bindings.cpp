@@ -322,7 +322,12 @@ void initBindings(nb::module_& m)
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_prepare", &tensorrt_llm::runtime::McastGPUBuffer::checkpointPrepare,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_restore", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestore,
+            nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
+        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
