@@ -1625,12 +1625,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     forward_args.latent_cache,
                 )
             else:
-                # TODO: this host-side path freezes write positions at CUDA
-                # graph capture time and may corrupt the cache on replay IF a
-                # non-hybrid MLA model reaches this path under graph capture.
-                # Investigate whether that is reachable; if so, the graph-safe
-                # branch above is a correctness fix to generalize, not an
-                # optimization. Tracked as a follow-up ticket.
+                # TODO(TRTLLM-15193): this host-side path freezes write
+                # positions at CUDA graph capture time and may corrupt the
+                # cache on replay IF a non-hybrid MLA model reaches this path
+                # under graph capture. Investigate whether that is reachable;
+                # if so, the graph-safe branch above is a correctness fix to
+                # generalize, not an optimization.
                 from .utils import append_mla_latent_cache
                 append_mla_latent_cache(
                     metadata.kv_cache_manager,
