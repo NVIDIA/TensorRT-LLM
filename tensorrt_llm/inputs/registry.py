@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import importlib
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -728,11 +729,16 @@ class MultimodalPlaceholderRegistry:
     Registry for the multimodal models to keep track of the placeholder information.
     """
 
+    # Trailing dot: package-boundary match, so "tensorrt_llm._torch.models_custom"
+    # counts as external. Registrants are always modeling_* submodules.
+    _BUILTIN_MODULE_PREFIX = "tensorrt_llm._torch.models."
+
     def __init__(self) -> None:
         self._multimodal_placeholder_by_model_type: Dict[
             str, MultimodalPlaceholderMetadata] = {}
 
     def __str__(self) -> str:
+        self._ensure_all_providers_imported()
         s = ""
         for model_type, placeholder_metadata in self._multimodal_placeholder_by_model_type.items(
         ):
@@ -745,22 +751,81 @@ class MultimodalPlaceholderRegistry:
         return s
 
     def set_placeholder_metadata(
-            self, model_type: str,
-            placeholder_metadata: MultimodalPlaceholderMetadata):
+            self,
+            model_type: str,
+            placeholder_metadata: MultimodalPlaceholderMetadata,
+            registrant_module: Optional[str] = None):
+        """Register placeholder metadata for ``model_type``.
+
+        ``registrant_module`` identifies the registering module. Built-in
+        registrations (under the lazily imported model zoo) only fill empty
+        slots: they may run *after* an external implementation claimed the
+        model type and must not clobber it (same priority rule as the model
+        class registry).
+        """
+        if (model_type in self._multimodal_placeholder_by_model_type
+                and registrant_module is not None
+                and registrant_module.startswith(self._BUILTIN_MODULE_PREFIX)):
+            logger.info(f"Keeping existing placeholder metadata for model "
+                        f"type {model_type}.")
+            return
         self._multimodal_placeholder_by_model_type[
             model_type] = placeholder_metadata
 
+    def _ensure_provider_imported(self, model_type: str) -> None:
+        """Import the modeling module that registers ``model_type``, if needed.
+
+        Registration is an import side effect of the (lazily imported) model
+        zoo, so point lookups resolve their provider on demand; model types
+        registered dynamically (or already imported) are returned as-is.
+        Imports are function-local: modeling modules import this module, so a
+        top-level import of the zoo index would be circular.
+        """
+        if model_type in self._multimodal_placeholder_by_model_type:
+            return
+        from tensorrt_llm._torch.models._arch_index import \
+            MULTIMODAL_MODEL_TYPE_TO_MODULE
+        module_name = MULTIMODAL_MODEL_TYPE_TO_MODULE.get(model_type)
+        if module_name is None:
+            return
+        full_name = f"tensorrt_llm._torch.models.{module_name}"
+        try:
+            importlib.import_module(full_name)
+        except ModuleNotFoundError as e:
+            # Only swallow "the providing module itself is missing" (stale
+            # index entry); a missing dependency inside the module is a real
+            # error and must not be masked as an unregistered model type.
+            if e.name != full_name:
+                raise
+            logger.warning(f"Lazy import of {module_name} for model type "
+                           f"{model_type} failed: {e!r}")
+
+    def _ensure_all_providers_imported(self) -> None:
+        """Import every indexed multimodal provider (for enumeration APIs).
+
+        Listing registered model types is only meaningful once all providers
+        have run their registration side effects; with the zoo lazy this
+        imports just the multimodal modeling modules, on first enumeration.
+        """
+        from tensorrt_llm._torch.models._arch_index import \
+            MULTIMODAL_MODEL_TYPE_TO_MODULE
+        for model_type in MULTIMODAL_MODEL_TYPE_TO_MODULE:
+            self._ensure_provider_imported(model_type)
+
     def remove_placeholder_metadata(self, model_type: str):
+        self._ensure_provider_imported(model_type)
         if model_type not in self._multimodal_placeholder_by_model_type:
             raise ValueError(f"Model type '{model_type}' is not registered")
         del self._multimodal_placeholder_by_model_type[model_type]
 
     def is_valid(self, model_type: str, modality: str) -> bool:
+        self._ensure_provider_imported(model_type)
         return model_type in self._multimodal_placeholder_by_model_type and \
             modality in self._multimodal_placeholder_by_model_type[model_type].placeholder_map
 
     def get_placeholder_metadata(
             self, model_type: str) -> MultimodalPlaceholderMetadata:
+        self._ensure_provider_imported(model_type)
         if model_type not in self._multimodal_placeholder_by_model_type:
             raise ValueError(
                 f"Model type {model_type} is not registered in MultimodalPlaceholderRegistry"
@@ -777,12 +842,14 @@ class MultimodalPlaceholderRegistry:
 
     def get_placeholder_placement(
             self, model_type: str) -> MultimodalPlaceholderPlacement:
+        self._ensure_provider_imported(model_type)
         if model_type not in self._multimodal_placeholder_by_model_type:
             raise ValueError(f"Model type '{model_type}' is not registered")
         return self._multimodal_placeholder_by_model_type[
             model_type].placeholder_placement
 
     def get_placeholders_separator(self, model_type: str) -> str:
+        self._ensure_provider_imported(model_type)
         if model_type not in self._multimodal_placeholder_by_model_type:
             raise ValueError(f"Model type '{model_type}' is not registered")
         return self._multimodal_placeholder_by_model_type[
@@ -790,6 +857,7 @@ class MultimodalPlaceholderRegistry:
 
     def get_interleave_placeholders(self, model_type: str) -> bool:
         """Return whether the model opts in to interleaved placeholder insertion."""
+        self._ensure_provider_imported(model_type)
         if model_type not in self._multimodal_placeholder_by_model_type:
             return False
         return self._multimodal_placeholder_by_model_type[
@@ -797,33 +865,38 @@ class MultimodalPlaceholderRegistry:
 
     def get_content_format(self, model_type: str) -> Optional[ContentFormat]:
         """Get the content format override for a model type, or None for auto-detect."""
+        self._ensure_provider_imported(model_type)
         if model_type not in self._multimodal_placeholder_by_model_type:
             return None
         return self._multimodal_placeholder_by_model_type[
             model_type].content_format
 
     def get_registered_image_model_types(self) -> Tuple[str, ...]:
-        return (
+        self._ensure_all_providers_imported()
+        return tuple(
             model_type
             for model_type in self._multimodal_placeholder_by_model_type
             if "image" in self.
             _multimodal_placeholder_by_model_type[model_type].placeholder_map)
 
     def get_registered_video_model_types(self) -> Tuple[str, ...]:
-        return (
+        self._ensure_all_providers_imported()
+        return tuple(
             model_type
             for model_type in self._multimodal_placeholder_by_model_type
             if "video" in self.
             _multimodal_placeholder_by_model_type[model_type].placeholder_map)
 
     def get_registered_audio_model_types(self) -> Tuple[str, ...]:
-        return (
+        self._ensure_all_providers_imported()
+        return tuple(
             model_type
             for model_type in self._multimodal_placeholder_by_model_type
             if "audio" in self.
             _multimodal_placeholder_by_model_type[model_type].placeholder_map)
 
     def get_registered_model_types(self) -> Tuple[str, ...]:
+        self._ensure_all_providers_imported()
         return tuple(self._multimodal_placeholder_by_model_type.keys())
 
 
@@ -894,7 +967,9 @@ def register_input_processor(
             )
 
         MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
-            model_type, placeholder_metadata)
+            model_type,
+            placeholder_metadata,
+            registrant_module=model_cls.__module__)
 
         # Expose the registered model_type on the processor class so callers
         # can look it up without re-deriving it from the HF config.

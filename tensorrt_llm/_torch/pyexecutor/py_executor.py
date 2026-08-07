@@ -5,6 +5,7 @@ import dataclasses
 import datetime
 import functools
 import os
+import sys
 import threading
 import time
 import traceback
@@ -18,7 +19,6 @@ import torch
 from strenum import StrEnum
 
 from tensorrt_llm.llmapi import DisaggScheduleStyle
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
     from cuda.bindings import runtime as cudart
@@ -26,6 +26,7 @@ except ImportError:
     from cuda import cudart
 
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+                                 get_steady_clock_now_in_seconds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
                                  nvtx_range, set_thread_local_mpi_comm,
                                  trace_func)
@@ -50,7 +51,6 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
-from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -4903,9 +4903,16 @@ class PyExecutor:
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
-            # Only skip token‐range checks for Llama4 when the request has multimodal data
-            if isinstance(self.model_engine.model,
-                          Llama4ForConditionalGeneration):
+            # Only skip token-range checks for Llama4 when the request has
+            # multimodal data. Probed via sys.modules so this module does not
+            # import a model-zoo module at startup (which would defeat the
+            # zoo's lazy loading): if modeling_llama was never imported, the
+            # engine's model cannot be a Llama4 instance.
+            modeling_llama = sys.modules.get(
+                "tensorrt_llm._torch.models.modeling_llama")
+            if modeling_llama is not None and isinstance(
+                    self.model_engine.model,
+                    modeling_llama.Llama4ForConditionalGeneration):
                 has_mm = bool(request.py_multimodal_data)
                 if has_mm:
                     logger.debug(

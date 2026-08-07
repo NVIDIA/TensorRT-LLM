@@ -616,7 +616,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
         torch.cuda.Stream()
 
         # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
