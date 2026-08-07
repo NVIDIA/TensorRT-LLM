@@ -588,6 +588,8 @@ class PyExecutor:
         self.force_terminate_ctx_for_partial_reuse = (
             self.enable_disagg_partial_reuse_store and self.dist.pp_size == 1)
 
+        self._warn_if_kv_block_budget_unchecked()
+
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
@@ -5459,6 +5461,51 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
+    def _warn_if_kv_block_budget_unchecked(self) -> None:
+        """Warn when beam search runs against a pool no admission check covers.
+
+        Managers that keep their own cost model -- sparse/compressed KV,
+        variable- or uniform-sliding-window, linear attention, mamba hybrids --
+        opt out of ``get_request_kv_block_budget``, so
+        ``_validate_request_budget`` cannot reject a request whose per-beam
+        demand exceeds the pool. Such a request is admitted and then cannot
+        complete: under GUARANTEED_NO_EVICT it waits for capacity that will
+        never exist rather than failing. Leave a trace so that is diagnosable.
+
+        Logged once because KV cache estimation builds a throwaway executor
+        before the real one (see create_py_executor), which would otherwise
+        report the same pools twice per startup.
+        """
+        if self.max_beam_width <= 1:
+            return
+        unchecked = self.resource_manager.get_unchecked_kv_block_budget_pools()
+        if not unchecked:
+            return
+        logger.warning_once(
+            f"[PyExecutor] max_beam_width={self.max_beam_width} with "
+            f"{', '.join(pool.value for pool in unchecked)}: these pools "
+            "estimate their own KV cache demand, so requests are admitted "
+            "without a per-beam block feasibility check. A request needing "
+            "more blocks than a pool holds waits unscheduled instead of "
+            "failing; lower max_beam_width or max_seq_len if generation makes "
+            "no progress.",
+            key="kv_block_budget_unchecked")
+
+    def _validate_request_budget(self, request: LlmRequest) -> None:
+        # Compare worst-case, beam-aware demand against every supported KV
+        # pool. Reject requests that can never fit so they fail cleanly instead
+        # of stalling the scheduler forever.
+        for resource_type, required_blocks, primary_capacity in (
+                self.resource_manager.get_request_kv_block_budgets(request)):
+            if required_blocks > primary_capacity:
+                raise ValueError(
+                    f"{resource_type.value} requires {required_blocks} KV cache "
+                    f"blocks to complete the request, which exceeds its "
+                    f"GPU-primary capacity of {primary_capacity} blocks "
+                    f"(prompt_len={request.orig_prompt_len}, "
+                    f"max_new_tokens={request.max_new_tokens}, "
+                    f"beam_width={request.py_beam_width}).")
+
     def _validate_request(self, request: LlmRequest):
         # Validate beam width
         sampling_config = request.sampling_config
@@ -5520,6 +5567,9 @@ class PyExecutor:
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
+
+        # Check if request has enough budget
+        self._validate_request_budget(request)
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
