@@ -26,7 +26,6 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
-#include <cstdlib>
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -396,8 +395,7 @@ nixl_status_t NixlTransferStatus::queryStatus() const
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
-    char const* disableMpi = std::getenv("TLLM_DISABLE_MPI");
-    bool const mpiEnabled = disableMpi == nullptr || std::atoi(disableMpi) == 0;
+    bool const mpiEnabled = !common::getBoolEnv("TLLM_DISABLE_MPI");
     TLLM_CHECK_WITH_INFO(config.rank.has_value() == config.worldSize.has_value(),
         "NIXL agent config fields 'rank' and 'worldSize' must be specified together");
 

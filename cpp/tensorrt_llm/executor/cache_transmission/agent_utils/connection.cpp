@@ -413,7 +413,10 @@ AgentConnectionManager::AgentConnectionManager(
         }
         else
         {
-            TLLM_LOG_WARNING("Torch process group is not initialized; cache transceiver defaults to one process");
+            TLLM_LOG_WARNING(
+                "Torch process group is not initialized while MPI is disabled; cache transceiver defaults to one "
+                "process. For multi-rank execution, initialize the Torch process group before constructing the cache "
+                "transceiver, or unset TLLM_DISABLE_MPI to use MPI");
         }
     }
 
