@@ -343,7 +343,7 @@ def run(
 
     if use_strided:
 
-        def generate_tensors():
+        def generate_tensors() -> cute.testing.JitArguments:
             _, a_torch_new = cutlass_torch.cute_tensor_like(
                 a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
             )
@@ -383,7 +383,7 @@ def run(
             )
     else:
 
-        def generate_tensors():
+        def generate_tensors() -> cute.testing.JitArguments:
             _, a_torch_new = cutlass_torch.cute_tensor_like(
                 a_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
             )
