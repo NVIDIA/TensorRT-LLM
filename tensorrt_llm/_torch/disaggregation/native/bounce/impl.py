@@ -271,7 +271,7 @@ class VmmBounceTransport(BounceTransport):
         # 96-block gate and fell onto the ~0.4 GB/s host-staged path). Plain-KV payloads keep the
         # original block-count gate so pre-existing bounce deployments (opted in via
         # kv_cache_bounce_size_mb) see no change in which transfers use the arena.
-        # TODO(TRTLLM followup, ticket to be filed): investigate whether the byte-only gate is
+        # TODO(TRTLLM-15194): investigate whether the byte-only gate is
         # safe (or better) for plain-KV payloads too, so this special case can be removed and
         # both payload kinds share one gate.
         nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
