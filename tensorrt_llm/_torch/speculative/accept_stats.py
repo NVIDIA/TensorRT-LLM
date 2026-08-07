@@ -67,6 +67,8 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from tensorrt_llm.logger import logger
+
 ENV_STATS_DIR = "TLLM_DFLASH_ACCEPT_STATS_DIR"
 ENV_FLUSH_EVERY = "TLLM_DFLASH_ACCEPT_STATS_FLUSH_EVERY"
 DEFAULT_NUM_CONF_BINS = 20
@@ -96,6 +98,12 @@ def maybe_create_recorder(max_draft_len: int, rank: int) -> Optional["DFlashAcce
     stats_dir = os.environ.get(ENV_STATS_DIR)
     if not stats_dir:
         return None
+    logger.warning(
+        "DFlash acceptance-stats recording is EXPERIMENTAL and specific to "
+        "the DFlash/DSpark drafter: enabling %s with other speculative "
+        "decoding methods records nothing and is unsupported.",
+        ENV_STATS_DIR,
+    )
     flush_every = int(os.environ.get(ENV_FLUSH_EVERY, "50"))
     return DFlashAcceptStatsRecorder(
         stats_dir,
