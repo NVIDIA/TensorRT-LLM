@@ -443,9 +443,41 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         # of the model on which load_state_dict is called (e.g., VLM models
         # where the text model lives at model.language_model.*).
         weight_name = prefix + weight_name
+        input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"
+        alpha_name = weight_name.rsplit(".", 1)[0] + ".alpha"
+        has_unified_hf_scales = (
+            weight_name + "_scale_2" in state_dict
+            and weight_name + "_scale" in state_dict
+            and input_scale_name in state_dict
+            and float4_sf_dtype
+        )
+        if has_unified_hf_scales and (
+            weight_name not in state_dict or state_dict[weight_name].dtype == torch.uint8
+        ):
+            # Unified HF checkpoint path. Sharded safetensors may present the
+            # packed weight and its scale tensors in different state_dict shards,
+            # so this path must not depend on the weight shard being present.
+            alpha = state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
+            alpha = torch.clamp(alpha, min=1e-30)
+            state_dict[alpha_name] = alpha
+            input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
+            state_dict[input_scale_name] = 1 / input_scale
+            weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
+            # Round the weight block scale factors to 128x4 and then swizzle.
+            weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
+                weight_scale.view(torch.uint8).cpu().contiguous()
+            ).view(float4_sf_dtype)
+
+            m, n = weight_scale.shape
+            # scaling factors m is padded along 128 and n is padded along 4.
+            # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
+            padded_m, padded_n = self._pad_m_n(m, n)
+            swizzled_shape = (padded_m, padded_n)
+
+            state_dict[weight_name + "_scale"] = weight_scale_swizzled.reshape(swizzled_shape)
+            return
+
         if weight_name in state_dict:
-            input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"
-            alpha_name = weight_name.rsplit(".", 1)[0] + ".alpha"
             weight = state_dict[weight_name]
             # ModelOpt quantized graph path
             if weight.dtype != torch.uint8:
@@ -465,7 +497,7 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                 # ``fp4_quantize`` returns the (swizzled) block scale as a flat
                 # 1-D tensor, but ``default_scales`` registers the buffer with the
                 # padded 2-D ``(padded_m, padded_n)`` cutlass shape -- the same
-                # shape the unified-HF-checkpoint branch below produces. Reshape
+                # shape the unified-HF-checkpoint branch above produces. Reshape
                 # here so this on-the-fly (bf16 ModelOpt) path stays consistent
                 # with the registered buffer and the HF path; otherwise the flat
                 # scale fails ``load_state_dict`` with a size mismatch.
@@ -477,34 +509,6 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                 state_dict[alpha_name] = 1 / torch.clamp(
                     weight_scale_2 * state_dict[input_scale_name], min=1e-30
                 )
-            # Unified HF ckpt path
-            else:
-                if (
-                    weight_name + "_scale_2" in state_dict
-                    and weight_name + "_scale" in state_dict
-                    and input_scale_name in state_dict
-                    and float4_sf_dtype
-                ):
-                    alpha = state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
-                    alpha = torch.clamp(alpha, min=1e-30)
-                    state_dict[alpha_name] = alpha
-                    input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
-                    state_dict[input_scale_name] = 1 / input_scale
-                    weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    # Round the weight block scale factors to 128x4 and then swizzle.
-                    weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
-                        weight_scale.view(torch.uint8).cpu().contiguous()
-                    ).view(float4_sf_dtype)
-
-                    m, n = weight_scale.shape
-                    # scaling factors m is padded along 128 and n is padded along 4.
-                    # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
-                    padded_m, padded_n = self._pad_m_n(m, n)
-                    swizzled_shape = (padded_m, padded_n)
-
-                    state_dict[weight_name + "_scale"] = weight_scale_swizzled.reshape(
-                        swizzled_shape
-                    )
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
         """Convert amax from modelopt quantized graph to scales."""
