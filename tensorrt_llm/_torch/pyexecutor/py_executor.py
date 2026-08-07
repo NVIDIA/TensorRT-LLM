@@ -607,7 +607,6 @@ class PyExecutor:
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
         self._rebalance_check_interval = KV_POOL_REBALANCE_CHECK_INTERVAL
-        self._rebalance_check_counter = 0
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -4527,13 +4526,16 @@ class PyExecutor:
         no beam search, no drafter, not during warmup or shutdown.
         Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
 
-        Every condition below must be rank-uniform, because a ``True`` here is
-        what puts a TP rank into ``_agreed_need_adjustment``'s collective, and
-        ranks entering that collective on different iterations would deadlock.
-        The config checks are identical by construction; ``is_warmup`` and
-        ``is_shutdown`` are phase flags the executor loop already has to keep in
-        lockstep for the many other per-iteration collectives it runs, so
-        relying on them here adds no new requirement.
+        A ``True`` here is what puts a TP rank into
+        ``_agreed_need_adjustment``'s collective, so ranks that disagree on this
+        predicate *on the same iteration* would enter that collective in
+        different numbers.  The config checks are identical across ranks by
+        construction, and ``is_warmup`` / ``is_shutdown`` are phase flags the
+        executor loop already has to keep in lockstep for the many other
+        per-iteration collectives it runs, so relying on them adds no new
+        requirement.  Note that the throttle below reads ``iter_counter``
+        instead of keeping its own counter precisely so that a rank which does
+        return early here cannot carry a lasting cadence offset out of it.
         """
         if not self.enable_kv_pool_rebalance:
             return False
@@ -4555,10 +4557,19 @@ class PyExecutor:
         # buys nothing and costs a collective per iteration in the TP case
         # (see _agreed_need_adjustment).  At typical iteration times this
         # delays a rebalance by a couple of seconds at most.
-        self._rebalance_check_counter += 1
-        if self._rebalance_check_counter < self._rebalance_check_interval:
+        #
+        # Throttling on iter_counter rather than on a counter of our own is
+        # deliberate.  A private counter would only advance on iterations where
+        # every gate above already passed, so a single iteration on which one
+        # rank returned early would leave that rank's counter permanently offset
+        # from its peers -- and the ranks would then reach the collective in
+        # _agreed_need_adjustment on different iterations from then on.
+        # iter_counter is bumped unconditionally at the end of every executor
+        # loop iteration, so being a pure function of the iteration index it
+        # cannot accumulate that offset.  This file already throttles the same
+        # way for iter stats (see _kv_iter_stats_interval).
+        if self.iter_counter % self._rebalance_check_interval != 0:
             return False
-        self._rebalance_check_counter = 0
         return True
 
     def _agreed_need_adjustment(self) -> bool:

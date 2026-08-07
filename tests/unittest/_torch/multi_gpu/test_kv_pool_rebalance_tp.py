@@ -108,18 +108,62 @@ def _make_executor(
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
     exe._rebalance_check_interval = rebalance_check_interval
-    exe._rebalance_check_counter = 0
+    exe.iter_counter = 0
     return exe
 
 
 def _tp_dist(world_size: int, rank: int) -> MPIDist:
+    """Build a pure-TP communicator for this rank.
+
+    Args:
+        world_size: Total number of ranks, all of them TP ranks.
+        rank: This process's global rank.
+
+    Returns:
+        An ``MPIDist`` whose mapping has ``tp_size == world_size``.
+    """
     return MPIDist(Mapping(world_size=world_size, rank=rank, tp_size=world_size))
 
 
 def _cp_dist(world_size: int, rank: int) -> MPIDist:
-    """A pure-CP mapping: ``tp_size == 1``, so ``cp_broadcast`` carries the
-    agreement and keying on ``tp_size`` alone would miss it entirely."""
+    """Build a pure-CP communicator for this rank.
+
+    ``tp_size`` is 1 here, so ``cp_broadcast`` alone carries the agreement and
+    keying the mechanism on ``tp_size`` would miss this configuration entirely.
+
+    Args:
+        world_size: Total number of ranks, all of them CP ranks.
+        rank: This process's global rank.
+
+    Returns:
+        An ``MPIDist`` whose mapping has ``cp_size == world_size`` and
+        ``tp_size == 1``.
+    """
     return MPIDist(Mapping(world_size=world_size, rank=rank, cp_size=world_size))
+
+
+def _cp_tp_dist(cp_size: int, tp_size: int, rank: int) -> MPIDist:
+    """Build a combined CP x TP communicator for this rank.
+
+    This is the only mapping that makes ``_agreed_need_adjustment`` run *both*
+    broadcasts, which is the shape the production chain actually takes.
+
+    Args:
+        cp_size: Context-parallel width.
+        tp_size: Tensor-parallel width.
+        rank: This process's global rank.
+
+    Returns:
+        An ``MPIDist`` over ``cp_size * tp_size`` ranks with both dimensions > 1.
+    """
+    return MPIDist(
+        Mapping(
+            world_size=cp_size * tp_size,
+            rank=rank,
+            tp_size=tp_size,
+            cp_size=cp_size,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +171,15 @@ def _cp_dist(world_size: int, rank: int) -> MPIDist:
 # ---------------------------------------------------------------------------
 
 
-def run_agreement(world_size, rank, local_flags, expected):
-    """Every TP rank must end up with rank 0's decision, not its own."""
+def run_agreement(world_size: int, rank: int, local_flags: list[bool], expected: bool) -> None:
+    """Every TP rank must end up with rank 0's decision, not its own.
+
+    Args:
+        world_size: Number of TP ranks.
+        rank: This process's global rank.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: The decision every rank should agree on.
+    """
     dist = _tp_dist(world_size, rank)
     exe = _make_executor(dist, need_adjustment=local_flags[rank])
 
@@ -149,13 +200,19 @@ def run_agreement(world_size, rank, local_flags, expected):
     assert len(set(all_decisions)) == 1, f"ranks disagreed after the collective: {all_decisions}"
 
 
-def run_cp_agreement(world_size, rank, local_flags, expected):
+def run_cp_agreement(world_size: int, rank: int, local_flags: list[bool], expected: bool) -> None:
     """Same guarantee as TP, but over a pure-CP mapping (``tp_size == 1``).
 
     A request is split across CP ranks, so they must admit it together; and CP
     runs on the same executor loops as TP, which compute ``_schedule()`` per
     rank with no broadcast.  Keying the agreement on ``tp_size`` alone would
     leave this configuration unsynchronized.
+
+    Args:
+        world_size: Number of CP ranks.
+        rank: This process's global rank.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: The decision every rank should agree on.
     """
     dist = _cp_dist(world_size, rank)
     assert dist.tp_size == 1, "this test is meaningless unless tp_size is 1"
@@ -173,12 +230,63 @@ def run_cp_agreement(world_size, rank, local_flags, expected):
     assert len(set(all_decisions)) == 1, f"CP ranks disagreed: {all_decisions}"
 
 
-def run_attention_dp_independence(world_size, rank, local_flags):
+def run_cp_tp_agreement(
+    world_size: int, rank: int, cp_size: int, local_flags: list[bool], expected: bool
+) -> None:
+    """Global rank 0's decision must reach every rank through *both* broadcasts.
+
+    This is the only case that exercises the production chain end to end:
+    ``cp_broadcast`` and then ``tp_broadcast``.  The pure-TP test has
+    ``cp_size == 1`` and the pure-CP test has ``tp_size == 1``, so each skips one
+    of the two steps; neither can show that the TP step consumes the *result* of
+    the CP step rather than the rank's own local reading.
+
+    With ``local_flags`` true only at global rank 0, a rank whose ``tp_rank`` is
+    non-zero can only end up ``True`` if its CP root picked up rank 0's decision
+    in the first step and then passed it on in the second.
+
+    Args:
+        world_size: Total number of ranks, equal to ``cp_size * tp_size``.
+        rank: This process's global rank.
+        cp_size: Context-parallel width; TP width is derived from it.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: The decision every rank should agree on.
+    """
+    tp_size = world_size // cp_size
+    dist = _cp_tp_dist(cp_size, tp_size, rank)
+    # Both dimensions must really be >1, or this degenerates into one of the
+    # single-dimension tests and stops covering the chain.
+    assert dist.cp_size > 1 and dist.tp_size > 1, (
+        f"this test only means something when both dimensions are > 1, got "
+        f"cp_size={dist.cp_size} tp_size={dist.tp_size}"
+    )
+    exe = _make_executor(dist, need_adjustment=local_flags[rank])
+
+    got = PyExecutor._agreed_need_adjustment(exe)
+
+    # Collect before asserting -- see run_agreement for why the order matters.
+    all_decisions = dist.allgather(got)
+
+    assert got == expected, (
+        f"rank {rank} (tp_rank={dist.mapping.tp_rank}, "
+        f"cp_rank={dist.mapping.cp_rank}): local reading was {local_flags[rank]}, "
+        f"global rank 0 said {local_flags[0]}, so the agreed decision should be "
+        f"{expected}, got {got}"
+    )
+    assert len(set(all_decisions)) == 1, f"CPxTP ranks disagreed: {all_decisions}"
+
+
+def run_attention_dp_independence(world_size: int, rank: int, local_flags: list[bool]) -> None:
     """Under attention DP each rank keeps its own decision.
 
     ADP ranks own independent request streams and independent KV caches, so
     forcing rank 0's decision on them would starve a rank that needs to
     rebalance when rank 0 does not.
+
+    Args:
+        world_size: Number of TP ranks.
+        rank: This process's global rank.
+        local_flags: Per-rank local ``need_adjustment`` readings.
     """
     dist = _tp_dist(world_size, rank)
     exe = _make_executor(dist, need_adjustment=local_flags[rank], enable_attention_dp=True)
@@ -190,11 +298,11 @@ def run_attention_dp_independence(world_size, rank, local_flags):
     )
 
 
-def run_throttle_lockstep(world_size, rank, interval, iterations):
+def run_throttle_lockstep(world_size: int, rank: int, interval: int, iterations: int) -> None:
     """Ranks must reach the agreement collective on the *same* iterations.
 
     This is the deadlock guard.  ``_can_pause_for_rebalance`` gates the
-    collective, so ranks whose throttle counters drifted apart would enter
+    collective, so ranks whose throttle cadence drifted apart would enter
     ``tp_broadcast`` on different iterations.  Driving the real collective
     inside the loop means such a divergence hangs here rather than passing
     silently; the allgather afterwards pins down that the firing iterations
@@ -202,14 +310,27 @@ def run_throttle_lockstep(world_size, rank, interval, iterations):
 
     Ranks are deliberately given *different* local ``need_adjustment`` readings,
     so it is the throttle cadence -- not agreement on the value -- that is under
-    test here.  Everything ``_can_pause_for_rebalance`` reads is rank-uniform,
-    which is precisely the property being confirmed.
+    test here.
+
+    Note the cadence is a pure function of ``iter_counter``, so drift can only
+    come from ranks disagreeing about the iteration index itself.  The related
+    hazard -- a rank skipping a check because of a rank-local gate -- cannot be
+    covered here, because by construction it would leave the other ranks
+    blocked in a collective that rank never enters; that one is pinned down
+    without a real collective in ``TestRebalanceCheckThrottle``.
+
+    Args:
+        world_size: Number of TP ranks.
+        rank: This process's global rank.
+        interval: Throttle interval to configure.
+        iterations: How many executor iterations to simulate.
     """
     dist = _tp_dist(world_size, rank)
     exe = _make_executor(dist, need_adjustment=(rank % 2 == 0), rebalance_check_interval=interval)
 
     fired_on = []
     for i in range(iterations):
+        exe.iter_counter = i
         if PyExecutor._can_pause_for_rebalance(exe):
             fired_on.append(i)
             # Real collective -- diverging ranks hang instead of passing.
@@ -221,7 +342,7 @@ def run_throttle_lockstep(world_size, rank, interval, iterations):
     )
 
     # Sanity: the throttle actually throttled, and it fired when expected.
-    expected = [i for i in range(iterations) if (i + 1) % interval == 0]
+    expected = [i for i in range(iterations) if i % interval == 0]
     assert fired_on == expected, (
         f"throttle fired on {fired_on}, expected {expected} for interval "
         f"{interval} over {iterations} iterations"
@@ -234,13 +355,29 @@ def run_throttle_lockstep(world_size, rank, interval, iterations):
 # ---------------------------------------------------------------------------
 
 
-def _skip_if_not_enough_gpus(world_size):
+def _skip_if_not_enough_gpus(world_size: int) -> None:
+    """Skip the calling test unless ``world_size`` GPUs are visible.
+
+    Args:
+        world_size: Number of ranks the test needs.
+    """
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"need {world_size} GPUs, have {torch.cuda.device_count()}")
 
 
-def _flags_for(case: str, world_size: int):
-    """Local per-rank ``need_adjustment`` readings for each skew scenario."""
+def _flags_for(case: str, world_size: int) -> list[bool]:
+    """Local per-rank ``need_adjustment`` readings for each skew scenario.
+
+    Args:
+        case: Name of the skew scenario.
+        world_size: Number of ranks to produce readings for.
+
+    Returns:
+        One local reading per rank.
+
+    Raises:
+        ValueError: If ``case`` is not a known scenario.
+    """
     if case == "all_true":
         return [True] * world_size
     if case == "all_false":
@@ -261,8 +398,13 @@ def _flags_for(case: str, world_size: int):
     ["all_true", "all_false", "only_rank0_true", "only_rank0_false"],
 )
 @pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"tp:{x}")
-def test_tp_ranks_agree_on_rebalance_trigger(world_size, case):
-    """Rank 0's decision wins on every TP rank, whatever the local readings."""
+def test_tp_ranks_agree_on_rebalance_trigger(world_size: int, case: str) -> None:
+    """Rank 0's decision wins on every TP rank, whatever the local readings.
+
+    Args:
+        world_size: Number of TP ranks to run on.
+        case: Skew scenario name, resolved by ``_flags_for``.
+    """
     _skip_if_not_enough_gpus(world_size)
     flags = _flags_for(case, world_size)
     expected = flags[0]
@@ -281,8 +423,13 @@ def test_tp_ranks_agree_on_rebalance_trigger(world_size, case):
     ["only_rank0_true", "only_rank0_false"],
 )
 @pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"cp:{x}")
-def test_cp_ranks_agree_on_rebalance_trigger(world_size, case):
-    """Pure CP (``tp_size == 1``) must agree just as TP does."""
+def test_cp_ranks_agree_on_rebalance_trigger(world_size: int, case: str) -> None:
+    """Pure CP (``tp_size == 1``) must agree just as TP does.
+
+    Args:
+        world_size: Number of CP ranks to run on.
+        case: Skew scenario name, resolved by ``_flags_for``.
+    """
     _skip_if_not_enough_gpus(world_size)
     flags = _flags_for(case, world_size)
     expected = flags[0]
@@ -296,9 +443,48 @@ def test_cp_ranks_agree_on_rebalance_trigger(world_size, case):
             assert r is True
 
 
+@pytest.mark.parametrize("cp_size", [2], ids=lambda x: f"cp:{x}")
+@pytest.mark.parametrize("world_size", [4], ids=lambda x: f"world:{x}")
+def test_cp_and_tp_ranks_agree_on_rebalance_trigger(world_size: int, cp_size: int) -> None:
+    """Both broadcasts chained: CP x TP propagates global rank 0's decision.
+
+    The pure-TP and pure-CP cases each collapse one dimension to 1, so between
+    them they never run ``cp_broadcast`` and ``tp_broadcast`` back to back.  This
+    case does, on a 2x2 topology.
+
+    ``only_rank0_true`` is the discriminating scenario: every rank ends ``True``
+    only if the TP step consumed the CP step's *result*.  Had it broadcast each
+    rank's own local reading instead, the ranks in the second TP group would
+    come back ``False``.
+
+    Args:
+        world_size: Total ranks; must equal ``cp_size * tp_size``.
+        cp_size: Context-parallel width; TP width is ``world_size // cp_size``.
+    """
+    _skip_if_not_enough_gpus(world_size)
+    flags = _flags_for("only_rank0_true", world_size)
+    expected = flags[0]
+    assert flags == [True, False, False, False], (
+        "this case only discriminates the chained broadcast when rank 0 alone "
+        f"reads True, got {flags}"
+    )
+
+    with MPIPoolExecutor(max_workers=world_size) as ex:
+        results = ex.map(
+            run_single_rank,
+            *zip(*[(world_size, run_cp_tp_agreement, cp_size, flags, expected)] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
 @pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"tp:{x}")
-def test_attention_dp_ranks_decide_independently(world_size):
-    """Attention DP opts out of the agreement: each rank keeps its own answer."""
+def test_attention_dp_ranks_decide_independently(world_size: int) -> None:
+    """Attention DP opts out of the agreement: each rank keeps its own answer.
+
+    Args:
+        world_size: Number of TP ranks to run on.
+    """
     _skip_if_not_enough_gpus(world_size)
     flags = _flags_for("only_rank0_false", world_size)
 
@@ -313,11 +499,15 @@ def test_attention_dp_ranks_decide_independently(world_size):
 
 @pytest.mark.parametrize("interval", [1, 8], ids=lambda x: f"interval:{x}")
 @pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"tp:{x}")
-def test_rebalance_check_stays_in_lockstep_across_ranks(world_size, interval):
+def test_rebalance_check_stays_in_lockstep_across_ranks(world_size: int, interval: int) -> None:
     """The throttle must fire on identical iterations on every rank.
 
     A drift here would put ranks into ``tp_broadcast`` on different iterations,
     which deadlocks -- so this test hanging is itself the failure signal.
+
+    Args:
+        world_size: Number of TP ranks to run on.
+        interval: Throttle interval to configure on every rank.
     """
     _skip_if_not_enough_gpus(world_size)
 
