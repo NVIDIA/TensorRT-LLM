@@ -142,7 +142,7 @@ The dashboard provides broad model coverage and performance testing for all supp
 
 ### Model Registry
 
-Models are registered in `examples/auto_deploy/model_registry/models.yaml`. For detailed instructions, see the [Model Registry README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/auto_deploy/model_registry).
+Models are registered in `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml`. For detailed instructions, see the [Model Registry README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/auto_deploy/model_registry).
 
 ### Format (Version 2.0)
 
