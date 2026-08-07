@@ -3194,6 +3194,8 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
 @Field
+def JOB_TYPE = "job_type"
+@Field
 def MAINTENANCE_ENTRIES = "maintenance_entries"
 // Whether this pipeline asked for BOLT-optimized binaries. Resolved once by
 // L0_MergeRequest.groovy::resolveBoltConsume and propagated here in globalVars,
@@ -3229,6 +3231,7 @@ def globalVars = [
     (BOLT_PROFILE_REF): "",
     (BOLT_PUBLISH_VARIANT): false,
     (BOLT_PROFILE_BRANCH): "",
+    (JOB_TYPE): null,
 ]
 
 class GlobalState {
@@ -4209,7 +4212,7 @@ def runLLMAgentFlowTest(pipeline, stageName)
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results.xml || true"
 }
 
-def launchTestListCheck(pipeline)
+def launchTestListCheck(pipeline, globalVars)
 {
     stageName = "Test List Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
@@ -4230,7 +4233,13 @@ def launchTestListCheck(pipeline)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            throw e
+            if (globalVars[JOB_TYPE] == "L0_PostMerge") {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    throw e
+                }
+            } else {
+                throw e
+            }
         }
     })
 }
@@ -7530,7 +7539,7 @@ pipeline {
             steps
             {
                 script {
-                    launchTestListCheck(this)
+                    launchTestListCheck(this, globalVars)
                 }
             }
         }
