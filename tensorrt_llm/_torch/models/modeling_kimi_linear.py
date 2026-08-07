@@ -986,8 +986,13 @@ class KimiKDARuntime(nn.Module):
         self._w_q_t = self._w_k_t = self._w_v_t = None
         self._A_log_f32 = self._dt_bias_f32 = self._onorm_w_f32 = None
         # Persistent batch-row-dense staging for the fused decode kernel's
-        # per-section conv windows (lazily sized to the pool slot count).
+        # per-section conv windows. Sized once, on the first decode call,
+        # to the conv pool's slot count and never reallocated (see
+        # ``_forward_decode``).
         self._cs_dense: Optional[torch.Tensor] = None
+        # fp32 [dim, W] conv weights for the fused verify kernel, prebuilt
+        # by ``_build_mtp_conv_weights()`` at weight-load finalize time.
+        self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
     def finalize_decode_weights(self) -> None:
         """Build the decode fast-path constants (once, after weight load).
@@ -1056,7 +1061,7 @@ class KimiKDARuntime(nn.Module):
         self._onorm_w_f32 = mixer.o_norm.weight.detach().float().contiguous()
         # Build the fused-verify conv constants eagerly too, so the first
         # verify call never allocates (a capture-unsafe lazy allocation).
-        self._get_mtp_conv_weights()
+        self._build_mtp_conv_weights()
 
     def finalize_decode_weights_fp8(self) -> None:
         """FP8 counterpart of ``finalize_decode_weights()``.
@@ -1343,12 +1348,13 @@ class KimiKDARuntime(nn.Module):
         W = mixer.conv_size
 
         # Allocated ONCE at the pool slot count (== per-rank max batch on
-        # the Mixed manager) and never reallocated: captured CUDA graphs
-        # hold this pointer, so a later realloc would leave earlier graphs
-        # writing into freed memory. Footprint: slots x ~9(H=6)..222(H=96)
-        # KB per layer.
+        # the Mixed manager; ``slot_indices`` are distinct pool rows and
+        # this is the plain one-token-per-request path, so B never exceeds
+        # it) and never reallocated: captured CUDA graphs hold this
+        # pointer, so a realloc would leave earlier graphs writing into
+        # freed memory. Footprint: slots x ~9(H=6)..222(H=96) KB per layer.
         buf = self._cs_dense
-        if buf is None or buf.shape[1] < B:
+        if buf is None:
             if torch.cuda.is_current_stream_capturing():
                 # Never allocate inside CUDA graph capture; the reference
                 # path is capture-safe (just slower).
@@ -1359,6 +1365,15 @@ class KimiKDARuntime(nn.Module):
                 3, max(conv_pool.shape[0], B), d, W - 1, dtype=torch.bfloat16, device=x2d.device
             )
             self._cs_dense = buf
+        else:
+            # Fail loudly if the sizing invariant ever breaks: silently
+            # reallocating here would hand previously captured CUDA graphs
+            # a dangling pointer.
+            assert buf.shape[1] >= B, (
+                f"KDA decode staging buffer holds {buf.shape[1]} rows but the "
+                f"decode batch is {B}; reallocating would corrupt previously "
+                f"captured CUDA graphs"
+            )
 
         if self._in_proj_weight is not None:
             # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
@@ -1600,26 +1615,28 @@ class KimiKDARuntime(nn.Module):
         o = out.view(num_decodes, num_steps, H, mixer.head_dim)
         return self._output_gate_and_proj(x, o)
 
+    def _build_mtp_conv_weights(self) -> None:
+        """Prebuild the fp32 ``[dim, W]`` conv weights for the fused verify
+        kernel (once, at weight-load finalize time). Building them lazily
+        at first use would allocate at runtime; under CUDA graph capture
+        that bakes capture-pool pointers into the cached tuple."""
+        mixer = self.mixer
+        self._mtp_conv_weights = tuple(
+            conv.weight.detach().squeeze(1).float().contiguous()
+            for conv in (mixer.q_conv1d, mixer.k_conv1d, mixer.v_conv1d)
+        )
+
     def _get_mtp_conv_weights(self):
         """fp32 ``[dim, W]`` conv weights for the fused verify kernel,
-        computed once per runtime instance."""
-        cached = getattr(self, "_mtp_conv_weights", None)
+        prebuilt by ``_build_mtp_conv_weights()``."""
+        cached = self._mtp_conv_weights
         if cached is None:
-            if torch.cuda.is_current_stream_capturing():
-                # Allocating inside CUDA graph capture would bake
-                # capture-pool pointers into the cached tuple; the constants
-                # are normally prebuilt by _build_decode_kernel_constants().
-                raise RuntimeError(
-                    "Kimi K3 fused-verify conv weights were not prebuilt "
-                    "before CUDA graph capture; call finalize_decode_weights"
-                    "() / finalize_decode_weights_fp8() after weight load."
-                )
-            mixer = self.mixer
-            cached = tuple(
-                conv.weight.detach().squeeze(1).float().contiguous()
-                for conv in (mixer.q_conv1d, mixer.k_conv1d, mixer.v_conv1d)
+            raise RuntimeError(
+                "Kimi K3 fused-verify conv weights were not prebuilt; call "
+                "_build_mtp_conv_weights() (done by load_weights() and by "
+                "finalize_decode_weights() / finalize_decode_weights_fp8()) "
+                "after weight load and before the first verify step."
             )
-            self._mtp_conv_weights = cached
         return cached
 
     def _forward_verify_sequential(
@@ -2581,6 +2598,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 if not kda_fp8:
                     layer.self_attn.finalize_decode_weights()
                 num_kda_fused += int(layer.self_attn._in_proj_weight is not None)
+                # The fused-verify conv constants are needed on every
+                # configuration that can reach _forward_verify_fused,
+                # including ones where neither finalize variant runs (e.g.
+                # FP8 KDA weight read with the fused decode glue disabled),
+                # and are never computed lazily (a first verify under CUDA
+                # graph capture must not allocate). Build them
+                # unconditionally; three small fp32 tensors per layer.
+                layer.self_attn._build_mtp_conv_weights()
         logger.info(
             f"Kimi K3: loaded {len(param_jobs)} parameters and the expert "
             f"slices of {len(expert_jobs)} MoE layers; fused decode "
