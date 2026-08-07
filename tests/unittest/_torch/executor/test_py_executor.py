@@ -1496,6 +1496,41 @@ def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     assert len(stub.active_requests) == 2
 
 
+def test_pad_dummy_tolerates_surplus_over_expected_on_busy_rank() -> None:
+    # expected_num_active_requests is capped at max_num_active_requests after
+    # the per-rank-load floor is applied, so a rank can legitimately end up
+    # holding more requests than the router expected -- e.g. when a pad dummy
+    # survives an iteration that was skipped fleet-wide and the next
+    # gather_all_rank_states counts it. This used to trip a bare assert and
+    # kill the executor event loop; a busy rank needs no dummy, so it must be
+    # tolerated instead.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS) for _ in range(3)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 3
+    # Tolerating must not leak a mutated expectation to downstream consumers.
+    assert stub.expected_num_active_requests == 2
+
+
+def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None:
+    # Tolerating the surplus must not short-circuit padding. A rank can hold
+    # more requests than expected AND have none of them schedulable (all parked
+    # at GENERATION_TO_COMPLETE), in which case it still schedules batch=0 and
+    # needs a dummy to stay in the forward-pass collectives.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE) for _ in range(3)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.expected_num_active_requests == 2
+
+
 def test_pad_dummy_allocation_failure_skips_padding():
     # add_dummy_requests returns None when the rank has no free cache
     # resources for even a 1-token dummy (possible while non-schedulable

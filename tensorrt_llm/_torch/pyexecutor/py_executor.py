@@ -5878,13 +5878,40 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        expected_num_active_requests = self.expected_num_active_requests
+        if expected_num_active_requests < len(self.active_requests):
+            # Not fatal, and not a capacity violation. The router derives this
+            # value as
+            #   min(max(ceil(multiplier * fair_share), max(per_rank_loads)),
+            #       max_num_active_requests)
+            # (adp_router.AttentionDpRouter._expected_num_active_requests), so
+            # the per-rank-load floor normally keeps it at or above this rank's
+            # own load -- but the hard cap is applied last. Any rank that ends
+            # up holding max_num_active_requests + 1 requests therefore breaks
+            # the relation, e.g. when an attention-DP pad dummy survives an
+            # iteration that was skipped fleet-wide (can_queue False skips both
+            # _forward_step and _update_request_states, and
+            # _update_request_states_tp is the only place the dummy is removed)
+            # and the next gather_all_rank_states counts it.
+            #
+            # Inside this method the value is consumed only by the idle-rank
+            # test below, and a rank holding surplus requests needs no dummy,
+            # so tolerate the surplus. Asserting here took down the executor
+            # event loop on every affected rank at once, leaving the survivors
+            # to HangDetector-abort.
+            logger.warning(
+                f"active_requests ({len(self.active_requests)}) exceeds "
+                f"expected_num_active_requests "
+                f"({expected_num_active_requests}); tolerating (a busy rank "
+                f"needs no attention-DP dummy).")
+            expected_num_active_requests = len(self.active_requests)
+
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        needs_dummy = (self.expected_num_active_requests > 0
+        needs_dummy = (expected_num_active_requests > 0
                        and num_active_request == 0)
         if not needs_dummy:
             return

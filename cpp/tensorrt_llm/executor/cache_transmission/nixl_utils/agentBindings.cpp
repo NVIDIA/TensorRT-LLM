@@ -83,9 +83,9 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // Classmethod: batch construction from numpy arrays
         .def_static(
             "from_arrays",
-            [](kvc::MemoryType type, nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
-                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
-                nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
+            [](kvc::MemoryType type, nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
+                nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
             {
                 size_t n = addrs.shape(0);
                 auto const* a = addrs.data();
@@ -105,8 +105,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // Classmethod: batch construction with uniform device_id (avoids np.full allocation)
         .def_static(
             "from_arrays_uniform_device",
-            [](kvc::MemoryType type, nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
-                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes, uint32_t deviceId)
+            [](kvc::MemoryType type, nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes, uint32_t deviceId)
             {
                 size_t n = addrs.shape(0);
                 auto const* a = addrs.data();
