@@ -19,7 +19,7 @@ Run:
         pytest tests/unittest/_torch/visual_gen/test_fastwan_pipeline.py -v -s
 
 Override checkpoint path via DIFFUSION_MODEL_PATH_FASTWAN env var or place
-the checkpoint at $LLM_MODELS_ROOT/FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers
+the checkpoint at $LLM_MODELS_ROOT/FastWan2.2-TI2V-5B-FullAttn-Diffusers
 """
 
 import gc
@@ -47,7 +47,7 @@ def _checkpoint_path() -> str:
         "LLM_MODELS_ROOT",
         "/home/scratch.trt_llm_data_ci/llm-models",
     )
-    return os.path.join(root, "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers")
+    return os.path.join(root, "FastWan2.2-TI2V-5B-FullAttn-Diffusers")
 
 
 FASTWAN_PATH = _checkpoint_path()
