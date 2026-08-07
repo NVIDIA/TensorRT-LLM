@@ -154,10 +154,17 @@ def _resolve_mm_encoder_token_budget(base_budget: int,
 
 def _validate_mm_encoder_scheduling_compatibility(
         llm_args: TorchLlmArgs, item_scheduling_enabled: bool) -> None:
-    """Validate EAGER-only combinations after the model capability is known."""
+    """Validate item-scheduling combinations after model capability is known."""
     policy = llm_args.multimodal_config.encoder_scheduling_policy
-    if (not item_scheduling_enabled
-            or policy != MultimodalEncoderSchedulingPolicy.EAGER):
+    if not item_scheduling_enabled:
+        return
+    if llm_args.multimodal_config.encoder_side_stream_max_ahead > 0:
+        raise ValueError(
+            "MM encoder item scheduling does not yet support side-stream "
+            "prefetch (multimodal_config.encoder_side_stream_max_ahead > 0); "
+            "set encoder_scheduling_policy=DISABLED or "
+            "encoder_side_stream_max_ahead=0")
+    if policy != MultimodalEncoderSchedulingPolicy.EAGER:
         return
     if llm_args.enable_attention_dp:
         raise ValueError(

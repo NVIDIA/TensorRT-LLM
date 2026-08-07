@@ -345,7 +345,8 @@ def test_output_budget_requires_processor_embedding_capacity():
 def test_eager_compatibility_is_checked_only_for_item_scheduled_models():
     args = SimpleNamespace(
         multimodal_config=SimpleNamespace(
-            encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.EAGER
+            encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.EAGER,
+            encoder_side_stream_max_ahead=0,
         ),
         enable_attention_dp=True,
         cache_transceiver_config=SimpleNamespace(backend="NIXL"),
@@ -358,6 +359,22 @@ def test_eager_compatibility_is_checked_only_for_item_scheduled_models():
 
     args.enable_attention_dp = False
     with pytest.raises(ValueError, match="disaggregated"):
+        _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
+
+
+def test_side_stream_compatibility_is_checked_only_for_item_scheduled_models():
+    args = SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.DEFAULT,
+            encoder_side_stream_max_ahead=1,
+        ),
+        enable_attention_dp=False,
+        cache_transceiver_config=None,
+    )
+
+    _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=False)
+
+    with pytest.raises(ValueError, match="side-stream prefetch"):
         _validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
 
