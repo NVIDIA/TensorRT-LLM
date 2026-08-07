@@ -11,22 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Resolve and fetch the latest merged CBTS touch DB from Artifactory.
+"""Resolve which post-merge CBTS touch DB to use.
 
-The tarball is uploaded per post-merge run to
-`<ARTIFACT_BASE>/<build>/cbts-coverage/cbts_pystart_report.tar.gz` (sqlite at
-the tar root plus `cbts_report/`). This module only resolves which one to use;
-the pipeline downloads and extracts it itself.
-
-`select_tarball()` reads the newest build number from the Jenkins REST API, walks
-builds down probing Artifactory with a 1-byte ranged GET, and ranks the ones that
-exist by how far `COVERAGE_BRANCH` has moved past the revision each collected
-(`build_info.txt`), since a build can be a re-run of an older commit. That
-distance comes from local git, or from the forge compare API when the CI
-checkout is too shallow to answer; the build number is only a tie-break.
+Candidates are the recent builds of `<ARTIFACT_BASE>` that have a
+`cbts-coverage/cbts_pystart_report.tar.gz`, ranked by how far `COVERAGE_BRANCH`
+has moved past the revision each collected (`build_info.txt`), since a build can
+be a re-run of an older commit; the build number is only a tie-break. That
+distance is `ahead_by` from the forge compare API — the CI checkout is depth-1,
+so git cannot answer it — and needs `GITHUB_API_TOKEN`, the anonymous quota
+being per-IP and exhausted by shared CI egress.
 
 `--print-selection` prints `{url, build, commit, lag}` as JSON for the Groovy
-wiring; `--build` pins a candidate instead of resolving one.
+wiring, which downloads and extracts the tarball itself.
 """
 
 from __future__ import annotations
