@@ -80,7 +80,24 @@ def _native_decode_chunk_size(
 class WanCausalConvHalo(HaloExchangeConv):
     """HaloExchangeConv for WanCausalConv3d, which takes an extra cache_x arg."""
 
-    def forward(self, x, cache_x=None, *args, **kwargs):
+    @property
+    def absorbs_silu(self) -> bool:
+        # Delegate the fusion contract through the halo wrapper. RMSNorm and
+        # SiLU are pointwise over spatial positions, so applying them after
+        # halo exchange is mathematically equivalent.
+        return getattr(self.module, "absorbs_silu", False)
+
+    @property
+    def absorbs_norm(self) -> bool:
+        return getattr(self.module, "absorbs_norm", False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         if self.halo_left == 0 and self.halo_right == 0:
             return self.module(x, cache_x, *args, **kwargs)
 
@@ -260,6 +277,9 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
     the native ``WanConv2d`` subclasses ``nn.Conv2d``.
     """
 
+    # ``NVFP4WanCausalConv3d`` subclasses this native class, so the same rewrite
+    # wraps both BF16 and FP4 convs with ``WanCausalConvHalo``. The halo wrapper
+    # delegates the FP4 fusion flags defined above.
     _conv3d_cls = wan_vae.WanCausalConv3d
     _attn_cls = wan_vae.WanAttentionBlock
 
