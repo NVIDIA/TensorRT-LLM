@@ -25,7 +25,6 @@ by directory the same way ``test_test_to_stage_mapping.py`` imports from
 
 import faulthandler
 import os
-import signal
 import sys
 import time
 from pathlib import Path
@@ -103,25 +102,15 @@ class _Report:
         self.nodeid = nodeid
 
 
-def _release(reporter: PeriodicJUnitXML) -> None:
-    """Undo the process-wide state that ``_setup_hang_dump()`` installs.
-
-    It registers C-level SIGINT/SIGTERM handlers and keeps the sidecar file open
-    for the whole process lifetime, so without this the next test in the session
-    would inherit a handler writing to a closed file.
-    """
-    # Timer.cancel() only stops a callback that has not started yet, so capture
-    # the timer before _cancel_hang_timer() drops the reference and join it --
-    # otherwise an in-flight _dump_hang() would write into the file closed below.
+def _close(reporter: PeriodicJUnitXML) -> None:
+    """Stop the watchdog and close the sidecar file."""
+    # Timer.cancel() only stops a callback that has not started yet, so capture the
+    # timer before _cancel_hang_timer() drops the reference and join it -- otherwise
+    # an in-flight _dump_hang() would write into the file closed below.
     timer = reporter._hang_timer
     reporter._cancel_hang_timer()
     if timer is not None:
         timer.join(_POLL_TIMEOUT)
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            faulthandler.unregister(signum)
-        except (OSError, RuntimeError, ValueError):
-            pass
     if reporter._hang_file is not None:
         reporter._hang_file.close()
         reporter._hang_file = None
@@ -130,9 +119,19 @@ def _release(reporter: PeriodicJUnitXML) -> None:
 ReporterFactory = Callable[..., PeriodicJUnitXML]
 
 
+@pytest.fixture(autouse=True)
+def _no_signal_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep _setup_hang_dump() from installing process-wide signal handlers.
+
+    These tests only need the sidecar file. Real SIGINT/SIGTERM handlers would
+    outlive the test that installed them and point at a file closed on teardown.
+    """
+    monkeypatch.setattr(faulthandler, "register", lambda *args, **kwargs: None)
+
+
 @pytest.fixture
 def make_reporter(tmp_path: Path, request: pytest.FixtureRequest) -> ReporterFactory:
-    """Build a reporter whose signal handlers and sidecar file are cleaned up."""
+    """Build a reporter whose watchdog and sidecar file are cleaned up."""
 
     def _make(dump_hang_traceback: bool = True, **kwargs: float) -> PeriodicJUnitXML:
         reporter = PeriodicJUnitXML(
@@ -142,7 +141,7 @@ def make_reporter(tmp_path: Path, request: pytest.FixtureRequest) -> ReporterFac
         )
         if dump_hang_traceback:
             reporter._setup_hang_dump()
-            request.addfinalizer(lambda: _release(reporter))
+            request.addfinalizer(lambda: _close(reporter))
         return reporter
 
     return _make
