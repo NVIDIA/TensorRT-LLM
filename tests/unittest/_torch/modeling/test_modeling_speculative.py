@@ -366,6 +366,8 @@ def _fake_dflash_buffer_wrapper():
     )
     wrapper._dflash_trtllm_gen_workspace = None
     wrapper._dflash_trtllm_gen_counters = None
+    wrapper.register_buffer("_dflash_batch_indices", None, persistent=False)
+    wrapper.register_buffer("_dflash_block_offsets", None, persistent=False)
     wrapper._dflash_trtllm_gen_device = None
     wrapper._dflash_trtllm_gen_sm_count = None
     return wrapper
