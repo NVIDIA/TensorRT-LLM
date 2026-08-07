@@ -348,6 +348,10 @@ def _bare_executor(pe, monkeypatch, world_size, is_shutdown=False):
     # it rank-locally on a fatal error while peers are told nothing.
     ex.is_shutdown = is_shutdown
     ex._event_loop_completed = False
+    # The real __init__ creates this; __new__ does not run it. The wrapper
+    # reads it on every crash path, so a bare executor without it turns a
+    # wiring test into an AttributeError.
+    ex._event_loop_error_delivered = threading.Event()
     return ex
 
 
@@ -374,15 +378,22 @@ class _FakeWatchdog:
         self._events.append("cancel")
 
 
-def _stub_kill_paths(pe, monkeypatch, events, arm_watchdog=True):
-    monkeypatch.setattr(
-        pe,
-        "hard_kill_on_rank_crash",
-        lambda world_size, deadline=None: events.append(("kill", world_size, deadline)),
-    )
+def _stub_kill_paths(pe, monkeypatch, events, arm_watchdog=True, seen=None):
+    # ``error_delivered`` is keyword-only with NO default on both stubs: if the
+    # wiring that threads the delivery gate through is ever dropped, these
+    # raise TypeError instead of silently accepting the pre-gate signature.
+    # Pass ``seen`` to capture the objects actually handed over.
+    def _kill(world_size, deadline=None, *, error_delivered):
+        if seen is not None:
+            seen.append(("kill", error_delivered))
+        events.append(("kill", world_size, deadline))
+
+    monkeypatch.setattr(pe, "hard_kill_on_rank_crash", _kill)
     watchdogs = []
 
-    def _start(world_size):
+    def _start(world_size, *, error_delivered):
+        if seen is not None:
+            seen.append(("watchdog", error_delivered))
         if not arm_watchdog:
             events.append(("watchdog", world_size))
             return None
@@ -419,6 +430,32 @@ def test_event_loop_wrapper_kills_world_on_crash(monkeypatch):
     assert events == [("watchdog", 4), "cleanup", "cancel", ("kill", 4, 1234.5)]
     assert watchdogs[0].cancelled is True
     assert isinstance(ex._event_loop_error, ValueError)
+
+
+def test_event_loop_wrapper_hands_both_kill_paths_this_executors_gate(monkeypatch):
+    """Both kill paths must receive THIS executor's delivery gate.
+
+    Handing over a fresh Event, or a different executor's, would read as
+    "the error never reached the client" and kill the world even on the
+    path the grace exists to protect.
+    """
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events, seen = [], []
+    _stub_kill_paths(pe, monkeypatch, events, seen=seen)
+    ex = _bare_executor(pe, monkeypatch, world_size=4, is_shutdown=False)
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+
+    def crash():
+        raise ValueError("boom")
+
+    ex.event_loop = crash
+
+    with pytest.raises(ValueError, match="boom"):
+        ex._event_loop_wrapper()
+
+    assert [kind for kind, _ in seen] == ["watchdog", "kill"]
+    assert all(gate is ex._event_loop_error_delivered for _, gate in seen)
 
 
 def test_event_loop_wrapper_kills_world_when_cleanup_raises(monkeypatch):
