@@ -10,19 +10,11 @@ Conventional benchmarks issue independent requests with fixed input and output l
 
 We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate the result with **job-level metrics** that complement conventional token-level ones. The framework code lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with runnable examples under [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
-Benchmarking practice for agentic scenarios is still taking shape, and the industry will gradually converge on a common methodology — efforts such as [AgentPerf](https://artificialanalysis.ai/methodology/agentperf) and [AgentX](https://docs.nvidia.com/aiperf/dev/benchmark-modes/semi-analysis-agent-x-how-the-benchmark-works-faq) are already moving in that direction. We do not claim a standard here. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
+Benchmarking practice for agentic scenarios is still taking shape. Industry benchmarks aimed at agentic serving already exist, and the field will gradually converge on a common methodology. We do not claim a standard here. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
 
-## The Trace-Replay Framework
+## Methodology
 
 Single-request benchmarks cannot capture prefix reuse or agent-level throughput; running live agent systems is realistic but hard to reproduce — the full tool environment (sandboxes, browsers, search services) must stay stable under high concurrency, and model nondeterminism makes every run take a different path. Trace replay sidesteps both problems, provided the trace records the prefix structure that drives cache reuse, the tool-call latency of each step, and the parallel-branch topology of the agent.
-
-### Design Choices Behind the Methodology
-
-Building an agentic evaluation forces a handful of choices, and the choices are what determine which conclusions the evaluation can reach. The first is the unit of measurement. Conventional serving evaluation models the service as a stream of independent, stateless generation requests, summarized by TTFT/TBT and a token-level throughput–interactivity frontier. That abstraction drops the three properties that dominate agentic serving: execution dependency between calls, so queueing accumulated along an agent's execution graph is charged to individual generations and never surfaces as a user-visible delay; tool gaps, so the server never sees the idle periods that leave a batch underfilled; and shared-prefix structure across calls, so prefix-cache residency — which our experiments show sets the performance ceiling for multi-turn serving — is never exercised. We therefore define the unit as the whole job and report a Pareto frontier over jobs, keeping the token-level view alongside rather than discarding it.
-
-The second choice is what a trace has to carry. We record structure and sizes only — token counts, prefix identity, tool-call durations, branch boundaries — and never the underlying text, because content does not affect serving performance, and a content-free trace can be published, replayed against a different model, and reproduced at any concurrency without re-instantiating the tool environment. Tool calls are replayed as timed sleeps of their recorded duration, which reproduces request-readiness gaps while decoupling the measurement from sandboxes, browsers, and search services that would otherwise have to stay stable under high concurrency. Prefix identity is recorded explicitly so that replay copies share a synthetic system-prompt prefix and prefix caching is exercised rather than bypassed. And the execution graph is recorded as `parallel_start`/`parallel_end` boundaries with per-branch dependency, so fan-out and its synchronization points replay concurrently instead of being flattened into a sequential chain — which matters because it changes the answer, not just the fidelity: as shown later, a fan-out workload wants a batch size two to four times the session concurrency, while a single-branch workload wants it near the session count.
-
-The third choice is coverage. It is tempting to build around coding agents alone: they are the highest-volume agentic workload today and the easiest to collect at scale. They are also, as it turns out, the most cacheable point in the workload space — one monotonically growing prefix per session — and calibrating on that shape alone is misleading. We deliberately traced four architectures with different execution patterns: a single-thread ReAct coder, a supervisor that fans out to parallel researcher subagents, an iterative researcher that bounds its context through compaction, and a tree-structured reasoner that expands, scores, and prunes parallel branches. Table 1 shows how far apart they land — median ISL differs by roughly 8×, median OSL by more than 15×, and the optimal cache hit rate ranges from 96.5% down to 24.4% — and the experiments show conclusions that do not transfer between them, such as KV-cache-aware routing lifting the frontier substantially on the coding trace while doing nothing for deep research.
 
 Figure 1 shows the pipeline. In the trace-collection phase (top), Scaffolding-based agents run agentic task benchmarks with their tools while trace hooks record the stepwise footprint of every run. In the replay-and-evaluation phase (bottom), the replay engine re-issues the recorded requests against the replay backend — the system under evaluation — and we compute agentic serving metrics from the run. The replay backend need not be the system that served the agents during tracing: a trace collected with one model can be replayed against another.
 
@@ -31,7 +23,26 @@ Figure 1 shows the pipeline. In the trace-collection phase (top), Scaffolding-ba
 </div>
 <p align="center"><sub><em>Figure 1. The trace-replay evaluation pipeline: a trace-collection phase (top) and a replay-and-evaluation phase (bottom).</em></sub></p>
 
-### The Trace
+### Design Choices
+
+Building an agentic evaluation forces a handful of choices, and the choices are what determine which conclusions the evaluation can reach. The first is the unit of measurement. Conventional serving evaluation models the service as a stream of independent, stateless generation requests, summarized by TTFT/TBT and a token-level throughput–interactivity frontier. That abstraction drops the three properties that dominate agentic serving: execution dependency between calls, so queueing accumulated along an agent's execution graph is charged to individual generations and never surfaces as a user-visible delay; tool gaps, so the server never sees the idle periods that leave a batch underfilled; and shared-prefix structure across calls, so prefix-cache residency — which our experiments show sets the performance ceiling for multi-turn serving — is never exercised. We therefore define the unit as the whole job and report a Pareto frontier over jobs, keeping the token-level view alongside rather than discarding it.
+
+The second choice is what a trace has to carry. We record structure and sizes only — token counts, prefix identity, tool-call durations, branch boundaries — and never the underlying text, because content does not affect serving performance, and a content-free trace can be published, replayed against a different model, and reproduced at any concurrency without re-instantiating the tool environment. Tool calls are replayed as timed sleeps of their recorded duration, which reproduces request-readiness gaps while decoupling the measurement from sandboxes, browsers, and search services that would otherwise have to stay stable under high concurrency. Prefix identity is recorded explicitly so that replay copies share a synthetic system-prompt prefix and prefix caching is exercised rather than bypassed. And the execution graph is recorded as `parallel_start`/`parallel_end` boundaries with per-branch dependency, so fan-out and its synchronization points replay concurrently instead of being flattened into a sequential chain — which matters because it changes the answer, not just the fidelity: as shown later, a fan-out workload wants a batch size two to four times the session concurrency, while a single-branch workload wants it near the session count.
+
+The third choice is coverage. It is tempting to build around coding agents alone: they are the highest-volume agentic workload today and the easiest to collect at scale. They are also, as it turns out, the most cacheable point in the workload space — one monotonically growing prefix per session — and calibrating on that shape alone is misleading. We deliberately traced four architectures with different execution patterns: a single-thread ReAct coder, a supervisor that fans out to parallel researcher subagents, an iterative researcher that bounds its context through compaction, and a tree-structured reasoner that expands, scores, and prunes parallel branches. Table 1 shows how far apart they land — median ISL differs by roughly 8×, median OSL by more than 15×, and the optimal cache hit rate ranges from 96.5% down to 24.4% — and the experiments show conclusions that do not transfer between them, such as KV-cache-aware routing lifting the frontier substantially on the coding trace while doing nothing for deep research.
+
+### Job-Level Metrics
+
+Inference systems are conventionally compared with token-level Pareto curves (tokens/s/GPU against tokens/s/user). For agentic workloads we complement that with a Pareto curve over whole **jobs**, for two reasons. First, users perceive end-to-end job latency — spanning many model calls, tool gaps, and synchronization points — not per-token rates. Second, token throughput is ambiguous under heavy prefix reuse: on our agentic traces, counting reused prefix tokens reports a per-GPU throughput roughly five times higher than counting only freshly computed tokens, and neither number alone compares systems fairly. A completed job carries no such ambiguity.
+
+The two axes are:
+
+- **Job-level interactivity — jobs/h/user**: 3600 s divided by the mean end-to-end job latency in seconds.
+- **Job-level throughput — jobs/h/GPU**: completed jobs per hour, normalized by GPU count.
+
+Because a single agent job runs for minutes, both are measured over a steady-state window: the shared system prompt is preloaded so it is a cache hit from the first call, session starts are staggered with a jittered ramp-up so identical copies do not stay phase-aligned, and a job is credited only if it completes inside the window.
+
+## Trace Format
 
 Each agent run produces one compact JSON file holding an ordered `events` list. Because token content does not affect serving performance, a trace records only structure and sizes, never the underlying text. The listing below is the opening of the Coder trace `matplotlib__matplotlib-23412`, which ships with the repository as a ready-to-run example:
 
@@ -57,7 +68,7 @@ Each agent run produces one compact JSON file holding an ordered `events` list. 
 
 Every event is one of three kinds: a **`message`** (one conversation turn, with role, conversation membership, token counts, and — for assistant turns — prompt/completion/reasoning token splits and issued tool calls), a **`tool_call`** (tool name plus measured `duration_ms`), or a **`parallel_start`/`parallel_end`** boundary marking fan-out and synchronization of concurrent branches. A `system_prompt_id` marks which messages share a cacheable prefix, so replay reproduces prefix-cache behavior faithfully.
 
-### Capturing and Replaying
+## Implementation
 
 Tracing attaches to an existing Scaffolding agent with two decorators — no change to the agent's logic:
 
@@ -90,17 +101,6 @@ The agents occupy clearly different regions of the workload space:
 <p align="center"><sub><em>Table 1. Trace-dataset summary. The optimal cache hit rate is the per-trace upper bound on prefix reuse, computed offline from the trace.</em></sub></p>
 
 Coder is input-heavy and decode-light, and caches almost perfectly (96.5%): one shared prefix grows monotonically, so each turn re-reads what previous turns already cached. The research agents invert the shape — moderate inputs, long reasoning-heavy outputs — and cache far worse, because subagent fan-out, context rewriting, and branch exploration repeatedly introduce fresh context. The rest of this blog follows two representative traces at opposite ends of this space: a **Coder** trace (single ReAct thread, 23 requests, only ~3% fresh tokens per prompt) and an **Open Deep Research** trace (supervisor plus four parallel researcher branches, generation-bound, mostly fresh context).
-
-## Job-Level Metrics
-
-Inference systems are conventionally compared with token-level Pareto curves (tokens/s/GPU against tokens/s/user). For agentic workloads we complement that with a Pareto curve over whole **jobs**, for two reasons. First, users perceive end-to-end job latency — spanning many model calls, tool gaps, and synchronization points — not per-token rates. Second, token throughput is ambiguous under heavy prefix reuse: on our agentic traces, counting reused prefix tokens reports a per-GPU throughput roughly five times higher than counting only freshly computed tokens, and neither number alone compares systems fairly. A completed job carries no such ambiguity.
-
-The two axes are:
-
-- **Job-level interactivity — jobs/h/user**: 3600 s divided by the mean end-to-end job latency in seconds.
-- **Job-level throughput — jobs/h/GPU**: completed jobs per hour, normalized by GPU count.
-
-Because a single agent job runs for minutes, both are measured over a steady-state window: the shared system prompt is preloaded so it is a cache hit from the first call, session starts are staggered with a jittered ramp-up so identical copies do not stay phase-aligned, and a job is credited only if it completes inside the window.
 
 ## Experimental Findings
 
