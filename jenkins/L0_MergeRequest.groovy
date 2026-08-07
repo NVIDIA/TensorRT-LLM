@@ -926,9 +926,7 @@ def _cbtsCoverageAudit(pipeline)
         // All commands run from ${LLM_ROOT}; covDir and the returned path are
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         def covDir = "cbts_cov"
-        // Selection is by collected revision, not build number; the JSON also carries the commit
-        // and how far main has moved past it, both recorded in the decision. The token is what
-        // lets artifact.py measure that — the depth-1 checkout cannot.
+        // Ranked by collected revision, not build number; the token is what measures it (depth-1 checkout cannot).
         def selJson = ""
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
             selJson = sh(
