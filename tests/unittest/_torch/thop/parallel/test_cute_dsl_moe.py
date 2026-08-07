@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 from utils.util import check_accuracy
@@ -56,6 +59,45 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
     assert set([helper.map_to_tuning_buckets(x) for x in max_num_permuted_tokens_list]) == set(
         buckets
     )
+
+
+def test_generate_token_selected_experts_skips_zero_count():
+    helper = GroupedGemmInputsHelper(
+        num_experts=256,
+        top_k=8,
+        num_local_experts=16,
+        local_expert_offset=0,
+        tile_size=128,
+    )
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(
+        num_tokens=1, approx_max_load=True
+    )
+
+    token_selected_experts = helper.generate_token_selected_experts(
+        num_tokens=1, num_tokens_per_expert=num_tokens_per_expert
+    )
+
+    assert num_tokens_per_expert == [1, 1] + [0] * 14
+    assert token_selected_experts.tolist() == [[0, 1] + [-1] * 6]
+
+
+def test_generate_token_selected_experts_prioritizes_by_global_expert(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    helper = GroupedGemmInputsHelper(
+        num_experts=8,
+        top_k=2,
+        num_local_experts=4,
+        local_expert_offset=4,
+        tile_size=128,
+    )
+    monkeypatch.setattr(torch, "randperm", lambda num_tokens: torch.arange(num_tokens))
+
+    token_selected_experts = helper.generate_token_selected_experts(
+        num_tokens=3, num_tokens_per_expert=[2, 1, 1, 1]
+    )
+
+    assert token_selected_experts.tolist() == [[4, 5], [4, 7], [6, -1]]
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
