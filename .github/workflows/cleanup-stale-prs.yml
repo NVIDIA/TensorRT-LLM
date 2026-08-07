@@ -28,7 +28,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
   pull-requests: write
 
 jobs:
@@ -42,33 +41,42 @@ jobs:
     steps:
       - name: Process stale pull requests
         uses: actions/github-script@v8
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         with:
           script: |
             const PING_AFTER_DAYS = 120;
             const CLOSE_AFTER_DAYS = 180;
             const MAX_ACTIONS_PER_RUN = 50;
+            const MAX_MERGEABILITY_ATTEMPTS = 3;
+            const MAX_WRITE_ATTEMPTS = 3;
+            const MERGEABILITY_RETRY_DELAY_MS = 2000;
+            const WRITE_RETRY_DELAY_MS = 2000;
+            const EXEMPT_LABEL = 'no-stale';
             const DAY_IN_MS = 24 * 60 * 60 * 1000;
             const dryRun =
               context.eventName === 'workflow_dispatch' &&
-              '${{ inputs.dry_run }}' === 'true';
+              process.env.DRY_RUN === 'true';
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const now = Date.now();
-            const searchCutoff = new Date(
-              now - PING_AFTER_DAYS * DAY_IN_MS
-            ).toISOString().slice(0, 10);
-
-            const searchQuery = `
-              query($query: String!, $cursor: String) {
-                search(query: $query, type: ISSUE, first: 100, after: $cursor) {
-                  nodes {
-                    ... on PullRequest {
+            const pullRequestsQuery = `
+              query($owner: String!, $repo: String!, $cursor: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequests(
+                    first: 100
+                    after: $cursor
+                    states: OPEN
+                    orderBy: { field: UPDATED_AT, direction: ASC }
+                  ) {
+                    nodes {
                       number
+                      updatedAt
                     }
-                  }
-                  pageInfo {
-                    endCursor
-                    hasNextPage
+                    pageInfo {
+                      endCursor
+                      hasNextPage
+                    }
                   }
                 }
               }
@@ -80,6 +88,16 @@ jobs:
                     author {
                       login
                     }
+                    isDraft
+                    labels(first: 100) {
+                      nodes {
+                        name
+                      }
+                      pageInfo {
+                        endCursor
+                        hasNextPage
+                      }
+                    }
                     mergeable
                     number
                     reviewDecision
@@ -90,50 +108,182 @@ jobs:
                 }
               }
             `;
+            const pullRequestLabelsQuery = `
+              query(
+                $owner: String!
+                $repo: String!
+                $number: Int!
+                $cursor: String!
+              ) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    labels(first: 100, after: $cursor) {
+                      nodes {
+                        name
+                      }
+                      pageInfo {
+                        endCursor
+                        hasNextPage
+                      }
+                    }
+                  }
+                }
+              }
+            `;
 
-            const candidates = [];
-            let cursor = null;
-            do {
-              const result = await github.graphql(searchQuery, {
-                query:
-                  `repo:${owner}/${repo} is:pr is:open ` +
-                  `updated:<${searchCutoff} sort:updated-asc`,
-                cursor,
-              });
-              candidates.push(...result.search.nodes);
-              cursor = result.search.pageInfo.hasNextPage
-                ? result.search.pageInfo.endCursor
-                : null;
-            } while (cursor);
+            const wait = (milliseconds) =>
+              new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+            async function hasExemptLabel(number, firstPage) {
+              let labels = firstPage;
+              while (labels) {
+                if (
+                  labels.nodes.some(
+                    (label) => label.name.toLowerCase() === EXEMPT_LABEL
+                  )
+                ) {
+                  return true;
+                }
+                if (!labels.pageInfo.hasNextPage) {
+                  return false;
+                }
+                const result = await github.graphql(pullRequestLabelsQuery, {
+                  owner,
+                  repo,
+                  number,
+                  cursor: labels.pageInfo.endCursor,
+                });
+                labels = result.repository.pullRequest?.labels;
+              }
+              return false;
+            }
+
+            async function getCurrentPullRequest(number) {
+              for (
+                let attempt = 1;
+                attempt <= MAX_MERGEABILITY_ATTEMPTS;
+                attempt += 1
+              ) {
+                const result = await github.graphql(pullRequestQuery, {
+                  owner,
+                  repo,
+                  number,
+                });
+                const pullRequest = result.repository.pullRequest;
+                const isExempt = pullRequest
+                  ? await hasExemptLabel(number, pullRequest.labels)
+                  : false;
+                const isFresh =
+                  pullRequest &&
+                  (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS <=
+                    PING_AFTER_DAYS;
+                if (
+                  !pullRequest ||
+                  pullRequest.state !== 'OPEN' ||
+                  isExempt ||
+                  isFresh ||
+                  pullRequest.mergeable !== 'UNKNOWN' ||
+                  attempt === MAX_MERGEABILITY_ATTEMPTS
+                ) {
+                  return pullRequest ? { ...pullRequest, isExempt } : null;
+                }
+
+                console.log(
+                  `Mergeability for ${pullRequest.url} is UNKNOWN; ` +
+                    `retrying (${attempt}/${MAX_MERGEABILITY_ATTEMPTS}).`
+                );
+                await wait(MERGEABILITY_RETRY_DELAY_MS);
+              }
+            }
+
+            async function retryWrite(description, operation) {
+              for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  if (attempt === MAX_WRITE_ATTEMPTS) {
+                    throw error;
+                  }
+                  core.warning(
+                    `${description} failed: ${error.message}; ` +
+                      `retrying (${attempt}/${MAX_WRITE_ATTEMPTS}).`
+                  );
+                  await wait(WRITE_RETRY_DELAY_MS);
+                }
+              }
+            }
 
             let actionCount = 0;
             let closeCount = 0;
+            let exemptCount = 0;
             let pingCount = 0;
+            let processedCandidateCount = 0;
+            let scannedCount = 0;
             let skipCount = 0;
+            const candidates = [];
+            let cursor = null;
+            let reachedFreshPullRequest = false;
 
-            for (const candidate of candidates) {
+            do {
+              const result = await github.graphql(pullRequestsQuery, {
+                owner,
+                repo,
+                cursor,
+              });
+              const connection = result.repository.pullRequests;
+
+              for (const candidate of connection.nodes) {
+                const candidateIdleDays =
+                  (now - Date.parse(candidate.updatedAt)) / DAY_IN_MS;
+                if (candidateIdleDays <= PING_AFTER_DAYS) {
+                  reachedFreshPullRequest = true;
+                  break;
+                }
+                candidates.push(candidate.number);
+              }
+
+              cursor = connection.pageInfo.hasNextPage
+                ? connection.pageInfo.endCursor
+                : null;
+            } while (cursor && !reachedFreshPullRequest);
+
+            for (const candidateNumber of candidates) {
               if (actionCount >= MAX_ACTIONS_PER_RUN) {
-                core.warning(
-                  `Reached the ${MAX_ACTIONS_PER_RUN}-action safety limit; ` +
-                    'remaining pull requests will be considered on the next run.'
-                );
                 break;
               }
 
+              processedCandidateCount += 1;
+              scannedCount += 1;
               // Re-read mutable state immediately before acting. This prevents a
-              // comment or push made during the run from being treated as stale.
-              const result = await github.graphql(pullRequestQuery, {
-                owner,
-                repo,
-                number: candidate.number,
-              });
-              const pullRequest = result.repository.pullRequest;
+              // comment, label, or push made during the run from being treated as stale.
+              const pullRequest = await getCurrentPullRequest(candidateNumber);
               if (!pullRequest || pullRequest.state !== 'OPEN') {
                 skipCount += 1;
                 continue;
               }
 
-              const idleDays = (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS;
+              const idleDays =
+                (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS;
+              if (idleDays <= PING_AFTER_DAYS) {
+                skipCount += 1;
+                continue;
+              }
+
+              if (pullRequest.isExempt) {
+                console.log(`Skipping ${pullRequest.url}: labeled ${EXEMPT_LABEL}.`);
+                exemptCount += 1;
+                continue;
+              }
+
+              if (pullRequest.mergeable === 'UNKNOWN') {
+                core.warning(
+                  `Skipping ${pullRequest.url}: GitHub did not compute mergeability ` +
+                    `after ${MAX_MERGEABILITY_ATTEMPTS} attempts.`
+                );
+                skipCount += 1;
+                continue;
+              }
+
               const hasConflicts = pullRequest.mergeable === 'CONFLICTING';
               const isClean = pullRequest.mergeable === 'MERGEABLE';
               const isApproved = pullRequest.reviewDecision === 'APPROVED';
@@ -143,32 +293,40 @@ jobs:
                   'This pull request has been automatically closed because it ' +
                   `has had no activity for more than ${CLOSE_AFTER_DAYS} days ` +
                   'and currently has merge conflicts. If the work is still ' +
-                  'relevant, please reopen it after resolving the conflicts or ' +
-                  'open a new pull request.';
+                  'relevant, please open a new pull request. You may also reopen ' +
+                  'this PR after resolving the conflicts if its source branch is ' +
+                  'still available.';
                 console.log(
                   `${dryRun ? '[dry run] Would close' : 'Closing'} ` +
                     `${pullRequest.url} (${idleDays.toFixed(1)} idle days).`
                 );
                 if (!dryRun) {
-                  await github.rest.issues.createComment({
-                    owner,
-                    repo,
-                    issue_number: pullRequest.number,
-                    body,
-                  });
-                  await github.rest.pulls.update({
-                    owner,
-                    repo,
-                    pull_number: pullRequest.number,
-                    state: 'closed',
-                  });
+                  await retryWrite(`Closing ${pullRequest.url}`, () =>
+                    github.rest.pulls.update({
+                      owner,
+                      repo,
+                      pull_number: pullRequest.number,
+                      state: 'closed',
+                    })
+                  );
+                  await retryWrite(`Commenting on ${pullRequest.url}`, () =>
+                    github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: pullRequest.number,
+                      body,
+                    })
+                  );
                 }
                 actionCount += 1;
                 closeCount += 1;
                 continue;
               }
 
+              // Conflicting PRs stay on the close track. Pinging them would update
+              // updatedAt and prevent them from reaching the close threshold.
               if (
+                !hasConflicts &&
                 idleDays > PING_AFTER_DAYS &&
                 (isClean || isApproved) &&
                 pullRequest.author?.login
@@ -189,24 +347,31 @@ jobs:
                     `${pullRequest.url} (${idleDays.toFixed(1)} idle days, ${status}).`
                 );
                 if (!dryRun) {
-                  await github.rest.issues.createComment({
-                    owner,
-                    repo,
-                    issue_number: pullRequest.number,
-                    body,
-                  });
+                  await retryWrite(`Commenting on ${pullRequest.url}`, () =>
+                    github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: pullRequest.number,
+                      body,
+                    })
+                  );
                 }
                 actionCount += 1;
                 pingCount += 1;
                 continue;
               }
 
-              if (pullRequest.mergeable === 'UNKNOWN') {
-                core.warning(
-                  `Skipping ${pullRequest.url}: GitHub has not computed mergeability.`
-                );
-              }
               skipCount += 1;
+            }
+
+            if (
+              actionCount >= MAX_ACTIONS_PER_RUN &&
+              processedCandidateCount < candidates.length
+            ) {
+              core.warning(
+                `Reached the ${MAX_ACTIONS_PER_RUN}-action safety limit; ` +
+                  'remaining pull requests will be considered on the next run.'
+              );
             }
 
             const mode = dryRun ? 'Dry run' : 'Run';
@@ -216,9 +381,18 @@ jobs:
                 [
                   { data: 'Mode', header: true },
                   { data: 'Closed', header: true },
+                  { data: 'Exempt', header: true },
                   { data: 'Pinged', header: true },
+                  { data: 'Scanned', header: true },
                   { data: 'Skipped', header: true },
                 ],
-                [mode, String(closeCount), String(pingCount), String(skipCount)],
+                [
+                  mode,
+                  String(closeCount),
+                  String(exemptCount),
+                  String(pingCount),
+                  String(scannedCount),
+                  String(skipCount),
+                ],
               ])
               .write();
