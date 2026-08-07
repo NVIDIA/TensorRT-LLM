@@ -65,9 +65,11 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadin
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
+    NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
@@ -352,6 +354,11 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert result == "loaded"
     backend.load_weights.assert_called_once_with(weights, True)
     assert configurable_moe._weights_transformed is False
+
+
+def test_moe_nvfp4_activation_quantization_capability():
+    assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
+    assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations
 
 
 def test_marlin_moe_repack_is_transform_stage():

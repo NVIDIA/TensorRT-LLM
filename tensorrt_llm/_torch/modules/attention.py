@@ -24,8 +24,9 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled, is_torch_compiling)
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+                     is_torch_compiling)
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
@@ -609,7 +610,7 @@ class Attention(nn.Module):
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_params=sparse_params)
 
-        self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
+        self.is_marlin_enabled = False
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -698,7 +699,9 @@ class Attention(nn.Module):
         self.attn.update_quant_config(self.quant_config)
 
         self.o_proj.create_weights()
-        self.has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
+        self.is_marlin_enabled = self.o_proj.uses_marlin_nvfp4
+        self.has_quant_scale = (self.o_proj.has_fp8_qdq
+                                or self.o_proj.has_nvfp4_activation_quantization
                                 or self.o_proj.has_fp8_block_scales
                                 or self.o_proj.has_fp8_rowwise
                                 or self.o_proj.has_w4a8_nvfp4_fp8)
@@ -761,6 +764,12 @@ class Attention(nn.Module):
         # If o_proj does dynamic activation quantization, it computes its own scales
         # at runtime from a BF16 input — attention must NOT pre-quantize output
         if self.o_proj.force_dynamic_quantization:
+            return False
+
+        # Producing FP4 output requires a calibrated activation scale on the
+        # consumer. Weight-only W4A16 has NVFP4 weights but consumes BF16/FP16.
+        if (self.o_proj.has_nvfp4
+                and not is_static_nvfp4_input_eligible(self.o_proj)):
             return False
 
         # If no quant is applied, no need to quantize the output
