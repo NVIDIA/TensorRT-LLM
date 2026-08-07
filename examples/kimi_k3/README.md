@@ -51,7 +51,7 @@ other GPU architectures may be added in a future release.
   provides FlashInfer's runtime
   dependencies; `--no-deps` prevents pip from replacing its pinned PyTorch,
   Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
-  currently pins `flashinfer-python==0.6.14`, so a later
+  currently pins `flashinfer-python==0.6.16`, so a later
   dependency-resolving TensorRT-LLM install can replace this source revision.
 
 ## Run the model

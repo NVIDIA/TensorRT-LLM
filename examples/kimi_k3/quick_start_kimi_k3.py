@@ -10,7 +10,7 @@ Example:
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MambaStateConfig
 
 SAMPLES = [
     ("The capital of France is", "Paris"),
@@ -64,6 +64,12 @@ def main() -> None:
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=args.enable_block_reuse,
             free_gpu_memory_fraction=0.7,
+            # Hybrid models only expose reusable prefixes at recurrent-state
+            # snapshot boundaries, and periodic snapshots default to off;
+            # without this, block reuse would silently never engage.
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256)
+            if args.enable_block_reuse
+            else MambaStateConfig(),
         ),
     )
 
