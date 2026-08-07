@@ -291,6 +291,10 @@ if(NOT WIN32)
                         PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../../..")
 endif()
 
+if(BUILD_DEEP_GEMM)
+  add_subdirectory(deep_gemm)
+endif()
+
 if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
@@ -299,10 +303,6 @@ add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
-endif()
-
-if(BUILD_DEEP_GEMM)
-  add_subdirectory(deep_gemm)
 endif()
 
 if(BUILD_FLASH_MLA)
