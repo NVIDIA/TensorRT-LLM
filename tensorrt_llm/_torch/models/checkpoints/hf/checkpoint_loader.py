@@ -1,4 +1,9 @@
-from typing import Optional
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
@@ -13,6 +18,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.config_loader import \
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
     HfWeightLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
+from tensorrt_llm.mapping import Mapping
 
 
 @register_checkpoint_loader("HF")
@@ -50,6 +56,34 @@ class HfCheckpointLoader(BaseCheckpointLoader):
 
     def get_default_weight_loader(self) -> HfWeightLoader:
         return HfWeightLoader()
+
+    @contextmanager
+    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Keep native HF read-ahead alive during materialization.
+
+        MX and Mistral subclass this loader and override ``load_weights``.
+        Delegate those and custom weight loaders through the polymorphic base
+        session instead of bypassing their format-specific behavior.
+        """
+        if (type(self) is not HfCheckpointLoader
+                or type(self.weight_loader) is not HfWeightLoader):
+            with super().open_weight_session(checkpoint_dir,
+                                             mapping=mapping,
+                                             **kwargs) as weights:
+                yield weights
+            return
+
+        with self.weight_loader.open_weight_session(checkpoint_dir,
+                                                    mapping=mapping,
+                                                    **kwargs) as weights:
+            yield weights
+
+    def coordinate_checkpoint_io_request(self, mapping: Mapping) -> None:
+        """Reject rank-divergent native-HF I/O policy requests."""
+        if (type(self) is HfCheckpointLoader
+                and type(self.weight_loader) is HfWeightLoader):
+            self.weight_loader.coordinate_checkpoint_io_request(mapping)
 
     def get_default_config_loader(self) -> HfConfigLoader:
         return HfConfigLoader()

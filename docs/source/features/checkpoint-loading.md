@@ -6,8 +6,9 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 1. [Overview](#overview)
 2. [Core Components](#core-components)
 3. [Built-in Checkpoint Formats](#built-in-checkpoint-formats)
-4. [Using Checkpoint Loaders](#using-checkpoint-loaders)
-5. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
+4. [Checkpoint I/O Policies](#checkpoint-io-policies)
+5. [Using Checkpoint Loaders](#using-checkpoint-loaders)
+6. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
 
 ## Overview
 
@@ -91,6 +92,75 @@ checkpoint loading. Selecting MX does not require an MX-specific on-disk
 checkpoint or conversion of the Hugging Face checkpoint. For installation, MX
 service deployment, and configuration details, see
 [ModelExpress (MX) Checkpoint Loading](./model-express.md).
+
+## Checkpoint I/O Policies
+
+The checkpoint format and checkpoint I/O policy are separate choices. The
+format selects how weights are represented and mapped, while
+`checkpoint_io_policy` selects how supported checkpoint bytes move from
+storage into the host page cache:
+
+| Policy | Behavior |
+|---|---|
+| `native` (default) | Preserves the existing loader. For eligible HF SafeTensors checkpoints, its current page-cache prefetch completes before native tensor materialization begins. |
+| `rank_striped_read_ahead` | Divides bounded SafeTensors file extents among node-local ranks and reads them concurrently in the background while SafeTensors mapping and the model's native `load_weights`/H2D path proceed. Post-load hooks run after read-ahead is joined. |
+
+Rank-striped read-ahead is currently a prototype for the PyTorch backend with
+`checkpoint_format: HF` and `load_format: auto`. It applies only to regular HF
+SafeTensors checkpoints. Checkpoints that require model-specific lazy loading,
+partial-checkpoint runs, the raw HF weight cache, `.bin` or `.pth` files,
+custom checkpoint loaders, MX, and GMS continue through their native paths.
+Distributed activation requires an active MPI model-load communicator; Ray or
+Torch-distributed execution without that communicator falls back to native I/O.
+The default budget permits at most 16 readers per rank and 64 per active
+model-load group on each node. Multiple independent loader groups colocated on
+one physical node each enforce their own budget. Within a group with more ranks
+than reader slots, a deterministic active-rank subset owns all extents;
+inactive ranks still run native materialization, and no checkpoint extent is
+omitted.
+
+The optimization is best effort. Before model mutation, an eligibility,
+memory-admission, planning, or reader-start failure cleans up its resources and
+falls back coherently to native demand-paged mapping without launching a second
+full-file prefetch. If an advisory background read fails after materialization
+has started, TensorRT LLM cancels and joins the readers but does not reload a
+partially mutated model; successful native materialization remains
+authoritative. Mapping, transformation, H2D, and other model-load failures are
+not retried on the same model instance. Cancellation is observed between
+bounded reads; a filesystem syscall blocked inside the kernel can therefore
+delay reader shutdown. Cleanup does not evict pages already admitted to the
+Linux page cache; those pages remain normally reclaimable by the operating
+system.
+
+Startup logs distinguish four states so a configured experiment is not mistaken
+for an activated optimization:
+
+- `requested`: the configured policy.
+- `selected`: the policy chosen after preflight checks.
+- `activated`: whether background rank-striped reads actually started.
+- `effective`: the path that successfully contributed to the completed load.
+
+Configure the requested policy through `checkpoint_io_policy`; the other three
+states are runtime diagnostics reported in startup logs. For example:
+
+```yaml
+backend: pytorch
+checkpoint_format: HF
+load_format: auto
+checkpoint_io_policy: rank_striped_read_ahead
+```
+
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(
+    model="/models/llama",
+    backend="pytorch",
+    checkpoint_format="HF",
+    load_format="auto",
+    checkpoint_io_policy="rank_striped_read_ahead",
+)
+```
 
 ## Using Checkpoint Loaders
 

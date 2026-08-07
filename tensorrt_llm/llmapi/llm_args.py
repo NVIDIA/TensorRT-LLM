@@ -5493,6 +5493,19 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    checkpoint_io_policy: Literal["native", "rank_striped_read_ahead"] = Field(
+        default="native",
+        description=
+        "Controls storage-to-host checkpoint I/O. 'native' preserves the "
+        "existing checkpoint loader, including its synchronous SafeTensors "
+        "page-cache prefetch. 'rank_striped_read_ahead' assigns disjoint "
+        "SafeTensors file extents to node-local ranks and overlaps bounded "
+        "page-cache read-ahead with native SafeTensors mapping and the "
+        "model's load_weights/H2D path. "
+        "Runtime eligibility or memory-admission failures fall back to "
+        "native I/O before model mutation.",
+        status="prototype")
+
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
         description="ModelExpress (MX) P2P checkpoint loading config.",
@@ -6097,6 +6110,30 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_checkpoint_io_policy(self) -> 'TorchLlmArgs':
+        if self.checkpoint_io_policy == "native":
+            return self
+
+        if self.backend != "pytorch":
+            raise ValueError(
+                "checkpoint_io_policy='rank_striped_read_ahead' is supported "
+                "only by the PyTorch backend.")
+        if self.checkpoint_loader is not None:
+            raise ValueError(
+                "checkpoint_io_policy='rank_striped_read_ahead' cannot be "
+                "combined with a custom checkpoint_loader.")
+        if self.checkpoint_format != "HF":
+            raise ValueError(
+                "checkpoint_io_policy='rank_striped_read_ahead' currently "
+                "requires checkpoint_format='HF'.")
+        load_format = getattr(self.load_format, "name", self.load_format)
+        if str(load_format).lower() != "auto":
+            raise ValueError(
+                "checkpoint_io_policy='rank_striped_read_ahead' currently "
+                "requires load_format='auto'.")
         return self
 
     @model_validator(mode="after")
