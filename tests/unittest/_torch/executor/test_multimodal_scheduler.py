@@ -12,6 +12,7 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBas
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
+    LlmRequestState,
     MultimodalEncoderProgress,
     MultimodalEncoderRequestState,
     get_multimodal_encoder_token_lengths,
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
     MultimodalScheduler,
+    ScheduledRequests,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
@@ -413,6 +415,86 @@ def test_forward_multimodal_encoder_step_delegates_to_model_engine():
     executor._forward_multimodal_encoder_step(scheduled_requests)
 
     assert calls == [(executor.active_requests, scheduled_items)]
+
+
+def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
+    failed = _request(1, [4])
+    unrelated_context = _llm_request(2)
+    unrelated_generation = _llm_request(3)
+    handled = []
+
+    def fail_encoder(*_):
+        raise ValueError("bad MM output")
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [failed, unrelated_context, unrelated_generation]
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(world_size=1)
+    executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([failed, unrelated_context])
+    scheduled_requests.append_generation_request(unrelated_generation)
+    scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
+
+    executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert scheduled_requests.context_requests == [unrelated_context]
+    assert scheduled_requests.generation_requests == [unrelated_generation]
+    assert scheduled_requests.scheduled_mm_encoder_items is None
+    assert handled == [("bad MM output", {"requests": [failed], "charge_budget": False})]
+
+
+def test_forward_multimodal_encoder_step_buffers_attention_dp_error_response():
+    failed = _request(1, [4])
+    terminated = []
+
+    def fail_encoder(*_):
+        raise ValueError("bad MM output")
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [failed]
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(world_size=2)
+    executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor._pending_mm_encoder_error_responses = []
+    executor._terminate_request = terminated.append
+    executor._handle_errors = lambda *_args, **_kwargs: pytest.fail(
+        "attention-DP errors must not enter a rank-divergent response collective"
+    )
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([failed])
+    scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
+
+    executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert executor.active_requests == []
+    assert failed.state == LlmRequestState.GENERATION_COMPLETE
+    assert terminated == [failed]
+    assert len(executor._pending_mm_encoder_error_responses) == 1
+    request_id, response = executor._pending_mm_encoder_error_responses[0]
+    assert request_id == failed.py_request_id
+    assert response.error_msg == "bad MM output"
+
+
+def test_flush_pending_responses_includes_multimodal_encoder_errors():
+    transfer_response = (1, object())
+    encoder_error_response = (2, object())
+    enqueued = []
+
+    executor = object.__new__(PyExecutor)
+    executor._pending_transfer_responses = [transfer_response]
+    executor._pending_mm_encoder_error_responses = [encoder_error_response]
+    executor.enable_attention_dp = False
+    executor._enqueue_responses = enqueued.extend
+
+    executor._flush_pending_transfer_responses()
+
+    assert enqueued == [transfer_response, encoder_error_response]
+    assert executor._pending_transfer_responses == []
+    assert executor._pending_mm_encoder_error_responses == []
 
 
 def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):

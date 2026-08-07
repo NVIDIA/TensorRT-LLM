@@ -721,6 +721,12 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        # Request-scoped MM encoder failures can occur on only one attention-DP
+        # rank. Buffer their responses for the same synchronized flush as
+        # transfer responses instead of entering `_enqueue_responses` from a
+        # rank-divergent exception path.
+        self._pending_mm_encoder_error_responses: List[Tuple[int,
+                                                             LlmResponse]] = []
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _handle_responses and _append_iter_stats are reached from
         # per-rank-divergent gates, so their tp_allgather collectives are
@@ -1135,13 +1141,15 @@ class PyExecutor:
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
-        """Enqueue buffered transfer-completion responses.
+        """Enqueue responses buffered by rank-divergent executor paths.
 
         Must be called at a point where ALL DP ranks execute in lockstep so
         that the tp_gather inside _enqueue_responses does not deadlock.
         """
-        responses = self._pending_transfer_responses
+        responses = (self._pending_transfer_responses +
+                     self._pending_mm_encoder_error_responses)
         self._pending_transfer_responses = []
+        self._pending_mm_encoder_error_responses = []
         if responses or self.enable_attention_dp:
             # Even when this rank has no responses we must participate in the
             # collective when ADP is enabled so that the other rank's gather
@@ -5521,8 +5529,53 @@ class PyExecutor:
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items
         if not scheduled_items:
             return
-        self.model_engine.forward_multimodal_encoder_items(
-            self.active_requests, scheduled_items)
+        try:
+            self.model_engine.forward_multimodal_encoder_items(
+                self.active_requests, scheduled_items)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Encountered an error in multimodal encoder forward: "
+                         f"{error_msg}\n{traceback.format_exc()}")
+
+            failed_request_ids = set(scheduled_items)
+            failed_requests = [
+                request for request in self.active_requests
+                if request.request_id in failed_request_ids
+            ]
+
+            # Capacity scheduling may already have placed requests whose last
+            # pending item was selected into this iteration's context batch.
+            # Remove the failed owners before the LLM forward; unrelated
+            # context and generation work remains intact.
+            scheduled_requests.reset_context_requests([
+                request for request in scheduled_requests.context_requests
+                if request.request_id not in failed_request_ids
+            ])
+            scheduled_requests.scheduled_mm_encoder_items = None
+
+            if self.enable_attention_dp and self.dist.world_size != 1:
+                # `_handle_errors` enqueues responses through a TP collective,
+                # but attention-DP ranks schedule independent requests and may
+                # not enter this exception path together. Perform the local
+                # lifecycle updates now and defer only response delivery to the
+                # executor's existing synchronized flush.
+                for request in failed_requests:
+                    request.state = LlmRequestState.GENERATION_COMPLETE
+                    self._pending_mm_encoder_error_responses.append(
+                        (request.py_request_id,
+                         LlmResponse(request_id=request.py_request_id,
+                                     error_msg=error_msg,
+                                     client_id=request.py_client_id)))
+                self.active_requests = [
+                    request for request in self.active_requests
+                    if request not in failed_requests
+                ]
+                for request in failed_requests:
+                    self._terminate_request(request)
+            else:
+                self._handle_errors(error_msg,
+                                    requests=failed_requests,
+                                    charge_budget=False)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
