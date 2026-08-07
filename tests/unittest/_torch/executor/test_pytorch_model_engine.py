@@ -36,7 +36,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
 # isort: on
 from utils.util import skip_ray
 
+from tensorrt_llm._torch.attention_backend import FlashInferAttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
@@ -1223,6 +1225,59 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine._preprocess_inputs(inputs)
         self.assertEqual(inputs["position_ids"][0, :4].cpu().tolist(),
                          list(range(prompt_len, prompt_len + 4)))
+        kv_cache_manager.shutdown()
+
+    def test_overlap_input_processing_applies_flashinfer_kv_offsets(
+            self) -> None:
+        spec_config = SADecodingConfig(max_draft_len=3)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            spec_config=spec_config)
+        model_engine.runtime_draft_len = spec_config.max_draft_len
+        model_engine.previous_pos_id_offsets_cuda = torch.zeros(
+            8, dtype=torch.int32, device="cuda")
+        model_engine.previous_kv_lens_offsets_cuda = torch.tensor(
+            [-3, -1], dtype=torch.int32, device="cuda")
+
+        attn_metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([2, 4, 4], dtype=torch.int32),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True),
+            max_num_requests=4,
+            max_num_tokens=32,
+            kv_cache_manager=kv_cache_manager,
+        )
+        attn_metadata.num_chunked_ctx_requests = 0
+        cached_token_lens = torch.tensor([10, 31, 62],
+                                         dtype=torch.int32,
+                                         device="cuda")
+        attn_metadata._cached_token_lens[:3].copy_(cached_token_lens)
+        attn_metadata._positions[:10].copy_(
+            torch.tensor([10, 11, 31, 32, 33, 34, 62, 63, 64, 65],
+                         dtype=torch.int32,
+                         device="cuda"))
+        inputs = {
+            "input_ids": torch.zeros(10, dtype=torch.int32, device="cuda"),
+            "position_ids": torch.zeros((1, 10),
+                                        dtype=torch.int32,
+                                        device="cuda"),
+            "attn_metadata": attn_metadata,
+        }
+
+        model_engine._preprocess_inputs(inputs)
+
+        torch.testing.assert_close(
+            attn_metadata._cached_token_lens[:3],
+            torch.tensor([10, 28, 61], dtype=torch.int32, device="cuda"))
+        torch.testing.assert_close(
+            attn_metadata._positions[:10],
+            torch.tensor([10, 11, 28, 29, 30, 31, 61, 62, 63, 64],
+                         dtype=torch.int32,
+                         device="cuda"))
+
+        model_engine._postprocess_inputs(inputs)
+
+        torch.testing.assert_close(attn_metadata._cached_token_lens[:3],
+                                   cached_token_lens)
         kv_cache_manager.shutdown()
 
     def test_pad_generation_requests(self) -> None:

@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -2045,3 +2046,73 @@ class TestOneModelMTPDraftTokenScheduling:
         assert gen.py_draft_tokens == sampler_drafts
         # The C++ count is still normalized for the micro-batch scheduler.
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+
+    @classmethod
+    def _make_runtime_draft_executor(cls, disable_overlap_scheduler: bool):
+        ex = object.__new__(PyExecutor)
+        spec_config = MTPDecodingConfig(
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            mtp_eagle_one_model=True,
+        )
+        ex.model_engine = Mock(
+            spec_config=spec_config,
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            max_total_draft_tokens=cls.MAX_TOTAL_DRAFT_TOKENS,
+        )
+        ex.disable_overlap_scheduler = disable_overlap_scheduler
+        ex.speculation_permanently_disabled = False
+        ex.max_seq_len = 16
+        return ex
+
+    @classmethod
+    def _make_generation_batch(cls, *sequence_lengths: int):
+        batch = ScheduledRequests()
+        for request_id, sequence_length in enumerate(sequence_lengths):
+            request = LlmRequest(
+                request_id=request_id,
+                max_new_tokens=10,
+                input_tokens=list(range(sequence_length)),
+                sampling_config=SamplingConfig(1),
+                is_streaming=False,
+                draft_tokens=None,
+            )
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            request.py_draft_tokens = [7, 8, 9]
+            batch.append_generation_request(request)
+        return batch
+
+    @pytest.mark.parametrize(
+        "disable_overlap_scheduler,sequence_length",
+        [
+            (False, 10),
+            (True, 14),
+        ],
+    )
+    def test_one_model_mtp_uses_zero_draft_near_sequence_limit(
+        self, disable_overlap_scheduler, sequence_length
+    ):
+        ex = self._make_runtime_draft_executor(disable_overlap_scheduler)
+        batch = self._make_generation_batch(sequence_length, 4)
+
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == 0
+        assert all(request.py_draft_tokens == [] for request in batch.generation_requests)
+
+    @pytest.mark.parametrize(
+        "disable_overlap_scheduler,sequence_length",
+        [
+            (False, 9),
+            (True, 13),
+        ],
+    )
+    def test_one_model_mtp_keeps_drafting_with_position_headroom(
+        self, disable_overlap_scheduler, sequence_length
+    ):
+        ex = self._make_runtime_draft_executor(disable_overlap_scheduler)
+        batch = self._make_generation_batch(sequence_length)
+
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert batch.generation_requests[0].py_draft_tokens == [7, 8, 9]

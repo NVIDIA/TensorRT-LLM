@@ -2,6 +2,7 @@ import random
 import unittest
 from collections import defaultdict
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional, Union
 from unittest import mock
 
@@ -13,7 +14,8 @@ from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
                                                    FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention_backend import \
     flashinfer as flashinfer_backend
-from tensorrt_llm._torch.attention_backend.flashinfer import PlanParams
+from tensorrt_llm._torch.attention_backend.flashinfer import (
+    FlashInferWrappers, PlanParams)
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -64,7 +66,143 @@ class CUDAGraphTestScenario:
     dtype: torch.dtype
 
 
+def _create_kv_cache_manager() -> KVCacheManager:
+    return KVCacheManager(
+        KvCacheConfig(max_tokens=256),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=64,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.BF16,
+    )
+
+
 class TestFlashInferAttention(unittest.TestCase):
+
+    def test_generation_page_table_uses_reserved_block_count(self):
+        manager = SimpleNamespace(kv_cache_map={
+            98: SimpleNamespace(num_blocks=4),
+            99: SimpleNamespace(num_blocks=325),
+        }, )
+
+        self.assertEqual(
+            flashinfer_backend._get_page_table_num_blocks(manager, [98, 99],
+                                                          [3, 324],
+                                                          num_contexts=1),
+            [3, 325],
+        )
+        v1_manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
+            return_value=[list(range(4)), list(range(325))]))
+        self.assertEqual(
+            flashinfer_backend._get_page_table_num_blocks(v1_manager, [98, 99],
+                                                          [3, 324],
+                                                          num_contexts=1),
+            [3, 325],
+        )
+        v1_manager.get_batch_cache_indices.assert_called_once_with([98, 99])
+
+    def test_spec_decode_kv_lens_offsets_update_logical_decode_state(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        kv_cache_manager = _create_kv_cache_manager()
+        with kv_cache_manager:
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.tensor([2, 4, 4], dtype=torch.int32),
+                num_contexts=1,
+                kv_cache_params=KVCacheParams(use_cache=True),
+                max_num_requests=3,
+                max_num_tokens=10,
+                kv_cache_manager=kv_cache_manager,
+            )
+            cached_token_lens = torch.tensor([10, 31, 62],
+                                             dtype=torch.int32,
+                                             device="cuda")
+            last_page_lens = torch.tensor([12, 3, 2],
+                                          dtype=torch.int32,
+                                          device="cuda")
+            positions = torch.tensor([10, 11, 31, 32, 33, 34, 62, 63, 64, 65],
+                                     dtype=torch.int32,
+                                     device="cuda")
+            metadata._cached_token_lens[:3].copy_(cached_token_lens)
+            metadata._paged_kv_last_page_len[:3].copy_(last_page_lens)
+            metadata._positions[:10].copy_(positions)
+            kv_lens_buffer = torch.tensor([35, 66],
+                                          dtype=torch.int32,
+                                          device="cuda")
+            metadata._plan_params_to_wrappers = {
+                object():
+                FlashInferWrappers(is_planned=True,
+                                   decode_wrapper=SimpleNamespace(
+                                       _kv_lens_buffer=kv_lens_buffer))
+            }
+            offsets = torch.tensor([-3, -1], dtype=torch.int32, device="cuda")
+
+            metadata.apply_spec_decode_kv_lens_offsets(offsets,
+                                                       num_generations=2,
+                                                       tokens_per_generation=4)
+
+            torch.testing.assert_close(
+                metadata._cached_token_lens[:3],
+                torch.tensor([10, 28, 61], dtype=torch.int32, device="cuda"))
+            torch.testing.assert_close(metadata._paged_kv_last_page_len[:3],
+                                       last_page_lens)
+            torch.testing.assert_close(
+                metadata._positions[:10],
+                torch.tensor([10, 11, 28, 29, 30, 31, 61, 62, 63, 64],
+                             dtype=torch.int32,
+                             device="cuda"))
+            torch.testing.assert_close(
+                kv_lens_buffer,
+                torch.tensor([32, 65], dtype=torch.int32, device="cuda"))
+
+            # A mixed prefill/decode forward can lazily plan after overlap
+            # preprocessing. Simulate plan() restoring the host upper bound and
+            # verify the post-plan publication restores device-logical lengths.
+            kv_lens_buffer.copy_(
+                torch.tensor([35, 66], dtype=torch.int32, device="cuda"))
+            metadata._publish_decode_wrapper_kv_lens(
+                next(iter(
+                    metadata._plan_params_to_wrappers.values())).decode_wrapper)
+            torch.testing.assert_close(
+                kv_lens_buffer,
+                torch.tensor([32, 65], dtype=torch.int32, device="cuda"))
+
+            metadata.apply_spec_decode_kv_lens_offsets(
+                offsets,
+                num_generations=2,
+                tokens_per_generation=4,
+                restore=True,
+            )
+
+            torch.testing.assert_close(metadata._cached_token_lens[:3],
+                                       cached_token_lens)
+            torch.testing.assert_close(metadata._paged_kv_last_page_len[:3],
+                                       last_page_lens)
+            torch.testing.assert_close(metadata._positions[:10], positions)
+            torch.testing.assert_close(
+                kv_lens_buffer,
+                torch.tensor([35, 66], dtype=torch.int32, device="cuda"))
+
+            # A shared external-assistant view is Q-only: its cached length is
+            # the full accepted target prefix and must not include its query token.
+            metadata.seq_lens = torch.ones(2, dtype=torch.int32)
+            metadata.num_contexts = 0
+            metadata._is_shared_kv_draft_view = True
+            metadata._draft_kv_runtime_lens[:2].copy_(
+                torch.tensor([32, 65], dtype=torch.int32, device="cuda"))
+            metadata._cached_token_lens[:2].zero_()
+            metadata._paged_kv_last_page_len[:2].zero_()
+            kv_lens_buffer.copy_(
+                torch.tensor([35, 66], dtype=torch.int32, device="cuda"))
+            metadata._update_draft_kv_lengths()
+            torch.testing.assert_close(
+                kv_lens_buffer,
+                torch.tensor([32, 65], dtype=torch.int32, device="cuda"))
 
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
@@ -72,23 +210,9 @@ class TestFlashInferAttention(unittest.TestCase):
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             self.skipTest("FlashInfer trtllm-gen requires SM100 or SM103")
 
-        def create_manager():
-            return KVCacheManager(
-                KvCacheConfig(max_tokens=256),
-                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-                num_layers=1,
-                num_kv_heads=1,
-                head_dim=128,
-                tokens_per_block=32,
-                max_seq_len=64,
-                max_batch_size=2,
-                mapping=Mapping(world_size=1, tp_size=1, rank=0),
-                dtype=tensorrt_llm.bindings.DataType.BF16,
-            )
-
-        target_manager = create_manager()
-        draft_manager = create_manager()
-        try:
+        target_manager = _create_kv_cache_manager()
+        draft_manager = _create_kv_cache_manager()
+        with target_manager, draft_manager:
             target_manager.add_dummy_requests([0, 1], [31, 45], is_gen=True)
             draft_manager.add_dummy_requests([0, 1], [31, 45],
                                              is_gen=True,
@@ -149,9 +273,6 @@ class TestFlashInferAttention(unittest.TestCase):
             replan.assert_not_called()
             self.assertEqual(refresh_block_tables.call_count,
                              len(draft_metadata._plan_params_to_wrappers))
-        finally:
-            target_manager.shutdown()
-            draft_manager.shutdown()
 
     def test_ragged_no_kv_cuda_graph_uses_stable_indptr_aliases(self):
         if not torch.cuda.is_available():
