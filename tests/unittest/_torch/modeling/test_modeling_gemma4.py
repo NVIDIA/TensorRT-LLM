@@ -948,6 +948,17 @@ class TestGemma4HFComparison(unittest.TestCase):
         )
 
     @torch.no_grad()
+    def test_kv_sharing_real_headdim_config_trtllm(self):
+        """TRTLLM backend reuses cached KV for Q-only H256/H512 layers."""
+        config_dict = deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG)
+        config_dict["num_hidden_layers"] = 12
+        config_dict["num_kv_shared_layers"] = 4
+        self._run_full_model_comparison(
+            config_dict,
+            attn_backend="TRTLLM",
+        )
+
+    @torch.no_grad()
     def test_diff_kv_heads_config(self):
         """Different num_kv_heads per layer type — tests V2 pool grouping."""
         self._run_full_model_comparison(deepcopy(GEMMA4_DIFF_KV_HEADS_CONFIG))

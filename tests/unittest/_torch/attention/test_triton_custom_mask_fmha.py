@@ -574,50 +574,90 @@ def test_mixed_batch_runs_context_and_generation_on_different_fmhas(monkeypatch)
     assert metadata.effective_workspace.numel() == 8
 
 
-@pytest.mark.parametrize(
-    "quant_mode",
-    [
-        QuantMode(0),
-        QuantMode.from_description(use_fp8_kv_cache=True),
-    ],
-)
-def test_large_head_generation_support_is_owned_by_trtllm_gen(
-    quant_mode: QuantMode,
-) -> None:
+@pytest.mark.parametrize("phase", [FmhaPhase.CONTEXT, FmhaPhase.GENERATION])
+def test_trtllm_gen_supports_q_only_cached_kv_input(phase: FmhaPhase) -> None:
     attn = SimpleNamespace(
         head_dim=512,
+        num_heads=2,
+        num_kv_heads=1,
         is_mla_enable=False,
-        quant_mode=int(quant_mode),
+        sparse_params=None,
+        quant_mode=0,
+        position_embedding_type=int(PositionEmbeddingType.rope_gpt_neox),
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: attn
+    metadata = SimpleNamespace(
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        is_cross=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=None,
+        tokens_per_block=32,
+        beam_width=1,
+    )
+    q = torch.empty((1, 2 * 512), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        is_fused_qkv=False,
+        update_kv_cache=False,
+    )
+
+    assert fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=phase,
+    )
+
+
+def test_trtllm_gen_rejects_separate_qkv_input() -> None:
+    attn = SimpleNamespace(
+        head_dim=512,
+        num_heads=2,
+        num_kv_heads=1,
+        is_mla_enable=False,
+        sparse_params=None,
+        quant_mode=0,
         position_embedding_type=int(PositionEmbeddingType.learned_absolute),
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha._attn_ref = lambda: attn
     metadata = SimpleNamespace(
-        num_contexts=0,
-        num_generations=1,
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
         is_cross=False,
         kv_cache_block_offsets=object(),
+        kv_cache_manager=None,
+        tokens_per_block=32,
+        beam_width=1,
     )
-    q = torch.empty((1, 8), dtype=torch.bfloat16)
-    k = torch.empty((1, 4), dtype=torch.bfloat16)
-    v = torch.empty((1, 4), dtype=torch.bfloat16)
-    output = torch.empty_like(q)
+    q = torch.empty((1, 2 * 512), dtype=torch.bfloat16)
+    k = torch.empty((1, 512), dtype=torch.bfloat16)
+    v = torch.empty((1, 512), dtype=torch.bfloat16)
     forward_args = AttentionForwardArgs(
-        output=output,
+        output=torch.empty_like(q),
         attention_mask=PredefinedAttentionMask.CAUSAL,
-        attention_input_type=AttentionInputType.generation_only,
         is_fused_qkv=False,
+        update_kv_cache=True,
     )
 
-    supported, reason = fmha._check_preprocessed_generation_with_reason(
+    assert not fmha.is_supported(
         q,
         k,
         v,
         metadata,
         forward_args,
+        phase=FmhaPhase.GENERATION,
     )
-
-    assert supported, reason
 
 
 def test_fp8_kv_uses_fp8_context_fmha() -> None:
@@ -630,36 +670,41 @@ def test_fp8_kv_uses_fp8_context_fmha() -> None:
     assert fmha._use_fp8_context_fmha(torch.empty(1, dtype=torch.bfloat16))
 
 
-def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> None:
-    fp8_kv_quant_mode = QuantMode.from_description(use_fp8_kv_cache=True)
+def test_q_only_generation_uses_generation_preprocess(monkeypatch) -> None:
     attn = SimpleNamespace(
         num_heads=2,
         num_kv_heads=1,
         head_dim=512,
-        quant_mode=int(fp8_kv_quant_mode),
+        quant_mode=0,
         local_layer_idx=0,
         q_scaling=1.0,
         attention_chunk_size=None,
+        rope_params=SimpleNamespace(
+            dim=0,
+            theta=10000.0,
+            scale_type=0,
+            scale=1.0,
+            max_positions=8192,
+        ),
+        rotary_inv_freq=None,
+        rotary_cos_sin=None,
+        position_embedding_type=int(PositionEmbeddingType.learned_absolute),
+        predicted_tokens_per_seq=1,
     )
     metadata = SimpleNamespace(
-        kv_cache_manager=object(),
-        num_generations=1,
-        seq_lens=torch.tensor([1], dtype=torch.int32),
-        kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[4]),
         beam_width=1,
         max_num_requests=1,
         host_kv_cache_pool_pointers=torch.empty(0),
         host_kv_cache_pool_mapping=torch.empty(0),
         kv_cache_block_offsets=torch.empty(0),
     )
+    output = torch.empty(1, 2, 512, dtype=torch.bfloat16)
     params = SimpleNamespace(
         attn=attn,
         meta=metadata,
-        fwd=AttentionForwardArgs(),
+        fwd=AttentionForwardArgs(output=output),
         qkv_input=torch.randn(1, 2 * 512, dtype=torch.bfloat16),
-        key_input=torch.randn(1, 512, dtype=torch.bfloat16),
-        value_input=torch.randn(1, 512, dtype=torch.bfloat16),
-        context_buf=torch.empty(1, 2, 512, dtype=torch.bfloat16),
+        context_buf=output,
         sequence_lengths=torch.tensor([5], dtype=torch.int32),
         workspace=torch.empty(1024, dtype=torch.int8),
         num_tokens=1,
@@ -670,39 +715,41 @@ def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> No
         total_num_blocks=4,
         input_seq_length=1,
         max_past_kv_length=5,
+        max_attention_window_size=5,
         cyclic_attention_window_size=5,
+        spec_decoding_generation_lengths=None,
+        spec_decoding_position_offsets=None,
+        is_cross=False,
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha._attn_ref = lambda: attn
     fmha._enable_pdl = False
     fmha._multi_processor_count = 1
 
-    appended_kv_dtypes = None
-
-    def _capture_append(params, q, k, v, *args, **kwargs):
-        nonlocal appended_kv_dtypes
-        appended_kv_dtypes = (q.dtype, k.dtype, v.dtype)
-        return object(), object(), object(), object(), [5]
-
-    monkeypatch.setattr(
-        FlashInferTrtllmGenFmha,
-        "_append_preprocessed_kv",
-        staticmethod(_capture_append),
-    )
+    q_processed = params.qkv_input.view(1, 2, 512).clone()
     kv_pool = torch.empty(1)
     block_tables = torch.zeros(1, 2, 4, dtype=torch.int32)
-    metadata_dtype = None
+    preprocess_input = None
 
-    def _build_metadata(*args, **kwargs):
-        nonlocal metadata_dtype
-        metadata_dtype = args[-1]
-        return kv_pool, block_tables
+    def _preprocess(qkv_input, *args):
+        nonlocal preprocess_input
+        preprocess_input = qkv_input
+        return (
+            q_processed,
+            kv_pool,
+            block_tables,
+            None,
+            torch.ones(2, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            params.workspace,
+            None,
+            1,
+            5,
+            -1,
+            False,
+        )
 
-    monkeypatch.setattr(
-        thop,
-        "build_trtllm_gen_kv_cache_metadata",
-        _build_metadata,
-    )
+    monkeypatch.setattr(thop, "trtllm_gen_generation_preprocess", _preprocess)
     monkeypatch.setattr(
         trtllm_gen_module,
         "_clear_multi_ctas_kv_counter_workspace",
@@ -720,13 +767,11 @@ def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> No
         _capture_decode,
     )
 
-    fmha._run_preprocessed_generation(params)
+    fmha.run_generation(params)
 
+    assert preprocess_input is params.qkv_input
     assert decode_args is not None
-    assert decode_args[0].shape == (1, 2, 512)
-    assert decode_args[0].dtype == torch.float8_e4m3fn
-    assert appended_kv_dtypes == (torch.float8_e4m3fn,) * 3
-    assert metadata_dtype == torch.float8_e4m3fn
+    assert decode_args[0] is q_processed
     assert decode_args[1] is kv_pool
     assert decode_args[3] is block_tables
     assert decode_args[5] == 5

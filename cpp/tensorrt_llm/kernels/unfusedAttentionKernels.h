@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -208,6 +208,8 @@ struct QKVPreprocessingParams
     bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
     bool generation_phase{false};
+    // The input contains Q only and the existing KV cache must not be updated.
+    bool q_only_input{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
@@ -307,6 +309,7 @@ struct QKVPreprocessingParams
         ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "generation_phase: " << generation_phase << std::endl;
+        ss << "q_only_input: " << q_only_input << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
         return ss.str();
