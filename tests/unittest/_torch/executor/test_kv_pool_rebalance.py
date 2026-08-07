@@ -43,6 +43,8 @@ def _make_executor(
     *,
     enable_kv_pool_rebalance: bool = True,
     pp_size: int = 1,
+    tp_size: int = 1,
+    enable_attention_dp: bool = False,
     kv_cache_transceiver=None,
     is_warmup: bool = False,
     is_shutdown: bool = False,
@@ -53,22 +55,36 @@ def _make_executor(
     previous_batch=None,
     padding_dummies=None,
     has_cuda_graph_runner: bool = True,
+    rebalance_check_interval: int = 1,
 ) -> MagicMock:
     """Construct a MagicMock shaped like PyExecutor with exactly the
     attributes the rebalance code path reads.
 
     ``padding_dummies`` is the runner's ``{draft_len: dummy}`` map; its
     dummies count as active on GPU, like real pre-allocated ones.
+
+    ``rebalance_check_interval`` defaults to 1 so the iteration throttle is
+    transparent for tests that are not about the throttle itself; the throttle
+    gets its own coverage in ``TestRebalanceCheckThrottle``.
     """
     exe = MagicMock(spec=PyExecutor)
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
-    exe.dist = MagicMock(pp_size=pp_size)
+    exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size)
+    exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
     exe.is_warmup = is_warmup
     exe.is_shutdown = is_shutdown
     exe.drafter = drafter
+
+    # Iteration throttle state.
+    exe._rebalance_check_interval = rebalance_check_interval
+    exe._rebalance_check_counter = 0
+
+    # Bind the real agreement helper so _maybe_rebalance_kv_pools exercises it
+    # rather than getting a truthy MagicMock back.
+    exe._agreed_need_adjustment = lambda: PyExecutor._agreed_need_adjustment(exe)
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()
@@ -375,6 +391,113 @@ class TestConsumePreviousBatch:
         exe._process_previous_batch.assert_called_once()
         exe.perf_manager.compute_batch_gpu_times.assert_called_once()
         assert exe.previous_batch is None
+
+
+# --------------------------------------------------------------------------- #
+# Iteration throttle
+# --------------------------------------------------------------------------- #
+
+
+class TestRebalanceCheckThrottle:
+    """``_can_pause_for_rebalance`` only lets a check through every N iterations.
+
+    The throttle must be driven purely by rank-uniform state: all ranks have to
+    reach the agreement collective on the same iteration or they deadlock.
+    """
+
+    def test_returns_false_until_interval_reached(self):
+        exe = _make_executor(rebalance_check_interval=4)
+        results = [PyExecutor._can_pause_for_rebalance(exe) for _ in range(4)]
+        assert results == [False, False, False, True]
+
+    def test_counter_resets_after_firing(self):
+        exe = _make_executor(rebalance_check_interval=3)
+        results = [PyExecutor._can_pause_for_rebalance(exe) for _ in range(6)]
+        assert results == [False, False, True, False, False, True]
+
+    def test_interval_of_one_checks_every_iteration(self):
+        exe = _make_executor(rebalance_check_interval=1)
+        assert all(PyExecutor._can_pause_for_rebalance(exe) for _ in range(5))
+
+    def test_counter_not_advanced_when_a_gate_rejects(self):
+        # The counter sits behind every gate, so an executor that cannot
+        # rebalance accumulates no throttle credit.  Every gate is rank-uniform,
+        # which is what keeps the counter -- and therefore the iteration the
+        # agreement collective runs on -- identical across ranks.
+        exe = _make_executor(enable_kv_pool_rebalance=False, rebalance_check_interval=2)
+        for _ in range(10):
+            assert PyExecutor._can_pause_for_rebalance(exe) is False
+        assert exe._rebalance_check_counter == 0
+
+    def test_counter_not_advanced_during_warmup(self):
+        exe = _make_executor(is_warmup=True, rebalance_check_interval=2)
+        for _ in range(10):
+            assert PyExecutor._can_pause_for_rebalance(exe) is False
+        assert exe._rebalance_check_counter == 0
+
+        # Once warmup clears, the throttle starts counting from scratch.
+        exe.is_warmup = False
+        assert [PyExecutor._can_pause_for_rebalance(exe) for _ in range(2)] == [False, True]
+
+
+# --------------------------------------------------------------------------- #
+# Cross-rank agreement on the rebalance trigger
+# --------------------------------------------------------------------------- #
+
+
+class TestAgreedNeedAdjustment:
+    """Rank 0 of the TP group decides; the decision is broadcast.
+
+    Rationale: every input to ``need_adjustment`` is deterministic given the
+    request stream except the 120s cooldown, which reads a per-rank
+    ``steady_clock``.  Two TP ranks straddling that boundary would rebalance on
+    different iterations, and TP ranks schedule independently, so their batches
+    could then diverge.
+    """
+
+    def test_single_rank_reads_locally_without_broadcast(self):
+        exe = _make_executor(tp_size=1, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_tp_broadcasts_rank0_decision(self):
+        exe = _make_executor(tp_size=4, need_adjustment=True)
+        exe.dist.tp_broadcast.return_value = True
+
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.tp_broadcast.assert_called_once_with(True, root=0)
+
+    def test_tp_rank_follows_broadcast_over_its_own_reading(self):
+        # This is the case the whole mechanism exists for: the local read says
+        # "rebalance" but rank 0 says no, so this rank must not rebalance.
+        exe = _make_executor(tp_size=2, need_adjustment=True)
+        exe.dist.tp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+
+    def test_tp_rank_follows_broadcast_when_local_says_no(self):
+        exe = _make_executor(tp_size=2, need_adjustment=False)
+        exe.dist.tp_broadcast.return_value = True
+
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+
+    def test_attention_dp_decides_independently(self):
+        # ADP ranks own independent request streams and independent KV caches,
+        # so forcing rank 0's decision on them would starve a rank that needs
+        # to rebalance when rank 0 does not.
+        exe = _make_executor(tp_size=4, enable_attention_dp=True, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_no_rebalance_when_agreement_says_no(self, monkeypatch):
+        exe = _make_executor(tp_size=2, need_adjustment=True, active_requests=[_make_request(1)])
+        exe.dist.tp_broadcast.return_value = False
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
 
 
 if __name__ == "__main__":
