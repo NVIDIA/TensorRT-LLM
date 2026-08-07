@@ -3507,21 +3507,26 @@ class PyExecutor:
         return [local_status]
 
     def _check_disagg_transfer_progress_when_idle(self) -> None:
-        """Reap completed KV transfers so their blocks can be freed.
+        """Reap completed context KV transfers so their blocks can be freed.
 
-        Both polls are non-blocking and rank-symmetric: every rank enters them
+        The poll is non-blocking and rank-symmetric: every rank enters it
         unconditionally on every disagg iteration, so the consensus performed
-        inside the status calls stays aligned without an extra collective here.
+        inside the status call stays aligned without an extra collective here.
         Ranks with nothing in flight simply reap nothing.
+
+        Generation transfers are deliberately not polled here: the loop head
+        already ran `_check_disagg_gen_transfer_status` this iteration, and any
+        receive started since then by `_prepare_disagg_gen_init` is polled by
+        `_recv_disagg_gen_cache` right after it is issued. A poll here would
+        only repeat the GEN status call and its consensus.
         """
         # A synchronous GEN receive is rank-local and blocking. One rank can
-        # still be receiving while another is idle, so entering either the
-        # generation or context progress collective here is unsafe.
+        # still be receiving while another is idle, so entering the context
+        # progress collective here is unsafe.
         if not self._uses_async_disagg_gen_transfer():
             return
 
         self._check_disagg_ctx_cache_transfer_status(0)
-        self._check_disagg_gen_cache_transfer_status(0)
 
     def _sync_gen_only_benchmark_has_insufficient_kv(
             self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],
