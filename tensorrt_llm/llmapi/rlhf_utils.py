@@ -208,8 +208,14 @@ class WorkerExtension:
             logger.error("Encountered an error in update_weights")
             raise e
 
+    @control_action_decorator
     def reset_prefix_cache(self) -> None:
-        """Invalidate the KV cache prefix reuse state after weight updates."""
+        """Invalidate the KV cache prefix reuse state after weight updates.
+
+        Drains in-flight requests first, like update_weights(): clearing the reuse state
+        detaches the whole radix tree, and a request that is still holding blocks from it
+        would go on committing into the detached subtree.
+        """
         self.engine.reset_prefix_cache()
 
     @control_action_decorator

@@ -72,12 +72,61 @@ llm.generate(["Hello, my name is",
             sampling_params_1])
 ```
 
+### Model generation config defaults
+
+The PyTorch backend can use compatible sampling defaults explicitly specified
+in a model's `generation_config.json`. This behavior is opt-in:
+
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
+          generation_config='auto')
+```
+
+For `trtllm-serve`, enable it on the command line:
+
+```bash
+trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --generation-config auto
+```
+
+or in the server YAML configuration:
+
+```yaml
+generation_config: auto
+```
+
+The `generation_config` option has two modes:
+
+* `trtllm` (default) keeps the TRT-LLM sampling behavior and defaults.
+* `auto` loads supported sampling values from the model's
+  `generation_config.json`.
+
+In `auto` mode, values are resolved in this order:
+
+1. A value explicitly specified by the request.
+2. A value explicitly present in `generation_config.json`.
+3. The existing default for the LLM API or serving protocol.
+
+The supported fields are `temperature`, `top_p`, `top_k`, `min_p`,
+`repetition_penalty`, `no_repeat_ngram_size`, `length_penalty`, and
+`early_stopping` when its value is a boolean or integer. Defaults synthesized
+by Hugging Face Transformers for fields absent from the JSON file are not
+applied.
+
+TRT-LLM's existing model-specific handling of `eos_token_id`, BART
+`forced_bos_token_id`, and Whisper suppression tokens remains active in both
+modes.
+
 ### LLM API sampling behavior when using Torch Sampler
 
 * The sampling is controlled via `SamplingParams`.
 
 * By default (`temperature = top_p = top_k = None`), greedy sampling is used
-  (unless min-p or top-p decay is active, see below).
+  (unless min-p or top-p decay is active, see below). With
+  `generation_config='auto'`, values explicitly specified in the model's
+  `generation_config.json` take the place of these defaults; see
+  [Model generation config defaults](#model-generation-config-defaults).
 
 * If either `temperature = 0`, `top_p = 0`, `top_k = 1`, and/or `min_p = 1`, is specified,
   sampling is greedy, irrespective of the values of the remaining parameters.
@@ -120,7 +169,7 @@ llm.generate(["Hello, my name is",
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
-* Positive Min-P is not supported in combination with one-model speculative decoding. Such 
+* Positive Min-P is not supported in combination with one-model speculative decoding. Such
   requests are rejected at admission.
 
 * Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and

@@ -903,8 +903,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+        return (self.top_k, self.num_fused_shared_experts,
+                self.intermediate_size, self.local_num_experts, self.act_type)
 
     def get_runner(self):
         instance_key = ()
@@ -922,8 +922,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
         the profiling cache. The result depends only on the key below, so
         memoize it the same way ``runner_dict`` memoizes the runner.
         """
-        key = (self.top_k, hidden_size, self.intermediate_size,
-               self.local_num_experts, num_tokens)
+        key = (self.top_k, self.num_fused_shared_experts, hidden_size,
+               self.intermediate_size, self.local_num_experts, num_tokens)
         tactic = FP8BlockScaleMoERunner.fallback_tactic_dict.get(key)
         if tactic is None:
             tactic = tuple(

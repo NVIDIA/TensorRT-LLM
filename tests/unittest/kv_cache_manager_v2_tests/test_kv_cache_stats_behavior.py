@@ -127,7 +127,7 @@ def _create_manager(
             max_gpu_total_bytes=gpu_bytes,
             max_util_for_resume=1.0,
             max_attention_window=max_attention_window,
-            block_reuse_config=BlockReuseConfig(block_reuse_policy=block_reuse_policy),
+            block_reuse_config=BlockReuseConfig(policy=block_reuse_policy),
         ),
         CacheType.SELF,
         num_layers=num_layers,

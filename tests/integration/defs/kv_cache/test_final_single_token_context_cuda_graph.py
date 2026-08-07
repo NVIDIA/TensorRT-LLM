@@ -91,7 +91,6 @@ class _CudaGraphExecutionProbe:
         draft_tokens_cuda: torch.Tensor | None = None,
         new_tensors_device: SampleStateTensors | None = None,
         spec_resource_manager: BaseResourceManager | None = None,
-        allow_mixed_encoder_decoder: bool = False,
         promoted_context_request_ids: frozenset[int] = frozenset(),
     ) -> tuple[Any | None, Any | None, KeyType | None]:
         # A new decision means the preceding one reached eager execution if it
@@ -105,7 +104,6 @@ class _CudaGraphExecutionProbe:
             draft_tokens_cuda,
             new_tensors_device,
             spec_resource_manager,
-            allow_mixed_encoder_decoder=allow_mixed_encoder_decoder,
             promoted_context_request_ids=promoted_context_request_ids,
         )
         if promoted_context_request_ids:

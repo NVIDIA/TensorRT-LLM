@@ -1660,6 +1660,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             None
         ] * self.max_num_sequences
         self._stable_greedy_request_ids: list[int] = []
+        self._stable_greedy_seq_slots: list[int] = []
         self._stable_greedy_seq_slots_host: Optional[torch.Tensor] = None
         self._stable_greedy_seq_slots_cuda: Optional[torch.Tensor] = None
 
@@ -4056,7 +4057,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         generation_requests = scheduled_requests.generation_requests
         request_ids = [request.py_request_id for request in generation_requests]
-        has_stable_request_ids = self._stable_greedy_request_ids == request_ids
+        maybe_seq_slots = [request.py_seq_slot for request in generation_requests]
+        has_stable_greedy_batch = (
+            self._stable_greedy_request_ids == request_ids
+            and self._stable_greedy_seq_slots == maybe_seq_slots
+        )
         can_use_stable_greedy_path = (
             bool(generation_requests)
             and self.max_beam_width == 1
@@ -4068,7 +4073,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 for request in generation_requests
             )
             and (
-                has_stable_request_ids
+                has_stable_greedy_batch
                 or all(
                     request._py_embedding_bias_1d is None
                     and not getattr(request, "py_bad_words", None)
@@ -4083,13 +4088,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
         )
         if can_use_stable_greedy_path:
-            if has_stable_request_ids:
+            if has_stable_greedy_batch:
                 assert self._stable_greedy_seq_slots_host is not None
                 assert self._stable_greedy_seq_slots_cuda is not None
                 seq_slots_host = self._stable_greedy_seq_slots_host
                 seq_slots_cuda = self._stable_greedy_seq_slots_cuda
             else:
-                maybe_seq_slots = [request.py_seq_slot for request in generation_requests]
                 assert all(seq_slot is not None for seq_slot in maybe_seq_slots)
                 seq_slots = [cast(int, seq_slot) for seq_slot in maybe_seq_slots]
                 seq_slots_host = torch.tensor(
@@ -4099,6 +4103,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     device="cuda", dtype=torch.int64, non_blocking=True
                 )
                 self._stable_greedy_request_ids = request_ids
+                self._stable_greedy_seq_slots = seq_slots
                 self._stable_greedy_seq_slots_host = seq_slots_host
                 self._stable_greedy_seq_slots_cuda = seq_slots_cuda
 
@@ -4121,6 +4126,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
         self._stable_greedy_request_ids = []
+        self._stable_greedy_seq_slots = []
 
         sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
             scheduled_requests,

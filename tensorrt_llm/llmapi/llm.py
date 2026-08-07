@@ -426,6 +426,8 @@ class BaseLLM:
             self._hf_model_dir: Optional[Path] = None
             self._hf_model_config = None
             self._generation_config = None
+            # Raw JSON preserves explicit keys; GenerationConfig fills defaults.
+            self._generation_config_explicit_values: dict[str, Any] = {}
 
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
@@ -1389,12 +1391,20 @@ class BaseLLM:
                 os.environ[key] = str_value
                 logger.info(f"Setting {key}='{str_value}'")
 
+    def _apply_generation_config_sampling_defaults(
+            self, sampling_params: SamplingParams) -> None:
+        if (self.args.backend == "pytorch"
+                and self.args.generation_config == "auto"):
+            sampling_params._apply_generation_config_defaults(
+                self._generation_config_explicit_values)
+
     def _prepare_sampling_params(
             self,
             sampling_params: Optional[SamplingParams] = None) -> SamplingParams:
         if sampling_params is None:
             sampling_params = SamplingParams()
         if isinstance(sampling_params, SamplingParams):
+            self._apply_generation_config_sampling_defaults(sampling_params)
             if sampling_params.end_id is None:
                 if self.tokenizer is None:
                     raise ValueError(
@@ -1612,6 +1622,12 @@ class BaseLLM:
             self) -> Optional[transformers.GenerationConfig]:
         return ModelLoader.load_hf_generation_config(self.args.model)
 
+    def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
+        if self.args.backend != "pytorch" or self.args.generation_config != "auto":
+            return {}
+        model_dir = self._hf_model_dir or self.args.model
+        return ModelLoader.load_hf_generation_config_dict(model_dir)
+
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
         return ModelLoader.load_hf_model_config(
@@ -1754,6 +1770,8 @@ class _TorchLLM(BaseLLM):
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
         self._generation_config = self._try_load_generation_config()
+        self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
+        )
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
