@@ -11,6 +11,10 @@
 # the SA config's eager regime, and place ctx and gen in SEPARATE NVL72
 # domains (co-located placement selects different comm algorithms and
 # diverges token-level on a fixed prompt subset; accuracy-neutral).
+# K3 ships a custom (trust-remote-code) tokenizer; without this the
+# server starts tokenizer-less and 400s every string prompt with
+# "tokenizer is required to tokenize string prompt".
+trust_remote_code: true
 tensor_parallel_size: 16
 moe_expert_parallel_size: 16
 enable_attention_dp: true
