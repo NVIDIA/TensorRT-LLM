@@ -137,6 +137,8 @@ class SelectionResult:
     # Revision the DB was collected at and HEAD's distance from it; None when unknown.
     coverage_db_commit: Optional[str] = None
     coverage_db_lag: Optional[int] = None
+    # Freshness verdict on that lag: ok / stale / unknown; empty when no DB was consulted.
+    coverage_freshness: str = ""
     # Residual files the forge API returned no patch for; they fall back to file level.
     coverage_no_diff_files: int = 0
 
@@ -156,9 +158,24 @@ class SelectionResult:
             "coverage_db_build": self.coverage_db_build,
             "coverage_db_commit": self.coverage_db_commit,
             "coverage_db_lag": self.coverage_db_lag,
+            "coverage_freshness": self.coverage_freshness,
             "coverage_no_diff_files": self.coverage_no_diff_files,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+# Tier 2 stands down past this many commits: what the DB says about who touches what
+# stops describing the code under test. Tune with --coverage-max-lag.
+DEFAULT_COVERAGE_MAX_LAG = 100
+
+
+def _coverage_freshness(lag: Optional[int], max_lag: int) -> tuple[str, str]:
+    """Verdict on the consulted DB's lag, plus the decline note (empty when usable)."""
+    if lag is None:
+        return "unknown", "coverage DB freshness unknown: its lag could not be measured"
+    if lag > max_lag:
+        return "stale", f"coverage DB is {lag} commit(s) behind main, over the {max_lag} limit"
+    return "ok", ""
 
 
 def _rule_reason(rule, r) -> dict:
@@ -374,6 +391,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Commits main gained since --coverage-db-commit; recorded in the decision.",
     )
     parser.add_argument(
+        "--coverage-max-lag",
+        type=int,
+        default=DEFAULT_COVERAGE_MAX_LAG,
+        help="Decline the coverage tier when the DB trails main by more than this many commits.",
+    )
+    parser.add_argument(
         "--no-data-policy",
         choices=NO_DATA_POLICIES,
         default=DEFAULT_NO_DATA_POLICY,
@@ -433,22 +456,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     result.coverage_db_lag = args.coverage_db_lag
 
     if args.coverage_db and result.scope is None:
-        note = ""
-        try:
-            db = open_db(args.coverage_db)
-            tier, note = apply_coverage_tier(
-                pr,
-                selector.pairs,
-                selector.handled,
-                stages,
-                yaml_index,
-                repo_root,
-                db,
-                no_data_policy=args.no_data_policy,
-            )
-        except Exception as e:  # noqa: BLE001 — CBTS must never break CI
-            note = f"coverage tier errored: {e}"
-            tier = None
+        tier = None
+        result.coverage_freshness, note = _coverage_freshness(
+            args.coverage_db_lag, args.coverage_max_lag
+        )
+        if not note:  # the gate passed; a note here means it did not
+            try:
+                db = open_db(args.coverage_db)
+                tier, note = apply_coverage_tier(
+                    pr,
+                    selector.pairs,
+                    selector.handled,
+                    stages,
+                    yaml_index,
+                    repo_root,
+                    db,
+                    no_data_policy=args.no_data_policy,
+                )
+            except Exception as e:  # noqa: BLE001 — CBTS must never break CI
+                note = f"coverage tier errored: {e}"
+                tier = None
         if tier is not None:
             result.scope = "coverage"
             result.scopes = sorted(

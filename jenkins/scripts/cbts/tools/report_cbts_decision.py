@@ -118,10 +118,12 @@ def build_document(
         "s_coverage_db_commit": decision.get("coverage_db_commit") or "",
         # Residual files whose patch the forge API omitted (binary / rename / oversized).
         "l_coverage_no_diff_files": int(decision.get("coverage_no_diff_files") or 0),
-        # Commits HEAD ran ahead of that DB; -1 when the build carried no commit.
+        # Commits main gained since that DB was collected; -1 when unmeasurable.
         "l_coverage_db_lag": int(
             decision["coverage_db_lag"] if decision.get("coverage_db_lag") is not None else -1
         ),
+        # Freshness-gate verdict on that lag: ok / stale / unknown; empty when no DB was consulted.
+        "s_coverage_freshness": decision.get("coverage_freshness") or "",
         "d_case_skip_rate": round(case_skip_rate, 4),
         "flat_detail": {
             "hit_stages": affected,

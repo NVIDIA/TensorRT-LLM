@@ -318,6 +318,9 @@ CBTS defers to the existing filter chain when:
   touch DB, or its changed qualname is under-recorded with no wider row set
   (see `coverage_selection/SELECTION.md` §3-4)
 - No touch DB artifact could be resolved — Tier 2 never runs
+- The resolved DB trails main by more than `--coverage-max-lag` commits, or by
+  an unmeasurable amount — Tier 2 declines (`coverage_freshness` = `stale` /
+  `unknown`)
 - Layer 3 narrowing would empty a block — block keeps original tests
 - `cbts_test_db` tarball upload or download/extraction fails — renderTestDB falls back to source
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back
