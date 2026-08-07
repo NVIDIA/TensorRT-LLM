@@ -567,16 +567,6 @@ def main(*,
     apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
-    # Get all submodules and check their folder exists. If not,
-    # invoke git submodule update
-    with open(project_dir / ".gitmodules", "r") as submodules_f:
-        submodules = [
-            l.split("=")[1].strip() for l in submodules_f.readlines()
-            if "path = " in l
-        ]
-    if any(not (project_dir / submodule / ".git").exists()
-           for submodule in submodules):
-        build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
@@ -1117,6 +1107,36 @@ def main(*,
                          pkg_dir / "flash_mla",
                          dirs_exist_ok=True)
 
+        # Stage the FetchContent-patched MSA package for setup.py packaging.
+        msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+        cutlass_src = build_dir / "_deps" / "cutlass-src"
+        msa_dst = project_dir / "3rdparty" / "fmha_sm100"
+        if not (msa_src / "cute" / "interface.py").is_file():
+            raise FileNotFoundError(
+                f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+                "did not populate the expected sources.")
+        if msa_dst.is_symlink():
+            msa_dst.unlink()
+        elif msa_dst.exists():
+            rmtree(msa_dst)
+        msa_dst.mkdir(parents=True)
+        for python_source in msa_src.glob("*.py"):
+            install_file(python_source, msa_dst)
+        for source_dir, relative_dir in (
+            (msa_src / "csrc", Path("csrc")),
+            (msa_src / "cute", Path("cute")),
+            (cutlass_src / "include", Path("cutlass/include")),
+            (cutlass_src / "tools/util/include",
+             Path("cutlass/tools/util/include")),
+        ):
+            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+            install_tree(
+                source_dir,
+                msa_dst / relative_dir,
+                dirs_exist_ok=True,
+            )
+        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
+
         if not skip_stubs:
             with working_directory(pkg_dir):
                 if on_windows:
@@ -1185,9 +1205,6 @@ def main(*,
                 f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
             )
 
-        build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
-        )
         env = os.environ.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
@@ -1195,7 +1212,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
