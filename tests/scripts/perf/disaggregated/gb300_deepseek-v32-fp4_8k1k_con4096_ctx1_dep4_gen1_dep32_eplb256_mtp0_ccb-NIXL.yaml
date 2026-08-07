@@ -111,4 +111,4 @@ worker_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: false
+    disable_overlap_scheduler: true

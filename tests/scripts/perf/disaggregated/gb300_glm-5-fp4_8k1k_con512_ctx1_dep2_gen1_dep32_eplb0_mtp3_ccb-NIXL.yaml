@@ -101,5 +101,5 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: false
+    disable_overlap_scheduler: true
     speculative_config: *id001
