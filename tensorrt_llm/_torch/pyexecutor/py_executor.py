@@ -4436,6 +4436,21 @@ class PyExecutor:
         those statistics keep being maintained on every rank regardless (they
         are updated from the KvCache close path, not from this read).
 
+        Context parallelism needs the same treatment.  A request is split across
+        CP ranks, so they must admit it together, and CP runs on the same
+        executor loops as TP -- the loop choice keys only on ``pp_size`` -- which
+        means CP ranks also compute ``_schedule()`` independently.  Note that
+        ``dist.tp_size`` is ``mapping.tp_size``, which is 1 for a pure-CP job, so
+        keying on it alone would silently leave CP unsynchronized.  Under
+        Ulysses, CP is folded into attention TP (``attn_tp_size = tp_size *
+        cp_size``), making those ranks TP-shaped for KV purposes.
+
+        Broadcasting over the CP group and then the TP group propagates global
+        rank 0's decision to everyone: after the CP step each rank holds
+        ``V(its tp_rank, cp_rank 0)``, and the TP step then replaces that with
+        ``V(tp_rank 0, cp_rank 0)``.  Dedicated sub-communicators are used rather
+        than the global one, which carries regular executor traffic.
+
         Attention DP is excluded for the same reason the scheduler's own
         ``tp_broadcast`` excludes it: ADP ranks own independent request streams
         and independent KV caches, so they legitimately need different pool
@@ -4443,9 +4458,13 @@ class PyExecutor:
         starve a rank that needs to rebalance when rank 0 does not.
         """
         need = self.kv_cache_manager.impl.need_adjustment
-        if self.dist.tp_size == 1 or self.enable_attention_dp:
+        if self.enable_attention_dp:
             return need
-        return self.dist.tp_broadcast(need, root=0)
+        if self.dist.cp_size > 1:
+            need = self.dist.cp_broadcast(need, root=0)
+        if self.dist.tp_size > 1:
+            need = self.dist.tp_broadcast(need, root=0)
+        return need
 
     def _consume_previous_batch_for_rebalance(self) -> None:
         """Drain ``previous_batch`` so its _KVCache instances are quiescent.

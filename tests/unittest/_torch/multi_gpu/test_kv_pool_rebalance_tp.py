@@ -116,6 +116,12 @@ def _tp_dist(world_size: int, rank: int) -> MPIDist:
     return MPIDist(Mapping(world_size=world_size, rank=rank, tp_size=world_size))
 
 
+def _cp_dist(world_size: int, rank: int) -> MPIDist:
+    """A pure-CP mapping: ``tp_size == 1``, so ``cp_broadcast`` carries the
+    agreement and keying on ``tp_size`` alone would miss it entirely."""
+    return MPIDist(Mapping(world_size=world_size, rank=rank, cp_size=world_size))
+
+
 # ---------------------------------------------------------------------------
 # Per-rank work
 # ---------------------------------------------------------------------------
@@ -128,15 +134,43 @@ def run_agreement(world_size, rank, local_flags, expected):
 
     got = PyExecutor._agreed_need_adjustment(exe)
 
+    # Collect *before* asserting.  Every rank has to reach this collective: if
+    # some ranks bailed out on a failed assert first, the ranks that passed
+    # would block here until the pytest timeout, turning a clean failure into a
+    # five-minute hang.
+    all_decisions = dist.allgather(got)
+
     assert got == expected, (
         f"rank {rank}: local reading was {local_flags[rank]}, rank 0 said "
         f"{local_flags[0]}, so the agreed decision should be {expected}, got {got}"
     )
-
     # And every rank must have reached the same answer, which is the property
     # that actually keeps the schedulers from diverging.
-    all_decisions = dist.allgather(got)
     assert len(set(all_decisions)) == 1, f"ranks disagreed after the collective: {all_decisions}"
+
+
+def run_cp_agreement(world_size, rank, local_flags, expected):
+    """Same guarantee as TP, but over a pure-CP mapping (``tp_size == 1``).
+
+    A request is split across CP ranks, so they must admit it together; and CP
+    runs on the same executor loops as TP, which compute ``_schedule()`` per
+    rank with no broadcast.  Keying the agreement on ``tp_size`` alone would
+    leave this configuration unsynchronized.
+    """
+    dist = _cp_dist(world_size, rank)
+    assert dist.tp_size == 1, "this test is meaningless unless tp_size is 1"
+    exe = _make_executor(dist, need_adjustment=local_flags[rank])
+
+    got = PyExecutor._agreed_need_adjustment(exe)
+
+    # Collect before asserting -- see run_agreement for why the order matters.
+    all_decisions = dist.allgather(got)
+
+    assert got == expected, (
+        f"CP rank {rank}: local reading was {local_flags[rank]}, rank 0 said "
+        f"{local_flags[0]}, so the agreed decision should be {expected}, got {got}"
+    )
+    assert len(set(all_decisions)) == 1, f"CP ranks disagreed: {all_decisions}"
 
 
 def run_attention_dp_independence(world_size, rank, local_flags):
@@ -237,6 +271,26 @@ def test_tp_ranks_agree_on_rebalance_trigger(world_size, case):
         results = ex.map(
             run_single_rank,
             *zip(*[(world_size, run_agreement, flags, expected)] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["only_rank0_true", "only_rank0_false"],
+)
+@pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"cp:{x}")
+def test_cp_ranks_agree_on_rebalance_trigger(world_size, case):
+    """Pure CP (``tp_size == 1``) must agree just as TP does."""
+    _skip_if_not_enough_gpus(world_size)
+    flags = _flags_for(case, world_size)
+    expected = flags[0]
+
+    with MPIPoolExecutor(max_workers=world_size) as ex:
+        results = ex.map(
+            run_single_rank,
+            *zip(*[(world_size, run_cp_agreement, flags, expected)] * world_size),
         )
         for r in results:
             assert r is True
