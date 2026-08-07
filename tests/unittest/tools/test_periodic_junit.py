@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable
 
 import pytest
 
@@ -66,16 +66,18 @@ def _read(path: str) -> str:
 
 
 class _Marker:
-    def __init__(self, args: Tuple[object, ...] = (), kwargs: Optional[Dict[str, object]] = None):
+    def __init__(
+        self, args: tuple[object, ...] = (), kwargs: dict[str, object] | None = None
+    ) -> None:
         self.args = args
         self.kwargs = kwargs or {}
 
 
 class _Config:
-    def __init__(self, timeout: Optional[float] = None):
+    def __init__(self, timeout: float | None = None) -> None:
         self._timeout = timeout
 
-    def getoption(self, name: str, default: Optional[object] = None) -> Optional[object]:
+    def getoption(self, name: str, default: object | None = None) -> object | None:
         return self._timeout if name == "timeout" else default
 
 
@@ -83,21 +85,21 @@ class _Item:
     def __init__(
         self,
         nodeid: str = "pkg/test_x.py::test_y",
-        timeout_opt: Optional[float] = None,
-        marker: Optional[_Marker] = None,
-    ):
+        timeout_opt: float | None = None,
+        marker: _Marker | None = None,
+    ) -> None:
         self.nodeid = nodeid
         self.config = _Config(timeout_opt)
         self._marker = marker
 
-    def get_closest_marker(self, name: str) -> Optional[_Marker]:
+    def get_closest_marker(self, name: str) -> _Marker | None:
         return self._marker
 
 
 class _Report:
     """Minimal stand-in for a pytest TestReport."""
 
-    def __init__(self, when: str, nodeid: str = "pkg/test_x.py::test_y"):
+    def __init__(self, when: str, nodeid: str = "pkg/test_x.py::test_y") -> None:
         self.when = when
         self.nodeid = nodeid
 
@@ -223,7 +225,7 @@ def test_release_waits_for_an_active_dump(make_reporter: ReporterFactory) -> Non
     # dump writes into a closed file.
     reporter = make_reporter(hang_dump_fraction=0.5)
     started = threading.Event()
-    errors: List[Exception] = []
+    errors: list[Exception] = []
 
     def slow_dump(nodeid: str) -> None:
         started.set()
@@ -249,8 +251,8 @@ def test_signal_handlers_registered_and_released(
 ) -> None:
     # Assert the C-level registration contract the whole signal path depends on,
     # without installing real handlers or delivering signals to this process.
-    registered: List[Tuple[int, Dict[str, object]]] = []
-    unregistered: List[int] = []
+    registered: list[tuple[int, dict[str, object]]] = []
+    unregistered: list[int] = []
     monkeypatch.setattr(
         faulthandler, "register", lambda signum, **kwargs: registered.append((signum, kwargs))
     )
