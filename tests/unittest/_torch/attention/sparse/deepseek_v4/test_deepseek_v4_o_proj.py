@@ -271,7 +271,11 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
     # in-place, so clone before passing to preserve original for reference)
-    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+    output = mla._deepseek_v4_o_proj(
+        attn_out_latent.clone(),
+        position_ids,
+        enable_dsv4_epilogue_fusion=False,
+    )
 
     # Calculate reference output
     if dtype_str == "bf16":

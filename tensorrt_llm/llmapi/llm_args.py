@@ -5001,6 +5001,18 @@ class SamplerType(StrEnum):
     auto = "auto"
 
 
+class PrefillCudaGraphBackend(StrEnum):
+    """CUDA graph implementation used for prefill requests."""
+
+    DISABLED = "disabled"
+    PIECEWISE = "piecewise"
+    BREAKABLE = "breakable"
+
+
+_DEFAULT_PREFILL_CAPTURE_NUM_TOKENS = [2**i for i in range(8)
+                                       ] + [i for i in range(256, 3073, 256)]
+
+
 class TorchCompileConfig(StrictBaseModel):
     """Configuration for torch.compile."""
     enable_fullgraph: bool = Field(
@@ -5012,13 +5024,12 @@ class TorchCompileConfig(StrictBaseModel):
 
     enable_piecewise_cuda_graph: bool = Field(
         default=False,
-        description="Enable piecewise CUDA graph in torch.compile.")
+        description="Deprecated. Use prefill_cuda_graph_backend='piecewise' "
+        "instead.")
 
     capture_num_tokens: Optional[List[PositiveInt]] = Field(
         default=None,
-        description=
-        "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
-    )
+        description="Deprecated. Use prefill_capture_num_tokens instead.")
 
     @field_validator('capture_num_tokens')
     @classmethod
@@ -5033,16 +5044,9 @@ class TorchCompileConfig(StrictBaseModel):
         "When torch compile is enabled, userbuffers is enabled by default.")
 
     max_num_streams: PositiveInt = Field(
-        default=1,
+        default=3,
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
-
-    @model_validator(mode='after')
-    def set_default_capture_num_tokens(self) -> 'TorchCompileConfig':
-        if self.enable_piecewise_cuda_graph and self.capture_num_tokens is None:
-            self.capture_num_tokens = [2**i for i in range(8)
-                                       ] + [i for i in range(256, 3073, 256)]
-        return self
 
 
 class TorchLlmArgs(BaseLlmArgs):
@@ -5247,6 +5251,20 @@ class TorchLlmArgs(BaseLlmArgs):
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
+
+    prefill_cuda_graph_backend: PrefillCudaGraphBackend = Field(
+        default=PrefillCudaGraphBackend.DISABLED,
+        description="CUDA graph implementation used for prefill requests. "
+        "Defaults to disabled.",
+        status="prototype",
+        telemetry=TelemetryField.categorical("disabled", "piecewise",
+                                             "breakable"))
+
+    prefill_capture_num_tokens: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Token-count buckets captured by the selected prefill CUDA graph implementation.",
+        status="prototype")
 
     enable_autotuner: bool = Field(
         default=True,
@@ -5542,6 +5560,63 @@ class TorchLlmArgs(BaseLlmArgs):
                 "encode_only does not support piecewise CUDA graph in "
                 "TorchCompileConfig. Use cuda_graph_config for encoder CUDA "
                 "graphs or disable enable_piecewise_cuda_graph.")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Normalize legacy piecewise CUDA graph options into prefill fields."""
+        backend_is_explicit = "prefill_cuda_graph_backend" in self.model_fields_set
+        buckets_are_explicit = "prefill_capture_num_tokens" in self.model_fields_set
+        compile_config = self.torch_compile_config
+        legacy_buckets_are_explicit = (compile_config is not None
+                                       and "capture_num_tokens"
+                                       in compile_config.model_fields_set)
+
+        if compile_config is not None and compile_config.enable_piecewise_cuda_graph:
+            if (backend_is_explicit and self.prefill_cuda_graph_backend
+                    != PrefillCudaGraphBackend.PIECEWISE):
+                raise ValueError(
+                    "torch_compile_config.enable_piecewise_cuda_graph conflicts "
+                    "with prefill_cuda_graph_backend")
+            logger.warning(
+                "TorchCompileConfig.enable_piecewise_cuda_graph is deprecated; "
+                "use prefill_cuda_graph_backend='piecewise' instead.")
+            self.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
+
+        legacy_buckets = (compile_config.capture_num_tokens
+                          if compile_config is not None else None)
+        if legacy_buckets_are_explicit:
+            logger.warning(
+                "TorchCompileConfig.capture_num_tokens is deprecated; use "
+                "prefill_capture_num_tokens instead.")
+            if (legacy_buckets is not None and buckets_are_explicit
+                    and self.prefill_capture_num_tokens is not None
+                    and sorted(set(legacy_buckets)) != sorted(
+                        set(self.prefill_capture_num_tokens))):
+                raise ValueError(
+                    "torch_compile_config.capture_num_tokens conflicts with "
+                    "prefill_capture_num_tokens")
+            if not buckets_are_explicit and legacy_buckets is not None:
+                self.prefill_capture_num_tokens = list(legacy_buckets)
+
+        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+            if self.prefill_capture_num_tokens is None:
+                self.prefill_capture_num_tokens = list(
+                    _DEFAULT_PREFILL_CAPTURE_NUM_TOKENS)
+            if self.encode_only:
+                raise ValueError(
+                    "encode_only does not support prefill CUDA graphs")
+
+        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
+            if self.torch_compile_config is None:
+                self.torch_compile_config = TorchCompileConfig()
+        elif (self.prefill_cuda_graph_backend
+              == PrefillCudaGraphBackend.BREAKABLE
+              and self.torch_compile_config is not None):
+            raise ValueError(
+                "breakable prefill CUDA graph does not support torch_compile_config"
+            )
+
         return self
 
     @model_validator(mode="after")
