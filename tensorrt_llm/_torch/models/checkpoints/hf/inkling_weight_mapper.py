@@ -328,9 +328,12 @@ class InklingHfWeightMapper(HfWeightMapper):
     ) -> None:
         """Unfuse a stacked expert tensor into per-expert fused-MoE keys.
 
-        ``w13_weight[e]`` is ``[2*inter, hidden]`` (gate rows first, up rows
-        second, per HF ``InklingExperts``); split into ``w1`` (gate) and ``w3``
-        (up). ``w2_weight[e]`` is the down projection. NVFP4 sidecars map to the
+        ``w13_weight[e]`` is ``[2*inter, hidden]`` with gate and up INTERLEAVED
+        along the output dim (``[g0, u0, g1, u1, ...]``), so ``w1`` (gate) is the
+        even rows and ``w3`` (up) the odd ones -- see
+        :func:`_split_interleaved_gate_up`. It is NOT ``[first half | second
+        half]``: reading it that way pairs the wrong gate/up channels in every
+        SwiGLU. ``w2_weight[e]`` is the down projection. NVFP4 sidecars map to the
         fused-MoE scale names: ``.scale`` -> ``weight_scale`` (block),
         ``.scale2`` -> ``weight_scale_2`` (per-expert), ``.input_amax`` ->
         ``input_scale``. ``.original_shape`` is metadata and is dropped.
