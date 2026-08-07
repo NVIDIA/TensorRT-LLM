@@ -327,22 +327,12 @@ class TRTLLMGenFusedMoE(MoE):
     def is_situ_activation(self) -> bool:
         return self.trtllm_gen_activation_type == ActType_TrtllmGen.SiTu
 
-    @property
-    def _gemm1_activation_params(
-            self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Per-expert (alpha, beta) for the shared gemm1 op slot.
-
-        SiTu and SwiGLU are mutually exclusive (see
-        ``_validate_backend_local_activation``) and feed the same
-        ``gemm1_alpha``/``gemm1_beta`` op arguments, so route both through one
-        accessor. SiTu's values live in the ``situ_alpha``/``situ_beta``
-        buffers; SwiGLU's in ``swiglu_alpha``/``swiglu_beta``.
-        """
-        if self.is_situ_activation:
-            return self.situ_alpha, self.situ_beta
-        return self.swiglu_alpha, self.swiglu_beta
-
     def _validate_backend_local_activation(self) -> None:
+        # Runs from __init__, before create_weights, so the swiglu_* attributes
+        # checked below are still the constructor-provided values. For SiTu,
+        # create_weights later reuses the swiglu_alpha/swiglu_beta storage for
+        # the backend-local activation parameters (SiTu and SwiGLU are mutually
+        # exclusive and feed the same gemm1_alpha/gemm1_beta op slots).
         if self.trtllm_gen_activation_type is None:
             if (self.trtllm_gen_activation_alpha is not None
                     or self.trtllm_gen_activation_beta is not None):
@@ -541,7 +531,9 @@ class TRTLLMGenFusedMoE(MoE):
                 raise ValueError(
                     "TRTLLM-Gen SiTu requires MXFP4 scaling vector size 32, "
                     f"got {self.scaling_vector_size}.")
-            for name in ("situ_alpha", "situ_beta"):
+            # For SiTu these hold the backend-local activation parameters
+            # (populated by create_weights, which runs before this check).
+            for name in ("swiglu_alpha", "swiglu_beta"):
                 value = getattr(self, name)
                 if (value.dtype != torch.float32
                         or value.shape != (self.expert_size_per_partition, )
@@ -586,26 +578,26 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             self.quant_method.create_weights(self)
 
-        # TODO(TRTLLM-15177 item 1.2(b)): fully merge these SiTu buffers into
-        # the swiglu_alpha/swiglu_beta storage so the gemm1 slot has a single
-        # backing parameter and _gemm1_activation_params can drop the branch.
-        # Deferred: `swiglu_alpha is not None` currently gates quant-method
-        # selection and validation (create_moe.py, this file's _get_quant_method
-        # / _check_configs), so reusing that storage for SiTu changes control
-        # flow on the numeric path and needs GPU parity revalidation first.
+        # SiTu reuses the swiglu_alpha/swiglu_beta storage: SiTu and SwiGLU are
+        # mutually exclusive (constructor-provided SwiGLU parameters are
+        # rejected by _validate_backend_local_activation) and feed the same
+        # gemm1_alpha/gemm1_beta op slots. Safe with respect to the
+        # `swiglu_alpha is not None` gates: create_moe.py checks the
+        # constructor kwargs (None for SiTu); _get_quant_method consults
+        # swiglu_alpha only on the nvfp4 branch (SiTu requires
+        # W4A8_MXFP4_MXFP8) and has already run above; _check_configs runs
+        # after this point and its swiglu gate admits w4a8_mxfp4_mxfp8.
         if self.is_situ_activation:
-            situ_alpha = nn.Parameter(torch.full(
+            self.swiglu_alpha = nn.Parameter(torch.full(
                 (self.expert_size_per_partition, ),
                 float(self.trtllm_gen_activation_alpha),
                 dtype=torch.float32),
-                                      requires_grad=False)
-            situ_beta = nn.Parameter(torch.full(
+                                             requires_grad=False)
+            self.swiglu_beta = nn.Parameter(torch.full(
                 (self.expert_size_per_partition, ),
                 float(self.trtllm_gen_activation_beta),
                 dtype=torch.float32),
-                                     requires_grad=False)
-            self.register_parameter("situ_alpha", situ_alpha)
-            self.register_parameter("situ_beta", situ_beta)
+                                            requires_grad=False)
 
         self._weights_created = True
         self._check_configs()
@@ -629,8 +621,9 @@ class TRTLLMGenFusedMoE(MoE):
         if self.is_situ_activation:
             # Reinitialize constants after meta-device materialization. These
             # are backend configuration, not checkpoint weights.
-            self.situ_alpha.data.fill_(float(self.trtllm_gen_activation_alpha))
-            self.situ_beta.data.fill_(float(self.trtllm_gen_activation_beta))
+            self.swiglu_alpha.data.fill_(float(
+                self.trtllm_gen_activation_alpha))
+            self.swiglu_beta.data.fill_(float(self.trtllm_gen_activation_beta))
 
     def load_weights(self,
                      weights: List[Dict],
@@ -900,7 +893,10 @@ class TRTLLMGenFusedMoE(MoE):
             ] else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
-            gemm1_alpha, gemm1_beta = self._gemm1_activation_params
+            # Holds SwiGLU's per-expert alpha/beta, or SiTu's backend-local
+            # activation parameters (which reuse this storage; see
+            # create_weights).
+            gemm1_alpha, gemm1_beta = self.swiglu_alpha, self.swiglu_beta
 
             output1_scale_scalar = self._get_data_or_none("fc31_scale_c")
             output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
