@@ -633,7 +633,7 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_polls_both_transfer_directions_without_blocking(self):
+    def test_polls_context_transfers_without_blocking(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -642,10 +642,20 @@ class TestDisaggTransferIdleProgress:
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
+    def test_does_not_repeat_gen_status_polled_by_loop_head(self):
+        """The loop head already polls GEN status every iteration."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
     def test_idle_poll_enters_no_extra_collective(self):
-        """Both polls are rank-symmetric, so no gating collective is needed."""
+        """The context poll is rank-symmetric, so no gating collective is needed."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=4, world_size=16)
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -657,7 +667,6 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_allreduce.assert_not_called()
         executor.dist.tp_cp_allgather.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
 
     def test_gen_only_no_context_benchmark_skips_idle_polls(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
