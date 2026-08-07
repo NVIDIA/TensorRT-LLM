@@ -38,6 +38,22 @@ global_kvcache_config_prompt_logprobs = KvCacheConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _dynamo_recompile_headroom():
+    """Recompile headroom for the fullgraph=True beam-search step.
+
+    The beam-search cases here build a fresh engine per parametrization in one
+    process, and Dynamo counts recompiles per code object across the process,
+    so the default limit (8) is exhausted partway through and the rest hard-fail
+    under fullgraph. The limit guards against runaway recompilation and is not a
+    correctness property; a served model has a fixed set of shapes.
+    """
+    import torch._dynamo
+
+    with torch._dynamo.config.patch(recompile_limit=128):
+        yield
+
+
 @pytest.fixture(scope="module", params=[False, True])
 def disable_overlap_scheduler_fixture(request) -> bool:
     return request.param
