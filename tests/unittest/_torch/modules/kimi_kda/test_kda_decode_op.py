@@ -299,7 +299,7 @@ def _make_direct_decode_args(
             dtype=torch.bfloat16,
             device=device,
         ),
-        "A_log": torch.zeros(projection_size, dtype=torch.float32, device=device),
+        "A_log": torch.zeros(num_heads, dtype=torch.float32, device=device),
         "g": torch.zeros(1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
         "dt_bias": torch.zeros(projection_size, dtype=torch.float32, device=device),
         "beta": torch.zeros(1, batch_size, num_heads, dtype=torch.bfloat16, device=device),

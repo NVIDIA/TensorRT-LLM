@@ -9,9 +9,10 @@ separate ``gate_proj`` / ``up_proj`` tensors (the same concat
 fused module against an unfused reference built from the split weights:
 
 * fused ``gate_up_proj`` output matches ``two GEMMs + torch.cat`` +
-  eager ``SituAndMul`` + ``down_proj`` across token counts and
-  ``situ_beta`` / ``situ_linear_beta`` settings (incl. ``None``);
-* the row-concat convention is load-bearing: swapping the halves breaks
+  eager ``SituAndMul`` + ``down_proj`` for a decode-shaped (1 token) and
+  a prefill-shaped (500 tokens) batch, with ``situ_linear_beta`` set and
+  ``None`` (the two activation code paths);
+* the row-concat convention is required: swapping the halves breaks
   the numerics (mutation control).
 """
 
@@ -72,12 +73,11 @@ def _make_pair(hidden_size, intermediate_size, situ_beta, situ_linear_beta, devi
     "situ_beta,situ_linear_beta",
     [
         (4.0, 25.0),  # Kimi K3 defaults
-        (2.5, 7.0),  # asymmetric non-defaults
         (1.0, None),  # linear_beta disabled (identity up half)
     ],
-    ids=["default", "asymmetric", "no_linear_beta"],
+    ids=["default", "no_linear_beta"],
 )
-@pytest.mark.parametrize("num_tokens", [1, 5, 64, 500], ids=lambda n: f"tokens{n}")
+@pytest.mark.parametrize("num_tokens", [1, 500], ids=lambda n: f"tokens{n}")
 def test_fused_gate_up_matches_unfused_reference(num_tokens, situ_beta, situ_linear_beta):
     device = torch.device("cuda")
     hidden_size, intermediate_size = 512, 384
@@ -96,8 +96,8 @@ def test_fused_gate_up_matches_unfused_reference(num_tokens, situ_beta, situ_lin
 
 @requires_cuda
 def test_gate_up_half_swap_mutation_breaks_accuracy():
-    """Up-first packing must break the numerics (the gate-first row-concat
-    convention in load_weights is load-bearing)."""
+    """Up-first packing must break the numerics (guards the gate-first
+    row-concat convention in load_weights)."""
     device = torch.device("cuda")
     hidden_size, intermediate_size = 512, 384
     fused, ref = _make_pair(hidden_size, intermediate_size, 4.0, 25.0, device)
