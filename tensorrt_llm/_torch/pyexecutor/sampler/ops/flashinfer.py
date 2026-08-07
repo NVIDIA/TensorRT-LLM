@@ -82,7 +82,8 @@ def radix_topk_op(
     order among equal values vary run to run. This op sits on the default beam
     path, where reproducible tie order matters for triage.
     """
-    return flashinfer.top_k(values, k, sorted=True, deterministic=True)
+    topk_values, topk_indices = flashinfer.top_k(values, k, sorted=True, deterministic=True)
+    return topk_values, topk_indices
 
 
 @_compiler_disable
