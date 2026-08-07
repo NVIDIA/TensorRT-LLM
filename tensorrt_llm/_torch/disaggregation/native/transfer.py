@@ -1235,12 +1235,15 @@ class TxSession(TxSessionBase):
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
+        overall_timeout_s: Optional[float] = None,
     ):
         super().__init__(
             sender,
             SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
         )
         self._timeout_s = timeout_s
+        self._overall_timeout_s = overall_timeout_s
+        self._deadline_monotonic_s: Optional[float] = None
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -1291,6 +1294,8 @@ class TxSession(TxSessionBase):
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
+            if not self.kv_tasks and self._overall_timeout_s is not None:
+                self._deadline_monotonic_s = time.monotonic() + self._overall_timeout_s
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -1367,9 +1372,11 @@ class TxSession(TxSessionBase):
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
 
-        With blocking=True (default): retries bounded wait slices until a
-        successful transfer finishes. Errors and cancellation remain terminal;
-        callers must not interpret them as proof that peer writes quiesced.
+        With blocking=True (default): retries bounded wait slices until the
+        transfer finishes or its overall deadline expires. Deadline expiry is
+        nonterminal: callers must retain the session and its KV pages because
+        peer writes may still be active. Errors and cancellation remain
+        terminal, but likewise do not prove that peer writes quiesced.
         With blocking=False: polls non-blockingly; returns None if any KV task
         or aux is not yet done.
         """
@@ -1395,37 +1402,61 @@ class TxSession(TxSessionBase):
                     return None
             return WaitResult.COMPLETED
 
-        # ``_timeout_s`` bounds one scheduler wait slice; it is not a transfer
-        # deadline. A successful blockAll must not return merely because one
-        # slice expired: NIXL may still be reading the request's KV pages.
+        # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
+        # deadline is shared by every KV task and aux; it is never reset by a
+        # later wait_complete() call.
         wait_slice_s = self._timeout_s
         if wait_slice_s is None or wait_slice_s <= 0:
             wait_slice_s = _FALLBACK_TX_WAIT_SLICE_S
-        # The loop preserves standalone block-until-terminal behavior while a
-        # bounded slice keeps cancellation and sibling failure observable.
-        for task in self.kv_tasks:
-            while not task.wait(timeout=wait_slice_s):
-                # cancel() leaves a TRANSFERRING task's event unset until the
-                # physical writer finishes. Preserve the bounded-slice control
-                # point so blockAll can still report terminal cancellation.
-                # Check every task: a sibling slice can fail while this one is
-                # still pending without setting the session terminal status.
+
+        def wait_for_task(task: SendTaskBase) -> WaitResult:
+            while True:
+                # A task/session terminal state observed at the deadline
+                # boundary takes precedence over TIMEOUT.
                 if self.has_failed():
                     return WaitResult.FAILED
-            if task.status == TaskStatus.ERROR:
-                return WaitResult.FAILED
+                if task.status == TaskStatus.TRANSFERRED:
+                    return WaitResult.COMPLETED
+
+                remaining_s = None
+                if self._deadline_monotonic_s is not None:
+                    remaining_s = self._deadline_monotonic_s - time.monotonic()
+                    if remaining_s <= 0:
+                        # The worker can publish terminal state between the
+                        # checks above and the clock read. Preserve boundary
+                        # precedence before classifying this as a timeout.
+                        if self.has_failed():
+                            return WaitResult.FAILED
+                        if task.status == TaskStatus.TRANSFERRED:
+                            return WaitResult.COMPLETED
+                        return WaitResult.TIMEOUT
+                timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
+                task.wait(timeout=timeout_s)
+
+        # A bounded slice keeps cancellation and sibling failure observable.
+        for task in self.kv_tasks:
+            result = wait_for_task(task)
+            if result != WaitResult.COMPLETED:
+                return result
         if self._need_aux:
             if self.aux_task is None:
-                return (
-                    WaitResult.FAILED
-                    if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
-                    else None
-                )
-            while not self.aux_task.wait(timeout=wait_slice_s):
-                if self.has_failed():
-                    return WaitResult.FAILED
-            if self.aux_task.status == TaskStatus.ERROR:
+                # _finalize_send() installs the aux task synchronously before
+                # publishing the request to _send_reqs. Once every KV task is
+                # terminal, a missing required aux task is an invariant error,
+                # not an asynchronously pending transfer.
+                with self.lock:
+                    if self._terminal_status not in (
+                        SessionStatus.ERROR,
+                        SessionStatus.CANCELLED,
+                    ):
+                        self._exception = RuntimeError(
+                            "required auxiliary transfer was not dispatched"
+                        )
+                        self._terminal_status = SessionStatus.ERROR
                 return WaitResult.FAILED
+            result = wait_for_task(self.aux_task)
+            if result != WaitResult.COMPLETED:
+                return result
         return (
             WaitResult.FAILED
             if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
@@ -2344,6 +2375,7 @@ class TransferWorkerConfig:
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
+    tx_overall_timeout_s: Optional[float] = None
 
 
 class TransferWorker:
@@ -2378,6 +2410,7 @@ class TransferWorker:
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
             beam_width=request.py_beam_width,
+            overall_timeout_s=self._config.tx_overall_timeout_s,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:

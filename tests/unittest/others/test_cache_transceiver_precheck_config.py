@@ -430,9 +430,10 @@ def _enabled_line(cfg):
         "/models/$HOME/$(must-not-run)",
     ),
 )
-def test_precheck_commands_export_model_root_safely(model_root):
+def test_precheck_commands_export_model_root_safely(model_root, monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
     lines = pcfg.precheck_prefix_lines(
-        _disagg_yaml(),
+        _disagg_yaml(cache_transceiver_precheck={"enabled": True}),
         "e2e",
         "$config",
         "unset UCX_TLS &&",
@@ -453,6 +454,34 @@ def test_precheck_commands_export_model_root_safely(model_root):
         check=True,
     )
     assert result.stdout == model_root
+
+
+def test_disabled_precheck_does_not_require_or_export_model_root(monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+
+    lines = pcfg.precheck_prefix_lines(
+        _disagg_yaml(),
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+    )
+
+    assert "export ctPrecheckEnabled=0" in lines
+    assert not any(line.startswith("export LLM_MODELS_ROOT=") for line in lines)
+
+
+def test_enabled_precheck_requires_model_root(monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+
+    with pytest.raises(ValueError, match="requires LLM_MODELS_ROOT"):
+        pcfg.precheck_prefix_lines(
+            _disagg_yaml(cache_transceiver_precheck={"enabled": True}),
+            "e2e",
+            "$config",
+            "unset UCX_TLS &&",
+            max_world=8,
+        )
 
 
 def test_precheck_env_kill_switch_truthy(monkeypatch):

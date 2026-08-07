@@ -432,7 +432,7 @@ def test_ctx_finish_wave_retains_pages_when_block_all_omits_request(monkeypatch)
         1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
     }
 
-    with pytest.raises(rp._TransferError, match="block-all returned before terminal"):
+    with pytest.raises(rp._FatalTransferError, match="block-all returned before terminal"):
         runner.ctx_finish_wave(reqs)
 
     assert events == []
@@ -445,7 +445,7 @@ def test_ctx_finish_wave_retains_pages_when_block_all_raises(monkeypatch):
     runner, events = _ctx_finish_runner(monkeypatch, check_status)
     reqs = {0: types.SimpleNamespace(py_request_id=101, state="in_progress")}
 
-    with pytest.raises(rp._TransferError, match="interrupted"):
+    with pytest.raises(rp._FatalTransferError, match="interrupted"):
         runner.ctx_finish_wave(reqs)
 
     assert events == []
@@ -458,9 +458,54 @@ def test_ctx_finish_wave_retains_pages_when_request_failed(monkeypatch):
         1: types.SimpleNamespace(py_request_id=102, state="error"),
     }
 
-    with pytest.raises(rp._TransferError, match=r"ctx transfer failed for pairs \[1\]"):
+    with pytest.raises(rp._FatalTransferError, match=r"ctx transfer failed for pairs \[1\]"):
         runner.ctx_finish_wave(reqs)
 
+    assert events == []
+
+
+def test_ctx_finish_wave_does_not_free_when_peer_rank_is_unsafe(monkeypatch):
+    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101, 102], []))
+    reqs = {
+        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
+        1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
+    }
+    runner._consensus_error = lambda _err: "rank 1 did not prove completion"
+
+    with pytest.raises(rp._FatalTransferError, match="rank 1 did not prove completion"):
+        runner.ctx_finish_wave(reqs)
+
+    assert events == []
+
+
+def test_ctx_finish_wave_consensus_exception_is_fatal(monkeypatch):
+    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101], []))
+    reqs = {0: types.SimpleNamespace(py_request_id=101, state="in_progress")}
+
+    def fail_consensus(_error):
+        raise RuntimeError("MPI consensus failed")
+
+    runner._consensus_error = fail_consensus
+
+    with pytest.raises(rp._FatalTransferError, match="MPI consensus failed"):
+        runner.ctx_finish_wave(reqs)
+
+    assert events == []
+
+
+def test_ctx_finish_wave_timeout_skips_consensus_and_free(monkeypatch):
+    def check_status(_n):
+        raise rp._Timeout("deadline")
+
+    runner, events = _ctx_finish_runner(monkeypatch, check_status)
+    consensus_calls = []
+    runner._consensus_error = lambda err: consensus_calls.append(err)
+    reqs = {0: types.SimpleNamespace(py_request_id=101, state="in_progress")}
+
+    with pytest.raises(rp._Timeout, match="deadline"):
+        runner.ctx_finish_wave(reqs)
+
+    assert consensus_calls == []
     assert events == []
 
 
@@ -506,10 +551,48 @@ def test_ctx_run_wave_setup_error_retains_allocated_pages(monkeypatch):
     runner._consensus_error = lambda err: None if err is None else repr(err)
     runner._free_all = lambda _reqs: calls.__setitem__("free", calls["free"] + 1)
 
-    with pytest.raises(rp._TransferError, match="injected setup failure"):
+    with pytest.raises(rp._FatalTransferError, match="injected setup failure"):
         runner.ctx_run_wave(0, 0, 64, 0, [0, 1])
 
     assert calls == {"send": 2, "free": 0}
+
+
+def test_ctx_run_wave_post_dispatch_collective_error_is_fatal(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm",
+        types.SimpleNamespace(logger=types.SimpleNamespace(info=lambda *_args, **_kwargs: None)),
+    )
+    monkeypatch.setattr(
+        rp,
+        "make_request",
+        lambda _is_ctx, rid, _req_len, _runtime: types.SimpleNamespace(
+            py_request_id=rid, context_phase_params=object()
+        ),
+    )
+    monkeypatch.setattr(rp, "add_sequence", lambda *_args: None)
+    monkeypatch.setattr(rp, "fill_request", lambda *_args: None)
+
+    runner = object.__new__(rp.PrecheckRunner)
+    runner.runtime = "PYTHON"
+    runner.kvm = object()
+    runner.use_v2 = True
+    runner.server_idx = 0
+    runner.rank = 0
+    runner.is_leader = True
+    runner.side = {"parallel": {"enable_attention_dp": False}}
+    runner.mapping = types.SimpleNamespace(pp_rank=0)
+    runner.xcvr = types.SimpleNamespace(respond_and_send_async=lambda _req: None)
+    runner.comm = types.SimpleNamespace(
+        gather=lambda _obj, root=0: (_ for _ in ()).throw(RuntimeError("MPI gather failed")),
+        bcast=lambda obj, root=0: obj,
+    )
+    runner._owned = lambda _wave: [0]
+    runner._pair_rid = lambda *_args: 101
+    runner._consensus_error = lambda _err: None
+
+    with pytest.raises(rp._FatalTransferError, match="MPI gather failed"):
+        runner.ctx_run_wave(0, 0, 64, 0, [0])
 
 
 def _gen_run_wave_runner(monkeypatch, outcome):
@@ -608,7 +691,7 @@ def test_gen_run_wave_setup_error_retains_allocated_pages(monkeypatch):
 
     runner.xcvr.request_and_receive_async = receive
 
-    with pytest.raises(rp._TransferError, match="injected setup failure"):
+    with pytest.raises(rp._FatalTransferError, match="injected setup failure"):
         runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
 
     assert calls == 2
@@ -626,10 +709,216 @@ def test_gen_run_wave_setup_error_retains_allocated_pages(monkeypatch):
 def test_gen_run_wave_retains_pages_without_all_successes(monkeypatch, outcome, message):
     runner, events = _gen_run_wave_runner(monkeypatch, outcome)
 
-    with pytest.raises(rp._TransferError, match=message):
+    with pytest.raises(rp._FatalTransferError, match=message):
         runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
 
     assert events == []
+
+
+def test_gen_run_wave_does_not_free_when_peer_rank_is_unsafe(monkeypatch):
+    runner, events = _gen_run_wave_runner(monkeypatch, lambda _reqs: ([101, 102], [], []))
+    consensus_calls = []
+
+    def consensus(error):
+        consensus_calls.append(error)
+        # First call covers receive setup; the second is the transfer-release
+        # proof and models another rank reporting a nonterminal request.
+        return None if len(consensus_calls) == 1 else "rank 1 did not prove completion"
+
+    runner._consensus_error = consensus
+
+    with pytest.raises(rp._FatalTransferError, match="rank 1 did not prove completion"):
+        runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
+
+    assert consensus_calls == [None, None]
+    assert events == ["cuda_sync"]
+
+
+def test_gen_run_wave_transfer_consensus_exception_is_fatal(monkeypatch):
+    runner, events = _gen_run_wave_runner(monkeypatch, lambda _reqs: ([101, 102], [], []))
+    consensus_calls = 0
+
+    def consensus(_error):
+        nonlocal consensus_calls
+        consensus_calls += 1
+        if consensus_calls == 2:
+            raise RuntimeError("MPI transfer consensus failed")
+        return None
+
+    runner._consensus_error = consensus
+
+    with pytest.raises(rp._FatalTransferError, match="MPI transfer consensus failed"):
+        runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
+
+    assert events == ["cuda_sync"]
+
+
+def test_gen_run_wave_timeout_skips_transfer_consensus_and_free(monkeypatch):
+    def timeout(_reqs):
+        raise rp._Timeout("deadline")
+
+    runner, events = _gen_run_wave_runner(monkeypatch, timeout)
+    consensus_calls = []
+
+    def consensus(error):
+        consensus_calls.append(error)
+        return None
+
+    runner._consensus_error = consensus
+
+    with pytest.raises(rp._Timeout, match="deadline"):
+        runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
+
+    # Receive setup reaches consensus before block-all. The timeout itself
+    # must propagate directly into the process-fatal path.
+    assert consensus_calls == [None]
+    assert events == []
+
+
+def test_hard_abort_unquiesced_persists_verdict_before_abort(monkeypatch):
+    class AbortSentinel(Exception):
+        pass
+
+    events = []
+    recorder = types.SimpleNamespace(
+        record=lambda *args: events.append(("record", *args)),
+        finalize=lambda **kwargs: events.append(("finalize", kwargs)),
+    )
+    runner = types.SimpleNamespace(
+        is_leader=True,
+        recorder=recorder,
+        work_dir="/tmp/precheck",
+        use_v2=True,
+        runtime="PYTHON",
+        comm=object(),
+        xcvr=types.SimpleNamespace(shutdown=lambda: events.append(("shutdown",))),
+    )
+    monkeypatch.setattr(rp.signal, "alarm", lambda seconds: events.append(("alarm", seconds)))
+    monkeypatch.setattr(
+        rp,
+        "raise_abort_flag",
+        lambda work_dir, reason: events.append(("abort_flag", work_dir, reason)),
+    )
+    monkeypatch.setattr(
+        rp,
+        "_coordinate_abort_after_leader_flush",
+        lambda comm: events.append(("coordinate", comm)),
+    )
+
+    def abort_process(comm):
+        events.append(("abort", comm))
+        raise AbortSentinel
+
+    monkeypatch.setattr(rp, "_hard_abort_process", abort_process)
+
+    with pytest.raises(AbortSentinel):
+        rp._hard_abort_unquiesced(
+            runner,
+            {"what": "ctx wave"},
+            rp._FatalTransferError("completion unproven"),
+        )
+
+    assert events == [
+        ("alarm", 0),
+        ("record", "ctx wave", 0, "TRANSFER_ERROR", "completion unproven"),
+        (
+            "abort_flag",
+            "/tmp/precheck",
+            "ctx wave TRANSFER_ERROR: completion unproven",
+        ),
+        (
+            "finalize",
+            {
+                "extra": {
+                    "kv_cache_manager": "V2",
+                    "transceiver_runtime": "PYTHON",
+                }
+            },
+        ),
+        ("coordinate", runner.comm),
+        ("abort", runner.comm),
+    ]
+
+
+def test_hard_abort_unquiesced_still_aborts_when_status_write_fails(monkeypatch):
+    class AbortSentinel(Exception):
+        pass
+
+    runner = types.SimpleNamespace(
+        is_leader=True,
+        recorder=types.SimpleNamespace(
+            record=lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
+        ),
+        work_dir="/tmp/precheck",
+        use_v2=True,
+        runtime="PYTHON",
+        comm=object(),
+    )
+    monkeypatch.setattr(rp.signal, "alarm", lambda _seconds: None)
+    monkeypatch.setattr(rp, "_coordinate_abort_after_leader_flush", lambda _comm: None)
+    monkeypatch.setattr(
+        rp,
+        "_hard_abort_process",
+        lambda _comm: (_ for _ in ()).throw(AbortSentinel()),
+    )
+
+    with pytest.raises(AbortSentinel):
+        rp._hard_abort_unquiesced(
+            runner,
+            {"what": "ctx wave"},
+            rp._FatalTransferError("completion unproven"),
+        )
+
+
+def test_ctx_peer_loop_reraises_fatal_transfer(monkeypatch):
+    fatal = rp._FatalTransferError("not quiesced")
+    runner = types.SimpleNamespace(
+        side={"num_peers": 1},
+        is_leader=False,
+        recorder=types.SimpleNamespace(record=lambda *_args: None),
+    )
+    recorded = []
+
+    def serve(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(rp, "ctx_serve_peer", serve)
+
+    with pytest.raises(rp._FatalTransferError, match="not quiesced"):
+        rp._serve_gen_peers(
+            runner,
+            plan={},
+            arm=lambda *_args, **_kwargs: None,
+            disarm=lambda: None,
+            record_peer_failure=lambda *args: recorded.append(args),
+        )
+
+    assert recorded == []
+
+
+def test_gen_peer_loop_reraises_fatal_transfer(monkeypatch):
+    fatal = rp._FatalTransferError("not quiesced")
+    runner = types.SimpleNamespace(
+        side={"num_peers": 1},
+        recorder=types.SimpleNamespace(record=lambda *_args: None),
+    )
+    recorded = []
+    monkeypatch.setattr(rp, "_consensus_abort_reason", lambda _runner: None)
+
+    def run_peer(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(rp, "gen_run_peer", run_peer)
+
+    with pytest.raises(rp._FatalTransferError, match="not quiesced"):
+        rp._drive_ctx_peers(
+            runner,
+            arm=lambda *_args, **_kwargs: None,
+            disarm=lambda: None,
+            record_peer_failure=lambda *args: recorded.append(args),
+        )
+
+    assert recorded == []
 
 
 # --------------------------------------------------------------------------- #
