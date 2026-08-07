@@ -746,6 +746,8 @@ class AutoTunerProfilingCache:
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
 
+            self._generation += 1
+
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
             )

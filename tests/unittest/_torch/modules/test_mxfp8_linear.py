@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import gc
+import json
 import sys
 import weakref
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.linear as linear_module
-from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.autotuner import AutoTuner, AutoTunerProfilingCache
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     MXFP8GemmRunner,
     _get_mxfp8_large_m_tuning_buckets,
@@ -348,6 +349,60 @@ def test_mxfp8_native_autotuner_syncs_profiles():
     gc.collect()
     assert cache_ref() is None
     assert len(MXFP8GemmRunner.synced_cache_keys) == initial_cache_count + 1
+
+
+def test_mxfp8_native_autotuner_resyncs_loaded_tactic(tmp_path):
+    runner = object.__new__(MXFP8GemmRunner)
+    runner.output_dtype = torch.bfloat16
+    runner.sm_version = 100
+    runner.mxfp8_gemm_runner = Mock()
+    profile = (
+        (8192, 6144),
+        (-1,),
+        (9216, 6144),
+        (1769472,),
+        (1,),
+    )
+    cache_key = (
+        "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+        "MXFP8GemmRunner",
+        str(runner.unique_id()),
+        profile,
+    )
+    profiling_cache = object.__new__(AutoTunerProfilingCache)
+    profiling_cache.cache = {cache_key: (0, 17, 0.25)}
+    profiling_cache.independent_op = set()
+    profiling_cache.excluded_op = set()
+    profiling_cache._generation = 0
+    tuner = Mock(profiling_cache=profiling_cache)
+
+    runner.sync_tactic_cache(tuner)
+    runner.mxfp8_gemm_runner.register_tactic.assert_called_once_with(8192, 9216, 6144, 17)
+
+    cache_path = tmp_path / "mxfp8-cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "lib_version": "test",
+                    "creation_timestamp": 0,
+                    "device_name": "test",
+                    "device_capability": [10, 0],
+                },
+                "rank_0": profiling_cache._serialize_cache_data({cache_key: (0, 23, 0.20)}),
+            }
+        )
+    )
+    profiling_cache.load_cache(cache_path, rank=0)
+    runner.sync_tactic_cache(tuner)
+
+    assert profiling_cache.generation == 1
+    assert runner.mxfp8_gemm_runner.register_tactic.call_args_list[-1].args == (
+        8192,
+        9216,
+        6144,
+        23,
+    )
 
 
 def test_mxfp8_rejects_unknown_backend(monkeypatch):
