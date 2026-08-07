@@ -115,15 +115,12 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
-    // When true, `seqQOffset` / `cu_kv_seqlens` were filled once per iteration by the
-    // attention metadata (they are layer-invariant), so the generation kernel must not
-    // recompute them per layer.
+    // `seqQOffset` / `cu_kv_seqlens` already filled per iteration by the attention
+    // metadata; layer-invariant, so do not recompute per layer.
     bool precomputed_cu_seqlens = false;
 
-    // When true, `fmha_tile_counter` and the bmm1/bmm2 scales are emitted by the DSv4
-    // sparse indices kernel (`_deepseek_v4_local_to_global_kernel`), which is the last
-    // kernel launched before FMHA. The MLA RoPE kernels must then leave them alone --
-    // writing them twice is harmless but pointless.
+    // `fmha_tile_counter` and the bmm scales already written by the DSv4 sparse
+    // indices kernel; skip them here.
     bool precomputed_fmha_scheduler = false;
 
     // Is it absorption mode?
@@ -132,29 +129,19 @@ struct MlaParams
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 
-    // Fused FP8-Q-quant in the absorption-mode context RoPE kernel: the rope
-    // STG goes to `quant_q_buf` as FP8 and the standalone quantize pass is
-    // skipped. Nope segment must be pre-filled (see deepseek_v4_q_norm_fused_fp8).
+    // Context RoPE kernel writes the rope segment straight to `quant_q_buf` as FP8,
+    // dropping the standalone quantize pass. Nope segment must be pre-filled by
+    // deepseek_v4_q_norm_fused_fp8.
     bool fuse_q_fp8_in_rope = false;
 
-    // q_b_layernorm already applied the Q RoPE and wrote the rotated rope segment
-    // as FP8, so the context RoPE kernel must skip its Q region entirely -- the
-    // bf16 `q_pe` it would rotate is stale on that path.
-
-    // Fused kv_a_layernorm in the absorption-mode context RoPE kernel. When set,
-    // `latent_cache` holds the RAW (un-normalized) kv_a_proj output and the kernel
-    // applies RMSNorm over kv_lora_rank + qk_rope_head_dim with `kv_norm_weight`
-    // before RoPE + quant + paged write. Lets the caller drop both the standalone
-    // kv_a_layernorm launch and the concat([compressed_kv, k_pe]) that only
-    // re-materializes its output. Requires absorption mode and
-    // meta.kv_lora_rank == the kernel's K_DIM template argument.
+    // Fold kv_a_layernorm into the KV kernels: `latent_cache` is then the RAW
+    // kv_a_proj output, RMS-normed over kv_lora_rank + qk_rope_head_dim before
+    // RoPE + quant + paged write. Needs absorption mode and kv_lora_rank == K_DIM.
     bool fuse_kv_norm_in_rope = false;
     void const* kv_norm_weight = nullptr;
     float kv_norm_eps = 1e-6f;
-    // Row stride of `latent_cache`, in elements. On the fused path the caller
-    // passes a last-dim slice of the kv_a_proj output, whose row stride is
-    // q_lora_rank + kv_lora_rank + qk_rope_head_dim rather than the packed
-    // kv_lora_rank + qk_rope_head_dim. 0 means "packed".
+    // `latent_cache` row stride in elements; the fused path passes a slice of
+    // kv_a_proj, so rows are wider than packed. 0 means packed.
     int latent_row_stride = 0;
 
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
@@ -177,11 +164,8 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
-// Generation-phase KV prologue, fused: kv_a_layernorm + RoPE + FP8 quant + paged write
-// in one warp-per-row pass. Replaces the two KV regions of the generation RoPE kernel
-// (which is then launched with `skip_kv = true`) plus the standalone RMSNorm and the
-// `concat([compressed_kv, k_pe])` on the Python side. DSv4 layout only; reads
-// `params.latent_cache` as the RAW kv_a_proj slice with `params.latent_row_stride`.
+// Generation KV prologue in one warp-per-row pass: kv_a_layernorm + RoPE + FP8 quant
+// + paged write. DSv4 layout only; `params.latent_cache` is the RAW kv_a_proj slice.
 template <typename T, typename KVCacheBuffer>
 void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 

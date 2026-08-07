@@ -65,9 +65,8 @@ struct MlaRopeGenArgs
     float* mla_bmm1_scale_ptr;
     float* mla_bmm2_scale_ptr;
     void* quant_q_buffer_ptr;
-    // Set when q_b_layernorm already wrote the FP8 q_nope segment of
-    // `quant_q_buffer`. The RoPE kernel then drops its q_nope quantize region and
-    // shares this scale for the rope segment it still writes.
+    // q_b_layernorm already wrote the FP8 q_nope segment, so the RoPE kernel drops
+    // its quantize region and reuses this scale for the rope segment.
     float const* quant_scale_qkv_ptr;
     float const* quant_scale_o_ptr;
     float const* kv_scale_orig_quant_ptr;
@@ -75,21 +74,18 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
-    // Fused generation kv-norm: when `kv_norm_weight_ptr` is set, the KV half of the
-    // latent is produced by `invokeMLAKvNormRopeQuantGeneration` (norm + rope + fp8 +
-    // paged write in one warp-per-row pass) and the RoPE kernel runs Q-only.
+    // `kv_norm_weight_ptr` set: `invokeMLAKvNormRopeQuantGeneration` produces the KV
+    // half (norm + rope + fp8 + paged write) and the RoPE kernel runs Q-only.
     void const* kv_norm_weight_ptr;
     float kv_norm_eps;
     int32_t latent_row_stride;
-    // cu_q_seqlens / cu_kv_seqlens were filled once for the iteration by the attention
-    // metadata; the kernel must not recompute them per layer.
+    // Filled once per iteration by the attention metadata; do not recompute per layer.
     bool precomputed_cu_seqlens;
     // The DSv4 sparse indices kernel already emits the FMHA scheduler prologue.
     bool precomputed_fmha_scheduler;
-    // Split launch. The KV kernel depends only on the raw kv_a_proj latent, so the
-    // caller can run it early -- on its own stream, concurrent with the Q branch --
-    // and come back for the Q kernel once q_pe exists. `kv_only` launches the first
-    // half, `kv_done_elsewhere` the second (Q-only, `kSkipKv`).
+    // Split launch: the KV kernel needs only the raw kv_a_proj latent, so the caller
+    // can run it early on its own stream and return for Q once q_pe exists.
+    // `kv_only` launches the KV half, `kv_done_elsewhere` the Q half.
     bool kv_only;
     bool kv_done_elsewhere;
 };
@@ -137,8 +133,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
 
     mla_params.precomputed_cu_seqlens = args.precomputed_cu_seqlens;
     mla_params.precomputed_fmha_scheduler = args.precomputed_fmha_scheduler;
-    // `fuse_kv_norm_in_rope` is what makes the RoPE kernel run `kSkipKv`. That holds
-    // whether the KV kernel ran in this same call or already ran on another stream.
+    // Set whether the KV kernel ran in this call or already ran on another stream.
     mla_params.fuse_kv_norm_in_rope = args.kv_norm_weight_ptr != nullptr || args.kv_done_elsewhere;
     mla_params.kv_norm_weight = args.kv_norm_weight_ptr;
     mla_params.kv_norm_eps = args.kv_norm_eps;
@@ -146,8 +141,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
 
     if (args.kv_norm_weight_ptr != nullptr)
     {
-        // When both halves run here, KV goes first: the RoPE kernel below no longer
-        // writes the latent, and the FMHA kernel that follows reads the cache.
+        // KV first: the RoPE kernel no longer writes the latent, and FMHA reads the cache.
         tk::invokeMLAKvNormRopeQuantGeneration<T>(mla_params, kv_cache_buffer, stream);
     }
     if (!args.kv_only)
@@ -179,8 +173,7 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     bool const precomputed_fmha_scheduler, bool const kv_only, bool const kv_done_elsewhere,
     std::optional<torch::Tensor> quant_scale_qkv)
 {
-    // `kv_only` runs the fused KV kernel alone, before q_pe exists; the Q tensors are
-    // then absent and every Q-side quantity below is unused.
+    // `kv_only` runs before q_pe exists, so the Q tensors are absent.
     TORCH_CHECK(kv_only || (fused_q.has_value() && q_pe.has_value()),
         "mla_rope_generation needs fused_q and q_pe unless kv_only is set");
     TORCH_CHECK(!kv_only || kv_norm_weight.has_value(), "kv_only requires kv_norm_weight");
@@ -281,9 +274,8 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         ? static_cast<int*>(block_ids_per_seq->data_ptr())
         : nullptr;
 
-    // Fused kv-norm inputs. `latent_cache` is then the RAW kv_a_proj slice -- a
-    // last-dim view whose row stride is q_lora_rank + kv_lora_rank + qk_rope_head_dim,
-    // not the row width -- so the stride is read off the tensor rather than assumed.
+    // Fused kv-norm: `latent_cache` is the RAW kv_a_proj slice, a last-dim view whose
+    // row stride exceeds the row width, so read the stride off the tensor.
     float const* quant_scale_qkv_ptr = nullptr;
     if (quant_scale_qkv.has_value())
     {

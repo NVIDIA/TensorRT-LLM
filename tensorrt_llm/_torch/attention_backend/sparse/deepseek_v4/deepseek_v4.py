@@ -1628,11 +1628,10 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             block_table_compressed = None
             compressed_local_indices = None
 
-        # FMHA scheduler prologue. This kernel is the last one launched before FMHA
-        # and already runs once per layer per forward, so it is the natural owner of
-        # the tile-counter reset and the bmm scale derivation -- the MLA RoPE kernels
-        # used to do it from block (0,0), two launches earlier. Generation only: the
-        # context path takes its scheduler buffers from the attention workspace.
+        # FMHA scheduler prologue: this kernel is the last one before FMHA, so it owns
+        # the tile-counter reset and bmm scale derivation the MLA RoPE kernels used to
+        # do two launches earlier. Generation only -- context uses the attention
+        # workspace.
         sched_kwargs = {}
         if (
             forward_args.attention_input_type == AttentionInputType.generation_only

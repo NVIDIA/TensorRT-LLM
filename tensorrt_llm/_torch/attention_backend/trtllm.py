@@ -303,11 +303,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
-        # FMHA prologue buffers for the MLA generation path. These used to be
-        # allocated per layer and filled by the generation RoPE kernel, which
-        # recomputed layer-invariant values once per layer. They are hoisted here:
-        # computed once per iteration in `prepare()`, written into fixed addresses so
-        # a captured CUDA graph keeps reading the same pointers.
+        # FMHA prologue buffers for the MLA generation path. The values are
+        # layer-invariant, so compute them once per iteration in `prepare()` instead of
+        # per layer in the RoPE kernel. Fixed addresses keep captured CUDA graphs valid.
         #   `mla_cu_q_seqlens`  cumulative Q ROWS  = cumsum(q_lens) * num_heads
         #   `mla_cu_kv_seqlens` cumulative KV lens = cumsum(kv_lens)
         # `+ 1` because both are exclusive-prefix arrays over num_seqs.
@@ -330,11 +328,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                      pin_memory=prefer_pinned())
         self.mla_cu_kv_seqlens_cpu = torch.empty_like(
             self.mla_cu_kv_seqlens, device='cpu', pin_memory=prefer_pinned())
-        # Token-wise cumulative Q seqlens over the CONTEXT sequences, for folding the
-        # Q RoPE into q_b_layernorm. `ctx_uncached_token_indptr` holds the same values
-        # but only exists when `enable_context_mla_with_cached_kv` is set (kv reuse /
-        # chunked context), so this path keeps its own copy and works either way.
-        # Note these count TOKENS, unlike `mla_cu_q_seqlens` which counts Q rows.
+        # Token-wise cumulative Q seqlens over CONTEXT sequences, for folding the Q RoPE
+        # into q_b_layernorm. Own copy because `ctx_uncached_token_indptr` holds the same
+        # values but only exists under `enable_context_mla_with_cached_kv`.
+        # Counts TOKENS, unlike `mla_cu_q_seqlens` which counts Q rows.
         self.mla_ctx_cu_q_seqlens = self.get_empty(
             buffers,
             (self.max_num_sequences + 1, ),
@@ -675,10 +672,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens[:self.num_seqs]),
                                                 non_blocking=True)
         # Cumulative KV lengths for the MLA generation FMHA kernel, hoisted out of the
-        # per-layer RoPE kernel. Built from `kv_lens` -- the SAME tensor kv_lens_cuda
-        # is copied from, i.e. WITHOUT `num_extra_kv_tokens` -- because that is what the
-        # kernel's `cache_seq_lens` scan used. `self.kv_lens` adds the extra tokens and
-        # would be wrong here.
+        # per-layer RoPE kernel. Must come from `kv_lens` (what the kernel's
+        # `cache_seq_lens` scan used), NOT `self.kv_lens`, which adds
+        # `num_extra_kv_tokens`.
         _n_gen = self.num_seqs - self.num_contexts
         self.mla_cu_kv_seqlens_cpu[0] = 0
         if _n_gen > 0:

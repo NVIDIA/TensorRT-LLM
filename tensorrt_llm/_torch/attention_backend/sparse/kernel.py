@@ -2354,8 +2354,8 @@ def deepseek_v4_local_to_global_indices(
     out_stride0, out_stride1 = out.stride()
     launch_with_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
-    # The scheduler prologue is all-or-nothing: the tile counter alone is enough to
-    # emit (bf16 KV needs no bmm scales), but the scales come as a set.
+    # Tile counter alone is valid (bf16 KV needs no bmm scales), but the scales come
+    # as a set.
     write_fmha_scheduler = fmha_tile_counter is not None
     write_bmm_scales = (bmm1_scale is not None and bmm2_scale is not None
                         and quant_scale_o is not None

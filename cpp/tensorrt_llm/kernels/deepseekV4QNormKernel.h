@@ -43,13 +43,11 @@ void invokeDeepseekV4QNorm(
 //
 // Only headDim==512, nopeDim==448 is currently supported (DeepSeek-V4 absorption shape).
 //
-// Passing `cos_sin_cache` + `cache_seq_lens` (with the interleaved row stride, i.e.
-// `quantQNopeRowStrideBytes == headDim`) additionally applies the Q RoPE here and writes
-// the rotated rope segment as FP8 into the same row, leaving the whole Q row complete so
-// the RoPE kernel has nothing left to do. Positions are derived from the KV cache
-// lengths: pass `cu_q_seqlens` (+ `num_seqs`) for the ragged context form, or `seq_len`
-// for the uniform generation form. Leave the cos/sin and cache-length pointers null to
-// keep the plain no-RoPE behaviour.
+// With `cos_sin_cache` + `cache_seq_lens` (interleaved stride only), also applies the Q
+// RoPE and writes the rotated rope segment as FP8 into the same row, completing the Q row
+// so no RoPE kernel is needed. Positions come from the cache lengths: `cu_q_seqlens`
+// (+ `num_seqs`) for ragged context, `seq_len` for uniform generation. Null cos/sin keeps
+// the plain no-RoPE behaviour.
 void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes,
     bool isBfloat16, float eps, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,

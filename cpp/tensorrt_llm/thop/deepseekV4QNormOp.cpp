@@ -114,9 +114,8 @@ void deepseekV4QNormFusedFp8(torch::Tensor q, torch::Tensor quantQOut, torch::Te
 
     int const quantQNopeRowStrideBytes = static_cast<int>(quantQStridePerHead);
 
-    // Fusing the Q RoPE needs the rope slots of this same row, so it is only
-    // available on the interleaved layout, and it needs a position per row, which
-    // only the generation path can supply.
+    // Fusing the Q RoPE writes into this row's rope slots, so it needs the
+    // interleaved layout and a position per row.
     void const* cosSinPtr = nullptr;
     int const* cacheSeqLensPtr = nullptr;
     int const* cuQSeqLensPtr = nullptr;

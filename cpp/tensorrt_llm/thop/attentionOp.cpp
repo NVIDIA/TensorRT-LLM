@@ -523,10 +523,8 @@ public:
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
 
-                // Fused kv_a_layernorm: when the caller supplies the norm weight it
-                // has also passed the RAW kv_a_proj output as `latent_cache` and
-                // skipped both its own RMSNorm launch and the
-                // concat([compressed_kv, k_pe]). Context-only, like the Q fusion.
+                // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
+                // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.
                 if (kv_norm_weight.has_value())
                 {
                     TORCH_CHECK(kv_norm_weight->is_cuda(), "kv_norm_weight must be a CUDA tensor");
@@ -535,10 +533,8 @@ public:
                         "kv_norm_weight dtype must match the activation dtype");
                     TORCH_CHECK(latent_cache.has_value(),
                         "fused kv-norm needs latent_cache (the raw kv_a_proj output) to be provided");
-                    // latent_cache is a last-dim slice of the kv_a_proj output, so
-                    // its rows are strided by q_lora_rank + kv_lora_rank +
-                    // qk_rope_head_dim. Forward the real stride; only the innermost
-                    // dim has to be unit-stride for the kernel's 16B vector loads.
+                    // A last-dim slice, so rows are wider than the row itself. Forward
+                    // the real stride; only the innermost dim must be unit-stride.
                     TORCH_CHECK(latent_cache->dim() == 2, "latent_cache must be 2D for fused kv-norm, got ",
                         latent_cache->dim(), "D");
                     TORCH_CHECK(latent_cache->stride(1) == 1, "latent_cache must be unit-stride in its last dim");
@@ -547,9 +543,6 @@ public:
                     mla_params.kv_norm_eps = static_cast<float>(kv_norm_eps);
                     mla_params.fuse_kv_norm_in_rope = true;
                 }
-                // q_b_layernorm already applied the Q RoPE and wrote the rotated
-                // rope segment as FP8, so the kernel must not rotate the stale bf16
-                // q_pe over it.
             }
             else if (is_context)
             {
@@ -1454,8 +1447,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
             quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
-            // the attention op's kv-norm fusion is context-only; generation gets it from
-            // the standalone mla_rope_generation op instead.
+            // Context-only here; generation gets the fusion from mla_rope_generation.
             /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
     }
 

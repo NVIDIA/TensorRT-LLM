@@ -176,24 +176,15 @@ void dispatchDeepseekV4QNorm(
 // (kPairsPerLane-1) iterations cover the nope range and the last iteration
 // covers the rope range exactly.
 
-// `kFuseRope`: also apply the Q RoPE here and write the rotated rope segment as
-// FP8 into the same row of `quant_q_nope`, instead of handing an un-rotated bf16
-// `q_pe` to `applyMLARopeAndAssignQKVKernelGeneration`. The layout already suits
-// it -- `kRopePairs == kWarpSize` means lane `l` owns exactly rope pair `l`, so
-// the rotation is register-local and needs no extra loads beyond one float2 of
-// cos/sin. With the q_nope quantize region already gone, this leaves that kernel
-// with nothing to do on the DSv4 decode path.
+// `kFuseRope`: rotate the rope segment here too and store it FP8 in the same row.
+// Register-local -- `kRopePairs == kWarpSize`, so lane `l` owns rope pair `l` and
+// needs only one float2 of cos/sin.
 //
-// Positions match whichever RoPE kernel this replaces:
-//   generation -- uniform query length, so batch = token / seq_len and
-//                 position = kv_cache_len[batch] - seq_len + token % seq_len.
-//   context    -- ragged, so the sequence owning a token is found by binary search
-//                 over `cu_q_seqlens` (in TOKENS here, unlike the generation
-//                 `seqQOffset` which counts Q rows), and
-//                 position = local_token + (kv_cache_len[b] - current_seq_len).
-//                 The second term is the chunked-prefill cached offset.
-// Passing `cu_q_seqlens` selects the context form. Every lane of a warp shares
-// `row`, so the search is uniform across the warp and does not diverge.
+// Position, by phase (`cu_q_seqlens` selects context):
+//   generation: batch = token / seq_len, pos = kv_cache_len[batch] - seq_len + token % seq_len
+//   context:    binary search `cu_q_seqlens` (in TOKENS, unlike the generation
+//               `seqQOffset` which counts Q rows), pos = local_token + cached_offset
+// `row` is warp-uniform, so the search does not diverge.
 template <typename T, int kHeadDim, int kNopeDim, bool kFuseRope = false, bool kWideVec = true>
 __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8_e4m3* __restrict__ quant_q_nope,
     T* __restrict__ q_pe_out, float const* __restrict__ quant_scale_qkv_ptr, int totalRows,
@@ -209,19 +200,14 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
     constexpr int kNopePairs = kNopeDim / 2;
     static_assert(kPairsPerLane >= 2);
 
-    // Two decompositions of the same row, chosen per phase by `kWideVec`.
+    // Row decomposition, per phase:
+    //   narrow (kWideVec=false): lane owns kPairsPerLane pairs -> 4B loads, 2B stores
+    //   wide   (kWideVec=true):  lane owns kVecsPerLane vectors -> 16B loads, 8B stores
     //
-    //   narrow (kWideVec=false): lane owns kPairsPerLane pairs, strided by the warp.
-    //     kPairsPerLane 4B loads + kPairsPerLane 2B FP8 stores per row.
-    //   wide   (kWideVec=true):  lane owns kVecsPerLane 16B vectors.
-    //     kVecsPerLane 16B loads + kVecsPerLane 8B FP8 stores per row.
-    //
-    // Wide is strictly fewer instructions but needs ~3 more registers, which drops
-    // reg-limited occupancy from 16 to 14 blocks/SM. That is the wrong trade for the
-    // CONTEXT instance: it moves 1.6 GB per launch and already runs at ~81% of HBM
-    // SOL, where resident waves are the bandwidth -- measured 248 -> 277 us when it
-    // was forced onto the wide path. The GENERATION instance moves 6 MB and runs at
-    // ~25% of SOL, so it is instruction-bound and wide wins there (3.10 -> 2.77 us).
+    // Wide costs ~3 registers, dropping occupancy 16 -> 14 blocks/SM. Context is
+    // bandwidth-bound (1.6 GB/launch, ~81% HBM SOL) so waves matter more than
+    // instructions: forcing it wide measured 248 -> 277 us. Generation moves 6 MB at
+    // ~25% SOL, instruction-bound, so wide wins there (3.10 -> 2.77 us).
     constexpr int kEltsPerVec = 16 / sizeof(T);
     constexpr int kPairsPerVec = kEltsPerVec / 2;
     constexpr int kRowVecs = kHeadDim / kEltsPerVec;
@@ -259,12 +245,10 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 
     float const quantScale = quant_scale_qkv_ptr ? quant_scale_qkv_ptr[0] : 1.0F;
 
-    // The wide path keeps the RAW vectors (kVecsPerLane x 16B = 8 registers) and
-    // re-converts in pass 2, rather than holding their float expansion
-    // (kPairsPerLane x float2 = 16 registers) live across the reduction. The extra
-    // bf16->float converts are nearly free; the 8 registers are not. At 128
-    // threads/block an SM caps at 2048 threads = 64 warps, and 32 regs/thread is
-    // exactly that ceiling (32 x 2048 = 65536), so anything above 32 costs waves.
+    // Wide keeps RAW vectors (8 regs) and re-converts in pass 2 instead of holding
+    // the float expansion (16 regs) across the reduction. The converts are nearly
+    // free; the registers are not -- 32 regs/thread is exactly the occupancy ceiling
+    // at 128 threads/block, so anything above it costs waves.
     uint4 raw[kWideVec ? kVecsPerLane : 1];
     float2 values[kWideVec ? 1 : kPairsPerLane];
     float sumSquares = 0.0F;
@@ -336,8 +320,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 
     if constexpr (kWideVec)
     {
-        // One store word per vector, written in place: no separate staging array
-        // and no second lifetime for the packed bytes.
+        // One store word per vector, written in place.
         union StoreWord
         {
             typename Fp8VecStore<kEltsPerVec>::Type packed;
@@ -442,15 +425,11 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
 
     dim3 const block(kThreadsPerBlock);
     dim3 const grid((totalRows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-    // Fusing the RoPE needs the rope slots of the same row, so the caller must be
-    // using the interleaved layout, and needs positions, which only generation has.
-    // Context supplies cu_q_seqlens and needs no uniform seq_len; generation
-    // supplies seq_len and no cu_q_seqlens. Either way the rope slots must live in
-    // this row, i.e. the interleaved layout.
-    // `row / num_heads`, `token / seq_len` and `token % seq_len` divide by runtime
-    // values, so each emits an emulated 32-bit division per row. Both are powers of
-    // two in every DSv4 config (128 heads; seq_len = 1 + MTP depth), so pass the
-    // shift and let the kernel use shift/mask; -1 keeps the divide.
+    // Fusing the RoPE needs the rope slots in this row (interleaved layout) plus
+    // positions: context passes cu_q_seqlens, generation passes seq_len.
+    // `row / num_heads` and `token / seq_len` divide by runtime values, costing an
+    // emulated 32-bit divide per row. Both are powers of two in every DSv4 config
+    // (128 heads; seq_len = 1 + MTP depth), so pass a shift; -1 keeps the divide.
     auto const pow2_shift = [](int v) -> int
     {
         if (v <= 0 || (v & (v - 1)) != 0)
@@ -470,10 +449,8 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
     bool const haveRopePositions = cu_q_seqlens != nullptr ? num_seqs > 0 : seq_len > 0;
     bool const fuseRope = cos_sin_cache != nullptr && cache_seq_lens != nullptr && num_heads > 0 && haveRopePositions
         && quantQNopeRowStrideBytes == headDim;
-    // Phase picks the decomposition (see the kernel's comment): context is
-    // bandwidth-bound and wants the extra occupancy the narrow path leaves free;
-    // generation is instruction-bound and wants the wider loads and stores.
-    // `cu_q_seqlens` is the context marker -- generation passes `seq_len` instead.
+    // Context is bandwidth-bound (narrow, more occupancy), generation is
+    // instruction-bound (wide). `cu_q_seqlens` marks context.
     bool const wideVec = cu_q_seqlens == nullptr;
 
     auto launch = [&](auto fuse_tag, auto wide_tag)
