@@ -86,8 +86,8 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --batch-size 32 --seq-len-q 4
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --layer-indices 5,6,7,8
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --layer-indices 5,6,7,8
 
-# Scale DEP=16 to 4 GPUs: reduces the number of experts; uses MNNVL A2A if applicable
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP
+# Scale DEP=16 to 4 GPUs: reduces the number of experts
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend CUTEDSL
 
 # Scale TEP=16 to 4 GPUs: reduces the number of attention heads and experts
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
@@ -101,8 +101,8 @@ NP=2 ./mpi_launch.sh ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-In
 NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --mamba-ssm-cache-dtype float16 --batch-size 512
 
 # Run with DeepEP A2A
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_ctx.yaml --moe-backend WIDEEP
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_gen.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # Run with imbalanced ranks: in addition to activating all experts, the specified ratio of tokens is sent to rank 0
 # Note: if balance ratio is 0, the "activate all experts" behavior is not applied
@@ -157,14 +157,14 @@ python3 scripts/build_wheel.py --cuda_architectures native --no-venv --skip_buil
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
-# Run DeepSeek-R1 NVFP4 with wide EP; uses MNNVL A2A if applicable
-NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+# Run DeepSeek-R1 NVFP4 with wide EP
+NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # Run with TRTLLMGen
 NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
 
 # Run with DeepEPLowLatency
-NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # You can run 4-GPU and 8-GPU tasks without reallocating the Slurm job
 NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
@@ -187,7 +187,7 @@ Run with OpenMPI:
 
 ```bash
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size 1,2,4 --seq-len-q 1024,8192
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend CUTEDSL --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
 ```
 
 ## Parse profiles
@@ -255,21 +255,22 @@ Two E2E traces are required because the two pieces of information cannot be capt
           calibration_file_path: profiles/calibration_data.json
       ```
 
-   2. Set `TLLM_PROFILE_START_STOP` to a range that captures some iterations (typically tens of iterations) of the GEN phase. Ensure that every iteration has the same batch size. Capture 5 extra iterations at the beginning, because the first 5 iterations are treated as warm-ups and will be dropped by the parser by default.
+   2. Set `TLLM_PROFILE_START_STOP` to a range that captures some iterations (typically tens of iterations) of the GEN phase. Ensure that every iteration has the same batch size. Capture 5 extra iterations at the beginning, because the first 5 iterations are treated as warm-ups and will be dropped by the parser by default. Calibration data is collected for the iterations `[start, stop)`, i.e. the stop iteration itself is not collected.
 
    3. Capture per-rank nsys profiles; each rank should produce a separate file.
 
       Place `nsys profile` after `mpirun` or `srun`. To minimize profiling overhead and file size, there is no need to capture samples or GPU metrics.
+
+      Trace the whole process instead of gating the collection with `-c cudaProfilerApi`: recent nsys versions export kernels launched by CUDA graphs that were instantiated before the capture range opened without runtime correlation, which breaks `parse_e2e.py`, and stopping the collection mid-run can hang the executor (the engine captures its CUDA graphs during warmup, before any capture range can open). `parse_e2e.py` selects the analyzed iterations via `--start-iter`/`--stop-iter` instead.
 
       If you use `trtllm-serve` or `trtllm-bench`, use the following command order. If you use `examples/disaggregated/slurm/benchmark/submit.py`, setting `gen_profile_range` is sufficient.
 
       ```bash
       NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
       nsys profile \
-          -t cuda,nvtx \
+          -t cuda,nvtx -s none \
           --cpuctxsw none --cuda-event-trace false \
           --cuda-graph-trace node \
-          -c cudaProfilerApi --capture-range-end stop \
           -o profiles/report_e2e_collect_rank%q{RANK}.nsys-rep \
           --force-overwrite true \
       trtllm-llmapi-launch \
@@ -306,7 +307,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
        --balance-method NotModified \
        --replay-file-path profiles/calibration_data.json \
        --replay-start-iter 47 \
-       --replay-stop-iter 67
+       --replay-stop-iter 66
    ```
 
    Argument explanations:
@@ -320,7 +321,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
    | `--seq-len-q 1` | Should match (1 + MTP) of the end-to-end run. |
    | `--seq-len-kv-cache 2090` | An estimate of the average context length for the captured iterations. The first 5 iterations should be excluded from this estimate because they will be dropped by the parser. |
    | `--replay-file-path` | The calibration file obtained from Step 1. |
-   | `--replay-start-iter` and `--replay-stop-iter` | Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations because they will be dropped by the parser. |
+   | `--replay-start-iter` and `--replay-stop-iter` | Both inclusive. The calibration file contains the end-to-end `TLLM_PROFILE_START_STOP` iterations `[start, stop)`. Do not replay the first 5 iterations because they will be dropped by the parser. |
 
 4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
 
@@ -330,6 +331,8 @@ Two E2E traces are required because the two pieces of information cannot be capt
        --graph-trace profiles/report_e2e_collect_rank%.nsys-rep \
        --layer-indices 5,6,7 \
        --warmup-times 5 \
+       --start-iter 42 \
+       --stop-iter 66 \
        -o profiles/report_e2e_collect_rank%.json
    seq 0 $((NP - 1)) | xargs -I% python3 parse.py \
        --world-size $NP \
@@ -351,7 +354,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
 Limitations:
 
 1. Pipeline parallelism is not supported.
-2. Only the CUTLASS and WIDEEP MoE backends are supported.
+2. Only the CUTEDSL, CUTLASS, DEEPGEMM and TRTLLM MoE backends are supported.
 3. Only tested with the GEN phase and attention DP.
 
 ## Developer utilities
@@ -369,7 +372,7 @@ Limitations:
 
 1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
 
-   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `WIDEEP`) and `--moe-backend-for-prefill DEEPGEMM` (or `WIDEEP`) options.
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) and `--moe-backend-for-prefill DEEPGEMM` options.
 
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 

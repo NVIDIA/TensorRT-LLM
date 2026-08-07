@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,16 @@
 
 namespace tensorrt_llm::batch_manager
 {
+
+// Single, process-global storage for the steady-clock offset. Keeping it in this
+// translation unit (rather than as an inline-static member reachable from every
+// shared object) guarantees that libtensorrt_llm.so and the nanobind extension
+// module observe the same value once either side calibrates it.
+std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset()
+{
+    static std::optional<std::chrono::steady_clock::duration> offset{std::nullopt};
+    return offset;
+}
 
 template <typename TTensor, typename TStream>
 runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)

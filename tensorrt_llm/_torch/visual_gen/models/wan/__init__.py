@@ -2,10 +2,13 @@ from .parallel_vae import ParallelVAE_Wan
 from .pipeline_wan import WanPipeline
 from .pipeline_wan_i2v import WanImageToVideoPipeline
 from .transformer_wan import WanTransformer3DModel
+from .wan_vae import WanVAE, WanVAEConfig
 
 __all__ = [
     "WanPipeline",
     "WanImageToVideoPipeline",
     "WanTransformer3DModel",
     "ParallelVAE_Wan",
+    "WanVAE",
+    "WanVAEConfig",
 ]

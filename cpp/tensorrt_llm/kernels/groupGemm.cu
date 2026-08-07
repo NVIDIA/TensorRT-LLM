@@ -28,6 +28,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -63,7 +64,7 @@ template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, 
 void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    nvinfer1::DataType dataType, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     using ElementA = cutlassType;
@@ -178,20 +179,20 @@ template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int 
 void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    nvinfer1::DataType dataType, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, cudaStream_t stream)
 {
-    if (dataType == nvinfer1::DataType::kHALF)
+    if (dataType == tensorrt_llm::DataType::kHALF)
     {
         groupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes, ptrA,
             ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType,
             stream);
     }
-    else if (dataType == nvinfer1::DataType::kFLOAT)
+    else if (dataType == tensorrt_llm::DataType::kFLOAT)
     {
         TLLM_CHECK_WITH_INFO(false, "not support float input/output");
     }
 #ifdef ENABLE_BF16
-    else if (dataType == nvinfer1::DataType::kBF16)
+    else if (dataType == tensorrt_llm::DataType::kBF16)
     {
         groupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes,
             ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize,
@@ -203,7 +204,7 @@ void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::
 void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream)
+    bool isLoraIn, tensorrt_llm::DataType dataType, int minKN, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
     if (isLoraIn)

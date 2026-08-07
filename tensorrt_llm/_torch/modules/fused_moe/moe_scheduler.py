@@ -42,6 +42,7 @@ exchange runs:
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -51,15 +52,22 @@ from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
+from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cutlass import CutlassFusedMoE
+from .fused_moe_cutlass import CutlassFusedMoE, raise_moe_lora_multichunk_unsupported
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .interface import MoESchedulerKind
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+FORCE_SEPARATED_ROUTING = os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 __all__ = [
     "MoEScheduler",
@@ -153,21 +161,40 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 2: Determine communication method ==========
         num_chunks = moe.calculate_num_chunks(all_rank_num_tokens_padded)
 
-        # Routed-expert MoE LoRA carries per-request adapter metadata that is
-        # not re-sliced per token-chunk, so multi-chunk execution would mismatch
-        # the kernel's per-token expansion. Reject here with a clear message
-        # instead of failing inside the C++ op.
         if (
             num_chunks > 1
             and moe.backend.__class__ == CutlassFusedMoE
             and moe.backend._moe_lora_active(lora_params)
         ):
-            raise NotImplementedError(
-                f"Routed-expert MoE LoRA does not support multi-chunk execution "
-                f"(num_chunks={num_chunks}). Reduce the per-forward token count "
-                f"or increase `moe_max_num_tokens` so the MoE runs in a single "
-                f"chunk."
-            )
+            raise_moe_lora_multichunk_unsupported(num_chunks)
+
+        # ========== 0-token rank deadlock fix ==========
+        # When some ranks have 0 tokens in single-chunk forward with collective comm,
+        # those ranks hang in CUDA kernels (e.g. NVFP4 quantize_input with 0-row tensor)
+        # before reaching moe.comm.dispatch(), causing NCCL AllGather deadlock on
+        # non-zero ranks. Fix: activate DP padding uniformly across all ranks so every
+        # rank uses sizes=None (uniform allgather) and pads x/router_logits to max_tokens.
+        # Mirrors the empty-chunk substitution in _forward_multiple_chunks (line ~597-620).
+        # Existing truncation at Step 4 discards dummy-token outputs automatically.
+        # NOTE: kept after the multi-chunk rejection above so unit tests that stub `moe`
+        # with a minimal namespace (no `.comm`/`.use_dp`) still exercise that path; only
+        # relevant to single-chunk collective comm anyway.
+        if (
+            moe.comm is not None
+            and moe.use_dp
+            and all_rank_max_num_tokens > 0
+            and not use_dp_padding
+            and any(t == 0 for t in all_rank_num_tokens_padded)
+        ):
+            use_dp_padding = True
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens] * len(all_rank_num_tokens)
+            local_n = x.shape[0]
+            if local_n < all_rank_max_num_tokens:
+                pad = all_rank_max_num_tokens - local_n
+                x = torch.cat([x, x.new_zeros((pad, x.shape[1]))], dim=0)
+                router_logits = torch.cat(
+                    [router_logits, router_logits.new_zeros((pad, router_logits.shape[1]))], dim=0
+                )
 
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.
@@ -354,8 +381,18 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
-        if moe.backend._supports_load_balancer():
+        # ========== Step 2: Apply routing ==========
+        # External dispatch (Step 5) sends per-token expert/scale payloads, so
+        # routing must be precomputed whenever a comm strategy is active — even
+        # for backends whose run_moe can otherwise route internally from
+        # router_logits (e.g. MarlinFusedMoE under attention-DP + EP).
+        requires_separated_routing = (
+            moe.backend._supports_load_balancer()
+            or moe.routing_method.requires_separated_routing
+            or moe.comm is not None
+            or FORCE_SEPARATED_ROUTING
+        )
+        if requires_separated_routing:
             # Separated routing: ConfigurableMoE calls routing_method
             token_selected_experts, token_final_scales = moe.routing_method.apply(
                 router_logits, input_ids
@@ -379,10 +416,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
                 x = x * token_final_scales.to(x.dtype)
-                # DeepEP variants need a non-None token_final_scales tensor
-                # (they don't tolerate None), so feed all-ones; other strategies
-                # accept None and skip the multiply.
-                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency)):
+                # These strategies need non-None token_final_scales, so feed
+                # all-ones after folding the real weights into x.
+                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency, NcclEP)):
                     token_final_scales = torch.ones_like(token_final_scales)
                 else:
                     token_final_scales = None
@@ -613,9 +649,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
                     input_ids_list[idx_chunk] = input_ids_list[0]
-                    all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
-                        all_rank_num_tokens_list[0][moe.mapping.tp_rank]
-                    )
+            # Mirror the empty-chunk substitution above into the work list:
+            # all_rank_num_tokens_list feeds the varsize collectives, so every
+            # rank must patch EVERY empty entry, not just its own -- the size
+            # vectors have to be identical on all ranks. all_rank_chunk_size_list
+            # is the untouched ground truth used to detect the empty chunks.
+            for idx_chunk in range(num_chunks):
+                vec = all_rank_num_tokens_list[idx_chunk]
+                for j in range(len(vec)):
+                    if all_rank_chunk_size_list[j][idx_chunk] == 0:
+                        vec[j] = all_rank_chunk_size_list[j][0]
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
             input_ids_list = tuple(input_ids_list)
@@ -797,7 +840,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # When the scheduler precomputes top-k for DP/load-balancer paths,
             # the backend must not route again.  Single-rank TRTLLMGen paths do
             # not get precomputed top-k, so they still need router_logits.
-            router_logits_arg = None if moe.backend._supports_load_balancer() else router_logits
+            router_logits_arg = (
+                None
+                if (
+                    moe.backend._supports_load_balancer()
+                    or moe.routing_method.requires_separated_routing
+                    or FORCE_SEPARATED_ROUTING
+                )
+                else router_logits
+            )
             kwargs["router_logits"] = router_logits_arg
             kwargs["do_finalize"] = do_finalize
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
@@ -904,6 +955,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
 
     def _strip_adp_padding(
@@ -1145,23 +1198,33 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe.num_slots, token_selected_slots
         )
 
-        # ----- quantize -----
-        # Always delegate to ``backend.quantize_input`` so each fused-comm
-        # backend owns its own empty-tensor layout. Both ``MegaMoEDeepGemm``
-        # and ``MegaMoECuteDsl`` short-circuit ``x.shape[0] == 0`` inside
-        # their quantize_input contracts (DG returns FP8 + packed-UE8M0
-        # int32 SF; CuteDSL returns NVFP4 packed bytes + plain K-major FP8
-        # SF). Synthesizing the DG-specific empty layout here would lock
-        # the scheduler to a single backend; the unconditional delegation
-        # keeps it layout-agnostic.
-        x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
+        # ----- quantize / prepare -----
+        if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
+            # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
+            # topk copies, so keep the original activations and let run_moe
+            # prepare its workspace.
+            moe_input = x_chunk_real
+            x_sf = None
+        else:
+            # Delegate to ``backend.quantize_input`` so each fused-comm backend
+            # owns its own empty-tensor layout. Both MegaMoEDeepGemm and
+            # MegaMoECuteDsl short-circuit ``x.shape[0] == 0`` inside their
+            # quantize_input contracts.
+            moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
+
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
         out = moe.backend.run_moe(
-            x=x_fp8,
+            x=moe_input,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,

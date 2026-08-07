@@ -250,8 +250,8 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    coverage: assert the value is captured, and for a categorical bare-string
    field assert that an out-of-allowlist value is redacted (dropped) while an
    in-allowlist value is captured.
-6. **Regenerate the manifest golden** from `build_capture_manifest`:
-   `python -c "import json; from tensorrt_llm.usage.llmapi_config import golden_manifest; open('tensorrt_llm/usage/llm_args_golden_manifest.json','w').write(json.dumps(golden_manifest(), indent=2, sort_keys=True)+'\n')"`
+6. **Regenerate the manifest golden**:
+   `python3 scripts/generate_llm_args_golden_manifest.py`
    Review the golden diff — **it is the privacy review.** A newly captured field
    requires sign-off from the GitHub telemetry/privacy CODEOWNER (`.github/CODEOWNERS`).
 7. **`docs/source/developer-guide/telemetry.md` is generated** from the committed

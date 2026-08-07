@@ -47,7 +47,6 @@ CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
 NCCL_VERSION       ?=
 CUBLAS_VERSION     ?=
-TRT_VERSION        ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
@@ -99,7 +98,6 @@ base_pull:
 		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \
 		$(if $(NCCL_VERSION), --build-arg NCCL_VER="$(NCCL_VERSION)") \
 		$(if $(CUBLAS_VERSION), --build-arg CUBLAS_VER="$(CUBLAS_VERSION)") \
-		$(if $(TRT_VERSION), --build-arg TRT_VER="$(TRT_VERSION)") \
 		$(if $(TRT_LLM_VERSION), --build-arg TRT_LLM_VER="$(TRT_LLM_VERSION)") \
 		$(if $(DEVEL_IMAGE), --build-arg DEVEL_IMAGE="$(DEVEL_IMAGE)") \
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \

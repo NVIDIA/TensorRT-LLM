@@ -40,6 +40,11 @@ foreach(HEAD ${basic_heads})
   list(APPEND SRC_CU ${HEAD_SRCS})
 endforeach()
 
+# Cascade attention kernel. Compiled together with the basic heads so it lives
+# in the same shared library as the MMHA dispatcher that calls into it. Uses Dh
+# in {64, 128}.
+list(APPEND SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/cascadeAttentionKernel.cu)
+
 # skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
   set(extra_heads 256)

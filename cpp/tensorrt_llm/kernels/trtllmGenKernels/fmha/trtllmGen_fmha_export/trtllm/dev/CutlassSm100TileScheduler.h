@@ -31,6 +31,7 @@
 #include "cutlass/conv/convnd_problem_shape.hpp"
 #include "cutlass/conv/detail.hpp"
 
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace trtllm::dev {
@@ -337,9 +338,7 @@ public:
                                                                   cuda_adapter);
   }
 
-  static bool can_implement(Arguments const& args) {
-    return true;
-  }
+  static bool can_implement(Arguments const& args) { return true; }
 
   //
   // Constructors
@@ -525,14 +524,10 @@ public:
   // Returns whether the block assigned this work should compute the epilogue for the corresponding
   // output tile. For the basic tile scheduler, this is always true.
   CUTLASS_HOST_DEVICE
-  static bool compute_epilogue(WorkTileInfo const&, Params const&) {
-    return true;
-  }
+  static bool compute_epilogue(WorkTileInfo const&, Params const&) { return true; }
 
   CUTLASS_HOST_DEVICE
-  static bool compute_epilogue(WorkTileInfo const&) {
-    return true;
-  }
+  static bool compute_epilogue(WorkTileInfo const&) { return true; }
 
   // Returns whether fixup is needed for `work_tile_info`. None of the work units returned by
   // this scheduler require fixup, since none of the work units partition the reduction extent.
@@ -567,9 +562,7 @@ public:
   // this scheduler only schedules work in units of single, full output tiles, the WorkTileInfo
   // passed in should not be used after having been processed.
   CUTLASS_DEVICE
-  static bool continue_current_work(WorkTileInfo&) {
-    return false;
-  }
+  static bool continue_current_work(WorkTileInfo&) { return false; }
 
   //
   // Implementation Helpers
@@ -627,25 +620,17 @@ public:
   }
 
   CUTLASS_DEVICE
-  static CLCResponse make_invalid_response() {
-    return CLCResponse{};
-  }
+  static CLCResponse make_invalid_response() { return CLCResponse{}; }
 
   // Set data SMEM ptr
   CUTLASS_DEVICE
-  void set_data_ptr(CLCResponse* clc_response_ptr) {
-    clc_response_ptr_ = clc_response_ptr;
-  }
+  void set_data_ptr(CLCResponse* clc_response_ptr) { clc_response_ptr_ = clc_response_ptr; }
 
   CUTLASS_DEVICE
-  static bool valid_warpgroup_in_work_tile(WorkTileInfo const& work_tile_info) {
-    return true;
-  }
+  static bool valid_warpgroup_in_work_tile(WorkTileInfo const& work_tile_info) { return true; }
 
   CUTLASS_DEVICE
-  static bool requires_separate_reduction(Params const& params) {
-    return false;
-  }
+  static bool requires_separate_reduction(Params const& params) { return false; }
 
   template <class FrgTensorC>
   CUTLASS_DEVICE static void fixup(Params const&,
@@ -838,7 +823,7 @@ public:
   // Data Members
   //
   CLCResponse* clc_response_ptr_ = nullptr;
-  Params const& params_;
+  Params params_;
   dim3 block_id_in_cluster_ = {0, 0, 0};
 };
 

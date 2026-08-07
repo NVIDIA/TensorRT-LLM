@@ -1,5 +1,16 @@
-# Imported first to register the op before the chain via ..modules.attention re-enters this package.
-from . import triton_fused_inv_rope_fp8_quant  # noqa: F401  # isort: skip
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
 
@@ -11,9 +22,9 @@ from .torch_custom_ops import BufferKind, bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 
-# Attention custom ops (attn_custom_op_inplace, mla_custom_op_inplace) are defined in
-# modules.attention and must be imported from there. They are not re-exported here to
-# avoid circular imports: custom_ops must not depend on modules.attention.
+# Attention custom ops are defined in modules.attention, and MLA custom ops are
+# defined in modules.mla. They are not re-exported here to avoid circular imports:
+# custom_ops must not depend on modules.attention or modules.mla.
 
 
 def inplace_slice_copy(dest: torch.Tensor, src: torch.Tensor, dim1_start: int,
@@ -72,6 +83,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     if IS_MEGAMOE_OP_AVAILABLE:
         from .cute_dsl_megamoe_custom_op import cute_dsl_megamoe_nvfp4_blackwell
         __all__ += ['cute_dsl_megamoe_nvfp4_blackwell']
+
+if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:
+    from .cute_dsl_kimi_k3_custom_ops import kda_prefill
+    __all__ += ['kda_prefill']
 
 if IS_CUDA_TILE_AVAILABLE:
     from .cuda_tile_custom_ops import (cuda_tile_rms_norm,

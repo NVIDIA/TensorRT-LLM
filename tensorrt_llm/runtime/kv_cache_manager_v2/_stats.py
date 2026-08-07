@@ -64,6 +64,11 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
     iter_offload_bytes: int = 0
     iter_intra_device_copy_blocks: int = 0
     iter_intra_device_copy_bytes: int = 0
+    # Host-tier pages released by LRU without ever being onboarded back to GPU
+    # in the lifetime since they were offloaded. Counted at the drop site in
+    # _storage_manager._prepare_free_slots when is_last_level(lvl).
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
 
     @property
     def iter_cache_hit_rate(self) -> float:
@@ -71,3 +76,25 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
         if self.iter_reused_blocks == 0 or total == 0:
             return 0.0
         return self.iter_reused_blocks / total
+
+
+@dataclass(slots=True)
+class SsmSnapshotIterationStatsDelta(_StatsDeltaMixin):
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+
+    @property
+    def iter_snapshot_hit_rate(self) -> float:
+        if self.iter_snapshot_hits == 0 or self.iter_snapshot_lookups == 0:
+            return 0.0
+        return self.iter_snapshot_hits / self.iter_snapshot_lookups
+
+
+_KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
+    field.name for field in fields(KVCacheIterationStatsDelta)
+)

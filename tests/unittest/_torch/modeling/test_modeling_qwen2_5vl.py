@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -13,12 +14,19 @@ from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import Qwen2_5_VLConfig
 from transformers import \
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalLM
+from transformers import Qwen2VLConfig
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.models.qwen2_vl.modeling_qwen2_vl import \
+    Qwen2VisionTransformerPretrainedModel
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
-    Qwen2_5_VLModel, Qwen2VLInputProcessorBase, _prepare_qwen_vl_mrope_config)
+    Qwen2_5_VisionModel, Qwen2_5_VLModel, Qwen2VisionModelBase,
+    Qwen2VLInputProcessorBase, Qwen2VLModel, _prepare_qwen_vl_mrope_config,
+    _prepare_qwen_vl_vision_attn_metadata)
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
 from tensorrt_llm._utils import get_sm_version
@@ -350,6 +358,66 @@ class _FakeRotaryEmbedding:
         return cos, cos + 1000
 
 
+def test_qwen2_vision_adapter_extracts_pooler_output():
+    """The real Transformers 5.x Qwen2 encoder wraps LLM features in pooler_output."""
+    config = Qwen2VLConfig(dtype="float32",
+                           vision_config={
+                               "depth": 1,
+                               "embed_dim": 32,
+                               "hidden_size": 64,
+                               "num_heads": 4,
+                               "mlp_ratio": 2,
+                               "patch_size": 2,
+                               "spatial_merge_size": 2,
+                               "temporal_patch_size": 1,
+                               "in_channels": 3,
+                           })
+    vision_model = Qwen2VisionModelBase(
+        ModelConfig(pretrained_config=config),
+        Qwen2VisionTransformerPretrainedModel).eval()
+    # Set to eager to make the test CPU-only.
+    vision_model.visual.config._attn_implementation = "eager"
+    multimodal_params = [
+        MultimodalParams(
+            multimodal_data={
+                "image": {
+                    "pixel_values": torch.randn(16, 12),
+                    "image_grid_thw": torch.tensor([[1, 4, 4]]),
+                }
+            })
+    ]
+    image = multimodal_params[0].multimodal_data["image"]
+    encoder_output = vision_model.visual(image["pixel_values"],
+                                         grid_thw=image["image_grid_thw"])
+
+    result = vision_model(multimodal_params)
+
+    assert isinstance(encoder_output, BaseModelOutputWithPooling)
+    assert len(result) == 1
+    torch.testing.assert_close(result[0], encoder_output.pooler_output)
+
+
+def test_qwen2_vl_device_paths_move_mrope_tensors_to_cuda():
+    multimodal_params = MultimodalParams(
+        multimodal_data={
+            "mrope_config": {
+                "mrope_position_ids":
+                torch.arange(6, dtype=torch.int32).reshape(3, 1, 2),
+                "mrope_position_deltas":
+                torch.tensor([[2]], dtype=torch.int32),
+            }
+        })
+    device_paths = Qwen2VLModel.multimodal_data_device_paths.fget(None)
+    multimodal_params.to_device("multimodal_data",
+                                "cuda",
+                                target_keywords=device_paths)
+
+    mrope_config = multimodal_params.multimodal_data["mrope_config"]
+
+    assert mrope_config["mrope_position_ids"].is_cuda
+    assert mrope_config["mrope_position_deltas"].is_cuda
+
+
 def _mrope_param(delta: int) -> MultimodalParams:
     return MultimodalParams(
         multimodal_data={
@@ -428,6 +496,85 @@ def test_prepare_qwen_vl_mrope_config_pure_generation_reads_deltas_only():
     torch.testing.assert_close(
         config["mrope_position_deltas"],
         torch.tensor([[11], [22]], device="cuda", dtype=torch.int32))
+
+
+class _StubVisionAttentionMetadata:
+    """CPU-only metadata stub for Qwen vision sequence preparation."""
+
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+        self._seq_lens = torch.empty(0, dtype=torch.int32)
+        self.seq_lens_cuda = torch.empty(0, dtype=torch.int32)
+        self.prepare_encoder_only_calls = 0
+
+    @property
+    def seq_lens(self) -> torch.Tensor:
+        return self._seq_lens
+
+    @seq_lens.setter
+    def seq_lens(self, value: torch.Tensor) -> None:
+        self._seq_lens = value
+        self.seq_lens_cuda = value
+
+    def prepare_encoder_only(self) -> None:
+        self.prepare_encoder_only_calls += 1
+
+
+def test_qwen_vision_metadata_uses_fixed_max_seq_len() -> None:
+    metadata = _StubVisionAttentionMetadata()
+
+    _prepare_qwen_vl_vision_attn_metadata([256], metadata, max_seq_len=65536)
+    assert metadata.max_seq_len == 65536
+    assert metadata.seq_lens.tolist() == [256]
+    assert metadata.cu_q_seqlens.tolist() == [0, 256]
+
+    _prepare_qwen_vl_vision_attn_metadata([128, 512],
+                                          metadata,
+                                          max_seq_len=65536)
+    assert metadata.max_seq_len == 65536
+    assert metadata.seq_lens.tolist() == [128, 512]
+    assert metadata.cu_q_seqlens.tolist() == [0, 128, 640]
+    assert metadata.cu_kv_seqlens.tolist() == [0, 128, 640]
+    assert metadata.prepare_encoder_only_calls == 2
+
+
+def test_qwen_vision_metadata_allows_segment_at_fixed_max_seq_len() -> None:
+    metadata = _StubVisionAttentionMetadata()
+
+    _prepare_qwen_vl_vision_attn_metadata([65536], metadata, max_seq_len=65536)
+
+    assert metadata.max_seq_len == 65536
+    assert metadata.seq_lens.tolist() == [65536]
+
+
+def test_qwen_vision_metadata_rejects_segment_above_fixed_max_seq_len() -> None:
+    metadata = _StubVisionAttentionMetadata()
+
+    with pytest.raises(ValueError, match=r"exceeds.*maximum=65536"):
+        _prepare_qwen_vl_vision_attn_metadata([128, 65537],
+                                              metadata,
+                                              max_seq_len=65536)
+
+    assert metadata.prepare_encoder_only_calls == 0
+
+
+def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
+    hf_config = Qwen2_5_VLConfig.from_dict(copy.deepcopy(QWEN2_5_VL_7B_CONFIG))
+    model_config = ModelConfig(pretrained_config=hf_config,
+                               skip_create_weights_in_init=True)
+    model = Qwen2VisionModelBase(model_config, Qwen2_5_VisionModel).visual
+    model.metadata_cls = _StubVisionAttentionMetadata
+
+    max_num_requests = 8
+    max_num_tokens = 16
+    fixed_max_seq_len = 65_536
+    expected_window_max_seq_len = 64
+    model.setup_attn_metadata(max_num_requests=max_num_requests,
+                              max_num_tokens=max_num_tokens)
+    model.set_attn_max_seq_len(fixed_max_seq_len)
+
+    assert model._full_attn_max_seq_len == fixed_max_seq_len
+    assert model._window_attn_max_seq_len == expected_window_max_seq_len
 
 
 # ---------------------------------------------------------------------------

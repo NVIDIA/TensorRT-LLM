@@ -20,6 +20,8 @@ The server also supports the following endpoints:
 
 The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
 
+For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
+
 Starting a Server
 -----------------
 

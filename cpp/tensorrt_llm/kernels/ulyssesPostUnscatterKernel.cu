@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "ulyssesPostUnscatterKernel.h"
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -27,47 +28,61 @@ namespace kernels
 namespace
 {
 
-// Each block handles one (p, b, sp) tile across all H heads.
-// Reads H*D bf16 contiguous from input; writes the same bytes scattered across
-// H rows of the output in NHD layout [B, P*Sp, H, D]. The caller (op wrapper)
-// returns this storage as a transpose-view when an HND-shape output is needed,
-// so the resulting tensor is HND-shape with NHD-stride (matching what the
-// sync `_forward_unfused` path produces via `q.transpose(1, 2)`).
-//
-// threads/block = H * (D / 8); each thread copies one uint4 (8 bf16).
+// Each block copies one (p, b, psp) tile of ONE tensor (H*D bf16) into NHD storage
+// [B, P*Sp, H, D]. Q/K/V may differ in (Sp, H) (cross-attn: Q=audio vs K/V=video): grid.x
+// is packed over all three tensors' tiles (P*Sp_q + P*Sp_k + P*Sp_v) and each block maps
+// blockIdx.x to its tensor, so no block is idle even when shapes differ. Block is sized to
+// max(H)*(D/8); threads with h >= H idle only when H differs (GQA).
 template <typename T>
 __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* __restrict__ k_in,
     T const* __restrict__ v_in, T* __restrict__ q_out, T* __restrict__ k_out, T* __restrict__ v_out, int const P,
-    int const B, int const Sp, int const H, int const D, int const vec_per_row)
+    int const B, int const D, int const vec_per_row, int const Sp_q, int const H_q, int const Sp_k, int const H_k,
+    int const Sp_v, int const H_v)
 {
     constexpr int VEC = 8;
 
+    // blockIdx.x packed over Q|K|V tiles: [0, P*Sp_q) -> Q, next P*Sp_k -> K, rest -> V.
+    int const nq = P * Sp_q;
+    int const nk = P * Sp_k;
+    int const bx = blockIdx.x;
+
+    T const* in_ptr;
+    T* out_ptr;
+    int Sp, H, psp;
+    if (bx < nq)
+    {
+        in_ptr = q_in;
+        out_ptr = q_out;
+        Sp = Sp_q;
+        H = H_q;
+        psp = bx;
+    }
+    else if (bx < nq + nk)
+    {
+        in_ptr = k_in;
+        out_ptr = k_out;
+        Sp = Sp_k;
+        H = H_k;
+        psp = bx - nq;
+    }
+    else
+    {
+        in_ptr = v_in;
+        out_ptr = v_out;
+        Sp = Sp_v;
+        H = H_v;
+        psp = bx - nq - nk;
+    }
+
     int const h = threadIdx.x / vec_per_row;
+    if (h >= H) // block sized to max(H); mask extra heads only when H differs (GQA)
+        return;
     int const vec_idx = threadIdx.x - h * vec_per_row;
 
-    int const psp = blockIdx.x; // 0 .. P*Sp-1
     int const p = psp / Sp;
     int const sp = psp - p * Sp;
     int const b = blockIdx.y;
     int const PSp = P * Sp;
-
-    T const* in_ptr;
-    T* out_ptr;
-    switch (blockIdx.z)
-    {
-    case 0:
-        in_ptr = q_in;
-        out_ptr = q_out;
-        break;
-    case 1:
-        in_ptr = k_in;
-        out_ptr = k_out;
-        break;
-    default:
-        in_ptr = v_in;
-        out_ptr = v_out;
-        break;
-    }
 
     // in[p, b, sp, h, d]: ((((p*B + b)*Sp + sp)*H + h)*D + vec_idx*VEC)
     // NHD out[b, p*Sp+sp, h, d]: (((b*PSp + psp)*H + h)*D + vec_idx*VEC)
@@ -83,16 +98,18 @@ __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* 
 } // namespace
 
 void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* v_in, void* q_out, void* k_out,
-    void* v_out, int P, int B, int Sp, int H, int D, cudaStream_t stream)
+    void* v_out, int P, int B, int D, int Sp_q, int H_q, int Sp_k, int H_k, int Sp_v, int H_v, cudaStream_t stream)
 {
     constexpr int VEC = 8;
     TLLM_CHECK_WITH_INFO(D % VEC == 0, "ulyssesPostUnscatter: D must be a multiple of 8 (uint4 vec), got %d", D);
     int const vec_per_row = D / VEC;
-    int const threads = H * vec_per_row;
+    int const H_max = std::max(H_q, std::max(H_k, H_v));
+    int const threads = H_max * vec_per_row;
     TLLM_CHECK_WITH_INFO(threads <= 1024,
-        "ulyssesPostUnscatter: threads/block (H*D/8) must be <= 1024, got H=%d D=%d -> %d", H, D, threads);
+        "ulyssesPostUnscatter: threads/block (maxH*D/8) must be <= 1024, got maxH=%d D=%d -> %d", H_max, D, threads);
 
-    dim3 const grid(P * Sp, B, 3);
+    int const total_tiles = P * (Sp_q + Sp_k + Sp_v); // packed over Q/K/V, no idle blocks
+    dim3 const grid(total_tiles, B, 1);
     dim3 const block(threads);
 
     auto* q_in_typed = reinterpret_cast<__nv_bfloat16 const*>(q_in);
@@ -102,8 +119,8 @@ void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* 
     auto* k_out_typed = reinterpret_cast<__nv_bfloat16*>(k_out);
     auto* v_out_typed = reinterpret_cast<__nv_bfloat16*>(v_out);
 
-    ulyssesPostUnscatterKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
-        q_in_typed, k_in_typed, v_in_typed, q_out_typed, k_out_typed, v_out_typed, P, B, Sp, H, D, vec_per_row);
+    ulyssesPostUnscatterKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(q_in_typed, k_in_typed, v_in_typed,
+        q_out_typed, k_out_typed, v_out_typed, P, B, D, vec_per_row, Sp_q, H_q, Sp_k, H_k, Sp_v, H_v);
 }
 
 } // namespace kernels

@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
 ConfigurableMoE: Composition-based Configurable MoE Module
 
@@ -38,7 +37,12 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    ActType_TrtllmGen,
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -73,7 +77,6 @@ class ConfigurableMoE(MoE):
     # authoritative check -- if the chosen inner backend doesn't opt in, its
     # ``MoE.__init__`` will still raise.
     _supports_non_divisible_ep: bool = True
-
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -160,6 +163,10 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+        trtllm_gen_activation_alpha: Optional[float] = None,
+        trtllm_gen_activation_beta: Optional[float] = None,
+        communication_method: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -174,12 +181,14 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        self._override_quant_config = override_quant_config
         if override_quant_config is not None:
             self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
+        self.communication_method = communication_method
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -189,6 +198,9 @@ class ConfigurableMoE(MoE):
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
+            trtllm_gen_activation_type=trtllm_gen_activation_type,
+            trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+            trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             **kwargs,
         )
 
@@ -272,14 +284,16 @@ class ConfigurableMoE(MoE):
         model_config: ModelConfig,
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen],
+        trtllm_gen_activation_alpha: Optional[float],
+        trtllm_gen_activation_beta: Optional[float],
         **kwargs,
     ) -> None:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
 
         Why this dance:
-        - ``init_load_balancer=False`` / ``without_comm=True``: the backend
-          would otherwise re-register itself with the load balancer and
-          initialize its own communication; ConfigurableMoE owns both.
+        - ``init_load_balancer=False``: the backend would otherwise
+          re-register itself with the load balancer; ConfigurableMoE owns it.
         - ``layer_idx=None``: the wrapper passes the real ``layer_idx`` to
           ``MoE.__init__`` to drive load-balancer setup. The backend
           receives ``None`` so its own EPLB hooks no-op until we sync the
@@ -326,8 +340,10 @@ class ConfigurableMoE(MoE):
                 swiglu_limit=kwargs.get("swiglu_limit"),
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
-                without_comm=True,
                 activation_type=self.activation_type,
+                trtllm_gen_activation_type=trtllm_gen_activation_type,
+                trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
+                trtllm_gen_activation_beta=trtllm_gen_activation_beta,
             )
 
         # Backend acceptance is validated at the end of ``__init__`` instead
@@ -347,8 +363,14 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        if not backend_model_config.skip_create_weights_in_init:
-            self.backend.create_weights()
+        # Layerwise quantization is applied after the model is constructed.
+        # Defer allocation so the backend is built from the final wrapper
+        # quant_config rather than an earlier global value. Module exclusions
+        # reset _weights_created on matching modules during __post_init__, so
+        # unrelated exclusions retain the historical eager allocation path.
+        has_post_init_quant_config = model_config.quant_config_dict is not None
+        if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
+            self.create_weights()
 
     def _supports_load_balancer(self) -> bool:
         """Check if this MoE implementation supports load balancer.
@@ -363,6 +385,17 @@ class ConfigurableMoE(MoE):
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
+
+    @property
+    def num_fused_shared_expert(self) -> int:
+        """Expose the backend's fused-shared-expert count so model code (e.g.
+        DeepseekV3 post_load_weights / shared-expert TP sizing) sees it through
+        this wrapper. Returns 0 when the backend does not support fusion."""
+        return getattr(self.backend, "num_fused_shared_expert", 0)
+
+    def fuse_shared_expert(self, shared_experts):
+        """Delegate shared-expert fusion to the backend (e.g. TRTLLMGenFusedMoE)."""
+        return self.backend.fuse_shared_expert(shared_experts)
 
     def validate_config(self):
         """
@@ -429,7 +462,12 @@ class ConfigurableMoE(MoE):
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
-            num_rows = sum(all_rank_num_tokens)
+            # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
+            # from [x.shape[0]] before calling here, so it must be a single-element list.
+            assert len(all_rank_num_tokens) == 1, (
+                f"non-DP path expects a single-element list, got {len(all_rank_num_tokens)}"
+            )
+            num_rows = all_rank_num_tokens[0]
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
 
     def split_chunk(self, split_token_num: int, split_num_chunks: int) -> List[int]:
@@ -538,6 +576,7 @@ class ConfigurableMoE(MoE):
             alltoall_result_do_sum=True,
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
+            communication_method=self.communication_method,
         )
 
     def forward_impl(
@@ -644,6 +683,14 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "create_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement create_weights()"
         )
+        # An explicit override is authoritative. Otherwise use the wrapper's
+        # final value, after model __post_init__ has applied layerwise and
+        # exclusion-based quantization settings.
+        self.backend.quant_config = (
+            self._override_quant_config
+            if self._override_quant_config is not None
+            else self.quant_config
+        )
         return self.backend.create_weights()
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
@@ -654,17 +701,33 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "load_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement load_weights()"
         )
-        return self.backend.load_weights(weights, allow_partial_loading)
+        result = self.backend.load_weights(weights, allow_partial_loading)
+        if weights:
+            self._weights_transformed = False
+        return result
 
-    def post_load_weights(self):
+    def transform_weights(self) -> None:
         """
-        Post load weights processing - delegated to backend
+        Transform weights - delegated to backend
 
         """
-        assert hasattr(self.backend, "post_load_weights"), (
-            f"Backend {self.backend.__class__.__name__} must implement post_load_weights()"
+        if getattr(self, "_weights_transformed", False):
+            return
+        assert hasattr(self.backend, "transform_weights"), (
+            f"Backend {self.backend.__class__.__name__} must implement transform_weights()"
         )
-        return self.backend.post_load_weights()
+        self.backend.transform_weights()
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
+        """
+        Cache derived state - delegated to backend
+
+        """
+        assert hasattr(self.backend, "cache_derived_state"), (
+            f"Backend {self.backend.__class__.__name__} must implement cache_derived_state()"
+        )
+        self.backend.cache_derived_state()
 
     def process_weights_after_loading(self):
         """
@@ -707,6 +770,14 @@ class ConfigurableMoE(MoE):
             f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
         )
         return self.backend._weights_created
+
+    @_weights_created.setter
+    def _weights_created(self, value: bool) -> None:
+        """Update backend weight state during post-init quantization changes."""
+        assert hasattr(self.backend, "_weights_created"), (
+            f"Backend {self.backend.__class__.__name__} must have _weights_created attribute"
+        )
+        self.backend._weights_created = value
 
     # ========== Explicit Backend Attribute Proxies ==========
     # These properties delegate to backend for commonly accessed attributes

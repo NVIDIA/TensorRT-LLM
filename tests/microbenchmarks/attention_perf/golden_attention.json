@@ -1,25 +1,166 @@
 {
-  "_comment": "Per-(case_id, arch) golden. Empty arch map => bootstrap: the test skips and prints the observed value. DISCRETE golden = exact scalar (== assert). CONTINUOUS golden = object {baseline_ms, cv, n, [k_sigma], [rel_floor]}; gate = baseline_ms*(1+max(k_sigma*cv, rel_floor)), defaults k_sigma=4, rel_floor=0.01. A legacy scalar continuous entry still works via the baseline*1.05 fallback. cv MUST come from a multi-run bootstrap; sm120 = cross-session (5 independent containers), sm90/sm100/sm103 = same-session REPEAT=5 (floor absorbs the gap; refine with cross-session later).",
-  "attn_ctx_dispatch":   {"sm120": false, "sm90": false, "sm100": false, "sm103": false},
-  "attn_decode_dispatch": {"sm120": 49,   "sm90": 59,    "sm100": 71,    "sm103": 71},
-  "attn_ctx_fmha_time": {
-    "sm120": {"baseline_ms": 2.7882, "cv": 0.0003, "n": 5,
-              "_src": "xsession build2800, 5 independent containers: 2.7876/2.7863/2.7884/2.7882/2.7884; cv 0.029% -> 1% floor binds"},
-    "sm90":  {"baseline_ms": 1.2344, "cv": 0.0047, "n": 5,
-              "_src": "samesession build2801 REPEAT=5 H100: 1.2220/1.2344/1.2389/1.2306/1.2359; cv 0.47% -> gate ~1.9%"},
-    "sm100": {"baseline_ms": 0.6677, "cv": 0.0009, "n": 5,
-              "_src": "samesession build2801 REPEAT=5 B200: 0.6687/0.6677/0.6671/0.6677/0.6671; cv 0.09% -> 1% floor binds"},
-    "sm103": {"baseline_ms": 1.0384, "cv": 0.0019, "n": 5,
-              "_src": "samesession build2801 REPEAT=5 B300-pcie: 1.0373/1.0363/1.0405/1.0384/1.0415; cv 0.19% -> 1% floor binds"}
+ "_comment": "Per-(case_id, GPU device name) golden. KEY IS THE GPU DEVICE NAME (torch.cuda.get_device_name == CSV gpu_name == DB `gpu`), NOT sm_arch \u2014 one arch spans multiple GPUs (sm90=H100/H200/H20, sm120=RTX-PRO-6000/5090) with different perf. Empty case map => bootstrap (test skips, prints observed). DISCRETE golden = exact scalar (== assert). CONTINUOUS golden = {baseline_ms, cv, n, [k_sigma], [rel_floor]}; gate = baseline_ms*(1+max(k_sigma*cv, rel_floor)), defaults k_sigma=4 rel_floor=0.01. A legacy scalar continuous entry still works via the baseline*1.05 fallback. cv MUST come from a multi-run bootstrap; status:provisional entries are n=1 seeds with a wide rel_floor pending cluster re-bless. HISTORY: 2026-06-26 launch_count goldens RE-BLESSED under the per-case-subprocess + CUPTI-drain isolated harness \u2014 the old discrete launch_counts (49/59/71) were CUPTI-async-buffer contamination, not the real forward (true sm120 decode launch_count is 1); only sm120 re-measured isolated so far, attn_decode_dispatch sm90/sm100/sm103 DROPPED (bootstrap-skip) until re-blessed on cluster under the isolated harness; continuous baselines sm120 re-measured isolated (build2806), sm90/sm100/sm103 still pre-isolation same-session REPEAT=5 values (re-bless on cluster too); launch_count==1 is a weak tripwire (toy config fuses to 1 kernel) \u2014 add larger pinned cases. 2026-06-29 MIGRATED arch->device-name keys; seeded H100/B200 long-seq (q8b/l70b ctx_fmha+decode_xqa) from nightly n=1.",
+ "attn_ctx_dispatch": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": false,
+  "NVIDIA H100 80GB HBM3": false,
+  "NVIDIA B200": false,
+  "NVIDIA B300": false
+ },
+ "attn_decode_dispatch": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1
+ },
+ "attn_ctx_fmha_time": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "baseline_ms": 2.986,
+   "cv": 0.0002,
+   "n": 5,
+   "_src": "ISOLATED harness (per-case subprocess + CUPTI drain) build2806 REPEAT=5: 2.986/2.9862/2.9864/2.9851/2.9851; cv 0.019% -> 1% floor binds. NOTE 2.99 vs old seed 2.79 is a cross-day env diff (proven NOT rc18->rc19, NOT contamination); verify clock-lock actually engages before trusting as a tight baseline."
   },
-  "attn_decode_xqa_time": {
-    "sm120": {"baseline_ms": 0.0858, "cv": 0.0036, "n": 5,
-              "_src": "xsession build2800, 5 independent containers: 0.0865/0.0858/0.0856/0.0858/0.0860; cv 0.36% -> k*cv~1.43% gate"},
-    "sm90":  {"baseline_ms": 0.1183, "cv": 0.0104, "n": 5,
-              "_src": "samesession build2801 REPEAT=5 H100: 0.1191/0.1191/0.1164/0.1183/0.1164; cv 1.04% -> gate ~4.2%"},
-    "sm100": {"baseline_ms": 0.0968, "cv": 0.0041, "n": 5,
-              "_src": "samesession build2801 REPEAT=5 B200: 0.0975/0.0964/0.0965/0.0968/0.0970; cv 0.41% -> gate ~1.6%"},
-    "sm103": {"baseline_ms": 0.0532, "cv": 0.0504, "n": 5, "status": "flaky",
-              "_src": "samesession build2801 REPEAT=5 B300-pcie: 0.0599/0.0532/0.0532/0.0553/0.0522; cv 5.04% (first val warmup outlier; drop-first cv 2.11%) -> gate ~20%, NEARLY USELESS. INSENSITIVE case: 0.053ms kernel too short for stable CUDA-event timing on fast B300. TODO raise warmup/iters or treat as discrete-only (launch_count=71 still guards structure)."}
+  "NVIDIA H100 80GB HBM3": {
+   "baseline_ms": 1.2344,
+   "cv": 0.0047,
+   "n": 5,
+   "_src": "samesession build2801 REPEAT=5 H100: 1.2220/1.2344/1.2389/1.2306/1.2359; cv 0.47% -> gate ~1.9%"
+  },
+  "NVIDIA B200": {
+   "baseline_ms": 0.6677,
+   "cv": 0.0009,
+   "n": 5,
+   "_src": "samesession build2801 REPEAT=5 B200: 0.6687/0.6677/0.6671/0.6677/0.6671; cv 0.09% -> 1% floor binds"
+  },
+  "NVIDIA B300": {
+   "baseline_ms": 1.0384,
+   "cv": 0.0019,
+   "n": 5,
+   "_src": "samesession build2801 REPEAT=5 B300-pcie: 1.0373/1.0363/1.0405/1.0384/1.0415; cv 0.19% -> 1% floor binds"
   }
+ },
+ "attn_decode_xqa_time": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "baseline_ms": 0.084,
+   "cv": 0.0097,
+   "n": 5,
+   "_src": "ISOLATED REPEAT=5 build2814(539ee22) 2026-07-01: 0.0860/0.0840/0.0840/0.0840/0.0840; run-1 cold-container spike +2.4%, cv 0.97% -> 4sigma gate 3.9% absorbs it. Nightly=REPEAT1 fresh container measures the COLD value, so gate must cover run-1. Supersedes 0.084/cv0.11% (false-flagged nightly)."
+  },
+  "NVIDIA H100 80GB HBM3": {
+   "baseline_ms": 0.1183,
+   "cv": 0.0104,
+   "n": 5,
+   "_src": "samesession build2801 REPEAT=5 H100: 0.1191/0.1191/0.1164/0.1183/0.1164; cv 1.04% -> gate ~4.2%"
+  },
+  "NVIDIA B200": {
+   "baseline_ms": 0.0968,
+   "cv": 0.0041,
+   "n": 5,
+   "_src": "samesession build2801 REPEAT=5 B200: 0.0975/0.0964/0.0965/0.0968/0.0970; cv 0.41% -> gate ~1.6%"
+  },
+  "NVIDIA B300": {
+   "baseline_ms": 0.0532,
+   "cv": 0.0504,
+   "n": 5,
+   "status": "flaky",
+   "_src": "samesession build2801 REPEAT=5 B300-pcie: 0.0599/0.0532/0.0532/0.0553/0.0522; cv 5.04% (first val warmup outlier; drop-first cv 2.11%) -> gate ~20%, NEARLY USELESS. INSENSITIVE case: 0.053ms kernel too short for stable CUDA-event timing on fast B300. TODO raise warmup/iters or treat as discrete-only (launch_count=71 still guards structure)."
+  }
+ },
+ "_comment_gqa": "Model-representative GQA cases (isolated harness, build2806). sm120 only so far; other arches bootstrap-skip until re-blessed on cluster. q8b=Qwen3-8B 32/8/128; l70b=64/8/128 (Qwen3-32B/Llama-3.3-70B/Nemotron-Super-49B). Continuous baselines are n=2 smoke values (1% floor binds since cv<0.1%); refine with a K=5 bootstrap.",
+ "attn_q8b_ctx_dispatch": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": false
+ },
+ "attn_q8b_decode_dispatch": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1
+ },
+ "attn_l70b_ctx_dispatch": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": false
+ },
+ "attn_l70b_decode_dispatch": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1
+ },
+ "attn_q8b_ctx_fmha_time": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "baseline_ms": 0.2673,
+   "cv": 0.0247,
+   "n": 5,
+   "_src": "ISOLATED REPEAT=5 build2814(539ee22) 2026-07-01: 0.2839/0.2686/0.2662/0.2673/0.2673; run-1 cold +6.2%, cv 2.47% -> 4sigma gate ~9.9%. Supersedes n=2 build2806 0.255 (undersampled, persistently false-flagged nightly REGRESSION)."
+  },
+  "NVIDIA H100 80GB HBM3": {
+   "baseline_ms": 0.1277,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.1906); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  },
+  "NVIDIA B200": {
+   "baseline_ms": 0.1046,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.3009); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  }
+ },
+ "attn_q8b_decode_xqa_time": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "baseline_ms": 0.7828,
+   "cv": 0.0006,
+   "n": 5,
+   "_src": "ISOLATED REPEAT=5 build2814(539ee22) 2026-07-01: 0.7838/0.7829/0.7826/0.7824/0.7828; cv 0.06% -> 1% floor. Refresh of n=2 build2806 0.7835."
+  },
+  "NVIDIA H100 80GB HBM3": {
+   "baseline_ms": 0.6977,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.0343); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  },
+  "NVIDIA B200": {
+   "baseline_ms": 0.2095,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.1675); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  }
+ },
+ "attn_l70b_ctx_fmha_time": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "baseline_ms": 0.4465,
+   "cv": 0.0232,
+   "n": 5,
+   "_src": "ISOLATED REPEAT=5 build2814(539ee22) 2026-07-01: 0.4724/0.4451/0.4462/0.4465/0.4470; run-1 cold +5.8%, cv 2.32% -> 4sigma gate ~9.3%. Supersedes n=2 build2806 0.4508 (cold runs could exceed tight gate)."
+  },
+  "NVIDIA H100 80GB HBM3": {
+   "baseline_ms": 0.2006,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.1221); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  },
+  "NVIDIA B200": {
+   "baseline_ms": 0.1188,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.2523); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  }
+ },
+ "attn_l70b_decode_xqa_time": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "baseline_ms": 1.1418,
+   "cv": 0.0002,
+   "n": 5,
+   "_src": "ISOLATED REPEAT=5 build2814(539ee22) 2026-07-01: 1.1423/1.1418/1.1416/1.1418/1.1418; cv 0.02% -> 1% floor. Refresh of n=2 build2806 1.1424."
+  },
+  "NVIDIA H100 80GB HBM3": {
+   "baseline_ms": 1.3251,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.0186); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  },
+  "NVIDIA B200": {
+   "baseline_ms": 0.211,
+   "rel_floor": 0.05,
+   "n": 1,
+   "status": "provisional",
+   "_src": "n=1 provisional from nightly 20260628 build2811 (single run, in-call cv=0.1692); 5% gate to avoid noise false-flags; PENDING cluster REPEAT=5 re-bless"
+  }
+ }
 }

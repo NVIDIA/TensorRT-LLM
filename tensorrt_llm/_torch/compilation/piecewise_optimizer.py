@@ -16,7 +16,22 @@ from ..utils import (get_model_extra_attrs,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
-from .utils import get_capture_piecewise_cuda_graph_flag, is_call_function
+from .utils import (get_capture_piecewise_cuda_graph_flag,
+                    get_optional_trtllm_op, is_call_function)
+
+
+def _piecewise_boundary_ops():
+    op_names = [
+        "attn_custom_op_inplace",
+        "mla_custom_op_inplace",
+        "mla_dsa_attn_inplace",
+        "gdn_custom_op_inplace",
+        "minimax_m3_attn_custom_op_inplace",
+    ]
+    return [
+        op for op in (get_optional_trtllm_op(op_name) for op_name in op_names)
+        if op is not None
+    ]
 
 
 class PiecewiseInterpreter(Interpreter):
@@ -47,6 +62,7 @@ class PiecewiseInterpreter(Interpreter):
         self.enable_inductor = enable_inductor
         self.num_events = 0
         self.max_num_streams = max_num_streams
+        self.runners: List["PiecewiseRunner"] = []
 
     def run(self, *args):
         fake_args = [
@@ -89,7 +105,7 @@ class PiecewiseInterpreter(Interpreter):
                 self.num_events = max(self.num_events, num_events)
                 submod.recompile()
 
-            self.module.__dict__[target] = PiecewiseRunner(
+            runner = PiecewiseRunner(
                 submod,
                 target,
                 self.compile_time_num_tokens,
@@ -102,6 +118,8 @@ class PiecewiseInterpreter(Interpreter):
                 self.piecewise_runner_idx == 0,
                 self.piecewise_runner_idx == self.piecewise_runner_num - 1,
             )
+            self.module.__dict__[target] = runner
+            self.runners.append(runner)
             self.piecewise_runner_idx += 1
         return output
 
@@ -160,6 +178,17 @@ class PiecewiseRunner(object):
                 enable_inductor=self.enable_inductor,
                 callable=default_callable,
             )
+
+    def clear_cuda_graphs(self):
+        """Release captures while retaining buckets for a later warmup."""
+        for entry in self.entries.values():
+            if entry.cuda_graph is not None:
+                entry.cuda_graph.reset()
+            entry.cuda_graph = None
+            entry.warmup_count = 0
+            entry.input_addresses = None
+            entry.output_addresses = None
+            entry.output = None
 
     def __call__(self, *args):
         runtime_num_of_token = None
@@ -248,7 +277,7 @@ def piecewise_optimizer(
     capture_num_tokens: Sequence[int],
     graph_pool_handle: tuple[int, int],
     max_num_streams: int = 1,
-) -> tuple[GraphModule, int]:
+) -> tuple[GraphModule, int, List[PiecewiseRunner]]:
     graph_pool_handle = torch.cuda.graph_pool_handle()
     graph = gm.graph
 
@@ -256,25 +285,21 @@ def piecewise_optimizer(
     node_to_graph_id = {}
     idx = 0
     exclude_modules_id = []
+    piecewise_boundary_ops = _piecewise_boundary_ops()
 
     for node in graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if (not stop_partition and is_call_function(node, [
-                torch.ops.trtllm.attn_custom_op_inplace.default,
-                torch.ops.trtllm.mla_custom_op_inplace.default,
-                torch.ops.trtllm.mla_dsa_attn_inplace.default,
-                torch.ops.aten.index.Tensor,
-                torch.ops.aten.cumsum.default,
-        ])):
+        is_boundary = is_call_function(node, piecewise_boundary_ops)
+        stop_target = is_call_function(node, [
+            torch.ops.aten.index.Tensor,
+            torch.ops.aten.cumsum.default,
+        ])
+        if not stop_partition and (is_boundary or stop_target):
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if (node.target != torch.ops.trtllm.attn_custom_op_inplace.default
-                    and node.target
-                    != torch.ops.trtllm.mla_custom_op_inplace.default
-                    and node.target
-                    != torch.ops.trtllm.mla_dsa_attn_inplace.default):
+            if not is_boundary:
                 # We only know it is safe to continue splitting after attention
                 stop_partition = True
             else:
@@ -300,4 +325,4 @@ def piecewise_optimizer(
 
     interpreter.run(*example_inputs)
 
-    return gm, interpreter.num_events
+    return gm, interpreter.num_events, interpreter.runners

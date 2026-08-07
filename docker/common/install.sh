@@ -11,11 +11,10 @@ base=0
 cmake=0
 ccache=0
 cuda_toolkit=0
-tensorrt=0
+cuda_libs=0
 polygraphy=0
 mpi4py=0
 pytorch=0
-opencv=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -35,8 +34,8 @@ while [[ $# -gt 0 ]]; do
             cuda_toolkit=1
             shift 1
             ;;
-        --tensorrt)
-            tensorrt=1
+        --cuda_libs)
+            cuda_libs=1
             shift 1
             ;;
         --polygraphy)
@@ -51,20 +50,15 @@ while [[ $# -gt 0 ]]; do
             pytorch=1
             shift 1
             ;;
-        --opencv)
-            opencv=1
-            shift 1
-            ;;
         --all)
             base=1
             cmake=1
             ccache=1
             cuda_toolkit=1
-            tensorrt=1
+            cuda_libs=1
             polygraphy=1
             mpi4py=1
             pytorch=1
-            opencv=1
             shift 1
             ;;
         *)
@@ -98,10 +92,9 @@ if [ $cuda_toolkit -eq 1 ]; then
     bash $SCRIPT_DIR/install_cuda_toolkit.sh
 fi
 
-if [ $tensorrt -eq 1 ]; then
-    echo "Installing TensorRT..."
-    bash $SCRIPT_DIR/install_tensorrt.sh \
-        --TRT_VER=${TRT_VER} \
+if [ $cuda_libs -eq 1 ]; then
+    echo "Installing CUDA libraries (cuDNN/NCCL/cuBLAS)..."
+    bash $SCRIPT_DIR/install_cuda_libs.sh \
         --CUDA_VER=${CUDA_VER} \
         --CUDNN_VER=${CUDNN_VER} \
         --NCCL_VER=${NCCL_VER} \
@@ -121,11 +114,4 @@ fi
 if [ $pytorch -eq 1 ]; then
     echo "Installing PyTorch..."
     bash $SCRIPT_DIR/install_pytorch.sh $TORCH_INSTALL_TYPE
-fi
-
-if [ $opencv -eq 1 ]; then
-    echo "Installing OpenCV..."
-    bash -c "pip3 uninstall -y opencv"
-    rm -rf /usr/local/lib/python3*/dist-packages/cv2/
-    bash -c "pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir"
 fi

@@ -21,7 +21,8 @@ context_servers:
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384
 generation_servers:
   num_instances: 1
@@ -53,5 +54,6 @@ generation_servers:
     - 128
   print_iter_log: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384

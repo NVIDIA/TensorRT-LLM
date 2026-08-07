@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import os
 from dataclasses import dataclass
 from typing import List
 
 import pytest
 import torch
+from huggingface_hub.errors import StrictDataclassClassValidationError
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import AutoProcessor
 from utils.llm_data import llm_models_root
@@ -108,6 +110,35 @@ EXAONE_4_5_TEST_CONFIG = {
 }
 
 _EXAONE_4_5_ASSET_PATH = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
+
+
+def test_exaone4_5_config_normalizes_trailing_mtp_layer_types():
+    config = copy.deepcopy(EXAONE_4_5_TEST_CONFIG)
+    text_config = config["text_config"]
+    text_config["_num_mtp_layers"] = 1
+    text_config["num_nextn_predict_layers"] = 1
+    text_config["layer_types"].append("sliding_attention")
+
+    hf_config = Exaone4_5Config(**config)
+
+    assert hf_config.text_config.layer_types == [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+    assert len(text_config["layer_types"]) == 5
+
+
+def test_exaone4_5_config_preserves_unexpected_layer_type_mismatch():
+    config = copy.deepcopy(EXAONE_4_5_TEST_CONFIG)
+    text_config = config["text_config"]
+    text_config["_num_mtp_layers"] = 1
+    text_config["num_nextn_predict_layers"] = 1
+    text_config["layer_types"].extend(["sliding_attention", "sliding_attention"])
+
+    with pytest.raises(StrictDataclassClassValidationError, match="number of layer types"):
+        Exaone4_5Config(**config)
 
 
 @dataclass(repr=False)

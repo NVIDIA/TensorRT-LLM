@@ -40,6 +40,8 @@ from tensorrt_llm._torch.custom_ops.userbuffers_custom_ops import \
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              Distributed,
                                              userbuffers_allreduce_finalize)
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
@@ -47,7 +49,6 @@ from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 
 def _allocate_nccl_window_tensor(input_tensor: torch.Tensor,

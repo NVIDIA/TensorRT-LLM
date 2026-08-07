@@ -64,7 +64,15 @@ class CacheReuseAdapter(ABC):
         group_idx: int,
         lg: AttentionLayerGroup,
     ) -> np.ndarray:
-        """All block IDs for *req* in layer group *lg* (dtype ``int64``)."""
+        """Per-layer-group block identifiers for *req* (dtype ``int64``).
+
+        Returned values are **primary memory-pool slot indices**, not raw block IDs:
+        ``KVRegionExtractorV1.extract`` and downstream transfer code do
+        ``base_ptr + slot_idx * slot_bytes`` and require the value to be a current
+        primary-pool offset. With host offload enabled, a block's logical ID can
+        diverge from its primary slot index after offload/onboard, so each backend
+        must translate before returning.
+        """
 
     @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
@@ -97,12 +105,23 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         first_layer = get_global_layer_ids(lg)[0]
         beam_width = req.py_beam_width
-        return np.asarray(
-            self._mgr.get_batch_cache_indices(
-                [req.py_request_id], layer_idx=first_layer, beam_width=beam_width
-            )[0],
-            dtype=np.int64,
+        raw_ids = self._mgr.get_batch_cache_indices(
+            [req.py_request_id], layer_idx=first_layer, beam_width=beam_width
+        )[0]
+        if not raw_ids:
+            return np.array([], dtype=np.int64)
+        # block_id != primary-pool slot index once host offload kicks in; translate
+        # so the cache transceiver's pointer arithmetic is correct. The manager aborts
+        # if any referenced block is currently offloaded — disagg transfer cannot read
+        # from the secondary pool, and a held block can never be offloaded.
+        window_size = lg.sliding_window_size
+        # V1 layer groups carry the manager's window key (full-attention layers get the
+        # max window), so this is always set; see kv_extractor.build_page_table.
+        assert window_size is not None
+        pool_indices = self._mgr.get_memory_pool_block_indices(
+            list(raw_ids), window_size=window_size
         )
+        return np.asarray(pool_indices, dtype=np.int64)
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
@@ -134,6 +153,11 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         return (kv_cache.num_committed_tokens // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+        # V2 already returns per-cache-level pool slot indices (not logical block
+        # IDs), and active sequences GPU-lock their pages (_UniqPageLock enforces
+        # cache_level==GPU), so the slot_ids yielded here are already the right
+        # offsets for primary-pool pointer arithmetic. No translation is needed,
+        # unlike V1 (see _CacheReuseAdapterV1.get_block_ids).
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
@@ -142,12 +166,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         )
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
-        if not self.enable_block_reuse:
-            return
-        kv_cache = self._mgr.kv_cache_map.get(req.py_request_id)
-        if kv_cache is None:
-            return
-        self._mgr.try_commit_blocks_for_reuse(req, kv_cache)
+        self._mgr.try_commit_blocks(req)
 
 
 def create_cache_reuse_adapter(

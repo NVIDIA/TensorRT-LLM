@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/MiniMaxReduceRMSKernel.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -61,7 +62,6 @@
 #include <limits>
 #include <unordered_set>
 
-// using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 using tensorrt_llm::mpi::MpiTag;
@@ -234,8 +234,8 @@ std::set<int> getLocalGroupTorch(std::set<int> const& group)
 class AllreduceOp
 {
 public:
-    AllreduceOp(
-        std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
+    AllreduceOp(std::set<int> group, tensorrt_llm::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op,
+        float eps)
         : mGroup(std::move(group))
         , mIsNVLINKSupported(false)
         , mIsP2PSupported(false)
@@ -248,7 +248,7 @@ public:
     }
 
     AllreduceOp(std::set<int> group, c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_,
-        nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
+        tensorrt_llm::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
         : mGroup(std::move(group))
         , mIsNVLINKSupported(false)
         , mIsP2PSupported(false)
@@ -348,7 +348,7 @@ private:
         {
             TORCH_CHECK(norm_weight, "norm_weight is required for residual rms norm allreduce");
             TORCH_CHECK(!bias, "bias is not supported for residual rms norm allreduce");
-            TORCH_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
+            TORCH_CHECK(mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16);
             auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
             tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle, 0,
                 size, hidden_size, nullptr, norm_weight.value().data_ptr(), mEps, residual.value().data_ptr(),
@@ -1461,7 +1461,7 @@ private:
     bool mIsNVLINKSupported;
     bool mIsP2PSupported;
     bool mIsMNNVLSupported;
-    nvinfer1::DataType mType;
+    tensorrt_llm::DataType mType;
     AllReduceStrategyType mStrategy;
     AllReduceFusionOp mOp;
     float mEps;
@@ -1538,6 +1538,47 @@ void preallocateNCCLWindowBuffer(
 #else
     (void) group;
     (void) buffersPerSize;
+#endif
+}
+
+bool isNCCLWindowBuffer(torch::Tensor const& input, torch::List<int64_t> const& group)
+{
+#if ENABLE_MULTI_DEVICE
+    if (!input.is_cuda() || input.numel() == 0 || group.size() == 0)
+    {
+        return false;
+    }
+
+    std::set<int> groupSet;
+    for (auto const& rank : group)
+    {
+        groupSet.insert(static_cast<int>(rank));
+    }
+
+    std::shared_ptr<ncclComm_t> commPtr;
+    try
+    {
+        commPtr = getComm(groupSet);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("[isNCCLWindowBuffer] getComm threw (MPI disabled?): %s", e.what());
+        return false;
+    }
+
+    if (!commPtr || *commPtr == nullptr)
+    {
+        TLLM_LOG_DEBUG("[isNCCLWindowBuffer] NCCL comm is null");
+        return false;
+    }
+
+    using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
+    auto const buffer = NCCLWindowAllocator::getInstance().searchBuffer(*commPtr, input.data_ptr());
+    return buffer.isValid();
+#else
+    (void) input;
+    (void) group;
+    return false;
 #endif
 }
 
@@ -2112,6 +2153,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
+    m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
     m.def(
         "minimax_allreduce_rms("
         "Tensor input,"
@@ -2142,6 +2184,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
+    m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
 }
@@ -2156,4 +2199,5 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
             return std::vector<at::Tensor>{};
         });
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
+    m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
 }

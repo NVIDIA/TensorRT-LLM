@@ -74,6 +74,45 @@ def _init_all_weights(model: torch.nn.Module, std: float = 0.02):
                 torch.nn.init.normal_(p, mean=0.0, std=std)
 
 
+# float32 quant-scale params (filled to 1.0, not normal_, so dequant is well-behaved).
+_FP4_FLOAT_SCALE_SUFFIXES = (
+    ".input_scale",
+    ".inv_input_scale",
+    ".weight_scale_2",
+    ".alpha",
+    ".kv_scales",
+    ".inv_kv_scales",
+)
+
+
+def _init_weights_quant_safe(model: torch.nn.Module, std: float = 0.02):
+    """Like ``_init_all_weights`` but safe for NVFP4 modules.
+
+    NVFP4 Linears hold a packed-fp4 weight (``float4_e2m1x2``) and an FP8 scale
+    factor (``weight_scale``) whose dtypes ``torch.nn.init.normal_`` cannot fill.
+    Fill standard float params (norm weights and quant scales to 1.0, the rest
+    random); for the sub-byte/FP8 quant tensors write a benign finite byte.
+    """
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.numel() == 0:
+                continue
+            if p.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                if any(name.endswith(s) for s in _FP4_FLOAT_SCALE_SUFFIXES):
+                    p.fill_(1.0)
+                elif "norm" in name and "weight" in name:
+                    p.fill_(1.0)
+                else:
+                    torch.nn.init.normal_(p, mean=0.0, std=std)
+            else:
+                # Packed-fp4 weight / FP8 scale factor: normal_ is undefined on
+                # these dtypes, so write a benign finite byte via a uint8 view.
+                try:
+                    p.view(torch.uint8).fill_(1)
+                except Exception:
+                    pass
+
+
 def _make_video_positions(
     batch: int, n_patches: int, n_frames: int, grid_h: int, grid_w: int, device: torch.device
 ) -> torch.Tensor:
@@ -387,6 +426,153 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         self.assertEqual(
             video_out.shape,
             (batch, v_patches, AUDIO_VIDEO_CONFIG["out_channels"]),
+        )
+
+
+# AudioVideo config with real fused-AdaLN hidden dims (video/audio both 32*64=2048,
+# in _FUSED_ADALN_SUPPORTED_DIMS). Smaller dims (e.g. 128) take the eager bf16 fallback,
+# so no rank-3 Fp4QuantizedTensor is ever produced and the smoke would be a trivial pass.
+FP4_SMOKE_AV_CONFIG = dict(
+    num_attention_heads=32,
+    attention_head_dim=64,  # video inner dim = 2048
+    in_channels=32,  # NVFP4 GEMM needs K (= in_channels patchify) divisible by 32
+    out_channels=32,
+    num_layers=1,
+    cross_attention_dim=2048,  # text cross-attn context_dim must equal inner_dim (32*64)
+    caption_channels=64,
+    norm_eps=1e-6,
+    positional_embedding_max_pos=[4, 32, 32],
+    timestep_scale_multiplier=1000,
+    use_middle_indices_grid=True,
+    audio_num_attention_heads=32,
+    audio_attention_head_dim=64,  # audio inner dim = 2048
+    audio_in_channels=32,
+    audio_out_channels=32,
+    audio_cross_attention_dim=2048,  # must equal audio inner_dim (32*64)
+    audio_positional_embedding_max_pos=[4],
+    av_ca_timestep_scale_multiplier=1,
+)
+
+
+class TestLTX2NVFP4ForwardSmoke(unittest.TestCase):
+    """NVFP4 forward smoke: a static-NVFP4 AudioVideo model must run end-to-end with
+    fabricated weights/inputs without raising.
+
+    Guards the rank-3 ``Fp4QuantizedTensor`` bug class (PR #15718): the fused
+    AdaLN+NVFP4 norm emits a rank-3 ``[B, S, D/2]`` fp4 activation that flows into the
+    fused MLP epilogue and the attention projections; consumers that ``reshape``/assert
+    2D crash on it. The forward-pre-hook below asserts the fp4 path is actually
+    exercised, so the test fails (rather than silently passing) if the model falls back
+    to bf16.
+
+    Requires Blackwell (NVFP4 fused kernels are SM100+) and a hidden dim in {2048, 4096}.
+    """
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+        reason="NVFP4 fused kernels require Blackwell (SM100+)",
+    )
+    def test_audio_video_nvfp4_forward_smoke(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        torch.manual_seed(42)
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+        model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(),
+            quant_config=quant_config,
+            mapping=Mapping(),
+            attention=AttentionConfig(backend="VANILLA"),
+            skip_create_weights_in_init=False,
+        )
+        # NVFP4 model: device-only .to() (a dtype cast would corrupt the packed fp4 weights).
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=model_config,
+                **FP4_SMOKE_AV_CONFIG,
+            )
+            .to(device)
+            .eval()
+        )
+        _init_weights_quant_safe(model)
+
+        batch = 1
+        v_frames, v_h, v_w = 1, 4, 4
+        v_patches = v_frames * v_h * v_w
+        a_patches = 8
+        in_channels = FP4_SMOKE_AV_CONFIG["in_channels"]
+        audio_in_channels = FP4_SMOKE_AV_CONFIG["audio_in_channels"]
+        caption_channels = FP4_SMOKE_AV_CONFIG["caption_channels"]
+        text_len = 8
+
+        v_context = (
+            torch.randn(batch, text_len, caption_channels, device=device, dtype=dtype) * 0.02
+        )
+        a_context = (
+            torch.randn(batch, text_len, caption_channels, device=device, dtype=dtype) * 0.02
+        )
+        v_positions = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, device)
+        a_positions = _make_audio_positions(batch, a_patches, device)
+
+        video_modality = Modality(
+            latent=torch.randn(batch, v_patches, in_channels, device=device, dtype=dtype) * 0.02,
+            timesteps=torch.tensor([0.5], device=device),
+            positions=v_positions,
+            context=v_context,
+        )
+        audio_modality = Modality(
+            latent=torch.randn(batch, a_patches, audio_in_channels, device=device, dtype=dtype)
+            * 0.02,
+            timesteps=torch.tensor([0.5], device=device),
+            positions=a_positions,
+            context=a_context,
+        )
+        text_cache = model.prepare_text_cache(
+            video_context=v_context,
+            video_positions=v_positions,
+            audio_context=a_context,
+            audio_positions=a_positions,
+            dtype=dtype,
+        )
+
+        # Self-validation: record whether a rank-3 Fp4QuantizedTensor reaches any module,
+        # so a silent bf16 fallback (e.g. unsupported dim) fails the test instead of passing.
+        saw_rank3_fp4 = []
+
+        def _record(mod, args):
+            for a in args:
+                if isinstance(a, Fp4QuantizedTensor) and a.fp4_tensor.dim() > 2:
+                    saw_rank3_fp4.append(type(mod).__name__)
+
+        handles = [m.register_forward_pre_hook(_record) for m in model.modules()]
+        try:
+            with torch.no_grad():
+                video_out, audio_out = model(
+                    video=video_modality, audio=audio_modality, text_cache=text_cache
+                )
+        finally:
+            for h in handles:
+                h.remove()
+
+        self.assertEqual(video_out.shape, (batch, v_patches, FP4_SMOKE_AV_CONFIG["out_channels"]))
+        self.assertEqual(
+            audio_out.shape, (batch, a_patches, FP4_SMOKE_AV_CONFIG["audio_out_channels"])
+        )
+        self.assertTrue(
+            saw_rank3_fp4,
+            "no rank-3 Fp4QuantizedTensor reached any module -- the fused AdaLN+NVFP4 "
+            "path was not exercised (check hidden dim in {2048, 4096} and the NVFP4 build).",
         )
 
 

@@ -1283,11 +1283,14 @@ class MoEShardableNode(ShardableNode):
         # are harmless.
         batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
         batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+        extra_kwargs = (
+            {"batch_info_host": batch_info_host_node} if batch_info_host_node is not None else {}
+        )
         set_op_args(
             self.node,
             mapping_config=dc.serialize(),
             max_num_tokens=max_num_tokens,
-            batch_info_host=batch_info_host_node,
+            **extra_kwargs,
         )
 
         ad_logger.debug(
@@ -1789,14 +1792,6 @@ class ApplyShardingHints(BaseTransform):
             )
 
         max_num_tokens = cm.info.max_num_tokens if (cm and cm.info) else 0
-
-        # When attention-DP is active with EP, the MoE all-to-all ops need
-        # runtime token counts (batch_info_host slot 14, ``max_dp_num_tokens``)
-        # to avoid over-padding.
-        # Add the placeholder before the node loop so MoEShardableNode.apply()
-        # can find and wire it into each MoE node.
-        if dc.enable_attention_dp and dc.moe_ep_size > 1 and cm is not None:
-            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
 
         num_updates = 0
         if self.config.simple_shard_only:

@@ -15,7 +15,7 @@
  */
 #pragma once
 #include "tensorrt_llm/common/assert.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <map>
@@ -44,7 +44,7 @@ struct GroupRMSParams
     float eps;
     float weight_bias;
     bool enable_weights;
-    nvinfer1::DataType dtype;
+    tensorrt_llm::DataType dtype;
     cudaStream_t stream;
 };
 
