@@ -561,6 +561,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
         return {
             "attn_backend": "FLASHINFER",
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
+            },
         }
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
