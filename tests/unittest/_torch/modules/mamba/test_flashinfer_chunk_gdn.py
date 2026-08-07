@@ -99,6 +99,38 @@ def test_wrapper_module_importable():
     )
 
 
+def test_cutlass_dsl_45_pipeline_compatibility():
+    """The FlashInfer nightly's explicit False keyword is a no-op on DSL 4.5."""
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (
+        _enable_cutlass_dsl_45_pipeline_compatibility,
+    )
+
+    calls = []
+
+    class PipelineTmaAsync:
+        @staticmethod
+        def create(*, num_stages):
+            calls.append(num_stages)
+            return num_stages
+
+    class Pipeline:
+        pass
+
+    Pipeline.PipelineTmaAsync = PipelineTmaAsync
+
+    _enable_cutlass_dsl_45_pipeline_compatibility(Pipeline)
+    assert Pipeline.PipelineTmaAsync.create(num_stages=3, enable_multicast_signaling=False) == 3
+    assert calls == [3]
+
+    # Repeated inference calls must not wrap the global CUTLASS class again.
+    first_compatible_create = Pipeline.PipelineTmaAsync.create
+    _enable_cutlass_dsl_45_pipeline_compatibility(Pipeline)
+    assert Pipeline.PipelineTmaAsync.create is first_compatible_create
+
+    with pytest.raises(ValueError, match="nvidia-cutlass-dsl>=4.6"):
+        Pipeline.PipelineTmaAsync.create(num_stages=3, enable_multicast_signaling=True)
+
+
 # Parity tests against the Triton reference -------------------------------
 
 

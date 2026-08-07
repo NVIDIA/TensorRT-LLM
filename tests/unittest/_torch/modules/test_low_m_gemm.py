@@ -3,7 +3,8 @@
 
 import atexit
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,16 +12,12 @@ import torch
 
 from tensorrt_llm._torch.modules import linear as linear_module
 from tensorrt_llm._torch.modules.low_m_gemm import (
-    GemmDispatchKey,
-    GemmTuningResult,
     LowMGemmBackend,
     LowMGemmDispatcher,
     _configured_backend,
-    _flashinfer_commit,
     _infer_op_name,
     _normalize_backend,
     _ShapeCollector,
-    write_dispatch_cache,
 )
 
 
@@ -49,30 +46,51 @@ def test_legacy_exact_m_backend_environment_is_ignored(monkeypatch) -> None:
     assert _configured_backend() == LowMGemmBackend.OFF
 
 
-def test_flashinfer_commit_uses_package_identity(monkeypatch) -> None:
-    monkeypatch.delenv("TRTLLM_FLASHINFER_COMMIT", raising=False)
-    assert _flashinfer_commit(SimpleNamespace(__git_version__="abc123")) == "abc123"
+def _install_fake_flashinfer(
+    monkeypatch,
+    *,
+    version: str = "0.6.17.dev20260806",
+    cute_dsl_available: bool = True,
+) -> MagicMock:
+    mm_bf16 = MagicMock()
+    mm_bf16.is_backend_supported = MagicMock(return_value=True)
+
+    flashinfer_module = ModuleType("flashinfer")
+    flashinfer_module.__path__ = []
+    flashinfer_module.__version__ = version
+    flashinfer_module.mm_bf16 = mm_bf16
+    cute_dsl_module = ModuleType("flashinfer.cute_dsl")
+    cute_dsl_module.__path__ = []
+    cute_dsl_utils_module = ModuleType("flashinfer.cute_dsl.utils")
+    cute_dsl_utils_module.is_cute_dsl_available = lambda: cute_dsl_available
+
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_module)
+    monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl", cute_dsl_module)
+    monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl.utils", cute_dsl_utils_module)
+    return mm_bf16
 
 
-def test_flashinfer_commit_rejects_false_environment_identity(monkeypatch) -> None:
-    monkeypatch.setenv("TRTLLM_FLASHINFER_COMMIT", "declared")
-    with pytest.raises(RuntimeError, match="does not match"):
-        _flashinfer_commit(SimpleNamespace(__git_version__="actual"))
+def test_auto_prepare_uses_packaged_flashinfer_without_tuning_cache(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_BACKEND", "auto")
+    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_TUNING_CACHE", "/missing/dispatch.json")
+    monkeypatch.setenv("TRTLLM_FLASHINFER_AUTOTUNER_CACHE", "/missing/flashinfer.json")
+    mm_bf16 = _install_fake_flashinfer(monkeypatch)
+    module = torch.nn.Linear(8, 8)
+
+    dispatcher = LowMGemmDispatcher()
+    dispatcher.prepare(module, cuda_graph_enabled=True)
+
+    assert dispatcher._flashinfer_mm is mm_bf16
+    assert dispatcher._prepared
+    assert module._low_m_gemm_name == ""
 
 
-def test_dispatch_key_includes_shape_layout_and_graph_mode() -> None:
-    key = GemmDispatchKey(sm=103, m=4, n=2304, k=8192)
-    assert key.cache_key() == "sm103:bf16:4x2304x8192:nt:nobias:graph"
-    assert (
-        GemmDispatchKey(sm=103, m=4, n=2304, k=8192, cuda_graph=False)
-        .cache_key()
-        .endswith(":eager")
-    )
-    assert (
-        GemmDispatchKey(sm=103, m=4, n=2304, k=8192, has_bias=True)
-        .cache_key()
-        .endswith(":bias:graph")
-    )
+def test_prepare_rejects_flashinfer_before_split_k_nightly(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_BACKEND", "auto")
+    _install_fake_flashinfer(monkeypatch, version="0.6.15")
+
+    with pytest.raises(RuntimeError, match="0.6.17.dev20260806"):
+        LowMGemmDispatcher().prepare(torch.nn.Linear(8, 8), cuda_graph_enabled=False)
 
 
 @pytest.mark.parametrize(("m", "expected"), ((32, True), (33, False)))
@@ -130,25 +148,31 @@ def test_infer_op_name_for_hot_modules(layer: str, expected: str) -> None:
     assert _infer_op_name(layer) == expected
 
 
-def test_write_dispatch_cache(tmp_path) -> None:
-    output = tmp_path / "dispatch.json"
-    key = GemmDispatchKey(sm=103, m=1, n=256, k=8192).cache_key()
-    write_dispatch_cache(
-        output,
-        {"flashinfer_commit": "b195c7a8"},
-        {
-            key: GemmTuningResult(
-                backend="flashinfer",
-                algorithm="direct",
-                latency_us=2.1,
-                baseline_us=3.3,
-            )
-        },
-    )
-    document = json.loads(output.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 3
-    assert document["metadata"]["flashinfer_commit"] == "b195c7a8"
-    assert document["entries"][key]["algorithm"] == "direct"
+def test_apply_uses_public_flashinfer_heuristic(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_BACKEND", "auto")
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._prepared = True
+    dispatcher._flashinfer_mm = MagicMock(return_value=torch.empty((4, 256)))
+    monkeypatch.setattr(dispatcher, "_is_candidate_shape", lambda *unused: True)
+    monkeypatch.setattr(dispatcher, "_is_flashinfer_supported", lambda unused: True)
+
+    input_tensor = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weight = torch.empty((256, 128), dtype=torch.bfloat16)
+    bias = torch.empty((256,), dtype=torch.bfloat16)
+    with torch.inference_mode():
+        output = dispatcher.apply(torch.nn.Linear(1, 1), input_tensor, weight, bias)
+
+    assert output.shape == (2, 2, 256)
+    args, kwargs = dispatcher._flashinfer_mm.call_args
+    assert args[0].shape == (4, 128)
+    assert args[1].shape == (128, 256)
+    assert kwargs["bias"].data_ptr() == bias.data_ptr()
+    assert kwargs["bias"].shape == bias.shape
+    assert kwargs["bias"].dtype == bias.dtype
+    assert kwargs["pdl"] is False
+    assert kwargs["out_dtype"] == torch.bfloat16
+    assert kwargs["backend"] == "cute-dsl"
 
 
 def test_shape_collector_persists_new_runtime_shape_after_warmup(tmp_path) -> None:
@@ -191,36 +215,3 @@ def test_shape_collector_persists_new_runtime_shape_after_warmup(tmp_path) -> No
         }
     finally:
         atexit.unregister(collector.flush)
-
-
-def test_auto_cache_can_keep_shape_on_cublas_without_flashinfer(tmp_path, monkeypatch) -> None:
-    output = tmp_path / "dispatch.json"
-    key = GemmDispatchKey(sm=103, m=2, n=2304, k=8192, cuda_graph=False).cache_key()
-    write_dispatch_cache(
-        output,
-        {"pdl": True, "cuda_version": torch.version.cuda or "none"},
-        {key: GemmTuningResult(backend="cublas", algorithm="cublas")},
-    )
-    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_BACKEND", "auto")
-    monkeypatch.setenv("TRTLLM_LOW_M_GEMM_TUNING_CACHE", str(output))
-    dispatcher = LowMGemmDispatcher()
-    module = torch.nn.Linear(8, 8)
-    dispatcher.prepare(module, cuda_graph_enabled=False)
-    assert (
-        dispatcher._select_backend(GemmDispatchKey(sm=103, m=2, n=2304, k=8192, cuda_graph=False))
-        == LowMGemmBackend.CUBLAS
-    )
-    assert module._low_m_gemm_name == ""
-
-
-def test_cached_tactic_requires_exact_fields() -> None:
-    result = GemmTuningResult(
-        backend="flashinfer",
-        algorithm="simt",
-        tactic={"block_size": 256, "rows_per_block": 4},
-    )
-    with pytest.raises(RuntimeError, match="Invalid 'simt' tactic"):
-        LowMGemmDispatcher._tactic_values(
-            result,
-            ("block_size", "outputs_per_block", "rows_per_block"),
-        )
