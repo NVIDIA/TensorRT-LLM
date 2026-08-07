@@ -17,3 +17,4 @@ l0_cpu_arm:
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/others/test_http_utils_fail_fast.py
   - unittest/llmapi/test_bench_async.py
+  - unittest/_torch/modeling/test_pre_mlp_nvfp4_fusion.py

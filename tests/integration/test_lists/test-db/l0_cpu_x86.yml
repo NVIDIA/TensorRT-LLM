@@ -18,3 +18,4 @@ l0_cpu_x86:
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/llmapi/test_bench_async.py
+  - unittest/_torch/modeling/test_pre_mlp_nvfp4_fusion.py
