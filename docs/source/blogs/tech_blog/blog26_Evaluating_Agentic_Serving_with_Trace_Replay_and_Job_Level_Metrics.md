@@ -167,7 +167,3 @@ Fan-out also makes the serving behavior harder to reason about in general. A sin
 Agent workloads are still moving fast: architectures, context-management strategies, and tool usage all keep changing, and with them the shapes that reach the serving system. We will therefore keep tracking the workload characteristics of real agentic scenarios, and let those measurements drive what we optimize — so that TensorRT-LLM's performance work lands where it matters in real deployments rather than only on synthetic benchmarks.
 
 Concretely, we plan to extend the trace dataset with more agent architectures, publish traces for community benchmarking, and use the framework as a reproducible testbed for agent-aware serving features — KV-cache-aware routing, proactive cache management, and agent-aware scheduling introduced in [our previous blog](https://nvidia.github.io/TensorRT-LLM/latest/blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html) — evaluated directly on job-level metrics. We invite the community to collect traces from their own Scaffolding agents with `--enable_tracing`, replay them against their deployments, and share findings.
-
-## Acknowledgements
-
-This work is a joint effort of the TensorRT-LLM team. We thank everyone who contributed to the Scaffolding framework, the trace-replay implementation, the trace dataset, and the serving experiments behind this blog.
