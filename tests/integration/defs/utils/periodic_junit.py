@@ -119,12 +119,10 @@ class PeriodicJUnitXML:
         # plugin, so arming/cancelling it here could clobber (or be clobbered by)
         # theirs. Our own timer owns no shared state.
         self._hang_timer: Optional[threading.Timer] = None
-        # Re-entrant on purpose: the SIGINT/SIGTERM handler runs on the main thread at
-        # an arbitrary bytecode boundary and calls _cancel_hang_timer(). If the signal
-        # lands while that same thread already holds this lock (inside
-        # _cancel_hang_timer() or the arming block of pytest_runtest_setup()), a plain
-        # Lock would deadlock the handler against itself and the process would never
-        # save results nor terminate.
+        # Re-entrant: the SIGINT/SIGTERM handler runs on the main thread at an
+        # arbitrary bytecode boundary and calls _cancel_hang_timer(). If it lands
+        # while that thread already holds this lock, a plain Lock would deadlock
+        # the handler against itself and results would never be saved.
         self._hang_lock = threading.RLock()
 
         self.completed_tests = 0
@@ -153,7 +151,7 @@ class PeriodicJUnitXML:
         else:
             print(f"WARNING: {message}")
 
-    def pytest_configure(self, config: Config) -> None:
+    def pytest_configure(self, config: Config):
         """Configure and initialize the reporter."""
         # Store config for later use
         self.config = config
@@ -196,13 +194,11 @@ class PeriodicJUnitXML:
         self.logxml.node_reporters_ordered = []  # type: ignore
         self.logxml.global_properties = []
 
-    def pytest_runtest_logreport(self, report: TestReport) -> None:
+    def pytest_runtest_logreport(self, report: TestReport):
         """Handle test reports and trigger periodic saving."""
-        # The teardown report is emitted after every fixture finalizer has run, so
-        # the item is genuinely done here. Disarm before doing any work below:
-        # otherwise the timer stays armed across post-teardown reporting and the
-        # gap until the next test starts, and a slow gap would make _dump_hang()
-        # write a bogus hang record for a test that already completed.
+        # The teardown report lands after every fixture finalizer, so the item is
+        # genuinely done. Disarm first: otherwise the timer stays armed until the
+        # next test starts and a slow gap dumps a bogus hang for a passing test.
         if self.dump_hang_traceback and report.when == "teardown":
             self._cancel_hang_timer()
 
@@ -264,7 +260,7 @@ class PeriodicJUnitXML:
                 except Exception as e:
                     self._log_warning(f"Error generating periodic report: {e}")
 
-    def pytest_sessionfinish(self) -> None:
+    def pytest_sessionfinish(self):
         """Generate final report at session end."""
         self._cancel_hang_timer()
         try:
@@ -485,10 +481,10 @@ class PeriodicJUnitXML:
             self._hang_timer = timer
         timer.start()
 
-    def _register_signal_handlers(self) -> None:
+    def _register_signal_handlers(self):
         """Register signal handlers for graceful shutdown on interruption."""
 
-        def signal_handler(signum: int, frame) -> None:
+        def signal_handler(signum, frame):
             """Handle interrupt signals by saving current progress before exit."""
             signal_name = signal.Signals(signum).name
             self._log_warning(
