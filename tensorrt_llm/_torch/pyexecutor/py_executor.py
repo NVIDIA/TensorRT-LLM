@@ -454,6 +454,16 @@ class AsyncTransferManager:
             else:
                 block_id = None
 
+            # Commit the draft cache's prompt blocks alongside the target's
+            # so the drafter's prefix is reusable by later conversation
+            # turns (try_commit_blocks gates internally on reuse being
+            # enabled and on gap-free draft reuse coverage).
+            draft_kv_mgr = self.resource_manager.resource_managers.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            if draft_kv_mgr is not None and hasattr(draft_kv_mgr,
+                                                    "try_commit_blocks"):
+                draft_kv_mgr.try_commit_blocks(request)
+
             self._requests_in_transfer[req_id] = request
             self._request_transfer_metadata[
                 req_id] = self.RequestTransferMetadata(block_id)
@@ -2627,6 +2637,17 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                    # Draft prefix reuse: the draft manager defers reuse-
+                    # eligible cache creation until after the target's
+                    # prepare (which sets the reuse boundary); create those
+                    # caches now, before the forward pass.
+                    draft_kv_mgr = self.resource_manager.resource_managers.get(
+                        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+                    if draft_kv_mgr is not None and hasattr(
+                            draft_kv_mgr, "prepare_deferred_draft_reuse"):
+                        draft_kv_mgr.prepare_deferred_draft_reuse(
+                            scheduled_batch)
+
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
@@ -4078,6 +4099,17 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                    # Draft prefix reuse: the draft manager defers reuse-
+                    # eligible cache creation until after the target's
+                    # prepare (which sets the reuse boundary); create those
+                    # caches now, before the forward pass.
+                    draft_kv_mgr = self.resource_manager.resource_managers.get(
+                        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+                    if draft_kv_mgr is not None and hasattr(
+                            draft_kv_mgr, "prepare_deferred_draft_reuse"):
+                        draft_kv_mgr.prepare_deferred_draft_reuse(
+                            scheduled_batch)
+
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
 
@@ -4554,6 +4586,17 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    # Draft prefix reuse: the draft manager defers reuse-
+                    # eligible cache creation until after the target's
+                    # prepare (which sets the reuse boundary); create those
+                    # caches now, before the forward pass.
+                    draft_kv_mgr = self.resource_manager.resource_managers.get(
+                        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+                    if draft_kv_mgr is not None and hasattr(
+                            draft_kv_mgr, "prepare_deferred_draft_reuse"):
+                        draft_kv_mgr.prepare_deferred_draft_reuse(
+                            scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
