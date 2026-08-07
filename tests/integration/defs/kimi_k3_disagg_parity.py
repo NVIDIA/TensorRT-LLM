@@ -126,6 +126,9 @@ def _served_model(base_url, timeout):
     except urllib.error.HTTPError as e:
         print(f"[parity] NOTE: {base_url}/v1/models unavailable (HTTP {e.code})")
         return None
+    except (urllib.error.URLError, OSError, KeyError, IndexError) as e:
+        print(f"[parity] NOTE: {base_url}/v1/models unavailable ({e})")
+        return None
 
 
 class Endpoint:
@@ -540,7 +543,8 @@ def main(argv=None) -> int:
         if cand_model is not None and cand_model != model:
             print(
                 f"[parity] NOTE: endpoints serve different model names "
-                f"({model!r} vs {cand_model!r}); using each server's own"
+                f"({model!r} vs {cand_model!r}); sending {model!r} to both, "
+                "pass --model to override"
             )
     report["model"] = model
 

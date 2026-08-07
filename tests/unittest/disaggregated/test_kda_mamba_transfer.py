@@ -253,8 +253,9 @@ def test_kda_hetero_tp_rejected():
     end of K3's replicated (pre-scaled) slots. The peer-registration gate
     (``MambaPolicy.validate_peer_compatible``) must reject this loudly.
     """
-    ctx_mgr = _create_kda_managers(2, enable_attention_dp=False)[0]
-    gen_mgr = _create_kda_managers(4, enable_attention_dp=False)[1]
+    ctx_mgrs = _create_kda_managers(2, enable_attention_dp=False)
+    gen_mgrs = _create_kda_managers(4, enable_attention_dp=False)
+    ctx_mgr, gen_mgr = ctx_mgrs[0], gen_mgrs[1]
     try:
         ctx_pt = build_page_table_from_manager(ctx_mgr)
         gen_pt = build_page_table_from_manager(gen_mgr)
@@ -269,8 +270,8 @@ def test_kda_hetero_tp_rejected():
         with pytest.raises(ValueError, match="TP-aggregated"):
             registrar.register("kda_gen", 1, gen_ri)
     finally:
-        ctx_mgr.shutdown()
-        gen_mgr.shutdown()
+        for mgr in ctx_mgrs + gen_mgrs:
+            mgr.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -285,8 +286,9 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
     """Matched-TP and ADP-on-both-sides layouts must pass peer validation."""
     ctx_tp, ctx_adp = ctx_cfg
     gen_tp, gen_adp = gen_cfg
-    ctx_mgr = _create_kda_managers(ctx_tp, enable_attention_dp=ctx_adp)[0]
-    gen_mgr = _create_kda_managers(gen_tp, enable_attention_dp=gen_adp)[-1]
+    ctx_mgrs = _create_kda_managers(ctx_tp, enable_attention_dp=ctx_adp)
+    gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=gen_adp)
+    ctx_mgr, gen_mgr = ctx_mgrs[0], gen_mgrs[-1]
     try:
         ctx_pt = build_page_table_from_manager(ctx_mgr)
         gen_pt = build_page_table_from_manager(gen_mgr)
@@ -294,8 +296,8 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
         gen_ri = RankInfo.from_kv_cache_manager("kda_gen", gen_mgr, device_id=0)
         MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
     finally:
-        ctx_mgr.shutdown()
-        gen_mgr.shutdown()
+        for mgr in ctx_mgrs + gen_mgrs:
+            mgr.shutdown()
 
 
 def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_ids=None):
@@ -452,124 +454,129 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
     """Loopback: matched ctx/gen TP, replicated full-size KDA state per rank."""
     ctx_mgrs = _create_kda_managers(ctx_tp, enable_attention_dp=enable_attention_dp)
     gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=enable_attention_dp)
-    for mgr in ctx_mgrs + gen_mgrs:
-        mgr._impl.mamba_cache.conv.zero_()
-        mgr._impl.mamba_cache.temporal.zero_()
+    ctx_tcs, gen_tcs = [], []
+    try:
+        for mgr in ctx_mgrs + gen_mgrs:
+            mgr._impl.mamba_cache.conv.zero_()
+            mgr._impl.mamba_cache.temporal.zero_()
 
-    config = CacheTransceiverConfig(
-        backend="NIXL",
-        transceiver_runtime="PYTHON",
-        max_tokens_in_buffer=512,
-    )
-    ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
-    gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
-    ctx_endpoint = ctx_tcs[0]._context_info_endpoint
-
-    sampling_params = SamplingParams()
-    ctx_rids, gen_rids, ctx_reqs, gen_reqs = [], [], [], []
-    for req_idx, req_len in enumerate(REQUEST_LENGTHS):
-        unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
-        ctx_rid, gen_rid = req_idx * 2, req_idx * 2 + 1
-        ctx_rids.append(ctx_rid)
-        gen_rids.append(gen_rid)
-        sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
-        ctx_req = LlmRequest(
-            request_id=ctx_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=sc,
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        config = CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            max_tokens_in_buffer=512,
         )
-        ctx_req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
-        gen_req = LlmRequest(
-            request_id=gen_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=sc,
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
+        gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
+        ctx_endpoint = ctx_tcs[0]._context_info_endpoint
+
+        sampling_params = SamplingParams()
+        ctx_rids, gen_rids, ctx_reqs, gen_reqs = [], [], [], []
+        for req_idx, req_len in enumerate(REQUEST_LENGTHS):
+            unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+            ctx_rid, gen_rid = req_idx * 2, req_idx * 2 + 1
+            ctx_rids.append(ctx_rid)
+            gen_rids.append(gen_rid)
+            sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
+            ctx_req = LlmRequest(
+                request_id=ctx_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=sc,
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            )
+            ctx_req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            gen_req = LlmRequest(
+                request_id=gen_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=sc,
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            )
+            gen_req.py_disaggregated_params = DisaggregatedParams(
+                ctx_request_id=ctx_rid,
+                ctx_dp_rank=0,
+                ctx_info_endpoint=ctx_endpoint,
+                disagg_request_id=unique_rid,
+            )
+            ctx_reqs.append(ctx_req)
+            gen_reqs.append(gen_req)
+
+        ctx_batch = ScheduledRequests()
+        ctx_batch.reset_context_requests(ctx_reqs)
+        for mgr in ctx_mgrs:
+            mgr.prepare_resources(ctx_batch)
+        gen_batch = ScheduledRequests()
+        gen_batch.reset_context_requests(gen_reqs)
+        for mgr in gen_mgrs:
+            mgr.prepare_resources(gen_batch)
+        for req in ctx_reqs + gen_reqs:
+            req.context_current_position = req.prompt_len
+            req.add_new_token(req.prompt_len, 0)
+        for mgr in ctx_mgrs:
+            mgr.update_resources(ctx_batch)
+        for mgr in gen_mgrs:
+            mgr.update_resources(gen_batch)
+
+        # Ground truth: identical full state on every ctx rank (replicated).
+        ground_truth = _generate_ground_truth(len(REQUEST_LENGTHS))
+        for mgr in ctx_mgrs:
+            for req_idx, rid in enumerate(ctx_rids):
+                slot = mgr.mamba_cache_index[rid]
+                for layer_idx in mgr._impl.mamba_layer_offsets:
+                    full = ground_truth[req_idx][layer_idx]
+                    mgr.get_conv_states(layer_idx)[slot] = full["conv"]
+                    mgr.get_ssm_states(layer_idx)[slot] = full["ssm"]
+
+        for rank in range(gen_tp):
+            for req in gen_reqs:
+                gen_tcs[rank].request_and_receive_async(req)
+        for rank in range(ctx_tp):
+            for req in ctx_reqs:
+                ctx_tcs[rank].respond_and_send_async(req)
+        _run_concurrent(
+            ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
         )
-        gen_req.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=ctx_rid,
-            ctx_dp_rank=0,
-            ctx_info_endpoint=ctx_endpoint,
-            disagg_request_id=unique_rid,
-        )
-        ctx_reqs.append(ctx_req)
-        gen_reqs.append(gen_req)
+        _run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
 
-    ctx_batch = ScheduledRequests()
-    ctx_batch.reset_context_requests(ctx_reqs)
-    for mgr in ctx_mgrs:
-        mgr.prepare_resources(ctx_batch)
-    gen_batch = ScheduledRequests()
-    gen_batch.reset_context_requests(gen_reqs)
-    for mgr in gen_mgrs:
-        mgr.prepare_resources(gen_batch)
-    for req in ctx_reqs + gen_reqs:
-        req.context_current_position = req.prompt_len
-        req.add_new_token(req.prompt_len, 0)
-    for mgr in ctx_mgrs:
-        mgr.update_resources(ctx_batch)
-    for mgr in gen_mgrs:
-        mgr.update_resources(gen_batch)
-
-    # Ground truth: identical full state on every ctx rank (replicated).
-    ground_truth = _generate_ground_truth(len(REQUEST_LENGTHS))
-    for mgr in ctx_mgrs:
-        for req_idx, rid in enumerate(ctx_rids):
-            slot = mgr.mamba_cache_index[rid]
-            for layer_idx in mgr._impl.mamba_layer_offsets:
-                full = ground_truth[req_idx][layer_idx]
-                mgr.get_conv_states(layer_idx)[slot] = full["conv"]
-                mgr.get_ssm_states(layer_idx)[slot] = full["ssm"]
-
-    for rank in range(gen_tp):
+        # Transfer-size metric must include the fixed-size KDA state — the actual
+        # transferred bytes must cover the computed payload size: per rank,
+        # num_layers * (conv + ssm) slot bytes on top of any KV bytes.
+        kda_bytes_per_rank = NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
+        rank_factor = 1 if enable_attention_dp else gen_tp
         for req in gen_reqs:
-            gen_tcs[rank].request_and_receive_async(req)
-    for rank in range(ctx_tp):
-        for req in ctx_reqs:
-            ctx_tcs[rank].respond_and_send_async(req)
-    _run_concurrent(ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True))
-    _run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
+            assert req.py_kv_cache_xfer_bytes >= kda_bytes_per_rank * rank_factor, (
+                f"kv_cache_xfer_bytes={req.py_kv_cache_xfer_bytes} misses the KDA "
+                f"state payload ({kda_bytes_per_rank} bytes/rank x {rank_factor})"
+            )
 
-    # Transfer-size metric must include the fixed-size KDA state — the actual
-    # transferred bytes must cover the computed payload size: per rank,
-    # num_layers * (conv + ssm) slot bytes on top of any KV bytes.
-    kda_bytes_per_rank = NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
-    rank_factor = 1 if enable_attention_dp else gen_tp
-    for req in gen_reqs:
-        assert req.py_kv_cache_xfer_bytes >= kda_bytes_per_rank * rank_factor, (
-            f"kv_cache_xfer_bytes={req.py_kv_cache_xfer_bytes} misses the KDA "
-            f"state payload ({kda_bytes_per_rank} bytes/rank x {rank_factor})"
-        )
+        # Bitwise comparison on every gen rank (state is replicated).
+        for gen_rank, mgr in enumerate(gen_mgrs):
+            for req_idx, rid in enumerate(gen_rids):
+                slot = mgr.mamba_cache_index[rid]
+                for layer_idx in mgr._impl.mamba_layer_offsets:
+                    full = ground_truth[req_idx][layer_idx]
+                    for name, getter in (
+                        ("conv", mgr.get_conv_states),
+                        ("ssm", mgr.get_ssm_states),
+                    ):
+                        torch.testing.assert_close(
+                            getter(layer_idx)[slot].cpu(),
+                            full[name],
+                            rtol=0,
+                            atol=0,
+                            msg=lambda m, n=name, r=gen_rank, ri=req_idx, li=layer_idx: (
+                                f"{n} mismatch: gen_rank={r} req={ri} layer={li} "
+                                f"ctx_tp={ctx_tp} gen_tp={gen_tp}: {m}"
+                            ),
+                        )
 
-    # Bitwise comparison on every gen rank (state is replicated).
-    for gen_rank, mgr in enumerate(gen_mgrs):
-        for req_idx, rid in enumerate(gen_rids):
-            slot = mgr.mamba_cache_index[rid]
-            for layer_idx in mgr._impl.mamba_layer_offsets:
-                full = ground_truth[req_idx][layer_idx]
-                for name, getter in (
-                    ("conv", mgr.get_conv_states),
-                    ("ssm", mgr.get_ssm_states),
-                ):
-                    torch.testing.assert_close(
-                        getter(layer_idx)[slot].cpu(),
-                        full[name],
-                        rtol=0,
-                        atol=0,
-                        msg=lambda m, n=name, r=gen_rank, ri=req_idx, li=layer_idx: (
-                            f"{n} mismatch: gen_rank={r} req={ri} layer={li} "
-                            f"ctx_tp={ctx_tp} gen_tp={gen_tp}: {m}"
-                        ),
-                    )
-
-    for mgr in ctx_mgrs + gen_mgrs:
-        mgr.shutdown()
-    for tc in ctx_tcs + gen_tcs:
-        tc.shutdown()
+    finally:
+        for tc in ctx_tcs + gen_tcs:
+            tc.shutdown()
+        for mgr in ctx_mgrs + gen_mgrs:
+            mgr.shutdown()
 
 
 @pytest.mark.timeout(180)

@@ -41,6 +41,11 @@ fi
 # Container runtimes (pyxis/enroot) reset image-defined variables like PATH
 # at container start, so values passed via srun --export are lost for them.
 # Allow the launcher config to prepend entries from inside the container.
+# srun --export keeps any quotes in the exported values literal; strip them.
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND:-}"
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND#\'}"; TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND%\'}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND:-}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND#\'}"; TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND%\'}"
 if [ -n "${TRTLLM_PATH_PREPEND:-}" ]; then
     export PATH="${TRTLLM_PATH_PREPEND}:${PATH}"
 fi
