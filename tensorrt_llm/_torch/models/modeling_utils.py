@@ -33,7 +33,7 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ._arch_index import MODEL_ARCH_TO_MODULE
+from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
 
 
 @contextlib.contextmanager
@@ -861,10 +861,7 @@ CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 # (no architecture is double-registered among built-ins, so filling empty
 # slots is equivalent to main). External registrations always overwrite.
 def _is_builtin_model_class(cls) -> bool:
-    module = getattr(cls, "__module__", "")
-    # Package-boundary match: "tensorrt_llm._torch.models_custom" is external.
-    return module == "tensorrt_llm._torch.models" or module.startswith(
-        "tensorrt_llm._torch.models.")
+    return is_builtin_zoo_module(getattr(cls, "__module__", ""))
 
 
 # Architecture names each decorated class declared via ``register_auto_model``,

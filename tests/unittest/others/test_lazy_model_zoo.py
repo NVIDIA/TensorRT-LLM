@@ -179,6 +179,48 @@ def test_arch_index_matches_decorators():
     assert not wrong, f"index points at the wrong module: {wrong}"
 
 
+def test_class_index_matches_package_all():
+    # MODEL_CLASS_TO_MODULE is the one table with no decorator to mirror: it
+    # backs PEP 562 attribute access on the models package. Every name in the
+    # package __all__ that is not bound eagerly must have an index entry
+    # (otherwise the first `from tensorrt_llm._torch.models import NewModel`
+    # fails as a confusing AttributeError), the index must not carry names the
+    # package no longer exports, and each mapped module must actually define
+    # its class.
+    from tensorrt_llm._torch.models._arch_index import MODEL_CLASS_TO_MODULE
+
+    init_tree = ast.parse((_MODELS_DIR / "__init__.py").read_text())
+    all_names, eager_names = set(), set()
+    for node in init_tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "__all__":
+            all_names = {elt.value for elt in node.value.elts}
+        elif isinstance(node, ast.ImportFrom):
+            eager_names |= {alias.asname or alias.name for alias in node.names}
+
+    missing = all_names - eager_names - set(MODEL_CLASS_TO_MODULE)
+    assert not missing, f"__all__ names missing from MODEL_CLASS_TO_MODULE: {missing}"
+    stale = set(MODEL_CLASS_TO_MODULE) - all_names
+    assert not stale, f"MODEL_CLASS_TO_MODULE entries not exported by __all__: {stale}"
+
+    undefined = {}
+    for class_name, module_name in MODEL_CLASS_TO_MODULE.items():
+        path = _MODELS_DIR / f"{module_name}.py"
+        if not path.exists():
+            undefined[class_name] = f"{module_name}: no such module"
+            continue
+        tree = ast.parse(path.read_text())
+        defined = {n.name for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))} | {
+            target.id
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            for target in n.targets
+            if isinstance(target, ast.Name)
+        }
+        if class_name not in defined:
+            undefined[class_name] = f"{module_name}: name not defined at module level"
+    assert not undefined, f"index maps classes to modules that do not define them: {undefined}"
+
+
 def test_models_package_missing_submodule_is_attribute_error():
     # The PEP 562 fallback must translate only "no such submodule" into
     # AttributeError (so hasattr works), same as the top-level package.

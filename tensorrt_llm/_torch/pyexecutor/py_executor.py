@@ -4906,10 +4906,15 @@ class PyExecutor:
             # Only skip token-range checks for Llama4 when the request has
             # multimodal data. Probed via sys.modules so this module does not
             # import a model-zoo module at startup (which would defeat the
-            # zoo's lazy loading): if modeling_llama was never imported, the
-            # engine's model cannot be a Llama4 instance.
+            # zoo's lazy loading): if the providing module was never imported,
+            # the engine's model cannot be a Llama4 instance. The module name
+            # comes from the sync-tested index, so re-homing the class updates
+            # the probe (or fails test_arch_index_matches_decorators) instead
+            # of silently turning it into a constant False.
+            from ..models._arch_index import MODEL_ARCH_TO_MODULE
             modeling_llama = sys.modules.get(
-                "tensorrt_llm._torch.models.modeling_llama")
+                "tensorrt_llm._torch.models." +
+                MODEL_ARCH_TO_MODULE["Llama4ForConditionalGeneration"])
             if modeling_llama is not None and isinstance(
                     self.model_engine.model,
                     modeling_llama.Llama4ForConditionalGeneration):

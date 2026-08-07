@@ -8,12 +8,28 @@ importing anything, which ``modeling_*`` module provides which architecture
 (``MODEL_ARCH_TO_MODULE``), which public class (``MODEL_CLASS_TO_MODULE``),
 and which multimodal ``model_type`` (``MULTIMODAL_MODEL_TYPE_TO_MODULE``).
 
-Regenerate after adding/moving a model:
-    scan ``@register_auto_model("<arch>")`` / ``@register_input_processor(...,
-    model_type="<type>")`` decorators and the public class names under
-    ``tensorrt_llm/_torch/models`` (see the lazy-import PR for the one-off
-    script), or add the new entry by hand next to its neighbors.
+Regenerate after adding/moving a model: add the new entry by hand next to its
+neighbors, mirroring the ``@register_auto_model("<arch>")`` /
+``@register_input_processor(..., model_type="<type>")`` decorators and the
+public class name. ``test_lazy_model_zoo.py`` fails on any drift between these
+tables and the decorators.
 """
+
+# The built-in model zoo package. Registrations from modules inside it only
+# fill empty registry slots (they may run after an external implementation,
+# e.g. via --custom_module_dirs, claimed the slot and must not clobber it);
+# everything else is external and keeps last-wins order.
+_ZOO_PACKAGE = "tensorrt_llm._torch.models"
+
+
+def is_builtin_zoo_module(module_name: str) -> bool:
+    """True if ``module_name`` lives inside the built-in model zoo package.
+
+    Package-boundary match: a sibling package such as
+    ``tensorrt_llm._torch.models_custom`` is external.
+    """
+    return module_name == _ZOO_PACKAGE or module_name.startswith(_ZOO_PACKAGE + ".")
+
 
 # Architecture name (HF ``config.architectures[0]``, possibly rewritten by
 # ``AutoModelForCausalLM._resolve_class``) -> providing module.

@@ -729,10 +729,6 @@ class MultimodalPlaceholderRegistry:
     Registry for the multimodal models to keep track of the placeholder information.
     """
 
-    # Trailing dot: package-boundary match, so "tensorrt_llm._torch.models_custom"
-    # counts as external. Registrants are always modeling_* submodules.
-    _BUILTIN_MODULE_PREFIX = "tensorrt_llm._torch.models."
-
     def __init__(self) -> None:
         self._multimodal_placeholder_by_model_type: Dict[
             str, MultimodalPlaceholderMetadata] = {}
@@ -761,11 +757,14 @@ class MultimodalPlaceholderRegistry:
         registrations (under the lazily imported model zoo) only fill empty
         slots: they may run *after* an external implementation claimed the
         model type and must not clobber it (same priority rule as the model
-        class registry).
+        class registry, via the shared ``is_builtin_zoo_module`` predicate).
         """
+        # Function-local: modeling modules import this module, so a top-level
+        # import of the zoo index would be circular.
+        from tensorrt_llm._torch.models._arch_index import is_builtin_zoo_module
         if (model_type in self._multimodal_placeholder_by_model_type
                 and registrant_module is not None
-                and registrant_module.startswith(self._BUILTIN_MODULE_PREFIX)):
+                and is_builtin_zoo_module(registrant_module)):
             logger.info(f"Keeping existing placeholder metadata for model "
                         f"type {model_type}.")
             return

@@ -616,6 +616,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
+        # With the lazily loaded model zoo this snapshot is intentionally
+        # partial: it carries only externally-registered (and already
+        # resolved) classes; workers resolve built-ins on demand. Do not
+        # "fix" it by importing the zoo eagerly before submit.
         from tensorrt_llm._torch.models.modeling_utils import \
             MODEL_CLASS_MAPPING
         torch.cuda.Stream()
