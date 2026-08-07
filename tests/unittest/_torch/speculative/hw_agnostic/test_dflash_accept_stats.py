@@ -15,7 +15,7 @@ import pytest
 
 try:
     from tensorrt_llm._torch.speculative import accept_stats
-except Exception:  # pragma: no cover - torch-less host fallback
+except ImportError:  # pragma: no cover - torch-less host fallback
     import importlib.util
 
     _path = os.path.join(
@@ -114,9 +114,9 @@ def test_merge_snapshots_and_load(tmp_path):
         accept_stats.merge_snapshots([])
 
 
-def test_merge_snapshots_shape_mismatch():
-    a = accept_stats.DFlashAcceptStatsRecorder("/tmp", 2, rank=0).snapshot()
-    b = accept_stats.DFlashAcceptStatsRecorder("/tmp", 3, rank=1).snapshot()
+def test_merge_snapshots_shape_mismatch(tmp_path):
+    a = accept_stats.DFlashAcceptStatsRecorder(str(tmp_path), 2, rank=0).snapshot()
+    b = accept_stats.DFlashAcceptStatsRecorder(str(tmp_path), 3, rank=1).snapshot()
     with pytest.raises(ValueError):
         accept_stats.merge_snapshots([a, b])
 

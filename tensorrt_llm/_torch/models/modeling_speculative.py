@@ -1143,11 +1143,12 @@ class DFlashForCausalLM(nn.Module):
     def has_markov_head(self) -> bool:
         return self._dspark_markov_rank > 0 and self.markov_w1 is not None
 
-    def apply_markov_chain_logits(self,
-                                  base_logits: torch.Tensor,
-                                  first_prev_tokens: torch.Tensor,
-                                  argmax_fn=None,
-                                  vocab_slice: slice = None) -> torch.Tensor:
+    def apply_markov_chain_logits(
+            self,
+            base_logits: torch.Tensor,
+            first_prev_tokens: torch.Tensor,
+            argmax_fn=None,
+            vocab_slice: slice | None = None) -> torch.Tensor:
         """Apply the dspark vanilla-Markov intra-block bias to block logits.
 
         No-op (returns ``base_logits`` unchanged) for non-dspark drafters.

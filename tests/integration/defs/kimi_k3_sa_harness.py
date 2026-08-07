@@ -348,6 +348,15 @@ def _compare_logits_parity(base, spec, prompt, failures, tol=None, tie_tol=None)
         tie_tol = float(os.environ.get("KIMI_K3_SPEC_TIE_TOL", "0.3"))
     b_ids, s_ids = list(base.token_ids), list(spec.token_ids)
     b_lp, s_lp = base.logprobs, spec.logprobs
+    if not b_lp or len(b_lp) != len(b_ids):
+        failures.append(
+            f"baseline for {prompt!r} has "
+            f"{len(b_lp) if b_lp else 0} logprob entries for "
+            f"{len(b_ids)} tokens; logits parity requires aligned "
+            "baseline logprobs (dump the baseline with "
+            "KIMI_K3_DUMP_LOGPROBS=1)"
+        )
+        return "drift"
     shared = 0
     while shared < min(len(b_ids), len(s_ids)) and b_ids[shared] == s_ids[shared]:
         shared += 1
@@ -426,6 +435,10 @@ def main() -> int:
     spec_parity = os.environ.get("KIMI_K3_SPEC_PARITY", "0")
     if spec_parity == "1":
         spec_parity = "text"
+    if spec_parity not in ("0", "text", "logits"):
+        raise ValueError(
+            f"KIMI_K3_SPEC_PARITY={spec_parity!r} (expected '0', '1'/'text', or 'logits')"
+        )
 
     # DEP deployment (attention data-parallel + MoE expert-parallel
     # dispatch/combine; EP width == tp) is the default. KIMI_K3_ADP=0
@@ -469,6 +482,13 @@ def main() -> int:
         )
         if baseline_json:
             baseline = _load_completions(baseline_json)
+            if len(baseline) != len(prompt_set):
+                raise ValueError(
+                    f"baseline {baseline_json} holds {len(baseline)} "
+                    f"completions but this run uses {len(prompt_set)} "
+                    "prompts; set KIMI_K3_SPEC_NUM_PROMPTS to the value "
+                    "used for the baseline run"
+                )
         else:
             llm = _build_llm(ckpt, tp, "off", adp)
             baseline = _generate(llm, prompt_texts, max_tokens, want_logprobs)
