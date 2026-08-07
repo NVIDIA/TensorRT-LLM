@@ -59,21 +59,14 @@ _MTP_TOP_TO_TRTLLM = {
 
 
 def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
-    """Return Ada/Hopper defaults for globally NVFP4-quantized Qwen3.5 MoE.
-
-    MIXED_PRECISION checkpoints are excluded because this hook cannot inspect
-    their per-layer expert algorithms, some of which Marlin cannot consume.
-    Dense Qwen3.5 checkpoints are outside this MoE-specific default.
-    """
+    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
     defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
     quant_config = getattr(llm_args, "quant_config", None)
-    if getattr(
-        quant_config, "quant_algo", None
-    ) == QuantAlgo.NVFP4 and is_nvfp4_marlin_supported_sm(get_sm_version()):
-        # The CUTLASS W4A4 NVFP4 kernels require Blackwell. Marlin consumes
-        # the same checkpoint weights with BF16 activations on Ada/Hopper.
-        # Marlin does not support EPLB, but an explicit user backend remains
-        # authoritative when model defaults are applied.
+    if getattr(quant_config, "quant_algo", None) in (
+        QuantAlgo.NVFP4,
+        QuantAlgo.MIXED_PRECISION,
+    ) and is_nvfp4_marlin_supported_sm(get_sm_version()):
+        # CUTLASS W4A4 requires Blackwell; use Marlin's W4A16 path instead.
         defaults.update(
             {
                 "moe_config": {

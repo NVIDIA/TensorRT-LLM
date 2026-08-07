@@ -165,7 +165,7 @@ def test_qwen35_moe_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
     ("quant_algo", "sm_version", "use_marlin"),
     [
         pytest.param(QuantAlgo.NVFP4, 90, True, id="hopper-nvfp4"),
-        pytest.param(QuantAlgo.MIXED_PRECISION, 90, False, id="hopper-mixed-precision"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 90, True, id="hopper-mixed-precision"),
         pytest.param(QuantAlgo.NVFP4, 100, False, id="blackwell-nvfp4"),
     ],
 )
