@@ -93,7 +93,11 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
 
 
 def _fake_request(output_type: str = "video", **param_overrides) -> SimpleNamespace:
-    """A DiffusionRequest look-alike with executor-merged (None = unset) params."""
+    """A DiffusionRequest look-alike with executor-merged params.
+
+    ``model_fields_set`` mirrors the real object: pipeline defaults are cleared
+    by ``VisualGen.default_params``, so only what this caller overrode is marked.
+    """
     params = SimpleNamespace(
         height=None,
         width=None,
@@ -109,6 +113,7 @@ def _fake_request(output_type: str = "video", **param_overrides) -> SimpleNamesp
     )
     for key, value in param_overrides.items():
         setattr(params, key, value)
+    params.model_fields_set = set(param_overrides)
     return SimpleNamespace(prompt="x", params=params)
 
 
@@ -410,6 +415,32 @@ class TestInferModeResolution:
         req = _fake_request("video", frame_rate=30.0, extra_params={"action_mode": "policy"})
         got = self._captured_forward_kwargs(_bare_pipeline(), req)
         assert got["frame_rate"] == 30.0
+
+    def test_action_honors_an_explicit_frame_rate_equal_to_the_video_default(self):
+        """The collision case: 24.0 is both a legal caller choice and the
+        materialized video default. Value equality reads it as unset and hands
+        back the embodiment preset; provenance keeps the caller's 24."""
+        req = _fake_request("video", frame_rate=24.0, extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["frame_rate"] == 24.0
+
+    def test_action_drops_a_frame_rate_the_caller_never_set(self):
+        req = _fake_request("video", extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["frame_rate"] is None
+
+    def test_action_honors_explicit_values_equal_to_their_defaults(self):
+        """Same hazard for the other mode-dependent fields."""
+        req = _fake_request(
+            "video",
+            height=COSMOS3_720P_PARAMS["height"],
+            guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
+            extra_params={"action_mode": "policy"},
+        )
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["height"] == COSMOS3_720P_PARAMS["height"]
+        assert got["guidance_scale"] == COSMOS3_720P_PARAMS["guidance_scale"]
+        assert got["width"] is None
 
     def test_distilled_merged_defaults_pass_through(self):
         req = _fake_request("image", num_inference_steps=4, guidance_scale=1.0)

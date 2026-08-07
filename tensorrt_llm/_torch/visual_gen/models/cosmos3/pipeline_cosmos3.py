@@ -347,33 +347,26 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         def resolved(value, field_name):
             return value if value is not None else mode_params[field_name]
 
-        # Action resolves every one of these itself, from the embodiment preset
-        # and COSMOS3_ACTION_PARAMS: the canvas from the resolution bucket, the
-        # frame rate from the robot, and steps/guidance from the action recipe.
-        # Filling them from the video table here would leave forward()'s
-        # fallbacks dead and silently run action at 720p, 35 steps, guidance 6
-        # (CFG on, double the work) and 24 fps.
+        specified = req.params.model_fields_set
+
+        def as_given(field_name):
+            value = getattr(req.params, field_name)
+            return value if field_name in specified else None
+
         is_action = extra_params.get("action_mode") is not None
-        height = req.params.height if is_action else resolved(req.params.height, "height")
-        width = req.params.width if is_action else resolved(req.params.width, "width")
+        height = as_given("height") if is_action else resolved(req.params.height, "height")
+        width = as_given("width") if is_action else resolved(req.params.width, "width")
         num_inference_steps = (
-            req.params.num_inference_steps
+            as_given("num_inference_steps")
             if is_action
             else resolved(req.params.num_inference_steps, "num_inference_steps")
         )
         guidance_scale = (
-            req.params.guidance_scale
+            as_given("guidance_scale")
             if is_action
             else resolved(req.params.guidance_scale, "guidance_scale")
         )
-        # frame_rate cannot stay None in the pipeline defaults the way the four
-        # above do: the serve layer derives num_frames from seconds x frame_rate
-        # before the pipeline sees the request. So for action, "unset" survives
-        # only as "still equal to what the executor materialized" — any other
-        # value is the caller's own and outranks the embodiment preset.
-        frame_rate = req.params.frame_rate
-        if is_action and frame_rate == self.default_generation_params.get("frame_rate"):
-            frame_rate = None
+        frame_rate = as_given("frame_rate") if is_action else req.params.frame_rate
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(

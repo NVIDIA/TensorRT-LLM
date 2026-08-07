@@ -321,7 +321,13 @@ class VisualGen:
         if extra:
             kwargs["extra_params"] = extra
 
-        return VisualGenParams(**kwargs)
+        params = VisualGenParams(**kwargs)
+        # These came from the pipeline, not the caller. Un-marking them keeps
+        # request-dependent defaults resolvable after a round trip through
+        # this object; assigning any of them re-marks it automatically.
+        for field_name in self.executor.default_generation_params:
+            params.model_fields_set.discard(field_name)
+        return params
 
     @set_api_status("prototype")
     def generate(
