@@ -1663,7 +1663,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
         ]
     }
 
-    if (env.testPhase2StageName) {
+    if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
         parameters += [
             'testPhase2StageName': env.testPhase2StageName,
         ]
@@ -1708,24 +1708,16 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     return buildStatus
 }
 
-def launchInfraDryRunTestJobs(pipeline, arch, testFilter, globalVars, platform, imageParameters)
+def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, imageParameters)
 {
     String testFilterJson = writeJSON returnText: true, json: testFilter
-    def additionalParameters = ['testFilter': testFilterJson] + imageParameters
-    def testJobs = [
-        "[Test-${arch}-Single-GPU] Remote Run": {
-            stage("[Test-${arch}-Single-GPU] Remote Run") {
-                launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
-            }
-        },
-        "[Test-${arch}-Multi-GPU] Remote Run": {
-            stage("[Test-${arch}-Multi-GPU] Remote Run") {
-                launchJob(pipeline, "L0_Test-${arch}-Multi-GPU", false, false, globalVars, platform, additionalParameters)
-            }
-        },
-    ]
-    testJobs.failFast = false
-    pipeline.parallel testJobs
+    def additionalParameters = [
+        'testFilter': testFilterJson,
+        'testPhase2StageName': '',
+    ] + imageParameters
+    stage("[Test-${arch}-Single-GPU] Remote Run") {
+        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
+    }
 }
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
@@ -1830,7 +1822,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-                    launchInfraDryRunTestJobs(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
+                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
                     return
                 }
 
@@ -1990,7 +1982,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                     ]
-                    launchInfraDryRunTestJobs(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
+                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
                     return
                 }
 
