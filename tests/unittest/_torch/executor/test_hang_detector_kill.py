@@ -117,3 +117,101 @@ def test_propagate_hard_kill_self_sigkills_without_mpi():
         f"expected self-SIGKILL (-9), got {proc.returncode}; "
         f"stderr={proc.stderr.decode(errors='replace')[-500:]}"
     )
+
+
+def _wait_until_detected(hd, budget_s):
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline and not hd.detected():
+        time.sleep(0.02)
+    return hd.detected()
+
+
+def test_suppressor_freezes_deadline_across_spinning_checkpoints():
+    """A hot loop that checkpoints every iteration still dies once suppressed.
+
+    This is the disagg livelock in miniature: the executor loop spins with an
+    empty batch and re-arms the watchdog thousands of times a second. With the
+    suppressor asserted the pending detection is left to run down instead of
+    being pushed forward, so the detector fires despite the checkpoint storm.
+    """
+    fired = []
+    hd = HangDetector(timeout=2, on_detected=lambda: fired.append(time.monotonic()))
+    with hd:
+        hd.checkpoint()  # arm before suppression begins
+        hd.set_rearm_suppressor(lambda: True)
+        start = time.monotonic()
+        while time.monotonic() - start < 3.0 and not hd.detected():
+            hd.checkpoint()
+            time.sleep(0.001)
+        assert hd.detected(), "suppressed checkpoints must not keep pushing the deadline out"
+        assert fired, "on_detected must run"
+
+
+def test_suppressed_pause_does_not_rearm():
+    """``pause()`` must not undo suppression on exit.
+
+    ``RequestBroadcaster.broadcast`` pause-wraps a collective on *every*
+    iteration, and ``pause.__exit__`` re-arms unconditionally. Gating only the
+    loop-top ``checkpoint()`` would therefore leave the watchdog re-armed ~1250
+    times a second by this path alone.
+    """
+    hd = HangDetector(timeout=2, on_detected=lambda: None)
+    with hd:
+        hd.checkpoint()
+        hd.set_rearm_suppressor(lambda: True)
+        start = time.monotonic()
+        while time.monotonic() - start < 3.0 and not hd.detected():
+            with hd.pause():
+                pass
+            time.sleep(0.001)
+        assert hd.detected(), "pause() must not re-arm the detector while suppressed"
+
+
+def test_suppressor_never_disables_an_unarmed_detector():
+    """Suppression can only ever *cause* a kill, never suppress one.
+
+    When nothing is armed yet there is no deadline to preserve, so the normal
+    arming path must still run even though the predicate holds.
+    """
+    hd = HangDetector(timeout=2, on_detected=lambda: None)
+    with hd:
+        hd.set_rearm_suppressor(lambda: True)
+        assert not hd.is_armed()
+        hd.checkpoint()
+        assert hd.is_armed(), "an unarmed detector must always be armed by checkpoint()"
+        assert _wait_until_detected(hd, 4.0), "the armed detection must still fire"
+
+
+def test_unsuppressed_checkpoint_still_resets_timer():
+    """A healthy idle server must never be killed by this mechanism."""
+    hd = HangDetector(timeout=2, on_detected=lambda: None)
+    with hd:
+        hd.set_rearm_suppressor(lambda: False)
+        hd.checkpoint()
+        start = time.monotonic()
+        while time.monotonic() - start < 3.0:
+            hd.checkpoint()
+            with hd.pause():
+                pass
+            time.sleep(0.001)
+        assert not hd.detected(), "an unsuppressed checkpoint must keep resetting the timer"
+
+
+def test_failing_suppressor_falls_back_to_normal_rearm(monkeypatch):
+    """A broken predicate must not wedge or kill the executor loop."""
+    logged = []
+    monkeypatch.setattr(hang_detector_module, "_best_effort_log_error", logged.append)
+
+    def boom():
+        raise RuntimeError("predicate blew up")
+
+    hd = HangDetector(timeout=2, on_detected=lambda: None)
+    with hd:
+        hd.checkpoint()
+        hd.set_rearm_suppressor(boom)
+        start = time.monotonic()
+        while time.monotonic() - start < 3.0:
+            hd.checkpoint()
+            time.sleep(0.001)
+        assert not hd.detected(), "a failing predicate must fall back to re-arming"
+        assert any("re-arm suppressor failed" in message for message in logged)
