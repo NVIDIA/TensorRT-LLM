@@ -44,6 +44,7 @@ def _make_executor(
     enable_kv_pool_rebalance: bool = True,
     pp_size: int = 1,
     tp_size: int = 1,
+    cp_size: int = 1,
     enable_attention_dp: bool = False,
     kv_cache_transceiver=None,
     is_warmup: bool = False,
@@ -71,7 +72,7 @@ def _make_executor(
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
-    exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size)
+    exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
     exe.is_warmup = is_warmup
@@ -480,6 +481,47 @@ class TestAgreedNeedAdjustment:
         exe.dist.tp_broadcast.return_value = True
 
         assert PyExecutor._agreed_need_adjustment(exe) is True
+
+    def test_cp_broadcasts_even_when_tp_size_is_one(self):
+        # A pure-CP job has mapping.tp_size == 1, so keying the agreement on
+        # tp_size alone would leave CP unsynchronized -- yet a request is split
+        # across CP ranks, and CP runs on the same executor loops as TP (loop
+        # choice keys only on pp_size), so CP ranks also schedule independently.
+        exe = _make_executor(tp_size=1, cp_size=4, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_tp_and_cp_chain_propagates_global_rank0(self):
+        # CP first, then TP: after the CP step a rank holds V(its tp_rank, cp0),
+        # and the TP step replaces it with V(tp0, cp0) -- global rank 0's value.
+        #
+        # The local reading and the CP result are deliberately *different* here.
+        # If they matched, the final assertion would pass whether or not the TP
+        # step actually consumes the CP step's result, and the chaining -- the
+        # whole point of this test -- would go unverified.
+        exe = _make_executor(tp_size=2, cp_size=2, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+        exe.dist.tp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        # Called with the CP result (False), not the local reading (True).
+        exe.dist.tp_broadcast.assert_called_once_with(False, root=0)
+
+    def test_single_rank_touches_no_collective(self):
+        exe = _make_executor(tp_size=1, cp_size=1, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.cp_broadcast.assert_not_called()
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_attention_dp_skips_cp_broadcast_too(self):
+        exe = _make_executor(tp_size=2, cp_size=2, enable_attention_dp=True, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.cp_broadcast.assert_not_called()
+        exe.dist.tp_broadcast.assert_not_called()
 
     def test_attention_dp_decides_independently(self):
         # ADP ranks own independent request streams and independent KV caches,
