@@ -550,6 +550,30 @@ def test_mm_admission_passes_oversized_request_to_validation():
     assert not waiting
 
 
+def test_mm_admission_uses_active_request_state_snapshot():
+    active = _request(1, [4])
+    active.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = object()
+    waiting = FCFSWaitingQueue([_waiting_item(2, [4])])
+    executor = _executor_for_mm_admission([active])
+
+    admitted = executor._pop_from_waiting_queue(waiting, 1)
+
+    assert [item.id for item in admitted] == [2]
+    assert not waiting
+
+
+def test_mm_admission_passes_malformed_metadata_to_validation():
+    malformed = _waiting_item(1, [4])
+    malformed.request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = object()
+    waiting = FCFSWaitingQueue([malformed, _waiting_item(2, [8])])
+    executor = _executor_for_mm_admission([])
+
+    admitted = executor._pop_from_waiting_queue(waiting, 0)
+
+    assert [item.id for item in admitted] == [1, 2]
+    assert not waiting
+
+
 def test_item_encoder_slices_and_restores_selected_item_order():
     class _Model(MultimodalModelMixin):
         def encode_multimodal_inputs(self, multimodal_params):
