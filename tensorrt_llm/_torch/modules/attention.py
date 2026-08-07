@@ -17,6 +17,7 @@ from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
+from ..attention_backend.sparse.hooks import get_sparse_attention_hooks
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -602,6 +603,8 @@ class Attention(nn.Module):
         sparse_params = (sparse_attn_cfg.to_sparse_params(
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
+        self.sparse_params = sparse_params
+        self.sparse_attn_hooks = get_sparse_attention_hooks(self)
 
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_params=sparse_params)
@@ -631,10 +634,8 @@ class Attention(nn.Module):
             logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
                              key="sparse_attention_config")
 
-            if config.sparse_attention_config.algorithm == "rocket":
-                logger.warning_once("disable rope_fusion for RocketKV.",
-                                    key="disable_rope_fusion_for_rocketkv")
-                self.rope_fusion = False
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.initialize(self)
 
         if (config.kv_cache_compression_config is not None and
                 config.kv_cache_compression_config.changes_physical_kv_length):
@@ -923,7 +924,28 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        **kwargs,
     ):
+        if self.sparse_attn_hooks is not None:
+            sparse_output = self.sparse_attn_hooks.forward(
+                self,
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                attention_window_size,
+                attention_mask_data,
+                mrope_config,
+                attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
+                has_lora,
+                **kwargs,
+            )
+            if sparse_output is not None:
+                return sparse_output
+
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
         if mrope_config is not None:
@@ -1066,10 +1088,22 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
+            **kwargs,
         )
 
         if self.attn_output_gate:
             attn_output = self.apply_output_gate(attn_output, gate)
+
+        if self.sparse_attn_hooks is not None:
+            sparse_output = self.sparse_attn_hooks.project_output(
+                self,
+                attn_output,
+                attn_metadata,
+                all_reduce_params,
+                lora_params,
+            )
+            if sparse_output is not None:
+                return sparse_output
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
