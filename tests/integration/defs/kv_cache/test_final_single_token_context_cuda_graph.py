@@ -92,6 +92,7 @@ class _CudaGraphExecutionProbe:
         new_tensors_device: SampleStateTensors | None = None,
         spec_resource_manager: BaseResourceManager | None = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
+        use_lora_graph: bool = False,
     ) -> tuple[Any | None, Any | None, KeyType | None]:
         # A new decision means the preceding one reached eager execution if it
         # did not call replay. Keep that earlier observation unchanged.
@@ -105,6 +106,7 @@ class _CudaGraphExecutionProbe:
             new_tensors_device,
             spec_resource_manager,
             promoted_context_request_ids,
+            use_lora_graph,
         )
         if promoted_context_request_ids:
             execution = _PromotedContextGraphExecution(
