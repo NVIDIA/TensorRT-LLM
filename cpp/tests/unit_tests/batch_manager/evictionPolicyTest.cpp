@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace tk = tensorrt_llm::kernels;
@@ -116,6 +117,43 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
     policy->releaseBlock(origPrimaryBlock);
 
     EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+}
+
+// A duplicate releaseBlock (same block released twice without an intervening claim) must not
+// insert a second free-queue node: pre-fix it double-counted the block and handed it out twice.
+TEST_F(LRUPolicyTest, DoubleReleaseDoesNotCorruptFreeQueue)
+{
+    constexpr SizeType32 kPrimaryLevel = 0;
+
+    // Claim a block so it leaves the free queue.
+    auto block = std::get<0>(policy->getFreeBlock(kPrimaryLevel));
+    policy->claimBlock(block);
+    auto const freeAfterClaim = policy->getNumFreeBlocks(kPrimaryLevel);
+
+    // Legitimate release: the block returns to the free queue exactly once.
+    policy->releaseBlock(block);
+    EXPECT_EQ(policy->getNumFreeBlocks(kPrimaryLevel), freeAfterClaim + 1);
+
+    // Buggy double release (no intervening claim). Must NOT add a duplicate queue entry.
+    policy->releaseBlock(block);
+    EXPECT_EQ(policy->getNumFreeBlocks(kPrimaryLevel), freeAfterClaim + 1)
+        << "duplicate release inflated the free-block count (orphaned duplicate queue node)";
+
+    // The queue must remain internally consistent.
+    EXPECT_TRUE(policy->verifyQueueIntegrity());
+
+    // Drain the primary queue: every block handed out must be distinct. A duplicate
+    // node would hand out `block` twice (and/or hand out an already-claimed block).
+    std::set<KVCacheBlock::IdType> seen;
+    auto const numFree = policy->getNumFreeBlocks(kPrimaryLevel);
+    for (SizeType32 i = 0; i < numFree; ++i)
+    {
+        auto handedOut = std::get<0>(policy->getFreeBlock(kPrimaryLevel));
+        EXPECT_TRUE(seen.insert(handedOut->getBlockId()).second)
+            << "free queue handed out block id " << handedOut->getBlockId() << " more than once";
+        policy->claimBlock(handedOut);
+    }
+    EXPECT_EQ(policy->getNumFreeBlocks(kPrimaryLevel), 0);
 }
 
 TEST_F(LRUPolicyTest, PooledPlaceholderReleaseReturnsToPlaceholderQueue)

@@ -183,6 +183,15 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
+    // A block occupies at most one free-queue slot. Releasing an already-queued block would
+    // insert a duplicate list node, orphaning the first and later double-freeing in claimBlock().
+    // Drop the duplicate release instead.
+    if (mFreeBlockIterators[id].has_value())
+    {
+        TLLM_LOG_WARNING("Block (id %d) released while already in the free queue; ignoring duplicate release", id);
+        return;
+    }
+
     // If there are no children, this is a leaf block. Insert into a queue.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
     if (toFront)
