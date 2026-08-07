@@ -24,7 +24,6 @@ object.__new__ and only the attributes control_action() touches.
 """
 
 import threading
-import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -243,37 +242,36 @@ def test_sequential_control_actions_are_allowed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bounded barrier wait -- a lost edge must fail loudly, not wedge the lock
+# Dead executor loop -- must be reported, not waited on forever
+#
+# The wait is deliberately unbounded (a deadline would strand the already
+# enqueued sentinel and hang the loop), so these are the ONLY two escapes.
+# Each runs the call on a worker thread and joins with a timeout, so a
+# regression surfaces as a test failure rather than a hung CI stage.
 # ---------------------------------------------------------------------------
 
 
-def test_lost_barrier_edge_fails_loudly_instead_of_wedging_the_lock() -> None:
-    """Reproduces the aborted-control-request pulse.
+def _run_expecting_shutdown_error(ex: "PyExecutor", control_id: str) -> str:
+    """Call control_action() off-thread; return "raised"/"yielded"/"hung"."""
+    outcome = []
 
-    _handle_control_request does set(); clear() on the abort path without
-    waiting for control_action_done.  A caller arriving after that pulse sees
-    a cleared barrier and would block forever while holding the lock, wedging
-    every later control action.  It must raise instead, and release the lock.
-    """
-    from tensorrt_llm._torch.pyexecutor import py_executor
+    def body() -> None:
+        try:
+            with ex.control_action(control_id=control_id):
+                outcome.append("yielded")
+        except RuntimeError as exc:
+            outcome.append("raised" if "shut down" in str(exc) else str(exc))
 
-    ex = _make_executor()
-    ex.control_request_barrier.clear()  # the edge was pulsed and missed
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(py_executor, "_CONTROL_BARRIER_TIMEOUT_S", 0.3)
-        mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
-        with pytest.raises(RuntimeError, match="timed out"):
-            with ex.control_action(control_id="lost-edge"):
-                pytest.fail("should not have yielded on a lost barrier edge")
-
-    # The whole point: the next caller is not wedged behind us.
-    assert not ex._control_action_lock.locked()
-    assert ex._control_action_owner is None
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    t.join(timeout=_TIMEOUT)
+    if t.is_alive():
+        return "hung"
+    return outcome[0] if outcome else "no-outcome"
 
 
-def test_shutdown_fails_fast_without_waiting_out_the_timeout() -> None:
-    """A dead executor loop must not cost a full timeout to discover."""
+def test_shutdown_is_reported_instead_of_waited_on() -> None:
+    """shutdown_event set => the loop already exited, so nothing will fire."""
     from tensorrt_llm._torch.pyexecutor import py_executor
 
     ex = _make_executor()
@@ -281,20 +279,14 @@ def test_shutdown_fails_fast_without_waiting_out_the_timeout() -> None:
     ex.shutdown_event.set()
 
     with pytest.MonkeyPatch.context() as mp:
-        # Large timeout: if shutdown were not detected this test would hang.
-        mp.setattr(py_executor, "_CONTROL_BARRIER_TIMEOUT_S", 300.0)
         mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
-        start = time.monotonic()
-        with pytest.raises(RuntimeError, match="shut down"):
-            with ex.control_action(control_id="after-shutdown"):
-                pytest.fail("should not have yielded after shutdown")
-        assert time.monotonic() - start < 5.0, "did not fail fast on shutdown"
+        assert _run_expecting_shutdown_error(ex, "after-shutdown") == "raised"
 
     assert not ex._control_action_lock.locked()
     assert ex._control_action_owner is None
 
 
-def test_dead_worker_thread_fails_fast_without_waiting_out_the_timeout() -> None:
+def test_dead_worker_thread_is_reported_instead_of_waited_on() -> None:
     """A crashed executor loop must be caught with ``shutdown_event`` clear.
 
     ``shutdown_event`` only covers the orderly path.  A worker that died
@@ -311,14 +303,43 @@ def test_dead_worker_thread_fails_fast_without_waiting_out_the_timeout() -> None
     ex.worker_thread = SimpleNamespace(is_alive=lambda: False)
 
     with pytest.MonkeyPatch.context() as mp:
-        # Large timeout: if the dead worker were not detected this would hang.
-        mp.setattr(py_executor, "_CONTROL_BARRIER_TIMEOUT_S", 300.0)
         mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
-        start = time.monotonic()
-        with pytest.raises(RuntimeError, match="shut down"):
-            with ex.control_action(control_id="dead-worker"):
-                pytest.fail("should not have yielded with a dead worker")
-        assert time.monotonic() - start < 5.0, "did not fail fast on a dead worker"
+        assert _run_expecting_shutdown_error(ex, "dead-worker") == "raised"
+
+    assert not ex._control_action_lock.locked()
+    assert ex._control_action_owner is None
+
+
+def test_live_loop_keeps_waiting_rather_than_stranding_the_sentinel() -> None:
+    """With the loop alive, a missing barrier edge must NOT raise.
+
+    Rank 0 has already enqueued the sentinel by this point.  Bailing out would
+    leave the loop to pop it, set the barrier and block forever in the untimed
+    control_action_done.wait() with no caller left -- hanging the executor.
+    So the caller has to keep waiting, and resume once the edge arrives.
+    """
+    from tensorrt_llm._torch.pyexecutor import py_executor
+
+    ex = _make_executor()
+    ex.control_request_barrier.clear()  # edge not fired yet
+    ex.worker_thread = SimpleNamespace(is_alive=lambda: True)  # loop is healthy
+    entered = threading.Event()
+
+    def body() -> None:
+        with ex.control_action(control_id="slow-drain"):
+            entered.set()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
+        t = threading.Thread(target=body, daemon=True)
+        t.start()
+        # Must still be waiting, not raising, well past several poll intervals.
+        assert not entered.wait(timeout=1.0), "caller bailed out on a live loop"
+        assert t.is_alive(), "caller must not have raised while the loop is alive"
+
+        ex.control_request_barrier.set()  # the loop finally fires it
+        assert entered.wait(timeout=_TIMEOUT), "caller never resumed"
+        t.join(timeout=_TIMEOUT)
 
     assert not ex._control_action_lock.locked()
     assert ex._control_action_owner is None

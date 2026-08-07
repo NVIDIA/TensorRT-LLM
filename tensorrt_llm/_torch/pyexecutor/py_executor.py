@@ -155,14 +155,9 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
-# Backstop for control_action()'s barrier wait.  Deliberately generous: with
-# drain=True the sentinel is parked until active_requests and waiting_queue
-# empty, so a legitimate wait is bounded only by how long in-flight requests
-# take.  This is not a latency budget, it is a last resort that turns a lost
-# barrier edge into a loud failure instead of a permanently wedged lock.
-# Shutdown and a dead executor loop are detected by the liveness poll below,
-# so they fail in _CONTROL_BARRIER_POLL_INTERVAL_S rather than waiting this out.
-_CONTROL_BARRIER_TIMEOUT_S = 1800.0
+# How often control_action() re-checks executor-loop liveness while waiting for
+# the control request barrier.  There is deliberately NO wall-clock deadline on
+# that wait -- see _wait_for_control_barrier() for why one would be unsafe.
 _CONTROL_BARRIER_POLL_INTERVAL_S = 0.5
 
 
@@ -4520,20 +4515,31 @@ class PyExecutor:
     def _wait_for_control_barrier(self, control_id: Optional[str]) -> None:
         """Wait for the executor loop to fire our control request.
 
-        Bounded rather than a bare ``wait()``, because the barrier edge can be
-        lost: ``_handle_control_request`` pulses ``set()`` then ``clear()`` on
-        the aborted-control-request path without waiting for
-        ``control_action_done``.  A caller that has not reached the wait yet
-        when that happens would otherwise block forever *while holding*
-        ``_control_action_lock``, wedging every later control action with no
-        diagnostic.  Failing loudly here blames the caller that actually lost
-        the edge.
+        Waits indefinitely, but polls so that a *dead* executor loop is
+        reported instead of hung on.
+
+        There is deliberately no wall-clock deadline.  Rank 0 has already
+        enqueued the sentinel by the time we get here, so bailing out while the
+        loop is still alive would strand it: the loop would later pop that
+        sentinel, ``set()`` the barrier and block in the untimed
+        ``control_action_done.wait()`` with no caller left to answer, hanging
+        the executor until the hang detector kills the job.  That is strictly
+        worse than the stall a deadline would have avoided.
+
+        The two conditions below are safe precisely because each one implies
+        there is no consumer left to strand: ``shutdown_event`` is set in
+        ``_executor_loop_cleanup()``, i.e. only once the loop has exited, and a
+        dead ``worker_thread`` cannot pop anything either.  So an orphaned
+        sentinel is inert in both cases.
+
+        Consequence: a lost barrier edge (``_handle_control_request`` pulses
+        ``set(); clear()`` on the aborted path without waiting for
+        ``control_action_done``) still blocks here while holding
+        ``_control_action_lock``.  That is pre-existing behaviour; fixing it
+        needs the abort to be routed back to this caller, not a timeout.
         """
-        deadline = time.monotonic() + _CONTROL_BARRIER_TIMEOUT_S
         while not self.control_request_barrier.wait(
                 timeout=_CONTROL_BARRIER_POLL_INTERVAL_S):
-            # The loop that would set the barrier is gone; waiting out the full
-            # timeout would serve no purpose.
             worker = getattr(self, "worker_thread", None)
             if self.shutdown_event.is_set() or (worker is not None
                                                 and not worker.is_alive()):
@@ -4541,13 +4547,6 @@ class PyExecutor:
                     "control_action() barrier never fired: the executor loop "
                     f"is shut down (control_id={control_id}). The control "
                     "request cannot be serviced.")
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "control_action() timed out after "
-                    f"{_CONTROL_BARRIER_TIMEOUT_S}s waiting for the control "
-                    f"request barrier (control_id={control_id}). The barrier "
-                    "edge was likely lost - e.g. the request was aborted "
-                    "between enqueue and this wait.")
 
     def _wait_for_model_engine_input_copy(self):
         wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",
