@@ -69,6 +69,10 @@ class _FileBackedSharedMemory:
     def buf(self):
         return self._mmap
 
+    def flush(self):
+        """Write dirty expert pages back before loading the next layer."""
+        self._mmap.flush()
+
     def close(self):
         self._mmap.close()
 
@@ -331,6 +335,12 @@ class HostMoeTensorSharer:
                 ), f"key={key} already exists"
                 self.host_weights[key] = st
                 offset += aligned_size
+        # Online EPLB can stage hundreds of GiB per node. Explicitly make
+        # completed file-backed layers writeback-eligible before materializing
+        # the next layer, otherwise dirty mmap pages can exhaust the Slurm
+        # memory cgroup during checkpoint loading.
+        if isinstance(shm, _FileBackedSharedMemory):
+            shm.flush()
         self.shared_tensors = {}
 
         for raw_weight in self.loaded_shared_weights:
