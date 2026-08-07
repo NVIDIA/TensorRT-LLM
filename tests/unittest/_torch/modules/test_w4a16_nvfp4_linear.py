@@ -111,8 +111,8 @@ def test_nvfp4_attention_keeps_high_precision_output_for_hopper_marlin():
         )
 
         assert o_proj.uses_marlin_nvfp4
-        assert type(o_proj.quant_method) is NVFP4LinearMethod
-        assert o_proj.has_nvfp4_activation_quantization
+        assert isinstance(o_proj.quant_method, MarlinNVFP4LinearMethod)
+        assert not o_proj.has_nvfp4_activation_quantization
         assert not Attention._use_quantize_output(attention)
 
 
@@ -161,26 +161,37 @@ def test_nvfp4_linear_forwards_allowed_backends_to_gemm(allowed_backends, expect
 
 
 @pytest.mark.parametrize(
-    ("sm_version", "dtype", "allowed_backends", "expect_marlin"),
+    ("sm_version", "allowed_backends", "expect_marlin"),
     [
-        (89, torch.bfloat16, None, False),
-        (90, torch.bfloat16, None, False),
-        (120, torch.bfloat16, None, False),
-        (121, torch.bfloat16, None, False),
-        (89, torch.bfloat16, ["marlin"], True),
-        (90, torch.bfloat16, ["marlin"], True),
-        (90, torch.float16, None, False),
+        # Honoured only on Ada/Hopper, and only when opted in.
+        (89, ["marlin"], True),
+        (90, ["marlin"], True),
+        (89, None, False),
+        (90, None, False),
+        (120, None, False),
+        (121, None, False),
+        # Opt-in ignored off Ada/Hopper: Marlin is not the right NVFP4 backend
+        # on SM120/121, where the W4A4 kernels are faster.
+        (120, ["marlin"], False),
+        (121, ["marlin"], False),
     ],
 )
-def test_nvfp4_linear_keeps_activation_quant_method(
-    sm_version, dtype, allowed_backends, expect_marlin
+def test_nvfp4_linear_marlin_opt_in_switches_to_weight_only_method(
+    sm_version, allowed_backends, expect_marlin
 ):
-    """Plain NVFP4 always keeps NVFP4LinearMethod -- Marlin is reached inside the
-    GEMM op, so only ``uses_marlin_nvfp4`` flips."""
+    """The Marlin kernel is W4A16, so opting a W4A4 checkpoint into it converts
+    the layer to the weight-only method, which pads N/K for the kernel. Without
+    the opt-in the layer keeps NVFP4LinearMethod and its activation quantize."""
     kwargs = {} if allowed_backends is None else {"nvfp4_allowed_backends": allowed_backends}
 
     with (
         patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=sm_version),
+        # is_nvfp4_marlin_supported_sm reads its own get_sm_version binding in
+        # utils.py, so it has to be patched alongside linear's.
+        patch(
+            "tensorrt_llm._torch.modules.linear.is_nvfp4_marlin_supported_sm",
+            return_value=89 <= sm_version < 100,
+        ),
         patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
         patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
     ):
@@ -188,15 +199,20 @@ def test_nvfp4_linear_keeps_activation_quant_method(
             32,
             32,
             bias=False,
-            dtype=dtype,
+            dtype=torch.bfloat16,
             quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
             reduce_output=False,
             **kwargs,
         )
 
-    assert type(linear.quant_method) is NVFP4LinearMethod
-    assert linear.has_nvfp4_activation_quantization
-    assert linear.uses_marlin_nvfp4 is expect_marlin
+        # Asserted inside the patch: uses_marlin_nvfp4 re-reads the SM on every
+        # access rather than caching what create_weights decided.
+        assert isinstance(linear.quant_method, MarlinNVFP4LinearMethod) is expect_marlin
+        assert linear.uses_marlin_nvfp4 is expect_marlin
+        # Marlin consumes BF16 activations; the plain NVFP4 path quantizes them.
+        assert linear.has_nvfp4_activation_quantization is not expect_marlin
+        if not expect_marlin:
+            assert type(linear.quant_method) is NVFP4LinearMethod
 
 
 def test_nvfp4_linear_hopper_marlin_applies_bias_as_post_op():

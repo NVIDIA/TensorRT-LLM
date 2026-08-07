@@ -31,6 +31,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                     is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
@@ -3503,9 +3504,19 @@ class Linear(nn.Module):
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         quant_method = get_quant_method(quant_config)
-        use_marlin = type(quant_method) is W4A16NVFP4LinearMethod
-        if use_marlin and MarlinNVFP4LinearMethod.is_enabled(self):
-            return MarlinNVFP4LinearMethod()
+        method_type = type(quant_method)
+        if method_type is W4A16NVFP4LinearMethod:
+            # Marlin by default on SM120/121, explicit opt-in elsewhere.
+            if MarlinNVFP4LinearMethod.is_enabled(self):
+                return MarlinNVFP4LinearMethod()
+        elif method_type is NVFP4LinearMethod:
+            # The Marlin kernel is W4A16, so an explicit opt-in on a W4A4
+            # checkpoint runs the weight-only method, which pads N/K to the
+            # tile sizes the kernel requires.
+            if ("marlin" in self.nvfp4_allowed_backends
+                    and is_nvfp4_marlin_supported_sm()
+                    and MarlinNVFP4LinearMethod.is_supported(self)):
+                return MarlinNVFP4LinearMethod()
         return quant_method
 
     @staticmethod
