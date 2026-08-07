@@ -24,6 +24,7 @@ import torch
 import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -45,7 +46,6 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     RequestScheduler,
     ScheduledRequests,
-    SerializableSchedulerOutput,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
