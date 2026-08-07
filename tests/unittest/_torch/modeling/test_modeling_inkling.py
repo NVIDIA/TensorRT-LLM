@@ -56,7 +56,18 @@ def _index(ckpt: str) -> dict[str, str]:
         return json.load(f)["weight_map"]
 
 
+def _is_quantized(ckpt: str) -> bool:
+    """A checkpoint is quantized iff it ships hf_quant_config.json.
+
+    The BF16 release does not, and its empty exclusion list means "nothing is
+    quantized" rather than "everything is".
+    """
+    return os.path.isfile(os.path.join(ckpt, "hf_quant_config.json"))
+
+
 def _exclude_modules(ckpt: str) -> set[str]:
+    if not _is_quantized(ckpt):
+        return set()
     with open(os.path.join(ckpt, "hf_quant_config.json")) as f:
         return set(json.load(f)["quantization"].get("exclude_modules", []))
 
@@ -158,7 +169,9 @@ def test_text_weight_accounting(ckpt_config):
     exclude = _exclude_modules(CHECKPOINT)
     all_keys = set(_index(CHECKPOINT))
 
-    acct = inkling_account_checkpoint(all_keys, ckpt_config, exclude)
+    acct = inkling_account_checkpoint(
+        all_keys, ckpt_config, exclude, quantized=_is_quantized(CHECKPOINT)
+    )
     assert not acct["unaccounted"], sorted(acct["unaccounted"])[:10]
     assert not acct["missing"], sorted(acct["missing"])[:10]
     assert all(
@@ -166,10 +179,45 @@ def test_text_weight_accounting(ckpt_config):
     )
     assert len(acct["consumed_text"]) + len(acct["deferred"]) == len(all_keys)
 
-    # NVFP4 routed experts are exactly layers 3..65 (layer-2 experts are bf16).
-    assert inkling_nvfp4_expert_layers(ckpt_config, exclude) == list(range(3, 66))
-    assert "model.llm.layers.2.mlp.experts" in exclude
-    assert "model.llm.layers.3.mlp.experts" not in exclude
+    if _is_quantized(CHECKPOINT):
+        # NVFP4 routed experts are exactly layers 3..65 (layer-2 experts are bf16).
+        assert inkling_nvfp4_expert_layers(ckpt_config, exclude) == list(range(3, 66))
+        assert "model.llm.layers.2.mlp.experts" in exclude
+        assert "model.llm.layers.3.mlp.experts" not in exclude
+    else:
+        assert inkling_nvfp4_expert_layers(ckpt_config, exclude, quantized=False) == []
+
+
+BF16_CHECKPOINT = os.environ.get(
+    "INKLING_BF16_CHECKPOINT", str(_models_root / "Inkling-Small") if _models_root else ""
+)
+
+requires_bf16_checkpoint = pytest.mark.skipif(
+    not BF16_CHECKPOINT or not os.path.isdir(BF16_CHECKPOINT),
+    reason="Inkling BF16 checkpoint not available",
+)
+
+
+@requires_bf16_checkpoint
+def test_bf16_text_weight_accounting():
+    """The unquantized release accounts exactly, with no scale sidecars expected.
+
+    Guards the failure mode the ``quantized`` flag exists for: an empty
+    exclusion list read as "every layer is NVFP4" makes the expected-key set ask
+    for ``.scale`` / ``.scale2`` / ``.input_amax`` / ``.original_shape`` on every
+    routed-expert tensor, none of which a BF16 checkpoint ships.
+    """
+    config = InklingConfig.from_pretrained(BF16_CHECKPOINT).text_config
+    all_keys = set(_index(BF16_CHECKPOINT))
+    assert not _is_quantized(BF16_CHECKPOINT)
+
+    acct = inkling_account_checkpoint(all_keys, config, set(), quantized=False)
+    assert not acct["unaccounted"], sorted(acct["unaccounted"])[:10]
+    assert not acct["missing"], sorted(acct["missing"])[:10]
+    assert len(acct["consumed_text"]) + len(acct["deferred"]) == len(all_keys)
+
+    # No routed-expert tensor carries a scale sidecar.
+    assert not [k for k in all_keys if k.endswith((".scale", ".scale2", ".input_amax"))]
 
 
 @requires_checkpoint

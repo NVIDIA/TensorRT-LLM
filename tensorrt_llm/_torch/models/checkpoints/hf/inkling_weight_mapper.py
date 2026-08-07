@@ -108,13 +108,26 @@ _NON_LAYER_TEXT_KEYS: Tuple[str, ...] = (
 )
 
 
-def _experts_are_nvfp4(layer_idx: int, exclude_modules: Set[str]) -> bool:
-    """Routed experts of an MoE layer are NVFP4 unless explicitly excluded."""
+def _experts_are_nvfp4(layer_idx: int, exclude_modules: Set[str], quantized: bool = True) -> bool:
+    """Routed experts of an MoE layer are NVFP4 unless explicitly excluded.
+
+    ``quantized=False`` for a checkpoint that ships no ``hf_quant_config.json``
+    (the BF16 release): there the exclusion list is empty not because every
+    layer is NVFP4 but because nothing is, and reading the emptiness as
+    "all quantized" would expect scale sidecars the checkpoint never ships.
+    """
+    if not quantized:
+        return False
     return f"model.llm.layers.{layer_idx}.mlp.experts" not in exclude_modules
 
 
-def inkling_expected_text_keys(config: InklingTextConfig, exclude_modules: Set[str]) -> Set[str]:
-    """Exact set of ``model.llm.*`` checkpoint keys the text loader consumes."""
+def inkling_expected_text_keys(
+    config: InklingTextConfig, exclude_modules: Set[str], quantized: bool = True
+) -> Set[str]:
+    """Exact set of ``model.llm.*`` checkpoint keys the text loader consumes.
+
+    ``quantized=False`` for the BF16 release, which ships no scale sidecars.
+    """
     keys: Set[str] = set(_NON_LAYER_TEXT_KEYS)
     for n in range(config.num_hidden_layers):
         pfx = f"model.llm.layers.{n}."
@@ -126,7 +139,7 @@ def inkling_expected_text_keys(config: InklingTextConfig, exclude_modules: Set[s
         else:
             for k in _MOE_COMMON_KEYS:
                 keys.add(pfx + k)
-            if _experts_are_nvfp4(n, exclude_modules):
+            if _experts_are_nvfp4(n, exclude_modules, quantized):
                 for base in _NVFP4_QUANTIZED_EXPERT_TENSORS:
                     for side in _NVFP4_SIDECARS:
                         keys.add(pfx + base + side)
@@ -134,7 +147,10 @@ def inkling_expected_text_keys(config: InklingTextConfig, exclude_modules: Set[s
 
 
 def inkling_account_checkpoint(
-    all_keys: Set[str], config: InklingTextConfig, exclude_modules: Set[str]
+    all_keys: Set[str],
+    config: InklingTextConfig,
+    exclude_modules: Set[str],
+    quantized: bool = True,
 ) -> Dict[str, Set[str]]:
     """Classify every checkpoint key into consumed-text / deferred /
     unaccounted.
@@ -144,7 +160,7 @@ def inkling_account_checkpoint(
     the checkpoint but not loaded by the text tower, so their keys land in
     ``deferred`` (see ``INKLING_DEFERRED_PREFIXES``).
     """
-    expected = inkling_expected_text_keys(config, exclude_modules)
+    expected = inkling_expected_text_keys(config, exclude_modules, quantized)
     consumed_text = all_keys & expected
     deferred = {k for k in all_keys if k.startswith(INKLING_DEFERRED_PREFIXES)}
     missing = expected - all_keys
@@ -158,12 +174,14 @@ def inkling_account_checkpoint(
     }
 
 
-def inkling_nvfp4_expert_layers(config: InklingTextConfig, exclude_modules: Set[str]) -> List[int]:
+def inkling_nvfp4_expert_layers(
+    config: InklingTextConfig, exclude_modules: Set[str], quantized: bool = True
+) -> List[int]:
     """Layers whose routed experts are stored as NVFP4 (expected: 3..65)."""
     return [
         n
         for n in range(config.num_hidden_layers)
-        if not config.is_dense_layer(n) and _experts_are_nvfp4(n, exclude_modules)
+        if not config.is_dense_layer(n) and _experts_are_nvfp4(n, exclude_modules, quantized)
     ]
 
 
