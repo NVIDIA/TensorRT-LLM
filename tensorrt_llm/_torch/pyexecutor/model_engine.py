@@ -6250,8 +6250,12 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata = self._set_up_attn_metadata(
                 kv_cache_manager=None
             ) if self.encoder_attn_metadata is None else self.encoder_attn_metadata
-            graph_attn_metadata, key = self.encoder_cuda_graph_runner.maybe_get_cuda_graph(
-                padded_inputs, attn_metadata)
+            if moe_load_balancer is not None and moe_load_balancer.requires_eager_forward(
+            ):
+                graph_attn_metadata, key = None, None
+            else:
+                graph_attn_metadata, key = self.encoder_cuda_graph_runner.maybe_get_cuda_graph(
+                    padded_inputs, attn_metadata)
             # Unpad seq_lens when fallback to eager path.
             if key is None:
                 padded_inputs['seq_lens'] = padded_inputs[
@@ -6454,17 +6458,21 @@ class PyTorchModelEngine(ModelEngine):
                     padded_graph_requests.all_requests())
                 self._sync_group_all_greedy_sample(spec_metadata)
 
-            maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_graph_requests,
-                enable_spec_decode=self.enable_spec_decode,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_tokens_cuda=self.draft_tokens_cuda
-                if self.is_spec_decode else None,
-                new_tensors_device=new_tensors_device,
-                spec_resource_manager=spec_resource_manager,
-                promoted_context_request_ids=promoted_context_request_ids,
-            )
+            if moe_load_balancer is not None and moe_load_balancer.requires_eager_forward(
+            ):
+                maybe_attn_metadata, maybe_spec_metadata, key = None, None, None
+            else:
+                maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
+                    padded_graph_requests,
+                    enable_spec_decode=self.enable_spec_decode,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_tokens_cuda=self.draft_tokens_cuda
+                    if self.is_spec_decode else None,
+                    new_tensors_device=new_tensors_device,
+                    spec_resource_manager=spec_resource_manager,
+                    promoted_context_request_ids=promoted_context_request_ids,
+                )
 
             can_run_graph = key is not None
             if can_run_graph:
