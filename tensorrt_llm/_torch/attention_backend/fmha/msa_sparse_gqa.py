@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.logger import logger
 
 from .interface import Fmha
 
@@ -25,6 +26,34 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+
+
+_DECODE_Q_WIDEN_REPORTED: set[tuple[torch.dtype, torch.dtype]] = set()
+
+
+def _report_decode_q_widen(q_dtype: torch.dtype, want_dtype: torch.dtype) -> None:
+    """Report, once per dtype pair, whether ported decode has to re-widen q.
+
+    Which branch runs cannot be settled by reading the producer: the fused
+    producer that emits E4M3 q sits behind a long chain of runtime capability
+    checks, and it is that success, not its failure, that forces the widen here.
+    The resulting kernel sits between the block selector and the decode kernel
+    on the serial per-layer chain, where nothing overlaps it.
+    """
+    key = (q_dtype, want_dtype)
+    if key in _DECODE_Q_WIDEN_REPORTED:
+        return
+    _DECODE_Q_WIDEN_REPORTED.add(key)
+    if q_dtype != want_dtype:
+        logger.warning(
+            f"MiniMax-M3 ported sparse decode: widening q from {q_dtype} to "
+            f"{want_dtype} in a standalone kernel on every sparse layer, because "
+            "the Triton decode kernel dequantizes the paged cache into q's dtype."
+        )
+    else:
+        logger.info(
+            f"MiniMax-M3 ported sparse decode: q already {want_dtype}; no widen."
+        )
 
 
 def run_msa_sparse_gqa(
@@ -184,6 +213,7 @@ def run_msa_paged_gqa(
         # wide here. An already-E4M3 q from the fused producer widens exactly,
         # leaving the same values the fmha_sm100 path would have used.
         gen_q = q_view[gen_tok0:]
+        _report_decode_q_widen(gen_q.dtype, out_view.dtype)
         if gen_q.dtype != out_view.dtype:
             gen_q = gen_q.to(out_view.dtype)
         minimax_m3_sparse_attn_decode(
