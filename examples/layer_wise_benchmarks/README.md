@@ -86,8 +86,8 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --batch-size 32 --seq-len-q 4
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --layer-indices 5,6,7,8
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --layer-indices 5,6,7,8
 
-# Scale DEP=16 to 4 GPUs: reduces the number of experts; uses MNNVL A2A if applicable
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP
+# Scale DEP=16 to 4 GPUs: reduces the number of experts
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend CUTEDSL
 
 # Scale TEP=16 to 4 GPUs: reduces the number of attention heads and experts
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
@@ -101,8 +101,8 @@ NP=2 ./mpi_launch.sh ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-In
 NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --mamba-ssm-cache-dtype float16 --batch-size 512
 
 # Run with DeepEP A2A
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_ctx.yaml --moe-backend WIDEEP
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_gen.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # Run with imbalanced ranks: in addition to activating all experts, the specified ratio of tokens is sent to rank 0
 # Note: if balance ratio is 0, the "activate all experts" behavior is not applied
@@ -157,14 +157,14 @@ python3 scripts/build_wheel.py --cuda_architectures native --no-venv --skip_buil
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
-# Run DeepSeek-R1 NVFP4 with wide EP; uses MNNVL A2A if applicable
-NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+# Run DeepSeek-R1 NVFP4 with wide EP
+NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # Run with TRTLLMGen
 NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
 
 # Run with DeepEPLowLatency
-NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # You can run 4-GPU and 8-GPU tasks without reallocating the Slurm job
 NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
@@ -187,7 +187,7 @@ Run with OpenMPI:
 
 ```bash
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size 1,2,4 --seq-len-q 1024,8192
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend CUTEDSL --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
 ```
 
 ## Parse profiles
@@ -354,7 +354,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
 Limitations:
 
 1. Pipeline parallelism is not supported.
-2. Only the CUTLASS and WIDEEP MoE backends are supported.
+2. Only the CUTEDSL, CUTLASS, DEEPGEMM and TRTLLM MoE backends are supported.
 3. Only tested with the GEN phase and attention DP.
 
 ## Developer utilities
@@ -372,7 +372,7 @@ Limitations:
 
 1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
 
-   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `WIDEEP`) and `--moe-backend-for-prefill DEEPGEMM` (or `WIDEEP`) options.
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) and `--moe-backend-for-prefill DEEPGEMM` options.
 
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 

@@ -90,6 +90,7 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
+from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
@@ -1157,6 +1158,12 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        # Ahead of the early returns below, since it holds regardless of why
+        # warmup is skipped: only the advanced-sampling CUDA graph capture pass
+        # exercises the non-greedy sampler, so with cuda_graph_config=None
+        # flashinfer's sampling kernels would be JIT-built mid-serving.
+        warmup_sampling_module()
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
