@@ -78,7 +78,7 @@ import gc
 import json
 import os
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from safetensors import safe_open
@@ -657,12 +657,12 @@ class KimiK3MoERuntime(nn.Module):
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
         self.moe_hidden_size = cfg.routed_expert_hidden_size
-        assert self.moe_hidden_size is not None, (
-            "Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)"
-        )
-        assert getattr(cfg, "latent_moe_use_norm", False), (
-            "Kimi K3 runtime expects latent_moe_use_norm=True"
-        )
+        # ValueError (not assert): these guard unsupported checkpoint
+        # configurations and must stay active under ``python -O``.
+        if self.moe_hidden_size is None:
+            raise ValueError("Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)")
+        if not getattr(cfg, "latent_moe_use_norm", False):
+            raise ValueError("Kimi K3 runtime expects latent_moe_use_norm=True")
 
         situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
         situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
@@ -2128,7 +2128,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     # correspondingly longer load).
     # ------------------------------------------------------------------
 
-    def _trunk_parameters(self):
+    def _trunk_parameters(self) -> Dict[str, torch.nn.Parameter]:
         """Named parameters of the trunk only. Spec-dec draft modules
         (e.g. the DFlash drafter attached by SpecDecOneEngineForCausalLM)
         live in a separate checkpoint loaded by
@@ -2142,7 +2142,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             and not name.endswith(_KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES)
         }
 
-    def checkpoint_name_plan(self, prefix: str):
+    def checkpoint_name_plan(
+        self, prefix: str
+    ) -> Tuple[Dict[str, str], Set[str], List[Tuple[int, KimiK3MoERuntime, str]]]:
         """Return ``(name_map, expected_keys, expert_jobs)``.
 
         ``name_map`` maps every model parameter name to its checkpoint key
@@ -2192,7 +2194,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             expert_jobs.append((layer_idx, moe, base))
         return name_map, expected_keys, expert_jobs
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
@@ -2202,7 +2204,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         self._load_expert_slices(weights, expert_jobs)
         self._finalize_weight_load(num_params, len(expert_jobs))
 
-    def _validate_checkpoint_keys(self, weights: Dict, expected_keys, prefix: str) -> None:
+    def _validate_checkpoint_keys(
+        self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
+    ) -> None:
         """Key-set validation (both directions): every expected key must be
         present; unmatched checkpoint keys (beyond the expected leftovers)
         only warn."""
@@ -2232,7 +2236,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"checkpoint keys, e.g. {surprising[:10]}"
             )
 
-    def _load_trunk_params(self, weights: Dict, params, name_map: Dict[str, str]) -> int:
+    def _load_trunk_params(
+        self,
+        weights: Dict[str, torch.Tensor],
+        params: Dict[str, torch.nn.Parameter],
+        name_map: Dict[str, str],
+    ) -> int:
         """Load every non-expert trunk parameter concurrently (with the
         per-parameter TP-shard / pad / fuse conversions) and return the
         number of parameters loaded."""
@@ -2457,7 +2466,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         )
         return len(param_jobs)
 
-    def _load_expert_slices(self, weights: Dict, expert_jobs) -> None:
+    def _load_expert_slices(
+        self,
+        weights: Dict[str, torch.Tensor],
+        expert_jobs: List[Tuple[int, KimiK3MoERuntime, str]],
+    ) -> None:
         """Load the rank-local MXFP4 expert slices of every MoE layer into
         the backend expert slots, then verify every slot was filled."""
         from .modeling_utils import run_concurrently
