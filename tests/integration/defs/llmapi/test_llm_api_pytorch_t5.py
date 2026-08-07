@@ -574,6 +574,19 @@ def _decoder_cuda_graph_config(
     )
 
 
+def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
+    """Introspect the in-process engine (single-process mode only).
+
+    Guards against the engine silently declining decoder graphs: without it a
+    workspace-sizing regression that disables capture would still pass the
+    output checks. The enc-dec encoder step stays eager.
+    """
+    model_engine = llm._executor.engine.model_engine
+    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
+
+
 class _SleepLogitsProcessor:
     def __init__(self, delay_seconds: float) -> None:
         self.delay_seconds = delay_seconds
@@ -759,6 +772,9 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     exact_match: bool,
 ) -> None:
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    # Single-process worker so _assert_decoder_cuda_graphs_captured can reach the engine; the
+    # default proxy executor runs it in another process.
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_path = _get_t5_model_path(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -798,6 +814,7 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
         )
 
         assert len(responses) == len(_MIXED_ENCODER_SOURCE_TEXTS)
+        _assert_decoder_cuda_graphs_captured(llm)
 
         for request_idx, response in enumerate(responses):
             expected_token_ids = (
