@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import unittest
 from unittest.mock import MagicMock, patch
@@ -310,6 +313,85 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # shutdown
         balancer.shutdown()
         mock_load_balancer_impl.return_value.shutdown.assert_called_once()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_online_iteration_cadence(self, mock_load_balancer_impl):
+        """Test that cadence samples, drains pending copies, then skips."""
+
+        torch.cuda.set_device(0)
+        balancer = MoeLoadBalancer(0, 4, 2, iteration_interval=4)
+        balancer.set_iter_info(True, True)
+
+        self.assertTrue(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertTrue(balancer.runtime_state.active)
+
+        self.assertTrue(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertTrue(balancer.runtime_state.active)
+
+        self.assertFalse(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertFalse(balancer.runtime_state.active)
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertFalse(balancer.runtime_state.active)
+
+        self.assertTrue(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertTrue(balancer.runtime_state.active)
+
+        self.assertEqual(
+            mock_load_balancer_impl.return_value.start_iter.call_args_list, [
+                unittest.mock.call(0, True, True),
+                unittest.mock.call(1, False, False),
+                unittest.mock.call(2, True, True),
+            ])
+        self.assertEqual(
+            mock_load_balancer_impl.return_value.end_iter.call_args_list, [
+                unittest.mock.call(0),
+                unittest.mock.call(1),
+                unittest.mock.call(2),
+            ])
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_invalid_online_iteration_interval(self, mock_load_balancer_impl):
+        """Test that a non-positive cadence interval is rejected."""
+
+        torch.cuda.set_device(0)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            MoeLoadBalancer(0, 4, 2, iteration_interval=0)
+        mock_load_balancer_impl.assert_not_called()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_inactive_online_iteration_routes_without_statistics(
+            self, mock_load_balancer_impl):
+        """Test that skipped iterations retain routing without EPLB sync."""
+
+        torch.cuda.set_device(0)
+        balancer = MoeLoadBalancer(0, 4, 2, iteration_interval=4)
+        mock_single_layer_impl = MagicMock()
+        selected_experts = torch.tensor([[0, 1]], dtype=torch.int32)
+        routed_slots = torch.tensor([[2, 3]], dtype=torch.int32)
+        layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl,
+                                           MPI.COMM_WORLD,
+                                           expert_count=4,
+                                           runtime_state=balancer.runtime_state)
+
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage') as mock_wait, \
+             patch('torch.ops.trtllm.moe_load_balance_set_cpu_stage') as mock_set_cpu, \
+             patch('torch.ops.trtllm.moe_load_balance_routing', return_value=routed_slots) as mock_route:
+            layer.start_wait_gpu_stage()
+            layer.done_wait_gpu_stage()
+            layer.update_local_statistic(selected_experts, True, True)
+            self.assertIsNone(layer.get_local_statistic_tensor())
+            result = layer.route(selected_experts)
+            layer.start_set_cpu_stage()
+            layer.done_set_cpu_stage()
+
+        mock_wait.assert_not_called()
+        mock_set_cpu.assert_not_called()
+        mock_route.assert_called_once()
+        self.assertTrue(torch.equal(result, routed_slots))
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_reconfigure_mask_only_rejects_active_iteration(

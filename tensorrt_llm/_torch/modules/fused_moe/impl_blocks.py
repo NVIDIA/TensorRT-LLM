@@ -221,9 +221,14 @@ class MoEEplbWeightLayoutMixin:
         param = getattr(self, weight_name)
         weight_tensor = param.detach()
         assert isinstance(weight_tensor, torch.Tensor), f"weight {weight_name} should be a tensor"
-        assert weight_tensor.is_contiguous(), (
-            f"weight {weight_name} should be contiguous, "
-            f"shape={weight_tensor.shape}, strides={weight_tensor.stride()}"
+        # DeepGemm FP8 block-scale tensors are column-major TMA views
+        # (stride[0]==1). The backing allocation is complete and starts at
+        # offset zero, so migrating it preserves the view's shape and strides.
+        # Use storage_offset()==0 instead of is_contiguous() so that
+        # column-major tensors pass this check.
+        assert weight_tensor.storage_offset() == 0, (
+            f"weight {weight_name} should start at storage offset zero, "
+            f"offset={weight_tensor.storage_offset()}"
         )
         assert (
             weight_tensor.numel() * weight_tensor.element_size()
@@ -267,6 +272,11 @@ class MoEEplbWeightLayoutMixin:
                         expert_id, weight_name, weight_tensor[local_slot_id]
                     )
                 else:
+                    # All expert tensors are migrated as flat byte blobs, so
+                    # the host transfer buffer size is numel * element_size
+                    # regardless of whether the tensor is row-major or
+                    # column-major (e.g. DeepGemm FP8 block scales).
+                    t0 = weight_tensor[0]
                     self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype, weight_tensor[0].shape
+                        expert_id, weight_name, t0.dtype, (t0.numel(),)
                     )
