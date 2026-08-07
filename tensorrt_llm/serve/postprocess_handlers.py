@@ -88,6 +88,19 @@ class ChatPostprocArgs(PostprocArgs):
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
+    # When set, ``tool_choice = {"type": "function", "function": {"name": X}}``
+    # was requested. The server prefix-injects the parser's tool-call ``begin``
+    # string into the prompt and constrains the args with JSON-schema guided
+    # decoding (see ``_build_forced_tool_call_decoding`` in openai_server.py),
+    # so the raw model output IS the JSON ``arguments`` string of the forced
+    # call. The chat post-processors below short-circuit the tool parser and
+    # synthesize a single ``ToolCall`` for this function.
+    forced_tool_name: Optional[str] = None
+    # Per-output flag tracking whether the streaming forced-call path has
+    # already emitted the opening delta (with id and function name). The id is
+    # generated once on the first non-empty delta; subsequent deltas omit it
+    # and only stream argument fragments.
+    forced_tool_name_sent: dict[int, bool] = field(default_factory=dict)
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -279,16 +292,41 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             True,
             finished=(output.finish_reason is not None))
 
-        if args.tool_choice and type(
-                args.tool_choice) is ChatCompletionNamedToolChoiceParam:
-            delta_message = DeltaMessage(tool_calls=[
-                DeltaToolCall(
-                    function=DeltaFunctionCall(
-                        name=args.tool_choice.function.name,
-                        arguments=delta_text),
-                    index=i,
-                ),
-            ], )
+        # Forced-call path: ``tool_choice = {"type":"function","function":
+        # {"name":X}}`` was requested. The server prefix-injected the parser's
+        # ``begin`` string into the prompt and constrained the args with
+        # JSON-schema guided decoding, so ``delta_text`` IS the next chunk of
+        # the JSON ``arguments`` string for function X. Synthesize a single
+        # DeltaToolCall and bypass the tool parser entirely.
+        if args.forced_tool_name is not None:
+            tool_calls = []
+            if delta_text:
+                if not args.forced_tool_name_sent.get(i, False):
+                    tool_call_id = make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=args.forced_tool_name,
+                        idx=0)
+                    args.forced_tool_name_sent[i] = True
+                    tool_calls.append(
+                        DeltaToolCall(
+                            id=tool_call_id,
+                            index=0,
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name=args.forced_tool_name,
+                                arguments=delta_text,
+                            ),
+                        ))
+                else:
+                    tool_calls.append(
+                        DeltaToolCall(
+                            index=0,
+                            function=DeltaFunctionCall(arguments=delta_text, ),
+                        ))
+            # Forced calls never produce assistant text content.
+            delta_text = ""
+            # Make sure the final chunk's finish_reason flips to "tool_calls".
+            args.has_tool_call[i] = True
         else:
             delta_text, calls = apply_tool_parser(args, i, delta_text, True)
             tool_calls = []
@@ -315,16 +353,16 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            # Keep token-bearing chunks visible even when detokenization has no
-            # text to flush yet.
-            if (tool_calls or delta_text or reasoning_delta_text
-                    or output.finish_reason or has_token_delta):
-                delta_message = DeltaMessage(
-                    content=delta_text,
-                    reasoning_content=reasoning_delta_text,
-                    tool_calls=tool_calls if tool_calls else None)
-            else:
-                continue
+        # Keep token-bearing chunks visible even when detokenization has no
+        # text to flush yet.
+        if (tool_calls or delta_text or reasoning_delta_text
+                or output.finish_reason or has_token_delta):
+            delta_message = DeltaMessage(
+                content=delta_text,
+                reasoning_content=reasoning_delta_text,
+                tool_calls=tool_calls if tool_calls else None)
+        else:
+            continue
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,
@@ -392,28 +430,38 @@ def chat_response_post_processor(
         text, reasoning_text = apply_reasoning_parser(args, output.index,
                                                       output.text, False)
 
-        if args.tool_choice and isinstance(args.tool_choice,
-                                           ChatCompletionNamedToolChoiceParam):
-            message = ChatMessage(
-                role=role,
-                content="",
-                tool_calls=[
-                    ToolCall(function=FunctionCall(
-                        name=args.tool_choice.function.name, arguments=text))
-                ])
+        if text is None:
+            text = ""
+
+        # Forced-call path: ``tool_choice = {"type":"function","function":
+        # {"name":X}}`` was requested. The server prefix-injected the parser's
+        # ``begin`` string into the prompt and constrained the args with
+        # JSON-schema guided decoding, so ``text`` IS the JSON ``arguments``
+        # string of the forced call. Skip the tool parser and synthesize the
+        # call directly.
+        if args.forced_tool_name is not None:
+            tool_call_id = make_tool_call_id(id_type=args.tool_call_id_type,
+                                             func_name=args.forced_tool_name,
+                                             idx=0)
+            tool_calls = [
+                ToolCall(id=tool_call_id,
+                         function=FunctionCall(name=args.forced_tool_name,
+                                               arguments=text))
+            ]
+            # Forced calls never produce assistant text content.
+            text = ""
+            args.has_tool_call[output.index] = True
         else:
-            if text is None:
-                text = ""
             text, calls = apply_tool_parser(args, output.index, text, False)
             tool_calls = [
                 ToolCall(function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
                 for call in calls
             ]
-            message = ChatMessage(role=role,
-                                  content=text,
-                                  reasoning_content=reasoning_text,
-                                  tool_calls=tool_calls)
+        message = ChatMessage(role=role,
+                              content=text,
+                              reasoning_content=reasoning_text,
+                              tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
