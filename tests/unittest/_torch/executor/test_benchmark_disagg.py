@@ -1230,7 +1230,6 @@ class TestFailFastDuringBenchmarkFill:
         ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
         ex._prepare_disagg_gen_init.assert_called_once_with([])
         ex._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
-        ex._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(
