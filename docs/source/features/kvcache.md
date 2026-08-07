@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # KV Cache System
 
 The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
@@ -45,6 +50,23 @@ TensorRT LLM takes advantage of grouped query attention in order to save memory.
 Many of the features in the KV cache system are optional or have user defined properties that alter how they work. Users can control KV cache features through class [KVCacheConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig). The remainder of this section describes how to change the most important behaviors of the KV cache system.
 
 See [this example](../examples/kvcacheconfig.md) for an example of how to use KvCacheConfig to control KV cache behavior.
+
+### KV Cache Manager Version
+
+`KvCacheConfig.use_kv_cache_manager_v2` selects the V2 manager; `"auto"` uses
+the model-specific default. When a sparse-attention model selects V2,
+TensorRT LLM raises `NotImplementedError` for V2-incompatible features instead
+of silently falling back to the V1 manager.
+
+`DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM`,
+`GlmMoeDsaForCausalLM`, and `MistralLarge3ForCausalLM` select V2 by default
+when this option is `"auto"`. Set the option to `false` to select V1
+explicitly.
+
+For DSA, KV cache manager V2 does not support STAR context parallelism. Use
+another context-parallel mode, or set
+`kv_cache_config.use_kv_cache_manager_v2: false` to use the DSA V1 cache
+manager with STAR.
 
 ### Datatype
 

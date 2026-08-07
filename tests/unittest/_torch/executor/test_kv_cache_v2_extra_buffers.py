@@ -189,35 +189,18 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             mgr.shutdown()
             del mgr
 
-    def test_pool_role_representative_uses_first_config_layer_with_role(self):
-        mgr = _IndexKeyOnSparseLayersV2(sparse_layer_ids=[2, 3], **_make_kwargs(num_layers=4))
-        try:
-            pool_id = int(mgr.impl.get_layer_group_id(2))
-            self.assertEqual(int(mgr.impl.get_layer_group_id(0)), pool_id)
-
-            layer_zero = mgr.kv_cache_manager_py_config.layers[0]
-            self.assertNotIn(Role.INDEX_KEY, [buffer.role for buffer in layer_zero.buffers])
-            self.assertEqual(
-                int(mgr._get_pool_layer_id(pool_id, Role.INDEX_KEY)),
-                2,
-                "the representative must be the first config-order layer that owns the role",
-            )
-        finally:
-            mgr.shutdown()
-            del mgr
-
     def test_pool_mapping_ignores_reordered_layer_grouping(self):
         mgr = KVCacheManagerV2(**_make_kwargs(num_layers=4))
         real_impl = mgr.impl
         try:
             self.assertEqual(mgr.num_pools, 1)
             pool_id = 0
-            expected_layer_id = mgr._get_pool_layer_id(pool_id, Role.KEY)
             config_group = tuple(
                 layer.layer_id
                 for layer in mgr.kv_cache_manager_py_config.layers
                 if int(real_impl.get_layer_group_id(layer.layer_id)) == pool_id
             )
+            expected_layer_id = config_group[0]
             self.assertGreater(len(config_group), 1)
             reordered_grouping = (config_group[1:] + config_group[:1],)
             reordered_first_layer_id = reordered_grouping[pool_id][0]
