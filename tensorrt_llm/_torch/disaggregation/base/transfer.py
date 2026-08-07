@@ -11,18 +11,51 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
-@dataclass
-class TokenRange:
-    """Range of tokens in the sequence dimension."""
+def project_blocks_to_global_chunk(
+    block_ids: np.ndarray,
+    chunk_block_offset: int,
+    chunk_block_count: int,
+    resident_block_end: int,
+) -> np.ndarray:
+    """Project a global block chunk into a suffix-resident block list.
 
-    start: int
-    end: int  # exclusive
+    ``block_ids`` represents the resident suffix of the logical range
+    ``[0, resident_block_end)``. ``chunk_block_offset`` and
+    ``chunk_block_count`` describe a chunk in that global coordinate space.
+    """
+    if chunk_block_count <= 0 or len(block_ids) == 0:
+        return block_ids[:0]
+
+    resident_start = max(0, resident_block_end - len(block_ids))
+    resident_end = resident_block_end
+    chunk_start = chunk_block_offset
+    chunk_end = chunk_start + chunk_block_count
+
+    overlap_start = max(chunk_start, resident_start)
+    overlap_end = min(chunk_end, resident_end)
+    if overlap_start >= overlap_end:
+        return block_ids[:0]
+
+    local_start = overlap_start - resident_start
+    local_end = overlap_end - resident_start
+    return block_ids[local_start:local_end]
+
+
+@dataclass
+class ChunkCoords:
+    """Position of one pipelined chunk in a request's global block space.
+
+    Its presence on a ``KVSlice`` is what makes the slice a chunk: only
+    ``_build_prefill_chunk`` produces it, so a monolithic transfer keeps its
+    whole-request addressing untouched.
+    """
+
+    block_offset: int
+    block_count: int  # may be 0 for a chunk that falls entirely inside a reused prefix
 
     def __post_init__(self):
-        if self.start < 0 or self.end < 0:
-            raise ValueError("Token indices must be non-negative")
-        if self.start >= self.end:
-            raise ValueError(f"Invalid range: [{self.start}, {self.end})")
+        if self.block_offset < 0 or self.block_count < 0:
+            raise ValueError(f"Invalid chunk: offset={self.block_offset}, count={self.block_count}")
 
 
 @dataclass
@@ -41,30 +74,36 @@ class LayerRange:
 
 @dataclass
 class KVSlice:
-    """A KV cache slice covering token_range = [start, end) of one request.
+    """A KV cache slice of one request.
 
-    Single-slice transfer uses [0, prompt_len) with is_last_slice=True;
-    multi-slice transfers split token_range and mark the last slice.
+    A single-slice transfer covers the whole request: is_last_slice=True and no
+    ``chunk``, with the extent taken from the session's ``prompt_len``. A
+    pipelined chunk sets ``chunk``, its position in the request's block space.
+    Chunk geometry is decided once by the producer — the reuse-prefix extension
+    back to block 0, the round up to the enclosing block, the clamp to
+    ``total_blocks`` — so the sender reads it rather than rederiving it from
+    token bounds.
 
-    Per-layer token starts are NOT encoded in token_range — they are derived
-    from block count by the sender:
-        total_blocks    = ceil(token_range.end / tpb)
-        token_start_i   = (total_blocks - len(block_ids_per_layer_groups[i])) * tpb
+    Per-layer token starts are not carried — the sender derives them from the
+    block count:
+        suffix_end      = chunk.block_offset + chunk.block_count, or total_blocks
+        token_start_i   = (suffix_end - len(block_ids_per_layer_groups[i])) * tpb
     Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
     block list. Beam search keeps this field 1-D: beam 0's blocks first,
     followed by the final unshared block from each remaining beam.
 
-    SWA stale_end uses the request prompt_len (on the session), not
-    token_range.end — they differ for non-final slices.
+    SWA stale_end is a property of the whole request, so it uses the prompt_len
+    on the session rather than how far this slice reaches.
     """
 
-    token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
     block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
+    total_blocks: Optional[int] = None
+    chunk: Optional[ChunkCoords] = None
 
 
 class SessionStatus(Enum):
@@ -104,7 +143,7 @@ class SessionArgsBase:
 
     params: DisaggregatedParams
     # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
-    prompt_len: Optional[int] = None
+    prompt_len: int
     beam_width: int = 1
 
 
@@ -158,7 +197,16 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> None: ...
+    def send(self, slice: KVSlice) -> None:
+        """Send a KV slice.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+                For pipelined chunks, ``chunk`` is the shared sender-side chunk
+                cursor; each layer group projects it into its own
+                resident/windowed source and destination block ranges.
+        """
+        ...
 
     @abstractmethod
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]: ...
