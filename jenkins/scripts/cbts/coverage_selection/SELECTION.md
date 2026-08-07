@@ -91,7 +91,7 @@ to can itself be import-only.
 ```
 for each residual file:
   ├ no usable diff / unparsable → decline
-  ├ diff has no lines           → whole file (the change was comments only)
+  ├ diff has no lines           → contributes nothing (comment / blank only)
   └ for each changed qualname:
        ├ import-executed → decline
        ├ closure         → _underrecorded_bound(cf, q)      bound or decline
@@ -101,7 +101,10 @@ for each residual file:
 
 Comments and blank lines are stripped upstream by `strip_noop_diff_lines` (`^\s*#` and empty
 lines), so a change that edits a function body and adds a module-level comment is not mistaken
-for a module-level change.
+for a module-level change. A file whose whole diff survives that stripping as empty changed no
+executable line — neither added nor removed, since `-` lines anchor at the following post-image
+line — so it contributes no impacted tests at all. Tier 1's rules already read diffs through the
+same stripping, so this introduces no assumption the pipeline does not already make.
 
 ## 6. Tests that are never skipped
 
