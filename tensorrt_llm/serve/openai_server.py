@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import socket
+import sys
 import time
 import traceback
 import uuid
@@ -17,8 +18,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
-                    Optional, Union)
+from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
+                    AsyncIterator, List, Optional, Union)
 
 import uvicorn
 from fastapi import Body, FastAPI, Request
@@ -104,10 +105,23 @@ from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
 from tensorrt_llm.version import __version__ as VERSION
-from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
+
+if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen import VisualGen
+
+
+def _is_visual_gen_instance(obj) -> bool:
+    """isinstance(obj, VisualGen) without importing the visual_gen tree.
+
+    If tensorrt_llm.visual_gen was never imported in this process, obj
+    cannot be a VisualGen instance, so the LLM serving path never pays
+    the visual_gen import cost.
+    """
+    visual_gen = sys.modules.get("tensorrt_llm.visual_gen")
+    return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
 
@@ -259,7 +273,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def __init__(
             self,
-            generator: Union[LLM, MultimodalEncoder, VisualGen],
+            generator: Union[LLM, MultimodalEncoder, "VisualGen"],
             model: str,
             tool_parser: Optional[str],
             server_role: Optional[ServerRole],
@@ -274,7 +288,7 @@ class OpenAIServer(_VideoRoutesMixin):
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None):
         self.generator = generator
-        self._is_visual_gen = isinstance(generator, VisualGen)
+        self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
@@ -391,7 +405,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.disagg_cluster_config, self.disagg_cluster_storage)
 
             # VisualGen has no args
-            if not isinstance(self.generator, VisualGen):
+            if not self._is_visual_gen:
                 # Start energy monitoring if enabled
                 if getattr(self.generator.args, "enable_energy_metrics", False):
                     try:
@@ -478,9 +492,8 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
-            assert isinstance(
-                self.generator, VisualGen
-            ), "generator must be a VisualGen for VISUAL_GEN server"
+            assert self._is_visual_gen, \
+                "generator must be a VisualGen for VISUAL_GEN server"
             self.register_visual_gen_routes()
         elif self.server_role is ServerRole.MM_ENCODER:
             assert isinstance(
@@ -752,9 +765,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 f"{raw_request.client} is disconnected, abort {promise.request_id}"
             )
 
+    @functools.cached_property
+    def _is_visual_gen(self) -> bool:
+        # __init__ pre-caches this (so a probe patched during construction
+        # sticks); computing on demand keeps instances built without
+        # __init__ (unit tests use OpenAIServer.__new__) working.
+        return _is_visual_gen_instance(self.generator)
+
     @property
     def postproc_worker_enabled(self) -> bool:
-        if isinstance(self.generator, VisualGen):
+        if self._is_visual_gen:
             return False
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
