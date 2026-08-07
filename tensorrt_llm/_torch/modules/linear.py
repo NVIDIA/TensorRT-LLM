@@ -566,9 +566,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        # The opt-in low-M dispatcher loads decisions produced by an offline
-        # FlashInfer direct/split-K versus cuBLAS sweep. It never benchmarks on
-        # the serving path and returns None for the normal GEMM fallback.
+        # The opt-in low-M dispatcher uses FlashInfer's packaged direct/split-K
+        # heuristic and returns None for the normal GEMM fallback.
         if _should_apply_low_m_gemm(input):
             output = apply_low_m_gemm(module, input, module.weight, bias)
             if output is not None:
