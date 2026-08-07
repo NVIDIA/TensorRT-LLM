@@ -298,6 +298,45 @@ def run_attention_dp_independence(world_size: int, rank: int, local_flags: list[
     )
 
 
+def run_adp_cp_agreement(
+    world_size: int, rank: int, cp_size: int, local_flags: list[bool], expected: list[bool]
+) -> None:
+    """Under ADP the TP hop is suppressed but the CP hop must still run.
+
+    ADP makes the TP dimension the DP dimension, so those ranks decide
+    independently.  CP is orthogonal: inside one DP replica the CP ranks split
+    the *same* request along the sequence dimension and must admit it together.
+    Skipping the CP broadcast here would reintroduce this mechanism's own
+    divergence once per replica.
+
+    Args:
+        world_size: Total ranks, equal to ``cp_size * tp_size``.
+        rank: This process's global rank.
+        cp_size: Context-parallel width; TP width is derived from it.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: Per-rank agreed decision after the CP-only broadcast.
+    """
+    tp_size = world_size // cp_size
+    dist = _cp_tp_dist(cp_size, tp_size, rank)
+    exe = _make_executor(dist, need_adjustment=local_flags[rank], enable_attention_dp=True)
+
+    got = PyExecutor._agreed_need_adjustment(exe)
+
+    # Collect before asserting -- see run_agreement for why the order matters.
+    all_decisions = dist.allgather(got)
+
+    assert got == expected[rank], (
+        f"rank {rank} (tp_rank={dist.mapping.tp_rank}, "
+        f"cp_rank={dist.mapping.cp_rank}): local reading was {local_flags[rank]}, "
+        f"its CP root read {expected[rank]}, so the agreed decision should be "
+        f"{expected[rank]}, got {got}"
+    )
+    assert all_decisions == expected, (
+        f"ADP+CP decisions were {all_decisions}, expected {expected}: CP ranks "
+        "must follow their replica's root while replicas stay independent"
+    )
+
+
 def run_throttle_lockstep(world_size: int, rank: int, interval: int, iterations: int) -> None:
     """Ranks must reach the agreement collective on the *same* iterations.
 
@@ -492,6 +531,43 @@ def test_attention_dp_ranks_decide_independently(world_size: int) -> None:
         results = ex.map(
             run_single_rank,
             *zip(*[(world_size, run_attention_dp_independence, flags)] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
+@pytest.mark.parametrize("cp_size", [2], ids=lambda x: f"cp:{x}")
+@pytest.mark.parametrize("world_size", [4], ids=lambda x: f"world:{x}")
+def test_attention_dp_agrees_over_cp_but_not_tp(world_size: int, cp_size: int) -> None:
+    """ADP + CP: CP ranks follow their replica's root, replicas stay independent.
+
+    ADP suppresses only the TP hop.  Nothing in ``Mapping`` or ``LlmArgs``
+    rejects ``enable_attention_dp`` with ``cp_size > 1``, so this topology is
+    reachable, and skipping the CP hop in it would leave each replica's CP ranks
+    deciding independently -- the divergence class this mechanism removes.
+
+    The flags are chosen so the case fails in both directions: two ranks are
+    overridden by their CP root (proving the CP hop ran) while the two replicas
+    end on *different* answers (proving the TP hop did not).
+
+    Args:
+        world_size: Total ranks; must equal ``cp_size * tp_size``.
+        cp_size: Context-parallel width; TP width is ``world_size // cp_size``.
+    """
+    _skip_if_not_enough_gpus(world_size)
+
+    # cp_groups are consecutive ranks within a TP slice: [[0, 1], [2, 3]].
+    flags = [True, False, False, True]
+    expected = [flags[(r // cp_size) * cp_size] for r in range(world_size)]
+
+    # Non-vacuity, both directions.
+    assert expected != flags, "flags must force the CP broadcast to change some rank"
+    assert len(set(expected)) > 1, "replicas must end up disagreeing, or the TP hop is untested"
+
+    with MPIPoolExecutor(max_workers=world_size) as ex:
+        results = ex.map(
+            run_single_rank,
+            *zip(*[(world_size, run_adp_cp_agreement, cp_size, flags, expected)] * world_size),
         )
         for r in results:
             assert r is True
