@@ -1,11 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
 import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from mpi4py import MPI
 
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import \
-    HostMoeTensorSharer
+from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
+    HostMoeTensorSharer, _FileBackedSharedMemory, _tensor_to_weight)
 
 
 class TestHostMoeTensorSharer(unittest.TestCase):
@@ -69,6 +87,70 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             for j in range(tensor_shape[1]):
                 tensor_data[i, j] = expert_id * 1000 + i * 100 + j
         return tensor_data
+
+    def test_column_major_transfer_view(self):
+        """Column-major TMA tensors use a transposed EPLB copy descriptor."""
+        row_major = torch.arange(24, dtype=torch.int32).reshape(4, 6)
+        column_major = row_major.transpose(0, 1)
+
+        self.assertFalse(column_major.is_contiguous())
+        transfer_view = HostMoeTensorSharer.get_transfer_view(column_major)
+        self.assertTrue(transfer_view.is_contiguous())
+        torch.testing.assert_close(transfer_view, row_major)
+
+        moe_weight = _tensor_to_weight(column_major)
+        self.assertEqual(moe_weight.height, row_major.shape[0])
+        self.assertEqual(moe_weight.width,
+                         row_major.shape[1] * row_major.element_size())
+        self.assertEqual(moe_weight.pitch,
+                         row_major.stride(0) * row_major.element_size())
+
+    def test_file_backed_storage(self):
+        """File-backed EPLB staging preserves tensors outside /dev/shm."""
+        comm = MPI.COMM_SELF
+        tensor_shape = (16, 32)
+        tensor_data = self.generate_tensor_data(0, tensor_shape)
+
+        with TemporaryDirectory() as directory, patch.dict(
+                "os.environ", {
+                    "TRTLLM_EPLB_SHM_DIR": directory,
+                    "TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL": "True",
+                }):
+            sharer = HostMoeTensorSharer(0, 1, comm)
+            sharer.set_shared_memory_base_name("test_file_backed_sharer")
+            sharer.share_host_tensor_with_shape(0, "weight", tensor_data)
+            sharer.finalize_layer_weights()
+            retrieved = {}
+            sharer.finalize_host_tensor_sharing(
+                lambda expert_id, name, tensor: retrieved.setdefault(
+                    (expert_id, name), tensor.clone()))
+
+            torch.testing.assert_close(retrieved[(0, "weight")], tensor_data)
+            backing_path = os.path.join(directory,
+                                        sharer.get_shared_memory_name())
+            self.assertTrue(os.path.exists(backing_path))
+
+            sharer.pre_shutdown_cleanup()
+            sharer.post_shutdown_cleanup()
+            self.assertFalse(os.path.exists(backing_path))
+
+    def test_file_backed_mappings_are_coherent_without_flush(self):
+        """Peer mappings see writes without forcing the whole file to disk."""
+        with TemporaryDirectory() as directory:
+            creator = _FileBackedSharedMemory("test_eplb_map",
+                                              directory,
+                                              create=True,
+                                              size=4096)
+            peer = _FileBackedSharedMemory("test_eplb_map", directory)
+            try:
+                creator.buf[:8] = b"EPLBTEST"
+                self.assertEqual(peer.buf[:8], b"EPLBTEST")
+                peer.buf[:8] = b"PEERVIEW"
+                self.assertEqual(creator.buf[:8], b"PEERVIEW")
+            finally:
+                peer.close()
+                creator.close()
+                creator.unlink()
 
     def test_host_tensor_sharing_basic(self):
         """Basic test for host tensor sharing"""

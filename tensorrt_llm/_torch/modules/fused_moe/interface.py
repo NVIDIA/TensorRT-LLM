@@ -819,9 +819,12 @@ class MoE(nn.Module):
         assert isinstance(
             weight_tensor,
             torch.Tensor), f'weight {weight_name} should be a tensor'
-        assert weight_tensor.is_contiguous(), (
-            f'weight {weight_name} should be contiguous, '
-            f'shape={weight_tensor.shape}, strides={weight_tensor.stride()}')
+        # DeepGemm FP8 block scales are column-major TMA views. The backing
+        # storage is complete and starts at offset zero, so migrating the
+        # allocation preserves the view's shape and strides.
+        assert weight_tensor.storage_offset() == 0, (
+            f'weight {weight_name} should start at storage offset zero, '
+            f'offset={weight_tensor.storage_offset()}')
         assert weight_tensor.numel() * weight_tensor.element_size(
         ) == weight_tensor.untyped_storage().size(), (
             f'weight {weight_name} shape={weight_tensor.shape} '
@@ -861,9 +864,11 @@ class MoE(nn.Module):
                     self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
                         expert_id, weight_name, weight_tensor[local_slot_id])
                 else:
+                    transfer_tensor = self.layer_load_balancer.host_tensor_sharer.get_transfer_view(
+                        weight_tensor[0])
                     self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype,
-                        weight_tensor[0].shape)
+                        expert_id, weight_name, transfer_tensor.dtype,
+                        transfer_tensor.shape)
 
     def _register_layer(self, model_config: ModelConfig):
         self.register_to_config = False
