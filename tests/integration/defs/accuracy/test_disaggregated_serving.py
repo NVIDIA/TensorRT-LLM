@@ -1127,7 +1127,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
     def test_gen_only_spec_dec(self):
         ctx_server_config = {"disable_overlap_scheduler": True}
@@ -1160,10 +1160,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
@@ -1202,7 +1202,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
         (1, 2, 2, False),
         (1, 2, 2, True),
@@ -1555,7 +1555,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize("block_reuse", [False, True])
     def test_auto_dtype(self, block_reuse, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
@@ -1676,7 +1676,7 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize("overlap_scheduler", [False])
     def test_auto_dtype(self, overlap_scheduler):
         cache_transceiver_config = {
@@ -1924,7 +1924,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         self._test_chunked_prefill_helper(ctx_pp=1)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
         (1, 2, 2, False),
         (1, 2, 2, True),
@@ -2131,7 +2131,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(180000)
     def test_nvfp4(self):
         """Disaggregated GSM8K accuracy for Kimi-K2.5 (NVFP4).
@@ -2272,7 +2272,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         }
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize(
         "mtp_nextn,block_reuse,use_py_transceiver",
         [
@@ -2302,7 +2302,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
             use_py_transceiver=False)
@@ -2386,7 +2386,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         }
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("use_py_transceiver", [True, False])
     def test_auto_dtype(self, use_py_transceiver, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
@@ -2403,7 +2403,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
     def test_nvfp4_nixl(self, use_kv_cache_manager_v2):

@@ -3164,7 +3164,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_nvfp4_multi_gpus_corner_case(self):
         """Test the corner case of the NVFP4 model.
 
@@ -3317,7 +3317,7 @@ class TestDeepSeekR1DistillLlama70B(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 class TestDeepSeekV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-0324-FP4"
@@ -3959,7 +3959,7 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
@@ -4152,7 +4152,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(120000)
     @pytest.mark.parametrize("tp_size", [
         pytest.param(4, marks=pytest.mark.skip_less_device(4)),
-        pytest.param(8, marks=pytest.mark.skip_less_device(8)),
+        pytest.param(8, marks=pytest.mark.skip_less_mpi_world_size(8)),
     ],
                              ids=["4gpus", "8gpus"])
     def test_nvfp4(self, tp_size):
@@ -4177,7 +4177,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.timeout(14400)
     @pytest.mark.filterwarnings(
@@ -4259,7 +4259,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                     assert not all(tid == 0 for tid in token_ids)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.timeout(14400)
     @pytest.mark.filterwarnings(
@@ -4892,7 +4892,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-235B-A22B"
 
     @skip_pre_hopper
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(8, 1, 8, False, True, True), (8, 1, 8, True, True, True)],
@@ -4921,7 +4921,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     @skip_pre_hopper
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp,moe_backend",
                              [(8, 1, 8, True, "DEEPGEMM"),
                               (8, 1, 8, False, "DEEPGEMM"),
@@ -7812,7 +7812,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "MiniMaxAI/MiniMax-M3"
     MODEL_PATH = f"{llm_models_root()}/MiniMax-M3"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_auto_dtype(self, tp_size, ep_size):
@@ -7939,7 +7939,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/GLM-5-FP8"
 
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_8gpus(self, tp_size, ep_size):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
 
@@ -7966,7 +7966,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
 class TestGLM52(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_nvfp4(self, tp_size, ep_size):
         # GLM-5.2 reuses the DeepSeek-V3.2 path (MLA + DSA) with cross-layer
@@ -7999,7 +7999,7 @@ class TestGLM52(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_nvfp4_mtp_index_share(self, tp_size, ep_size):
         # Like test_nvfp4 but max_draft_len=3, exercising DSA indexer Top-K reuse
@@ -8029,7 +8029,7 @@ class TestGLM52(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_nvfp4_mtp_index_share_mtp_ar(self, tp_size, ep_size):
         # Acceptance-rate guard for max_draft_len=3 + index-share; counts accepted
@@ -8110,7 +8110,7 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
     # the text decoder path. The custom HF config requires trust_remote_code.
     MODEL_NAME = "stepfun-ai/Step-3.7-Flash"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_auto_dtype(self, tp_size, ep_size):
