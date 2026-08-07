@@ -42,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _get_mamba_hybrid_pool_size,
     _get_num_cuda_graph_padding_dummy_slots,
     _mamba_snapshot_rule_counts,
+    _promote_mamba_state_triton,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
@@ -52,7 +53,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
     CacheTransceiverConfig,
     KvCacheConfig,
     MambaStateConfig,
@@ -216,14 +219,19 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
 
 
-def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
-    """GDN's all-layer replay commit requires the contiguous C++ state view."""
+def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
+    """GDN replay uses C++ V1 directly and V2 through state descriptors."""
     captured_cpp = {}
+    captured_mixed = {}
     captured_v2 = {}
 
     class RecordingCppManager(CppMambaHybridCacheManager):
         def __init__(self, *args, **kwargs):
             captured_cpp.update(kwargs)
+
+    class RecordingMixedManager(MixedMambaHybridCacheManager):
+        def __init__(self, *args, **kwargs):
+            captured_mixed.update(kwargs)
 
     class RecordingV2Manager(MambaHybridCacheManagerV2):
         def __init__(self, *args, **kwargs):
@@ -260,6 +268,11 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
         "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
         lambda *args, **kwargs: mamba_params,
     )
+    info_log = MagicMock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.logger.info",
+        info_log,
+    )
 
     common_kwargs = dict(
         model_engine=None,
@@ -283,6 +296,11 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
         **common_kwargs,
     )
     _create_kv_cache_manager(
+        kv_cache_manager_cls=RecordingMixedManager,
+        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False),
+        **common_kwargs,
+    )
+    _create_kv_cache_manager(
         kv_cache_manager_cls=RecordingV2Manager,
         kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
         **common_kwargs,
@@ -290,9 +308,14 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
 
     assert captured_cpp["use_replay_state_update"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
-    assert captured_v2["use_replay_state_update"] is False
+    assert captured_mixed["use_replay_state_update"] is False
+    assert captured_mixed["model_type"] == "qwen3_next"
+    assert captured_v2["use_replay_state_update"] is True
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
+    fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
+    assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
+    assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
@@ -540,6 +563,55 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
         assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.parametrize(
+    ("replay_env", "manager_setting", "expected_v2"),
+    [
+        (None, "auto", True),
+        ("1", "auto", True),
+        ("0", "auto", True),
+        (None, True, True),
+        (None, False, False),
+    ],
+)
+def test_qwen3_gdn_replay_defaults_to_v2_cache_manager(
+    monkeypatch,
+    replay_env,
+    manager_setting,
+    expected_v2,
+):
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
+
+    if replay_env is None:
+        monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", replay_env)
+
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=manager_setting,
+        ),
+        speculative_config=MTPDecodingConfig(max_draft_len=3),
+    )
+    model_defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    apply_model_defaults_to_llm_args(llm_args, model_defaults)
+    _resolve_kv_cache_manager_v2_auto(
+        llm_args,
+        model_defaults,
+        original_setting=manager_setting,
+    )
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
+    expected_manager = MambaHybridCacheManagerV2 if expected_v2 else CppMambaHybridCacheManager
+    assert (
+        get_kv_cache_manager_cls(
+            _hybrid_model_config(),
+            llm_args.kv_cache_config,
+        )
+        is expected_manager
+    )
 
 
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
@@ -805,6 +877,102 @@ def test_replay_update_mamba_states_skips_dummy_slots():
     assert mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot].item() == 13
     assert mgr.mamba_cache.cache_buf_idx[real_slot].item() == 0
     assert mgr.mamba_cache.cache_buf_idx[dummy_slot].item() == 1
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    (
+        "position_source_values",
+        "position_source_is_token_count",
+        "expected_positions",
+    ),
+    [
+        ([3, 2], True, [2, 1]),
+        ([1, 3], False, [1, 3]),
+    ],
+)
+def test_promote_mamba_state_fuses_replay_bookkeeping(
+    position_source_values,
+    position_source_is_token_count,
+    expected_positions,
+):
+    intermediate = torch.arange(2 * 2 * 4 * 3, dtype=torch.float32, device="cuda").reshape(
+        2, 2, 4, 3
+    )
+    dst = torch.zeros(2, 5, 3, dtype=torch.float32, device="cuda")
+    src_state_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    accepted_position_source = torch.tensor(
+        position_source_values, dtype=torch.int32, device="cuda"
+    )
+    num_accepted_tokens = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+    dst_state_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    replay_pnat = torch.tensor([0, 13, 0, 7, 0], dtype=torch.int32, device="cuda")
+    replay_cache_buf_idx = torch.tensor([0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    dummy_request_mask = torch.tensor([False, True], dtype=torch.bool, device="cuda")
+
+    _promote_mamba_state_triton(
+        dst,
+        intermediate,
+        src_state_indices,
+        accepted_position_source,
+        dst_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        position_source_is_token_count=position_source_is_token_count,
+        replay_pnat=replay_pnat,
+        replay_cache_buf_idx=replay_cache_buf_idx,
+        dummy_request_mask=dummy_request_mask,
+        replay_step_width=4,
+        replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+    )
+
+    torch.testing.assert_close(dst[:, 1], intermediate[:, 0, expected_positions[0]])
+    torch.testing.assert_close(dst[:, 3], intermediate[:, 1, expected_positions[1]])
+    assert replay_pnat.tolist() == [0, 3, 0, 7, 0]
+    assert replay_cache_buf_idx.tolist() == [0, 0, 0, 1, 0]
+
+
+def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
+    monkeypatch,
+):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.local_num_mamba_layers = 1
+    mgr._use_replay_state_update = True
+    mgr._dummy_request_mask = torch.tensor([False, True])
+    mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
+    mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
+    mgr.replay_step_width = 4
+    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
+    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
+    mgr.all_conv_states = torch.empty(0)
+    mgr.intermediate_conv_states = torch.empty(0)
+    mgr._commit_gdn_cached_replay_history_layers = MagicMock()
+
+    promote_calls = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        lambda *args, **kwargs: promote_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._advance_replay_state",
+        lambda *args, **kwargs: pytest.fail(
+            "Cpp replay bookkeeping must not advance before conv promotion"
+        ),
+    )
+
+    mgr.update_mamba_states(
+        SimpleNamespace(num_seqs=2, num_contexts=0),
+        torch.tensor([3, 2], dtype=torch.int32),
+        state_indices=torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+    mgr._commit_gdn_cached_replay_history_layers.assert_called_once()
+    assert len(promote_calls) == 1
+    _, kwargs = promote_calls[0]
+    assert kwargs["replay_pnat"] is mgr.prev_num_accepted_tokens
+    assert kwargs["replay_cache_buf_idx"] is mgr.cache_buf_idx
+    assert kwargs["dummy_request_mask"].tolist() == [False, True]
+    assert kwargs["replay_step_width"] == 4
+    assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
 
 
 @skip_no_cuda
@@ -1677,6 +1845,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     enable_partial_reuse=True,
     block_reuse_policy="all_reusable",
+    max_num_turns=1,
     periodic_snapshot_interval=0,
     additional_snapshot_offsets_from_end=None,
     enable_attention_dp=False,
@@ -1699,7 +1868,10 @@ def _build_v2_hybrid_with_mamba_layer(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=enable_partial_reuse,
-        block_reuse_policy=block_reuse_policy,
+        block_reuse_config=BlockReuseConfig(
+            policy=block_reuse_policy,
+            max_num_turns=max_num_turns,
+        ),
         enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
@@ -1747,6 +1919,39 @@ def _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5):
         tokens_per_gen_step=tokens_per_gen_step,
         spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False),
     )
+
+
+def _make_v2_conversation_request(
+    request_id: int,
+    tokens: list[int],
+    conversation_id: str,
+) -> LlmRequest:
+    request = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+    return request
+
+
+def _run_v2_hybrid_context(
+    manager: MambaHybridCacheManagerV2,
+    request: LlmRequest,
+) -> None:
+    manager.prepare_expect_snapshot_points([request])
+    assert manager.prepare_context(request)
+    num_tokens = request.context_remaining_length
+    assert manager.resize_context(request, num_tokens=num_tokens)
+
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+    manager.prepare_resources(batch)
+    request.context_current_position = request.prompt_len
+    assert request.context_remaining_length == 0
+    manager.update_context_resources(batch)
 
 
 def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
@@ -2017,6 +2222,90 @@ def test_v2_hybrid_preserves_per_conversation_and_disables_periodic_snapshots():
         mgr.shutdown()
 
 
+@skip_no_cuda
+def test_v2_hybrid_retains_configured_number_of_conversation_turns():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        max_num_turns=2,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    request_a = _make_v2_conversation_request(1, list(range(64)), "conv-1")
+    request_b = _make_v2_conversation_request(2, list(range(100, 164)), "conv-1")
+    # Use fresh conversation IDs so probes query the shared prefix cache
+    # without altering conv-1's retained-turn accounting.
+    # Probe one token past the exact SSM snapshots committed at token 64.
+    request_a_probe = _make_v2_conversation_request(3, list(range(65)), "conv-2")
+    request_b_probe = _make_v2_conversation_request(4, list(range(100, 165)), "conv-3")
+    request_c = _make_v2_conversation_request(5, list(range(200, 264)), "conv-1")
+    request_a_after_eviction = _make_v2_conversation_request(6, list(range(65)), "conv-4")
+    request_b_after_eviction = _make_v2_conversation_request(7, list(range(100, 165)), "conv-5")
+    requests = [
+        request_a,
+        request_b,
+        request_a_probe,
+        request_b_probe,
+        request_c,
+        request_a_after_eviction,
+        request_b_after_eviction,
+    ]
+
+    try:
+        _run_v2_hybrid_context(mgr, request_a)
+        request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]
+        mgr.free_resources(request_a)
+        _run_v2_hybrid_context(mgr, request_b)
+        request_b_state_index = mgr.get_state_indices([request_b.py_request_id], [False])[0]
+        mgr.free_resources(request_b)
+
+        mgr.prepare_expect_snapshot_points([request_a_probe])
+        assert mgr.prepare_context(request_a_probe)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(request_a_probe)
+        mgr.prepare_resources(probe_batch)
+        assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        assert mgr.get_state_indices([request_a_probe.py_request_id], [False]) == [
+            request_a_state_index
+        ]
+        mgr.free_resources(request_a_probe)
+
+        mgr.prepare_expect_snapshot_points([request_b_probe])
+        assert mgr.prepare_context(request_b_probe)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(request_b_probe)
+        mgr.prepare_resources(probe_batch)
+        assert request_b_probe.prepopulated_prompt_len == request_b_probe.prompt_len - 1
+        assert mgr.get_state_indices([request_b_probe.py_request_id], [False]) == [
+            request_b_state_index
+        ]
+        mgr.free_resources(request_b_probe)
+
+        _run_v2_hybrid_context(mgr, request_c)
+        mgr.free_resources(request_c)
+
+        mgr.prepare_expect_snapshot_points([request_a_after_eviction])
+        assert mgr.prepare_context(request_a_after_eviction)
+        assert request_a_after_eviction.prepopulated_prompt_len == 0
+
+        mgr.prepare_expect_snapshot_points([request_b_after_eviction])
+        assert mgr.prepare_context(request_b_after_eviction)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(request_b_after_eviction)
+        mgr.prepare_resources(probe_batch)
+        assert (
+            request_b_after_eviction.prepopulated_prompt_len
+            == request_b_after_eviction.prompt_len - 1
+        )
+        assert mgr.get_state_indices([request_b_after_eviction.py_request_id], [False]) == [
+            request_b_state_index
+        ]
+    finally:
+        for request in requests:
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
 def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.enable_block_reuse = True
@@ -2256,6 +2545,129 @@ def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder):
         )
     finally:
         mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_gdn_replay_builds_affine_state_layout():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=16,
+        num_mamba_layers=3,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        conv_state_layout="q_k_v",
+    )
+    try:
+        assert mgr.use_gdn_cached_replay_all_layer_commit
+        assert mgr._gdn_cached_replay_state_descriptors is None
+        state_strides = mgr._gdn_cached_replay_state_strides
+        assert state_strides is not None
+        states = mgr.all_ssm_states
+        first_state = states[0]
+        expected_layer_stride = (
+            states[1].data_ptr() - first_state.data_ptr()
+        ) // first_state.element_size()
+        assert state_strides == (
+            mgr.local_num_mamba_layers,
+            expected_layer_stride,
+            first_state.stride(0),
+        )
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
+    from tensorrt_llm._torch.modules.fla.cached_replay import (
+        commit_gdn_cached_replay_history_layers,
+    )
+
+    batch_size = 16
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=batch_size,
+        num_mamba_layers=3,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        conv_state_layout="q_k_v",
+    )
+    try:
+        torch.manual_seed(1234)
+        for state in mgr.all_ssm_states:
+            state.normal_()
+        mgr.old_x.normal_()
+        mgr.old_B.normal_()
+        mgr.old_dt.uniform_(-0.2, -0.01)
+
+        positions = torch.arange(batch_size, device="cuda", dtype=torch.int32)
+        replay_work_items = torch.stack(
+            (
+                positions,
+                positions,
+                torch.full_like(positions, mgr.replay_history_size),
+                torch.zeros_like(positions),
+            ),
+            dim=1,
+        )
+        n_writes = torch.tensor([batch_size], device="cuda", dtype=torch.int32)
+        expected = torch.stack(mgr.all_ssm_states)
+        commit_gdn_cached_replay_history_layers(
+            ssm_states=expected,
+            old_u=mgr.old_x,
+            old_k=mgr.old_B,
+            old_G=mgr.old_dt,
+            replay_work_items=replay_work_items,
+            n_writes=n_writes,
+            history_size=mgr.replay_history_size,
+        )
+
+        mgr._commit_gdn_cached_replay_history_layers(
+            SimpleNamespace(
+                mamba_metadata=SimpleNamespace(
+                    replay_num_decodes=batch_size,
+                    replay_work_items=replay_work_items,
+                    replay_n_writes=n_writes,
+                )
+            ),
+            batch_size,
+        )
+
+        torch.testing.assert_close(torch.stack(mgr.all_ssm_states), expected, rtol=0, atol=0)
+    finally:
+        mgr.shutdown()
+
+
+def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    batch_size = 16
+    mgr.local_num_mamba_layers = 1
+    mgr._use_replay_state_update = True
+    mgr._use_gdn_cached_replay_all_layer_commit = True
+    mgr.replay_step_width = 4
+    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
+    mgr.prev_num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int32)
+    mgr.cache_buf_idx = torch.zeros(batch_size, dtype=torch.int32)
+    mgr.intermediate_state_indices = torch.arange(batch_size, dtype=torch.int32)
+    mgr._dummy_request_mask = torch.zeros(batch_size, dtype=torch.bool)
+    mgr.all_conv_states = [torch.empty(0)]
+    mgr.intermediate_conv_states = torch.empty(0)
+
+    events = []
+    mgr._commit_gdn_cached_replay_history_layers = lambda *_args, **_kwargs: events.append("commit")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._advance_replay_state",
+        lambda *_args, **_kwargs: events.append("advance"),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        lambda *_args, **_kwargs: None,
+    )
+
+    mgr.update_mamba_states(
+        SimpleNamespace(num_seqs=batch_size, num_contexts=0),
+        torch.full((batch_size,), 3, dtype=torch.int32),
+        state_indices=torch.arange(batch_size, dtype=torch.int32),
+    )
+
+    assert events == ["commit", "advance"]
 
 
 def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):

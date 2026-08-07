@@ -14,9 +14,13 @@
 # limitations under the License.
 import unittest
 
+import pytest
+
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderMetadata,
                                           MultimodalPlaceholderPlacement)
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestMultimodalPlaceholderRegistry(unittest.TestCase):
