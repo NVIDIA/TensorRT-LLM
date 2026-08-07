@@ -880,7 +880,12 @@ def main():
         # Enable/kill-switch policy and timeouts live in precheck_config
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
-        llm_models_root = extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+        precheck_enabled = pcfg.precheck_enabled(config)
+        llm_models_root = (
+            extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+            if precheck_enabled
+            else None
+        )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -896,12 +901,10 @@ def main():
             )
         )
         srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=LLM_MODELS_ROOT",
-                "--container-env=pytestCommand",
-            ]
+            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
         )
+        if precheck_enabled:
+            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
 
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)

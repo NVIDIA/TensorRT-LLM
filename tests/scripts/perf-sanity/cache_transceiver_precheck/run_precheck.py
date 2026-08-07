@@ -85,6 +85,7 @@ import precheck_config as pcfg  # noqa: E402
 # requests of a session; the peer stride only separates sessions, which talk
 # to distinct agents and therefore cannot alias tags with each other.
 RID_PEER_STRIDE = 1 << 24
+ABORT_COORDINATION_TIMEOUT_S = 2.0
 
 
 class _Timeout(Exception):
@@ -95,12 +96,39 @@ class _TransferError(Exception):
     pass
 
 
+class _FatalTransferError(_TransferError):
+    """Transfer quiescence is unproven; finalizers must not release its memory."""
+
+
 class _PeerAbort(Exception):
     pass
 
 
 def _alarm_handler(signum, frame):
     raise _Timeout()
+
+
+def _coordinate_abort_after_leader_flush(comm):
+    """Bounded best-effort rendezvous after the leader writes its verdict."""
+    try:
+        request = comm.Ibarrier()
+        deadline = time.monotonic() + ABORT_COORDINATION_TIMEOUT_S
+        while not request.Test():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+    except Exception:  # noqa: BLE001 - abort remains the mandatory fallback
+        return
+
+
+def _hard_abort_process(comm):
+    """Terminate without running transceiver/KV-manager finalizers."""
+    try:
+        comm.Abort(137)
+    except Exception:  # noqa: BLE001 - SIGKILL is the mandatory fallback
+        pass
+    os.kill(os.getpid(), signal.SIGKILL)
+    raise RuntimeError("SIGKILL unexpectedly returned")
 
 
 def make_rid(ctx_idx, gen_idx, num_ctx, seq):
@@ -939,51 +967,64 @@ class PrecheckRunner:
                     f"[ctx{self.server_idx} r{self.rank}] rid={rid} len={req_len}: send START"
                 )
                 self.xcvr.respond_and_send_async(req)
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001 - relayed to gen, then raised
             local_err = e
-        reason = self._consensus_error(local_err)
+        try:
+            reason = self._consensus_error(local_err)
 
-        # Params for pair k come from its owning dp rank at pp stage 0 with
-        # attention DP; without DP every rank sends the same request, and the
-        # instance leader's params are the ones the real server would return.
-        if self.side["parallel"]["enable_attention_dp"]:
-            contributes = self.mapping.pp_rank == 0
-        else:
-            contributes = self.is_leader
-        contrib = (
-            {p: r.context_phase_params for p, r in reqs.items()}
-            if local_err is None and contributes
-            else {}
-        )
-        gathered = self.comm.gather(contrib, root=0)
-        params_by_pair = {}
-        if self.is_leader:
-            for d in gathered:
-                params_by_pair.update(d or {})
-            if reason is None:
-                missing = [p for p in wave if p not in params_by_pair]
-                if missing:
-                    reason = f"missing context_phase_params for pairs {missing}"
-        # The missing-params check runs only on the leader (only it holds the
-        # gathered params). Broadcast the verdict so EVERY rank raises together:
-        # otherwise the leader raises here while the other ranks return and enter
-        # ctx_finish_wave's collective, the collective sequence diverges, and the
-        # step deadlocks until the watchdog SIGKILLs it (misreported as TIMEOUT).
-        reason = self.comm.bcast(reason, root=0)
+            # Params for pair k come from its owning dp rank at pp stage 0 with
+            # attention DP; without DP every rank sends the same request, and the
+            # instance leader's params are the ones the real server would return.
+            if self.side["parallel"]["enable_attention_dp"]:
+                contributes = self.mapping.pp_rank == 0
+            else:
+                contributes = self.is_leader
+            contrib = (
+                {p: r.context_phase_params for p, r in reqs.items()}
+                if local_err is None and contributes
+                else {}
+            )
+            gathered = self.comm.gather(contrib, root=0)
+            params_by_pair = {}
+            if self.is_leader:
+                for d in gathered:
+                    params_by_pair.update(d or {})
+                if reason is None:
+                    missing = [p for p in wave if p not in params_by_pair]
+                    if missing:
+                        reason = f"missing context_phase_params for pairs {missing}"
+            # The missing-params check runs only on the leader (only it holds the
+            # gathered params). Broadcast the verdict so EVERY rank raises together:
+            # otherwise the leader raises here while the other ranks return and enter
+            # ctx_finish_wave's collective, the collective sequence diverges, and the
+            # step deadlocks until the watchdog SIGKILLs it (misreported as TIMEOUT).
+            reason = self.comm.bcast(reason, root=0)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - sends may already be in flight
+            raise _FatalTransferError(f"ctx send ownership consensus failed: {e!r}") from e
 
         if reason is not None:
             # Send setup can fail asymmetrically after another rank dispatched
             # work. A block-all collective is not safe from that state, and
-            # reusing the pages is worse than retaining them until teardown.
-            raise _TransferError(f"ctx send setup failed: {reason}")
+            # orderly teardown can deregister memory while a worker still owns
+            # it. Conservatively abort without running finalizers.
+            raise _FatalTransferError(f"ctx send setup failed: {reason}")
         return params_by_pair, reqs
 
     def ctx_finish_wave(self, reqs):
         """Wait for all in-flight sends of this wave, then free."""
-        import tensorrt_llm
+        try:
+            import tensorrt_llm
 
-        t0 = time.monotonic()
-        local_err = None
+            t0 = time.monotonic()
+            local_err = None
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - sends are already in flight
+            raise _FatalTransferError(f"ctx transfer ownership proof could not start: {e!r}") from e
         try:
             completed, failed = self.xcvr.check_context_transfer_status(None)  # block-all
             completed_rids = set(completed)
@@ -1005,21 +1046,28 @@ class PrecheckRunner:
             ]
             if bad:
                 raise _TransferError(f"ctx DISAGG_TRANS_ERROR on pairs {bad}")
-            # Only successful IDs prove that every sender finished reading its
-            # source pages. Failed/cancelled/missing waves retain ownership
-            # until process teardown because their task events need not prove
-            # physical NIXL quiescence.
-            self._free_all(reqs)
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001
             local_err = e
-        states = {p: str(r.state) for p, r in reqs.items()}
-        tensorrt_llm.logger.info(
-            f"[ctx{self.server_idx} r{self.rank}] wave sends finished in "
-            f"{time.monotonic() - t0:.1f}s states={states}"
-        )
-        reason = self._consensus_error(local_err)
+        try:
+            states = {p: str(r.state) for p, r in reqs.items()}
+            tensorrt_llm.logger.info(
+                f"[ctx{self.server_idx} r{self.rank}] wave sends finished in "
+                f"{time.monotonic() - t0:.1f}s states={states}"
+            )
+            reason = self._consensus_error(local_err)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - release proof is incomplete
+            raise _FatalTransferError(f"ctx transfer ownership consensus failed: {e!r}") from e
         if reason is not None:
-            raise _TransferError(f"ctx transfer failed: {reason}")
+            # Failed/cancelled/missing results do not prove that every NIXL
+            # reader has relinquished the source pages. Do not proceed to the
+            # ordinary shutdown path, which deregisters those pages.
+            raise _FatalTransferError(f"ctx transfer failed: {reason}")
+        # Every rank proved exact completion before any rank recycles pages.
+        self._free_all(reqs)
 
     def gen_run_wave(self, peer_idx, li, req_len, rep, wave, params_by_pair):
         """Receive + verify owned pairs. Returns (ok, mismatch_detail).
@@ -1027,12 +1075,17 @@ class PrecheckRunner:
         Warmup reps skip the (CPU-heavy) byte verification: their result is
         discarded by the caller either way, transfer errors still raise.
         """
-        import torch
+        try:
+            import torch
 
-        import tensorrt_llm
+            import tensorrt_llm
 
-        owned = self._owned(wave)
-        reqs, local_err = {}, None
+            owned = self._owned(wave)
+            reqs, local_err = {}, None
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - ctx sends are already in flight
+            raise _FatalTransferError(f"gen receive ownership proof could not start: {e!r}") from e
         try:
             for pair in owned:
                 rid = self._pair_rid(peer_idx, li, rep, pair)
@@ -1041,21 +1094,35 @@ class PrecheckRunner:
                 )
                 add_sequence(self.kvm, req, req_len, self.use_v2)
                 # Track every allocated sequence before receive dispatch. On
-                # setup failure, retain all pages until process teardown.
+                # setup failure, retain all pages and bypass normal teardown.
                 reqs[pair] = req
                 tensorrt_llm.logger.info(
                     f"[gen{self.server_idx} r{self.rank}] rid={rid} len={req_len}: recv START"
                 )
                 self.xcvr.request_and_receive_async(req)
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001
             local_err = e
-        reason = self._consensus_error(local_err)
+        try:
+            reason = self._consensus_error(local_err)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - ctx sender is already live
+            raise _FatalTransferError(f"gen receive setup consensus failed: {e!r}") from e
         if reason is not None:
-            raise _TransferError(f"gen receive setup failed: {reason}")
+            # The context sender is already live, and receive setup can fail
+            # after partially dispatching local work. Quiescence is unknown.
+            raise _FatalTransferError(f"gen receive setup failed: {reason}")
 
-        mismatch = ""
-        t0 = time.monotonic()
-        safe_to_free = False
+        try:
+            mismatch = ""
+            t0 = time.monotonic()
+            transfer_error = None
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - transfer quiescence is unknown
+            raise _FatalTransferError(f"gen transfer ownership proof could not start: {e!r}") from e
         try:
             if self.runtime == "PYTHON":
                 completed, failed, cancelled = self.xcvr.check_gen_transfer_status(None)
@@ -1092,22 +1159,40 @@ class PrecheckRunner:
             ]
             if incomplete:
                 raise _TransferError(f"gen requests not complete for pairs {incomplete}")
-            # Remote writes and local CUDA work are now complete. Later byte
-            # verification failures do not invalidate the ownership proof.
-            safe_to_free = True
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001
+            transfer_error = e
+        try:
+            reason = self._consensus_error(transfer_error)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - release proof is incomplete
+            raise _FatalTransferError(f"gen transfer ownership consensus failed: {e!r}") from e
+        if reason is not None:
+            # Exact completion plus CUDA stream synchronization is the release
+            # proof. Do not let a locally successful rank free while another
+            # rank still has transport-owned pages.
+            raise _FatalTransferError(f"gen transfer failed: {reason}")
+
+        # Remote writes and local CUDA work are complete on every rank. Later
+        # byte-verification failures do not invalidate the ownership proof.
+        verification_error = None
+        try:
             if self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
                 for pair, req in reqs.items():
                     ok, detail = verify_request(self.kvm, req.py_request_id, req_len)
                     if not ok:
                         mismatch = f"pair={pair} {detail}"
                         break
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001
-            local_err = e
-        if safe_to_free:
-            self._free_all(reqs)
-        reason = self._consensus_error(local_err)
+            verification_error = e
+        self._free_all(reqs)
+        reason = self._consensus_error(verification_error)
         if reason is not None:
-            raise _TransferError(f"gen transfer failed: {reason}")
+            raise _TransferError(f"gen verification failed: {reason}")
         mismatches = [m for m in self.comm.allgather(mismatch) if m]
         return (not mismatches, "; ".join(mismatches[:4]))
 
@@ -1134,13 +1219,19 @@ class PrecheckRunner:
         """REQ round-trip on the gen leader; broadcast the reply to all ranks."""
         reply = None
         err = None
+        timed_out = False
         if self.is_leader:
             try:
                 sock.send(pack_msg(obj, key))
                 reply = unpack_msg(sock.recv(), key)
+            except _Timeout as e:
+                timed_out = True
+                err = repr(e)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
-        err, reply = self.comm.bcast((err, reply), root=0)
+        timed_out, err, reply = self.comm.bcast((timed_out, err, reply), root=0)
+        if timed_out:
+            raise _Timeout(err)
         if err:
             raise _TransferError(f"ZMQ control channel failed: {err}")
         return reply
@@ -1206,13 +1297,18 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     comm = runner.comm
 
     def leader_recv():
-        msg, err = None, None
+        msg, err, timed_out = None, None, False
         if runner.is_leader:
             try:
                 msg = unpack_msg(sock.recv(), key)
+            except _Timeout as e:
+                timed_out = True
+                err = repr(e)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
-        err, msg = comm.bcast((err, msg), root=0)
+        timed_out, err, msg = comm.bcast((timed_out, err, msg), root=0)
+        if timed_out:
+            raise _Timeout(err)
         if err:
             raise _TransferError(f"ZMQ recv from gen_{peer_idx} failed: {err}")
         return msg
@@ -1242,12 +1338,39 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
             )
         try:
             params_by_pair, reqs = runner.ctx_run_wave(peer_idx, li, req_len, rep, wave)
+        except _FatalTransferError as e:
+            try:
+                leader_reply(("abort", str(e)))
+            except Exception:  # noqa: BLE001 - preserve ownership-fatal outcome
+                pass
+            raise
         except _TransferError as e:
             leader_reply(("abort", str(e)))
             raise
+        except Exception as e:  # noqa: BLE001 - dispatch may have started
+            fatal = _FatalTransferError(f"ctx send path failed with ownership unknown: {e!r}")
+            try:
+                leader_reply(("abort", str(fatal)))
+            except Exception:  # noqa: BLE001 - preserve ownership-fatal outcome
+                pass
+            raise fatal from e
         # JSON object keys are strings; the gen side converts back to int.
-        leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
-        runner.ctx_finish_wave(reqs)
+        try:
+            leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - sends may already be in flight
+            raise _FatalTransferError(
+                f"failed to publish params to gen_{peer_idx} after send dispatch: {e!r}"
+            ) from e
+        try:
+            runner.ctx_finish_wave(reqs)
+        except (_Timeout, _FatalTransferError, _TransferError):
+            raise
+        except Exception as e:  # noqa: BLE001 - send quiescence is unknown
+            raise _FatalTransferError(
+                f"ctx completion proof failed with ownership unknown: {e!r}"
+            ) from e
 
     # The gen defers "done" until it has finished the schedules of ALL its
     # ctx peers, so every ctx instance stays alive for the whole precheck --
@@ -1339,13 +1462,33 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
         case_ok = {}
         for li, req_len, rep, wave in _schedule(plan):
             arm(f"ctx_{peer_idx} len={req_len} rep={rep}", seconds=wave_timeout_s(plan, li, rep))
-            reply = runner._leader_send_recv(
-                sock, ("go", {"li": li, "rep": rep, "wave": wave[0]}), key
-            )
-            if reply[0] == "abort":
-                raise _TransferError(f"ctx_{peer_idx} aborted: {reply[1]}")
-            params_by_pair = {int(p): params_from_wire(v) for p, v in reply[1].items()}
-            ok, detail = runner.gen_run_wave(peer_idx, li, req_len, rep, wave, params_by_pair)
+            try:
+                reply = runner._leader_send_recv(
+                    sock, ("go", {"li": li, "rep": rep, "wave": wave[0]}), key
+                )
+                if reply[0] == "abort":
+                    raise _FatalTransferError(f"ctx_{peer_idx} aborted: {reply[1]}")
+                if reply[0] != "params":
+                    raise _FatalTransferError(
+                        f"unexpected wave reply from ctx_{peer_idx}: {reply[:1]}"
+                    )
+                params_by_pair = {int(p): params_from_wire(v) for p, v in reply[1].items()}
+            except _Timeout:
+                raise
+            except _FatalTransferError:
+                raise
+            except Exception as e:  # noqa: BLE001 - ctx may have dispatched sends
+                raise _FatalTransferError(
+                    f"wave control failed after ctx_{peer_idx} may have dispatched sends: {e!r}"
+                ) from e
+            try:
+                ok, detail = runner.gen_run_wave(peer_idx, li, req_len, rep, wave, params_by_pair)
+            except (_Timeout, _FatalTransferError, _TransferError):
+                raise
+            except Exception as e:  # noqa: BLE001 - receive quiescence is unknown
+                raise _FatalTransferError(
+                    f"gen completion proof failed with ownership unknown: {e!r}"
+                ) from e
             if rep >= plan["warmup_requests"]:
                 prev_ok, prev_detail = case_ok.get(req_len, (True, ""))
                 case_ok[req_len] = (prev_ok and ok, prev_detail or detail)
@@ -1441,14 +1584,26 @@ def _install_watchdog(runner, plan, rank):
     current_cell = {"what": "startup"}
 
     def _on_hang():
-        runner.recorder.record("-", 0, "TIMEOUT", f"hang detected during {current_cell['what']}")
-        runner.recorder.finalize()
-        sys.stderr.write(
-            f"[precheck {runner.role}_{runner.server_idx} r{rank}] WATCHDOG_KILL "
-            f"{current_cell['what']}\n"
-        )
-        sys.stderr.flush()
-        os.kill(os.getpid(), signal.SIGKILL)
+        if runner.is_leader:
+            try:
+                runner.recorder.record(
+                    "-", 0, "TIMEOUT", f"hang detected during {current_cell['what']}"
+                )
+                runner.recorder.finalize()
+            except Exception:  # noqa: BLE001 - SIGKILL must still happen
+                pass
+        else:
+            # Let the leader's concurrently armed watchdog replace its status
+            # files before this rank's bad exit tears down the srun step.
+            time.sleep(ABORT_COORDINATION_TIMEOUT_S)
+        try:
+            sys.stderr.write(
+                f"[precheck {runner.role}_{runner.server_idx} r{rank}] WATCHDOG_KILL "
+                f"{current_cell['what']}\n"
+            )
+            sys.stderr.flush()
+        finally:
+            os.kill(os.getpid(), signal.SIGKILL)
 
     # The detector must outlast the LONGEST legitimate wait (peer handshakes
     # are serialized across sessions); per-cell alarms are the tighter bound
@@ -1497,6 +1652,43 @@ def _make_peer_failure_recorder(runner, disarm, current_cell):
     return record_peer_failure
 
 
+def _hard_abort_unquiesced(runner, current_cell, exc):
+    """Persist the ownership-fatal verdict, then exit without teardown."""
+    try:
+        signal.alarm(0)
+    except Exception:  # noqa: BLE001 - abort must still happen
+        pass
+    if isinstance(exc, _Timeout):
+        status = "TIMEOUT"
+        reason = f"exceeded the budget during {current_cell['what']}"
+    else:
+        status = "TRANSFER_ERROR"
+        reason = str(exc)
+    if runner.is_leader:
+        try:
+            peer = current_cell["what"]
+            runner.recorder.record(peer, 0, status, reason)
+            raise_abort_flag(runner.work_dir, f"{peer} {status}: {reason}")
+            runner.recorder.finalize(
+                extra={
+                    "kv_cache_manager": "V2" if runner.use_v2 else "V1",
+                    "transceiver_runtime": runner.runtime,
+                }
+            )
+        except Exception:  # noqa: BLE001 - abort must still happen
+            pass
+    # Fatal transfer paths first reach instance-wide consensus. This bounded
+    # rendezvous lets the leader finish replacing the status files before a
+    # nonleader aborts MPI, but does not rely on coordination for rank-local
+    # signal timeouts.
+    _coordinate_abort_after_leader_flush(runner.comm)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        _hard_abort_process(runner.comm)
+
+
 def _consensus_abort_reason(runner):
     """Instance-wide agreed view of the fail-fast flag (leader reads, bcast).
 
@@ -1538,6 +1730,8 @@ def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
         try:
             ctx_serve_peer(runner, socks.get(gj), gj, arm, disarm, keys.get(gj))
             runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
+        except (_FatalTransferError, _Timeout):
+            raise
         except _PeerAbort as e:
             # A gen driver that failed elsewhere aborts our session as part of
             # fail-fast: record a (non-failing) SKIP, not our own failure --
@@ -1580,6 +1774,8 @@ def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
         try:
             sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
             open_sessions.append((ci, sock, sess_key))
+        except (_FatalTransferError, _Timeout):
+            raise
         except Exception as e:  # noqa: BLE001 - failure sets the fail-fast flag
             record_peer_failure(f"ctx_{ci}", e)
     for ci, sock, sess_key in open_sessions:
@@ -1683,6 +1879,16 @@ def main(argv=None):
             _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure)
         else:
             _drive_ctx_peers(runner, arm, disarm, record_peer_failure)
+    except (_FatalTransferError, _Timeout) as e:
+        try:
+            print(
+                f"[precheck {runner.role}_{runner.server_idx} r{rank}] OWNERSHIP_FATAL: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 - abort must still happen
+            pass
+        _hard_abort_unquiesced(runner, current_cell, e)
     finally:
         stop_watchdog()
 

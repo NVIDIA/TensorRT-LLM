@@ -58,6 +58,13 @@ so the precheck does too. Later reps run under the tight `wave_timeout_s`,
 which is what actually catches hangs. Set `PRECHECK_DEBUG=1` in the worker
 env to raise the C++/Python transceiver log levels when debugging a stall.
 
+The Python sender's `kv_transfer_timeout_ms` is also a real request deadline.
+If block-all returns without every expected request completed—or any rank
+reports failure, cancellation, or unsynchronized receive work—the precheck
+retains the KV pages, persists an ownership-fatal verdict, and hard-aborts the
+instance without running transceiver/cache-manager finalizers. Pages are freed
+only after exact completion on every rank (plus CUDA synchronization on gen).
+
 ## Failure output
 
 The sbatch log gets a summary block: per-instance verdicts
