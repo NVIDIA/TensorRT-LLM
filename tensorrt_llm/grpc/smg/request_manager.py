@@ -211,8 +211,18 @@ class GrpcRequestManager:
 
             # Try to get tokenizer info
             if hasattr(self.llm, "tokenizer") and self.llm.tokenizer is not None:
-                if hasattr(self.llm.tokenizer, "vocab_size"):
-                    config["vocab_size"] = self.llm.tokenizer.vocab_size
+                # TransformersTokenizer wraps the HF tokenizer without
+                # overriding vocab_size, so the wrapper attribute resolves to
+                # PreTrainedTokenizerBase's abstract property (raises
+                # NotImplementedError). Read from the inner tokenizer.
+                tokenizer = self.llm.tokenizer
+                inner_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+                try:
+                    vocab_size = inner_tokenizer.vocab_size
+                except (AttributeError, NotImplementedError):
+                    vocab_size = None
+                if vocab_size:
+                    config["vocab_size"] = int(vocab_size)
 
             # Try to get max context length from various sources
             if hasattr(self.llm, "args") and self.llm.args is not None:

@@ -652,12 +652,15 @@ def get_model_path(model_name):
     return str(llm_models_root() / model_name)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def grpc_service():
     """Create a real LLM, request manager, and servicer for e2e testing.
 
     Uses TinyLlama-1.1B for minimal GPU resource usage.
-    Shared across all tests in this module.
+    Shared across all tests in the class; class scope (not module) so the
+    LLM is shut down and its GPU memory released before the multimodal
+    class below creates its own LLM — with module scope both models are
+    alive at once and the second one OOMs on A10.
     """
     model_path = get_model_path(default_model_name)
     llm = LLM(
@@ -830,12 +833,13 @@ def get_test_image_path():
     return str(llm_models_root() / "multimodals" / "test_data" / "seashore.png")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def grpc_vlm_service():
     """Create a real VLM LLM, request manager, and servicer for multimodal e2e testing.
 
     Uses Qwen3-VL-8B-Instruct for vision-language model testing.
-    Shared across all tests in this module.
+    Shared across all tests in the class; class scope so this LLM does not
+    coexist with the one from grpc_service (see note there).
     """
     model_path = get_model_path(vlm_model_name)
     llm = LLM(
