@@ -931,7 +931,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cu_seq_lens_buf: torch.Tensor,
         req_idx_per_token_buf: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute cu_seq_lens, req_idx_per_token, and token_positions (eager)."""
+        """Compute cu_seq_lens and token_positions (eager).
+
+        req_idx_per_token_buf is read, not recomputed: super().on_update_kv_lens()
+        has already rebuilt it for the current seq_lens.
+        """
         device = seq_lens.device
 
         # cu_seq_lens
@@ -939,14 +943,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             torch.cumsum(seq_lens.to(torch.int), dim=0), (1, 0)
         )
 
-        # req_idx_per_token via searchsorted
-        token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
-        req_idx = torch.searchsorted(
-            cu_seq_lens_buf[1 : batch_size + 1].to(torch.int32), token_idx, right=True
-        )
-        req_idx_per_token_buf[:num_tokens] = req_idx
+        req_idx = req_idx_per_token_buf[:num_tokens].to(torch.int64)
 
         # token positions
+        token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
         base_pos = cached_tokens[req_idx].to(torch.int32)
         offsets = token_idx - cu_seq_lens_buf[req_idx].to(torch.int32)
         return base_pos + offsets

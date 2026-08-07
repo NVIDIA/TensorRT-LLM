@@ -211,6 +211,31 @@ class DeepSeekR1Parser(BaseReasoningParser):
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
+    def finish(self) -> ReasoningParserResult:
+        """Flush text withheld by `parse_delta` when the stream ends.
+
+        `parse_delta` holds back a trailing fragment that could still grow
+        into a `<think>` / `</think>` tag. If the stream ends while such a
+        fragment is buffered - because the response was truncated mid-tag, or
+        simply ends with a literal `<` - the fragment is ordinary model output
+        and must still be emitted, otherwise it is silently dropped. The
+        buffered text is attributed to the block it was withheld in: inside a
+        reasoning block it is reasoning content, otherwise it is visible
+        content.
+
+        A buffer holding exactly a complete tag is a delimiter rather than
+        model output, so it is discarded as it would have been had more text
+        followed.
+        """
+        remaining = self._buffer
+        self._buffer = ""
+        if not remaining or remaining in (self.reasoning_start,
+                                          self.reasoning_end):
+            return ReasoningParserResult()
+        if self.in_reasoning:
+            return ReasoningParserResult(reasoning_content=remaining)
+        return ReasoningParserResult(content=remaining)
+
 
 @register_reasoning_parser("deepseek_v4")
 class DeepSeekV4ReasoningParser(BaseReasoningParser):

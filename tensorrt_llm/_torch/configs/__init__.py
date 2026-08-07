@@ -24,6 +24,7 @@ from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4UnifiedVisionConfig,
 )
 from tensorrt_llm._torch.configs.inkling import InklingConfig, InklingTextConfig
+from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 
@@ -55,6 +56,12 @@ def _register_custom_configs_with_transformers() -> None:
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
         "gemma4_assistant": Gemma4AssistantConfig,
+        # Kimi K3 text config ("kimi_linear"). The composite "kimi_k3"
+        # model_type is flattened to the text config by
+        # pyexecutor.config_utils.load_pretrained_config; registering the
+        # text config here lets AutoConfig / AutoTokenizer resolve
+        # "kimi_linear" without trust_remote_code.
+        "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
         # minicpmv4_6 is only registered in transformers>=5.7.0; register our
         # own composite config so AutoTokenizer.from_pretrained works on older
@@ -91,6 +98,7 @@ __all__ = [
     "Gemma4UnifiedVisionConfig",
     "InklingConfig",
     "InklingTextConfig",
+    "KimiLinearConfig",
     "LagunaConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",

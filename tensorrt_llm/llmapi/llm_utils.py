@@ -318,6 +318,29 @@ class ModelLoader:
             return None
 
     @staticmethod
+    def load_hf_generation_config_dict(
+            model_dir: Union[str, Path]) -> Dict[str, Any]:
+        """Load only values explicitly present in generation_config.json."""
+        generation_config_path = Path(model_dir) / "generation_config.json"
+        try:
+            with open(generation_config_path, "r") as config_file:
+                generation_config = json.load(config_file)
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                f"Failed to load generation config values from {generation_config_path}, encountered error: {e}"
+            )
+            return {}
+
+        if not isinstance(generation_config, dict):
+            logger.warning(
+                f"Ignoring generation config from {generation_config_path}: expected a JSON object."
+            )
+            return {}
+        return generation_config
+
+    @staticmethod
     def load_hf_model_config(
             model_dir,
             trust_remote_code: bool = True,
