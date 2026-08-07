@@ -1116,8 +1116,8 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
 def mamba_deps():
     """Install mamba-ssm and causal-conv1d for the duration of the test, then
     restore the full pip environment. Uses a pip-freeze diff so transitive
-    dependencies (e.g. quack-kernels pinning nvidia-cutlass-dsl==4.6.0.dev0,
-    which breaks tensorrt-llm's pin of 4.5.0) are also reverted."""
+    dependencies (e.g. quack-kernels pinning a different nvidia-cutlass-dsl
+    version than TensorRT-LLM) are also reverted."""
 
     def _freeze():
         out = subprocess.check_output(
