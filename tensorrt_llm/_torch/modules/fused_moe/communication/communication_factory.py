@@ -146,7 +146,7 @@ class CommunicationFactory:
         force_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
 
         if force_method is not None:
-            return CommunicationFactory._create_forced_method(
+            strategy = CommunicationFactory._create_forced_method(
                 force_method,
                 model_config,
                 num_experts,
@@ -158,6 +158,11 @@ class CommunicationFactory:
                 use_flashinfer,
                 hidden_size=hidden_size,
             )
+            logger.info(
+                f"Selected communication strategy: {strategy.__class__.__name__} "
+                f"(forced by TRTLLM_FORCE_COMM_METHOD={force_method})"
+            )
+            return strategy
 
         # Auto-selection: Try strategies in priority order using try-catch
         # Priority: NVLinkOneSided > NVLinkTwoSided > NcclEP > DeepEP > DeepEPLowLatency > AllGather

@@ -198,6 +198,35 @@ def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
     assert strategy.moe_max_num_tokens is None
 
 
+def test_forced_strategy_logs_selected_implementation(monkeypatch: pytest.MonkeyPatch):
+    class _FakeForcedStrategy:
+        pass
+
+    messages = []
+    monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "NVLINK_ONE_SIDED")
+    monkeypatch.setattr(
+        communication_factory.CommunicationFactory,
+        "_create_forced_method",
+        lambda *args, **kwargs: _FakeForcedStrategy(),
+    )
+    monkeypatch.setattr(communication_factory.logger, "info", messages.append)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        _make_model_config(),
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, _FakeForcedStrategy)
+    assert messages == [
+        "Selected communication strategy: _FakeForcedStrategy "
+        "(forced by TRTLLM_FORCE_COMM_METHOD=NVLINK_ONE_SIDED)"
+    ]
+
+
 def test_auto_selection_uses_nccl_ep_with_missing_moe_max_num_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ):
