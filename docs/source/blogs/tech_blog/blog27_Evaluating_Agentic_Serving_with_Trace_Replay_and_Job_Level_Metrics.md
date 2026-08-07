@@ -10,7 +10,7 @@ Conventional benchmarks issue independent requests with fixed input and output l
 
 We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate the result with **job-level metrics** that complement conventional token-level ones. The framework code lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with runnable examples under [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
-Benchmarking practice for agentic scenarios is still taking shape. Industry benchmarks aimed at agentic serving already exist, and the field will gradually converge on a common methodology. We do not claim a standard here. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
+Benchmarking practice for agentic scenarios is still taking shape, with several efforts in the industry evolving alongside ours. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
 
 ## Methodology
 
