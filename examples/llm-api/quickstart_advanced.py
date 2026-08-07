@@ -87,8 +87,8 @@ def add_llm_args(parser):
         type=str,
         default='AUTO',
         choices=[
-            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'DEEPGEMM',
-            'CUTEDSL', 'TRITON'
+            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM', 'CUTEDSL',
+            'TRITON'
         ],
         help=
         'MoE backend to use. AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.'

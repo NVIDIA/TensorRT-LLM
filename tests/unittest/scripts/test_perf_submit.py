@@ -77,6 +77,28 @@ def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return _load_module(SUBMIT_PATHS[0], monkeypatch)
 
 
+def _select_ci_test_case_line(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+    pytest_options: str,
+    split_group: int,
+) -> str:
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text(
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
+        encoding="utf-8",
+    )
+    script_prefix_lines = [
+        f'export pytestCommand="pytest --splitting-algorithm least_duration {pytest_options}"'
+    ]
+    return ci_submit_module.select_test_case_line(
+        test_list_path,
+        tmp_path,
+        script_prefix_lines,
+        split_group=split_group,
+    )
+
+
 @pytest.mark.parametrize(
     "concurrency",
     (True, 1.5, [], {}, "0", 0, "-1", -1, "1.5", "not-an-integer", None),
@@ -230,20 +252,11 @@ def test_ci_submit_rejects_split_group_disagreement(
     ci_submit_module: ModuleType,
     tmp_path: Path,
 ) -> None:
-    test_list_path = tmp_path / "test_list.txt"
-    test_list_path.write_text(
-        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
-        encoding="utf-8",
-    )
-    script_prefix_lines = [
-        'export pytestCommand="pytest --splitting-algorithm least_duration --splits 1 --group 1"'
-    ]
-
     with pytest.raises(ValueError, match="disagrees with pytest --group"):
-        ci_submit_module.select_test_case_line(
-            test_list_path,
+        _select_ci_test_case_line(
+            ci_submit_module,
             tmp_path,
-            script_prefix_lines,
+            pytest_options="--splits 1 --group 1",
             split_group=2,
         )
 
@@ -252,21 +265,11 @@ def test_ci_submit_rejects_missing_pytest_split_durations(
     ci_submit_module: ModuleType,
     tmp_path: Path,
 ) -> None:
-    test_list_path = tmp_path / "test_list.txt"
-    test_list_path.write_text(
-        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
-        encoding="utf-8",
-    )
-    script_prefix_lines = [
-        'export pytestCommand="pytest --splitting-algorithm least_duration '
-        '--splits 1 --group 1 --durations-path /remote/.test_durations"'
-    ]
-
     expected_path = tmp_path / "tests" / "integration" / "defs" / ".test_durations"
     with pytest.raises(FileNotFoundError, match=f"durations file not found: {expected_path}"):
-        ci_submit_module.select_test_case_line(
-            test_list_path,
+        _select_ci_test_case_line(
+            ci_submit_module,
             tmp_path,
-            script_prefix_lines,
+            pytest_options="--splits 1 --group 1 --durations-path /remote/.test_durations",
             split_group=1,
         )

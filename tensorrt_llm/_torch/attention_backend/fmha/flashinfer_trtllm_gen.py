@@ -299,6 +299,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         None,  # lse
         0,  # lse_stride_tokens
         0,  # lse_stride_heads
+        False,  # enable_block_sparse_attention (added in flashinfer 0.6.16, flashinfer-ai/flashinfer#3955)
     )
 
 
@@ -760,8 +761,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "sage attention."
         if meta.helix_position_offsets is not None:
             return False, "helix parallelism."
-        sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
+        sparse_kv_indices = fwd.sparse_runtime_params.sparse_kv_indices
+        sparse_attn_indices = fwd.sparse_runtime_params.sparse_attn_indices
         if (
             (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
             or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)

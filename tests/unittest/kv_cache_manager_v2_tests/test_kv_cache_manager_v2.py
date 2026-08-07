@@ -65,7 +65,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         SlidingWindowSize,
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-    from kv_cache_manager_v2._exceptions import OutOfPagesError
+    from kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
     from kv_cache_manager_v2._storage._core import CacheLevelStorage, PoolGroupBase, SlotAllocator
     from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
@@ -118,7 +118,7 @@ else:
         SlidingWindowSize,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
         CacheLevelStorage,
         PoolGroupBase,
@@ -1015,6 +1015,121 @@ class TestNoBatching(TestKVCacheManagerV2):
             profiler.disable()
             profiler.print_stats(sort="cumtime")
             profiler.dump_stats("profiler.prof")
+
+
+class TestLivingKvCacheGuard(TestKVCacheManagerV2):
+    """Guard against clearing/freeing the reuse state while KV caches are still open.
+
+    `clear_reusable_blocks()` detaches the whole radix tree and `shutdown()` frees the
+    storage the pages live in. A request that is still open keeps committing into the
+    detached subtree, which silently discards work on the Python backend and segfaults on
+    the C++ one, so both entry points must reject the call instead.
+    """
+
+    # The two backends raise different types: the Python backend raises its own
+    # LogicError, while the C++ backend's TLLM_CHECK_WITH_INFO throws a TllmException
+    # (a std::runtime_error), which nanobind surfaces as RuntimeError. Accept either so
+    # this test is meaningful under both.
+    GuardError = (LogicError, RuntimeError)
+
+    def _seed_reusable_prompt(self) -> list[TokenIdExt]:
+        """Commit and close a sequence so the radix tree actually holds reusable blocks.
+
+        Without this the tree is empty, and a regression that cleared it *before* raising
+        would still pass — there would be nothing left to observe.
+        """
+        prompt = [self.next_token() for _ in range(64)]
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        seed = self.manager.create_kv_cache()
+        seed.resume(stream)
+        seed.capacity = 32
+        seed.commit(prompt[:32])
+        seed.capacity = 64
+        seed.commit(prompt[32:])
+        seed.stop_committing()
+        seed.close()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+        return prompt
+
+    def _open_cache(self) -> _KVCache:
+        return self.manager.create_kv_cache(
+            ReuseScope(lora_id=None), [self.next_token() for _ in range(64)]
+        )
+
+    def test_clear_reusable_blocks_rejects_open_kv_cache(self) -> None:
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 4, 128, 1)
+        prompt = self._seed_reusable_prompt()
+        kv_cache = self._open_cache()
+        try:
+            with self.assertRaises(self.GuardError) as ctx:
+                self.manager.clear_reusable_blocks()
+            # The message must name the API the caller actually invoked, and report how
+            # many sequences are still open.
+            self.assertIn("clear_reusable_blocks()", str(ctx.exception))
+            self.assertIn("1 KV cache(s) still open", str(ctx.exception))
+            # The rejected call must be a no-op: the check runs before the tree is
+            # touched, so every block is still reusable.
+            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+        finally:
+            kv_cache.close()
+
+        # ...and once permitted it really does clear, which is what stops the assertion
+        # above from passing vacuously.
+        self.manager.clear_reusable_blocks()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
+
+    def test_shutdown_rejects_open_kv_cache(self) -> None:
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 4, 128, 1)
+        prompt = self._seed_reusable_prompt()
+        kv_cache = self._open_cache()
+        try:
+            with self.assertRaises(self.GuardError) as ctx:
+                self.manager.shutdown()
+            self.assertIn("shutdown()", str(ctx.exception))
+            self.assertIn("1 KV cache(s) still open", str(ctx.exception))
+            # shutdown() frees the storage the pages live in, so a rejected call must
+            # leave both the reuse state and the pool intact: the blocks are still
+            # reusable, and the manager can still hand out and resume a new sequence.
+            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+            stream_holder = CachedCudaStream()
+            probe = self.manager.create_kv_cache()
+            probe.resume(cast(CudaStream, stream_holder.handle))
+            probe.close()
+        finally:
+            kv_cache.close()
+
+        self.manager.shutdown()
+        del self.manager
+
+    def test_guard_counts_only_open_caches(self) -> None:
+        """The guard counts sequences still open, not objects still referenced."""
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 4, 128, 1)
+        caches = [
+            self.manager.create_kv_cache(
+                ReuseScope(lora_id=None), [self.next_token() for _ in range(64)]
+            )
+            for _ in range(3)
+        ]
+        try:
+            with self.assertRaises(self.GuardError) as ctx:
+                self.manager.clear_reusable_blocks()
+            self.assertIn("3 KV cache(s) still open", str(ctx.exception))
+
+            caches[0].close()
+            with self.assertRaises(self.GuardError) as ctx:
+                self.manager.clear_reusable_blocks()
+            self.assertIn("2 KV cache(s) still open", str(ctx.exception))
+        finally:
+            # Close every cache, not just caches[1:]: if an assertion above fails before
+            # caches[0] is closed, leaving it open makes tearDown's shutdown() raise and
+            # mask the real failure. close() is idempotent, so the double close is fine.
+            for kv_cache in caches:
+                kv_cache.close()
+
+        # `caches` still holds all three references, so a passing call here proves the
+        # guard tracks close() rather than object liveness.
+        self.manager.clear_reusable_blocks()
 
 
 class TestBatching(TestKVCacheManagerV2):

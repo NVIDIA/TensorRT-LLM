@@ -22,12 +22,7 @@ MODEL_PATH_DICT = {
     "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "llama_v3.3_70b_instruct_fp8": "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
-    "llama_v3.1_nemotron_nano_8b_fp8": "Llama-3.1-Nemotron-Nano-8B-v1-FP8",
-    "llama_v3.3_nemotron_super_49b": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.3_nemotron_super_49b_fp8": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
     "llama_v3.3_nemotron_super_49b_v1.5_fp8": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8",
-    "llama_v3.1_nemotron_ultra_253b": "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
-    "llama_v3.1_nemotron_ultra_253b_fp8": "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     "llama_v4_scout_17b_16e_instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
     "llama_v4_scout_17b_16e_instruct_fp8": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
     "llama_v4_scout_17b_16e_instruct_fp4": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
@@ -42,8 +37,6 @@ MODEL_PATH_DICT = {
     "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "gemma_4_26b_a4b_nvfp4": "gemma/nvidia-Gemma-4-26B-A4B-NVFP4",
     "gemma_4_31b_it_nvfp4": "gemma/nvidia-Gemma-4-31B-IT-NVFP4",
-    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
-    "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
@@ -85,9 +78,6 @@ MODEL_PATH_DICT = {
     # Nemotron-3-Nano-Omni-30B (text + image multimodal)
     "nemotron_3_nano_omni_nvfp4": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
     "nemotron_3_nano_omni_nvfp4_image": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
-    "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
-    # MiniMax M2.5 (FP8 block-scale, ~230B MoE)
-    "minimax_m2.5_fp8": "MiniMax-M2.5",
     # MiniMax M3 (block-sparse MoE, MXFP8 weights, BF16 activations + KV cache)
     "minimax_m3_mxfp8": "MiniMax-M3-MXFP8",
     # Qwen3.5 dense + MoE
@@ -99,9 +89,6 @@ MODEL_PATH_DICT = {
     "qwen3.5_397b_a17b_fp4": "Qwen3.5-397B-A17B-NVFP4",
     # Qwen3.6 (GDN linear-attn MoE, NVFP4)
     "qwen3.6_35b_a3b_fp4": "Qwen3.6-35B-A3B-NVFP4",
-    # DeepSeek V3.2 (671B MoE)
-    "deepseek_v3.2_fp8": "DeepSeek-V3.2-hf",
-    "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
