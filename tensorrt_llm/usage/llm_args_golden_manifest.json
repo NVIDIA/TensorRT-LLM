@@ -275,6 +275,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.encoder.batch_sizes"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
