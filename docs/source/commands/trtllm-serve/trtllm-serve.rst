@@ -167,10 +167,10 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
      ]}
 
 .. note::
-   To convert images to base64-encoded format, use the utility function
-   :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
-   `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__
-   for implementation details.
+   To produce the base64 payload, use ``encode_base64_image`` for an in-memory
+   PIL image, or ``encode_base64_content_from_url`` to fetch and encode a remote
+   URL. Both are exported from ``tensorrt_llm.inputs`` and defined in
+   `tensorrt_llm/inputs/utils.py <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/inputs/utils.py>`__.
 
 **Image embeddings**
 
