@@ -28,7 +28,7 @@
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
