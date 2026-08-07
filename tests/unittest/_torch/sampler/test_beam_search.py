@@ -989,6 +989,8 @@ def test_beam_search_sampling_batch_diversity_rate():
             seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
             finished_beams=torch.zeros((max_batch_size, beam_width),
                                        dtype=torch.int32),
+            pending_harvest=torch.zeros((max_batch_size, beam_width),
+                                        dtype=torch.bool),
             new_log_probs=torch.zeros((max_batch_size, beam_width),
                                       dtype=torch.float32),
             predecessor_beams=torch.zeros((max_batch_size, beam_width),
@@ -1096,6 +1098,9 @@ def _make_cba_metadata(max_batch, K, attn_len, snap_len, seq_len, prompt_len,
         seq_slots=slots,
         seq_lens=torch.full((batch, ), seq_len, dtype=torch.int32),
         finished_beams=torch.zeros((max_batch, K), dtype=torch.int32),
+        # One-shot latch the finish handler raises and the CBA step consumes;
+        # tests set it alongside finished_beams to stage a pending harvest.
+        pending_harvest=torch.zeros((max_batch, K), dtype=torch.bool),
         predecessor_beams=torch.zeros((max_batch, K), dtype=torch.int32),
         beam_idx_arange=torch.arange(K, dtype=torch.int32),
         cba=CBAState(
@@ -1418,6 +1423,7 @@ def test_beam_search_cba_harvest_stop_word_beam():
     m.cum_log_probs[0] = torch.tensor([-1.5, -2.0])
     # beam 0 was latched STOP_WORDS by the finish handler after last step
     m.finished_beams[0, 0] = FinishReason.STOP_WORDS.value
+    m.pending_harvest[0, 0] = True
 
     logits = torch.full((K, vocab), -50.0)
     logits[0, 1] = 10.0  # beam0's candidates must be ignored (harvested)
@@ -1448,6 +1454,90 @@ def test_beam_search_cba_harvest_stop_word_beam():
     # both slots refilled from beam1 (beam0's row was masked)
     assert m.predecessor_beams[0].tolist() == [1, 1]
     assert tokens[0].tolist() == [2, 3]
+
+
+@_kernel_test
+def test_beam_search_cba_harvest_latch_clears_after_refill():
+    """A harvested slot must not be harvested again on the next step.
+
+    The harvest mask reads first_finish_reasons, which is also the request's
+    persistent output finish reason and so survives the refill. Reading it as
+    a transient latch means the *new* continuation occupying that slot looks
+    finished on the following step: it gets harvested a second time, the pool
+    gains an entry for a hypothesis that never ended, and the request can be
+    declared done early.
+    """
+    from tensorrt_llm._torch.pyexecutor.sampler.beam_search import \
+        beam_search_sampling_batch_cba
+
+    K, vocab, end_id = 2, 6, 5
+    prompt, gen = 2, 3
+    seq_len = prompt + gen
+    m = _make_cba_metadata(max_batch=1,
+                           K=K,
+                           attn_len=10,
+                           snap_len=6,
+                           seq_len=seq_len,
+                           prompt_len=prompt,
+                           end_id=end_id,
+                           batch=1)
+    for b in range(K):
+        m.cache_indirection[0, b, :] = b
+        m.cba.original_tokens[0, b, prompt:seq_len] = torch.tensor(
+            [70 + b, 71 + b, 72 + b], dtype=torch.int32)
+    m.cum_log_probs[0] = torch.tensor([-1.5, -2.0])
+    # Step 1: beam 0 was latched STOP_WORDS by the finish handler.
+    m.finished_beams[0, 0] = FinishReason.STOP_WORDS.value
+    m.pending_harvest[0, 0] = True
+
+    logits = torch.full((K, vocab), -50.0)
+    logits[0, 1] = 10.0  # ignored: beam 0 is harvested, not expanded
+    logits[1, 2] = 9.0
+    logits[1, 3] = 8.0
+
+    beam_search_sampling_batch_cba(
+        logits=logits,
+        beam_width_in=K,
+        beam_width_out=K,
+        beam_search_args=m,
+        temperature=1.0,
+        early_stopping=0,
+        length_penalty=1.0,
+        return_probs=False,
+    )
+    # Step 2 verifies the harvest happened and both slots refilled from beam 1.
+    entries_after_first = int((m.cba.cba_normed_scores[0]
+                               > _CBA_NEG_INF).sum().item())
+    assert entries_after_first == 1, "the stop-word beam should be pooled once"
+    assert m.predecessor_beams[0].tolist() == [1, 1]
+
+    # Step 3: run again. Neither slot finished this step -- they hold the
+    # continuations that refilled them, and the finish handler latched nothing
+    # new, so nothing may be harvested.
+    m.seq_lens = torch.full((1, ), seq_len + 1, dtype=torch.int32)
+    logits2 = torch.full((K, vocab), -50.0)
+    logits2[0, 1] = 7.0
+    logits2[1, 2] = 6.0
+
+    beam_search_sampling_batch_cba(
+        logits=logits2,
+        beam_width_in=K,
+        beam_width_out=K,
+        beam_search_args=m,
+        temperature=1.0,
+        early_stopping=0,
+        length_penalty=1.0,
+        return_probs=False,
+    )
+    # Step 4: the refilled continuation must not be pooled or masked again.
+    entries_after_second = int((m.cba.cba_normed_scores[0]
+                                > _CBA_NEG_INF).sum().item())
+    assert entries_after_second == entries_after_first, (
+        f"pool grew from {entries_after_first} to {entries_after_second}: an "
+        "unfinished continuation was harvested because the stop-word latch "
+        "outlived the refill")
+    assert not m.cba.batch_dones[0].item(), (
+        "request finished early: the re-harvest emptied the beam slots")
 
 
 @_kernel_test
