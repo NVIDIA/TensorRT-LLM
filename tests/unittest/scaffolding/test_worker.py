@@ -78,6 +78,17 @@ def create_trtoai_worker(model_name, async_client):
     )
 
 
+def test_trtllm_worker_generation(default_prompt, trtllm_model_path):
+    worker = create_trtllm_worker(trtllm_model_path)
+    try:
+        task = GenerationTask.create_from_prompt(default_prompt)
+        task.max_tokens = 100
+        status = asyncio.run(worker.run_task(task))
+        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
+    finally:
+        worker.shutdown()
+
+
 @pytest.mark.asyncio(loop_scope="module")
 def test_trtoai_worker_generation(default_prompt, model_name, server):
     worker = create_trtoai_worker(model_name, server.get_async_client())
