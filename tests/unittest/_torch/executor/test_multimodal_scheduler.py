@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
     MultimodalScheduler,
+    ScheduledRequests,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
@@ -413,6 +414,35 @@ def test_forward_multimodal_encoder_step_delegates_to_model_engine():
     executor._forward_multimodal_encoder_step(scheduled_requests)
 
     assert calls == [(executor.active_requests, scheduled_items)]
+
+
+def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
+    failed = _request(1, [4])
+    unrelated_context = _llm_request(2)
+    unrelated_generation = _llm_request(3)
+    handled = []
+
+    def fail_encoder(*_):
+        raise ValueError("bad MM output")
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [failed, unrelated_context, unrelated_generation]
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(world_size=1)
+    executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([failed, unrelated_context])
+    scheduled_requests.append_generation_request(unrelated_generation)
+    scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
+
+    executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert scheduled_requests.context_requests == [unrelated_context]
+    assert scheduled_requests.generation_requests == [unrelated_generation]
+    assert scheduled_requests.scheduled_mm_encoder_items is None
+    assert handled == [("bad MM output", {"requests": [failed], "charge_budget": False})]
 
 
 def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):

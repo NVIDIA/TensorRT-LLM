@@ -1211,7 +1211,7 @@ class PyExecutor:
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
-        """Enqueue buffered transfer-completion responses.
+        """Enqueue responses buffered by rank-divergent executor paths.
 
         Must be called at a point where ALL DP ranks execute in lockstep so
         that the tp_gather inside _enqueue_responses does not deadlock.
@@ -5960,8 +5960,33 @@ class PyExecutor:
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items
         if not scheduled_items:
             return
-        self.model_engine.forward_multimodal_encoder_items(
-            self.active_requests, scheduled_items)
+        try:
+            self.model_engine.forward_multimodal_encoder_items(
+                self.active_requests, scheduled_items)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Encountered an error in multimodal encoder forward: "
+                         f"{error_msg}\n{traceback.format_exc()}")
+
+            failed_request_ids = set(scheduled_items)
+            failed_requests = [
+                request for request in self.active_requests
+                if request.request_id in failed_request_ids
+            ]
+
+            # Capacity scheduling may already have placed requests whose last
+            # pending item was selected into this iteration's context batch.
+            # Remove the failed owners before the LLM forward; unrelated
+            # context and generation work remains intact.
+            scheduled_requests.reset_context_requests([
+                request for request in scheduled_requests.context_requests
+                if request.request_id not in failed_request_ids
+            ])
+            scheduled_requests.scheduled_mm_encoder_items = None
+
+            self._handle_errors(error_msg,
+                                requests=failed_requests,
+                                charge_budget=False)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
