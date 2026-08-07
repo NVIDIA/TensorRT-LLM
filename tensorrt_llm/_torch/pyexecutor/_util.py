@@ -591,7 +591,7 @@ class KvCacheCreator:
             kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
-        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+        cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
         if is_hybrid_linear(model_config.pretrained_config):
             logger.info_once(
@@ -609,7 +609,7 @@ class KvCacheCreator:
                     f"when using non-V2 Mamba cache manager {cls.__name__}")
         return cls
 
-    def _fallback_if_unsupported_kv_cache_manager_v2(
+    def _validate_or_fallback_kv_cache_manager_v2(
             self,
             kv_cache_manager_cls,
             model_config: ModelConfig,
@@ -1446,7 +1446,7 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+        draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est

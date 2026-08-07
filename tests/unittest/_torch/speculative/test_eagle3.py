@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import sys
@@ -324,6 +339,38 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.max_seq_len = 512
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
     return mock_kv_cache_manager
+
+
+@skip_num_gpus_less_than(1)
+def test_separate_draft_flash_mla_buffers_use_manager_geometry():
+    """Target and draft FlashMLA block IDs need stable, disjoint storage."""
+    num_seqs = 3
+    target_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
+    draft_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
+    draft_kv_cache_manager.max_blocks_per_seq = 7
+    attn_metadata = TrtllmAttentionMetadata(
+        max_num_requests=num_seqs,
+        max_num_tokens=num_seqs * 3,
+        kv_cache_manager=target_kv_cache_manager,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+        enable_flash_mla=True,
+    )
+
+    for metadata in (
+            attn_metadata,
+            attn_metadata.create_cuda_graph_metadata(num_seqs,
+                                                     max_draft_tokens=2),
+    ):
+        assert metadata.block_ids_per_seq.shape == (num_seqs, 16)
+        assert metadata.kv_block_ids_per_seq.shape == (num_seqs, 16)
+        assert metadata.draft_block_ids_per_seq.shape == (num_seqs, 7)
+        assert metadata.draft_kv_block_ids_per_seq.shape == (num_seqs, 7)
+        assert len({
+            metadata.block_ids_per_seq.data_ptr(),
+            metadata.kv_block_ids_per_seq.data_ptr(),
+            metadata.draft_block_ids_per_seq.data_ptr(),
+            metadata.draft_kv_block_ids_per_seq.data_ptr(),
+        }) == 4
 
 
 @pytest.mark.parametrize("spec_signal", [

@@ -67,7 +67,7 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
     apply_model_defaults_to_llm_args,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
@@ -841,9 +841,36 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator._max_beam_width = max_beam_width
 
     with pytest.raises(NotImplementedError, match=expected):
-        creator._fallback_if_unsupported_kv_cache_manager_v2(
+        creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, model_config, KvCacheConfig()
         )
+
+
+def test_dsa_star_rejects_v2_and_keeps_explicit_v1_selection():
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="dsa"),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 1
+    creator._mapping = SimpleNamespace(cp_config={"cp_type": CpType.STAR})
+
+    with pytest.raises(NotImplementedError, match="STAR context parallelism"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2,
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=True),
+        )
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManager,
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=False),
+        )
+        is KVCacheManager
+    )
 
 
 def _make_mgr(

@@ -28,6 +28,7 @@ from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 
 from .yaml_validation_harness import (
     assert_no_default_valued_leaves,
@@ -108,13 +109,10 @@ def _get_default_values_for_config(config_path: Path) -> dict:
     if not model_cls or not hasattr(model_cls, "get_model_defaults"):
         return global_default
 
-    base_args = llm_args_module.TorchLlmArgs(model=model, skip_tokenizer_init=True).model_dump(
-        mode="json"
-    )
-
+    base_args = llm_args_module.TorchLlmArgs(model=model, skip_tokenizer_init=True)
     model_defaults = model_cls.get_model_defaults(base_args)
-    base_args.update(model_defaults)
-    return base_args
+    apply_model_defaults_to_llm_args(base_args, model_defaults)
+    return base_args.model_dump(mode="json")
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +124,23 @@ def mock_gpu_environment():
 
 def get_config_id(config_path: Path) -> str:
     return str(config_path.relative_to(CONFIG_ROOT))
+
+
+def test_model_nested_defaults_preserve_global_nested_defaults(monkeypatch):
+    config_key = "test-only/deepseek-v3.yaml"
+    monkeypatch.setitem(
+        _CONFIG_PATH_TO_ENTRY,
+        config_key,
+        {
+            "model": "dummy/model",
+            "arch": "DeepseekV3ForCausalLM",
+        },
+    )
+
+    defaults = _get_default_values_for_config(REPO_ROOT / config_key)
+
+    assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+    assert defaults["kv_cache_config"]["enable_block_reuse"] is True
 
 
 def _assert_kv_cache_block_reuse_policy(config_dict: dict) -> None:
