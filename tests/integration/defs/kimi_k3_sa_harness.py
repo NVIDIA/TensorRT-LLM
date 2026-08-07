@@ -33,9 +33,11 @@ Environment:
                                checkpoint copy (skips output-quality
                                assertions)
   KIMI_K3_MOE_BACKEND          moe_config.backend passed to the LLM
-                               (default AUTO = fused on SM100/SM103;
-                               VANILLA = reference dequant MoE — the
-                               parity oracle, no fused-cubin dependency)
+                               (default AUTO). Currently a no-op for
+                               Kimi K3: KimiK3MoERuntime pins the routed
+                               MoE backend to TRTLLM regardless; parity
+                               holds because the baseline and spec runs
+                               share the same backend
   KIMI_K3_SPEC_MODE            'off' (default) or 'sa' (suffix
                                automaton, one-engine)
   KIMI_K3_SPEC_DRAFT_LEN       SA max_draft_len (default 2)
@@ -148,8 +150,10 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         enable_attention_dp=adp,
         moe_expert_parallel_size=tp if adp else None,
         trust_remote_code=True,  # tiktoken tokenizer ships with the ckpt
-        # VANILLA = per-expert dequant reference MoE (parity oracle, no
-        # fused-cubin dependency); AUTO = fused on SM100/SM103.
+        # Currently a no-op for Kimi K3: KimiK3MoERuntime pins the routed
+        # MoE backend to TRTLLM regardless of moe_config.backend. Kept as
+        # a passthrough for checkpoints that honor it; parity is
+        # unaffected because the baseline and spec runs share the backend.
         moe_config=MoeConfig(backend=os.environ.get("KIMI_K3_MOE_BACKEND", "AUTO")),
         max_batch_size=int(os.environ.get("KIMI_K3_MAX_BATCH_SIZE", "8")),
         max_seq_len=int(os.environ.get("KIMI_K3_MAX_SEQ_LEN", "4096")),

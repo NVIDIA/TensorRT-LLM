@@ -1011,7 +1011,11 @@ class DFlashForCausalLM(nn.Module):
             or 'vanilla').lower()
         self._dspark_use_confidence_head = bool(
             dflash_config.get('use_confidence_head', False))
-        # Loaded by load_weights() when the checkpoint ships them.
+        # Plain None placeholders rather than nn.Parameter/buffer: most
+        # DFlash checkpoints don't ship these heads, and their shapes
+        # ([vocab, rank]) are checkpoint-dependent, so nothing is
+        # pre-allocated. load_weights() fills them in only when the
+        # checkpoint ships them; consumers treat None as "head absent".
         self.markov_w1 = None  # [vocab, rank] (nn.Embedding weight layout)
         self.markov_w2 = None  # [vocab, rank] (nn.Linear(rank->vocab) weight)
         self.confidence_proj_weight = None  # loaded, unused (follow-up MR)

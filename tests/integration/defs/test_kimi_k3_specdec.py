@@ -58,10 +58,10 @@ def test_kimi_k3_sa_specdec_logits_parity():
             # ~50 trajectories make the aggregate divergence statistics
             # meaningful; loading dominates runtime so this is nearly free.
             "KIMI_K3_SPEC_NUM_PROMPTS": "48",
-            # Default to the reference dequant MoE (moe_config.backend=VANILLA,
-            # the bit-parity oracle) so the test has no fused-kernel dependency;
-            # opt in to the fused path by exporting KIMI_K3_MOE_BACKEND=AUTO.
-            "KIMI_K3_MOE_BACKEND": env.get("KIMI_K3_MOE_BACKEND", "VANILLA"),
+            # No KIMI_K3_MOE_BACKEND override: KimiK3MoERuntime pins the
+            # routed MoE backend to TRTLLM regardless of moe_config.backend,
+            # so a VANILLA default here would not take effect. Parity holds
+            # because the baseline and spec runs share the same backend.
         }
     )
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kimi_k3_sa_harness.py")
