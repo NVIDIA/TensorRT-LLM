@@ -1,0 +1,227 @@
+# trtllm-test-specialist config file template
+# Parsed by scripts/parse_config.py — values override prompt inputs.
+# Unrecognized keys are warned about and ignored.
+
+# ---------------------------------------------------------------------------
+# Common
+# ---------------------------------------------------------------------------
+
+# [required] Short model name used in reports and file names (e.g. llama_3_1_8b)
+model_name: llama_3_1_8b
+
+# [required] Path to the HuggingFace checkpoint directory, or a HF model ID
+checkpoint_path: /models/Llama-3.1-8B-Instruct
+
+# [optional] Root of the TensorRT-LLM repo. Default: current working directory
+repo_path: /home/user/TensorRT-LLM
+
+# [optional] Path to write the markdown test report.
+#            Default: ./<model_name>-auto-test-report.md
+report_file: results/llama_3_1_8b-report.md
+
+# ---------------------------------------------------------------------------
+# Module test
+# ---------------------------------------------------------------------------
+
+# [required for module test] Exact pytest (or other) command to run verbatim.
+#                            Presence of this field triggers the module-test workflow.
+test_cmd: pytest tests/unittest/_torch/modules/test_attention.py -v
+
+# [optional] Name of the class under test (used in the report only).
+class_name: LlamaAttention
+
+# [optional] Number of GPUs required to run test_cmd. Default: 1
+required_devices: 1
+
+# ---------------------------------------------------------------------------
+# Model test — classification
+# ---------------------------------------------------------------------------
+
+# [optional] Test type: functionality | benchmark | evaluation
+#            Auto-classified from other inputs if not set.
+test_type: benchmark
+
+# ---------------------------------------------------------------------------
+# Model test — parallelism
+# ---------------------------------------------------------------------------
+
+# [optional] Tensor parallelism size. Default: 1
+tp_size: 1
+
+# [optional] Expert parallelism size (MoE models). Default: 0
+ep_size: 0
+
+# [optional] Data parallelism size. Default: 1
+dp_size: 1
+
+# [optional] Pipeline parallelism size. Default: 1
+pp_size: 1
+
+# ---------------------------------------------------------------------------
+# Model test — hardware
+# ---------------------------------------------------------------------------
+
+# [optional] Target GPU device type (e.g. GB200, B200). Used for cluster routing.
+device_type: GB200
+
+# ---------------------------------------------------------------------------
+# Model test — dataset / paths
+# ---------------------------------------------------------------------------
+
+# [optional] Path to evaluation or benchmark dataset file.
+dataset_path: /data/datasets/gsm8k.json
+
+# [optional] Path to an existing perf-sanity benchmark config YAML.
+#            Providing this triggers the multi-node perf-sanity fallback.
+benchmark_config_yaml: examples/disaggregated/slurm/benchmark/config.yaml
+
+# [optional] Path to a YAML file passed via --config to trtllm-bench / trtllm-eval
+#            (extra LLM API options).
+extra_llm_api_options_yaml: /tmp/pytorch_extra.yaml
+
+# ---------------------------------------------------------------------------
+# Model test — trtllm-bench
+# ---------------------------------------------------------------------------
+
+# [optional] trtllm-bench subcommand: throughput | latency. Default: throughput
+bench_subcommand: throughput
+
+# [optional] Backend: pytorch | tensorrt | _autodeploy. Default: pytorch
+backend: pytorch
+
+# [optional] trtllm-bench --workspace: directory for benchmark intermediate files.
+#            Default: /tmp (set by trtllm-bench internally)
+workspace: /tmp/bench_workspace
+
+# [optional] Synthetic dataset size when dataset_path is not provided. Default: 100
+num_requests: 100
+
+# [optional] Mean input token length for synthetic dataset. Default: 128
+input_mean: 128
+
+# [optional] Standard deviation for input token length distribution. Default: 0 (fixed length)
+input_stdev: 0
+
+# [optional] Mean output token length for synthetic dataset. Default: 128
+output_mean: 128
+
+# [optional] Standard deviation for output token length distribution. Default: 0 (fixed length)
+output_stdev: 0
+
+# [optional] Fraction of GPU memory reserved for KV cache after model load.
+#            Maps to --kv_cache_free_gpu_mem_fraction. Default: 0.90
+kv_cache_free_gpu_mem_fraction: 0.90
+
+# [optional] Maximum total sequence length (input + output tokens).
+#            Maps to --max_seq_len. Default: no limit
+max_seq_len: 4096
+
+# [optional] Number of search beams for beam search decoding.
+#            Maps to --beam_width. Default: 1 (greedy)
+beam_width: 1
+
+# [optional] Number of warmup requests to run before measuring.
+#            Maps to --warmup. Default: 2
+warmup: 2
+
+# [optional] --concurrency value for trtllm-bench.
+concurrency: 32
+
+# [optional] Maximum batch size runtime limit.
+max_batch_size: 64
+
+# [optional] Maximum number of tokens runtime limit.
+max_num_tokens: 8192
+
+# [optional] Enable streaming mode (throughput subcommand only). Default: false
+streaming: false
+
+# [optional] Disable chunked prefill context (throughput subcommand only).
+#            Passes --disable_chunked_context. Default: false (chunked is enabled by default)
+no_chunked_context: false
+
+# [optional] KV cache scheduler policy (throughput subcommand only).
+#            Choices: guaranteed_no_evict | max_utilization. Default: guaranteed_no_evict
+scheduler_policy: guaranteed_no_evict
+
+# [optional] Expert cluster parallelism size (MoE models with expert cluster parallelism).
+#            Maps to --cluster_size.
+cluster_size: 4
+
+# [optional] Path to write per-iteration benchmark log.
+#            Maps to --iteration_log.
+iteration_log: /tmp/bench_iteration_log.jsonl
+
+# ---------------------------------------------------------------------------
+# Model test — trtllm-eval
+# ---------------------------------------------------------------------------
+# trtllm-eval <global-options> <task> <task-options>
+# Supported tasks: gsm8k, mmlu, gpqa_diamond, gpqa_main, gpqa_extended,
+#                  cnn_dailymail, mmmu, longbench_v1, longbench_v2, json_mode_eval
+
+# [required for evaluation] Comma-separated evaluation task names.
+eval_tasks: gsm8k,gpqa_diamond
+
+# --- Global options (passed before the task name) ---
+
+# [optional] Tokenizer path or HF name. Only needed when using a TensorRT engine
+#            as the model (--tokenizer). Defaults to the model's own tokenizer.
+eval_tokenizer: /models/Llama-3.1-8B-Instruct
+
+# [optional] Trust remote code for HF models (--trust_remote_code). Default: false
+eval_trust_remote_code: false
+
+# [optional] Disable KV cache block reuse (--disable_kv_cache_reuse). Default: false
+eval_disable_kv_cache_reuse: false
+
+# [optional] Fraction of free GPU memory reserved for KV cache after model weights
+#            are allocated. Maps to --kv_cache_free_gpu_memory_fraction. Default: 0.90
+#            Note: flag name differs from trtllm-bench (memory vs mem).
+eval_kv_cache_free_gpu_memory_fraction: 0.90
+
+# --- Per-task options (common across most tasks) ---
+
+# [optional] Number of samples to evaluate. Default: full dataset (None)
+eval_num_samples: 500
+
+# [optional] Apply the model's chat template to each prompt (--apply_chat_template).
+#            Default: false (true for longbench_v1, longbench_v2, mmmu)
+eval_apply_chat_template: false
+
+# [optional] Chat template kwargs as a JSON string (--chat_template_kwargs).
+#            Used to enable thinking mode, e.g. '{"enable_thinking": true}' for Qwen3.
+eval_chat_template_kwargs: '{"thinking_budget": 0}'
+
+# [optional] System prompt prepended to every request (--system_prompt).
+eval_system_prompt: "You are a helpful assistant."
+
+# [optional] Maximum input prompt length in tokens (--max_input_length).
+#            Prompts exceeding this are truncated. Task-specific defaults vary
+#            (e.g. gsm8k: 4096, mmlu: 4094, cnn_dailymail: 924).
+eval_max_input_length: 4096
+
+# [optional] Maximum output generation length in tokens (--max_output_length).
+#            Task-specific defaults vary (e.g. gsm8k: 256, gpqa: 32768, mmlu: 2).
+eval_max_output_length: 256
+
+# [optional] Log per-sample outputs to stdout for debugging (--log_samples).
+#            Supported by: gsm8k, gpqa_*, mmmu, longbench_v1. Default: false
+eval_log_samples: false
+
+# [optional] Path to save per-sample evaluation results JSON (--output_path).
+#            Supported by: gsm8k, gpqa_*, mmmu, longbench_v1.
+eval_output_path: /tmp/eval_results.json
+
+# --- Task-specific options ---
+
+# [optional] Assert that accuracy meets a minimum threshold (--check_accuracy).
+#            mmlu only. Default: false
+eval_check_accuracy: false
+
+# [optional] Minimum accuracy fraction to pass when eval_check_accuracy is true
+#            (--accuracy_threshold). mmlu only. Default: 30
+eval_accuracy_threshold: 30
+
+# [optional] Number of few-shot examples prepended to each prompt (--num_fewshot).
+#            mmlu only. Default: 5
+eval_num_fewshot: 5
