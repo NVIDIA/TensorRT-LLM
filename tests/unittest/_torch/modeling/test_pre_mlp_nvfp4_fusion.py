@@ -44,17 +44,26 @@ def _mentions_nvfp4_flag(node: ast.AST) -> bool:
     return False
 
 
+def _collect_nvfp4_aliases(node: ast.AST, aliases: set[str]) -> None:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return
+    if isinstance(node, ast.Assign) and _mentions_nvfp4_flag(node.value):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                aliases.add(target.id)
+    elif isinstance(node, ast.AnnAssign) and node.value is not None and _mentions_nvfp4_flag(node.value):
+        target = node.target
+        if isinstance(target, ast.Name):
+            aliases.add(target.id)
+
+    for child in ast.iter_child_nodes(node):
+        _collect_nvfp4_aliases(child, aliases)
+
+
 def _forward_mlp_nvfp4_aliases(function_node: ast.FunctionDef) -> set[str]:
     aliases: set[str] = set()
     for stmt in function_node.body:
-        if isinstance(stmt, ast.Assign) and _mentions_nvfp4_flag(stmt.value):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    aliases.add(target.id)
-        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None and _mentions_nvfp4_flag(stmt.value):
-            target = stmt.target
-            if isinstance(target, ast.Name):
-                aliases.add(target.id)
+        _collect_nvfp4_aliases(stmt, aliases)
     return aliases
 
 
@@ -124,8 +133,8 @@ def test_forward_mlp_has_nvfp4_branch_supports_alias_and_getattr(tmp_path) -> No
                 def forward_mlp(self):
                     if self.fusion_config.PRE_MLP_FUSION:
                         gate_up_proj = self.mlp.gate_up_proj
-                        has_nvfp4 = getattr(gate_up_proj, "has_nvfp4", False)
-                        if has_nvfp4:
+                        use_nvfp4 = getattr(gate_up_proj, "has_nvfp4", False)
+                        if use_nvfp4:
                             act_fp4, act_sf, residual = self.allreduce(
                                 hidden_states,
                                 all_reduce_params=AllReduceParams(
