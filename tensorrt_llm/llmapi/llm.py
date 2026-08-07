@@ -408,6 +408,13 @@ class BaseLLM:
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
 
+            # The worker may have disabled runtime features (e.g. chunked
+            # prefill) by mutating its copy of llm_args during engine
+            # creation. Fetch the effective values back so frontend-side
+            # validation (LLM._check_arguments) reads the same state as the
+            # runtime even under MPI/Ray/RPC execution.
+            self._sync_effective_llm_args()
+
         except Exception:
             # _owns_mpi_session is assigned before this try block, so it is
             # always present here.
@@ -1481,11 +1488,18 @@ class BaseLLM:
             # Check prompt length and query length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
-                max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
-                    raise RequestError(
-                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
-                        f"max_num_tokens ({max_num_tokens})")
+                # Skip the check when block reuse is enabled: the runtime
+                # scheduler subtracts the estimated reusable prefix tokens
+                # from the prompt length, so a cache-hit request can exceed
+                # max_num_tokens in raw length and still be schedulable. The
+                # reusable length is only known at scheduling time, so leave
+                # the capacity decision to the runtime in that case.
+                if not self.args.kv_cache_config.enable_block_reuse:
+                    max_num_tokens = self.args.max_num_tokens
+                    if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                        raise RequestError(
+                            f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                            f"max_num_tokens ({max_num_tokens})")
             return
 
         build_config = self.args.build_config
@@ -1538,6 +1552,30 @@ class BaseLLM:
             raise ValueError(
                 f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
                 f"to be passed explicitly to the `LLM()` constructor.")
+
+    def _sync_effective_llm_args(self) -> None:
+        """Synchronize llm_args fields mutated by the worker back to the frontend.
+
+        ``create_py_executor`` runs inside the worker process and may disable
+        runtime features (e.g. chunked prefill for MLA on unsupported SMs) by
+        mutating its own copy of ``llm_args``. Under MPI/Ray/RPC execution the
+        mutation is not visible to the main process, so fetch the effective
+        values from the executor so that frontend-side validation (see
+        ``_check_arguments``) reads the same state as the runtime.
+        """
+        if self.args.backend != "pytorch":
+            return
+        executor = getattr(self, "_executor", None)
+        get_effective = getattr(executor, "get_effective_llm_args",
+                                None) if executor is not None else None
+        if get_effective is None:
+            return
+        effective = get_effective()
+        if not isinstance(effective, dict):
+            return
+        for field, value in effective.items():
+            if value is not None:
+                setattr(self.args, field, value)
 
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
