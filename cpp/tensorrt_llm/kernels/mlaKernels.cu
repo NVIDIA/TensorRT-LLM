@@ -225,6 +225,12 @@ inline __device__ void dequantCopy(
     }
 }
 
+// `kOutputFp8Q`: when true, write the rotated Q rope segment directly to
+// `quant_q_buf` as FP8 (scaled by `*quant_scale_qkv`) and skip the bf16 STG to
+// `q_ptr`. Companion: `deepseek_v4_q_norm_fused_fp8` pre-fills the nope segment
+// of `quant_q_buf`, so the standalone quantizeCopyInputToFp8Kernel can be
+// dropped. `quant_q_buf`/`quant_scale_qkv`/bmm_scale outputs are unused when
+// `kOutputFp8Q == false`.
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer, bool kOutputFp8Q = false>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
