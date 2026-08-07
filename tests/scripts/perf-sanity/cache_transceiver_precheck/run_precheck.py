@@ -278,28 +278,33 @@ def _pattern_like(shape, dtype, device, seed):
     return rnd.to(dtype).to(device).expand(nb, kv, heads, tok, dim)
 
 
-def _request_block_views(kvm, rid):
-    """Yield (global_layer, buffer, valid_block_indices) for this rank."""
+def _request_block_views(kvm, rid, prompt_len):
+    """Yield the prompt blocks transferred for this request on this rank."""
+    num_prompt_blocks = (prompt_len + kvm.tokens_per_block - 1) // kvm.tokens_per_block
     for global_layer in kvm.pp_layers:
         blocks = kvm.get_batch_cache_indices([rid], layer_idx=global_layer)[0]
-        valid = [b for b in blocks if b >= 0]
+        # V2 may reserve extra KV tokens for speculative decoding. At an exact
+        # block boundary those tokens allocate an additional page, but the
+        # transceiver intentionally trims its slice to prompt_len blocks.
+        # Verify the same payload range instead of the untransferred page.
+        valid = [b for b in blocks if b >= 0][:num_prompt_blocks]
         if not valid:
             continue
         buf = kvm.get_buffers(global_layer, kv_layout="HND")
         yield global_layer, buf, valid
 
 
-def fill_request(kvm, rid):
-    for global_layer, buf, valid in _request_block_views(kvm, rid):
+def fill_request(kvm, rid, prompt_len):
+    for global_layer, buf, valid in _request_block_views(kvm, rid, prompt_len):
         shape = (len(valid), *buf.shape[1:])
         buf[valid] = _pattern_like(shape, buf.dtype, buf.device, seed_for(rid, global_layer))
 
 
-def verify_request(kvm, rid):
+def verify_request(kvm, rid, prompt_len):
     """Returns (ok, detail) comparing received blocks to the expected pattern."""
     import torch
 
-    for global_layer, buf, valid in _request_block_views(kvm, rid):
+    for global_layer, buf, valid in _request_block_views(kvm, rid, prompt_len):
         recv = buf[valid]
         exp = _pattern_like(recv.shape, recv.dtype, recv.device, seed_for(rid, global_layer))
         recv_f, exp_f = recv.float(), exp.float()  # fp8 lacks direct compare ops
@@ -932,7 +937,7 @@ class PrecheckRunner:
                 rid = self._pair_rid(peer_idx, li, rep, pair)
                 req = make_request(True, rid, req_len, self.runtime)
                 add_sequence(self.kvm, req, req_len, self.use_v2)
-                fill_request(self.kvm, rid)
+                fill_request(self.kvm, rid, req_len)
                 tensorrt_llm.logger.info(
                     f"[ctx{self.server_idx} r{self.rank}] rid={rid} len={req_len}: send START"
                 )
@@ -1050,7 +1055,7 @@ class PrecheckRunner:
                 local_err = _TransferError(f"gen DISAGG_TRANS_ERROR on pairs {bad}")
             elif self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
                 for pair, req in reqs.items():
-                    ok, detail = verify_request(self.kvm, req.py_request_id)
+                    ok, detail = verify_request(self.kvm, req.py_request_id, req_len)
                     if not ok:
                         mismatch = f"pair={pair} {detail}"
                         break
