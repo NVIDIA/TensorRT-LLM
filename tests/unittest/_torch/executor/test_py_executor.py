@@ -2139,6 +2139,8 @@ class TestOneModelMTPDraftTokenScheduling:
         model_engine.is_spec_decode is True, so _prepare_and_schedule_batch
         takes the elif draft-token normalization branch. kv_cache_transceiver
         is None to keep the test hermetic (skips the disagg blocks).
+        enable_attention_dp is False so _pad_empty_attention_dp_batch returns
+        immediately instead of padding a batch this test does not exercise.
         """
         ex = object.__new__(PyExecutor)
         ex.drafter = None
@@ -2147,6 +2149,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.kv_cache_transceiver = None
         ex.is_shutdown = False
         ex.enable_iter_perf_stats = False
+        ex.enable_attention_dp = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
 
