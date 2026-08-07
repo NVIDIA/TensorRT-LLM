@@ -845,6 +845,22 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        # Release the C++ MoE workspaces before the pool that backs them is
+        # erased. FusedMoeRunner allocates a workspace under isCapturing
+        # (moeOp.cpp getWorkspaceInfo, the only thop unit that does), so it
+        # comes from this graph's private pool, and caches it in
+        # mStreamWorkspaces keyed by the capture stream. That map hangs off
+        # MoERunner.runner_dict, a class attribute, so it outlives the executor
+        # that captured the graph -- with KV-cache-size estimation on, the
+        # estimation executor is torn down and the next warmup's
+        # clear_all_workspaces() would free the workspace against a pool that
+        # no longer exists, segfaulting in the caching allocator's free_block().
+        #
+        # The deadline is the empty_cache() below, which is where
+        # release_cached_blocks() actually erases the PrivatePool; graph.reset()
+        # only drops its use_count.
+        from ..custom_ops.torch_custom_ops import MoERunner
+        MoERunner.clear_all_workspaces()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
