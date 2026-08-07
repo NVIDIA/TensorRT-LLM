@@ -330,6 +330,10 @@ def parse_visual_gen_params(
         params.width, params.height = request.width, request.height
     elif request.size is not None and request.size != "auto":
         params.width, params.height = map(int, request.size.split("x"))
+    elif isinstance(request, ImageEditRequest):
+        if request.width is None and request.height is None and request.size in (None, "auto"):
+            params.width = None
+            params.height = None
 
     # Universal per-request overlays — each guard is the "do not
     # override with None" rule in action.
