@@ -585,15 +585,24 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         if hasattr(model_config.pretrained_config, 'num_experts'):
             model_config.pretrained_config.num_local_experts = model_config.pretrained_config.num_experts
             model_config.pretrained_config.num_experts_per_tok = model_config.pretrained_config.experts_per_token
+            # transformers 5.10+ consolidated RoPE attrs into rope_parameters dict;
+            # fall back to it when the old direct attributes are absent.
+            _rp = getattr(model_config.pretrained_config, 'rope_parameters',
+                          None) or {}
             model_config.pretrained_config.rope_scaling = {
                 'factor':
-                model_config.pretrained_config.rope_scaling_factor,
+                getattr(model_config.pretrained_config, 'rope_scaling_factor',
+                        _rp.get('factor')),
                 'beta_fast':
-                model_config.pretrained_config.rope_ntk_beta,
+                getattr(model_config.pretrained_config, 'rope_ntk_beta',
+                        _rp.get('beta_fast')),
                 'beta_slow':
-                model_config.pretrained_config.rope_ntk_alpha,
+                getattr(model_config.pretrained_config, 'rope_ntk_alpha',
+                        _rp.get('beta_slow')),
                 'original_max_position_embeddings':
-                model_config.pretrained_config.initial_context_length,
+                getattr(model_config.pretrained_config,
+                        'initial_context_length',
+                        _rp.get('original_max_position_embeddings')),
             }
         if model_config.pretrained_config.torch_dtype is None:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
