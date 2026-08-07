@@ -31,7 +31,7 @@ Three choices shape what such an evaluation can conclude.
 
 **A trace records structure, not content.** Token counts, prefix identity, tool-call durations, and branch boundaries are enough, because content does not affect serving performance — and a content-free trace can be published, replayed against a different model, and scaled to any concurrency without re-instantiating sandboxes, browsers, or search services. Tool calls replay as timed sleeps of their recorded duration, reproducing request-readiness gaps. **Crucially, the execution graph is recorded too**, so fan-out and its join points replay concurrently instead of being flattened into a sequential chain. That is not a fidelity detail — it changes the answer: a fan-out workload wants a batch size two to four times the session concurrency, a single-branch workload wants it near the session count.
 
-**Coverage must go beyond coding agents.** Coding agents are the highest-volume agentic workload and the easiest to collect, but they are also the most cacheable point in the space — one monotonically growing prefix per session — so calibrating on that shape alone is misleading. We traced four architectures with deliberately different execution patterns, and Table 1 shows how far apart they land: median ISL differs by roughly 8×, median OSL by more than 15×, and the optimal cache hit rate spans 96.5% down to 24.4%. Conclusions do not transfer between them — KV-cache-aware routing lifts the frontier substantially on the coding trace and does nothing for deep research.
+**Coverage has to span diverse agentic scenarios.** Agent workflows differ far more from one another than chat requests do: a single ReAct thread over a monotonically growing context, a supervisor fanning out to independent subagents, a researcher rewriting its own context to stay bounded, and a tree search expanding and pruning branches produce entirely different request shapes, prefix-reuse patterns, and in-flight profiles. Table 1 shows how far apart they land — median ISL differs by roughly 8×, median OSL by more than 15×, and the optimal cache hit rate spans 96.5% down to 24.4%. Conclusions therefore do not transfer across scenarios: KV-cache-aware routing lifts the frontier substantially on the coding trace and does nothing for deep research. Any evaluation calibrated on a single workflow shape will generalize poorly, so we traced several deliberately different ones.
 
 ### Job-Level Metrics
 
@@ -44,25 +44,13 @@ The two axes are:
 
 Because a single agent job runs for minutes, both are measured over a steady-state window: the shared system prompt is preloaded so it is a cache hit from the first call, session starts are staggered with a jittered ramp-up so identical copies do not stay phase-aligned, and a job is credited only if it completes inside the window.
 
-## Trace Format
+## Trace Format and Dataset
 
 Each agent run produces one compact JSON file holding an ordered `events` list. Because token content does not affect serving performance, a trace records only structure and sizes, never the underlying text.
 
 Every event is one of three kinds: a **`message`** (one conversation turn, with role, conversation membership, token counts, and — for assistant turns — prompt/completion/reasoning token splits and issued tool calls), a **`tool_call`** (tool name plus measured `duration_ms`), or a **`parallel_start`/`parallel_end`** boundary marking fan-out and synchronization of concurrent branches. A `system_prompt_id` marks which messages share a cacheable prefix, so replay reproduces prefix-cache behavior faithfully.
 
-## Implementation
-
-Tracing attaches to an existing Scaffolding agent through two decorators, with no change to the agent's own logic; the example agents already wire this up behind a flag, so collecting a trace is one CLI switch. Replay then follows a few fixed rules: each call keeps its recorded ISL/OSL but is filled with random token IDs; all replay copies share the same synthetic system-prompt prefix, so prefix caching is exercised rather than bypassed; tool calls become timed sleeps of the recorded duration; and concurrency is created by replaying many copies of the same trace at once. Internally, the `ReplayEngine` runs one queue per branch path so parallel sections and join points run concurrently rather than serialized.
-
-A bundled example trace replays against any running `trtllm-serve` endpoint; the runnable scripts and their usage live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
-
-The framework also includes an offline analyzer that needs no GPU: it walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**, which we compare against engine-measured hit rates below.
-
-## Trace Dataset and Setup
-
-We collect 730 traces from four Scaffolding agents chosen to cover distinct execution patterns: **Coder**, a single-thread ReAct loop over filesystem/shell tools (500 SWE-bench Verified tasks); **Open Deep Research**, a supervisor that fans out to parallel researcher subagents (100 Deep Research Bench tasks); **IterResearch**, an iterative researcher that keeps its context bounded through compaction (100 Deep Research Bench tasks); and **Tree-of-Thought Research**, a tree-structured reasoner that expands, scores, and prunes parallel branches (30 AIME 2026 problems). For replay we serve Qwen3-235B-A22B-Instruct-2507 through TensorRT-LLM on a single GB200 node (4 GPUs).
-
-The agents occupy clearly different regions of the workload space:
+We collect 730 traces from four Scaffolding agents chosen to cover distinct execution patterns: **Coder**, a single-thread ReAct loop over filesystem/shell tools (500 SWE-bench Verified tasks); **Open Deep Research**, a supervisor that fans out to parallel researcher subagents (100 Deep Research Bench tasks); **IterResearch**, an iterative researcher that keeps its context bounded through compaction (100 Deep Research Bench tasks); and **Tree-of-Thought Research**, a tree-structured reasoner that expands, scores, and prunes parallel branches (30 AIME 2026 problems). They occupy clearly different regions of the workload space:
 
 | | **Coder** | **Open Deep Research** | **IterResearch** | **Tree-of-Thought** |
 |---|---|---|---|---|
@@ -74,9 +62,17 @@ The agents occupy clearly different regions of the workload space:
 
 Coder is input-heavy and decode-light, and caches almost perfectly (96.5%): one shared prefix grows monotonically, so each turn re-reads what previous turns already cached. The research agents invert the shape — moderate inputs, long reasoning-heavy outputs — and cache far worse, because subagent fan-out, context rewriting, and branch exploration repeatedly introduce fresh context. The rest of this blog follows two representative traces at opposite ends of this space: a **Coder** trace (single ReAct thread, 23 requests, only ~3% fresh tokens per prompt) and an **Open Deep Research** trace (supervisor plus four parallel researcher branches, generation-bound, mostly fresh context).
 
+## Implementation
+
+Tracing attaches to an existing Scaffolding agent through two decorators, with no change to the agent's own logic; the example agents already wire this up behind a flag, so collecting a trace is one CLI switch. Replay then follows a few fixed rules: each call keeps its recorded ISL/OSL but is filled with random token IDs; all replay copies share the same synthetic system-prompt prefix, so prefix caching is exercised rather than bypassed; tool calls become timed sleeps of the recorded duration; and concurrency is created by replaying many copies of the same trace at once. Internally, the `ReplayEngine` runs one queue per branch path so parallel sections and join points run concurrently rather than serialized.
+
+A bundled example trace replays against any running `trtllm-serve` endpoint; the runnable scripts and their usage live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
+
+The framework also includes an offline analyzer that needs no GPU: it walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**, which we compare against engine-measured hit rates below.
+
 ## Experimental Findings
 
-We replay the two representative traces while varying the server maximum batch size **B** and the user concurrency **C** (the number of agent sessions replayed at once).
+We serve Qwen3-235B-A22B-Instruct-2507 through TensorRT-LLM on a single GB200 node (4 GPUs), and replay the two representative traces while varying the server maximum batch size **B** and the user concurrency **C** (the number of agent sessions replayed at once).
 
 ### Token-Level and Job-Level Metrics Can Disagree
 
