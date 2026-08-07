@@ -256,21 +256,13 @@ def test_indexer_configures_one_top_k_module():
     assert not hasattr(indexer, "decode_top_k")
 
 
-def test_indexer_prepare_keeps_metadata_and_top_k_preparation_together():
-    top_k = Mock()
-    indexer = SimpleNamespace(top_k=top_k)
+def test_indexer_prepare_updates_metadata_without_layer_state():
     metadata = SimpleNamespace(
-        indexer=indexer,
         num_contexts=0,
         num_generations=0,
         num_ctx_tokens=0,
         seq_lens=torch.empty(0, dtype=torch.int32),
         compress_ratios=[1],
-        kv_lens_cuda=torch.empty(0),
-        get_indexer_max_seq_len=Mock(return_value=4096),
-        max_draft_tokens=3,
-        num_sms=148,
-        max_num_sequences=32,
     )
     indexer_params = SimpleNamespace(new_kv_tokens=torch.empty(0, dtype=torch.int32))
 
@@ -281,14 +273,6 @@ def test_indexer_prepare_keeps_metadata_and_top_k_preparation_together():
         Indexer.prepare(metadata)
 
     prepare_metadata.assert_called_once_with(metadata, indexer_params)
-    top_k.prepare.assert_called_once_with(
-        device=metadata.kv_lens_cuda.device,
-        max_num_columns=4096,
-        next_n=4,
-        input_dtype=torch.float32,
-        num_sms=148,
-        max_num_requests=32,
-    )
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):

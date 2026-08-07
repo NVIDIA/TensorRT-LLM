@@ -3230,29 +3230,7 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
-        if hasattr(self.attn_metadata, "indexer"):
-            indexers = {}
-            for module in self.model.modules():
-                indexer = getattr(module, "indexer", None)
-                if indexer is not None and hasattr(indexer, "top_k"):
-                    indexers[id(indexer)] = indexer
-            self._top_k_indexers = tuple(indexers.values())
-            self.attn_metadata.indexer = (self._top_k_indexers[0]
-                                          if self._top_k_indexers else None)
         return self.attn_metadata
-
-    def _prepare_sparse_top_k_modules(self,
-                                      attn_metadata: AttentionMetadata) -> None:
-        """Prepare layer-local Top-K state before model forward."""
-        for indexer in getattr(self, "_top_k_indexers", ()):
-            indexer.top_k.prepare(
-                device=attn_metadata.kv_lens_cuda.device,
-                max_num_columns=attn_metadata.get_indexer_max_seq_len(),
-                next_n=1 + attn_metadata.max_draft_tokens,
-                input_dtype=torch.float32,
-                num_sms=attn_metadata.num_sms,
-                max_num_requests=attn_metadata.max_num_sequences,
-            )
 
     @property
     def is_multimodal(self) -> bool:
@@ -7522,9 +7500,6 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_resource_manager = None
             spec_metadata = None
-
-        if kv_cache_manager is not None:
-            self._prepare_sparse_top_k_modules(attn_metadata)
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)

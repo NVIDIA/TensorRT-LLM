@@ -1146,16 +1146,6 @@ class Indexer(nn.Module):
             # This is a preprocessing step that computes scheduling information for the kernel
             Indexer.prepare_scheduler_metadata(metadata)
 
-        if metadata.indexer is not None:
-            metadata.indexer.top_k.prepare(
-                device=metadata.kv_lens_cuda.device,
-                max_num_columns=metadata.get_indexer_max_seq_len(),
-                next_n=1 + metadata.max_draft_tokens,
-                input_dtype=torch.float32,
-                num_sms=metadata.num_sms,
-                max_num_requests=metadata.max_num_sequences,
-            )
-
     def _update_k_cache(
         self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: DSAtrtllmAttentionMetadata
     ) -> None:

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from functools import cache
 
 import torch
 import torch.nn as nn
@@ -25,59 +24,6 @@ _GVR_IMPLEMENTATIONS = {
     TopKImplementation.CUDA_GVR,
     TopKImplementation.CUTE_DSL_GVR,
 }
-_GVR_WARMUP_COLUMNS = 4096
-_RADIX_MAX_BLOCKS_PER_ROW = 10
-
-
-@cache
-def _warmup_decode_top_k(
-    implementation: TopKImplementation,
-    device: torch.device,
-    input_dtype: torch.dtype,
-    top_k: int,
-    max_num_columns: int,
-    next_n: int,
-    num_sms: int | None,
-    compress_ratio: int,
-) -> None:
-    if implementation == TopKImplementation.CUDA_GVR:
-        num_columns = max(_GVR_WARMUP_COLUMNS, top_k)
-        scores = torch.zeros((1, num_columns), dtype=input_dtype, device=device)
-        sequence_lengths = torch.tensor([num_columns], dtype=torch.int32, device=device)
-        output_indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
-        prior_indices = torch.zeros((1, top_k), dtype=torch.int32, device=device)
-        heuristic_values = torch.empty((1, top_k), dtype=input_dtype, device=device)
-        radix_indices = torch.empty(
-            (1, _RADIX_MAX_BLOCKS_PER_ROW, top_k), dtype=torch.int32, device=device
-        )
-        radix_values = torch.empty(
-            (1, _RADIX_MAX_BLOCKS_PER_ROW, top_k), dtype=torch.float32, device=device
-        )
-        torch.ops.trtllm.indexer_topk_decode(
-            scores,
-            sequence_lengths,
-            output_indices,
-            1,
-            top_k,
-            pre_idx=prior_indices,
-            heuristic_scratch=heuristic_values,
-            radix_aux_indices=radix_indices,
-            radix_aux_logits=radix_values,
-        )
-    elif implementation == TopKImplementation.CUTE_DSL_RADIX and not (
-        compress_ratio > 1 and next_n > 1
-    ):
-        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-            warmup_cute_dsl_radix_topk_decode,
-        )
-
-        warmup_cute_dsl_radix_topk_decode(
-            top_k=top_k,
-            num_cols=max_num_columns,
-            next_n=next_n,
-            dtype=input_dtype,
-            num_sms=num_sms,
-        )
 
 
 class TopK(nn.Module):
@@ -100,52 +46,22 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
-        self.register_buffer("_gvr_prior_indices", None, persistent=False)
-        self.register_buffer("_cuda_gvr_scratch", None, persistent=False)
-        self.register_buffer("_gvr_row_order", None, persistent=False)
-        self._num_sms: int | None = None
-
-    def prepare(
-        self,
-        *,
-        device: torch.device,
-        max_num_columns: int,
-        next_n: int,
-        input_dtype: torch.dtype,
-        max_num_requests: int,
-        num_sms: int | None = None,
-    ) -> None:
-        """Allocate GVR state and warm up the configured decode implementation."""
-        implementation = self.decode_implementation
-        if implementation in _GVR_IMPLEMENTATIONS:
-            if self._gvr_prior_indices is None:
-                self._gvr_prior_indices = torch.zeros(
-                    (max_num_requests, self.top_k), dtype=torch.int32, device=device
-                )
-
-            if implementation == TopKImplementation.CUDA_GVR:
-                scratch_shape = (max_num_requests * next_n, self.top_k)
-                if self._cuda_gvr_scratch is None or self._cuda_gvr_scratch.shape != scratch_shape:
-                    self._cuda_gvr_scratch = torch.empty(
-                        scratch_shape, dtype=input_dtype, device=device
-                    )
-            else:
-                self._num_sms = num_sms
-                if self._gvr_row_order is None:
-                    self._gvr_row_order = torch.empty(
-                        (max_num_requests,), dtype=torch.int32, device=device
-                    )
-
-        _warmup_decode_top_k(
-            implementation,
-            device,
-            input_dtype,
-            self.top_k,
-            max_num_columns,
-            next_n,
-            num_sms,
-            self.compress_ratio,
+        self.register_buffer(
+            "_gvr_prior_indices",
+            torch.empty((0, top_k), dtype=torch.int32),
+            persistent=False,
         )
+        self.register_buffer(
+            "_cuda_gvr_scratch",
+            torch.empty((0, top_k)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_gvr_row_order",
+            torch.empty((0,), dtype=torch.int32),
+            persistent=False,
+        )
+        self._num_sms = 0
 
     def forward(
         self,
@@ -185,10 +101,19 @@ class TopK(nn.Module):
         request_offset: int = 0,
     ) -> None:
         """Seed GVR from the last selected row of each prefill request."""
-        if self._gvr_prior_indices is None:
+        if self.decode_implementation not in _GVR_IMPLEMENTATIONS:
             return
         last_rows = (torch.cumsum(request_lengths, dim=0) - 1).to(dtype=torch.long)
         num_requests = request_lengths.shape[0]
+        required_rows = request_offset + num_requests
+        if (
+            self._gvr_prior_indices.device != output_indices.device
+            or self._gvr_prior_indices.shape[0] < required_rows
+        ):
+            prior_indices = output_indices.new_zeros((required_rows, self.top_k), dtype=torch.int32)
+            if self._gvr_prior_indices.device == output_indices.device:
+                prior_indices[: self._gvr_prior_indices.shape[0]].copy_(self._gvr_prior_indices)
+            self._gvr_prior_indices = prior_indices
         self._gvr_prior_indices[request_offset : request_offset + num_requests].copy_(
             output_indices[last_rows]
         )
@@ -234,6 +159,9 @@ class TopK(nn.Module):
         if implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
 
+        if implementation in _GVR_IMPLEMENTATIONS:
+            self._ensure_gvr_state(scores, sequence_lengths, next_n, radix_indices)
+
         use_cuda = implementation in (
             TopKImplementation.CUDA_RADIX,
             TopKImplementation.CUDA_GVR,
@@ -246,8 +174,6 @@ class TopK(nn.Module):
             prior_indices = None
             heuristic_values = None
             if implementation == TopKImplementation.CUDA_GVR:
-                assert self._gvr_prior_indices is not None
-                assert self._cuda_gvr_scratch is not None
                 prior_indices = self._gvr_prior_indices[: sequence_lengths.shape[0]]
                 heuristic_values = self._cuda_gvr_scratch[: scores.shape[0]]
             torch.ops.trtllm.indexer_topk_decode(
@@ -276,7 +202,6 @@ class TopK(nn.Module):
             )
             return output_indices
 
-        assert self._gvr_prior_indices is not None
         prior_indices = self._gvr_prior_indices[: sequence_lengths.shape[0]]
         torch.ops.trtllm.cute_dsl_gvr_topk_decode(
             scores,
@@ -292,12 +217,51 @@ class TopK(nn.Module):
         prior_indices.copy_(output_indices[next_n - 1 :: next_n])
         return output_indices
 
+    def _ensure_gvr_state(
+        self,
+        scores: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        next_n: int,
+        radix_indices: torch.Tensor | None,
+    ) -> None:
+        row_capacity = radix_indices.shape[0] if radix_indices is not None else scores.shape[0]
+        request_capacity = max(sequence_lengths.shape[0], row_capacity // next_n)
+
+        if (
+            self._gvr_prior_indices.device != scores.device
+            or self._gvr_prior_indices.shape[0] < request_capacity
+        ):
+            prior_indices = scores.new_zeros((request_capacity, self.top_k), dtype=torch.int32)
+            if self._gvr_prior_indices.device == scores.device:
+                prior_indices[: self._gvr_prior_indices.shape[0]].copy_(self._gvr_prior_indices)
+            self._gvr_prior_indices = prior_indices
+
+        if self.decode_implementation == TopKImplementation.CUDA_GVR:
+            if (
+                self._cuda_gvr_scratch.device != scores.device
+                or self._cuda_gvr_scratch.dtype != scores.dtype
+                or self._cuda_gvr_scratch.shape[0] < row_capacity
+            ):
+                self._cuda_gvr_scratch = scores.new_empty((row_capacity, self.top_k))
+            return
+
+        if (
+            self._gvr_row_order.device != scores.device
+            or self._gvr_row_order.shape[0] < request_capacity
+        ):
+            self._gvr_row_order = scores.new_empty((request_capacity,), dtype=torch.int32)
+        if self._num_sms == 0:
+            self._num_sms = (
+                torch.cuda.get_device_properties(scores.device).multi_processor_count
+                if scores.is_cuda
+                else 1
+            )
+
     def _prepare_row_order(
         self,
         sequence_lengths: torch.Tensor,
         next_n: int,
     ) -> torch.Tensor | None:
-        assert self._num_sms is not None and self._gvr_row_order is not None
         num_requests = sequence_lengths.shape[0]
         if num_requests * next_n < 2 * self._num_sms:
             return None

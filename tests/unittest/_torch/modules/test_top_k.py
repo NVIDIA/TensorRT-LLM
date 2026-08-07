@@ -4,10 +4,8 @@
 
 from unittest.mock import Mock
 
-import pytest
 import torch
 
-from tensorrt_llm._torch.modules import top_k as top_k_module
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 
 
@@ -160,17 +158,6 @@ def test_gvr_owns_prior_state_and_updates_it(monkeypatch) -> None:
     logical_lengths = torch.tensor([32], dtype=torch.int32)
     scan_lengths = torch.tensor([8], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
-    prior = torch.zeros(1, 2, dtype=torch.int32)
-    top_k.prepare(
-        device=torch.device("cpu"),
-        max_num_columns=8,
-        next_n=1,
-        input_dtype=torch.float32,
-        num_sms=16,
-        max_num_requests=1,
-    )
-    assert top_k._gvr_prior_indices is not None
-    top_k._gvr_prior_indices.copy_(prior)
     gvr.side_effect = lambda *args, **kwargs: output.copy_(torch.tensor([[5, 3]]))
 
     top_k(
@@ -201,17 +188,8 @@ def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
     gvr = Mock(side_effect=lambda *args, **kwargs: args[3].zero_())
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
-    num_sms = 4
     next_n = 2
     lengths = torch.tensor([4, 1, 8, 2], dtype=torch.int32)
-    top_k.prepare(
-        device=torch.device("cpu"),
-        max_num_columns=8,
-        next_n=next_n,
-        input_dtype=torch.float32,
-        num_sms=num_sms,
-        max_num_requests=lengths.shape[0],
-    )
 
     top_k(
         torch.randn(lengths.shape[0] * next_n, 8),
@@ -229,14 +207,6 @@ def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
 
 def test_seed_from_prefill_uses_last_request_rows() -> None:
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
-    top_k.prepare(
-        device=torch.device("cpu"),
-        max_num_columns=8,
-        next_n=1,
-        input_dtype=torch.float32,
-        num_sms=4,
-        max_num_requests=4,
-    )
     prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
 
     top_k.seed_from_prefill(
@@ -245,8 +215,19 @@ def test_seed_from_prefill_uses_last_request_rows() -> None:
         request_offset=1,
     )
 
-    assert top_k._gvr_prior_indices is not None
-    assert top_k._gvr_prior_indices.tolist() == [[0, 0], [2, 3], [4, 5], [0, 0]]
+    assert top_k._gvr_prior_indices.tolist() == [[0, 0], [2, 3], [4, 5]]
+
+
+def test_gvr_state_buffers_are_registered_during_init() -> None:
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
+
+    buffers = dict(top_k.named_buffers())
+    assert set(buffers) == {
+        "_gvr_prior_indices",
+        "_cuda_gvr_scratch",
+        "_gvr_row_order",
+    }
+    assert all(buffer.numel() == 0 for buffer in buffers.values())
 
 
 def test_implementations_are_named_by_backend_and_algorithm() -> None:
@@ -267,22 +248,15 @@ def test_none_implementations_use_cuda_radix_defaults() -> None:
 
 
 def test_cuda_gvr_owns_scratch_and_updates_prior(monkeypatch) -> None:
-    top_k_module._warmup_decode_top_k.cache_clear()
     decode = Mock(side_effect=lambda *args, **kwargs: args[2].copy_(torch.tensor([[3, 1]])))
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
 
     top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
-    top_k.prepare(
-        device=torch.device("cpu"),
-        max_num_columns=8,
-        next_n=1,
-        input_dtype=torch.float32,
-        max_num_requests=2,
-        num_sms=4,
-    )
     scores = torch.randn(1, 8)
     lengths = torch.tensor([8], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
+    radix_indices = torch.empty(2, 10, 2, dtype=torch.int32)
+    radix_values = torch.empty(2, 10, 2)
 
     top_k(
         scores,
@@ -290,49 +264,11 @@ def test_cuda_gvr_owns_scratch_and_updates_prior(monkeypatch) -> None:
         is_prefill=False,
         sequence_lengths=lengths,
         scan_lengths=lengths,
+        radix_indices=radix_indices,
+        radix_values=radix_values,
     )
 
     runtime_call = decode.call_args_list[-1]
     assert runtime_call.kwargs["pre_idx"].data_ptr() == top_k._gvr_prior_indices.data_ptr()
     assert runtime_call.kwargs["heuristic_scratch"].data_ptr() == top_k._cuda_gvr_scratch.data_ptr()
     assert top_k._gvr_prior_indices.tolist() == [[3, 1], [0, 0]]
-
-
-def test_prepare_deduplicates_warmup(monkeypatch) -> None:
-    top_k_module._warmup_decode_top_k.cache_clear()
-    decode = Mock()
-    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
-
-    prepare_args = dict(
-        device=torch.device("cpu"),
-        max_num_columns=4096,
-        next_n=1,
-        input_dtype=torch.float32,
-        max_num_requests=2,
-        num_sms=148,
-    )
-    TopK(32, decode_implementation=TopKImplementation.CUDA_GVR).prepare(**prepare_args)
-    TopK(32, decode_implementation=TopKImplementation.CUDA_GVR).prepare(**prepare_args)
-
-    decode.assert_called_once()
-
-
-def test_prepare_does_not_cache_failure(monkeypatch) -> None:
-    top_k_module._warmup_decode_top_k.cache_clear()
-    decode = Mock(side_effect=RuntimeError("warmup failed"))
-    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
-    top_k = TopK(16, decode_implementation=TopKImplementation.CUDA_GVR)
-    prepare_args = dict(
-        device=torch.device("cpu"),
-        max_num_columns=1024,
-        next_n=1,
-        input_dtype=torch.float32,
-        max_num_requests=1,
-    )
-
-    with pytest.raises(RuntimeError, match="warmup failed"):
-        top_k.prepare(**prepare_args)
-
-    decode.side_effect = None
-    top_k.prepare(**prepare_args)
-    assert decode.call_count == 2
