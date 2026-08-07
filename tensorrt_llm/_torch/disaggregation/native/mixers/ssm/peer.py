@@ -372,22 +372,21 @@ class MambaPolicy:
         """
         self_mlg = MambaPolicy._find_mamba_layer_group(self_page_table)
         peer_mlg = MambaPolicy._find_mamba_layer_group(peer_page_table)
-        if self_mlg is None and peer_mlg is None:
+        if self_mlg is None or peer_mlg is None:
+            # Under pipeline parallelism each rank publishes only its own
+            # stage's layers, so a hybrid model can pair a rank holding
+            # recurrent layers with a peer stage holding none. The transfer
+            # path (build_mamba_frags) intersects the two layer sets and
+            # moves nothing when either side has no recurrent layers, so
+            # there is nothing to validate for this pair.
             return
-        if (self_mlg is None) != (peer_mlg is None):
-            raise ValueError(
-                "MambaPolicy.validate_peer_compatible: one side has "
-                f"recurrent-state pools and the other does not (local={self_mlg is not None}, "
-                f"peer={peer_mlg is not None})"
-            )
 
-        if set(self_mlg.mamba_layer_offsets.keys()) != set(peer_mlg.mamba_layer_offsets.keys()):
-            raise ValueError(
-                "MambaPolicy.validate_peer_compatible: mamba layer sets differ "
-                f"(local={sorted(self_mlg.mamba_layer_offsets)}, "
-                f"peer={sorted(peer_mlg.mamba_layer_offsets)})"
-            )
-
+        # Layer sets are NOT required to match: with pipeline parallelism the
+        # two sides may partition layers differently, and the transfer covers
+        # exactly the intersection (empty intersection moves no state). The
+        # invariants below are per-layer-slot quantities, uniform across a
+        # model's recurrent layers, so they apply regardless of which layers
+        # overlap.
         if (
             self_mlg.ssm_bytes_per_head is not None
             and peer_mlg.ssm_bytes_per_head is not None

@@ -298,13 +298,15 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
         gen_mgr.shutdown()
 
 
-def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int):
+def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_ids=None):
     """MambaLayerGroup-only page table with fake addresses (no CUDA needed)."""
     from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, PhysicalPool
 
+    if layer_ids is None:
+        layer_ids = range(1, NUM_KDA_LAYERS + 1)
     mlg = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets={glid: i for i, glid in enumerate(range(1, NUM_KDA_LAYERS + 1))},
+        mamba_layer_offsets={glid: i for i, glid in enumerate(layer_ids)},
         conv_states=PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8),
         ssm_states=PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8),
         conv_section_bytes=[conv_slot_bytes // 3] * 3,
@@ -378,6 +380,44 @@ def test_kda_peer_validation_synthetic_cpu(ctx, gen, ok):
     else:
         with pytest.raises(ValueError, match="TP-aggregated"):
             MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+
+
+def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
+    """Peer validation must not require identical layer sets.
+
+    Under pipeline parallelism each rank publishes only its own stage's
+    layers, and the transfer path takes the intersection of the two layer
+    sets. Peers with partially overlapping, disjoint, or one-sided
+    recurrent-layer sets are all legitimate stage pairings and must pass
+    validation as long as the per-slot size invariants hold.
+    """
+    full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
+    full_conv = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_W * CONV_DTYPE.itemsize
+    ctx_ri = _synthetic_rank_info(2, False)
+    gen_ri = _synthetic_rank_info(2, False)
+
+    # Partially overlapping stages (ctx PP split differs from gen's).
+    ctx_pt = _synthetic_kda_page_table(full_ssm, full_conv, layer_ids=[1, 2, 3])
+    gen_pt = _synthetic_kda_page_table(full_ssm, full_conv, layer_ids=[3, 4, 5])
+    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+
+    # Disjoint stages: this pair simply moves no recurrent state.
+    gen_pt = _synthetic_kda_page_table(full_ssm, full_conv, layer_ids=[7, 8])
+    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+
+    # One side holds a recurrent-layer-free stage of the hybrid model
+    # (no MambaLayerGroup at all): nothing to validate.
+    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+
+    empty_pt = KVCachePageTable(tokens_per_block=8, layer_groups=[], pool_groups=[])
+    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, empty_pt)
+    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, empty_pt, gen_pt)
+
+    # Size invariants still apply on the overlap: mismatched global state
+    # sizes are rejected even when the layer sets differ.
+    bad_gen_pt = _synthetic_kda_page_table(full_ssm // 2, full_conv // 2, layer_ids=[3, 4, 5])
+    with pytest.raises(ValueError, match="TP-aggregated"):
+        MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, bad_gen_pt)
 
 
 # ---------------------------------------------------------------------------
