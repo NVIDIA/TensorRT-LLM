@@ -82,6 +82,10 @@ methods:
         default: null
         status: prototype
       # Runtime behavior
+      generation_config:
+        annotation: Literal['auto', 'trtllm']
+        default: trtllm
+        status: prototype
       garbage_collection_gen0_threshold:
         annotation: int
         default: 20000
