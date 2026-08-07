@@ -125,7 +125,10 @@ class GroupedGemmInputsHelper:
         else:
             num_tokens_on_curr_rank = math.ceil(average_num_tokens_per_rank)
 
-        num_tokens_on_curr_rank = min(num_tokens * self.top_k,
+        # A token can select each local expert at most once.
+        max_num_tokens_on_curr_rank = num_tokens * min(self.top_k,
+                                                       self.num_local_experts)
+        num_tokens_on_curr_rank = min(max_num_tokens_on_curr_rank,
                                       num_tokens_on_curr_rank)
 
         base, remainder = divmod(num_tokens_on_curr_rank,
@@ -139,43 +142,91 @@ class GroupedGemmInputsHelper:
     def generate_token_selected_experts(
             self, num_tokens: int,
             num_tokens_per_expert: List[int]) -> torch.Tensor:
-        """Balanced random based on rejection sampling.
-        """
-        token_selected_experts = -torch.ones(
-            num_tokens, self.top_k, dtype=torch.int32)
-        num_selected_experts = torch.zeros(num_tokens, dtype=torch.int32)
+        """Generate a random rank-local routing assignment."""
+        if len(num_tokens_per_expert) != self.num_local_experts:
+            raise ValueError(
+                f"Expected {self.num_local_experts} token counts, got "
+                f"{len(num_tokens_per_expert)}")
+        if any(num_tokens_j < 0 or num_tokens_j > num_tokens
+               for num_tokens_j in num_tokens_per_expert):
+            raise ValueError("Each expert token count must be between zero and "
+                             f"num_tokens ({num_tokens})")
 
-        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-            torch.manual_seed(self.seed)
-            selection_orders = [
-                torch.randperm(num_tokens)
-                for _ in range(self.num_local_experts)
-            ]
+        num_assignments = sum(num_tokens_per_expert)
+        max_num_assignments = num_tokens * min(self.top_k,
+                                               self.num_local_experts)
+        if num_assignments > max_num_assignments:
+            raise ValueError(
+                f"Requested {num_assignments} token-expert assignments, "
+                f"but rank-local capacity is {max_num_assignments}")
 
-        for j, num_tokens_j in enumerate(num_tokens_per_expert):
-            selection_order_j = selection_orders[j].tolist()
-            prioritized = torch.nonzero(num_selected_experts <= (
-                self.top_k - (self.num_experts - j))).squeeze(-1).tolist()
-            if len(prioritized) > 0:
-                selection_order_j = prioritized + [
-                    i for i in selection_order_j if i not in prioritized
-                ]
-            for i in selection_order_j:
-                if num_selected_experts[i] < self.top_k:
-                    token_selected_experts[
-                        i,
-                        num_selected_experts[i]] = j + self.local_expert_offset
-                    num_selected_experts[i] += 1
-                    num_tokens_j -= 1
-                    if num_tokens_j <= 0:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.seed)
+        experts_per_token = [[] for _ in range(num_tokens)]
+        for local_expert_idx, num_tokens_j in enumerate(num_tokens_per_expert):
+            if num_tokens_j == 0:
+                continue
+            selected_tokens = torch.randperm(
+                num_tokens, generator=generator,
+                device="cpu")[:num_tokens_j].tolist()
+            for token_idx in selected_tokens:
+                experts_per_token[token_idx].append(local_expert_idx)
+
+        # Independent expert sampling preserves realistic per-token occupancy.
+        # Move overflow edges to underloaded tokens without changing the
+        # requested per-expert histogram.
+        repair_order = torch.randperm(num_tokens,
+                                      generator=generator,
+                                      device="cpu").tolist()
+        overloaded_tokens = [
+            token_idx for token_idx in repair_order
+            if len(experts_per_token[token_idx]) > self.top_k
+        ]
+        underloaded_tokens = [
+            token_idx for token_idx in repair_order
+            if len(experts_per_token[token_idx]) < self.top_k
+        ]
+        next_underloaded = 0
+        for overloaded_token in overloaded_tokens:
+            source_experts = experts_per_token[overloaded_token]
+            while len(source_experts) > self.top_k:
+                while (next_underloaded < len(underloaded_tokens) and len(
+                        experts_per_token[underloaded_tokens[next_underloaded]])
+                       == self.top_k):
+                    next_underloaded += 1
+                if next_underloaded == len(underloaded_tokens):
+                    raise RuntimeError(
+                        "Unable to repair a valid rank-local routing assignment"
+                    )
+
+                target_experts = experts_per_token[
+                    underloaded_tokens[next_underloaded]]
+                target_expert_set = set(target_experts)
+                for source_pos, local_expert_idx in enumerate(source_experts):
+                    if local_expert_idx not in target_expert_set:
+                        target_experts.append(local_expert_idx)
+                        del source_experts[source_pos]
                         break
+                else:
+                    raise RuntimeError(
+                        "Unable to move an overflowing expert assignment")
 
-        assert ((token_selected_experts
-                 >= 0).sum(dim=-1) == num_selected_experts).all().item()
+        assert sum(len(experts)
+                   for experts in experts_per_token) == num_assignments
+        assert all(len(experts) <= self.top_k for experts in experts_per_token)
+        assert all(
+            len(experts) == len(set(experts)) for experts in experts_per_token)
+        token_selected_experts = torch.tensor(
+            [[
+                local_expert_idx + self.local_expert_offset
+                for local_expert_idx in experts
+            ] + [-1] * (self.top_k - len(experts))
+             for experts in experts_per_token],
+            dtype=torch.int32,
+            device="cpu").view(num_tokens, self.top_k)
+
         if self.num_local_experts == self.num_experts:
-            assert (num_selected_experts == self.top_k).all().item()
-        else:
-            assert (num_selected_experts <= self.top_k).all().item()
+            assert (token_selected_experts >= 0).all().item()
         return token_selected_experts
 
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
