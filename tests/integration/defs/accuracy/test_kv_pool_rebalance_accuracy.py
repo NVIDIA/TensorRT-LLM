@@ -55,7 +55,6 @@ def _inject_pool_ratio_mismatch(llm: LLM, *, skew: float = 2.0) -> None:
 
     executor = llm._executor.engine
     executor._rebalance_check_interval = 1
-    executor._rebalance_check_counter = 0
     kv_cache_manager = executor.kv_cache_manager
     _introspection.force_rebalance_precondition(kv_cache_manager.impl, skew=skew)
 

@@ -74,9 +74,10 @@ def _make_executor(
     exe.is_shutdown = is_shutdown
     exe.drafter = drafter
 
-    # Iteration throttle state.
+    # Iteration throttle state.  The throttle keys on iter_counter, the
+    # loop-wide iteration index, so tests drive that directly.
     exe._rebalance_check_interval = rebalance_check_interval
-    exe._rebalance_check_counter = 0
+    exe.iter_counter = 0
 
     # Bind the real agreement helper so _maybe_rebalance_kv_pools exercises it
     # rather than getting a truthy MagicMock back.
@@ -270,43 +271,82 @@ class TestConsumePreviousBatch:
 class TestRebalanceCheckThrottle:
     """``_can_pause_for_rebalance`` only lets a check through every N iterations.
 
-    The throttle must be driven purely by rank-uniform state: all ranks have to
-    reach the agreement collective on the same iteration or they deadlock.
+    The throttle keys on ``iter_counter``, the loop-wide iteration index, rather
+    than on a counter of its own.  That makes the set of iterations a rank fires
+    the agreement collective on a pure function of the iteration number, so it
+    cannot drift between ranks.
     """
 
-    def test_returns_false_until_interval_reached(self):
+    @staticmethod
+    def _fired_on(exe: MagicMock, iterations: int) -> list[int]:
+        """Run ``iterations`` executor iterations and report which ones opened
+        the gate.
+
+        Args:
+            exe: The PyExecutor stand-in to drive.
+            iterations: How many iterations to step through.
+
+        Returns:
+            The ``iter_counter`` values on which the gate returned ``True``.
+        """
+        fired = []
+        for i in range(iterations):
+            exe.iter_counter = i
+            if PyExecutor._can_pause_for_rebalance(exe):
+                fired.append(i)
+        return fired
+
+    def test_fires_once_per_interval(self) -> None:
         exe = _make_executor(rebalance_check_interval=4)
-        results = [PyExecutor._can_pause_for_rebalance(exe) for _ in range(4)]
-        assert results == [False, False, False, True]
+        assert self._fired_on(exe, 12) == [0, 4, 8]
 
-    def test_counter_resets_after_firing(self):
-        exe = _make_executor(rebalance_check_interval=3)
-        results = [PyExecutor._can_pause_for_rebalance(exe) for _ in range(6)]
-        assert results == [False, False, True, False, False, True]
-
-    def test_interval_of_one_checks_every_iteration(self):
+    def test_interval_of_one_checks_every_iteration(self) -> None:
         exe = _make_executor(rebalance_check_interval=1)
-        assert all(PyExecutor._can_pause_for_rebalance(exe) for _ in range(5))
+        assert self._fired_on(exe, 5) == [0, 1, 2, 3, 4]
 
-    def test_counter_not_advanced_when_a_gate_rejects(self):
-        # The counter sits behind every gate, so an executor that cannot
-        # rebalance accumulates no throttle credit.  Every gate is rank-uniform,
-        # which is what keeps the counter -- and therefore the iteration the
-        # agreement collective runs on -- identical across ranks.
+    def test_config_gate_suppresses_every_iteration(self) -> None:
         exe = _make_executor(enable_kv_pool_rebalance=False, rebalance_check_interval=2)
-        for _ in range(10):
-            assert PyExecutor._can_pause_for_rebalance(exe) is False
-        assert exe._rebalance_check_counter == 0
+        assert self._fired_on(exe, 10) == []
 
-    def test_counter_not_advanced_during_warmup(self):
-        exe = _make_executor(is_warmup=True, rebalance_check_interval=2)
-        for _ in range(10):
-            assert PyExecutor._can_pause_for_rebalance(exe) is False
-        assert exe._rebalance_check_counter == 0
+    def test_gate_rejection_does_not_shift_the_schedule(self) -> None:
+        """Regression guard for the cadence-drift deadlock.
 
-        # Once warmup clears, the throttle starts counting from scratch.
-        exe.is_warmup = False
-        assert [PyExecutor._can_pause_for_rebalance(exe) for _ in range(2)] == [False, True]
+        A throttle counting its own eligible iterations would only advance on
+        iterations that cleared every gate, so a rank that bailed out early even
+        once would fire on a different set of iterations than its peers from
+        then on -- and the two would meet ``_agreed_need_adjustment``'s
+        broadcast out of step.  Keying on ``iter_counter`` makes the schedule
+        independent of that history: a rank that skips a check rejoins the
+        common cadence instead of being permanently offset from it.
+        """
+        interval = 4
+        iterations = 16
+        # A peer rank that never bails out: the cadence everyone must share.
+        reference = self._fired_on(_make_executor(rebalance_check_interval=interval), iterations)
+
+        # This rank alone is briefly shut down, over a window that straddles one
+        # of its firing iterations.
+        window = (3, 4, 5)
+        exe = _make_executor(rebalance_check_interval=interval)
+        fired = []
+        for i in range(iterations):
+            exe.iter_counter = i
+            exe.is_shutdown = i in window
+            if PyExecutor._can_pause_for_rebalance(exe):
+                fired.append(i)
+
+        # The property that matters: this rank may *miss* checks, but it must
+        # never fire on an iteration its peers do not.  Anything else means it
+        # carried a lasting offset out of the window and would meet them at
+        # _agreed_need_adjustment's broadcast out of step.
+        assert set(fired) <= set(reference), (
+            f"rank drifted off the shared cadence: fired on {fired}, peers fire "
+            f"on {reference}; the extra iterations {sorted(set(fired) - set(reference))} "
+            "would enter the agreement collective alone"
+        )
+        # And it really did skip the check inside the window (not vacuous).
+        assert [i for i in reference if i not in fired] == [4]
+        assert fired == [0, 8, 12]
 
 
 # --------------------------------------------------------------------------- #
