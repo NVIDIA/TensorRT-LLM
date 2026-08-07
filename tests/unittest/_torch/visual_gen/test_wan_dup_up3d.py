@@ -3,6 +3,8 @@
 
 """Unit tests for the fused Wan DupUp3D output mapping."""
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -18,6 +20,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D
         pytest.param(4, 4, 2, id="temporal-repeat-8"),
         pytest.param(8, 4, 2, id="temporal-repeat-4"),
         pytest.param(8, 2, 2, id="temporal-repeat-2"),
+        pytest.param(32, 4, 2, id="temporal-repeat-1"),
         pytest.param(4, 4, 1, id="spatial-repeat-4"),
         pytest.param(8, 4, 1, id="spatial-repeat-2"),
     ],
@@ -89,6 +92,28 @@ def test_fused_dup_up3d_empty_input_uses_eager(
 def test_fused_dup_up3d_int32_index_limit() -> None:
     assert dup_up3d_module._supports_triton_indexing(1 << 31)
     assert not dup_up3d_module._supports_triton_indexing((1 << 31) + 1)
+
+
+def test_fused_dup_up3d_input_span_limit() -> None:
+    x = mock.Mock(spec=torch.Tensor)
+    x.dim.return_value = 5
+    x.shape = (1, 4, 2, 3, 4)
+    x.stride.return_value = (1, 1 << 30, 12, 4, 1)
+    x.is_cuda = True
+
+    with mock.patch.object(dup_up3d_module.logger, "warning_once") as warning_once:
+        supported = dup_up3d_module.can_implement_dup_up3d(
+            x,
+            output_channels=4,
+            repeats=8,
+            factor_t=2,
+            factor_s=2,
+            first_chunk=False,
+        )
+
+    assert not supported
+    warning_once.assert_called_once()
+    assert "%d" not in warning_once.call_args.args[0]
 
 
 def test_fused_dup_up3d_falls_back_above_index_limit(

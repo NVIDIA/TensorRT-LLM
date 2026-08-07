@@ -76,8 +76,8 @@ def can_implement_dup_up3d(
         first_chunk: Whether the cache-initializing temporal crop is required.
 
     Returns:
-        ``True`` for a non-empty CUDA invocation whose output fits the kernel's
-        signed 32-bit indexing range; otherwise ``False``.
+        ``True`` for a non-empty CUDA invocation whose input span and output
+        fit the kernel's signed 32-bit indexing range; otherwise ``False``.
     """
     _validate_dup_up3d_contract(x, output_channels, repeats, factor_t, factor_s)
     if not x.is_cuda or 0 in x.shape:
@@ -91,12 +91,15 @@ def can_implement_dup_up3d(
         first_chunk,
     )
     output_elements = math.prod(output_shape)
-    supported = _supports_triton_indexing(output_elements)
+    input_span_elements = 1 + sum((size - 1) * stride for size, stride in zip(x.shape, x.stride()))
+    supported = _supports_triton_indexing(output_elements) and _supports_triton_indexing(
+        input_span_elements
+    )
     if not supported:
         logger.warning_once(
-            "Fused DupUp3D output has %d elements, exceeding the Triton "
+            f"Fused DupUp3D input span ({input_span_elements} elements) or output size "
+            f"({output_elements} elements) exceeds the Triton "
             "signed 32-bit indexing limit; falling back to the eager implementation.",
-            output_elements,
             key="wan_dup_up3d_int32_index_fallback",
         )
     return supported
@@ -183,14 +186,7 @@ def dup_up3d(
         A logical NCTHW tensor stored in PyTorch ``channels_last_3d`` physical
         order, which corresponds to NTHWC.
     """
-    assert can_implement_dup_up3d(
-        x,
-        output_channels=output_channels,
-        repeats=repeats,
-        factor_t=factor_t,
-        factor_s=factor_s,
-        first_chunk=first_chunk,
-    )
+    _validate_dup_up3d_contract(x, output_channels, repeats, factor_t, factor_s)
 
     temporal_crop = factor_t - 1 if first_chunk else 0
     output_shape = _dup_up3d_output_shape(
