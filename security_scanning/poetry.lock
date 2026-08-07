@@ -3209,19 +3209,6 @@ files = [
 ]
 
 [[package]]
-name = "nvidia-cuda-crt"
-version = "13.3.73"
-description = "CUDA C Runtime"
-optional = false
-python-versions = ">=3"
-groups = ["main"]
-files = [
-    {file = "nvidia_cuda_crt-13.3.73-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:60aacc0b5e1e8b40c62abe4d1ab16440add91b99bd2f17f62dd091586b73d166"},
-    {file = "nvidia_cuda_crt-13.3.73-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:df14a17ae1c5c3171265411212246654d780f89344ea85344466c6b955247543"},
-    {file = "nvidia_cuda_crt-13.3.73-py3-none-win_amd64.whl", hash = "sha256:af04e75148db1f0eea30958f33a9ec5a5a2dc2afa99ca4323f9a93b840602ca5"},
-]
-
-[[package]]
 name = "nvidia-cuda-cupti"
 version = "13.0.85"
 description = "CUDA profiling tools runtime libs."
@@ -3234,24 +3221,6 @@ files = [
     {file = "nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_x86_64.whl", hash = "sha256:4eb01c08e859bf924d222250d2e8f8b8ff6d3db4721288cf35d14252a4d933c8"},
     {file = "nvidia_cuda_cupti-13.0.85-py3-none-win_amd64.whl", hash = "sha256:683f58d301548deeefcb8f6fac1b8d907691b9d8b18eccab417f51e362102f00"},
 ]
-
-[[package]]
-name = "nvidia-cuda-nvcc"
-version = "13.3.73"
-description = "CUDA nvcc"
-optional = false
-python-versions = ">=3"
-groups = ["main"]
-files = [
-    {file = "nvidia_cuda_nvcc-13.3.73-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:70f250825355d2c3aa6c7a972a0ec00f020bad66d2679e527eb4336301c904aa"},
-    {file = "nvidia_cuda_nvcc-13.3.73-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f483af83166c4fa356a21606076d553b0b4ceaebbd9912e537545080db695bdd"},
-    {file = "nvidia_cuda_nvcc-13.3.73-py3-none-win_amd64.whl", hash = "sha256:3d9da631bcac3dee49d1357b84cd05abe56aa3ccf76b05a7df8a80ef78addcb5"},
-]
-
-[package.dependencies]
-nvidia-cuda-crt = "*"
-nvidia-cuda-runtime = "*"
-nvidia-nvvm = "*"
 
 [[package]]
 name = "nvidia-cuda-nvdisasm"
@@ -3287,6 +3256,7 @@ description = "CUDA Runtime native Libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
+markers = "(sys_platform == \"win32\" or sys_platform == \"linux\") and platform_system == \"Linux\""
 files = [
     {file = "nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ef9bcbe90493a2b9d810e43d249adb3d02e98dd30200d86607d8d02687c43f55"},
     {file = "nvidia_cuda_runtime-13.0.96-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:7f82250d7782aa23b6cfe765ecc7db554bd3c2870c43f3d1821f1d18aebf0548"},
@@ -3295,21 +3265,16 @@ files = [
 
 [[package]]
 name = "nvidia-cuda-tileiras"
-version = "13.3.36"
+version = "13.1.80"
 description = "TileIR Assembler Package"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 files = [
-    {file = "nvidia_cuda_tileiras-13.3.36-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:91510f8f9b4f4b3f3a365c43218b62873b5ae1474db6b32eb3ece7f0934496af"},
-    {file = "nvidia_cuda_tileiras-13.3.36-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9221618a3f6422efcb9ae38225d1db7bf0f4ca211f8fdc98a3cd6a81a8f00eca"},
-    {file = "nvidia_cuda_tileiras-13.3.36-py3-none-win_amd64.whl", hash = "sha256:0dd286086c6d273826218d02c076ddea8e285b50ee223bd1429756b706b7bbc7"},
+    {file = "nvidia_cuda_tileiras-13.1.80-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8f877e45762505d31c29aad9b09a21383b7865428f4a4564390e80597e2425a3"},
+    {file = "nvidia_cuda_tileiras-13.1.80-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:dbf5ab15e8ad70fad28ce3cc2398e71bda55ce90dae32fe92c09f07d84ce2e02"},
+    {file = "nvidia_cuda_tileiras-13.1.80-py3-none-win_amd64.whl", hash = "sha256:67719ad98c78e85720f4ca5f55cfea9ea22eedf70c0b408b3e96c8b8bc13d1c4"},
 ]
-
-[package.dependencies]
-nvidia-cuda-nvcc = "*"
-nvidia-nvjitlink = "*"
-nvidia-nvvm = "*"
 
 [[package]]
 name = "nvidia-cudnn-cu13"
@@ -3630,6 +3595,7 @@ description = "Nvidia JIT LTO Library"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
+markers = "(sys_platform == \"win32\" or sys_platform == \"linux\") and platform_system == \"Linux\""
 files = [
     {file = "nvidia_nvjitlink-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:13a74f429e23b921c1109976abefacc69835f2f433ebd323d3946e11d804e47b"},
     {file = "nvidia_nvjitlink-13.0.88-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:e931536ccc7d467a98ba1d8b89ff7fa7f1fa3b13f2b0069118cd7f47bff07d0c"},
@@ -3661,19 +3627,6 @@ files = [
     {file = "nvidia_nvtx-13.0.85-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:4936d1d6780fbe68db454f5e72a42ff64d1fd6397df9f363ae786930fd5c1cd4"},
     {file = "nvidia_nvtx-13.0.85-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:cb7780edb6b14107373c835bf8b72e7a178bac7367e23da7acb108f973f157a6"},
     {file = "nvidia_nvtx-13.0.85-py3-none-win_amd64.whl", hash = "sha256:d66ea44254dd3c6eacc300047af6e1288d2269dd072b417e0adffbf479e18519"},
-]
-
-[[package]]
-name = "nvidia-nvvm"
-version = "13.3.73"
-description = "NVVM Libraries"
-optional = false
-python-versions = ">=3"
-groups = ["main"]
-files = [
-    {file = "nvidia_nvvm-13.3.73-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:0e28e0858a3475e11ac67d35301cd5bf82666a1c0dc4ec4e80ceaf3a5fd1dea8"},
-    {file = "nvidia_nvvm-13.3.73-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:e2bcdd5783b5481445f1f0e7170cb836cc0d72999839ba850bbba6dc97b76bb8"},
-    {file = "nvidia_nvvm-13.3.73-py3-none-win_amd64.whl", hash = "sha256:b5c91dfa59ee4cee90b2dfb19c6203f31c914b9c9b5ca10726c2da7cf8ed401d"},
 ]
 
 [[package]]
@@ -7323,4 +7276,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "9ee26ed6f98a81b42bfe9c128aa355d26c427e9159b3f5634989fd3b7a858d30"
+content-hash = "3e6ad2cc9b171d2c5217bca441d84ee74acbe99f3dd00ce656d25b7a5b940a22"
