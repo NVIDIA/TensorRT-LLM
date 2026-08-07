@@ -37,6 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CudaGraphConfig,
     ParallelConfig,
+    RuntimeLoRAConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
@@ -187,6 +188,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    runtime_lora: Optional[RuntimeLoRAConfig] = None
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -473,6 +475,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         attention_cfg = args.attention_config if args else AttentionConfig()
         parallel_cfg = args.parallel_config if args else ParallelConfig()
         cache_cfg = args.cache_config if args else None
+        runtime_lora_cfg = args.runtime_lora_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
 
         from .pipeline_registry import PipelineComponent
@@ -625,6 +628,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            runtime_lora=runtime_lora_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,

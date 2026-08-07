@@ -89,6 +89,7 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+        self._runtime_lora_applications: List[Any] = []
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
@@ -406,6 +407,48 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+        self._setup_runtime_lora()
+
+    def _setup_runtime_lora(self) -> None:
+        runtime_lora = getattr(self.pipeline_config, "runtime_lora", None)
+        if runtime_lora is None or self._runtime_lora_applications:
+            return
+
+        from .runtime_lora import apply_runtime_lora
+
+        component_names = runtime_lora.target_components or self.transformer_components
+        total_applied = 0
+        applications = []
+        for component_name in component_names:
+            component = getattr(self, component_name, None)
+            if component is None:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested missing component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping missing component '{component_name}'")
+                continue
+
+            component_prefixes = [f"{component_name}.", f"model.{component_name}."]
+            application = apply_runtime_lora(
+                component,
+                runtime_lora,
+                default_strip_prefixes=component_prefixes,
+                raise_on_no_matches=False,
+            )
+            applications.append(application)
+            total_applied += len(application.applied_modules)
+            if application.applied_modules:
+                logger.info(
+                    f"Runtime LoRA applied to {component_name}: {list(application.applied_modules)}"
+                )
+
+        if total_applied == 0 and runtime_lora.strict:
+            raise ValueError(
+                f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                f"components {component_names}."
+            )
+        self._runtime_lora_applications = applications
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
         """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
