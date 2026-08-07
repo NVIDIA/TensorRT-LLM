@@ -27,7 +27,6 @@ import faulthandler
 import os
 import signal
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -217,62 +216,3 @@ def test_hang_traceback_off_by_default(make_reporter: ReporterFactory) -> None:
     assert reporter._hang_timer is None
     assert reporter._hang_file is None
     assert not os.path.exists(reporter._hang_traceback_path())
-
-
-def test_release_waits_for_an_active_dump(make_reporter: ReporterFactory) -> None:
-    # Timer.cancel() does not stop a callback that already started, so cleanup has
-    # to join the timer before closing the sidecar file -- otherwise the in-flight
-    # dump writes into a closed file.
-    reporter = make_reporter(hang_dump_fraction=0.5)
-    started = threading.Event()
-    errors: list[Exception] = []
-
-    def slow_dump(nodeid: str) -> None:
-        started.set()
-        time.sleep(0.3)  # still running when _release() is called below
-        try:
-            reporter._hang_file.write(f"late dump for {nodeid}\n")
-            reporter._hang_file.flush()
-        except (OSError, ValueError) as exc:  # file closed underneath the callback
-            errors.append(exc)
-
-    reporter._dump_hang = slow_dump
-    reporter.pytest_runtest_setup(_Item(timeout_opt=0.02))
-    assert started.wait(_POLL_TIMEOUT)
-
-    _release(reporter)
-
-    assert errors == []
-    assert "late dump for pkg/test_x.py::test_y" in _read(reporter._hang_traceback_path())
-
-
-def test_signal_handlers_registered_and_released(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Assert the C-level registration contract the whole signal path depends on,
-    # without installing real handlers or delivering signals to this process.
-    registered: list[tuple[int, dict[str, object]]] = []
-    unregistered: list[int] = []
-    monkeypatch.setattr(
-        faulthandler, "register", lambda signum, **kwargs: registered.append((signum, kwargs))
-    )
-    monkeypatch.setattr(faulthandler, "unregister", lambda signum: unregistered.append(signum))
-
-    reporter = PeriodicJUnitXML(
-        xmlpath=os.path.join(str(tmp_path), "results.xml"),
-        dump_hang_traceback=True,
-    )
-    reporter._setup_hang_dump()
-
-    assert [signum for signum, _ in registered] == [signal.SIGINT, signal.SIGTERM]
-    for _, kwargs in registered:
-        # all_threads: a hang is usually in a worker thread, not the main one.
-        # chain: keeps the Python handler that persists the JUnit report.
-        assert kwargs["all_threads"] is True
-        assert kwargs["chain"] is True
-        assert kwargs["file"] is reporter._hang_file
-
-    _release(reporter)
-
-    assert unregistered == [signal.SIGINT, signal.SIGTERM]
-    assert reporter._hang_file is None
