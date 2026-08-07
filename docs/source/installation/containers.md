@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 (build-containers)=
 
 # Container Images
@@ -25,6 +30,36 @@ docker pull nvcr.io/nvidia/tensorrt-llm/release:x.y.z
 Replace `x.y.z` with the desired version. Browse the available tags for [`devel`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags) and [`release`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) on NGC.
 
 {{container_tag_admonition}}
+
+## Binary Compatibility
+
+Use TensorRT LLM Python packages, Python bindings, and native libraries from the
+same TensorRT LLM release. The Python extension module
+`tensorrt_llm/bindings.cpython-*.so` is compiled against the C++ runtime library
+layout for a specific build, so replacing only selected shared libraries from a
+newer image or wheel is unsupported and can fail with Python signature errors or
+native crashes.
+
+When moving to a newer release, update the full TensorRT LLM environment
+together. For example, use a single `release:x.y.z` image, install one matching
+TensorRT LLM wheel, or rebuild and install the wheel from the same source tree.
+Native shared libraries are installed under `tensorrt_llm/libs/`. Do not mix
+files such as these across different release tags:
+
+- `tensorrt_llm/bindings.cpython-*.so`
+- `tensorrt_llm/libs/libtensorrt_llm.so`
+- `tensorrt_llm/libs/libtensorrt_llm_ucx_wrapper.so`
+- `tensorrt_llm/libs/libtensorrt_llm_nixl_wrapper.so`
+- `tensorrt_llm/libs/libth_common.so`
+
+This is especially important when adopting a new transport or runtime feature
+by copying libraries into an older base image. The UCX and NIXL transport
+wrappers use `$ORIGIN`-relative rpaths into `tensorrt_llm/libs/ucx/` and
+`tensorrt_llm/libs/nixl/`, so copying only a wrapper can leave its transport
+dependencies behind. If the base image was built with an older TensorRT LLM
+release, rebuild the image with the newer release or replace the complete
+installed TensorRT LLM package instead of copying only the feature-specific
+`.so` files.
 
 ## Building Images Locally
 
