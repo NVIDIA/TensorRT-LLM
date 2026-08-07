@@ -1,5 +1,7 @@
 # Override the CUTLASS DSL version shipped in the base image. PrimTS requires 4.7.0 or newer.
+# Constraints cannot specify extras, so require the CUDA 13 compiler library directly.
 nvidia-cutlass-dsl>=4.7.0
+nvidia-cutlass-dsl-libs-cu13>=4.7.0
 # The `nvidia-cutlass-dsl` package does not pin numpy at all, which can be problematic in certain CI
 # stages.
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
