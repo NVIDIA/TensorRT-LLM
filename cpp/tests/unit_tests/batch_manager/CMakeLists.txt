@@ -37,6 +37,11 @@ target_include_directories(
   kvCacheManagerV2StatsTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheManagerV2SlotAllocatorTest
+          kvCacheManagerV2SlotAllocatorTest.cpp)
+target_include_directories(
+  kvCacheManagerV2SlotAllocatorTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
 add_gtest(llmRequestTest llmRequestTest.cpp)
 add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
