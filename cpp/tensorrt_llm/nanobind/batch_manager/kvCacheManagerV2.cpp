@@ -512,6 +512,43 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sLogicError = nb::exception<kv::LogicError>(m, "LogicError");
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
+    static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
+    // Default attribute so the class mirrors the pure-Python CuError surface.
+    sCuError.attr("error_code") = nb::none();
+
+    // Translate kv::CuError so the Python instance carries the numeric CUDA
+    // error code (mirrors the pure-Python CuError.error_code). Registered after
+    // the nb::exception<kv::CuError> auto-translator so it is tried first.
+    nb::register_exception_translator(
+        [](std::exception_ptr const& p, void*)
+        {
+            try
+            {
+                if (p)
+                {
+                    std::rethrow_exception(p);
+                }
+            }
+            catch (kv::CuError const& e)
+            {
+                nb::object inst = sCuError(nb::str(e.what()));
+                // Match Python's error_code type (cuda.bindings.driver.CUresult)
+                // when available; fall back to a plain int otherwise.
+                nb::object code;
+                try
+                {
+                    nb::object cuResult = nb::module_::import_("cuda.bindings.driver").attr("CUresult");
+                    code = cuResult(static_cast<int>(e.errorCode));
+                }
+                catch (nb::python_error const&)
+                {
+                    PyErr_Clear();
+                    code = nb::cast(static_cast<int>(e.errorCode));
+                }
+                inst.attr("error_code") = code;
+                PyErr_SetObject(sCuError.ptr(), inst.ptr());
+            }
+        });
 
     // Map kv::AssertionError to Python's builtin AssertionError so shared tests see
     // the same exception type as the pure-Python backend (which uses `assert`).
@@ -522,7 +559,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             try
             {
                 if (p)
+                {
                     std::rethrow_exception(p);
+                }
             }
             catch (kv::AssertionError const& e)
             {
@@ -1406,7 +1445,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 // Contract: callers must keep the KvCache alive and must not mutate/resize it
                 // while using this view. The view is intended for read-only use, matching the
                 // practical use of Python's array.array/memoryview index buffers.
-                // TODO(yaoy): switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
+                // TODO: switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
                 // or nb::memoryview for nanobind >= 2.12.0.
                 return nb::ndarray<nb::numpy, int const, nb::ndim<1>>(
                     span.ptr, {static_cast<size_t>(span.len)}, nb::handle());

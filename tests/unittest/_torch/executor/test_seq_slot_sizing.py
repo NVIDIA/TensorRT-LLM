@@ -71,6 +71,9 @@ def test_disagg_adp_overlap_headroom_gate(
         ("deepseek_v4", 1, True),
         ("deepseek_v3", 1, False),
         ("deepseek_v4", 2, False),
+        ("qwen3_5_moe", 1, True),
+        ("qwen3_5_moe", 2, False),
+        ("llama", 1, False),
     ],
 )
 def test_dsv4_adp_dummy_fix_gate(model_type, pp_size, expected):

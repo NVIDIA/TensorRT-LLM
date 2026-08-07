@@ -48,8 +48,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
-                           is_gemma4_hybrid, is_hybrid_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid)
+                           is_gemma4_hybrid, is_hybrid_linear, is_kimi_linear,
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -155,6 +155,31 @@ def get_kv_cache_manager_cls(
             raise ValueError("Mamba additional snapshot offsets require "
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
+
+        # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
+        # (CppMambaHybridCacheManager) like the other hybrid linear models —
+        # per-block KDA state snapshots every mamba_state_cache_interval
+        # tokens with FORCE_CHUNK context chunking. Without block reuse the
+        # Mixed manager (separate KV / recurrent-state pools) stays the
+        # default. SA speculative decoding is validated on the Mixed
+        # manager's SpeculativeState scratch path only; reuse + SA is
+        # unvalidated.
+        if is_kimi_linear(config) and not use_v2:
+            if is_disagg:
+                # Fail fast instead of bypassing the disagg transceiver
+                # validation below with an unvalidated route.
+                raise NotImplementedError(
+                    "Disaggregated serving is not supported for Kimi K3 yet "
+                    "(TRTLLM-14815).")
+            if kv_cache_config.enable_block_reuse:
+                logger.info(
+                    "Using CppMambaHybridCacheManager for Kimi K3 hybrid "
+                    "model (block reuse enabled)")
+                return CppMambaHybridCacheManager
+            logger.info(
+                "Using MixedMambaHybridCacheManager for Kimi K3 hybrid model")
+            return MixedMambaHybridCacheManager
+
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
         if is_disagg:
@@ -1395,6 +1420,18 @@ class KvCacheCreator:
                 "would not be partitioned from the target's and would overrun "
                 "GPU memory. Derived draft max_attention_window="
                 f"{draft_kv_config.max_attention_window}.")
+        if (draft_kv_config.pool_ratio is not None
+                and len(draft_kv_config.pool_ratio) != 1):
+            # pool_ratio describes one manager's pool-group layout. The
+            # target hybrid manager may have separate recurrent-state and
+            # attention groups, while today's supported one-model draft
+            # manager has one non-VSWA attention group. Reusing the target's
+            # two ratios for that separate manager fails its arity check.
+            logger.info(
+                "Normalizing the separate one-model draft KV cache pool_ratio "
+                f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
+                "pool group.")
+            draft_kv_config.pool_ratio = [1.0]
         if is_vswa_enabled(self._kv_cache_config):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -2135,7 +2172,88 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
-    if is_mla(config):
+    if is_kimi_linear(config):
+        # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
+        # the mamba side of the hybrid manager, absorbed-MQA MLA latent cache
+        # (num_kv_heads=1, head_dim = kv_lora_rank + qk_rope_head_dim,
+        # SELFKONLY) on the paged-KV side. Must come before the is_mla(...)
+        # route: the kimi_linear config carries MLA fields, but only 24 of
+        # its 93 layers are MLA.
+        if max_beam_width > 1:
+            raise ValueError(
+                "MambaHybridCacheManager + beam search is not supported yet.")
+        if not estimating_kv_cache and kv_connector_manager is not None:
+            raise NotImplementedError(
+                "Connector manager is not supported for MambaHybridCacheManager."
+            )
+        mamba_params = extract_mamba_kv_cache_params(
+            config,
+            spec_config=spec_config,
+            quant_config=quant_config,
+        )
+        mamba_layer_mask, full_attention_layer_mask = (
+            _get_mamba_cache_layer_masks(
+                mamba_params,
+                mapping,
+                spec_config,
+                is_draft,
+            ))
+        num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
+                            else mamba_params.num_mamba_layers)
+        # Kimi K3 KDA state sharding follows the attention-family TP
+        # semantics (Qwen3-Next pattern): replicated under attention-DP,
+        # head-sharded across tp_size otherwise. That is exactly the cache
+        # manager's own internal gate (`tp_size = 1 if enable_attention_dp
+        # else tp_size`, then num_heads / n_groups / conv_dim divide by
+        # it), so the params pass through unscaled.
+        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
+        # kernel can run here, allocate the per-slot replay caches instead
+        # of the legacy per-step intermediate verification buffers. The
+        # kernel replays accepted drafts from these caches and commits
+        # states in place, replacing the intermediate-buffer + promotion
+        # flow for KDA layers.
+        kimi_extra_kwargs = {}
+        if spec_config is not None and issubclass(kv_cache_manager_cls,
+                                                  MixedMambaHybridCacheManager):
+            from ..modules.kimi_kda._kda_kernels import \
+                is_kda_mtp_verify_available
+            if is_kda_mtp_verify_available():
+                kimi_extra_kwargs["kda_replay_num_spec"] = (
+                    spec_config.tokens_per_gen_step - 1)
+        kv_cache_manager = kv_cache_manager_cls(
+            # mamba (KDA) cache parameters
+            mamba_params.state_size,
+            mamba_params.conv_kernel,
+            mamba_params.num_heads,
+            mamba_params.n_groups,
+            mamba_params.head_dim,
+            num_mamba_layers,
+            mamba_layer_mask,
+            mamba_params.dtype,
+            mamba_params.mamba_ssm_cache_dtype,
+            # kv cache parameters (MLA latent cache)
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=sum(full_attention_layer_mask),
+            layer_mask=full_attention_layer_mask,
+            num_kv_heads=1,
+            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            is_draft=is_draft,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=spec_config,
+            is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
+            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
+            # all three KDA sections have identical width.
+            model_type="qwen3_next",
+            **kimi_extra_kwargs,
+            **manager_extra_kwargs,
+        )
+    elif is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -2335,20 +2453,20 @@ def _create_kv_cache_manager(
                 "MTP path")
             use_replay = False
 
-        # Replay is opt-in because its end-to-end benefit is workload-dependent.
+        # Replay is enabled by default for eligible GDN MTP workloads.
         if not is_gdn_replay_enabled():
-            logger.info("GDN replay kernel is disabled; set "
-                        "TRTLLM_USE_GDN_REPLAY=1 to enable it")
             use_replay = False
 
-        # Upstream GDN replay commits all local layer checkpoints through the
-        # contiguous C++ manager state view. V2 exposes per-layer state views,
-        # so enabling the same path there would fail for partitioned batches.
-        if (use_replay and issubclass(kv_cache_manager_cls,
-                                      MambaHybridCacheManagerV2)):
-            logger.info(
-                "GDN replay is not supported by MambaHybridCacheManagerV2; "
-                "using the legacy MTP path")
+        # GDN replay supports the contiguous C++ V1 state pool and the indirect
+        # per-layer state views exposed by V2. Mixed/Python does not expose an
+        # all-layer commit, so keep that manager but use non-replay MTP.
+        replay_manager_types = (CppMambaHybridCacheManager,
+                                MambaHybridCacheManagerV2)
+        if use_replay and not issubclass(kv_cache_manager_cls,
+                                         replay_manager_types):
+            logger.info("GDN replay requires C++ V1 or V2 Mamba cache manager; "
+                        f"{kv_cache_manager_cls.__name__} was selected, so the "
+                        "non-replay MTP path will be used")
             use_replay = False
         logger.info("GDN replay state update: " +
                     ("ENABLED" if use_replay else "DISABLED"))
@@ -2518,10 +2636,17 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
+# Model types whose disaggregated attention-DP path has been measured against
+# the ADP dummy fixes. The gate stays an explicit list rather than a capability
+# check (``enable_attention_dp and kv_cache_transceiver is not None``) so that
+# each entry is added only after its disagg ADP behavior has been exercised.
+_ADP_DUMMY_FIX_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+
+
 def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
                                        mapping: Mapping) -> bool:
-    """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
-    return model_type == "deepseek_v4" and not mapping.has_pp()
+    """Gate the ADP dummy fixes while PP remains follow-up scope."""
+    return model_type in _ADP_DUMMY_FIX_MODEL_TYPES and not mapping.has_pp()
 
 
 def should_enable_disagg_adp_overlap_headroom(

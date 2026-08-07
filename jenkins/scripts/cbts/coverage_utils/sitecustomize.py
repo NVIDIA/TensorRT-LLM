@@ -111,6 +111,12 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         _PERIODIC_SAVE_SECONDS = 5.0
     _stop_event = threading.Event()
 
+    # While this file exists (created by result collection) no process saves.
+    _STOP_FILE = os.environ.get("CBTS_STOP_FILE", "")
+
+    def _frozen():
+        return bool(_STOP_FILE) and os.path.exists(_STOP_FILE)
+
     _tracker = PyStartTracker(_src, _data_dir, _stage)
 
     def switch_test_context(nodeid):
@@ -132,6 +138,8 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
         _tracker.note_expected_workers(nodeid or "", n)
 
     def _save_active():
+        if _frozen():
+            return
         try:
             _tracker.save()
         except Exception as e:
@@ -140,7 +148,8 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     def _final_save():
         _stop_event.set()
         try:
-            _tracker.save()
+            if not _frozen():
+                _tracker.save()
             _tracker.stop()
         except Exception as e:
             print(f"[cbts] final save failed in pid {os.getpid()}: {e!r}", file=sys.stderr)
@@ -222,6 +231,9 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     # pool workers in particular lose their atexit save when the pool is torn down at test end.
     def _periodic_save():
         while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
+            if _frozen():
+                _stop_event.set()
+                return
             _save_active()
 
     threading.Thread(

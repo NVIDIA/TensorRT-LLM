@@ -11,6 +11,9 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _expand_prompt_token_ids_for_mm_handoff,
 )
 
+pytestmark = pytest.mark.cpu_only
+
+
 _VISION_START_TOKEN_ID = 151652
 _VISION_END_TOKEN_ID = 151653
 _IMAGE_TOKEN_ID = 151655

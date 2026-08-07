@@ -38,6 +38,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ...mmap_utils import advise_tensor_pageout
 from ...utils import (ActivationType, replace_parameter_and_save_metadata,
                       swizzle_sf, unswizzle_sf)
+from ..gated_mlp import GatedMLP
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 
@@ -1068,14 +1069,15 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
     FP8_QUANT_BLOCK_SIZE = 128
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module, n_shared_experts=0):
         weight_dtype = torch.float8_e4m3fn
 
-        w3_w1_weight_shape = (module.expert_size_per_partition,
+        w3_w1_weight_shape = (module.expert_size_per_partition +
+                              n_shared_experts,
                               module.intermediate_size_per_partition * 2,
                               module.hidden_size)
         w2_weight_shape = (
-            module.expert_size_per_partition,
+            module.expert_size_per_partition + n_shared_experts,
             module.hidden_size,
             module.intermediate_size_per_partition,
         )
@@ -1084,7 +1086,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
         cell_div = lambda x, y: (x + y - 1) // y
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition,
+            (module.expert_size_per_partition + n_shared_experts,
              cell_div(module.intermediate_size_per_partition,
                       self.FP8_QUANT_BLOCK_SIZE) * 2,
              cell_div(w3_w1_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
@@ -1094,7 +1096,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                                   w3_w1_weight_scaling_factor)
 
         w2_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition,
+            (module.expert_size_per_partition + n_shared_experts,
              cell_div(w2_weight_shape[1], self.FP8_QUANT_BLOCK_SIZE),
              cell_div(w2_weight_shape[2], self.FP8_QUANT_BLOCK_SIZE)),
             dtype=torch.float32),
@@ -1113,6 +1115,61 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                      allow_partial_loading: bool = False):
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
+
+    def fuse_shared_expert(self, module: torch.nn.Module,
+                           shared_experts: GatedMLP, n_shared_experts: int):
+        # Fuse the shared expert(s) into the trailing routed-expert slots
+        # (module.expert_size_per_partition + i). On this trtllm-gen FP8 block-scale path the
+        # routed-expert weights are stored in plain (non-shuffled) layout, so the shared expert
+        # weights are reshaped and copied without any extra layout transform.
+        # gate_up_proj stores [gate(w1); up(w3)]; the routed expert tensor stores [w3; w1].
+        w1_weight, w3_weight = shared_experts.gate_up_proj.weight.data.chunk(
+            2, dim=0)
+        w1_weight = w1_weight.view(n_shared_experts,
+                                   module.w3_w1_weight.shape[1] // 2,
+                                   module.w3_w1_weight.shape[2])
+        w3_weight = w3_weight.view(n_shared_experts,
+                                   module.w3_w1_weight.shape[1] // 2,
+                                   module.w3_w1_weight.shape[2])
+        w2_weight = shared_experts.down_proj.weight.view(
+            module.w2_weight.shape[1], n_shared_experts,
+            module.w2_weight.shape[2]).permute(1, 0, 2).contiguous()
+
+        w1_w3_weight_scale = shared_experts.gate_up_proj.weight_scale.data
+        w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(2, dim=0)
+        w1_weight_scale = w1_weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scaling_factor.shape[1] // 2,
+            module.w3_w1_weight_scaling_factor.shape[2])
+        w3_weight_scale = w3_weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scaling_factor.shape[1] // 2,
+            module.w3_w1_weight_scaling_factor.shape[2])
+        # down_proj weight_scale is (hidden_blocks, n_shared * intermediate_blocks);
+        # the per-expert intermediate blocks are the trailing dim, so split there and
+        # move the expert axis to the front (mirrors the w2 weight reshape above).
+        w2_weight_scale = shared_experts.down_proj.weight_scale.data.view(
+            module.w2_weight_scaling_factor.shape[1], n_shared_experts,
+            module.w2_weight_scaling_factor.shape[2]).permute(1, 0,
+                                                              2).contiguous()
+
+        for i in range(n_shared_experts):
+            slot = module.expert_size_per_partition + i
+            # Routed-expert layout is [w3; w1] along dim 0 (see load_expert_w3_w1_weight).
+            dst_w3_weight, dst_w1_weight = module.w3_w1_weight[slot].chunk(
+                2, dim=0)
+            dst_w3_weight.copy_(w3_weight[i].view(dst_w3_weight.dtype),
+                                non_blocking=True)
+            dst_w1_weight.copy_(w1_weight[i].view(dst_w1_weight.dtype),
+                                non_blocking=True)
+            module.w2_weight[slot].copy_(w2_weight[i].view(
+                module.w2_weight.dtype),
+                                         non_blocking=True)
+
+            dst_w3_scale, dst_w1_scale = module.w3_w1_weight_scaling_factor[
+                slot].chunk(2, dim=0)
+            dst_w3_scale.copy_(w3_weight_scale[i].view(dst_w3_scale.dtype))
+            dst_w1_scale.copy_(w1_weight_scale[i].view(dst_w1_scale.dtype))
+            module.w2_weight_scaling_factor[slot].copy_(w2_weight_scale[i].view(
+                module.w2_weight_scaling_factor.dtype))
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
@@ -5859,6 +5916,11 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                     self.BLOCK_SCALES_DTYPE).reshape(orig_w2_int32_shape))
 
 
+# Serializes the duplicate-check + slot-claim step of
+# ``load_packed_mxfp4_expert`` across the loader thread pool.
+_PACKED_MXFP4_SLOT_CLAIM_LOCK = threading.Lock()
+
+
 class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     weight_dtype = torch.uint8
     block_scales_dtype = torch.uint8
@@ -6172,6 +6234,73 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         if not dst_on_gpu:
             dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
+
+    def load_packed_mxfp4_expert(
+        self,
+        module: torch.nn.Module,
+        *,
+        global_expert_id: int,
+        local_slot_id: int,
+        w1_weight: torch.Tensor,
+        w1_weight_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_scale: torch.Tensor,
+        w3_weight: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+    ) -> None:
+        """Load one group-32 packed MXFP4 checkpoint expert into a local slot.
+
+        This adapter is intentionally per-expert so model-specific streaming
+        loaders can keep safetensors mappings short-lived while reusing the
+        TRTLLM-Gen padding, sharding, shuffle, and scale-interleave lifecycle.
+        """
+        if not 0 <= local_slot_id < module.expert_size_per_partition:
+            raise IndexError(f"local_slot_id={local_slot_id} is outside "
+                             f"[0, {module.expert_size_per_partition}).")
+        expected_expert_id = module.initial_local_expert_ids[local_slot_id]
+        if global_expert_id != expected_expert_id:
+            raise ValueError(
+                f"local slot {local_slot_id} expects global expert "
+                f"{expected_expert_id}, got {global_expert_id}.")
+
+        tensors = {
+            "w1_weight": w1_weight,
+            "w1_weight_scale": w1_weight_scale,
+            "w2_weight": w2_weight,
+            "w2_weight_scale": w2_weight_scale,
+            "w3_weight": w3_weight,
+            "w3_weight_scale": w3_weight_scale,
+        }
+        for name, value in tensors.items():
+            if value.dtype != torch.uint8:
+                raise TypeError(
+                    f"{name} must contain packed MXFP4 uint8 data, got "
+                    f"{value.dtype}.")
+
+        # Callers stream experts from a thread pool, so the duplicate check
+        # and slot claim must be one atomic step. The slot is claimed BEFORE
+        # the loaders run: a failed load leaves the destination buffer
+        # partially transformed, and a retry must not transform it again.
+        with _PACKED_MXFP4_SLOT_CLAIM_LOCK:
+            loaded_slots = getattr(module, "_packed_mxfp4_loaded_slots", None)
+            if loaded_slots is None:
+                loaded_slots = set()
+                module._packed_mxfp4_loaded_slots = loaded_slots
+            if local_slot_id in loaded_slots:
+                raise ValueError(
+                    f"Packed MXFP4 local slot {local_slot_id} was loaded twice."
+                )
+            loaded_slots.add(local_slot_id)
+
+        self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                      module.w3_w1_weight.data[local_slot_id])
+        self.load_expert_w2_weight(module, w2_weight,
+                                   module.w2_weight.data[local_slot_id])
+        self.load_expert_w3_w1_weight_scale_mxfp4(
+            module, w1_weight_scale, w3_weight_scale,
+            module.w3_w1_weight_scale.data[local_slot_id])
+        self.load_expert_w2_weight_scale_mxfp4(
+            module, w2_weight_scale, module.w2_weight_scale.data[local_slot_id])
 
 
 class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):

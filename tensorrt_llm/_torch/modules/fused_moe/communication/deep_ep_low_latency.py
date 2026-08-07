@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
@@ -45,6 +46,15 @@ class DeepEPLowLatency(Communication):
     """frozenset[int]: Hidden sizes supported by extension kernels (nvfp4 post-quant/low-precision combine).
 
     Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
+    """
+
+    MAX_TOP_K: int = 9
+    """int: Compile-time top-k cap of the low-latency kernels.
+
+    ``kNumMaxTopK``/``kNumMaxTopk`` in internode_ll.cu (dispatch and combine)
+    size per-thread register arrays with it and guard it with
+    ``EP_HOST_ASSERT(num_topk <= kNumMaxTopK)`` — a larger top_k aborts on the
+    first dispatch/combine, so selection must reject it up front.
     """
 
     def __init__(
@@ -114,6 +124,13 @@ class DeepEPLowLatency(Communication):
             return False
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
         if get_sm_version() in (120, 121):
+            return False
+        # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
+        # H100/H200 NVL systems. Disabling P2P does not avoid the abort: this
+        # build has no IBRC fallback, and IBGDA fails before Buffer can use
+        # allow_nvlink_for_low_latency_mode=False. Reject before setup.
+        dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
             return False
         return True
 

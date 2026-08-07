@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import os
@@ -42,8 +45,8 @@ EventType = Enum(
 
 
 def is_gdn_replay_enabled() -> bool:
-    """Return whether GDN replay was explicitly enabled."""
-    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") == "1"
+    """Return whether GDN replay is enabled (default: enabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -69,6 +72,10 @@ class ActType_TrtllmGen(IntEnum):
     Relu2 = 1
     # act = x0 * sigmoid(x0)
     Silu = 2
+    # SiTu gated activation (Kimi K3), gate on x1:
+    #   act = (beta * tanh(x0 / beta)) * (alpha * tanh(x1 / alpha) * sigmoid(x1))
+    # alpha/beta come from the per-expert gemm1_alpha/gemm1_beta runtime buffers.
+    SiTu = 3
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
