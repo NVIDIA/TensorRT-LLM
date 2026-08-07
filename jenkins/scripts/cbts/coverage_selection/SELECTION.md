@@ -201,11 +201,21 @@ The tarball is downloaded (retried), the sqlite extracted, and `coverage_audit.p
 any failure in this whole path is caught and non-fatal — `coverageDb.path` stays empty, Tier 2
 never runs, and the PR gets a full run.
 
-The chosen build, its commit and its lag ride into `main.py` and are recorded in the decision
-(`coverage_db_build` / `coverage_db_commit` / `coverage_db_lag`; an unmeasurable lag is `null`
-here and `-1` in the OpenSearch record).
-**These are recorded, not gated**: observed lag varies widely even in healthy operation, so a
-threshold needs data first.
+The chosen build, its commit and its lag ride into `main.py`, which **gates on the lag**: past
+`--coverage-max-lag` (default 100) the tier declines and the PR runs in full, on the grounds that a
+DB that far behind no longer describes who touches what in the code under test. A lag that could
+not be measured at all is treated the same way — freshness that cannot be shown is not assumed.
+
+All four land in the decision and in OpenSearch:
+
+| Decision field | OpenSearch | Note |
+|---|---|---|
+| `coverage_db_build` | `l_coverage_db_build` | 0 when no DB was consulted |
+| `coverage_db_commit` | `s_coverage_db_commit` | |
+| `coverage_db_lag` | `l_coverage_db_lag` | `null` / `-1` when unmeasurable |
+| `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
+
+so the decline rate is queryable per verdict rather than only readable in `s_reason`.
 
 ## 9. Decision output
 
