@@ -763,6 +763,34 @@ class Sender(SenderBase):
             return block_ids.size
         return max(0, block_ids.size - (beam_width - 1))
 
+    @staticmethod
+    def _trim_receiver_window_head(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        peer_window_size: Optional[int],
+        beam_width: int,
+    ) -> np.ndarray:
+        """Drop the receiver's extra leading blocks for a windowed layer group.
+
+        A windowed receiver keeps a larger window when only it runs speculative
+        decoding, so its suffix starts earlier and the extra blocks are at the
+        head. Both starts are derived from list length, so trimming the tail
+        instead would shift every block one position early.
+
+        Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
+        _create_kv_slice, so there dst must not exceed src. A smaller dst
+        (generation prefix-cache reuse) is handled via dst_start.
+        """
+        block_diff = dst_block_ids.size - src_block_ids.size
+        if block_diff <= 0:
+            return dst_block_ids
+        if peer_window_size is None or beam_width > 1:
+            raise ValueError(
+                f"src/dst block count mismatch: {src_block_ids.size} vs "
+                f"{dst_block_ids.size} (dst must not exceed src)"
+            )
+        return dst_block_ids[block_diff:]
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -800,19 +828,18 @@ class Sender(SenderBase):
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Both sides trim block lists to ceil(prompt_len / tpb) in
-            # _create_kv_slice, so dst must never exceed src. A smaller dst
-            # (generation prefix-cache reuse) is handled via dst_start below.
-            block_diff = dst_block_ids.size - src_block_ids.size
-            if block_diff > 0:
-                raise ValueError(
-                    f"src/dst block count mismatch: {src_block_ids.size} vs "
-                    f"{dst_block_ids.size} (dst must not exceed src)"
-                )
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
+
+            peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
+            dst_block_ids = Sender._trim_receiver_window_head(
+                src_block_ids,
+                dst_block_ids,
+                peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
+                beam_width=task._beam_width,
+            )
 
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
