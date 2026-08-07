@@ -2650,8 +2650,8 @@ def should_enable_scheduler_aware_adp_dummy(
         disable_overlap_scheduler: bool) -> bool:
     """Enable scheduler-aware padding for validated lifecycle configurations."""
     return (should_enable_adp_dummy_fixes(mapping)
-            and (disable_overlap_scheduler or model_type
-                 in _VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES))
+            and (disable_overlap_scheduler
+                 or model_type in _VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES))
 
 
 def should_enable_non_overlap_adp_forward_intent(
