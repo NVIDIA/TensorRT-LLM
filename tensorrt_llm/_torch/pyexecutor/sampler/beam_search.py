@@ -208,6 +208,16 @@ class BeamSearchStore:
     of each active beam."""
     first_finish_reasons: torch.Tensor
     """[max_num_sequences, max_beam_width] int32, first finish reason per beam."""
+    pending_harvest: torch.Tensor
+    """[max_num_sequences, max_beam_width] bool, beams latched finished by the
+    finish handler and not yet harvested into the CBA.
+
+    Kept apart from ``first_finish_reasons`` on purpose. That tensor is the
+    request's reported finish reason and must survive for the whole request,
+    while this one is a one-shot signal: the harvest consumes it, and the slot
+    it frees goes on to hold an unrelated, unfinished continuation. Reading the
+    persistent reason as the latch would harvest that continuation again on the
+    next step."""
     predecessor_beams: torch.Tensor
     """[max_num_sequences, max_beam_width] int32, predecessor beam per beam, used
     for stop word detection."""
@@ -248,6 +258,7 @@ class BeamSearchStore:
             predecessor_beams=int_tensor(per_beam),
             original_tokens=int_tensor(cache_indirection_shape),
             first_finish_reasons=int_tensor(per_beam),
+            pending_harvest=torch.zeros(per_beam, device="cuda", dtype=torch.bool),
             beam_idx_arange=torch.arange(max_beam_width, device="cuda", dtype=torch.int32),
             prompt_lens=int_tensor((max_num_sequences,)),
             batch_dones=torch.zeros((max_num_sequences,), device="cuda", dtype=torch.bool),
@@ -312,6 +323,7 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_slots: torch.Tensor
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
+    pending_harvest: torch.Tensor
     predecessor_beams: torch.Tensor
     beam_idx_arange: torch.Tensor
     stop_past_tokens: Optional[torch.Tensor] = None
@@ -548,7 +560,7 @@ def _cba_step_math(
     original_tokens: torch.Tensor,
     original_log_probs: torch.Tensor,
     cum_log_probs: torch.Tensor,
-    finished_beams: torch.Tensor,
+    pending_harvest: torch.Tensor,
     end_ids: torch.Tensor,
     prompt_lens: torch.Tensor,
     cba_caps: torch.Tensor,
@@ -591,7 +603,7 @@ def _cba_step_math(
     batch_size, num_candidates = cand_cum.shape
     neg_inf = float("-inf")
 
-    harvest_mask = finished_beams[slots, :beam_width_in] != FinishReason.NOT_FINISHED.value
+    harvest_mask = pending_harvest[slots, :beam_width_in]
     end_ids_b = end_ids[slots].view(-1, 1)
     caps = cba_caps[slots].view(-1, 1)
     prompts = prompt_lens[slots].view(-1, 1)
@@ -851,7 +863,7 @@ def beam_search_sampling_batch_cba(
     # lengths are uniform here) and the END_ID flood below is all-beams too —
     # either way the request stops that same step, so there is no next step
     # to harvest them (finalize handles those paths instead).
-    harvest_mask = args.finished_beams[slots, :beam_width_in] != FinishReason.NOT_FINISHED.value
+    harvest_mask = args.pending_harvest[slots, :beam_width_in]
     logprobs = logprobs.masked_fill(harvest_mask.unsqueeze(-1), float("-inf"))
     logprobs += args.cum_log_probs.unsqueeze(-1)[slots, :beam_width_in]
 
@@ -936,7 +948,7 @@ def beam_search_sampling_batch_cba(
         original_tokens=cba.original_tokens,
         original_log_probs=cba.original_log_probs,
         cum_log_probs=args.cum_log_probs,
-        finished_beams=args.finished_beams,
+        pending_harvest=args.pending_harvest,
         end_ids=cba.end_ids,
         prompt_lens=cba.prompt_lens,
         cba_caps=cba.cba_caps,
@@ -959,6 +971,10 @@ def beam_search_sampling_batch_cba(
     cba.cba_tokens[slots, :, :snap_len] = merged_tokens
     cba.cba_log_probs[slots, :, :snap_len] = merged_lps
     cba.batch_dones[slots] = done
+    # The latch is one-shot: the beams it named have just been pooled and their
+    # slots refilled with unrelated continuations, so leaving it set would
+    # harvest those on the next step (see BeamSearchStore.pending_harvest).
+    args.pending_harvest[slots] = torch.zeros_like(args.pending_harvest[slots])
     # Publish the done verdict across the full row: the stop criterion reads the
     # first py_beam_width (== capacity) entries, which can exceed this step's
     # beam_width_out for variable-beam-width requests.
@@ -1069,6 +1085,7 @@ def prepare_beam_search(
     beam_search_store.first_finish_reasons.index_fill_(
         0, seq_slots_long, FinishReason.NOT_FINISHED.value
     )
+    beam_search_store.pending_harvest.index_fill_(0, seq_slots_long, False)
     beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
     beam_search_store.prompt_lens.index_copy_(0, seq_slots_long, prompt_lens_cuda)
     beam_search_store.batch_dones.index_fill_(0, seq_slots_long, False)

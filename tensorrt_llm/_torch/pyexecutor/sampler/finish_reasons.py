@@ -528,6 +528,7 @@ class FinishReasonsHandler:
         seq_lens_cuda: torch.Tensor,
         new_tokens_cuda: torch.Tensor,
         first_finish_reasons_cuda: torch.Tensor | None = None,
+        pending_harvest_cuda: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Calculates the finish reasons for each request and returns the finish reasons tensor.
 
@@ -567,6 +568,7 @@ class FinishReasonsHandler:
             stop_word_indices=stop_word_indices_cuda,
             single_token_stop_words_only=single_token_stop_words_only,
             first_finish_reasons=first_finish_reasons_cuda,
+            pending_harvest=pending_harvest_cuda,
         )
         return self.store.finish_reasons_cuda
 
@@ -638,6 +640,7 @@ class FinishReasonsHandler:
         stop_word_indices: torch.Tensor | None = None,
         single_token_stop_words_only: bool = False,
         first_finish_reasons: torch.Tensor | None = None,
+        pending_harvest: torch.Tensor | None = None,
     ) -> None:
         """Writes the finish reasons to the finish_reasons tensor.
 
@@ -712,11 +715,20 @@ class FinishReasonsHandler:
         if first_finish_reasons is not None:
             # store the first stop reason for each beam of a seq_slot.
             batched_first_finish_reasons = first_finish_reasons[seq_slots]
+            newly_finished = (batched_first_finish_reasons == FinishReason.NOT_FINISHED.value) & (
+                batched_finish_reasons != FinishReason.NOT_FINISHED.value
+            )
             first_finish_reasons[seq_slots, ...] = torch.where(
                 batched_first_finish_reasons == FinishReason.NOT_FINISHED.value,
                 batched_finish_reasons,
                 batched_first_finish_reasons,
             )
+            if pending_harvest is not None:
+                # Raise the beam-search harvest latch for beams that finished on
+                # *this* step. The CBA step lowers it once it has pooled them;
+                # first_finish_reasons itself cannot serve as the latch because
+                # it must outlive the harvest to be reported to the caller.
+                pending_harvest[seq_slots, ...] |= newly_finished.any(dim=0)
 
     def _are_end_id(self, end_ids_cuda: torch.Tensor, tokens_cuda: torch.Tensor) -> torch.Tensor:
         """Checks if the tokens are the end id

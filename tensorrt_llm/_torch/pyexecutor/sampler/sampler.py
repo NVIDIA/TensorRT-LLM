@@ -2237,6 +2237,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     seq_slots=group_seq_slots_cuda,
                     seq_lens=group_seq_lens_cuda,
                     finished_beams=beam_search_store.first_finish_reasons,
+                    pending_harvest=beam_search_store.pending_harvest,
                     predecessor_beams=beam_search_store.predecessor_beams,
                     beam_idx_arange=beam_search_store.beam_idx_arange,
                     stop_past_tokens=self._finish_reasons_handler.store.past_tokens_cuda,
@@ -2573,6 +2574,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     beam_search_store.first_finish_reasons
                     if beam_search_store is not None
                     else None
+                ),
+                pending_harvest_cuda=(
+                    beam_search_store.pending_harvest if beam_search_store is not None else None
                 ),
             )
             finish_reasons_host = self._copy_to_host(finish_reasons_device)
