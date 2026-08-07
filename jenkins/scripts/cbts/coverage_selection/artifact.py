@@ -15,7 +15,8 @@
 
 The tarball is uploaded per post-merge run to
 `<ARTIFACT_BASE>/<build>/cbts-coverage/cbts_pystart_report.tar.gz` (sqlite at
-the tar root plus `cbts_report/`).
+the tar root plus `cbts_report/`). This module only resolves which one to use;
+the pipeline downloads and extracts it itself.
 
 `select_tarball()` reads the newest build number from the Jenkins REST API, walks
 builds down probing Artifactory with a 1-byte ranged GET, and ranks the ones that
@@ -24,10 +25,8 @@ exist by how far `COVERAGE_BRANCH` has moved past the revision each collected
 distance comes from local git, or from the forge compare API when the CI
 checkout is too shallow to answer; the build number is only a tie-break.
 
-Three entry points for the Groovy wiring:
-  * `--print-url` — resolve and print the tarball URL only (no download).
-  * `--print-selection` — print `{url, build, commit, lag}` as JSON.
-  * `--dest DIR` — download + extract, printing the local sqlite path.
+`--print-selection` prints `{url, build, commit, lag}` as JSON for the Groovy
+wiring; `--build` pins a candidate instead of resolving one.
 """
 
 from __future__ import annotations
@@ -35,19 +34,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
-import tarfile
 import urllib.error
 import urllib.request
 from functools import lru_cache
-from pathlib import Path
 from typing import Optional
 
 # Merged-artifact base for the main-branch L0_PostMerge job.
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
 TARBALL_NAME = "cbts_pystart_report.tar.gz"
-SQLITE_NAME = "cbts_touchmap.sqlite"
 # Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
@@ -183,56 +178,9 @@ def select_tarball(
     return best
 
 
-def latest_tarball_url(
-    artifact_base: str = ARTIFACT_BASE,
-    jenkins_base: str = _JENKINS_BASE,
-    max_probe: int = _MAX_PROBE,
-) -> Optional[str]:
-    """URL of the best available coverage tarball; see `select_tarball`."""
-    best = select_tarball(artifact_base, jenkins_base, max_probe)
-    return best["url"] if best else None
-
-
-def extract_touch_db(tarball: Path | str, dest_dir: Path | str) -> Optional[Path]:
-    """Extract `cbts_touchmap.sqlite` from a downloaded tarball; return its path."""
-    dest_dir = Path(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tarball) as tf:
-        member = next((m for m in tf.getmembers() if m.name.endswith(SQLITE_NAME)), None)
-        if member is None:
-            return None
-        member.name = SQLITE_NAME
-        tf.extract(member, dest_dir)
-    return dest_dir / SQLITE_NAME
-
-
-def fetch_latest_touch_db(dest_dir: Path | str, url: Optional[str] = None) -> Optional[Path]:
-    """Download + extract the latest post-merge touch DB; return local sqlite Path or None.
-
-    `url` pins an explicit tarball (skips latest-build resolution); any failure returns None.
-    """
-    dest_dir = Path(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    url = url or latest_tarball_url()
-    if url is None:
-        return None
-    tarball = dest_dir / TARBALL_NAME
-    try:
-        with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp, open(tarball, "wb") as f:
-            shutil.copyfileobj(resp, f)
-        return extract_touch_db(tarball, dest_dir)
-    except OSError as e:
-        print(f"[artifact] download/extract failed {url}: {e}", file=sys.stderr)
-        return None
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--dest", help="download + extract into DIR; prints the local sqlite path")
-    ap.add_argument(
-        "--print-url", action="store_true", help="resolve and print the tarball URL only"
     )
     ap.add_argument(
         "--print-selection",
@@ -244,40 +192,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    url = tarball_url(args.build) if args.build is not None else None
+    if not args.print_selection:
+        ap.error("--print-selection is required")
 
-    if args.print_selection:
-        if args.build is not None:
-            commit = build_commit(args.build)
-            best = {
-                "url": url,
-                "build": args.build,
-                "commit": commit,
-                "lag": compare_distance(commit) if commit else None,
-            }
-        else:
-            best = select_tarball()
-        if best is None:
-            return 1
-        print(json.dumps(best))
-        return 0
-
-    if args.print_url:
-        url = url or latest_tarball_url()
-        if url is None:
-            return 1
-        print(url)
-        return 0
-
-    if args.dest:
-        path = fetch_latest_touch_db(args.dest, url=url)
-        if path is None:
-            return 1
-        print(path)
-        return 0
-
-    ap.error("one of --print-url or --dest is required")
-    return 2
+    if args.build is not None:
+        commit = build_commit(args.build)
+        best = {
+            "url": tarball_url(args.build),
+            "build": args.build,
+            "commit": commit,
+            "lag": compare_distance(commit) if commit else None,
+        }
+    else:
+        best = select_tarball()
+    if best is None:
+        return 1
+    print(json.dumps(best))
+    return 0
 
 
 if __name__ == "__main__":
