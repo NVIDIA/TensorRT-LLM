@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -419,7 +419,11 @@ namespace PermuteGemm1
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType)
 {
-    bool is_gated_activation = actType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(actType);
+    // DeepSeek FP8 runs the gated activation as a standalone kernel (see moe::dev::activation),
+    // which only implements SwiGlu math; SiTu is available exclusively through fused FC1 cubins.
+    TLLM_CHECK_WITH_INFO(!(useDeepSeekFp8 && actType == ActType::SiTu),
+        "SiTu activation is not supported with DeepSeek FP8 (no standalone SiTu activation kernel).");
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options;
 
     if (is_gated_activation)
@@ -487,7 +491,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    bool is_gated_activation = mActType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
     mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, numTokens,
         intermediateSizeFactor * validIntermediateSize, validHiddenSize, {}, numTokens, numExperts,
@@ -502,7 +506,7 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
     int32_t numTokens, int32_t configIndex) const
 {
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    int32_t const intermediateSizeFactor = mActType == ActType::SwiGlu ? 2 : 1;
+    int32_t const intermediateSizeFactor = tensorrt_llm::kernels::isGatedActType(mActType) ? 2 : 1;
 
     return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, configIndex);
@@ -512,7 +516,7 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    bool is_gated_activation = mActType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
         hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize,
         validHiddenSize);
@@ -522,7 +526,7 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-    bool is_gated_activation = mActType == ActType::SwiGlu;
+    bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
         is_gated_activation ? 2 * intermediateSize : intermediateSize, hiddenSize, {}, numTokens, numExperts,
         maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
@@ -640,6 +644,7 @@ Runner::Runner(
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
     , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
     , mActType(actType)
+    , mTileTokensDim(tileTokensDim)
 {
     auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
     auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
@@ -687,10 +692,12 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     activationData.outPtr = workspace.activation_output;
     activationData.inDqSfsPtr = workspace.gemm1_output_scale;
     activationData.outDqSfsPtr = workspace.activation_output_scale;
-    activationData.innerDim = args.intermediate_size * (mActType == ActType::SwiGlu ? 2 : 1);
+    activationData.innerDim = args.intermediate_size * (tensorrt_llm::kernels::isGatedActType(mActType) ? 2 : 1);
     activationData.topK = totalExpertsPerToken; // TODO Rename topK in activation data struct
     activationData.numTokens = args.num_tokens;
     activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
+    activationData.numExperts = args.num_experts;
+    activationData.tileTokensDim = mTileTokensDim;
     // For DeepSeek FP8 the activation runs as a separate kernel rather than
     // fused into the FC1 GEMM cubin; forward the scalar swiglu_limit so it
     // can honor swiglu_limit (uniform across experts; see DevKernel.h note).
@@ -744,7 +751,7 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
 }
 
 std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-    int32_t numLocalExperts, int32_t numTokens, int32_t validIntermediateSize, int32_t validHiddenSize) const
+    int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
     std::vector<int64_t> validIndices;
 

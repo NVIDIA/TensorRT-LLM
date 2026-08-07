@@ -56,7 +56,7 @@ def test_has_moe_lora_targets_each_module(name):
 def test_check_no_lora_is_noop():
     # No LoRA at all; validator must not raise regardless of backend/quant.
     check_moe_lora_supported(
-        moe_backend_name="WIDEEP",
+        moe_backend_name="CUTEDSL",
         lora_config=None,
         quant_config=_FakeQuantConfig(_FP8_BLOCK_SCALE),
     )
@@ -117,7 +117,6 @@ def test_check_moe_lora_rejects_fp8_block_scale():
 @pytest.mark.parametrize(
     "backend",
     [
-        "WIDEEP",
         "TRITON",
         "DEEPGEMM",
         "VANILLA",

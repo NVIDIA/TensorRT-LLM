@@ -54,7 +54,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    build_aux_transfer_layout,
+    get_non_empty_aux_indices,
+)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -934,9 +938,17 @@ class Sender(SenderBase):
             peer_slot = req_info.aux_slot
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
-            src_ptrs = src_aux_meta.ptrs + src_aux_meta.item_sizes * task._slot
-            dst_ptrs = peer_aux_meta.ptrs + peer_aux_meta.item_sizes * peer_slot
-            sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
+            layout = self._registrar.get_aux_transfer_layout(
+                peer_ri.instance_name, peer_ri.instance_rank
+            )
+            if layout is None:
+                layout = build_aux_transfer_layout(src_aux_meta, peer_aux_meta)
+                self._registrar.cache_aux_transfer_layout(
+                    peer_ri.instance_name, peer_ri.instance_rank, layout
+                )
+            src_ptrs = layout.src_base_ptrs + layout.src_item_sizes * task._slot
+            dst_ptrs = layout.dst_base_ptrs + layout.dst_item_sizes * peer_slot
+            sizes = layout.src_item_sizes
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -2353,10 +2365,14 @@ class TransferWorker:
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None
         aux_meta = self._aux_buffer.meta
-        ptr_num = len(aux_meta.ptrs)
+        non_empty = get_non_empty_aux_indices(
+            aux_meta.ptrs, aux_meta.size, "auxiliary registration"
+        )
         ptr_descs = []
-        for i in range(ptr_num):
+        for i in non_empty:
             ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
+        if not ptr_descs:
+            return
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self._agent.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")

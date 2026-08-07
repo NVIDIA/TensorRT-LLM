@@ -1062,6 +1062,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 return getattr(pretrained_config, name, default)
             return default
 
+        num_layers = getattr(pretrained_config, "num_hidden_layers", None)
+        has_shared_indexer_layers = (num_layers is not None and any(
+            not self._is_full_indexer_layer(pretrained_config, layer_idx)
+            for layer_idx in range(num_layers)))
+
         return DSAMetadataParams(
             indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
             max_sparse_topk=_value("index_topk"),
@@ -1071,6 +1076,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
+            has_shared_indexer_layers=has_shared_indexer_layers,
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
 
@@ -3720,21 +3728,29 @@ class MambaStateConfig(StrictBaseModel):
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
 
-    block_reuse_policy: Literal[
-        "all_reusable", "per_request", "per_conversation"] = Field(
-            default="all_reusable",
-            status="prototype",
-            description="KV cache manager v2 block reuse policy. "
-            "'all_reusable' commits reusable blocks after every context chunk; "
-            "'per_request' commits them only after the final context chunk; "
-            "'per_conversation' uses 'per_request' commits and retains committed "
-            "SWA-window blocks and Mamba stable-boundary state for up to "
-            "`max_num_turns` completed turns. Periodic Mamba state snapshots "
-            "are disabled with 'per_conversation'. All reusable blocks remain "
-            "subject to normal cache eviction. "
-            "Requests without conversation params use 'per_request' behavior. When "
-            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
-            "blocks are committed for reuse.")
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_renamed_block_reuse_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "block_reuse_policy" in data:
+            raise ValueError(
+                "'kv_cache_config.block_reuse_config.block_reuse_policy' was "
+                "renamed to 'kv_cache_config.block_reuse_config.policy'.")
+        return data
+
+    policy: Literal["all_reusable", "per_request", "per_conversation"] = Field(
+        default="all_reusable",
+        status="prototype",
+        description="KV cache manager v2 block reuse policy. "
+        "'all_reusable' commits reusable blocks after every context chunk; "
+        "'per_request' commits them only after the final context chunk; "
+        "'per_conversation' uses 'per_request' commits and retains committed "
+        "SWA-window blocks and Mamba stable-boundary state for up to "
+        "`max_num_turns` completed turns. Periodic Mamba state snapshots "
+        "are disabled with 'per_conversation'. All reusable blocks remain "
+        "subject to normal cache eviction. "
+        "Requests without conversation params use 'per_request' behavior. When "
+        "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+        "blocks are committed for reuse.")
 
     max_num_turns: PositiveInt = Field(
         default=1,
@@ -3743,7 +3759,7 @@ class BlockReuseConfig(StrictBaseModel):
         "Maximum number of completed conversation turns whose committed SWA-window "
         "blocks and Mamba stable-boundary state are retained by KV cache manager v2. "
         "Only used when "
-        "`block_reuse_policy` is 'per_conversation'.")
+        "`policy` is 'per_conversation'.")
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -4072,14 +4088,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     def disable_periodic_mamba_snapshots_for_conversations(
             self) -> 'KvCacheConfig':
         """Use only explicit stable boundaries for conversation reuse."""
-        if (self.block_reuse_config.block_reuse_policy == "per_conversation"
+        if (self.block_reuse_config.policy == "per_conversation"
                 and self.mamba_state_config.periodic_snapshot_interval != 0):
             interval = self.mamba_state_config.periodic_snapshot_interval
             logger.warning(
                 f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
                 "is ignored because "
-                "'kv_cache_config.block_reuse_config."
-                "block_reuse_policy=per_conversation' disables "
+                "'kv_cache_config.block_reuse_config.policy=per_conversation' disables "
                 "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})
@@ -5040,6 +5055,17 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    generation_config: Literal["auto", "trtllm"] = Field(
+        default="trtllm",
+        description=
+        "Controls whether sampling defaults are loaded from the model's "
+        "generation_config.json. 'auto' applies supported values when the "
+        "request does not specify them; 'trtllm' preserves TRT-LLM defaults. "
+        "Precedence is request values, generation_config.json values, then "
+        "TRT-LLM defaults.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'trtllm']"})
+
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=

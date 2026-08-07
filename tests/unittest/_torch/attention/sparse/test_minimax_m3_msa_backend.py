@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
-from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
