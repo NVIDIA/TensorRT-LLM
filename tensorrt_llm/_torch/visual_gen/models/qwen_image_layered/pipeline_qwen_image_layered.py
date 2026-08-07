@@ -133,6 +133,7 @@ def _retrieve_latents(
 class QwenImageLayeredPipeline(BasePipeline):
     """Qwen-Image-Layered image decomposition pipeline."""
 
+    supports_image_edit = True
     DEFAULT_GENERATION_PARAMS = _LAYERED_DEFAULT_GENERATION_PARAMS
 
     def __init__(self, pipeline_config):

@@ -31,7 +31,6 @@ from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -246,57 +245,6 @@ def _normalize_image_output(image) -> list:
     if hasattr(image, "dim") and image.dim() == 4:
         return [image[i] for i in range(image.shape[0])]
     return [image]
-
-
-_IMAGE_EDIT_PIPELINE_CLASS_NAMES = {
-    "Flux2Pipeline",
-    "QwenImageEditPlusPipeline",
-    "QwenImageLayeredPipeline",
-}
-
-
-def _resolve_visual_gen_pipeline_class_name(
-        model_id: Optional[str]) -> Optional[str]:
-    if not model_id:
-        return None
-
-    model_key = str(model_id)
-    for class_name, entry in PIPELINE_REGISTRY.items():
-        if model_key in entry.hf_ids:
-            return class_name
-
-    return None
-
-
-def _model_supports_image_edit(model_id: Optional[str]) -> bool:
-    pipeline_class_name = _resolve_visual_gen_pipeline_class_name(model_id)
-    if pipeline_class_name is None:
-        return False
-    return pipeline_class_name in _IMAGE_EDIT_PIPELINE_CLASS_NAMES
-
-
-def _is_local_model_path(model_id: Optional[str]) -> bool:
-    if not model_id:
-        return False
-    return Path(str(model_id)).exists()
-
-
-def _visual_gen_pipeline_class_name(generator: VisualGen) -> Optional[str]:
-    executor = getattr(generator, "executor", None)
-    pipeline_class_name = getattr(executor, "pipeline_class_name", None)
-    if pipeline_class_name:
-        return str(pipeline_class_name)
-
-    pipeline = getattr(executor, "pipeline", None)
-    if pipeline is not None:
-        return pipeline.__class__.__name__
-
-    return None
-
-
-def _pipeline_class_supports_image_edit(
-        pipeline_class_name: Optional[str]) -> bool:
-    return pipeline_class_name in _IMAGE_EDIT_PIPELINE_CLASS_NAMES
 
 
 def _image_output_size(image) -> Optional[str]:
@@ -591,24 +539,20 @@ class OpenAIServer(_VideoRoutesMixin):
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
             return False
-        args = getattr(self.generator, "args", None)
-        original_model_ids = (
-            getattr(self.generator, "model", None),
-            getattr(args, "model", None),
-        )
-        if any(
-                _is_local_model_path(model_id)
-                for model_id in original_model_ids):
-            return _pipeline_class_supports_image_edit(
-                _visual_gen_pipeline_class_name(self.generator))
 
-        model_ids = (
-            self.model,
-            getattr(self.generator, "model", None),
-            getattr(args, "model", None),
-        )
-        return any(
-            _model_supports_image_edit(model_id) for model_id in model_ids)
+        executor = getattr(self.generator, "executor", None)
+        if executor is None:
+            return False
+
+        pipeline = getattr(executor, "pipeline", None)
+        if pipeline is not None:
+            return bool(getattr(pipeline, "supports_image_edit", False))
+
+        supports_image_edit = getattr(executor, "supports_image_edit", None)
+        if supports_image_edit is not None:
+            return bool(supports_image_edit)
+
+        return False
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer

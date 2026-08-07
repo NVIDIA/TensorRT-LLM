@@ -369,7 +369,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
-                        "pipeline_class_name": self.pipeline.__class__.__name__,
+                        "supports_image_edit": self.pipeline.supports_image_edit,
                     },
                 )
             )
@@ -674,7 +674,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
-        self.pipeline_class_name: Optional[str] = None
+        self.supports_image_edit: bool = False
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1030,7 +1030,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
-                        self.pipeline_class_name = payload.get("pipeline_class_name")
+                        self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
