@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KimiK3SparseMoeBlock — in-tree Kimi K3 sparse MoE module.
+"""Test-only Kimi K3 sparse MoE reference module.
 
 Structural mirror of HF ``KimiSparseMoeBlock`` at
 ``modeling_kimi.py:806-918`` end to end:
 
-* :class:`KimiK3MoEGate` for routing (see :mod:`kimi_k3_moe_gate`).
+* :class:`KimiK3ReferenceMoEGate` for eager reference routing.
 * :class:`KimiK3RoutedExpertBank` — per-expert MXFP4-packed
   ``w1 / w2 / w3`` linear weights (group_size=32), dequantized on the
   fly during the Python fallback path.
@@ -43,20 +43,67 @@ Two mutation flags cover the negative controls required by AC4:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import torch
-from torch import nn
-
-from ._mlp import KimiK3MLP, KimiK3RMSNorm, NonSituActivation, SituAndMul
-from ._moe_kernels import (
+from _torch.modules.moe.kimi_k3_mlp_test_utils import KimiK3MLP, NonSituActivation
+from _torch.modules.moe.kimi_k3_moe_kernel_test_utils import (
     assert_native_situ_supported,
     invoke_native_situ_moe,
     make_situ_alpha_beta,
     pack_routed_expert_weights,
 )
-from ._mxfp4 import DEFAULT_GROUP_SIZE, dequantize_last_dim_mxfp4, quantize_last_dim_mxfp4
-from .kimi_k3_moe_gate import KimiK3MoEGate
+from _torch.modules.moe.kimi_k3_mxfp4_test_utils import (
+    DEFAULT_GROUP_SIZE,
+    dequantize_last_dim_mxfp4,
+    quantize_last_dim_mxfp4,
+)
+from torch import nn
+
+from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import KimiK3RMSNorm, SituAndMul
+from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+
+
+class KimiK3ReferenceMoEGate(KimiK3MoEGate):
+    """Eager HF-compatible Kimi K3 routing reference."""
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, sequence_length, _ = hidden_states.shape
+        logits = self.compute_logits(hidden_states)
+        if self.moe_router_activation_func == "sigmoid":
+            scores = logits.sigmoid()
+        else:
+            scores = logits.softmax(dim=1)
+        scores = scores.view(batch_size * sequence_length, -1)
+
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
+            group_scores = (
+                scores_for_choice.view(batch_size * sequence_length, self.num_expert_group, -1)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
+            group_indices = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_indices, 1)
+            score_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(
+                    batch_size * sequence_length,
+                    self.num_expert_group,
+                    self.num_experts // self.num_expert_group,
+                )
+                .reshape(batch_size * sequence_length, -1)
+            )
+            scores_for_selection = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        else:
+            scores_for_selection = scores_for_choice
+
+        topk_indices = torch.topk(scores_for_selection, k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_indices)
+        if self.top_k > 1 and self.moe_renormalize:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        return topk_indices, topk_weights * self.routed_scaling_factor
 
 
 class KimiK3RoutedExpertBank(nn.Module):
@@ -90,8 +137,8 @@ class KimiK3RoutedExpertBank(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         group_size: int = DEFAULT_GROUP_SIZE,
-        activation: Optional[nn.Module] = None,
-        device: Optional[torch.device] = None,
+        activation: nn.Module | None = None,
+        device: torch.device | None = None,
     ) -> None:
         super().__init__()
         assert hidden_size % group_size == 0, (
@@ -149,7 +196,7 @@ class KimiK3RoutedExpertBank(nn.Module):
         w1_fp32: torch.Tensor,
         w2_fp32: torch.Tensor,
         w3_fp32: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize fp32 ``[out, in]`` weights and store them.
 
         Returns the fp32 round-tripped (canonical) values for each
@@ -181,7 +228,7 @@ class KimiK3RoutedExpertBank(nn.Module):
         w3_canon = dequantize_last_dim_mxfp4(w3_packed, w3_scales, self.group_size)
         return w1_canon, w2_canon, w3_canon
 
-    def dequantize_expert(self, expert_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def dequantize_expert(self, expert_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         w1 = dequantize_last_dim_mxfp4(
             self.w1_packed[expert_idx], self.w1_scales[expert_idx], self.group_size
         )
@@ -220,8 +267,8 @@ class MoEBlockProvenance:
     """Provenance record returned by :func:`copy_hf_moe_block_weights`."""
 
     n_experts: int
-    shared_expert_names: List[str]
-    routed_expert_layout: Tuple[int, int]
+    shared_expert_names: list[str]
+    routed_expert_layout: tuple[int, int]
     latent: bool
     latent_use_norm: bool
     canonicalized: bool
@@ -268,7 +315,7 @@ class KimiK3SparseMoeBlock(nn.Module):
         non_situ_activation_mutation: bool = False,
         use_fused_cubin: bool = False,
         dtype: torch.dtype = torch.float32,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -304,7 +351,7 @@ class KimiK3SparseMoeBlock(nn.Module):
         else:
             routed_activation = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
-        self.gate = KimiK3MoEGate(config)
+        self.gate = KimiK3ReferenceMoEGate(config)
 
         # Routed expert storage — the MXFP4 bank is always the checkpoint
         # quantization source of truth. The fused path derives its packed
@@ -318,12 +365,12 @@ class KimiK3SparseMoeBlock(nn.Module):
             device=device,
         )
         self._fused_bank_ready = False
-        self.gemm1_weights: Optional[torch.Tensor] = None
-        self.gemm1_weights_scale: Optional[torch.Tensor] = None
-        self.gemm2_weights: Optional[torch.Tensor] = None
-        self.gemm2_weights_scale: Optional[torch.Tensor] = None
-        self._gemm1_alpha: Optional[torch.Tensor] = None
-        self._gemm1_beta: Optional[torch.Tensor] = None
+        self.gemm1_weights: torch.Tensor | None = None
+        self.gemm1_weights_scale: torch.Tensor | None = None
+        self.gemm2_weights: torch.Tensor | None = None
+        self.gemm2_weights_scale: torch.Tensor | None = None
+        self._gemm1_alpha: torch.Tensor | None = None
+        self._gemm1_beta: torch.Tensor | None = None
         if use_fused_cubin:
             # Fail before any weight processing when the platform cannot run
             # the fused path at all.
@@ -546,7 +593,7 @@ class KimiK3SparseMoeBlock(nn.Module):
 
         tokens_per_expert_cpu = tokens_per_expert.cpu().tolist()
 
-        outputs: List[torch.Tensor] = []
+        outputs: list[torch.Tensor] = []
         start = 0
         for i, n_tokens in enumerate(tokens_per_expert_cpu):
             end = start + int(n_tokens)
@@ -623,7 +670,7 @@ def copy_hf_moe_block_weights(
                     hf.routed_expert_norm.weight.data.to(k3.routed_expert_norm.weight.dtype)
                 )
 
-    shared_names: List[str] = []
+    shared_names: list[str] = []
     if k3.shared_experts is not None and hasattr(hf, "shared_experts"):
         with torch.no_grad():
             gate_up_fused = torch.cat(

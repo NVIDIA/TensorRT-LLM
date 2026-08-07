@@ -1,30 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Parity tests for the Kimi K3 MoE gate fused-routing fast path.
-
-``KimiK3MoEGate.forward`` routes eligible configs (per-expert sigmoid
-scoring, ``num_expert_group == 1``, renormalize on, no mutation controls,
-within the kernel's supported bounds) through the fused
-``torch.ops.trtllm.noaux_tc_op`` kernel via ``Deepseekv3RoutingImpl``.
-
-These tests assert:
-
-* the fused path is numerically equivalent to the eager
-  ``sigmoid -> +bias select -> top-k -> gather raw scores -> renormalize
-  (sum + 1e-20) -> scale`` reference it replaces (same experts selected,
-  same weights), and preserves the eager dtype contract (int64 indices,
-  fp32 weights) every downstream consumer relies on; and
-* ineligible configs (softmax scoring, grouped routing, renormalize off,
-  any mutation control) keep the eager reference path.
-"""
+"""Parity tests for the production Kimi K3 MoE routing method."""
 
 import dataclasses
 
 import pytest
 import torch
+from _torch.modules.moe.kimi_k3_moe_test_utils import KimiK3ReferenceMoEGate
 
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import \
-    KimiK3MoEGate
+from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 
 
 @dataclasses.dataclass
@@ -44,8 +28,9 @@ class _GateConfig:
     topk_group: int = 1
 
 
-def _dense_weights(topk_idx: torch.Tensor, topk_weight: torch.Tensor,
-                   num_experts: int) -> torch.Tensor:
+def _dense_weights(
+    topk_idx: torch.Tensor, topk_weight: torch.Tensor, num_experts: int
+) -> torch.Tensor:
     """Scatter per-token ``(index, weight)`` pairs into a dense
     ``[num_tokens, num_experts]`` map so the fused and eager outputs can be
     compared without depending on the (unsorted) top-k ordering."""
@@ -54,35 +39,25 @@ def _dense_weights(topk_idx: torch.Tensor, topk_weight: torch.Tensor,
     return dense
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(),
-                    reason="noaux_tc_op is a CUDA custom op")
-def test_fused_routing_matches_eager():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="noaux_tc_op is a CUDA custom op")
+def test_fused_routing_matches_eager_reference():
     torch.manual_seed(0)
     cfg = _GateConfig()
     gate = KimiK3MoEGate(cfg).cuda()
+    reference_gate = KimiK3ReferenceMoEGate(cfg).cuda()
     with torch.no_grad():
         gate.weight.normal_(0.0, 0.05)
         gate.e_score_correction_bias.normal_(0.0, 0.1)
-
-    # The stock K3 config takes the fused fast path.
-    assert gate._use_fused_routing is True
+        reference_gate.load_state_dict(gate.state_dict())
 
     num_tokens = 17
     hidden = torch.randn(1, num_tokens, cfg.hidden_size, device="cuda")
 
-    idx_fused, wt_fused = gate(hidden)
+    idx_eager, wt_eager = reference_gate(hidden)
+    idx_fused, wt_fused = gate.routing_method.apply(gate.compute_logits(hidden))
 
-    # Dtype/shape contract preserved for downstream consumers: the python
-    # fallback's ``scatter_`` needs int64 indices; the weighted sum consumes
-    # fp32 weights.
-    assert idx_fused.dtype == torch.int64
-    assert wt_fused.dtype == torch.float32
     assert idx_fused.shape == (num_tokens, cfg.num_experts_per_token)
     assert wt_fused.shape == (num_tokens, cfg.num_experts_per_token)
-
-    # Force the eager reference path on the same gate/weights/input.
-    gate._use_fused_routing = False
-    idx_eager, wt_eager = gate(hidden)
 
     # Same experts selected per token (top-k is unsorted, so compare sets).
     sel_fused = torch.sort(idx_fused, dim=-1).values
@@ -99,30 +74,12 @@ def test_fused_routing_matches_eager():
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "cfg,error",
     [
-        dict(softmax_routing_mutation=True),
-        dict(biased_weights_mutation=True),
-        dict(omit_renormalize_mutation=True),
+        (_GateConfig(moe_router_activation_func="softmax"), "requires sigmoid"),
+        (_GateConfig(moe_renormalize=False), "requires top-k weight renormalization"),
     ],
 )
-def test_mutation_controls_disable_fused_routing(kwargs):
-    # The mutation controls change the routing math, so they must fall back
-    # to the eager reference rather than the fused kernel.
-    gate = KimiK3MoEGate(_GateConfig(), **kwargs)
-    assert gate._use_fused_routing is False
-
-
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        _GateConfig(moe_router_activation_func="softmax"),
-        _GateConfig(num_expert_group=4, topk_group=2),
-        _GateConfig(moe_renormalize=False),
-        _GateConfig(num_experts_per_token=1),
-    ],
-)
-def test_ineligible_configs_disable_fused_routing(cfg):
-    # softmax scoring, grouped routing, renormalize off, and top_k == 1 all
-    # diverge from the fused kernel's fixed contract -> eager path.
-    assert KimiK3MoEGate(cfg)._use_fused_routing is False
+def test_invalid_config_rejected_by_production_routing(cfg, error):
+    with pytest.raises(ValueError, match=error):
+        _ = KimiK3MoEGate(cfg).routing_method
