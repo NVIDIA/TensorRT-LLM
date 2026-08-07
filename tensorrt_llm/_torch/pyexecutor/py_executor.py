@@ -4609,18 +4609,29 @@ class PyExecutor:
         ``V(tp_rank 0, cp_rank 0)``.  Dedicated sub-communicators are used rather
         than the global one, which carries regular executor traffic.
 
-        Attention DP is excluded for the same reason the scheduler's own
-        ``tp_broadcast`` excludes it: ADP ranks own independent request streams
-        and independent KV caches, so they legitimately need different pool
-        ratios at different times.  Forcing rank 0's decision on them would
+        Attention DP suppresses the **TP** hop only, matching the scheduler's
+        own propagation (``py_executor.py:2470-2477``), which likewise gates its
+        ``tp_broadcast`` on ``not enable_attention_dp`` while running its
+        ``cp_broadcast`` unconditionally.  Under ADP the TP dimension *is* the
+        DP dimension (``mapping.py``: ``dp_size = tp_size if
+        enable_attention_dp else 1``), so those ranks own independent request
+        streams and independent KV caches and legitimately need different pool
+        ratios at different times; forcing rank 0's decision on them would
         starve a rank that needs to rebalance when rank 0 does not.
+
+        CP is orthogonal to that and must **not** be skipped.  Within a single
+        DP replica the CP ranks still split the same request along the sequence
+        dimension, so they must admit it together for exactly the reason given
+        above for pure CP.  Nothing in ``Mapping`` or ``LlmArgs`` rejects
+        ``enable_attention_dp`` with ``cp_size > 1``, so skipping the CP hop
+        under ADP would reintroduce this PR's divergence inside every replica.
+        The net effect is that each DP replica decides on its own ``cp_rank``-0
+        reading, and its CP ranks follow it.
         """
         need = self.kv_cache_manager.impl.need_adjustment
-        if self.enable_attention_dp:
-            return need
         if self.dist.cp_size > 1:
             need = self.dist.cp_broadcast(need, root=0)
-        if self.dist.tp_size > 1:
+        if self.dist.tp_size > 1 and not self.enable_attention_dp:
             need = self.dist.tp_broadcast(need, root=0)
         return need
 

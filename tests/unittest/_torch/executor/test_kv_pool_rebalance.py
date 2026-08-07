@@ -557,8 +557,29 @@ class TestAgreedNeedAdjustment:
         exe.dist.cp_broadcast.assert_not_called()
         exe.dist.tp_broadcast.assert_not_called()
 
-    def test_attention_dp_skips_cp_broadcast_too(self):
+    def test_attention_dp_still_broadcasts_over_cp(self):
+        """ADP suppresses the TP hop only -- CP ranks must still agree.
+
+        Under ADP the TP dimension is the DP dimension, so those ranks own
+        independent request streams and decide independently.  But CP is
+        orthogonal: inside one DP replica the CP ranks split the *same* request
+        along the sequence dimension, so they have to admit it together.
+        Skipping the CP hop here would reintroduce the divergence this whole
+        mechanism exists to remove, once per replica.  This mirrors the
+        scheduler's own propagation, which gates ``tp_broadcast`` on
+        ``not enable_attention_dp`` but runs ``cp_broadcast`` unconditionally.
+        """
         exe = _make_executor(tp_size=2, cp_size=2, enable_attention_dp=True, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+
+        # The CP result wins over this rank's own reading...
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        # ...but the TP hop stays suppressed, so replicas remain independent.
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_attention_dp_without_cp_touches_no_collective(self):
+        exe = _make_executor(tp_size=2, cp_size=1, enable_attention_dp=True, need_adjustment=True)
         assert PyExecutor._agreed_need_adjustment(exe) is True
         exe.dist.cp_broadcast.assert_not_called()
         exe.dist.tp_broadcast.assert_not_called()
