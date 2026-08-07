@@ -291,6 +291,37 @@ def test_shutdown_fails_fast_without_waiting_out_the_timeout() -> None:
         assert time.monotonic() - start < 5.0, "did not fail fast on shutdown"
 
     assert not ex._control_action_lock.locked()
+    assert ex._control_action_owner is None
+
+
+def test_dead_worker_thread_fails_fast_without_waiting_out_the_timeout() -> None:
+    """A crashed executor loop must be caught with ``shutdown_event`` clear.
+
+    ``shutdown_event`` only covers the orderly path.  A worker that died
+    without setting it is the other half of the fast-fail condition, and is
+    reachable only through the liveness check -- ``_make_executor`` leaves
+    ``worker_thread`` unset, so every other test evaluates that half as
+    ``False`` and would not notice it breaking.
+    """
+    from tensorrt_llm._torch.pyexecutor import py_executor
+
+    ex = _make_executor()
+    ex.control_request_barrier.clear()
+    # shutdown_event stays CLEAR: only the worker liveness check can catch this.
+    ex.worker_thread = SimpleNamespace(is_alive=lambda: False)
+
+    with pytest.MonkeyPatch.context() as mp:
+        # Large timeout: if the dead worker were not detected this would hang.
+        mp.setattr(py_executor, "_CONTROL_BARRIER_TIMEOUT_S", 300.0)
+        mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="shut down"):
+            with ex.control_action(control_id="dead-worker"):
+                pytest.fail("should not have yielded with a dead worker")
+        assert time.monotonic() - start < 5.0, "did not fail fast on a dead worker"
+
+    assert not ex._control_action_lock.locked()
+    assert ex._control_action_owner is None
 
 
 def test_lock_and_owner_are_released_when_the_body_raises() -> None:
