@@ -23,7 +23,7 @@ functions plus their metadata dataclasses; no dependency on the
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, TypeAlias, cast
 
 import torch
 
@@ -751,7 +751,23 @@ def _cba_step_math(
 # Compiled lazily on first use; the first CBA-mode request of a process pays
 # the inductor compile once (subsequent shapes are covered by the dynamic
 # batch/snapshot-length dims marked at the call site).
-_cba_step_compiled = torch.compile(_cba_step_math, dynamic=None, fullgraph=True)
+#
+# Dynamo counts recompiles per code object for the lifetime of the process, and
+# fullgraph turns exhaustion into a hard failure rather than a fallback to
+# eager. A served engine sees one shape family and never approaches the default
+# cap of 8, but a process that builds many engines -- a test session, or a
+# worker reused across configurations -- does. Give this one function its own
+# headroom so a later engine in the same process still compiles; the cap exists
+# to catch runaway recompilation, not as a correctness property.
+_CBA_RECOMPILE_LIMIT = 256
+
+
+def _cba_step_compiled(*args: Any, **kwargs: Any) -> CBAStepResult:
+    with torch._dynamo.config.patch(recompile_limit=_CBA_RECOMPILE_LIMIT):
+        return _cba_step_compiled_inner(*args, **kwargs)
+
+
+_cba_step_compiled_inner = torch.compile(_cba_step_math, dynamic=None, fullgraph=True)
 
 
 def beam_search_sampling_batch_cba(
