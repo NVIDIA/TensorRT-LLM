@@ -1590,6 +1590,7 @@ class Indexer(nn.Module):
 
         reuse_topk = (
             self.mtp_index_share
+            and metadata.in_mtp_draft_loop
             and metadata.indexer_skip_topk
             and metadata.shared_topk_indices is not None
         )

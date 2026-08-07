@@ -45,6 +45,13 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
 
+def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Map each flattened-batch token to its request index."""
+    cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+    token_idx = torch.arange(num_tokens, device=seq_lens.device, dtype=torch.int32)
+    return torch.searchsorted(cu_seq_lens, token_idx, right=True)
+
+
 @dataclass(init=False)
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
@@ -287,13 +294,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
+
+        # The draft loop can rewrite seq_lens after prepare() built this map.
+        if self.num_tokens > 0:
+            self.req_idx_per_token[: self.num_tokens] = build_req_idx_per_token(
+                self.seq_lens_cuda[: self.num_seqs], self.num_tokens
+            ).to(self.req_idx_per_token.dtype)
+
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[: self.num_seqs] - seq_lens
 
-            # Reuse request-per-token mapping prepared in metadata.prepare().
-            # This avoids repeat_interleave in graph-capture mode.
             req_indices = self.req_idx_per_token[: self.num_tokens].to(dtype=torch.int64)
             seq_starts = torch.cumsum(seq_lens, dim=0, dtype=torch.int64) - seq_lens.to(torch.int64)
             token_offsets = (
