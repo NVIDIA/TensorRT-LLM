@@ -33,56 +33,36 @@ from tensorrt_llm.lora_helper import LoraConfig
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
-def test_eagle_metadata_restore_preserves_derived_query_counts() -> None:
-
-    class Metadata:
-
-        def __init__(self) -> None:
-            self._seq_lens = torch.ones(1, dtype=torch.int32)
-            self._seq_lens_cuda = torch.ones(1, dtype=torch.int32)
-            self._saved_tensors = {}
-            self._num_tokens = 4
-            self._num_ctx_tokens = 0
-            self._num_generations = 1
-            self.spec_decoding_packed_mask = None
-            self.spec_decoding_position_offsets = None
-            self.spec_decoding_position_offsets_cpp = None
-            self.spec_decoding_generation_lengths = None
-
-        @property
-        def num_seqs(self) -> int:
-            return self._seq_lens.shape[0]
-
-        def prepare_for_spec_dec(self, *fields: str) -> None:
-            for field in fields:
-                value = getattr(self, field)
-                self._saved_tensors[field] = value
-                setattr(self, field, value.clone())
-
-        def restore_from_spec_dec(self) -> None:
-            for field, value in self._saved_tensors.items():
-                setattr(self, field, value)
-            self._saved_tensors.clear()
-
-        def on_update(self) -> None:
-            self._num_tokens = int(self._seq_lens.sum())
-            self._num_ctx_tokens = 0
-            self._num_generations = self._seq_lens.shape[0]
-
-    metadata = Metadata()
-    worker = object.__new__(Eagle3OneModelWorker)
-    worker._prepare_attn_metadata_for_spec_dec(metadata)
-    metadata._seq_lens.zero_()
-    metadata._seq_lens_cuda.zero_()
+def test_eagle_metadata_restore_preserves_context_metadata() -> None:
+    metadata = TrtllmAttentionMetadata(
+        seq_lens=None,
+        seq_lens_kv=None,
+        num_contexts=1,
+        max_num_requests=2,
+        max_num_tokens=4,
+    )
+    metadata._seq_lens = torch.tensor([3, 1], dtype=torch.int32)
+    metadata._seq_lens_cuda = metadata._seq_lens.clone()
     metadata.on_update()
-    assert metadata._num_tokens == 0
+    worker = object.__new__(Eagle3OneModelWorker)
+    worker._saved_num_contexts = None
+    worker._prepare_attn_metadata_for_spec_dec(metadata)
+    metadata._seq_lens.fill_(1)
+    metadata._seq_lens_cuda.fill_(1)
+    metadata.on_update()
+    metadata.num_contexts = 0
+    assert metadata.num_contexts == 0
+    assert metadata.num_ctx_tokens == 0
+    assert metadata.num_generations == 2
 
     worker._restore_attn_metadata_from_spec_dec(metadata)
 
     assert metadata._num_tokens == 4
-    assert metadata._num_ctx_tokens == 0
+    assert metadata.num_contexts == 1
+    assert metadata.num_ctx_tokens == 3
     assert metadata._num_generations == 1
-    assert worker._saved_token_counts is None
+    assert metadata.context_lens.tolist() == [3]
+    assert worker._saved_num_contexts is None
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
