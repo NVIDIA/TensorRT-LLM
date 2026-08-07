@@ -3005,18 +3005,18 @@ files = [
 
 [[package]]
 name = "pybind11"
-version = "3.0.4"
+version = "3.1.0"
 description = "Seamless operability between C++11 and Python"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pybind11-3.0.4-py3-none-any.whl", hash = "sha256:961720ee652da51d531b7b2451a6bd2bc042b0106e6d9baa48ecb7d58034ce63"},
-    {file = "pybind11-3.0.4.tar.gz", hash = "sha256:3286b59c8a774b9ee650169302dd5a4eedc30a8617905a0560dd8ee44775130c"},
+    {file = "pybind11-3.1.0-py3-none-any.whl", hash = "sha256:b8488090f8acffbcb6b5d6a85571a6827a0a2981ffb75e5a0b27b87c4a6b7dd0"},
+    {file = "pybind11-3.1.0.tar.gz", hash = "sha256:a1cc06b524ab3edca51f8ad3895f9c4fa20b8b19283173dff4ae781449dc9639"},
 ]
 
 [package.extras]
-global = ["pybind11-global (==3.0.4)"]
+global = ["pybind11-global (==3.1.0)"]
 
 [[package]]
 name = "pygments"
