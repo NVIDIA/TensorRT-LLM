@@ -48,11 +48,22 @@ class _Item:
         return self._marker
 
 
-def _make(tmp_path, **kwargs):
+class _Report:
+    """Minimal stand-in for a pytest TestReport."""
+
+    def __init__(self, when, nodeid="pkg/test_x.py::test_y"):
+        self.when = when
+        self.nodeid = nodeid
+
+
+def _make(tmp_path, dump_hang_traceback=True, **kwargs):
     reporter = PeriodicJUnitXML(
-        xmlpath=os.path.join(tmp_path, "results.xml"), dump_hang_traceback=True, **kwargs
+        xmlpath=os.path.join(tmp_path, "results.xml"),
+        dump_hang_traceback=dump_hang_traceback,
+        **kwargs,
     )
-    reporter._setup_hang_dump()
+    if dump_hang_traceback:
+        reporter._setup_hang_dump()
     return reporter
 
 
@@ -76,11 +87,25 @@ def test_hang_dumps_traceback(tmp_path):
     assert "Thread" in content or 'File "' in content
 
 
+def test_subsecond_timeout_dumps_before_the_kill(tmp_path):
+    # pytest-timeout accepts fractional seconds, so the watchdog must not floor the
+    # delay at 1s -- that would arm it after such a test had already been killed.
+    reporter = _make(str(tmp_path), hang_dump_fraction=0.5)
+    reporter.pytest_runtest_setup(_Item(timeout_opt=0.5))
+    time.sleep(0.4)  # still inside the 0.5s timeout window
+    content = open(reporter._hang_traceback_path(), encoding="utf-8").read()
+    assert "hang watchdog fired for pkg/test_x.py::test_y" in content
+
+
 def test_completed_test_is_not_dumped(tmp_path):
+    # The teardown report arrives after every fixture finalizer, so it must disarm
+    # the watchdog; nothing may be dumped for an item that already finished.
     reporter = _make(str(tmp_path), hang_dump_fraction=0.5)
     reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
     time.sleep(0.2)
-    reporter._cancel_hang_timer()  # what the next setup / sessionfinish does
+    for when in ("setup", "call", "teardown"):
+        reporter.pytest_runtest_logreport(_Report(when))
+    assert reporter._hang_timer is None
     time.sleep(1.2)  # past the would-be dump point
     assert os.path.getsize(reporter._hang_traceback_path()) == 0
 
@@ -89,3 +114,14 @@ def test_no_watchdog_without_timeout(tmp_path):
     reporter = _make(str(tmp_path))
     reporter.pytest_runtest_setup(_Item())  # no timeout -> nothing armed
     assert reporter._hang_timer is None
+
+
+def test_hang_traceback_off_by_default(tmp_path):
+    # --periodic-hang-traceback defaults to False; the reporter must then arm no
+    # watchdog and leave no sidecar file behind.
+    reporter = _make(str(tmp_path), dump_hang_traceback=False)
+    assert reporter.dump_hang_traceback is False
+    reporter.pytest_runtest_setup(_Item(timeout_opt=1.0))
+    assert reporter._hang_timer is None
+    assert reporter._hang_file is None
+    assert not os.path.exists(reporter._hang_traceback_path())
