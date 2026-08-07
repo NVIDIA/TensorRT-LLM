@@ -5384,11 +5384,7 @@ class PyExecutor:
             state = request.py_mm_encoder_state
             if state is None or is_multimodal_encoder_ready(request):
                 continue
-            mm_data = request.py_multimodal_data or {}
-            item_metadata = get_multimodal_encoder_item_metadata(mm_data)
-            if item_metadata is None:
-                continue
-            consume_pending(item_metadata.encoder_token_lengths,
+            consume_pending(state.encoder_token_lengths,
                             state.pending_item_indices())
 
         admitted = []
@@ -5399,8 +5395,16 @@ class PyExecutor:
                 deferred.append(queue_item)
                 continue
             mm_data = getattr(queue_item.request, "py_multimodal_data", None)
-            item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
-                             if isinstance(mm_data, dict) else None)
+            try:
+                item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
+                                 if isinstance(mm_data, dict) else None)
+            except (TypeError, ValueError):
+                # Admission only estimates capacity. Pass malformed requests
+                # through so the normal request-scoped validation path can
+                # report the error without terminating the executor loop or
+                # blocking later FCFS entries behind an invalid request.
+                admitted.append(queue_item)
+                continue
             costs = (item_metadata.encoder_token_lengths
                      if item_metadata is not None else None)
             has_full_embedding = (isinstance(mm_data, dict)
