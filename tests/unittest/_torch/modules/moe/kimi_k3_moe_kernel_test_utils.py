@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Native TRTLLM-Gen SiTU MoE dispatch for the in-tree Kimi K3 sparse MoE block.
+"""Test-only native SiTU dispatch for the Kimi K3 sparse MoE reference.
 
 The K3 MoE block has two mutually exclusive kernel paths:
 

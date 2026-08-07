@@ -27,15 +27,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 from _torch.modules.moe import kimi_k3_moe_test_utils
-from _torch.modules.moe.kimi_k3_moe_test_utils import KimiK3SparseMoeBlock
-from utils.util import check_accuracy
-
-from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
-from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
+from _torch.modules.moe.kimi_k3_moe_kernel_test_utils import (
     is_native_situ_supported,
     make_situ_alpha_beta,
     padded_fused_shapes,
 )
+from _torch.modules.moe.kimi_k3_moe_test_utils import KimiK3ReferenceMoEGate, KimiK3SparseMoeBlock
+from utils.util import check_accuracy
+
+from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
@@ -140,7 +140,7 @@ def test_padded_fused_shapes():
 
 def test_kimi_gate_reuses_deepseek_v3_routing():
     config = _K3Config(num_experts=16, num_experts_per_token=4)
-    gate = KimiK3MoEGate(config)
+    gate = KimiK3ReferenceMoEGate(config)
     torch.manual_seed(23)
     with torch.no_grad():
         gate.weight.normal_(std=0.1)
@@ -348,7 +348,7 @@ def test_fc1_swap_mutation_breaks_accuracy():
     fused, ref = _make_block_pair(config, device)
 
     # Rebuild the fused buffers with w1/w3 swapped.
-    from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import pack_routed_expert_weights
+    from _torch.modules.moe.kimi_k3_moe_kernel_test_utils import pack_routed_expert_weights
 
     swapped = pack_routed_expert_weights(
         w1_packed=fused.expert_bank.w3_packed,
@@ -377,7 +377,7 @@ def test_swiglu_act_mutation_breaks_accuracy():
     config = _K3Config()
     fused, ref = _make_block_pair(config, device)
 
-    import tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels as mk
+    from _torch.modules.moe import kimi_k3_moe_kernel_test_utils as mk
 
     torch.manual_seed(17)
     x = torch.randn(1, 64, config.hidden_size, dtype=torch.bfloat16, device=device) * 0.5
