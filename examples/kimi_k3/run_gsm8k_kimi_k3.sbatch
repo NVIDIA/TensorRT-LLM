@@ -81,17 +81,13 @@ done
 
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
-# Per-mode LLM options.
-# - reuse: KV-cache block reuse; drops --disable_kv_cache_reuse so the
-#   yaml's enable_block_reuse takes effect.
-MAX_BATCH_SIZE=32
-MAX_NUM_TOKENS=8192
-KV_FRAC=0.25
-KV_REUSE_ARG="--disable_kv_cache_reuse"
+# Per-mode LLM options. All engine options live in the selected yaml
+# (single source of truth); trtllm-eval lets explicit CLI flags override
+# --config, so none are duplicated here.
+# - reuse: KV-cache block reuse (enable_block_reuse: true in the yaml).
 case "$MODE" in
     reuse)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_reuse.yaml
-        KV_REUSE_ARG=""
         ;;
     *)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
@@ -157,13 +153,6 @@ srun --mpi=pmix \
             '$REPO/.venv-3.12/bin/trtllm-eval' \
             --model \"$MODEL\" \
             --backend pytorch \
-            --tp_size 16 \
-            --max_batch_size $MAX_BATCH_SIZE \
-            --max_seq_len 8192 \
-            --max_num_tokens $MAX_NUM_TOKENS \
-            --kv_cache_free_gpu_memory_fraction $KV_FRAC \
-            $KV_REUSE_ARG \
-            --trust_remote_code \
             --config '$EVAL_CONFIG' \
             gsm8k
     "

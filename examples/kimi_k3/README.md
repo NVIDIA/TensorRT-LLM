@@ -163,10 +163,12 @@ Chunked prefill is supported and enabled by default in this example
 (`enable_chunked_prefill: true` in the quick start and in
 `eval_extra_llm_options.yaml`).
 
-KV-cache block reuse is supported as an opt-in: set
-`kv_cache_config.enable_block_reuse: true`, or use the example flags —
-`--enable-block-reuse` for the quick start and `--reuse` for the GSM8K
-job (which selects `eval_extra_llm_options_reuse.yaml`):
+KV-cache block reuse is supported. The LLM API enables it by default
+(`KvCacheConfig.enable_block_reuse` defaults to `true`), but the example
+configurations here explicitly disable it and treat reuse as an opt-in:
+set `kv_cache_config.enable_block_reuse: true`, or use the example
+flags — `--enable-block-reuse` for the quick start and `--reuse` for the
+GSM8K job (which selects `eval_extra_llm_options_reuse.yaml`):
 
 ```bash
 sbatch examples/kimi_k3/quick_start_kimi_k3.sbatch \
@@ -176,8 +178,9 @@ sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
     --model MODEL --image IMAGE --reuse
 ```
 
-Block reuse stays off by default; the tested evaluation and serving
-configurations run with the default cache manager.
+Unless one of the flags above is passed, these examples run with block
+reuse disabled; the tested evaluation and serving configurations use the
+default cache manager.
 
 ## Current limitations
 
