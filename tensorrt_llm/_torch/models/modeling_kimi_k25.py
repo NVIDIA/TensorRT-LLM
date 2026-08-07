@@ -355,7 +355,7 @@ def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
-def _vision_requires_replication(model_config: ModelConfig) -> bool:
+def _vision_requires_replication(model_config: ModelConfig, num_heads: int) -> bool:
     """Whether the MoonViT vision tower must run replicated (tp=1) rather than
     tensor-parallel sharded across the attention-TP ranks.
 
@@ -363,26 +363,20 @@ def _vision_requires_replication(model_config: ModelConfig) -> bool:
 
     * attention data-parallelism is enabled (attention weights are already
       replicated per rank), or
-    * the vision attention head count is not divisible by the attention-TP
-      degree (e.g. Kimi K3's 12 heads under TP16). Such a tower cannot be
-      TP-sharded at all, so it must be replicated instead of tripping the
-      ``num_heads % tp_size`` assertion in :class:`Attention`.
+    * ``num_heads`` — the tower's attention head count, resolved by the caller
+      with its per-model default (16 for K2.5, 12 for K3) — is not divisible
+      by the attention-TP degree (e.g. Kimi K3's 12 heads under TP16). Such a
+      tower cannot be TP-sharded at all, so it must be replicated instead of
+      tripping the ``num_heads % tp_size`` assertion in :class:`Attention`.
     """
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
         return True
-    vision_cfg = getattr(model_config.pretrained_config, "vision_config",
-                         None) or {}
-    if not isinstance(vision_cfg, dict):
-        vision_cfg = (vision_cfg.to_dict()
-                      if hasattr(vision_cfg, "to_dict") else vars(vision_cfg))
-    num_heads = vision_cfg.get("vt_num_attention_heads",
-                               vision_cfg.get("num_attention_heads", 12))
     return (num_heads % mapping.tp_size) != 0
 
 
-def _get_vision_tp_mapping(model_config: ModelConfig) -> Mapping:
-    if not _vision_requires_replication(model_config):
+def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping:
+    if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
     return Mapping(
@@ -720,6 +714,7 @@ class PatchMergerMLP(nn.Module):
         model_config: ModelConfig,
         mm_hidden_size: int,
         text_hidden_size: int,
+        num_heads: int,
         merge_kernel_size: Tuple[int, int] = (2, 2),
         ln_eps: float = 1e-5,
     ) -> None:
@@ -731,7 +726,7 @@ class PatchMergerMLP(nn.Module):
             eps=ln_eps,
             dtype=model_config.torch_dtype,
         )
-        mapping = _get_vision_tp_mapping(model_config)
+        mapping = _get_vision_tp_mapping(model_config, num_heads)
         self.proj = nn.Sequential(
             Linear(
                 self.merged_dim,
@@ -796,13 +791,28 @@ class KimiK25VisionModel(nn.Module):
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
         )
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
+
+        # Extract vision config dict (num_heads is resolved here, with this
+        # model's default of 16 heads, because the TP-replication decision
+        # below must use the same head count the tower is built with).
+        vision_cfg = getattr(self.model_config.pretrained_config, "vision_config", {})
+        if vision_cfg is None:
+            vision_cfg = {}
+        if not isinstance(vision_cfg, dict):
+            vision_cfg = (
+                vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
+            )
+        num_heads = vision_cfg.get(
+            "vt_num_attention_heads", vision_cfg.get("num_attention_heads", 16)
+        )
+
         # The MoonViT tower cannot be tensor-parallel sharded when its attention
         # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
         # 12 heads under TP16); run the whole tower replicated (tp=1) in that
         # case so module construction and weight loading agree. Attention-DP
         # already replicates the vision tower via its own path, so leave it be.
         if not model_config.mapping.enable_attention_dp:
-            self.model_config.mapping = _get_vision_tp_mapping(model_config)
+            self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
         model_dtype = (
             getattr(pretrained_config, "torch_dtype", None)
@@ -813,21 +823,9 @@ class KimiK25VisionModel(nn.Module):
             model_dtype = getattr(torch, model_dtype, torch.bfloat16)
         pretrained_config.torch_dtype = model_dtype
 
-        # Extract vision config dict
-        vision_cfg = getattr(pretrained_config, "vision_config", {})
-        if vision_cfg is None:
-            vision_cfg = {}
-        if not isinstance(vision_cfg, dict):
-            vision_cfg = (
-                vision_cfg.to_dict() if hasattr(vision_cfg, "to_dict") else vars(vision_cfg)
-            )
-
         # Read HF-prefixed names with unprefixed fallback
         hidden_dim = vision_cfg.get("vt_hidden_size", vision_cfg.get("hidden_size", 1152))
         num_layers = vision_cfg.get("vt_num_hidden_layers", vision_cfg.get("num_hidden_layers", 27))
-        num_heads = vision_cfg.get(
-            "vt_num_attention_heads", vision_cfg.get("num_attention_heads", 16)
-        )
         self.model_config.pretrained_config.head_dim = hidden_dim // num_heads
         self.model_config._frozen = True
         mlp_dim = vision_cfg.get("vt_intermediate_size", vision_cfg.get("intermediate_size", 4304))
@@ -878,6 +876,7 @@ class KimiK25VisionModel(nn.Module):
             self.model_config,
             mm_hidden_size,
             self.text_hidden_size,
+            num_heads,
             self.merge_kernel_size,
             ln_eps,
         )
