@@ -28,8 +28,6 @@
 
 #include "RoutingCustomPolicy.cuh"
 
-#include <tensorrt_llm/common/envUtils.h>
-
 namespace moe::dev::routing
 {
 namespace routingCustom
@@ -1228,19 +1226,10 @@ void run(Data const& data, void* stream)
 
     static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
 
+    bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
     int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
-    bool const dynBlockEligible
-        = data.mNumTokens <= DynBlockKernelMaxNumTokens && dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
-    // The static block kernel claims every batch it can handle, but the dynamic
-    // one was written to beat it exactly there: a warp per token instead of a
-    // batch loop, and a fused scan with half the barriers. Neither has been
-    // measured against the other at <= BlockKernelMaxNumTokens, which is the
-    // decode regime for a speculative model. The override hands those batches
-    // to the dynamic kernel so both can be timed from one build.
-    static bool const preferDynBlock = tensorrt_llm::common::getBoolEnv("TRTLLM_MOE_ROUTING_PREFER_DYN_BLOCK");
-    bool const useStaticBlock
-        = data.mNumTokens <= BlockKernelMaxNumTokens && !(preferDynBlock && dynBlockEligible);
-    bool const useDynBlock = !useStaticBlock && dynBlockEligible;
+    bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens
+        && dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
     bool const useSingleBlock = useStaticBlock || useDynBlock;
     bool const useSingleCluster = (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensSingleClusterScores);
 
