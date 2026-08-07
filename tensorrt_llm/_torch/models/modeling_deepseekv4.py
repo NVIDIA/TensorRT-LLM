@@ -73,7 +73,7 @@ from ..modules.fused_moe import (
     TritonFusedMoE,
     TRTLLMGenFusedMoE,
     create_moe,
-    get_moe_cls,
+    resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
@@ -1504,10 +1504,22 @@ class DeepseekV4MoE(nn.Module):
         moe_swiglu_limit = None
         if swiglu_limit is not None:
             # `create_moe` only accepts swiglu_limit for these MoE classes;
-            # resolve via get_moe_cls so backend-string fallbacks (e.g.
-            # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
-            # unsupported quant) are handled correctly.
-            moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            # ask the resolver rather than the backend string so that a
+            # degradation (e.g. TRTLLM/CUTEDSL/DENSEGEMM dropping back to
+            # CutlassFusedMoE on unsupported quant) is accounted for here too.
+            moe_cls = resolve_moe_cls(
+                model_config,
+                override_quant_config=experts_quant_config,
+                dtype=dtype,
+                # Same routing object as create_moe below.
+                routing=self.gate.routing_method,
+                # create_moe below passes no bias and no swiglu alpha/beta, so
+                # it resolves with the plain SwiGLU package. Say so here too:
+                # leaving this unknown lets gates abstain that create_moe
+                # rejects, and the two calls would pick different backends.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            )
             supports_swiglu_limit = moe_cls in (
                 CutlassFusedMoE,
                 TritonFusedMoE,

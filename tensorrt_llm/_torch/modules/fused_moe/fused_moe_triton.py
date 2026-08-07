@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -33,13 +33,18 @@ from triton_kernels.tensor import Tensor as TritonTensor
 from triton_kernels.tensor import convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
-from .interface import MoE
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
+                            MoERejectReason)
+from .interface import MoE, _reject
 from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
                            load_activation_scales_fp8_qdq,
                            requantize_expert_w3_w1_weight_fp8_qdq)
-from .routing import BaseMoeRoutingMethod, RenormalizeMoeRoutingMethod
+from .routing import (ROUTING_METHOD_TYPE_TO_CLASS, BaseMoeRoutingMethod,
+                      RenormalizeMoeRoutingMethod)
 
 
 # Triton kernels has hardcoded beta = 1, so we use this implementation when beta is not 1
@@ -1468,70 +1473,73 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 class TritonFusedMoE(MoE):
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional["QuantAlgo"],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Triton MoE: SM90 only, and only the gpt-oss style swiglu.
+
+        Supports unquantized BF16, FP8 per-tensor QDQ, W4A8_MXFP4_FP8 and
+        W4A16_MXFP4.
         """
-        Check if TritonFusedMoE can implement the given quantization algorithm.
-
-        TritonFusedMoE supports (SM90 only, swiglu_gptoss_style=True only):
-        - Unquantized (BF16 only)
-        - FP8 per-tensor (QDQ)
-        - W4A8_MXFP4_FP8
-        - W4A16_MXFP4
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation data type. In unquantized mode, activation,
-                weight, and output dtypes must all match (only bfloat16 supported).
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                TritonFusedMoE ONLY supports swiglu_gptoss_style=True.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from tensorrt_llm._utils import get_sm_version
-        from tensorrt_llm.models.modeling_utils import QuantAlgo
-
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
 
         # TritonFusedMoE only supports SM90
         if sm_version != 90:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
                 f"TritonFusedMoE only supports SM90, got SM{sm_version}")
 
-        # TritonFusedMoE ONLY supports swiglu_gptoss_style=True
-        if not swiglu_gptoss_style:
-            return _warn_and_return(
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "TritonFusedMoE does not implement the EPLB slot hooks")
+
+        # Require gpt-oss SwiGLU; abstain when the style is unknown.
+        if p.swiglu_gptoss_style is False:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "TritonFusedMoE only supports swiglu_gptoss_style=True")
+
+        if d.smart_router:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"TritonFusedMoE has no smart-router path (moe_cluster_size="
+                f"{d.cluster_size})")
+
+        # Require renormalize-family routing; abstain when routing is unknown.
+        routing_type = p.routing_method_type
+        if routing_type is not None and not issubclass(
+                ROUTING_METHOD_TYPE_TO_CLASS[routing_type],
+                RenormalizeMoeRoutingMethod):
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"TritonFusedMoE fuses renormalize routing only, got {p.routing}"
+            )
 
         # Unquantized mode - only bfloat16 is supported
         if quant_algo is None:
-            if dtype_activation != torch.bfloat16:
-                return _warn_and_return(
-                    f"TritonFusedMoE unquantized mode only supports bfloat16, got {dtype_activation}"
+            if p.dtype_act != torch.bfloat16:
+                return _reject(
+                    MoERejectReason.DTYPE_UNSUPPORTED,
+                    f"TritonFusedMoE unquantized mode only supports bfloat16, got {p.dtype_act}"
                 )
-            return True, None
+            return MoEEligibility.ok()
 
-        # FP8 per-tensor (QDQ) and W4A8_MXFP4_FP8 - no dtype_activation restriction
+        # FP8 per-tensor (QDQ) and W4A8_MXFP4_FP8 - no activation dtype restriction
         if quant_algo in {QuantAlgo.FP8, QuantAlgo.W4A8_MXFP4_FP8}:
-            return True, None
+            return MoEEligibility.ok()
 
         # W4A16_MXFP4 - only bfloat16 and float16 are supported
         if quant_algo == QuantAlgo.W4A16_MXFP4:
-            if dtype_activation not in {torch.bfloat16, torch.float16}:
-                return _warn_and_return(
+            if p.dtype_act not in {torch.bfloat16, torch.float16}:
+                return _reject(
+                    MoERejectReason.DTYPE_UNSUPPORTED,
                     f"TritonFusedMoE W4A16_MXFP4 only supports bfloat16 or float16, "
-                    f"got {dtype_activation}")
-            return True, None
+                    f"got {p.dtype_act}")
+            return MoEEligibility.ok()
 
         # Unsupported quantization algorithm
-        return _warn_and_return(
+        return _reject(
+            MoERejectReason.QUANT_UNSUPPORTED,
             f"TritonFusedMoE does not support quant_algo={quant_algo}")
 
     def __init__(
@@ -1563,13 +1571,8 @@ class TritonFusedMoE(MoE):
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
         )
-        if torch.cuda.get_device_capability()[0] != 9 and self.ep_size > 1:
-            raise NotImplementedError(
-                "TritonFusedMoE is only supported on Hopper with EP size > 1.")
-
-        assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
-            "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
-        assert not self.smart_router, "Smart router is not supported in TritonFusedMoE."
+        # Eligibility (SM / routing / smart_router / quant) is owned by
+        # ``can_implement``; do not re-assert it here.
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
