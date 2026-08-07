@@ -110,6 +110,35 @@ def test_parse_disagg_config_file(sample_yaml_file, sample_yaml_config):
     verify_disagg_config(config, sample_yaml_config)
 
 
+def test_parse_disagg_config_file_rejects_empty_file(tmp_path):
+    config_file = tmp_path / "empty.yaml"
+    config_file.write_text("")
+
+    with pytest.raises(ValueError, match="Disaggregated config file is empty"):
+        parse_disagg_config_file(config_file)
+
+
+def test_parse_disagg_config_file_validates_schedule_style_override(tmp_path):
+    config_file = tmp_path / "pipelined.yaml"
+    config_file.write_text(
+        yaml.safe_dump({
+            "schedule_style": "generation_first",
+            "context_servers": {
+                "cache_transceiver_config": {
+                    "enable_pipelined_transfer": True,
+                },
+            },
+            "generation_servers": {},
+        }))
+
+    with pytest.raises(
+            ValueError,
+            match="enable_pipelined_transfer=True requires top-level "
+            "schedule_style='generation_first'"):
+        parse_disagg_config_file(config_file,
+                                 schedule_style_override="context_first")
+
+
 @pytest.mark.parametrize("sample_yaml_config", ["disagg_cluster", ""],
                          indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
@@ -232,6 +261,70 @@ def test_extract_disagg_cfg_rejects_non_string_internal_request_auth_key():
             ValueError,
             match="internal_request_auth_key must be a non-empty string"):
         extract_disagg_cfg(internal_request_auth_key=123)
+
+
+@pytest.mark.parametrize("server_group",
+                         ["context_servers", "generation_servers"])
+def test_extract_disagg_cfg_rejects_pipelined_transfer_with_context_first(
+        server_group):
+    server_configs = {
+        "context_servers": {},
+        "generation_servers": {},
+    }
+    server_configs[server_group] = {
+        "cache_transceiver_config": {
+            "enable_pipelined_transfer": True,
+        },
+    }
+
+    with pytest.raises(
+            ValueError,
+            match="enable_pipelined_transfer=True requires top-level "
+            "schedule_style='generation_first'"):
+        extract_disagg_cfg(schedule_style="context_first", **server_configs)
+
+
+def test_extract_disagg_cfg_allows_pipelined_transfer_with_generation_first():
+    config = extract_disagg_cfg(
+        schedule_style="generation_first",
+        context_servers={
+            "cache_transceiver_config": {
+                "enable_pipelined_transfer": True,
+            },
+        },
+        generation_servers={},
+    )
+
+    assert config.schedule_style == "generation_first"
+
+
+def test_extract_disagg_cfg_rejects_invalid_schedule_style():
+    with pytest.raises(ValueError, match="schedule_style must be one of"):
+        extract_disagg_cfg(
+            schedule_style="generation-first",
+            context_servers={},
+            generation_servers={},
+        )
+
+
+@pytest.mark.parametrize(
+    "cache_transceiver_config, expected_error",
+    [
+        ({
+            "enable_pipelined_transfer": 1
+        }, "enable_pipelined_transfer must be a boolean"),
+        ([], "cache_transceiver_config must be a mapping"),
+    ],
+)
+def test_extract_disagg_cfg_rejects_invalid_cache_transceiver_config(
+        cache_transceiver_config, expected_error):
+    with pytest.raises(ValueError, match=expected_error):
+        extract_disagg_cfg(
+            context_servers={
+                "cache_transceiver_config": cache_transceiver_config,
+            },
+            generation_servers={},
+        )
 
 
 def test_extract_ctx_gen_cfgs():

@@ -20,7 +20,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -345,7 +345,6 @@ def worker_fn(
             send_kv_slice = KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=[block_ids],
-                token_range=TokenRange(start=0, end=req_len),
             )
             sender_session.send(send_kv_slice)
 
@@ -391,7 +390,6 @@ def worker_fn(
             recv_kv_slice = KVSlice(
                 is_last_slice=True,
                 block_ids_per_layer_groups=[block_ids],
-                token_range=TokenRange(start=0, end=req_len),
             )
             receiver_session.receive(recv_kv_slice)
 
