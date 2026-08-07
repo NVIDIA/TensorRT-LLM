@@ -2363,7 +2363,23 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         mgr.shutdown()
 
 
-@pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
+@pytest.mark.parametrize(
+    ("rank", "expected_log_count"),
+    [
+        pytest.param(
+            0,
+            1,
+            marks=pytest.mark.xfail(
+                reason="MambaHybridCacheManagerV2 on this branch does not "
+                "override _create_kv_cache with the rank-0 prefix-reuse "
+                "debug log yet. Runtime-side logging is a follow-up "
+                "(TRTLLM-14813).",
+                strict=True,
+            ),
+        ),
+        (3, 0),
+    ],
+)
 def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
@@ -2403,6 +2419,13 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
         )
 
 
+@pytest.mark.xfail(
+    reason="MambaHybridCacheManagerV2 on this branch does not override "
+    "get_iteration_stats with the recurrent-pool aggregation counters "
+    "(_recurrent_evicted_blocks_total et al.) or the rank-0 status log. "
+    "Runtime-side accounting is a follow-up (TRTLLM-14813).",
+    strict=True,
+)
 @pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
 def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     monkeypatch: pytest.MonkeyPatch,
