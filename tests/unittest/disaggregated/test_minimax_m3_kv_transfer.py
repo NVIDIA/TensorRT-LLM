@@ -27,6 +27,7 @@ are exercised by the topology matrix below.
 
 from collections.abc import Sequence
 from types import SimpleNamespace
+from typing import Any
 
 import kv_transfer_harness as transfer_harness
 import pytest
@@ -99,9 +100,11 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
     [("triton", MapperKind.NHD), ("msa", MapperKind.INDEXED)],
 )
 def test_minimax_disagg_role_mapper_kinds(
-    monkeypatch, implementation, expected_main_mapper
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+    expected_main_mapper: MapperKind,
 ) -> None:
-    def fake_base_init(self, *args, **kwargs):
+    def fake_base_init(self: KVCacheManagerV2, *args: Any, **kwargs: Any) -> None:
         self.is_disagg = kwargs.get("is_disagg", False)
         self.dtype = kwargs.get("dtype", DataType.BF16)
         self.layer_offsets = {}
@@ -657,7 +660,9 @@ def test_minimax_m3_kv_transfer(
     [True, False],
     ids=["update_before", "update_after"],
 )
-def test_minimax_m3_msa_hnd_head_mismatch_transfer(update_before_transfer) -> None:
+def test_minimax_m3_msa_hnd_head_mismatch_transfer(
+    update_before_transfer: bool,
+) -> None:
     transfer_harness.run_kv_transfer_test(
         ctx_tp=1,
         ctx_pp=1,
