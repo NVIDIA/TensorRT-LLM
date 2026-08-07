@@ -1,14 +1,16 @@
 # Evaluating Agentic Serving with Trace Replay and Job-Level Metrics
 
+by NVIDIA TensorRT LLM team
+
 ## Overview
 
-**How do we measure whether a serving system is actually good at agentic workloads?**
+Agentic applications — coding assistants, deep-research pipelines, tree-structured reasoners — have become a major and fast-growing share of LLM serving traffic, and they stress an inference system in ways chatbot-style traffic never did. Yet the way we evaluate serving systems has largely not followed: performance is still reported on independent requests of fixed shape, while the workload being served is a long-running, multi-turn, tool-invoking, sometimes parallel agent task. This gap raises a practical question for anyone deploying an agent stack: **how do we measure whether a serving system is actually good at agentic workloads?**
 
 Conventional benchmarks issue independent requests with fixed input and output lengths (ISL/OSL). A real agent task instead unfolds as a long-lived *job*: a shared system prompt is reused across many turns, the conversation grows as the agent reasons and invokes tools, sub-agents may run in parallel, and branches synchronize before the job completes. These behaviors — prefix reuse, tool-call gaps, parallel branching — are exactly what govern serving efficiency, and none of them is visible to a fixed-shape benchmark. Nor can such a benchmark answer the question practitioners actually ask: how many agent tasks does a GPU complete per hour?
 
 We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate the result with **job-level metrics** that complement conventional token-level ones. The framework code lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with runnable examples under [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
-Benchmarking practice for agentic scenarios is still taking shape, and the industry will gradually converge on a common methodology — efforts such as Agent Perf are already moving in that direction. We do not claim a standard here. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
+Benchmarking practice for agentic scenarios is still taking shape, and the industry will gradually converge on a common methodology — efforts such as [AgentPerf](https://artificialanalysis.ai/methodology/agentperf) are already moving in that direction. We do not claim a standard here. What follows is what the TensorRT-LLM team has learned while building and using this evaluation pipeline, offered as one set of concrete choices and measurements that others can reuse or argue with.
 
 ## The Trace-Replay Framework
 
