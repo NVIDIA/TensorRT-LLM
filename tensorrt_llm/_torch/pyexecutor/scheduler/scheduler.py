@@ -226,6 +226,12 @@ class RequestScheduler(ABC):
         """Return whether request state permits admission to a forward batch."""
         if is_decoder_context_request_waiting_for_encoder_output(request):
             return False
+        if request.state in (
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        ):
+            return False
         schedule_from, schedule_to = self.scheduling_state_range
         return schedule_from.value <= request.state_value < schedule_to.value
 

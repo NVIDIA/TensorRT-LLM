@@ -22,6 +22,8 @@ from tensorrt_llm._torch.pyexecutor._util import (
     create_torch_sampler_args,
     should_enable_adp_dummy_fixes,
     should_enable_disagg_adp_overlap_headroom,
+    should_enable_non_overlap_adp_forward_intent,
+    should_enable_scheduler_aware_adp_dummy,
 )
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
@@ -69,6 +71,34 @@ def test_disagg_adp_overlap_headroom_gate(
 def test_adp_dummy_fix_gate(pp_size, expected):
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
     assert should_enable_adp_dummy_fixes(mapping) is expected
+
+
+@pytest.mark.parametrize(
+    "model_type,pp_size,disable_overlap,expected",
+    [
+        ("kimi_k2", 1, True, True),
+        ("kimi_k2", 1, False, False),
+        ("deepseek_v4", 1, False, True),
+        ("qwen3_5_moe", 1, False, True),
+        ("deepseek_v4", 2, True, False),
+    ],
+)
+def test_scheduler_aware_adp_dummy_scope(model_type, pp_size, disable_overlap, expected):
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    assert should_enable_scheduler_aware_adp_dummy(model_type, mapping, disable_overlap) is expected
+
+
+@pytest.mark.parametrize(
+    "pp_size,disable_overlap,expected",
+    [
+        (1, True, True),
+        (1, False, False),
+        (2, True, False),
+    ],
+)
+def test_non_overlap_adp_forward_intent_scope(pp_size, disable_overlap, expected):
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    assert should_enable_non_overlap_adp_forward_intent(mapping, disable_overlap) is expected
 
 
 @pytest.mark.parametrize(

@@ -2644,6 +2644,25 @@ def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
     return not mapping.has_pp()
 
 
+_VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+
+
+def should_enable_scheduler_aware_adp_dummy(
+        model_type: Optional[str], mapping: Mapping,
+        disable_overlap_scheduler: bool) -> bool:
+    """Enable scheduler-aware padding for validated lifecycle configurations."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and (disable_overlap_scheduler
+                 or model_type in _VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES))
+
+
+def should_enable_non_overlap_adp_forward_intent(
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Enable fresh cross-rank dummy intent for the generic non-overlap path."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and disable_overlap_scheduler)
+
+
 def should_enable_disagg_adp_overlap_headroom(
         mapping: Mapping,
         cache_transceiver_config: Optional[CacheTransceiverConfig],

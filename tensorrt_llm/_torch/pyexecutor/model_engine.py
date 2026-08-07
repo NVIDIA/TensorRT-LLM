@@ -392,7 +392,9 @@ class PyTorchModelEngine(ModelEngine):
         # scheduler releases the previous batch's terminal sequence slots.
         from ._util import (compute_max_num_sequences,
                             should_enable_adp_dummy_fixes,
-                            should_enable_disagg_adp_overlap_headroom)
+                            should_enable_disagg_adp_overlap_headroom,
+                            should_enable_non_overlap_adp_forward_intent,
+                            should_enable_scheduler_aware_adp_dummy)
         self._enable_disagg_adp_overlap_headroom = (
             should_enable_disagg_adp_overlap_headroom(
                 mapping, llm_args.cache_transceiver_config,
@@ -475,7 +477,6 @@ class PyTorchModelEngine(ModelEngine):
                 sparse_attention_config=self.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
-                max_num_seq_slots=self.max_num_seq_slots,
                 lora_config=lora_config,
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
@@ -486,7 +487,14 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
-        self._validate_mrope_position_delta_cache_capacity()
+        pretrained_config = self.model.model_config.pretrained_config
+        model_type = getattr(pretrained_config, "model_type", None)
+        self._enable_scheduler_aware_adp_dummy = (
+            should_enable_scheduler_aware_adp_dummy(
+                model_type, mapping, llm_args.disable_overlap_scheduler))
+        self._enable_non_overlap_adp_forward_intent = (
+            should_enable_non_overlap_adp_forward_intent(
+                mapping, llm_args.disable_overlap_scheduler))
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -1009,33 +1017,6 @@ class PyTorchModelEngine(ModelEngine):
                 self.guided_decoder = guided_decoder
             return success
         return False
-
-    def _validate_mrope_position_delta_cache_capacity(self) -> None:
-        """Validate slot-indexed MRoPE state on preconstructed models.
-
-        Models created by ModelLoader receive ``max_num_seq_slots`` before
-        construction. A caller-supplied model bypasses that path, so fail
-        early instead of indexing past an undersized cache at runtime.
-        """
-        mrope_position_deltas_cache = getattr(self.model,
-                                              "mrope_position_deltas_cache",
-                                              None)
-        if mrope_position_deltas_cache is None:
-            mrope_position_deltas_cache = getattr(
-                getattr(self.model, "draft_model", None),
-                "mrope_position_deltas_cache", None)
-        if mrope_position_deltas_cache is None:
-            return
-
-        required_size = self.max_num_seq_slots + 1
-        actual_size = mrope_position_deltas_cache.shape[0]
-        if actual_size < required_size:
-            raise ValueError(
-                "The supplied model's MRoPE position-delta cache has "
-                f"{actual_size} slots, but this executor requires at least "
-                f"{required_size} ({self.max_num_seq_slots} runtime sequence "
-                "slots plus one reserved dummy slot). Rebuild the model with "
-                "the executor's sequence-slot capacity.")
 
     @property
     def use_mrope(self):
@@ -4816,7 +4797,7 @@ class PyTorchModelEngine(ModelEngine):
         # that carry no MRoPE metadata at all. The cache is zero-initialized and
         # the write path only ever targets real ``py_seq_slot``s, so this slot
         # permanently reads back a zero delta.
-        mrope_dummy_seq_slot = self.max_num_seq_slots
+        mrope_dummy_seq_slot = self.max_num_tokens * self.mapping.pp_size
         num_accepted_draft_tokens = []  # per request
         is_enc_dec = self._is_encoder_decoder_model()
         cross_encoder_hidden_states: List[torch.Tensor] = []

@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -36,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
     DisaggTransferAdmissionController,
     EncoderStepResult,
     PyExecutor,
+    _ADPForwardIntent,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
@@ -1651,7 +1651,9 @@ def _make_adp_request(
     req.py_skip_gen_alloc_revert = False
     req.llm_request_type = llm_request_type
     req.py_seq_slot = None
+    req.is_encoder_init_state = state == LlmRequestState.ENCODER_INIT
     req.is_context_init_state = state == LlmRequestState.CONTEXT_INIT
+    req.is_generation_in_progress_state = state == _STATE_GENERATION_IN_PROGRESS
     req.py_encoder_output_ready_event = None
     return req
 
@@ -1668,6 +1670,9 @@ class _StubADPExecutor:
         is_warmup=False,
         benchmark_req_queues_size=0,
         enable_adp_dummy_fixes=True,
+        enable_scheduler_aware_adp_dummy=None,
+        enable_non_overlap_adp_forward_intent=None,
+        peer_forward_intent=_ADPForwardIntent.GENERATION,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1683,12 +1688,23 @@ class _StubADPExecutor:
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
         self._enable_adp_dummy_fixes = enable_adp_dummy_fixes
+        self._enable_scheduler_aware_adp_dummy = (
+            enable_adp_dummy_fixes
+            if enable_scheduler_aware_adp_dummy is None
+            else enable_scheduler_aware_adp_dummy
+        )
+        self._enable_non_overlap_adp_forward_intent = (
+            enable_adp_dummy_fixes
+            if enable_non_overlap_adp_forward_intent is None
+            else enable_non_overlap_adp_forward_intent
+        )
         self.add_dummy_calls = []
         self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
         self.dist.tp_size = 1
         self.dist.tp_allgather.side_effect = lambda value: [value]
+        self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
 
         self.scheduler = Mock()
         self.scheduler.scheduling_state_range = (
@@ -1729,6 +1745,7 @@ class _StubADPExecutor:
 def _run_pad(stub):
     for helper in (
         "_count_schedulable_active_requests",
+        "_get_non_overlap_adp_forward_intent",
         "_has_adp_dummy_kv_capacity",
         "_should_skip_dummy_for_benchmark_disagg",
     ):
@@ -1833,9 +1850,9 @@ def test_disabled_adp_dummy_fix_gate_preserves_pp_behavior(state):
 
 def test_pad_dummy_added_when_only_to_complete_requests_disagg():
     # In disaggregated mode a GENERATION_TO_COMPLETE request is refused by
-    # MicroBatchScheduler (no_schedule_after_state), so a rank holding only
-    # such requests schedules batch=0. It must receive a pad dummy, or
-    # can_queue goes False fleet-wide and pad dummies leak on other ranks.
+    # MicroBatchScheduler (no_schedule_after_state). When a peer has real
+    # generation work, a rank holding only terminal requests must receive a
+    # pad dummy or can_queue goes False fleet-wide.
     stub = _StubADPExecutor()
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
     stub.expected_num_active_requests = 2
@@ -1850,8 +1867,8 @@ def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     # Gen-first mode on the context server: DISAGG_CONTEXT_WAIT_SCHEDULER
     # sits BELOW the scheduler's window [CONTEXT_INIT, GENERATION_TO_COMPLETE)
     # (no_schedule_until_state), so a rank holding only such requests
-    # schedules batch=0 and must receive a pad dummy — the left-boundary
-    # mirror of the TO_COMPLETE case above.
+    # schedules batch=0. A peer's generation intent therefore requires a pad
+    # dummy — the left-boundary mirror of the TO_COMPLETE case above.
     stub = _StubADPExecutor()
     stub.active_requests = [_make_adp_request(LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER)]
     stub.expected_num_active_requests = 2
@@ -1912,6 +1929,29 @@ def test_encoder_init_uses_encoder_decoder_scheduler_state_window():
     assert len(stub.active_requests) == 1
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+        LlmRequestState.DISAGG_GENERATION_INIT,
+        LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    ],
+)
+def test_encoder_decoder_disagg_wait_and_transfer_states_are_not_schedulable(state):
+    stub = _StubADPExecutor()
+    stub.scheduler.scheduling_state_range = (
+        LlmRequestState.ENCODER_INIT,
+        LlmRequestState.GENERATION_TO_COMPLETE,
+    )
+    stub.active_requests = [_make_adp_request(state)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
 def test_decoder_context_waiting_for_encoder_output_is_not_counted():
     stub = _StubADPExecutor()
     request = _make_adp_request(LlmRequestState.CONTEXT_INIT)
@@ -1926,7 +1966,7 @@ def test_decoder_context_waiting_for_encoder_output_is_not_counted():
     assert len(stub.active_requests) == 2
 
 
-def test_non_dsv4_disagg_adp_mixed_rank_states_stay_queueable():
+def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     # The generic non-PP path must give both ranks a non-empty scheduled batch:
     # one rank schedules its real request, while the terminal-only rank
     # schedules the dummy inserted for the scheduler-excluded request.
@@ -1980,8 +2020,10 @@ def test_pad_dummy_allocation_failure_skips_padding():
 
 
 def test_adp_pad_dummy_checks_full_context_capacity():
-    stub = _StubADPExecutor(max_num_tokens=4096)
-    stub._adp_dummy_is_gen = False
+    stub = _StubADPExecutor(
+        max_num_tokens=4096,
+        peer_forward_intent=_ADPForwardIntent.CONTEXT,
+    )
     stub.kv_cache_manager.get_num_available_tokens.return_value = 1024
 
     _run_pad(stub)
@@ -2122,8 +2164,10 @@ def test_pad_dummy_skips_when_active_request_present():
 
 
 def test_pad_dummy_ctx_pads_to_max_num_tokens():
-    stub = _StubADPExecutor(max_num_tokens=4096)
-    stub._adp_dummy_is_gen = False
+    stub = _StubADPExecutor(
+        max_num_tokens=4096,
+        peer_forward_intent=_ADPForwardIntent.CONTEXT,
+    )
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -2147,9 +2191,28 @@ def test_pad_dummy_gen_keeps_default_token_nums():
     assert call["is_gen"] is True
 
 
-def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
-    stub = _StubADPExecutor(max_num_tokens=None)
+def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
+    stub = _StubADPExecutor(
+        max_num_tokens=4096,
+        enable_scheduler_aware_adp_dummy=False,
+        enable_non_overlap_adp_forward_intent=False,
+    )
     stub._adp_dummy_is_gen = False
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["token_nums"] == [4096]
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+    stub.dist.tp_allreduce.assert_not_called()
+
+
+def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
+    stub = _StubADPExecutor(
+        max_num_tokens=None,
+        peer_forward_intent=_ADPForwardIntent.CONTEXT,
+    )
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -2158,12 +2221,27 @@ def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
-def test_pad_dummy_ctx_added_for_disagg_rank_only_awaiting_kv_transfer():
-    # Disagg ADP: a rank whose only request is awaiting KV transfer counts as
-    # idle (excluded by _count_schedulable), so a CTX dummy padded to
-    # max_num_tokens is added to keep it in the MoE all-to-all.
-    stub = _StubADPExecutor(max_num_tokens=4096)
-    stub._adp_dummy_is_gen = False
+def test_pad_dummy_not_added_when_all_ranks_only_await_kv_transfer():
+    stub = _StubADPExecutor(
+        max_num_tokens=4096,
+        peer_forward_intent=_ADPForwardIntent.NONE,
+    )
+    stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert stub._adp_dummy_is_gen is True
+    stub.dist.tp_allreduce.assert_called_once_with(int(_ADPForwardIntent.NONE), op=ReduceOp.MAX)
+
+
+def test_pad_dummy_context_role_re_evaluated_while_local_rank_drains():
+    stub = _StubADPExecutor(
+        max_num_tokens=4096,
+        peer_forward_intent=_ADPForwardIntent.CONTEXT,
+    )
+    stub._adp_dummy_is_gen = True
     stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
     stub.expected_num_active_requests = 1
 
