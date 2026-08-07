@@ -30,8 +30,18 @@ import pytest
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.request import StartProfileRequest, StopProfileRequest
 
+# These tests deliberately keep a real single-thread
+# ``_profile_control_executor`` alive for the whole test body -- pinning
+# every profile ZMQ op to one owner thread is precisely what they assert.
+# ``pytest-threadleak`` samples threads around the *call* phase, so a
+# function-scoped fixture finalizer necessarily runs too late to satisfy
+# it. The ``bare_proxy`` teardown below still drains the executor, so the
+# owner threads are reclaimed and do not accumulate across the module.
+pytestmark = pytest.mark.threadleak(enabled=False)
 
-def _bare_proxy():
+
+@pytest.fixture
+def bare_proxy():
     """Build a minimal ``GenerationExecutorProxy`` for testing.
 
     Provides only the queues the profile handlers touch. Avoids the
@@ -55,10 +65,17 @@ def _bare_proxy():
     proxy._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="proxy_profile_control"
     )
-    return proxy
+    yield proxy
+    # ``pytest-threadleak`` fails any test that leaves the owner thread
+    # running, so always drain the executor -- including when the test
+    # already cleared the attribute to simulate teardown.
+    executor = proxy._profile_control_executor
+    if executor is not None:
+        executor.shutdown(wait=True)
+        proxy._profile_control_executor = None
 
 
-def test_stop_profile_blocks_until_worker_acks():
+def test_stop_profile_blocks_until_worker_acks(bare_proxy):
     """*Reproducer* for §2.1.
 
     Simulates a worker that takes 500ms to actually flush the chrome
@@ -75,7 +92,7 @@ def test_stop_profile_blocks_until_worker_acks():
     has finished processing the StopProfileRequest. ``elapsed`` will be
     ~0.5s and the assertion will PASS.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
 
     worker_flush_duration = 0.5  # seconds the "worker" pretends to flush
 
@@ -123,14 +140,14 @@ def test_stop_profile_blocks_until_worker_acks():
     )
 
 
-def test_start_profile_blocks_until_worker_acks(tmp_path):
+def test_start_profile_blocks_until_worker_acks(bare_proxy, tmp_path):
     """/start_profile blocks until the worker acks.
 
     Same contract as ``/stop_profile``: the handler should not return
     200 until the worker has accepted (or rejected) the request, so
     that 409 conflicts are visible in the IPC-proxy path too.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
 
     worker_setup_duration = 0.3
     ack_event = threading.Event()
@@ -161,7 +178,7 @@ def test_start_profile_blocks_until_worker_acks(tmp_path):
     )
 
 
-def test_start_profile_propagates_worker_rejection_as_runtime_error():
+def test_start_profile_propagates_worker_rejection_as_runtime_error(bare_proxy):
     """Worker rejection surfaces as RuntimeError on the proxy.
 
     If the worker's PyExecutor rejected the start (RequestError —
@@ -170,7 +187,7 @@ def test_start_profile_propagates_worker_rejection_as_runtime_error():
     rejection was logged on the worker and silently dropped; the HTTP
     layer always saw success.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
 
     def fake_get(timeout=None):
         # Worker reports the start was rejected by PyExecutor.
@@ -183,7 +200,7 @@ def test_start_profile_propagates_worker_rejection_as_runtime_error():
 
 
 @pytest.mark.parametrize("kind", ["start", "stop"])
-def test_profile_control_after_shutdown_raises_runtime_error(kind):
+def test_profile_control_after_shutdown_raises_runtime_error(bare_proxy, kind):
     """Profile control after shutdown fails cleanly, not with AttributeError.
 
     ``shutdown()`` drains ``_profile_control_executor`` and sets it to
@@ -193,7 +210,7 @@ def test_profile_control_after_shutdown_raises_runtime_error(kind):
     ``AttributeError`` escapes to FastAPI instead of producing a
     controlled response.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
     proxy._profile_control_executor.shutdown(wait=True)
     proxy._profile_control_executor = None
 
@@ -206,7 +223,7 @@ def test_profile_control_after_shutdown_raises_runtime_error(kind):
 
 
 @pytest.mark.parametrize("kind", ["start", "stop"])
-def test_profile_control_during_pre_shutdown_raises_runtime_error(kind):
+def test_profile_control_during_pre_shutdown_raises_runtime_error(bare_proxy, kind):
     """Profile control is rejected as soon as ``pre_shutdown()`` starts.
 
     ``pre_shutdown()`` sets ``doing_shutdown`` and sends the quit sentinel
@@ -215,7 +232,7 @@ def test_profile_control_during_pre_shutdown_raises_runtime_error(kind):
     still live, so a profile call would submit and then block for the full
     ack timeout against workers that are already exiting.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
     proxy.doing_shutdown = True
 
     t0 = time.monotonic()
@@ -228,7 +245,7 @@ def test_profile_control_during_pre_shutdown_raises_runtime_error(kind):
     proxy.profile_ack_queue.get.assert_not_called()
 
 
-def test_stop_profile_timeout_warns_does_not_hang():
+def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
     """Timeout produces a warning rather than wedging the event loop.
 
     If the worker is stuck (no ack within the timeout), the proxy
@@ -239,7 +256,7 @@ def test_stop_profile_timeout_warns_does_not_hang():
     (not ``TimeoutError``), so the mock must mirror that to exercise the
     real ``except Empty`` branch in ``_wait_profile_ack``.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
 
     def never_ack(timeout=None):
         raise queue.Empty()
@@ -254,7 +271,7 @@ def test_stop_profile_timeout_warns_does_not_hang():
     assert elapsed < 1.0
 
 
-def test_profile_control_pinned_to_single_owner_thread(tmp_path):
+def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
     """Regression test for QiJune's review §2.
 
     All ZMQ socket operations triggered by ``start_profile`` /
@@ -272,7 +289,7 @@ def test_profile_control_pinned_to_single_owner_thread(tmp_path):
         the dedicated ``proxy_profile_control`` worker created by
         ``_profile_control_executor``.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
 
     seen_threads = []
 
@@ -372,7 +389,7 @@ class _ThreadSafetyRecorder:
                 self._active -= 1
 
 
-def test_profile_ops_serialized_under_concurrent_callers(tmp_path):
+def test_profile_ops_serialized_under_concurrent_callers(bare_proxy, tmp_path):
     """N concurrent callers must not produce concurrent ZMQ access.
 
     Mirrors what FastAPI would do under load: many request handlers each
@@ -382,7 +399,7 @@ def test_profile_ops_serialized_under_concurrent_callers(tmp_path):
     every op through ``_profile_control_executor`` (max_workers=1), so
     peak concurrency MUST stay at 1.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
     recorder = _ThreadSafetyRecorder()
 
     n_callers = 16
@@ -444,7 +461,7 @@ def test_profile_ops_serialized_under_concurrent_callers(tmp_path):
     )
 
 
-def test_profile_control_thread_name_is_stable_across_calls(tmp_path):
+def test_profile_control_thread_name_is_stable_across_calls(bare_proxy, tmp_path):
     """The same single owner thread serves *every* call, not just one.
 
     A pool with ``max_workers=1`` reuses its worker thread across submitted
@@ -453,7 +470,7 @@ def test_profile_control_thread_name_is_stable_across_calls(tmp_path):
     ``max_workers > 1`` (which would still pass under serialized tests but
     break the contract under concurrency).
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
     seen_owners = []
     seen_lock = threading.Lock()
     put_kinds = []
@@ -489,7 +506,7 @@ def test_profile_control_thread_name_is_stable_across_calls(tmp_path):
     )
 
 
-def test_caller_thread_never_touches_zmq_queue(tmp_path):
+def test_caller_thread_never_touches_zmq_queue(bare_proxy, tmp_path):
     """The HTTP-handler thread is never the owner of a queue op.
 
     This is exactly what QiJune's review asked for: ``request_queue.put`` and
@@ -498,7 +515,7 @@ def test_caller_thread_never_touches_zmq_queue(tmp_path):
     asserting it is disjoint from the set of owner threads observed inside
     the queue mocks.
     """
-    proxy = _bare_proxy()
+    proxy = bare_proxy
 
     queue_op_threads = []
     queue_lock = threading.Lock()
