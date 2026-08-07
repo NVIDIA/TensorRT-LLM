@@ -155,6 +155,16 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# Backstop for control_action()'s barrier wait.  Deliberately generous: with
+# drain=True the sentinel is parked until active_requests and waiting_queue
+# empty, so a legitimate wait is bounded only by how long in-flight requests
+# take.  This is not a latency budget, it is a last resort that turns a lost
+# barrier edge into a loud failure instead of a permanently wedged lock.
+# Shutdown and a dead executor loop are detected by the liveness poll below,
+# so they fail in _CONTROL_BARRIER_POLL_INTERVAL_S rather than waiting this out.
+_CONTROL_BARRIER_TIMEOUT_S = 1800.0
+_CONTROL_BARRIER_POLL_INTERVAL_S = 0.5
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -4469,6 +4479,14 @@ class PyExecutor:
         body still runs. Callers therefore serialise on
         ``_control_action_lock``; a nested call from the holding thread is
         rejected rather than blocked, which would deadlock.
+
+        The lock provides *local* mutual exclusion only.  It does not order
+        control actions across ranks: only rank 0 enqueues, and the order in
+        which callers on rank N acquire the lock is not tied to rank 0's
+        enqueue order, so concurrent control actions could still pair
+        different bodies with the same barrier cycle on different ranks.
+        Cross-rank correctness relies on rank 0 being the single enqueue
+        point - do not issue concurrent collective control actions.
         """
 
         # Unsynchronised read is sound: only the owning thread writes its own
@@ -4489,7 +4507,7 @@ class PyExecutor:
                     self.executor_request_queue.enqueue_control_request(
                         drain=drain, control_id=control_id)
 
-                self.control_request_barrier.wait()
+                self._wait_for_control_barrier(control_id)
 
                 try:
                     yield self
@@ -4498,6 +4516,38 @@ class PyExecutor:
                     self.control_request_barrier.clear()
             finally:
                 self._control_action_owner = None
+
+    def _wait_for_control_barrier(self, control_id: Optional[str]) -> None:
+        """Wait for the executor loop to fire our control request.
+
+        Bounded rather than a bare ``wait()``, because the barrier edge can be
+        lost: ``_handle_control_request`` pulses ``set()`` then ``clear()`` on
+        the aborted-control-request path without waiting for
+        ``control_action_done``.  A caller that has not reached the wait yet
+        when that happens would otherwise block forever *while holding*
+        ``_control_action_lock``, wedging every later control action with no
+        diagnostic.  Failing loudly here blames the caller that actually lost
+        the edge.
+        """
+        deadline = time.monotonic() + _CONTROL_BARRIER_TIMEOUT_S
+        while not self.control_request_barrier.wait(
+                timeout=_CONTROL_BARRIER_POLL_INTERVAL_S):
+            # The loop that would set the barrier is gone; waiting out the full
+            # timeout would serve no purpose.
+            worker = getattr(self, "worker_thread", None)
+            if self.shutdown_event.is_set() or (worker is not None
+                                                and not worker.is_alive()):
+                raise RuntimeError(
+                    "control_action() barrier never fired: the executor loop "
+                    f"is shut down (control_id={control_id}). The control "
+                    "request cannot be serviced.")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "control_action() timed out after "
+                    f"{_CONTROL_BARRIER_TIMEOUT_S}s waiting for the control "
+                    f"request barrier (control_id={control_id}). The barrier "
+                    "edge was likely lost - e.g. the request was aborted "
+                    "between enqueue and this wait.")
 
     def _wait_for_model_engine_input_copy(self):
         wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",

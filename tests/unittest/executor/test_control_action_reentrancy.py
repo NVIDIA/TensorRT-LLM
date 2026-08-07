@@ -24,6 +24,7 @@ object.__new__ and only the attributes control_action() touches.
 """
 
 import threading
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -39,24 +40,36 @@ pytestmark = pytest.mark.cpu_only
 _TIMEOUT = 10.0
 
 
-def _make_executor() -> "PyExecutor":
+def _make_executor(rank: int = 1, queue: object = None) -> "PyExecutor":
     """Build a PyExecutor shell exercising only control_action()'s state.
 
-    rank is 1 so the rank-0 enqueue path is skipped, and the barrier starts
-    set so wait() returns immediately instead of blocking on a real executor
-    loop.
+    rank defaults to 1 so the rank-0 enqueue path is skipped, and the barrier
+    starts set so the wait returns immediately instead of blocking on a real
+    executor loop.  Pass rank=0 with a recording queue to exercise enqueue
+    ordering.
     """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     ex = object.__new__(PyExecutor)
-    ex.dist = SimpleNamespace(rank=1)
-    ex.executor_request_queue = None  # unreachable while rank != 0
+    ex.dist = SimpleNamespace(rank=rank)
+    ex.executor_request_queue = queue  # unreachable while rank != 0
     ex.control_request_barrier = threading.Event()
     ex.control_request_barrier.set()
     ex.control_action_done = threading.Event()
+    ex.shutdown_event = threading.Event()
     ex._control_action_lock = threading.Lock()
     ex._control_action_owner = None
     return ex
+
+
+class _RecordingQueue:
+    """Records enqueue_control_request() calls so ordering can be asserted."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def enqueue_control_request(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +108,31 @@ def test_rejected_nesting_leaves_the_outer_handshake_intact() -> None:
     assert not ex.control_request_barrier.is_set()
     assert ex._control_action_owner is None
     assert not ex._control_action_lock.locked()
+
+
+def test_rejected_nesting_enqueues_no_control_request() -> None:
+    """On rank 0 the guard must fire BEFORE enqueue_control_request().
+
+    This is the property the change exists for: a refused nesting attempt must
+    not leave an orphaned sentinel in the queue for the executor loop to fire
+    at a body that never runs.  Needs rank=0 -- with rank=1 the enqueue is
+    skipped entirely, so moving the guard below it would go unnoticed.
+    """
+    queue = _RecordingQueue()
+    ex = _make_executor(rank=0, queue=queue)
+
+    with ex.control_action(control_id="outer"):
+        assert len(queue.calls) == 1, "outer action should enqueue exactly once"
+        with pytest.raises(RuntimeError, match="not re-entrant"):
+            with ex.control_action(control_id="nested"):
+                pytest.fail("nested control_action() should not have yielded")
+        # The decisive assertion: still one call, so the rejected nested entry
+        # enqueued nothing.
+        assert len(queue.calls) == 1, (
+            f"rejected nesting left an orphaned control request: {queue.calls}"
+        )
+
+    assert [c.get("control_id") for c in queue.calls] == ["outer"]
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +240,57 @@ def test_sequential_control_actions_are_allowed() -> None:
         with ex.control_action():
             assert ex._control_action_owner == threading.get_ident()
         assert ex._control_action_owner is None
+
+
+# ---------------------------------------------------------------------------
+# Bounded barrier wait -- a lost edge must fail loudly, not wedge the lock
+# ---------------------------------------------------------------------------
+
+
+def test_lost_barrier_edge_fails_loudly_instead_of_wedging_the_lock() -> None:
+    """Reproduces the aborted-control-request pulse.
+
+    _handle_control_request does set(); clear() on the abort path without
+    waiting for control_action_done.  A caller arriving after that pulse sees
+    a cleared barrier and would block forever while holding the lock, wedging
+    every later control action.  It must raise instead, and release the lock.
+    """
+    from tensorrt_llm._torch.pyexecutor import py_executor
+
+    ex = _make_executor()
+    ex.control_request_barrier.clear()  # the edge was pulsed and missed
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(py_executor, "_CONTROL_BARRIER_TIMEOUT_S", 0.3)
+        mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
+        with pytest.raises(RuntimeError, match="timed out"):
+            with ex.control_action(control_id="lost-edge"):
+                pytest.fail("should not have yielded on a lost barrier edge")
+
+    # The whole point: the next caller is not wedged behind us.
+    assert not ex._control_action_lock.locked()
+    assert ex._control_action_owner is None
+
+
+def test_shutdown_fails_fast_without_waiting_out_the_timeout() -> None:
+    """A dead executor loop must not cost a full timeout to discover."""
+    from tensorrt_llm._torch.pyexecutor import py_executor
+
+    ex = _make_executor()
+    ex.control_request_barrier.clear()
+    ex.shutdown_event.set()
+
+    with pytest.MonkeyPatch.context() as mp:
+        # Large timeout: if shutdown were not detected this test would hang.
+        mp.setattr(py_executor, "_CONTROL_BARRIER_TIMEOUT_S", 300.0)
+        mp.setattr(py_executor, "_CONTROL_BARRIER_POLL_INTERVAL_S", 0.05)
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="shut down"):
+            with ex.control_action(control_id="after-shutdown"):
+                pytest.fail("should not have yielded after shutdown")
+        assert time.monotonic() - start < 5.0, "did not fail fast on shutdown"
+
+    assert not ex._control_action_lock.locked()
 
 
 def test_lock_and_owner_are_released_when_the_body_raises() -> None:
