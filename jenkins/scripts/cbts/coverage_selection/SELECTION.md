@@ -170,16 +170,26 @@ tie-break — which is the pre-existing behaviour, not a regression.
 
 ### 8.2 Measuring the lag
 
-Two sources, in order; `artifact.db_lag()` falls through:
+The lag is always measured against the **tip of `main`**, never against the PR's own base commit:
+every candidate is scored on the same scale, and a PR whose base predates all the candidates would
+otherwise score them all identically and collapse the ranking back to the build number.
+
+Two sources; `artifact.db_lag()` falls through:
 
 | Source | Answers when | Fails when |
 |---|---|---|
-| `git rev-list --count <sha>..HEAD` | the checkout has history — local runs, dev tooling | **always in CI**: `trtllm_utils.checkoutSpec` clones `depth: 1, noTags: true` with a single-SHA refspec, so no candidate revision is in the object store |
 | GitHub compare `<sha>...main` → `ahead_by` | a token is bound and the revision is public | the revision has not reached the public mirror yet (404); no token (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is routinely already spent) |
+| `git rev-list --count <sha>..<ref>` over `upstream/main`, `origin/main`, `main` | a local clone tracks the branch — dev runs, offline | **always in CI**: `trtllm_utils.checkoutSpec` clones `depth: 1, noTags: true` with a single-SHA refspec, so no candidate revision is in the object store |
 
-Both failing leaves `lag: null`. Each failure prints its own reason to stderr — a missing working
-directory, git's own `fatal: bad object <sha>`, or the HTTP status — so the CI log distinguishes a
-wiring mistake from a shallow checkout from a rate limit.
+The API is authoritative and git is the backup, not the other way round: git answers relative to
+whatever local ref is named, and a ref that is merely stale returns a *smaller* number rather than
+an error. On one checkout the same DB measured 51 commits behind `HEAD` (the feature branch's own
+commits inflating it), 0 behind a stale local `main`, and 32 behind `upstream/main` — only the last
+is the real distance, and nothing in the first two signals that they are wrong.
+
+Both sources failing leaves `lag: null`. Each failure prints its own reason to stderr — a missing
+working directory, git's own `fatal: bad object <sha>`, or the HTTP status — so the CI log
+distinguishes a wiring mistake from a shallow checkout from a rate limit.
 
 The token comes from the `github-cred-trtllm-ci` credential, bound around the `--print-selection`
 call in `_cbtsCoverageAudit` and read from `GITHUB_API_TOKEN`. `compare_distance` is cached per

@@ -59,6 +59,8 @@ GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
+# Local stand-ins for COVERAGE_BRANCH, best first; a stale ref understates the lag.
+_LOCAL_REFS = (f"upstream/{COVERAGE_BRANCH}", f"origin/{COVERAGE_BRANCH}", COVERAGE_BRANCH)
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Max builds to walk back when recent builds have no tarball.
 _MAX_PROBE = 10
@@ -123,7 +125,7 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
     return None
 
 
-def commit_distance(commit: str, repo_root: str = ".", ref: str = "HEAD") -> Optional[int]:
+def commit_distance(commit: str, repo_root: str = ".", ref: str = COVERAGE_BRANCH) -> Optional[int]:
     """Commits in `ref` not reachable from `commit`, or None if git cannot answer."""
     try:
         out = subprocess.run(
@@ -164,9 +166,16 @@ def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int
 
 
 def db_lag(commit: str, repo_root: str = ".") -> Optional[int]:
-    """How far `COVERAGE_BRANCH` moved past `commit`: local git first, then the compare API."""
-    lag = commit_distance(commit, repo_root)
-    return lag if lag is not None else compare_distance(commit)
+    """Commits `COVERAGE_BRANCH` gained since `commit`; the API is authoritative, git is the backup."""
+    lag = compare_distance(commit)
+    if lag is not None:
+        return lag
+    # Only reached without a token or network: whichever local ref tracks the branch answers.
+    for ref in _LOCAL_REFS:
+        lag = commit_distance(commit, repo_root, ref)
+        if lag is not None:
+            return lag
+    return None
 
 
 def select_tarball(
