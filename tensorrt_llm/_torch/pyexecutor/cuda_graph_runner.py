@@ -119,7 +119,7 @@ class CUDAGraphRunner:
 
     This unified class handles high-level orchestration (padding, eligibility)
     and low-level execution (capturing, resource management, replaying) for
-    multiple graphs, keyed by (batch size, draft_len, is_first_draft, use_lora).
+    multiple graphs, keyed by batch size and execution path specializations.
     """
     WARMUP_STEPS = 1
 
