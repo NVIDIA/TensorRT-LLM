@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from inspect import signature
 from operator import getitem
 from typing import Callable, List, Optional
 
@@ -15,6 +19,12 @@ from ...distributed import AllReduceFusionOp, AllReduceStrategy
 from . import MATCHER_SUBSYSTEM
 
 aten = torch.ops.aten
+
+
+def _make_pattern_example_inputs(
+        search_fn: Callable[..., object]) -> List[torch.Tensor]:
+    """Create dummy inputs required for manual pattern registration."""
+    return [torch.empty(0) for _ in signature(search_fn).parameters]
 
 
 def _append_named_pass(custom_passes: List[PatternMatcherPass], pass_name: str):
@@ -123,7 +133,7 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass, mapping: Mapping,
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=ar_residual_norm_pattern,
@@ -241,7 +251,7 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=pattern_with_scale,
@@ -251,7 +261,7 @@ def register_ar_residual_norm_out_fp8_quant(custom_pass: PatternMatcherPass,
     register_replacement(
         empty_pattern,
         target_pattern_without_scale,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=pattern_without_scale,
@@ -347,7 +357,7 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=pattern_with_scale,
@@ -357,7 +367,7 @@ def register_ar_residual_norm_fp8_quant(custom_pass: PatternMatcherPass,
     register_replacement(
         empty_pattern,
         target_pattern_without_scale,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=pattern_without_scale,
@@ -430,7 +440,7 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=pattern,
@@ -502,7 +512,7 @@ def register_ar_residual_norm_fp4_quant(custom_pass: PatternMatcherPass,
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=pattern,
@@ -573,7 +583,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
         register_replacement(
             empty_convert_supported_ar_to_ub,
             target_convert_supported_ar_to_ub,
-            [],
+            _make_pattern_example_inputs(empty_convert_supported_ar_to_ub),
             fwd_only,
             custom_pass,
             search_fn_pattern=trtllm_allreduce_default,
@@ -623,7 +633,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             register_replacement(
                 empty_scaled_mm_prologue_pattern,
                 target_scaled_mm_prologue_pattern,
-                [],
+                _make_pattern_example_inputs(empty_scaled_mm_prologue_pattern),
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
@@ -735,7 +745,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             register_replacement(
                 empty_nvfp4_gemm_prologue_pattern,
                 target_nvfp4_gemm_prologue_pattern,
-                [],
+                _make_pattern_example_inputs(empty_nvfp4_gemm_prologue_pattern),
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
@@ -744,7 +754,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             register_replacement(
                 empty_nvfp4_gemm_bias_prologue_pattern,
                 target_nvfp4_gemm_bias_prologue_pattern,
-                [],
+                _make_pattern_example_inputs(
+                    empty_nvfp4_gemm_bias_prologue_pattern),
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy_with_bias,
@@ -775,7 +786,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             register_replacement(
                 empty_mm_prologue_pattern,
                 target_mm_prologue_pattern,
-                [],
+                _make_pattern_example_inputs(empty_mm_prologue_pattern),
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
@@ -806,7 +817,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             register_replacement(
                 empty_add_prologue_pattern,
                 target_add_prologue_pattern,
-                [],
+                _make_pattern_example_inputs(empty_add_prologue_pattern),
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
@@ -855,7 +866,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
         register_replacement(
             empty_finalize_pattern,
             target_finalize_pattern,
-            [],
+            _make_pattern_example_inputs(empty_finalize_pattern),
             fwd_only,
             custom_pass,
             search_fn_pattern=trtllm_allreduce_default,
@@ -913,7 +924,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
         register_replacement(
             empty_copy_for_graph_output_pattern,
             target_copy_for_graph_output_pattern,
-            [],
+            _make_pattern_example_inputs(empty_copy_for_graph_output_pattern),
             fwd_only,
             custom_pass,
             search_fn_pattern=trtllm_allreduce_default,
