@@ -2122,6 +2122,24 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
+    def mtp_head_module_names(self) -> List[str]:
+        """Names of the MTP heads under every alias they are reachable by.
+
+        One-model MTP registers the same head objects twice: under
+        ``draft_model.mtp_layers.{h}`` and, after the target model extends its
+        layer list, under ``model.layers.{num_hidden_layers + h}``. A load that
+        wants to leave the heads untouched has to exclude both aliases.
+        """
+        mtp_layers = getattr(self.draft_model, "mtp_layers", None)
+        if not mtp_layers:
+            return []
+        head_ids = {id(layer) for layer in mtp_layers}
+        return [
+            name
+            for name, module in self.named_modules(remove_duplicate=False)
+            if name and id(module) in head_ids
+        ]
+
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional[BaseWeightMapper] = None,
@@ -2130,13 +2148,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         from tensorrt_llm._torch.speculative.utils import (
             filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model)
 
+        skip_modules = ["draft_model"]
         if loads_mtp_from_speculative_model(self.spec_config):
-            # Skip embedded MTP heads; they are loaded from speculative_model.
+            # The heads come from speculative_model in a second pass
+            # (load_draft_weights), so exclude them here. They must be
+            # *skipped* rather than tolerated via allow_partial_loading:
+            # partial loading suppresses process_weights_after_loading() on
+            # every quantized Linear/MoE it touches, which would leave the
+            # target model's quant scales (NVFP4 alphas, MoE input scales)
+            # uninitialized.
             weights = filter_mtp_checkpoint_weights(weights)
-            allow_partial_loading = True
+            skip_modules.extend(self.mtp_head_module_names())
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
-                             skip_modules=["draft_model"],
+                             skip_modules=skip_modules,
                              params_map=params_map,
                              allow_partial_loading=allow_partial_loading)
 

@@ -61,35 +61,36 @@ _MTP_PATTERN_TO_LAYER = {
 
 
 def _set_pretrained_config_attr(model_config,
-                                 name: str,
-                                 value,
-                                 *,
-                                 required: bool = True) -> bool:
+                                name: str,
+                                value,
+                                *,
+                                required: bool = True) -> bool:
     """Set a config field, tolerating read-only properties / strict dataclasses.
 
-    Returns True if the value was applied. When ``required`` is False, failures
-    are logged and ignored (used for optional fields like ``mtp_block_configs``).
+    Each write is verified by reading the value back: a class-level property
+    shadows ``__dict__``, so writing through ``vars()`` can appear to succeed
+    while the config keeps reporting its old value. When ``required`` is False,
+    failures are logged and ignored (used for optional fields like
+    ``mtp_block_configs``).
     """
-    try:
-        setattr(model_config, name, value)
-        return True
-    except AttributeError:
-        pass
-    try:
-        vars(model_config)[name] = value
-        return True
-    except (TypeError, AttributeError) as exc:
-        if required:
-            raise AttributeError(
-                f"Unable to set '{name}' on {type(model_config).__name__}"
-            ) from exc
-        logger.warning(
-            "Skipping optional MTP config field '%s' on %s: %s",
-            name,
-            type(model_config).__name__,
-            exc,
-        )
-        return False
+    writes = (
+        lambda: setattr(model_config, name, value),
+        lambda: vars(model_config).__setitem__(name, value),
+    )
+    for write in writes:
+        try:
+            write()
+        except (TypeError, AttributeError):
+            continue
+        if getattr(model_config, name, None) == value:
+            return True
+
+    message = (f"Unable to set MTP config field '{name}' on "
+               f"{type(model_config).__name__}")
+    if required:
+        raise AttributeError(message)
+    logger.warning("%s; keeping the target checkpoint's value.", message)
+    return False
 
 
 def _pattern_to_mtp_layers_block_type(pattern: str) -> list:

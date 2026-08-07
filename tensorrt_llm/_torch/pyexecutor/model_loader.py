@@ -1402,6 +1402,18 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
+        from tensorrt_llm._torch.speculative.utils import (
+            loads_mtp_from_speculative_model,
+            update_spec_config_from_model_config)
+
+        if loads_mtp_from_speculative_model(self.spec_config):
+            # `load_config_and_apply_defaults` already ran this, but against a
+            # config object it then discards. The MTP heads' structure fields
+            # (head count, block pattern) come from `speculative_model` and
+            # have to reach the config the model is actually built from.
+            update_spec_config_from_model_config(self.spec_config,
+                                                 config.pretrained_config)
+
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends

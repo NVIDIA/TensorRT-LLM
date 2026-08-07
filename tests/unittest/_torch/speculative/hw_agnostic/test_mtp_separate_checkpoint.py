@@ -133,6 +133,102 @@ def test_remap_preprocessed_mtp_weights_for_draft_model():
     }
 
 
+def _make_one_engine_stub(spec_config):
+    """A bare SpecDecOneEngineForCausalLM with just the module tree we need.
+
+    ``__init__`` builds a whole target model, so construct the instance
+    directly and register only the two aliases of a single MTP head: the
+    target's ``model.layers[N]`` and ``draft_model.mtp_layers[0]``.
+    """
+    from tensorrt_llm._torch.models.modeling_speculative import \
+        SpecDecOneEngineForCausalLM
+
+    model = object.__new__(SpecDecOneEngineForCausalLM)
+    torch.nn.Module.__init__(model)
+
+    head = torch.nn.Module()
+    inner = torch.nn.Module()
+    inner.layers = torch.nn.ModuleList([torch.nn.Module(), head])
+    model.model = inner
+    draft = torch.nn.Module()
+    draft.mtp_layers = torch.nn.ModuleList([head])
+    model.draft_model = draft
+    model.spec_config = spec_config
+    return model
+
+
+def _capture_parent_load_weights(monkeypatch) -> dict:
+    """Intercept the base-class load to inspect the dispatch arguments."""
+    from tensorrt_llm._torch.models.modeling_utils import \
+        DecoderModelForCausalLM
+
+    captured = {}
+
+    def fake_load_weights(self,
+                          weights,
+                          weight_mapper=None,
+                          skip_modules=(),
+                          params_map=None,
+                          allow_partial_loading=False):
+        captured["skip_modules"] = list(skip_modules)
+        captured["allow_partial_loading"] = allow_partial_loading
+        captured["weights"] = weights
+
+    monkeypatch.setattr(DecoderModelForCausalLM, "load_weights",
+                        fake_load_weights)
+    return captured
+
+
+def test_mtp_head_module_names_covers_both_aliases():
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=3, speculative_model="/path/to/mtp"))
+    assert set(model.mtp_head_module_names()) == {
+        "model.layers.1",
+        "draft_model.mtp_layers.0",
+    }
+
+
+def test_separate_mtp_target_load_skips_heads_without_partial_loading(
+        monkeypatch):
+    """The target load must never fall back to partial loading.
+
+    ``allow_partial_loading=True`` suppresses ``process_weights_after_loading``
+    on every quantized Linear/MoE it touches, which silently leaves the whole
+    target model's quant scales uninitialized (garbage output). The MTP heads
+    have to be excluded by module instead.
+    """
+    captured = _capture_parent_load_weights(monkeypatch)
+
+    model = _make_one_engine_stub(
+        MTPDecodingConfig(max_draft_len=3, speculative_model="/path/to/mtp"))
+    model.load_weights(
+        weights={
+            "backbone.layers.0.norm.weight": torch.ones(4),
+            "mtp.layers.0.enorm.weight": torch.ones(4),
+        })
+
+    assert captured["allow_partial_loading"] is False
+    assert set(captured["skip_modules"]) == {
+        "draft_model",
+        "model.layers.1",
+        "draft_model.mtp_layers.0",
+    }
+    assert "mtp.layers.0.enorm.weight" not in captured["weights"]
+    assert "backbone.layers.0.norm.weight" in captured["weights"]
+
+
+def test_embedded_mtp_target_load_is_unchanged(monkeypatch):
+    captured = _capture_parent_load_weights(monkeypatch)
+
+    model = _make_one_engine_stub(MTPDecodingConfig(max_draft_len=3))
+    model.load_weights(weights={"mtp.layers.0.enorm.weight": torch.ones(4)})
+
+    assert captured["skip_modules"] == ["draft_model"]
+    assert captured["allow_partial_loading"] is False
+    # Embedded heads still load from the target checkpoint.
+    assert "mtp.layers.0.enorm.weight" in captured["weights"]
+
+
 def test_nemotron_mapper_remaps_mtp_layers_keys():
     mapper = NemotronHHfWeightMapper()
     pretrained = SimpleNamespace(

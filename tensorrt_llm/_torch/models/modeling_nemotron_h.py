@@ -920,10 +920,10 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 "heads checkpoint, or use a target checkpoint that embeds MTP."
             )
             if ckpt_nextn == 0 and has_external_mtp:
-                # Structure fields were merged from speculative_model; treat as
-                # a single shared MTP head unless the draft config said otherwise.
-                ckpt_nextn = model_nextn = max(
-                    getattr(self.config, "num_nextn_predict_layers", 1) or 1, 1)
+                # Neither checkpoint declares a head count: fall back to a
+                # single shared head, matching MTPForCausalLM's MTP-Eagle
+                # default.
+                ckpt_nextn = model_nextn = 1
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -994,7 +994,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             # Filter before preprocess: mapper remaps mtp.layers.* ->
             # model.layers.{N}.* and would otherwise load embedded MTP heads.
             weights = filter_mtp_checkpoint_weights(weights)
-            allow_partial_loading = True
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights,
                              weight_mapper=weight_mapper,
