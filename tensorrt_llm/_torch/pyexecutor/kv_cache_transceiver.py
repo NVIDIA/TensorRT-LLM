@@ -16,6 +16,7 @@ from tensorrt_llm.mapping import Mapping
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
+                                  MambaHybridCacheManager,
                                   MambaHybridCacheManagerV2,
                                   MixedMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
@@ -100,6 +101,64 @@ def _validate_disagg_inflight_cancel_config(
         f"layerwise={layerwise!r}, try_zcopy={try_zcopy!r}.")
 
 
+def resolve_cache_transceiver_config(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> None:
+    """Resolve defaults and validate runtime-independent configuration."""
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        return
+
+    # "auto" is normally resolved against the model's preference at config load
+    # time (ModelLoader.load_config_and_apply_defaults); paths that skip that
+    # step (e.g. AutoDeploy) fall back to the C++ transceiver. Collapse it to
+    # None here so every consumer below - including the pipelined-transfer
+    # auto-selection - sees a resolved runtime.
+    if cache_transceiver_config.transceiver_runtime == "auto":
+        cache_transceiver_config.transceiver_runtime = None
+
+    # Resolved for the checks below only; "DEFAULT" is deliberately left on the
+    # config so that _validate_disagg_inflight_cancel_config() can still reject
+    # it as an ambiguous backend. create_kv_cache_transceiver() commits the
+    # resolved value after that validation runs.
+    effective_backend = cache_transceiver_config.backend
+    if effective_backend == "DEFAULT":
+        effective_backend, _ = cache_transceiver_config._resolve_default_backend(
+        )
+
+    runtime = cache_transceiver_config.transceiver_runtime
+    enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
+    if runtime is None and enable_pipelined_transfer:
+        if effective_backend != "NIXL":
+            raise ValueError(
+                f"enable_pipelined_transfer is set but backend "
+                f"'{effective_backend}' requires the C++ "
+                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
+                f"enable pipelined transfer.")
+        logger.warning(
+            "enable_pipelined_transfer is set; auto-selecting the Python "
+            "transceiver instead of the C++ transceiver to enable "
+            "pipelined KV cache transfer. "
+            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+        cache_transceiver_config.transceiver_runtime = "PYTHON"
+    elif runtime == "CPP" and enable_pipelined_transfer:
+        raise ValueError(
+            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
+        )
+
+    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and effective_backend != "NIXL"):
+        raise ValueError(
+            f"Python transceiver currently only supports NIXL backend, "
+            f"got {effective_backend}. "
+            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+        )
+    if (enable_pipelined_transfer
+            and cache_transceiver_config.kv_cache_bounce_size_mb > 0):
+        raise ValueError(
+            "kv_cache_bounce_size_mb must be 0 when enable_pipelined_transfer is set."
+        )
+
+
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
     return WorldConfig(tensor_parallelism=mapping.tp_size,
@@ -117,26 +176,22 @@ def create_kv_cache_transceiver(
         kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+        enable_chunked_prefill: bool = False):
+    resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
 
-    # "auto" is normally resolved against the model's preference at config
-    # load time (ModelLoader.load_config_and_apply_defaults); paths that skip
-    # that step (e.g. AutoDeploy) fall back to the C++ transceiver here. This
-    # must run before any consumer of transceiver_runtime below (e.g. the
-    # inflight-cancel validation, which treats non-CPP runtimes as
-    # unsupported).
-    if cache_transceiver_config.transceiver_runtime == "auto":
-        cache_transceiver_config.transceiver_runtime = None
-
+    # transceiver_runtime is already resolved by resolve_cache_transceiver_config
+    # above; these checks need the cache managers, so they cannot move there.
     if (cache_transceiver_config.transceiver_runtime != "PYTHON"
             and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
         raise ValueError(
             "MixedMambaHybridCacheManager requires the Python transceiver "
             "runtime in disaggregated serving.")
 
+    # Runs while backend may still be "DEFAULT", which it rejects as ambiguous.
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "DEFAULT":
@@ -157,6 +212,24 @@ def create_kv_cache_transceiver(
             "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
+
+    if (cache_transceiver_config.enable_pipelined_transfer
+            and (isinstance(kv_cache_manager, MambaHybridCacheManager)
+                 or mamba_cache_manager is not None)):
+        raise ValueError(
+            "enable_pipelined_transfer is not supported with Mamba/hybrid attention models."
+        )
+    if (cache_transceiver_config.enable_pipelined_transfer
+            and not enable_chunked_prefill):
+        raise ValueError(
+            "enable_chunked_prefill is required when enable_pipelined_transfer is set."
+        )
+    is_kv_cache_sender = getenv("TRTLLM_DISAGG_ROLE") != "generation"
+    if (cache_transceiver_config.enable_pipelined_transfer
+            and is_kv_cache_sender and mapping.pp_size != 1):
+        raise ValueError(
+            "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set."
+        )
 
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
@@ -191,6 +264,7 @@ def create_kv_cache_transceiver(
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
+        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
@@ -201,6 +275,34 @@ def create_kv_cache_transceiver(
 
 
 class KvCacheTransceiver(ABC):
+
+    @property
+    def pipeline_transfer_enabled(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return False
+
+    def has_inflight_transfer(self, req: LlmRequest) -> bool:
+        """Whether this transceiver still owns transfer resources for req.
+
+        Independent of ``LlmRequestState``: with pipelined transfer a chunk can
+        be in flight while the request is still in its context-compute phase.
+        True means the request's KV pages may be read by the fabric and must
+        not be released.
+        """
+        return False
+
+    def has_any_inflight_transfer(self) -> bool:
+        """Whether any request has transfer resources in flight."""
+        return False
+
+    def has_retired_send_session(self, req: LlmRequest) -> bool:
+        """Whether req's send session was torn down before its last slice.
+
+        Tearing it down also drops the peer's receive registration, so no
+        further slice can reach the generation server. The request has to be
+        failed rather than fed another chunk.
+        """
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):

@@ -2998,8 +2998,13 @@ def create_py_executor_instance(
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        mapping,
+        dist,
+        kv_cache_manager,
+        attention_type,
+        cache_transceiver_config,
+        mamba_cache_manager,
+        enable_chunked_prefill=llm_args.enable_chunked_prefill)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

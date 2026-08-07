@@ -53,6 +53,8 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TxSessionBase,
     WaitResult,
+    derive_chunk_block_coords,
+    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
@@ -98,6 +100,7 @@ class RecvReqInfo:
     dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
+    # The receiver's own task index; the sender echoes it back in KV_AGENT_RESULT.
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
 
@@ -152,7 +155,9 @@ class WriteMeta:
     dst_ptrs: np.ndarray  # dtype=np.int64
     sizes: np.ndarray  # dtype=np.int64
     dst_device_id: Optional[int] = None
-    slice_id: Optional[int] = None
+    sender_slice_id: Optional[int] = None
+    # The peer's task index, taken from RecvReqInfo.slice_id.
+    receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
@@ -181,15 +186,32 @@ class AgentResult(Enum):
 
 
 # KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
-# GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
-# transfer_size. The optional bounce tail follows at message[2:].
-_KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
+# GIL per slice per writer): instance_rank, unique_rid, sender_slice_id, receiver_slice_id,
+# is_last, status, transfer_size. The optional bounce tail follows at message[2:].
+#
+# sender_slice_id identifies the sender's chunk (one per KVSendTask) and is carried for logging
+# and cross-side correlation only. receiver_slice_id is the peer's own task index, echoed back
+# from RecvReqInfo.slice_id, and is what the receiver uses to resolve the task.
+#
+# This layout is the ctx<->gen wire format and has no version negotiation: the receiver unpacks
+# whatever arrives against its compiled-in struct. Both servers must run matching builds.
+_KV_RESULT_PREFIX = struct.Struct("<qqqq?Bq")
 _AGENT_RESULT_CODE = {AgentResult.SUCCESS: 0, AgentResult.FAILED: 1}
 _AGENT_RESULT_BY_CODE = {0: AgentResult.SUCCESS, 1: AgentResult.FAILED}
 
+# sender_slice_id value for results emitted without an owning KVSendTask.
+NO_SLICE_ID = -1
+
 
 def _make_kv_result_msg(
-    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
+    instance_rank,
+    unique_rid,
+    sender_slice_id,
+    receiver_slice_id,
+    is_last_slice,
+    agent_result,
+    transfer_size=0,
+    tail=None,
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
     through this single binary frame so the receiver's _KV_RESULT_PREFIX.unpack never hits a stale
@@ -199,7 +221,8 @@ def _make_kv_result_msg(
         _KV_RESULT_PREFIX.pack(
             int(instance_rank),
             int(unique_rid),
-            int(slice_id),
+            int(sender_slice_id),
+            int(receiver_slice_id),
             bool(is_last_slice),
             _AGENT_RESULT_CODE[agent_result],
             int(transfer_size),
@@ -258,14 +281,24 @@ class AuxSendTask(SendTaskBase):
 
 
 class KVSendTask(SendTaskBase):
+    """A per-slice send task within a TxSession.
+
+    Args:
+        kv_slice: The KV slice describing which blocks to transfer.
+            For pipelined chunks, ``token_range`` encodes the shared global
+            chunk cursor in block-aligned token units.
+        params: Disaggregated serving parameters for this request.
+        slice_id: Index of this slice within the session's task list.
+    """
+
     def __init__(
         self,
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
-        prompt_len: Optional[int] = None,
+        prompt_len: int,
         beam_width: int = 1,
-    ):
+    ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
@@ -529,9 +562,10 @@ class Sender(SenderBase):
             logger.error(msg)
             write_meta.task.fail(RuntimeError(msg))
             return
-        assert write_meta.slice_id is not None
-        task = session.kv_tasks[write_meta.slice_id]
+        assert write_meta.sender_slice_id is not None
+        task = session.kv_tasks[write_meta.sender_slice_id]
         timer = task._perf_timer
+
         if timer:
             timer.record_push_end(write_meta.peer_rank)
         # Hold session.lock to serialize the INIT→TRANSFERRING transition with
@@ -551,19 +585,12 @@ class Sender(SenderBase):
                 f"in {status.value} state; sending FAILED to receiver"
             )
             # Task may have been enqueued after cancel() already iterated kv_tasks,
-            # so its future was never set by cancel(). Set it here as a fallback.
+            # so its event was never set by cancel(). Set it here as a fallback.
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                _make_kv_result_msg(
-                    self._instance_rank,
-                    write_meta.unique_rid,
-                    write_meta.slice_id,
-                    True,  # is_last_slice — ensures receiver resolves its task future
-                    AgentResult.FAILED,
-                )
-            )
+            # is_last=True ensures the receiver resolves its task event.
+            self._send_kv_result_to_receiver(write_meta, is_last=True, result=AgentResult.FAILED)
             return
 
         from .bounce import build_send_request, encode_result_tail
@@ -582,17 +609,13 @@ class Sender(SenderBase):
                 # region leak. Tell the receiver it failed and fail the local task instead.
                 logger.error(
                     f"_deliver_kv_to_agent: failed to build the KV send request for "
-                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
+                    f"{write_meta.unique_rid} sender_slice_id={write_meta.sender_slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                    _make_kv_result_msg(
-                        self._instance_rank,
-                        write_meta.unique_rid,
-                        write_meta.slice_id,
-                        True,  # is_last_slice — ensures receiver resolves its task future
-                        AgentResult.FAILED,
-                    )
+                self._send_kv_result_to_receiver(
+                    write_meta,
+                    is_last=True,  # ensures receiver resolves its task future
+                    result=AgentResult.FAILED,
                 )
                 return
             if timer:
@@ -606,7 +629,7 @@ class Sender(SenderBase):
                     detail = (
                         f"KV transfer agent failed: "
                         f"unique_rid={write_meta.unique_rid} "
-                        f"slice={write_meta.slice_id} "
+                        f"sender_slice_id={write_meta.sender_slice_id} "
                         f"peer_rank={write_meta.peer_rank} "
                         f"peer_endpoint={write_meta.peer_endpoint} "
                         f"op={getattr(request, 'op', '?')} "
@@ -623,23 +646,21 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
-        ## TODO: just last slice need to send task state?
+        # Intermediate chunk results are sent (not suppressed) so that RDMA
+        # failures propagate to the receiver immediately rather than requiring
+        # a timeout. Only the last chunk carries is_last_slice=True.
         tail = (
             encode_result_tail(write_meta)
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
             else None
         )
-        transfer_size = timer.get_transfer_size(write_meta.peer_rank) if timer else 0
-        result_msg = _make_kv_result_msg(
-            self._instance_rank,
-            write_meta.unique_rid,
-            write_meta.slice_id,
-            write_meta.is_last_slice,
-            agent_result,
-            transfer_size=transfer_size,
+        self._send_kv_result_to_receiver(
+            write_meta,
+            is_last=write_meta.is_last_slice,
+            result=agent_result,
+            transfer_size=timer.get_transfer_size(write_meta.peer_rank) if timer else 0,
             tail=tail,
         )
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -652,13 +673,14 @@ class Sender(SenderBase):
 
         if count > write_meta.expected_transfers:
             session.set_exception(
-                f"KV slice {write_meta.slice_id} received more than {write_meta.expected_transfers} transfers"
+                f"KV sender slice {write_meta.sender_slice_id} received more than "
+                f"{write_meta.expected_transfers} transfers"
             )
         elif count == write_meta.expected_transfers:
             if task.is_done:
                 task.status = TaskStatus.ERROR
                 session.set_exception(
-                    f"KV slice {write_meta.slice_id} task already resolved on completion"
+                    f"KV sender slice {write_meta.sender_slice_id} task already resolved on completion"
                 )
             else:
                 task.complete()
@@ -667,8 +689,38 @@ class Sender(SenderBase):
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
-            f"slice_id={write_meta.slice_id}, agent_result={agent_result}"
+            f"sender_slice_id={write_meta.sender_slice_id}, "
+            f"receiver_slice_id={write_meta.receiver_slice_id}, agent_result={agent_result}"
         )
+
+    def _send_kv_result_to_receiver(
+        self,
+        write_meta: WriteMeta,
+        is_last: bool,
+        result: AgentResult,
+        transfer_size: int = 0,
+        tail=None,
+    ) -> None:
+        """Send a KV_AGENT_RESULT for a worker-thread delivery outcome.
+
+        Covers every per-slice outcome (pre-transfer abort, RDMA failure, and
+        success). Sender-side chunking is transparent to the receiver because
+        the result addresses the receiver by its own task index
+        (``receiver_slice_id``, echoed from ``RecvReqInfo``); the sender's chunk
+        index rides along for logging and cross-side correlation.
+        Uses the per-thread DEALER because this runs on worker threads.
+        """
+        result_msg = _make_kv_result_msg(
+            self._instance_rank,
+            write_meta.unique_rid,
+            write_meta.sender_slice_id if write_meta.sender_slice_id is not None else NO_SLICE_ID,
+            write_meta.receiver_slice_id,
+            is_last,
+            result,
+            transfer_size=transfer_size,
+            tail=tail,
+        )
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
     @nvtx_range("_deliver_aux_to_agent")
     def _deliver_aux_to_agent(self, write_meta: WriteMeta):
@@ -798,11 +850,47 @@ class Sender(SenderBase):
         # Aggregate fragments from all matching pools using numpy concatenation.
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
+        tpb = extractor.page_table.tokens_per_block
+        token_range = task._slice.token_range
+        slice_end = task._prompt_len
+        total_blocks = task._slice.total_blocks
+        if total_blocks is None:
+            total_blocks = (slice_end + tpb - 1) // tpb
+        # A slice is chunked (pipelined) when it is not the last slice or
+        # its block-aligned token_range starts past the sequence beginning.
+        # Only chunked slices need block-space chunk coordinates; a full
+        # transfer's token_range (end = prompt_len) need not be block-aligned,
+        # so avoid deriving/validating it in that case.
+        is_chunked = (not task._slice.is_last_slice) or (
+            token_range is not None and token_range.start > 0
+        )
+        chunk_offset, chunk_block_count = (
+            derive_chunk_block_coords(token_range, tpb) if is_chunked else (0, 0)
+        )
+        # Resident block lists are the suffix of a range ending at the
+        # current global chunk boundary when pipelined, or at the full
+        # prompt end otherwise. token_start = (suffix_end - n_blocks) * tpb.
+        suffix_end_blocks = chunk_offset + chunk_block_count if is_chunked else total_blocks
+
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
             if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
             src_block_ids = src_block_ids_per_groups[self_lg]
-            dst_block_ids = dst_block_ids_per_groups[peer_lg]
+            full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
+
+            # When sender uses chunking, the receiver sends all dst blocks
+            # in a single RecvReqInfo. Project the global chunk cursor into
+            # each destination layer group's resident/windowed block range.
+            if is_chunked:
+                dst_projectable_blocks = full_dst_block_ids[:total_blocks]
+                dst_block_ids = project_blocks_to_global_chunk(
+                    dst_projectable_blocks,
+                    chunk_block_offset=chunk_offset,
+                    chunk_block_count=chunk_block_count,
+                    resident_block_end=total_blocks,
+                )
+            else:
+                dst_block_ids = full_dst_block_ids
 
             # Both sides trim block lists to ceil(prompt_len / tpb) in
             # _create_kv_slice, so dst must never exceed src. A smaller dst
@@ -813,15 +901,11 @@ class Sender(SenderBase):
                     f"src/dst block count mismatch: {src_block_ids.size} vs "
                     f"{dst_block_ids.size} (dst must not exceed src)"
                 )
-            tpb = extractor.page_table.tokens_per_block
-            token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
 
-            # Block lists are the suffix of [..., slice_end); cached prefix
-            # is implicit in their size. token_start = (total_blocks - n) * tpb.
-            slice_end = token_range.end if token_range is not None else 0
-            total_blocks = (slice_end + tpb - 1) // tpb
+            # Cached prefix is implicit in the block-list size, so the token
+            # start is derived from suffix_end_blocks computed above.
             src_beam0_blocks = Sender._beam0_block_count(
                 src_block_ids, total_blocks, task._beam_width
             )
@@ -836,19 +920,14 @@ class Sender(SenderBase):
                 f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
                 f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
             )
-            src_start = (total_blocks - src_beam0_blocks) * tpb
-            dst_start = (total_blocks - dst_beam0_blocks) * tpb
+            src_start = (suffix_end_blocks - src_beam0_blocks) * tpb
+            dst_start = (suffix_end_blocks - dst_beam0_blocks) * tpb
             if req_info.dst_start_token is not None:
                 dst_start = max(dst_start, req_info.dst_start_token)
             if window_size is not None:
-                # SWA stale_end uses the request prompt_len (not slice_end —
-                # they differ for non-final slices). prompt_len must be plumbed
-                # via the session; falling back to slice_end is wrong on
-                # non-final slices.
-                assert task._prompt_len is not None, (
-                    "SWA layer requires session.prompt_len; "
-                    "set TxSession(prompt_len=request.prompt_len)."
-                )
+                # The stale-block boundary is a property of the whole request,
+                # so it uses prompt_len rather than this chunk's end; the two
+                # differ on every non-final slice.
                 stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
                 src_start = max(stale_end * tpb, src_start)
                 dst_start = max(stale_end * tpb, dst_start)
@@ -915,7 +994,8 @@ class Sender(SenderBase):
             peer_rank=peer_ri.instance_rank,
             peer_endpoint=peer_ri.self_endpoint,
             unique_rid=task._unique_rid,
-            slice_id=task.slice_id,
+            sender_slice_id=task.slice_id,
+            receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._slice.is_last_slice,
             bounce_dst_base=req_info.bounce_dst_base,
         )
@@ -1055,39 +1135,41 @@ class Sender(SenderBase):
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
-        # session.lock serializes _enqueue calls from both paths.
+        # dispatch_lock keeps replayed tasks ahead of concurrently added slices.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
                 self._save_peer_req_info(info)
                 return
-        with session.lock:
-            self._save_peer_req_info(info)
-            tasks = list(session.kv_tasks)
-            # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-            # Send it directly to unblock the receiver's TRANSFERRING task future;
-            # CANCEL_SESSION alone would leave it stuck indefinitely.
-            if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                self._send_failed_result_to_receiver(info)
-                return
-        for task in tasks:
-            if task._perf_timer is not None:
-                task._perf_timer.record_task_start(info.instance_rank)
-            trans_meta = self._build_kv_write_meta(task, info)
-            if task._perf_timer is not None:
-                task._perf_timer.record_push_start(trans_meta.peer_rank)
-            self._enqueue(trans_meta)
+        with session.dispatch_lock:
+            with session.lock:
+                self._save_peer_req_info(info)
+                tasks = list(session.kv_tasks)
+                # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
+                # Send it directly to unblock the receiver's TRANSFERRING task event;
+                # CANCEL_SESSION alone would leave it stuck indefinitely.
+                if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                    self._send_failed_result_to_receiver(info)
+                    return
+            for task in tasks:
+                if task._perf_timer is not None:
+                    task._perf_timer.record_task_start(info.instance_rank)
+                trans_meta = self._build_kv_write_meta(task, info)
+                if task._perf_timer is not None:
+                    task._perf_timer.record_push_start(trans_meta.peer_rank)
+                self._enqueue(trans_meta)
 
     def _send_failed_result_to_receiver(self, info: RecvReqInfo):
         try:
             peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
-            slice_id = info.slice_id if info.slice_id is not None else 0
+            receiver_slice_id = info.slice_id if info.slice_id is not None else 0
             self._get_or_connect_dealer(peer_ri.self_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
-                    slice_id,
+                    NO_SLICE_ID,  # no KVSendTask owns this result
+                    receiver_slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
                 )
@@ -1200,9 +1282,9 @@ class TxSession(TxSessionBase):
         request_id: int,
         params: DisaggregatedParams,
         sender: Sender,
+        prompt_len: int,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
-        prompt_len: Optional[int] = None,
         beam_width: int = 1,
     ):
         super().__init__(
@@ -1219,6 +1301,10 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
+        # Serializes task discovery and queue insertion between live sends and
+        # late-peer replay. The worker FIFO makes is_last_slice correct only
+        # when every older slice is enqueued first.
+        self.dispatch_lock = threading.Lock()
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -1245,6 +1331,10 @@ class TxSession(TxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self.kv_tasks):
+            return SessionStatus.ERROR
+        if self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR:
+            return SessionStatus.ERROR
         kv_all_transferred = bool(self.kv_tasks) and all(
             t.status == TaskStatus.TRANSFERRED for t in self.kv_tasks
         )
@@ -1259,29 +1349,31 @@ class TxSession(TxSessionBase):
     def send(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
-        with self.lock:
-            params = self._base_args.params
-            slice_id = len(self.kv_tasks)
-            task = KVSendTask(
-                slice,
-                params,
-                slice_id,
-                prompt_len=self._base_args.prompt_len,
-                beam_width=self._base_args.beam_width,
-            )
-            task._unique_rid = self.disagg_request_id
-            self.kv_tasks.append(task)
-            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
-        self._sender.dispatch_task(task, req_info_snapshot)
+        with self.dispatch_lock:
+            with self.lock:
+                params = self._base_args.params
+                slice_id = len(self.kv_tasks)
+                task = KVSendTask(
+                    slice,
+                    params,
+                    slice_id,
+                    prompt_len=self._base_args.prompt_len,
+                    beam_width=self._base_args.beam_width,
+                )
+                task._unique_rid = self.disagg_request_id
+                self.kv_tasks.append(task)
+                req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+            self._sender.dispatch_task(task, req_info_snapshot)
 
     def send_aux(self) -> AuxSendTask:
-        with self.lock:
-            params = self._base_args.params
-            task = AuxSendTask(params, self.aux_slot)
-            task._unique_rid = self.disagg_request_id
-            self.aux_task = task
-            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
-        self._sender.dispatch_task(task, req_info_snapshot)
+        with self.dispatch_lock:
+            with self.lock:
+                params = self._base_args.params
+                task = AuxSendTask(params, self.aux_slot)
+                task._unique_rid = self.disagg_request_id
+                self.aux_task = task
+                req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+            self._sender.dispatch_task(task, req_info_snapshot)
         return task
 
     def pack_aux(self, request: LlmRequest) -> None:
@@ -1758,9 +1850,15 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
-        peer_rank, unique_rid, sender_slice_id, is_last_slice, status_code, transfer_size = (
-            _KV_RESULT_PREFIX.unpack(message[1])
-        )
+        (
+            peer_rank,
+            unique_rid,
+            sender_slice_id,
+            receiver_slice_id,
+            is_last_slice,
+            status_code,
+            transfer_size,
+        ) = _KV_RESULT_PREFIX.unpack(message[1])
         from .bounce import decode_result_tail
 
         dst_ptrs, sizes, src_base = decode_result_tail(message)
@@ -1772,6 +1870,7 @@ class Receiver(ReceiverBase):
             return
         session.process_kv_agent_result(
             peer_rank,
+            receiver_slice_id,
             sender_slice_id,
             is_last_slice,
             _AGENT_RESULT_BY_CODE[status_code],
@@ -1818,9 +1917,9 @@ class RxSession(RxSessionBase):
         request_id: int,
         params: DisaggregatedParams,
         receiver: Receiver,
+        prompt_len: int,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
-        prompt_len: Optional[int] = None,
         beam_width: int = 1,
     ):
         super().__init__(
@@ -1896,6 +1995,7 @@ class RxSession(RxSessionBase):
     def process_kv_agent_result(
         self,
         peer_rank: int,
+        receiver_slice_id: int,
         sender_slice_id: int,
         is_last_slice: bool,
         status: AgentResult,
@@ -1904,14 +2004,21 @@ class RxSession(RxSessionBase):
         src_base=None,
         transfer_size: int = 0,
     ):
+        """Apply one sender chunk's delivery outcome to this session.
+
+        Args:
+            receiver_slice_id: Index of the local task this result resolves.
+            sender_slice_id: The sender's chunk index, for logging only;
+                NO_SLICE_ID when the sender had no task to attribute it to.
+        """
         with self.lock:
             self.kv_cache_size_bytes += transfer_size
-            assert sender_slice_id < len(self._kv_tasks), (
-                f"Receiver got slice_id={sender_slice_id} from sender but only has "
-                f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
-                f"Sender/receiver slice count mismatch."
+            assert receiver_slice_id < len(self._kv_tasks), (
+                f"Receiver got receiver_slice_id={receiver_slice_id} (sender_slice_id="
+                f"{sender_slice_id}) but only has {len(self._kv_tasks)} receive task(s) "
+                f"for request {self.request_id}. Sender/receiver slice count mismatch."
             )
-            task = self._kv_tasks[sender_slice_id]
+            task = self._kv_tasks[receiver_slice_id]
             if status == AgentResult.SUCCESS:
                 from .bounce import scatter_write_result
 
@@ -1931,6 +2038,7 @@ class RxSession(RxSessionBase):
                             success,
                             task=task,
                             peer_rank=peer_rank,
+                            receiver_slice_id=receiver_slice_id,
                             sender_slice_id=sender_slice_id,
                             request_id=request_id,
                             instance_name=instance_name,
@@ -1944,7 +2052,8 @@ class RxSession(RxSessionBase):
                                 task.fail(
                                     RuntimeError(
                                         f"KV bounce scatter failed for request {request_id} "
-                                        f"slice={sender_slice_id}"
+                                        f"receiver_slice_id={receiver_slice_id} "
+                                        f"sender_slice_id={sender_slice_id}"
                                     )
                                 )
                                 return
@@ -1957,7 +2066,8 @@ class RxSession(RxSessionBase):
                             except Exception as e:  # perf is best-effort; never block completion
                                 logger.warning(
                                     f"KV transfer perf logging failed for request {request_id} "
-                                    f"slice={sender_slice_id}: {e}"
+                                    f"receiver_slice_id={receiver_slice_id} "
+                                    f"sender_slice_id={sender_slice_id}: {e}"
                                 )
                             task.complete()
                             # Transfer end for perf/time-sync: only meaningful once every slice has
@@ -1969,7 +2079,8 @@ class RxSession(RxSessionBase):
                                 )
                             logger.debug(
                                 f"KV transfer complete for request {request_id} "
-                                f"slice={sender_slice_id}"
+                                f"receiver_slice_id={receiver_slice_id} "
+                                f"sender_slice_id={sender_slice_id}"
                             )
 
                 scatter_write_result(
@@ -1983,7 +2094,8 @@ class RxSession(RxSessionBase):
                 )
             elif status == AgentResult.FAILED:
                 detail = (
-                    f"KV transfer failed for request {self.request_id} slice={sender_slice_id} "
+                    f"KV transfer failed for request {self.request_id} "
+                    f"receiver_slice_id={receiver_slice_id} sender_slice_id={sender_slice_id} "
                     f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
                     f"(reported by remote agent; see sender-side log for nixl_status)"
                 )
@@ -2002,8 +2114,8 @@ class RxSession(RxSessionBase):
                 )
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
-        # Aux is session-level (not per-slice); expected_transfers is identical
-        # across all kv_tasks, so any task provides the right count.
+        # Aux is session-level (not per-slice); the RxSession's single task's
+        # expected_transfers is the number of sender transfers to wait for.
         with self.lock:
             if not self._kv_tasks:
                 logger.warning(
@@ -2279,7 +2391,18 @@ class TransferWorker:
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
 
-    def create_tx_session(self, request: LlmRequest) -> TxSession:
+    def create_tx_session(
+        self,
+        request: LlmRequest,
+    ) -> TxSession:
+        """Create a TxSession for the given request.
+
+        Args:
+            request: The LLM request to create a send session for.
+
+        Returns:
+            A new ``TxSession`` ready to accept ``send()`` calls.
+        """
         params = request.py_disaggregated_params
         assert params is not None
         return TxSession(
