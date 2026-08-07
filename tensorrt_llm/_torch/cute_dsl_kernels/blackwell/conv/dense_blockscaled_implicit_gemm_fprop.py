@@ -529,15 +529,16 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         self.tma_warp_id = 5
         self.ldgsts_sfa_warp_id = (6, 7, 8, 9)
         self.sched_warp_id = 10
-        self.threads_per_cta = 32 * len(
-            (
-                self.mma_warp_id,
-                self.tma_warp_id,
-                *self.ldgsts_sfa_warp_id,
-                self.sched_warp_id,
-                *self.epilogue_warp_id,
-            )
+        # A dedicated residual G2S warp is added in __call__ only when beta != 0.
+        self.residual_warp_id = 11
+        self.base_warp_ids = (
+            self.mma_warp_id,
+            self.tma_warp_id,
+            *self.ldgsts_sfa_warp_id,
+            self.sched_warp_id,
+            *self.epilogue_warp_id,
         )
+        self.threads_per_cta = 32 * len(self.base_warp_ids)
         # Override barrier ids; parent's preferred_cluster init reserves bar 0 for cta_sync.
         self.epilog_sync_bar_id = 1
         self.epilog_sync_barrier = pipeline.NamedBarrier(
@@ -1064,6 +1065,12 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         self.has_residual: bool = beta != 0.0
         if cutlass.const_expr(self.has_residual and c_tensor is None):
             raise ValueError("beta != 0 requires a c_tensor")
+        # Keep the non-residual launch unchanged; only residual kernels pay for
+        # the extra warp that overlaps residual TMA loads with the main TMA warp.
+        if cutlass.const_expr(self.has_residual):
+            self.threads_per_cta = 32 * (len(self.base_warp_ids) + 1)
+        else:
+            self.threads_per_cta = 32 * len(self.base_warp_ids)
         if cutlass.const_expr(self.gen_sfd and self.d_dtype is not cutlass.Float4E2M1FN):
             raise ValueError(
                 f"SFD is only supported for Float4E2M1FN (NVFP4) output; got d_dtype={self.d_dtype}"
@@ -1830,7 +1837,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             defer_sync=True,
         )
 
-        # Pipeline Init: residual TMA load. The epilogue warp leader issues the
+        # Pipeline Init: residual TMA load. The dedicated residual warp issues the
         # TMA load (single-thread producer arrive) into sC; all epilogue
         # warps consume it (one release arrive per warp). No multicast: each CTA
         # loads its own output-tile residual.
@@ -1851,12 +1858,23 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             c_pipeline = None
 
         # Pipeline Init: Initialize clc_pipeline (CLC fetch async)
-        # Consumers of CLC response: TMA(1) + LDGSTS_SFA(4) + MMA(1) + Epilogue(4) per CTA, * cluster_size
-        # The tile-coord query is broadcast to all CTAs in the cluster.
+        # Consumers of CLC response: TMA(1) + LDGSTS_SFA(4) + MMA(1) + Epilogue(4)
+        # [+ residual(1) when beta != 0] per CTA, * cluster_size; plus sched(1) on
+        # the first CTA only. The residual count must use the same const gate as
+        # the residual warp below or the CLC pipeline can hang.
         clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_shape)
+        num_residual_clc_warps = 1 if cutlass.const_expr(mC_mnl is not None) else 0
         num_clc_consumer_threads = 32 * (
-            1 + cluster_size * (1 + len(self.ldgsts_sfa_warp_id) + len(self.epilogue_warp_id) + 1)
+            1
+            + cluster_size
+            * (
+                1
+                + len(self.ldgsts_sfa_warp_id)
+                + len(self.epilogue_warp_id)
+                + 1
+                + num_residual_clc_warps
+            )
         )
         clc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_clc_consumer_threads
@@ -2103,29 +2121,6 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
 
-            # Residual G2S producer lives on this (TMA) warp so the producer and
-            # the epilogue consumer sit on physically separate warps; a same-warp
-            # producer/consumer pair on the residual barrier self-deadlocks the
-            # epilogue. The gmem/smem TMA partition is thread-invariant, so
-            # recompute the exact handles the epilogue consumer expects.
-            if cutlass.const_expr(mC_mnl is not None):
-                (
-                    tma_atom_c,
-                    bGS_sC,
-                    bGS_gC_partitioned,
-                ) = self.epilog_gmem_copy_and_partition(tidx, tma_atom_c, tCgC, epi_tile, sC)
-                c_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.num_d_stage
-                )
-                # Overlapping-accum walks output subtiles back-to-front on the
-                # phase-0 tile; mirror the epilogue's acc-consumer phase with a
-                # shadow state so the producer stages subtiles in the same order
-                # the consumer reads them.
-                if cutlass.const_expr(self.overlapping_accum):
-                    c_acc_shadow_state = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer, self.num_acc_stage
-                    )
-
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -2227,50 +2222,6 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     trav_coord = cute.increment_coord(trav_coord, trav_shape)
 
                 #
-                # Issue this output tile's residual TMA loads (gmem -> smem),
-                # one per output N-subtile, walking subtiles in lockstep with
-                # the epilogue consumer. Whole-warp producer arrive (no
-                # elect_one): PipelineTmaAsync's single-thread producer group
-                # self-elects the signaling lane.
-                #
-                if cutlass.const_expr(mC_mnl is not None):
-                    bGS_gC = bGS_gC_partitioned[
-                        (
-                            None,
-                            None,
-                            None,
-                            *mma_tile_coord_mnl,
-                        )
-                    ]
-                    bGS_gC = cute.group_modes(bGS_gC, 1, cute.rank(bGS_gC))
-                    subtile_cnt = cute.size(bGS_gC.shape, mode=[1])
-                    num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-                    # Under overlapping-accum the epilogue drains subtiles
-                    # back-to-front on the phase-0 tile; the shadow acc-consumer
-                    # state reproduces that phase so buffers are staged in the
-                    # order they are consumed.
-                    if cutlass.const_expr(self.overlapping_accum):
-                        reverse_subtile = c_acc_shadow_state.phase == 0
-                    for subtile_idx in cutlass.range(subtile_cnt):
-                        real_subtile_idx = subtile_idx
-                        if cutlass.const_expr(self.overlapping_accum):
-                            if reverse_subtile:
-                                real_subtile_idx = (
-                                    self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
-                                )
-                        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
-                        c_pipeline.producer_acquire(c_producer_state)
-                        cute.copy(
-                            tma_atom_c,
-                            bGS_gC[(None, real_subtile_idx)],
-                            bGS_sC[(None, c_buffer)],
-                            tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
-                        )
-                        c_producer_state.advance()
-                    if cutlass.const_expr(self.overlapping_accum):
-                        c_acc_shadow_state.advance()
-
-                #
                 # Advance to next tile (CLC consumer)
                 #
                 clc_pipeline.consumer_wait(clc_consumer_state)
@@ -2282,12 +2233,6 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             # Wait shared AB/SFB buffer empty
             #
             ab_sfa_pipeline.producer_tail(ab_producer_state)
-
-            #
-            # Drain the residual TMA load pipeline before exiting.
-            #
-            if cutlass.const_expr(mC_mnl is not None):
-                c_pipeline.producer_tail(c_producer_state)
 
         #
         # Specialized LDGSTS SFA warp
@@ -2564,6 +2509,88 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             # Wait SFA buffer empty
             #
             ab_sfa_pipeline.producer_tail(sfa_producer_state)
+
+        #
+        # Specialized residual G2S warp (only spawned when beta != 0).
+        #
+        # Keeping residual loads off the A/B/SFB TMA warp allows both input and
+        # epilogue traffic to progress concurrently. The producer must remain on
+        # a different warp from the epilogue consumer to avoid self-deadlocking
+        # on the residual pipeline barrier.
+        #
+        if warp_idx == self.residual_warp_id:
+            if cutlass.const_expr(mC_mnl is not None):
+                tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                    tile_sched_params,
+                    cute.arch.block_idx(),
+                    cute.arch.grid_dim(),
+                    clc_response_ptr,
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+
+                (
+                    tma_atom_c,
+                    bGS_sC,
+                    bGS_gC_partitioned,
+                ) = self.epilog_gmem_copy_and_partition(tidx, tma_atom_c, tCgC, epi_tile, sC)
+                c_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_d_stage
+                )
+                # The epilogue consumes overlapping-accum's phase-0 subtiles in
+                # reverse order, so mirror its accumulator phase here.
+                if cutlass.const_expr(self.overlapping_accum):
+                    c_acc_shadow_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, self.num_acc_stage
+                    )
+
+                while work_tile.is_valid_tile:
+                    cur_tile_coord = work_tile.tile_idx
+                    mma_tile_coord_mnl = (
+                        cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                        cur_tile_coord[1],
+                        cur_tile_coord[2],
+                    )
+
+                    # Stage one residual tile per output N-subtile, in exactly
+                    # the order consumed by the epilogue warps.
+                    bGS_gC = bGS_gC_partitioned[
+                        (
+                            None,
+                            None,
+                            None,
+                            *mma_tile_coord_mnl,
+                        )
+                    ]
+                    bGS_gC = cute.group_modes(bGS_gC, 1, cute.rank(bGS_gC))
+                    subtile_cnt = cute.size(bGS_gC.shape, mode=[1])
+                    num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
+                    if cutlass.const_expr(self.overlapping_accum):
+                        reverse_subtile = c_acc_shadow_state.phase == 0
+                    for subtile_idx in cutlass.range(subtile_cnt):
+                        real_subtile_idx = subtile_idx
+                        if cutlass.const_expr(self.overlapping_accum):
+                            if reverse_subtile:
+                                real_subtile_idx = (
+                                    self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
+                                )
+                        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
+                        c_pipeline.producer_acquire(c_producer_state)
+                        cute.copy(
+                            tma_atom_c,
+                            bGS_gC[(None, real_subtile_idx)],
+                            bGS_sC[(None, c_buffer)],
+                            tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
+                        )
+                        c_producer_state.advance()
+                    if cutlass.const_expr(self.overlapping_accum):
+                        c_acc_shadow_state.advance()
+
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work_tile = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+
+                c_pipeline.producer_tail(c_producer_state)
 
         #
         # Specialized scheduler warp (drives CLC fetch, only first CTA in cluster)
@@ -3012,7 +3039,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 producer_group=d_producer_group,
             )
 
-            # The residual producer state lives on the TMA warp; the epilogue
+            # The residual producer state lives on the dedicated residual warp; the epilogue
             # only tracks the consumer side of the residual load pipeline.
             if cutlass.const_expr(mC_mnl is not None):
                 c_consumer_state = pipeline.make_pipeline_state(
