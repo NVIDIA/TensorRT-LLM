@@ -194,16 +194,25 @@ class TestResultTail:
 def test_kv_result_prefix_roundtrip():
     """The KV_AGENT_RESULT binary prefix (transfer.py) must round-trip exactly."""
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
-    for rank, rid, sl, last, status, size in [
-        (7, 6925227277844486, 42, True, tfr.AgentResult.SUCCESS, 4096),
-        (0, 1, 0, False, tfr.AgentResult.FAILED, 0),
-        (31, 2**62, 9999, True, tfr.AgentResult.SUCCESS, 2**40),
+    # Sender and receiver slice ids differ in every case so a field swap is caught.
+    for rank, rid, send_sl, recv_sl, last, status, size in [
+        (7, 6925227277844486, 42, 0, True, tfr.AgentResult.SUCCESS, 4096),
+        (0, 1, 0, 3, False, tfr.AgentResult.FAILED, 0),
+        (31, 2**62, 9999, 1, True, tfr.AgentResult.SUCCESS, 2**40),
+        (2, 77, tfr.NO_SLICE_ID, 0, True, tfr.AgentResult.FAILED, 0),
     ]:
         packed = tfr._KV_RESULT_PREFIX.pack(
-            rank, rid, sl, last, tfr._AGENT_RESULT_CODE[status], size
+            rank, rid, send_sl, recv_sl, last, tfr._AGENT_RESULT_CODE[status], size
         )
-        r, i, s, last_out, c, sz = tfr._KV_RESULT_PREFIX.unpack(packed)
-        assert (r, i, s, last_out, sz) == (rank, rid, sl, last, size)
+        r, i, send_out, recv_out, last_out, c, sz = tfr._KV_RESULT_PREFIX.unpack(packed)
+        assert (r, i, send_out, recv_out, last_out, sz) == (
+            rank,
+            rid,
+            send_sl,
+            recv_sl,
+            last,
+            size,
+        )
         assert tfr._AGENT_RESULT_BY_CODE[c] is status
 
 
@@ -212,11 +221,11 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
     """Every KV result (success and failure) uses the binary frame so the receiver can decode it."""
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     result = getattr(tfr.AgentResult, result_name)
-    msg = tfr._make_kv_result_msg(3, 12345, 7, True, result, transfer_size=8192)
+    msg = tfr._make_kv_result_msg(3, 12345, 7, 2, True, result, transfer_size=8192)
     assert msg[0] == tfr.MessageType.KV_AGENT_RESULT
     assert len(msg) == 2  # prefix only; no bounce tail when none is passed
-    r, rid, sl, last, code, size = tfr._KV_RESULT_PREFIX.unpack(msg[1])
-    assert (r, rid, sl, last, size) == (3, 12345, 7, True, 8192)
+    r, rid, send_sl, recv_sl, last, code, size = tfr._KV_RESULT_PREFIX.unpack(msg[1])
+    assert (r, rid, send_sl, recv_sl, last, size) == (3, 12345, 7, 2, True, 8192)
     assert tfr._AGENT_RESULT_BY_CODE[code] is result
 
 

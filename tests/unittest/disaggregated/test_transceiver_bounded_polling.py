@@ -127,6 +127,7 @@ def _make_tx_session(
     session._timeout_s = 0.25
     session._need_aux = need_aux
     session._terminal_status = None
+    session._exception = None
     session.receiver_ready = True
     session.kv_tasks = kv_tasks
     session.aux_task = aux_task
