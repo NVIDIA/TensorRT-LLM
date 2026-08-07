@@ -85,9 +85,10 @@ Measured scale: `tensorrt_llm` is 646410 lines, of which **14191 (2.2%)** are cl
 7513 of those sit under an enclosing function whose row set trails the whole file's by more than
 300 tests.
 
-The consumer side can only widen a closure change to file level (see `../coverage_selection/SELECTION.md` §4);
-**the collection side itself is unfixed.** A real fix means having the producer record closure
-frames (the `<locals>` segments in `co_qualname` can be kept or folded), which is follow-up work.
+The consumer side widens a closure change to file level when that is wider, and otherwise runs in
+full (`../coverage_selection/SELECTION.md` §4.1); **the collection side itself is unfixed.** A real
+fix means having the producer record closure frames (the `<locals>` segments in `co_qualname` can
+be kept or folded), which is follow-up work.
 
 ### 5.2 Import phase is lost inside pool workers
 
@@ -104,6 +105,11 @@ workers.
 
 Deferred activation is deliberate: without it, the instrumented cold-start import overruns the
 `wait_shutdown` worker identity barrier.
+
+This blind spot is what costs the most on the consumer side: a change landing on a module body, a
+class body or a signature / decorator line cannot be bounded from these rows, so the tier declines
+and the PR runs in full (`../coverage_selection/SELECTION.md` §4). Recording the workers' import
+phase is what would let those changes narrow again.
 
 ### 5.3 Other blind spots
 
