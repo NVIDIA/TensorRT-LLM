@@ -384,6 +384,27 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         return out.reshape(out_shape)
 
 
+def _swap_linear_to_fp8_weight_read(
+    parent: nn.Module,
+    attr: str,
+    linear_types: Tuple[type, ...] = (nn.Linear,),
+) -> bool:
+    """Replace ``parent.<attr>`` with an FP8 weight-read module if it is a
+    plain linear of one of ``linear_types``; return whether it converted.
+
+    Frees the original BF16 weight storage immediately: the loader holds a
+    transient name->Parameter map that keeps it alive until load returns, so
+    without this the FP8 copy is purely additive and fragments the pool the
+    FP8 GEMM autotuner and KV-cache init need.
+    """
+    child = getattr(parent, attr, None)
+    if not isinstance(child, linear_types):
+        return False
+    setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
+    child.weight.data = child.weight.data.new_empty(0)
+    return True
+
+
 def _convert_moe_mlps_to_fp8_weight_read(
     model: nn.Module, include_fused_gate_up: bool = True
 ) -> int:
@@ -396,18 +417,6 @@ def _convert_moe_mlps_to_fp8_weight_read(
     BF16. Returns the number of projections converted.
     """
     count = 0
-
-    def _swap(parent: nn.Module, attr: str) -> None:
-        nonlocal count
-        child = getattr(parent, attr, None)
-        if isinstance(child, nn.Linear):
-            setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
-            # Release the original BF16 weight storage now. The loader holds a
-            # transient name->Parameter map that keeps it alive until load
-            # returns, so without this the FP8 copy is purely additive and
-            # fragments the pool the FP8 GEMM autotuner and KV-cache init need.
-            child.weight.data = child.weight.data.new_empty(0)
-            count += 1
 
     for layer in model.layers:
         moe = getattr(layer, "block_sparse_moe", None)
@@ -426,9 +435,9 @@ def _convert_moe_mlps_to_fp8_weight_read(
                 else ("gate_proj", "up_proj", "down_proj")
             )
             for attr in shared_attrs:
-                _swap(shared, attr)
+                count += _swap_linear_to_fp8_weight_read(shared, attr)
         for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
-            _swap(moe, attr)
+            count += _swap_linear_to_fp8_weight_read(moe, attr)
 
     # Return the freed BF16 blocks to the driver so the raw (non-caching-
     # allocator) allocations made during executor creation succeed on the
@@ -509,11 +518,7 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
 
         # o_proj reads the decode-kernel output, so it is not part of the fused
         # hidden-reading group; convert it on its own.
-        o_proj = getattr(mixer, "o_proj", None)
-        if isinstance(o_proj, nn.Linear):
-            setattr(mixer, "o_proj", _Fp8BlockScaleWeightReadLinear.from_linear(o_proj))
-            o_proj.weight.data = o_proj.weight.data.new_empty(0)
-            count += 1
+        count += _swap_linear_to_fp8_weight_read(mixer, "o_proj")
 
     if count:
         gc.collect()
@@ -610,18 +615,6 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     """
     count = 0
 
-    def _swap(parent: nn.Module, attr: str) -> None:
-        nonlocal count
-        child = getattr(parent, attr, None)
-        if isinstance(child, (nn.Linear, TrtllmLinear)):
-            setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
-            # Free the original BF16 storage now (as in the MLP/KDA conversions
-            # above): the loader's transient name->Parameter map would otherwise
-            # keep it alive until load returns, making the FP8 copy purely
-            # additive on the tight DEP16 pool.
-            child.weight.data = child.weight.data.new_empty(0)
-            count += 1
-
     for layer in model.layers:
         # MLA layers are the non-KDA layers (each layer is exactly one of the
         # two); their projections live on the KimiK3MLAAttention mixer.
@@ -633,7 +626,9 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
         # g_proj exists only when the MLA output gate is enabled; a missing
         # attr is a safe no-op.
         for attr in ("q_a_proj", "q_b_proj", "o_proj", "g_proj"):
-            _swap(mixer, attr)
+            count += _swap_linear_to_fp8_weight_read(
+                mixer, attr, linear_types=(nn.Linear, TrtllmLinear)
+            )
 
     if count:
         gc.collect()
@@ -2181,25 +2176,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         return name_map, expected_keys, expert_jobs
 
     def load_weights(self, weights: Dict):
-        from .modeling_utils import run_concurrently
-
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
-
-        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
-        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
-        # instead, so context can project directly into the FMHA layout and
-        # absorbed decode can take zero-copy K/V views.
-        mla_mixers = [
-            layer.self_attn.mixer
-            for layer in self.model.layers
-            if not getattr(layer, "is_kda", True)
-        ]
-        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
-
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
-        # ---- key-set validation (both directions) ----
+        self._validate_checkpoint_keys(weights, expected_keys, prefix)
+        num_params = self._load_trunk_params(weights, params, name_map)
+        self._load_expert_slices(weights, expert_jobs)
+        self._finalize_weight_load(num_params, len(expert_jobs))
+
+    def _validate_checkpoint_keys(self, weights: Dict, expected_keys, prefix: str) -> None:
+        """Key-set validation (both directions): every expected key must be
+        present; unmatched checkpoint keys (beyond the expected leftovers)
+        only warn."""
         ckpt_keys = set(weights.keys())
         relevant_ckpt_keys = {
             k
@@ -2225,6 +2214,23 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"Kimi K3 load_weights: {len(surprising)} unmatched "
                 f"checkpoint keys, e.g. {surprising[:10]}"
             )
+
+    def _load_trunk_params(self, weights: Dict, params, name_map: Dict[str, str]) -> int:
+        """Load every non-expert trunk parameter concurrently (with the
+        per-parameter TP-shard / pad / fuse conversions) and return the
+        number of parameters loaded."""
+        from .modeling_utils import run_concurrently
+
+        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
+        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
+        # instead, so context can project directly into the FMHA layout and
+        # absorbed decode can take zero-copy K/V views.
+        mla_mixers = [
+            layer.self_attn.mixer
+            for layer in self.model.layers
+            if not getattr(layer, "is_kda", True)
+        ]
+        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
 
         device = next(self.parameters()).device
 
@@ -2426,6 +2432,21 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             param.data.copy_(src.to(param.dtype))
 
+        param_jobs = [(name, params[name]) for name in name_map]
+        run_concurrently(load_param, param_jobs, num_workers=8)
+
+        logger.info(
+            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
+        )
+        return len(param_jobs)
+
+    def _load_expert_slices(self, weights: Dict, expert_jobs) -> None:
+        """Load the rank-local MXFP4 expert slices of every MoE layer into
+        the backend expert slots, then verify every slot was filled."""
+        from .modeling_utils import run_concurrently
+
+        device = next(self.parameters()).device
+
         def load_expert(
             moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
         ):
@@ -2454,13 +2475,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     expert_idx,
                     lambda key: _materialize(weights[key]),
                 )
-
-        param_jobs = [(name, params[name]) for name in name_map]
-        run_concurrently(load_param, param_jobs, num_workers=8)
-
-        logger.info(
-            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
-        )
 
         # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the
@@ -2551,6 +2565,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             backend._weights_transformed = False
 
+    def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
+        """Post-load finalization: build the KDA decode fast-path constants
+        and apply the FP8 weight-read conversions (all behind their env
+        switches)."""
         # FP8 weight-read master switch (see the conversion block below).
         # The KDA conversion replaces the decode in-projection GEMV with a
         # fused FP8 qkvg GEMM in the mixer decode path, so when it is enabled
@@ -2575,8 +2593,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     layer.self_attn.finalize_decode_weights()
                 num_kda_fused += int(layer.self_attn._in_proj_weight is not None)
         logger.info(
-            f"Kimi K3: loaded {len(param_jobs)} parameters and the expert "
-            f"slices of {len(expert_jobs)} MoE layers; fused decode "
+            f"Kimi K3: loaded {num_params} parameters and the expert "
+            f"slices of {num_moe_layers} MoE layers; fused decode "
             f"in-projections on {num_kda_fused} KDA layers"
         )
 
