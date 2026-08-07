@@ -160,6 +160,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.enable_pipelined_transfer"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
