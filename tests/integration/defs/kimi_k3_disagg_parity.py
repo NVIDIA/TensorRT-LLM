@@ -126,7 +126,11 @@ def _served_model(base_url, timeout):
     except urllib.error.HTTPError as e:
         print(f"[parity] NOTE: {base_url}/v1/models unavailable (HTTP {e.code})")
         return None
-    except (urllib.error.URLError, OSError, KeyError, IndexError) as e:
+    # URLError/OSError: connection-level failures. KeyError/IndexError/
+    # TypeError: malformed payload shapes ([], {"data": None},
+    # {"data": [None]}, ...). ValueError covers json.JSONDecodeError from
+    # non-JSON response bodies.
+    except (urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError) as e:
         print(f"[parity] NOTE: {base_url}/v1/models unavailable ({e})")
         return None
 
@@ -741,6 +745,40 @@ def _self_test() -> int:
     f = []
     _diff_gsm8k({"exact_match,strict-match": 0.90}, {"exact_match,strict-match": 0.80}, 0.02, f)
     check("gsm8k tolerance", ok_within and len(f) == 1)
+
+    # 11. _served_model returns None for malformed /v1/models payloads,
+    #     invalid JSON, and connection failures; extracts the id otherwise.
+    global _http_json
+    orig_http_json = _http_json
+    bad_responses = [
+        [],
+        {"data": None},
+        {"data": [None]},
+        {"data": [{}]},
+        json.JSONDecodeError("Expecting value", "not-json", 0),
+        urllib.error.URLError("connection refused"),
+    ]
+    try:
+        results = []
+        for rsp in bad_responses:
+
+            def _canned(url, payload=None, timeout=0, _rsp=rsp):
+                if isinstance(_rsp, Exception):
+                    raise _rsp
+                return _rsp
+
+            _http_json = _canned
+            results.append(_served_model("http://stub", timeout=1))
+
+        def _good(url, payload=None, timeout=0):
+            return {"data": [{"id": "the-model"}]}
+
+        _http_json = _good
+        served = _served_model("http://stub", timeout=1)
+    finally:
+        _http_json = orig_http_json
+    check("_served_model malformed payloads -> None", all(r is None for r in results))
+    check("_served_model well-formed payload", served == "the-model")
 
     failed = [name for name, cond in checks if not cond]
     if failed:
