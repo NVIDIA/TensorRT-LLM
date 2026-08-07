@@ -565,11 +565,11 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
     model = Qwen2VisionModelBase(model_config, Qwen2_5_VisionModel).visual
     model.metadata_cls = _StubVisionAttentionMetadata
 
-    max_num_requests = 8
+    max_num_items = 8
     max_num_tokens = 16
     fixed_max_seq_len = 65_536
     expected_window_max_seq_len = 64
-    model.setup_attn_metadata(max_num_requests=max_num_requests,
+    model.setup_attn_metadata(max_num_items=max_num_items,
                               max_num_tokens=max_num_tokens)
     model.set_attn_max_seq_len(fixed_max_seq_len)
 
