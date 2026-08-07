@@ -67,7 +67,7 @@ def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch():
 
 
 def test_prepare_buffers_span_seq_slot_pool():
-    # Under overlap scheduling the SeqSlotManager pool
+    # Under DeepSeek-V4 overlap scheduling the SeqSlotManager pool
     # (num_seq_slots) can exceed max_num_requests; py_seq_slot then indexes past
     # max_num_requests. Slot-indexed buffers must span the full pool plus the
     # dummy scratch row, and dummy_slot_row must land on that last row so a real

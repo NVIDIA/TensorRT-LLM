@@ -48,14 +48,21 @@ def _make_active_request(
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
-    req.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
-    req.state = (
-        LlmRequestState.DISAGG_TRANS_ERROR if in_error else LlmRequestState.GENERATION_IN_PROGRESS
-    )
+    if in_error:
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    elif in_transfer:
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    elif in_init:
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    else:
+        req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.state_value = req.state.value
     req.is_attention_dp_dummy = False
+    req.is_encoder_init_state = False
     req.is_context_init_state = False
+    req.is_generation_in_progress_state = req.state == LlmRequestState.GENERATION_IN_PROGRESS
     req.py_encoder_output_ready_event = None
     return req
 
@@ -591,11 +598,18 @@ class MockPadDummyExecutor:
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
         self._enable_adp_dummy_fixes = True
+        self._enable_scheduler_aware_adp_dummy = True
+        self._enable_non_overlap_adp_forward_intent = True
         self.max_num_tokens = None
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
         self.dist.tp_allgather.side_effect = lambda value: [value]
+        # Simulate a peer rank with generation compute after the fill gate
+        # opens, so an empty local rank needs a generation dummy.
+        self.dist.tp_allreduce.side_effect = lambda value, op: max(
+            value, int(self._ADPForwardIntent.GENERATION)
+        )
 
         self.scheduler = Mock()
         self.scheduler.scheduling_state_range = (
@@ -618,10 +632,11 @@ class MockPadDummyExecutor:
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
 
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _ADPForwardIntent
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
+    _get_non_overlap_adp_forward_intent = PyExecutor._get_non_overlap_adp_forward_intent
     _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
 

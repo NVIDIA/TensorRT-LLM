@@ -92,7 +92,7 @@ def get_spec_metadata(spec_config,
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
-    # Overlap can make the sequence-slot pool exceed max_num_requests.
+    # DeepSeek-V4 overlap can exceed max_num_requests.
     num_seq_slots = (num_seq_slots
                      if num_seq_slots is not None else max_num_requests)
     vocab_size = getattr(model_config, "vocab_size", 0)

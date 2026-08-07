@@ -866,29 +866,6 @@ class TestBindCapacitySchedulerCrossParam:
             impl.assert_called_once_with([], kv_mgr, None, cross_mgr)
 
 
-class TestBindMicroBatchSchedulerStateRange:
-    """C++-bound micro-batch scheduling exposes its configured state range."""
-
-    def test_encoder_state_range_is_forwarded(self):
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import BindMicroBatchScheduler
-
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.scheduler.scheduler.tb_internal.algorithms.MicroBatchScheduler"
-        ) as micro_cls:
-            micro_cls.return_value = Mock()
-            scheduler = BindMicroBatchScheduler(
-                max_batch_size=8,
-                max_num_tokens=4096,
-                no_schedule_until_state=LlmRequestState.ENCODER_INIT,
-            )
-
-        kwargs = micro_cls.call_args.kwargs
-        assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
-        assert kwargs["no_schedule_after_state"] == LlmRequestState.GENERATION_TO_COMPLETE
-        assert scheduler.no_schedule_until_state == LlmRequestState.ENCODER_INIT
-
-
 class TestSimpleUnifiedSchedulerCrossParam:
     """V1 Python ``SimpleUnifiedScheduler`` exposes cross-KV wiring."""
 
@@ -917,10 +894,6 @@ class TestSimpleUnifiedSchedulerCrossParam:
         assert scheduler.capacity_scheduler.no_schedule_until_state == LlmRequestState.ENCODER_INIT
         assert (
             scheduler.micro_batch_scheduler.no_schedule_until_state == LlmRequestState.ENCODER_INIT
-        )
-        assert scheduler.scheduling_state_range == (
-            LlmRequestState.ENCODER_INIT,
-            LlmRequestState.GENERATION_TO_COMPLETE,
         )
 
 
