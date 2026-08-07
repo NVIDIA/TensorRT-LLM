@@ -38,15 +38,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
-from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
-
 _HAVE_DEPS = True
 _DEP_ERR = None
 try:
     import cuda.bindings.driver  # noqa: F401
     import cutlass  # noqa: F401
     from fla.ops.kda import fused_recurrent_kda  # noqa: F401
+
+    # The model module transitively imports the optional deps above, so it
+    # must stay behind the guard too or collection fails instead of skipping.
+    from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
