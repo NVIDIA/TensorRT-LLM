@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import VideoJob
-from tensorrt_llm.serve.openai_server import _model_supports_image_edit, _normalize_image_output
+from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
@@ -141,7 +141,7 @@ class MockVisualGen:
         generate_error: Optional[BaseException] = None,
         extra_param_specs: Optional[dict] = None,
         model: str = "test-model",
-        pipeline_class_name: Optional[str] = None,
+        supports_image_edit: bool = False,
     ):
         from types import SimpleNamespace
 
@@ -184,7 +184,7 @@ class MockVisualGen:
             },
             extra_param_specs=extra_param_specs
             or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
-            pipeline_class_name=pipeline_class_name,
+            supports_image_edit=supports_image_edit,
         )
 
     def _maybe_batch(self, tensor, n):
@@ -708,30 +708,43 @@ class TestImageGeneration:
 class TestImageEdit:
     """``/v1/images/edits`` support is gated by the loaded visual model."""
 
+    def _client(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        image_output: Optional[torch.Tensor] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "Qwen/Qwen-Image-Layered",
+        should_fail: bool = False,
+        supports_image_edit: bool = True,
+    ):
+        gen = MockVisualGen(
+            image_output=image_output if image_output is not None else _make_dummy_image_tensor(),
+            extra_param_specs=extra_param_specs,
+            model=model,
+            should_fail=should_fail,
+            supports_image_edit=supports_image_edit,
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        return _create_server(gen, model_name=model), gen
+
     @pytest.mark.parametrize(
-        ("model_id", "expected"),
+        ("model", "supports_image_edit", "expected_status"),
         [
-            ("black-forest-labs/FLUX.2-dev", True),
-            ("Qwen/Qwen-Image-Edit-2511", True),
-            ("Qwen/Qwen-Image-Layered", True),
-            ("FLUX.2-dev", False),
-            ("Qwen/Qwen-Image", False),
-            (None, False),
+            ("not-a-canonical-edit-model-id", True, 200),
+            ("Qwen/Qwen-Image-Layered", False, 501),
         ],
     )
-    def test_model_supports_image_edit(self, model_id, expected):
-        assert _model_supports_image_edit(model_id) is expected
-
-    def test_local_path_flux2_image_edit_uses_pipeline_class(self, tmp_path, monkeypatch):
-        local_model = tmp_path / "FLUX.2-dev"
-        local_model.mkdir()
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model=str(local_model),
-            pipeline_class_name="Flux2Pipeline",
+    def test_image_edit_support_uses_loaded_pipeline_capability(
+        self, tmp_path, monkeypatch, model, supports_image_edit, expected_status
+    ):
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            model=model,
+            supports_image_edit=supports_image_edit,
         )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
-        client = _create_server(gen, model_name=str(local_model))
 
         resp = client.post(
             "/v1/images/edits",
@@ -742,7 +755,9 @@ class TestImageEdit:
             },
         )
 
-        assert resp.status_code == 200
+        assert resp.status_code == expected_status
+        if expected_status == 501:
+            assert gen.last_params is None
 
     def test_image_edit_returns_not_implemented(self, image_client):
         """Valid request body short-circuits to 501 NotImplemented."""
@@ -770,38 +785,12 @@ class TestImageEdit:
         assert body.get("type") == "NotImplementedError"
 
     def test_image_edit_accepts_json_base64_image(self, tmp_path, monkeypatch):
-        """JSON image-edit requests materialize base64 images into upload storage."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
+        """JSON edit requests materialize inputs and map OpenAI-shaped fields."""
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            image_output=_make_dummy_image_tensor(4, 4),
         )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
-
-        resp = client.post(
-            "/v1/images/edits",
-            json={
-                "prompt": "split layers",
-                "image": _b64_white_png_1x1(),
-                "response_format": "b64_json",
-            },
-        )
-
-        assert resp.status_code == 200
-        assert str(gen.last_params.image).startswith(str(tmp_path))
-        assert not os.path.exists(gen.last_params.image)
-        body = resp.json()
-        assert body["size"] == "64x64"
-        assert len(body["data"]) == 1
-
-    def test_image_edit_accepts_case_insensitive_json_content_type(self, tmp_path, monkeypatch):
-        """Media-type matching is case-insensitive."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
 
         resp = client.post(
             "/v1/images/edits",
@@ -809,6 +798,8 @@ class TestImageEdit:
                 {
                     "prompt": "split layers",
                     "image": _b64_white_png_1x1(),
+                    "n": 2,
+                    "output_format": "webp",
                     "response_format": "b64_json",
                 }
             ),
@@ -816,16 +807,42 @@ class TestImageEdit:
         )
 
         assert resp.status_code == 200
-        assert gen.last_params is not None
+        assert str(gen.last_params.image).startswith(str(tmp_path))
+        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.num_images_per_prompt == 2
+        body = resp.json()
+        assert body["output_format"] == "webp"
+        assert body["size"] == "4x4"
+        assert len(body["data"]) == 2
+
+    def test_image_edit_default_url_returns_fetchable_output(self, tmp_path, monkeypatch):
+        """The default edit response writes a fetchable image content URL."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        url = body["data"][0]["url"]
+        assert "/v1/images/" in url and "/content" in url
+        assert str(gen.last_params.image).startswith(str(tmp_path))
+        assert not os.path.exists(gen.last_params.image)
+
+        path = url.split("//", 1)[-1].split("/", 1)[1]
+        content = client.get("/" + path)
+        assert content.status_code == 200
+        assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert content.headers["content-type"] == "image/png"
 
     def test_image_edit_rejects_json_array_body(self, tmp_path, monkeypatch):
         """Non-object JSON bodies are client errors, not server errors."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -846,12 +863,7 @@ class TestImageEdit:
 
     def test_image_edit_rejects_file_extra_params(self, tmp_path, monkeypatch):
         """Multipart extra_params must be a JSON string field."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
         resp = client.post(
@@ -872,12 +884,7 @@ class TestImageEdit:
 
     def test_image_edit_rejects_empty_image_list(self, tmp_path, monkeypatch):
         """Empty image lists fail request validation before pipeline dispatch."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -895,12 +902,7 @@ class TestImageEdit:
 
     def test_image_edit_rejects_non_image_base64_input(self, tmp_path, monkeypatch):
         """Decoded image-edit bytes must be a supported image before disk write."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -922,12 +924,7 @@ class TestImageEdit:
 
     def test_image_edit_rejects_non_image_upload_input(self, tmp_path, monkeypatch):
         """Multipart image-edit bytes are sniffed before materialization."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -947,41 +944,9 @@ class TestImageEdit:
         assert gen.last_params is None
         assert list(tmp_path.iterdir()) == []
 
-    def test_image_edit_maps_n_and_output_format(self, tmp_path, monkeypatch):
-        """OpenAI edit fields map through the visual-gen serving path."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(4, 4),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
-
-        resp = client.post(
-            "/v1/images/edits",
-            json={
-                "prompt": "split layers",
-                "image": _b64_white_png_1x1(),
-                "n": 2,
-                "output_format": "webp",
-                "response_format": "b64_json",
-            },
-        )
-
-        assert resp.status_code == 200
-        assert gen.last_params.num_images_per_prompt == 2
-        body = resp.json()
-        assert body["output_format"] == "webp"
-        assert body["size"] == "4x4"
-        assert len(body["data"]) == 2
-
     def test_image_edit_rejects_mask_with_clear_error(self, tmp_path, monkeypatch):
         """Mask is OpenAI-shaped but not implemented by TRTLLM image edit yet."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -999,12 +964,7 @@ class TestImageEdit:
 
     def test_image_edit_rejects_too_many_input_images(self, tmp_path, monkeypatch):
         """Input image count is capped before files are materialized."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -1020,25 +980,42 @@ class TestImageEdit:
         assert gen.last_params is None
         assert list(tmp_path.iterdir()) == []
 
-    def test_image_edit_rejects_excessive_output_fanout(self, tmp_path, monkeypatch):
-        """Layered output fan-out is capped before files are materialized."""
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            extra_param_specs={
-                "layers": ExtraParamSchema(type="int", default=4, range=(1, 16)),
-            },
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+    def test_image_edit_allows_max_input_images_without_output_fanout(self, tmp_path, monkeypatch):
+        """Multiple edit inputs are joint conditioning, not output fan-out."""
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
             json={
                 "prompt": "split layers",
-                "image": [_b64_white_png_1x1()] * 5,
+                "image": [_b64_white_png_1x1()] * 16,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert len(gen.last_params.image) == 16
+        assert len(resp.json()["data"]) == 1
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_excessive_output_fanout(self, tmp_path, monkeypatch):
+        """Layered output fan-out is capped before files are materialized."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            extra_param_specs={
+                "layers": ExtraParamSchema(type="int", default=4, range=(1, 16)),
+            },
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "n": 5,
                 "extra_params": {"layers": 16},
                 "response_format": "b64_json",
             },
@@ -1053,18 +1030,13 @@ class TestImageEdit:
         """Base64 image size is capped before allocating decoded bytes."""
         from tensorrt_llm.serve import visual_gen_utils
 
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client, gen = self._client(tmp_path, monkeypatch)
         monkeypatch.setattr(visual_gen_utils, "IMAGE_EDIT_MAX_IMAGE_BYTES", 8)
         monkeypatch.setattr(
             visual_gen_utils.base64,
             "b64decode",
             lambda *args, **kwargs: pytest.fail("oversized payload was decoded"),
         )
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
 
         resp = client.post(
             "/v1/images/edits",
@@ -1082,13 +1054,11 @@ class TestImageEdit:
 
     def test_image_edit_cleans_inputs_when_generation_fails(self, tmp_path, monkeypatch):
         """Temporary edit inputs are removed even when generation raises."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
             should_fail=True,
-            model="Qwen/Qwen-Image-Layered",
         )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
 
         resp = client.post(
             "/v1/images/edits",
@@ -1113,12 +1083,7 @@ class TestImageEdit:
     )
     def test_image_edit_rejects_json_path_or_url_image(self, tmp_path, monkeypatch, image_value):
         """Serving image-edit input strings must be base64, not server paths or URLs."""
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(),
-            model="Qwen/Qwen-Image-Layered",
-        )
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        client, gen = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -1131,74 +1096,6 @@ class TestImageEdit:
 
         assert resp.status_code == 400
         assert gen.last_params is None
-
-    def test_qwen_layered_image_edit_returns_multiple_layers_by_default(self, tmp_path):
-        """Qwen-Image-Layered returns one response item per layer by default."""
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-
-        gen = MockVisualGen(
-            image_output=torch.stack(
-                [
-                    _make_dummy_image_tensor(4, 4),
-                    _make_dummy_image_tensor(4, 4),
-                    _make_dummy_image_tensor(4, 4),
-                    _make_dummy_image_tensor(4, 4),
-                ]
-            ),
-            extra_param_specs={
-                "save_layers_to_grid": ExtraParamSchema(type="bool", default=False),
-            },
-            model="Qwen/Qwen-Image-Layered",
-        )
-        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
-        try:
-            image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
-            resp = client.post(
-                "/v1/images/edits",
-                data={
-                    "prompt": "split layers",
-                    "response_format": "b64_json",
-                },
-                files={"image": ("input.png", image_bytes, "image/png")},
-            )
-        finally:
-            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
-
-        assert resp.status_code == 200
-        assert gen.last_params.extra_params is None
-        assert len(resp.json()["data"]) == 4
-
-    def test_qwen_layered_image_edit_save_layers_to_grid_returns_single_image(self, tmp_path):
-        """Qwen-Image-Layered packs layers when the request opts into grid output."""
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-
-        gen = MockVisualGen(
-            image_output=_make_dummy_image_tensor(8, 8),
-            extra_param_specs={
-                "save_layers_to_grid": ExtraParamSchema(type="bool", default=False),
-            },
-            model="Qwen/Qwen-Image-Layered",
-        )
-        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
-        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
-        try:
-            image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
-            resp = client.post(
-                "/v1/images/edits",
-                data={
-                    "prompt": "split layers",
-                    "response_format": "b64_json",
-                    "extra_params": json.dumps({"save_layers_to_grid": True}),
-                },
-                files={"image": ("input.png", image_bytes, "image/png")},
-            )
-        finally:
-            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
-
-        assert resp.status_code == 200
-        assert gen.last_params.extra_params == {"save_layers_to_grid": True}
-        assert len(resp.json()["data"]) == 1
 
 
 # =========================================================================

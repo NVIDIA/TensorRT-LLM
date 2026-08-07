@@ -253,9 +253,7 @@ def _validate_image_edit_request_limits(
             f"Image edit accepts at most {IMAGE_EDIT_MAX_IMAGES} input images, got {image_count}."
         )
 
-    output_count = (
-        image_count * (request.n or 1) * _resolve_image_edit_layer_multiplier(request, generator)
-    )
+    output_count = (request.n or 1) * _resolve_image_edit_layer_multiplier(request, generator)
     if output_count > IMAGE_EDIT_MAX_OUTPUT_IMAGES:
         raise ValueError(
             "Image edit request can produce at most "
