@@ -1228,15 +1228,14 @@ class DFlashForCausalLM(nn.Module):
                 for k, v in weights.items() if k not in dspark_weights
             }
         if self._dspark_markov_rank > 0:
+            vocab = self.config.vocab_size
+            rank = self._dspark_markov_rank
             for k in ('markov_w1.weight', 'markov_w2.weight'):
                 if k not in dspark_weights:
                     raise ValueError(
                         f"DFlash dspark drafter declares markov_rank="
                         f"{self._dspark_markov_rank} but the checkpoint is "
                         f"missing {k}.")
-            vocab = self.config.vocab_size
-            rank = self._dspark_markov_rank
-            for k in ('markov_w1.weight', 'markov_w2.weight'):
                 if tuple(dspark_weights[k].shape) != (vocab, rank):
                     raise ValueError(
                         f"DFlash dspark {k} has shape "
