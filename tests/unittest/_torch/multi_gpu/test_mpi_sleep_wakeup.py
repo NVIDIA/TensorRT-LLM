@@ -15,7 +15,7 @@
 """Multi-rank (TP=2) sleep/wakeup tests for the MPI/IPC executor path.
 
 Verifies that sleep() and wakeup() correctly release and restore GPU memory on
-*all* ranks, not just rank-0.  Uses TinyLlama with tensor_parallel_size=2 so
+*all* ranks, not just rank-0.  Uses Llama-3.1-8B with tensor_parallel_size=2 so
 the PyExecutor starts two MPI worker processes; the control-listener thread on
 rank-1 is exercised by every sleep/wakeup call.
 
@@ -33,7 +33,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
-_LLAMA_MODEL_PATH = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+_LLAMA_MODEL_PATH = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
 
 _PROMPTS = [
     "Hello, my name is",

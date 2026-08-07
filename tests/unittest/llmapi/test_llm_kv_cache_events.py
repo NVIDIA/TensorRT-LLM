@@ -30,7 +30,7 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .test_llm import get_model_path
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
 llama_model_path = get_model_path(default_model_name)
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,

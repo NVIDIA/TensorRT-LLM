@@ -83,7 +83,7 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
     Both components must use the same stream for proper synchronization.
     """
     # Use a simple model for testing
-    MODEL = "llama-3.2-models/Llama-3.2-1B-Instruct"
+    MODEL = "llama-3.1-model/Llama-3.1-8B-Instruct"
     MODEL_PATH = get_model_path(MODEL)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,

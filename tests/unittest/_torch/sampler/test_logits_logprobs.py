@@ -90,7 +90,7 @@ def llm(
         )
 
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "llama-3.1-model", "Llama-3.1-8B-Instruct"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         sampler_type=sampler_type,
@@ -104,7 +104,7 @@ def llm(
 @pytest.fixture(scope="module")
 def simple_llm() -> LLM:
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "llama-3.1-model", "Llama-3.1-8B-Instruct"),
         max_batch_size=8,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
@@ -817,7 +817,7 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
 @force_ampere
 @pytest.mark.gpu2
 def test_logprobs_match_hf_tp2():
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "llama-3.1-model", "Llama-3.1-8B-Instruct")
     llm = LLM(
         model=model_path,
         tensor_parallel_size=2,
@@ -873,7 +873,7 @@ def test_logprobs_pp2():
     Without the fix, logprobs length = 2N-1 instead of N due to duplication
     in the PP ring broadcast diff mechanism.
     """
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "llama-3.1-model", "Llama-3.1-8B-Instruct")
     max_tokens = 16
     llm = LLM(
         model=model_path,

@@ -191,7 +191,7 @@ def test_result_completes_within_timeout():
 
 def test_DetokenizedGenerationResultBase():
     sampling_params = SamplingParams(max_tokens=4)
-    model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct"
     tokenizer = TransformersTokenizer.from_pretrained(model_path)
     result = DetokenizedGenerationResultBase(
         id=2,
@@ -408,7 +408,7 @@ def test_ResponsePostprocessWorker():
     fut = pool.submit(
         ResponsePostprocessWorker_worker_task, input_pipe.address,
         out_pipe.address,
-        str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"))
+        str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct"))
 
     inputs = [
         Input(rsp=create_rsp(123),
@@ -503,7 +503,7 @@ def test_PostprocWorker_disaggregated_params():
     fut = pool.submit(
         ResponsePostprocessWorker_worker_task, input_pipe.address,
         out_pipe.address,
-        str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"))
+        str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct"))
 
     disagg_params = DisaggregatedParams(
         request_type="generation_only",
