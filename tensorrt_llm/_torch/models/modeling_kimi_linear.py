@@ -74,10 +74,14 @@ is validated only without block reuse (Mixed cache manager).
 from __future__ import annotations
 
 import copy
+import gc
+import json
 import os
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from ..._utils import is_sm_100f
@@ -391,8 +395,6 @@ def _convert_moe_mlps_to_fp8_weight_read(
     (MLA/KDA), the routed MXFP4 experts and the dense layer-0 MLP are left in
     BF16. Returns the number of projections converted.
     """
-    import gc
-
     count = 0
 
     def _swap(parent: nn.Module, attr: str) -> None:
@@ -462,8 +464,6 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
     ``o_proj`` reads the decode-kernel output (not the shared hidden) and is
     converted on its own. Returns the number of projections converted.
     """
-    import gc
-
     count = 0
 
     for layer in model.layers:
@@ -608,8 +608,6 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     ``forward``), with no FP8 dequant path. Returns the number of projections
     converted.
     """
-    import gc
-
     count = 0
 
     def _swap(parent: nn.Module, attr: str) -> None:
@@ -666,6 +664,9 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_hidden_size = cfg.routed_expert_hidden_size
         assert self.moe_hidden_size is not None, (
             "Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)"
+        )
+        assert getattr(cfg, "latent_moe_use_norm", False), (
+            "Kimi K3 runtime expects latent_moe_use_norm=True"
         )
 
         situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
@@ -762,9 +763,6 @@ class KimiK3MoERuntime(nn.Module):
         )
         self.routed_expert_up_proj = nn.Linear(
             self.moe_hidden_size, cfg.hidden_size, bias=False, dtype=dtype
-        )
-        assert getattr(cfg, "latent_moe_use_norm", False), (
-            "Kimi K3 runtime expects latent_moe_use_norm=True"
         )
         # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
         # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
@@ -2493,13 +2491,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         ckpt_dir = getattr(self.model_config.pretrained_config, "_name_or_path", None)
         index_path = os.path.join(ckpt_dir or "", "model.safetensors.index.json")
         if expert_jobs and ckpt_dir and os.path.isfile(index_path):
-            import json as _json
-            from contextlib import ExitStack
-
-            from safetensors import safe_open
-
             with open(index_path) as f:
-                weight_map = _json.load(f)["weight_map"]
+                weight_map = json.load(f)["weight_map"]
             per_file: Dict[str, list] = {}
             split_file_jobs = []
             for layer_idx, moe, base in expert_jobs:
