@@ -926,20 +926,13 @@ def _cbtsCoverageAudit(pipeline)
         // All commands run from ${LLM_ROOT}; covDir and the returned path are
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         def covDir = "cbts_cov"
-        // Selection is by collected revision, not build number; the JSON also carries
-        // the commit and how far HEAD runs ahead of it, both recorded in the decision.
-        // GITHUB_API_TOKEN: the checkout is depth-1, so lag comes from the compare API instead of git.
+        // Selection is by collected revision, not build number; the JSON also carries the commit
+        // and how far main has moved past it, both recorded in the decision. The token is what
+        // lets artifact.py measure that — the depth-1 checkout cannot.
         def selJson = ""
-        withCredentials([
-            usernamePassword(
-                credentialsId: 'github-cred-trtllm-ci',
-                usernameVariable: 'NOT_USED_YET',
-                passwordVariable: 'GITHUB_API_TOKEN'
-            ),
-        ]) {
+        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
             selJson = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--print-selection --repo-root ${LLM_ROOT} || true",
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-selection || true",
                 returnStdout: true,
             ).trim()
         }

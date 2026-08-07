@@ -36,7 +36,6 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tarfile
 import urllib.error
@@ -59,8 +58,6 @@ GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
-# Local stand-ins for COVERAGE_BRANCH, best first; a stale ref understates the lag.
-_LOCAL_REFS = (f"upstream/{COVERAGE_BRANCH}", f"origin/{COVERAGE_BRANCH}", COVERAGE_BRANCH)
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Max builds to walk back when recent builds have no tarball.
 _MAX_PROBE = 10
@@ -125,22 +122,6 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
     return None
 
 
-def commit_distance(commit: str, repo_root: str = ".", ref: str = COVERAGE_BRANCH) -> Optional[int]:
-    """Commits in `ref` not reachable from `commit`, or None if git cannot answer."""
-    try:
-        out = subprocess.run(
-            ["git", "rev-list", "--count", f"{commit}..{ref}"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
-
-
 @lru_cache(maxsize=None)
 def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int]:
     """Commits `branch` gained since `commit`, from the forge compare API, or None."""
@@ -165,24 +146,10 @@ def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int
         return None
 
 
-def db_lag(commit: str, repo_root: str = ".") -> Optional[int]:
-    """Commits `COVERAGE_BRANCH` gained since `commit`; the API is authoritative, git is the backup."""
-    lag = compare_distance(commit)
-    if lag is not None:
-        return lag
-    # Only reached without a token or network: whichever local ref tracks the branch answers.
-    for ref in _LOCAL_REFS:
-        lag = commit_distance(commit, repo_root, ref)
-        if lag is not None:
-            return lag
-    return None
-
-
 def select_tarball(
     artifact_base: str = ARTIFACT_BASE,
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
-    repo_root: str = ".",
 ) -> Optional[dict]:
     """Tarball of the least-trailing commit as {url, build, commit, lag}; build number breaks ties."""
     build = latest_build_number(jenkins_base)
@@ -195,16 +162,16 @@ def select_tarball(
         if not _exists(url):
             continue
         commit = build_commit(b, artifact_base)
-        lag = db_lag(commit, repo_root) if commit else None
+        lag = compare_distance(commit) if commit else None
         candidates.append({"url": url, "build": b, "commit": commit, "lag": lag})
     if not candidates:
         print(f"[artifact] no tarball in the last {max_probe} builds", file=sys.stderr)
         return None
-    # Known lag first (smallest = closest to HEAD); unknown lag falls back to build order.
+    # Known lag first (smallest = closest to the branch tip); unknown falls back to build order.
     best = min(candidates, key=lambda c: (c["lag"] is None, c["lag"] or 0, -c["build"]))
     if best["lag"] is None:
         print(
-            f"[artifact] build {best['build']}: commit unknown, selected by build number",
+            f"[artifact] build {best['build']}: lag unknown, selected by build number",
             file=sys.stderr,
         )
     skipped = [c["build"] for c in candidates if c["build"] > best["build"]]
@@ -275,7 +242,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
     )
-    ap.add_argument("--repo-root", default=".", help="repo the lag is measured against")
     args = ap.parse_args(argv)
 
     url = tarball_url(args.build) if args.build is not None else None
@@ -287,10 +253,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "url": url,
                 "build": args.build,
                 "commit": commit,
-                "lag": db_lag(commit, args.repo_root) if commit else None,
+                "lag": compare_distance(commit) if commit else None,
             }
         else:
-            best = select_tarball(repo_root=args.repo_root)
+            best = select_tarball()
         if best is None:
             return 1
         print(json.dumps(best))
