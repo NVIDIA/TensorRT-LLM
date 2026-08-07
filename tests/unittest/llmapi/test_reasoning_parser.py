@@ -85,6 +85,19 @@ def _stream_parse(parser_key: str,
     return content, reasoning_context
 
 
+def _stream_parse_deltas(parser_key: str,
+                         deltas: list[str]) -> list[tuple[str, str]]:
+    """Return (content, reasoning) from each parse_delta, then finish."""
+    parser = ReasoningParserFactory.create_reasoning_parser(parser_key)
+    results = []
+    for delta in deltas:
+        r = parser.parse_delta(delta)
+        results.append((r.content, r.reasoning_content))
+    r = parser.finish()
+    results.append((r.content, r.reasoning_content))
+    return results
+
+
 @pytest.mark.parametrize(
     ("parser_key", "text"),
     [
@@ -95,16 +108,14 @@ def _stream_parse(parser_key: str,
         ("qwen3", "a<"),
         # End delimiter after reasoning body.
         ("deepseek-r1", f"a{R1_END}"),
-        # Issue #17296: preamble before <think> must not become content when
-        # streaming (``parse()`` drops it for reasoning_at_start=False).
+        # Same-delta preamble drop (#17296) matches parse() when the first
+        # <think> arrives in the same buffer as the preamble.
         ("qwen3", f"a{R1_START}b"),
         ("qwen3", f"a{R1_START}a"),
         ("qwen3", f"a{R1_END}"),
         ("qwen3", f"{R1_END}{R1_START}a"),
         ("qwen3", f"Sure.{R1_START}2+2=4{R1_END}4"),
         ("qwen3", f"pre{R1_START}{R1_END}post"),
-        # Multi-block interleaved is intentionally richer on the stream path
-        # than one-shot ``parse()`` (single partition); not a #17296 case.
         # Complete start tag left at EOS must match ``parse()`` (kept as
         # reasoning when already inside the block).
         ("deepseek-r1", f"a{R1_START}"),
@@ -115,19 +126,86 @@ def _stream_parse(parser_key: str,
         ("qwen3", R1_START),
         ("deepseek-r1", R1_START),
     ])
-def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
+def test_deepseek_r1_reasoning_parser_stream_matches_non_stream_one_shot(
         parser_key: str, text: str) -> None:
-    """Streaming then finishing must match a non-streaming parse.
+    """Full-text streaming (one delta) must match non-streaming parse.
 
-    Covers ``finish()`` flush branches and the #17296 stream/non-stream
-    content/reasoning split parity (preamble drop, end-of-stream tags).
+    Live partial-tag hold preserves same-delta preamble drop and finish()
+    tag handling. Multi-chunk preamble before the first open can differ
+    from parse() by design (already-emitted content is not retracted).
     """
+    expected = ReasoningParserFactory.create_reasoning_parser(parser_key).parse(
+        text)
+    content, reasoning_context = _stream_parse(parser_key,
+                                               text,
+                                               chunk_size=max(len(text), 1))
+    assert content == expected.content
+    assert reasoning_context == expected.reasoning_content
+
+
+@pytest.mark.parametrize(
+    ("parser_key", "text"),
+    [
+        ("deepseek-r1", "a <"),
+        ("qwen3", "a<"),
+        ("deepseek-r1", f"a{R1_END}"),
+        ("deepseek-r1", f"a{R1_START}"),
+        ("deepseek-r1", f"{R1_END}a{R1_END}"),
+        ("qwen3", "Hello"),
+        ("qwen3", ""),
+        ("qwen3", R1_START),
+        ("deepseek-r1", R1_START),
+        # No multi-delta preamble: tags at the start or reasoning_at_start.
+        ("qwen3", f"{R1_START}b{R1_END}c"),
+        ("deepseek-r1", f"reason{R1_END}answer"),
+    ])
+def test_deepseek_r1_reasoning_parser_stream_matches_non_stream_chunked(
+        parser_key: str, text: str) -> None:
+    """Chunked stream matches parse when no retractable preamble is involved."""
     expected = ReasoningParserFactory.create_reasoning_parser(parser_key).parse(
         text)
     for chunk_size in (1, 2, 3, max(len(text), 1)):
         content, reasoning_context = _stream_parse(parser_key, text, chunk_size)
-        assert content == expected.content
-        assert reasoning_context == expected.reasoning_content
+        assert content == expected.content, chunk_size
+        assert reasoning_context == expected.reasoning_content, chunk_size
+
+
+def test_qwen3_tag_free_stream_emits_incrementally() -> None:
+    """Tag-free deltas must stream live (not buffer until finish).
+
+    Regression for the hold-all preamble path that turned streaming into
+    non-streaming for default qwen3/laguna responses without <think>.
+    """
+    deltas = ["Hello", " ", "world", "!"]
+    results = _stream_parse_deltas("qwen3", deltas)
+    # Each content delta emits non-empty content; finish is empty.
+    for i, delta in enumerate(deltas):
+        assert results[i][0] == delta, results
+        assert results[i][1] == ""
+    assert results[-1] == ("", "")
+
+
+def test_qwen3_same_delta_preamble_dropped() -> None:
+    """Same-delta text before the first <think> is dropped (parse parity)."""
+    parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
+    r = parser.parse_delta(f"Sure.{R1_START}2+2=4{R1_END}4")
+    assert r.content == "4"
+    assert r.reasoning_content == "2+2=4"
+    assert parser.finish().content == ""
+
+
+def test_qwen3_multi_delta_preamble_already_emitted() -> None:
+    """Content emitted before a later first <think> is not retracted.
+
+    Live streaming cannot unsend tokens; parse() would still drop that
+    preamble. Documented intentional stream/non-stream difference.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
+    r1 = parser.parse_delta("Sure.")
+    assert r1.content == "Sure."
+    r2 = parser.parse_delta(f"{R1_START}math{R1_END}4")
+    assert r2.content == "4"
+    assert r2.reasoning_content == "math"
 
 
 def test_interleaved_second_think_with_content_prefix_same_delta() -> None:
@@ -155,7 +233,7 @@ def test_interleaved_second_think_with_content_prefix_same_delta() -> None:
 
 def test_qwen3_interleaved_second_think_with_content_prefix_same_delta(
 ) -> None:
-    """Same interleaved prefix rule for qwen3 (hold-preamble only first open)."""
+    """Same interleaved prefix rule for qwen3 (first open drops prefix only)."""
     parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
     for d, exp_c, exp_r in [
         (R1_START, "", ""),
