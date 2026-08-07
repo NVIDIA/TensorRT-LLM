@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -310,6 +310,18 @@ inline bool isSM100Family()
 {
     int const sm = getSMVersion();
     return sm == 100 || sm == 103; // To be continued...
+}
+
+/// @brief Detects whether the current device is an integrated GPU.
+/// @details Uses cudaDevAttrIntegrated rather than cudaDevAttrPageableMemoryAccess, which can
+/// also be true on HMM-enabled discrete GPUs.
+inline bool isUnifiedMemorySystem()
+{
+    int device{-1};
+    check_cuda_error(cudaGetDevice(&device));
+    int integrated{0};
+    check_cuda_error(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
+    return integrated != 0;
 }
 
 inline int getDevice()
