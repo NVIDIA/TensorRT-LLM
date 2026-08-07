@@ -29,7 +29,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 
 def _install_cutlass_dsl_compatibility() -> None:
-    """Restore CuTe names moved by CUTLASS DSL 4.7 for FA4 and QuACK."""
+    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
     import cutlass.cute as cute
 
     for name in ("ThrCopy", "ThrMma"):

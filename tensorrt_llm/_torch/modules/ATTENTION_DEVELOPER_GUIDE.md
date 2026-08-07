@@ -375,6 +375,12 @@ The FMHA package is split by role:
   TRT-LLM-specific adaptations in the persistent patch.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
+  The Python sources under `prims_ts/kernels` are copied byte-for-byte from
+  [FlashInfer PR #4357](https://github.com/flashinfer-ai/flashinfer/pull/4357) at
+  commit `74790b32b55f6c45a4fee78007b4d2b2109497e3` and retain FlashInfer's headers;
+  its README files are not vendored.
+- `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
+  MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
