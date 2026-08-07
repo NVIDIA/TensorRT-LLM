@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# isort: off
-# isort: on
-
 import asyncio
 import os
 import sys
