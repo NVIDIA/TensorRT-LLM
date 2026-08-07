@@ -1146,8 +1146,13 @@ class PyTorchModelEngine(ModelEngine):
 
     def _use_lora_cuda_graph(self,
                              scheduled_requests: ScheduledRequests) -> bool:
+        """
+        Determines whether a non-LoRA or LoRA CUDA graph should be used, if
+        both are available (cudagraph_specialize_lora==True).
+        """
         if self.cuda_graph_lora_manager is None:
             return False
+        # Needed during graph capture to enforce a given mode
         if self._force_lora_graph_for_capture is not None:
             return self._force_lora_graph_for_capture
         if not self.llm_args.lora_config.cudagraph_specialize_lora:
