@@ -40,6 +40,34 @@ _MEM_FRACTION_80 = 0.8
 _MEM_FRACTION_95 = 0.95
 
 
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
+])
+def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
+    """RCCA: https://nvbugs/5238105 - none of n>1 sequences may be empty."""
+    from tensorrt_llm import LLM, SamplingParams
+
+    prompt = r"The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step."
+
+    sampling_params = SamplingParams(
+        max_tokens=1024,
+        n=4,
+        temperature=0.6,
+        top_p=1.0,
+        top_k=1024,
+    )
+
+    with LLM(model=f"{llm_models_root()}/{model_path}",
+             max_batch_size=8,
+             max_seq_len=4224) as llm:
+        outputs = llm.generate([prompt], sampling_params=sampling_params)
+
+    completions = outputs[0].outputs
+    seq_lengths = [len(c.token_ids) for c in completions]
+    assert all(length > 0 for length in seq_lengths), \
+        f"Found zero-length completion: {seq_lengths}"
+
+
 # TODO replace the trtllm_bench_prolog
 class BenchRunner:
 
