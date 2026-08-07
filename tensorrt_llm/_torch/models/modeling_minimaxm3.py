@@ -51,6 +51,7 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fp32_router_gemm import fp32_router_gemm
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
@@ -502,8 +503,10 @@ class MiniMaxM3Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
-        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
+        # Router runs in fp32 to match SGLang. At decode this takes a GEMV that
+        # keeps the full fp32 mantissa; cuBLAS answers the same call with a
+        # TF32 split-K, a splitKreduce, and a separate cast of the activation.
+        return fp32_router_gemm(hidden_states, self.weight)
 
     def load_weights(self, weights: List[Dict]):
         """Load the router weight and the e_score_correction_bias.
