@@ -1146,8 +1146,8 @@ class Indexer(nn.Module):
             # This is a preprocessing step that computes scheduling information for the kernel
             Indexer.prepare_scheduler_metadata(metadata)
 
-        for indexer in getattr(metadata, "indexers", ()):
-            indexer.top_k.prepare(
+        if metadata.indexer is not None:
+            metadata.indexer.top_k.prepare(
                 device=metadata.kv_lens_cuda.device,
                 max_num_columns=metadata.get_indexer_max_seq_len(),
                 next_n=1 + metadata.max_draft_tokens,

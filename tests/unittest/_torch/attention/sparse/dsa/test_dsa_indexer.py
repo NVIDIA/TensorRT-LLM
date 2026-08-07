@@ -260,7 +260,7 @@ def test_indexer_prepare_keeps_metadata_and_top_k_preparation_together():
     top_k = Mock()
     indexer = SimpleNamespace(top_k=top_k)
     metadata = SimpleNamespace(
-        indexers=(indexer,),
+        indexer=indexer,
         num_contexts=0,
         num_generations=0,
         num_ctx_tokens=0,
@@ -289,36 +289,6 @@ def test_indexer_prepare_keeps_metadata_and_top_k_preparation_together():
         num_sms=148,
         max_num_requests=32,
     )
-
-
-def test_draft_width_change_reprepares_indexer():
-    metadata = object.__new__(DSAtrtllmAttentionMetadata)
-    metadata.max_draft_tokens = 0
-    metadata.max_num_sequences = 2
-    metadata.is_cuda_graph = False
-    metadata.kv_lens_cuda_2d = torch.empty((2, 1))
-    metadata.kv_lens_expanded_host = torch.empty(2)
-    metadata._create_kv_lens_2d_buffer = Mock()
-    metadata.create_expanded_buffers = Mock()
-    metadata._create_radix_aux_buffers = Mock()
-
-    with (
-        patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata."
-            "TrtllmAttentionMetadata.update_spec_dec_param"
-        ),
-        patch.object(Indexer, "prepare") as prepare,
-    ):
-        metadata.update_spec_dec_param(
-            batch_size=2,
-            is_spec_decoding_enabled=True,
-            is_spec_dec_tree=False,
-            is_spec_dec_dynamic_tree=False,
-            max_draft_len=3,
-            max_total_draft_tokens=3,
-        )
-
-    prepare.assert_called_once_with(metadata=metadata)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):

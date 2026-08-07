@@ -91,10 +91,10 @@ class DummyModel(torch.nn.Module):
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
 
 
-def test_setup_attn_metadata_registers_unique_topk_indexers():
+def test_setup_attn_metadata_registers_single_indexer():
 
     class SparseMetadata:
-        indexers = ()
+        indexer = None
 
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -133,7 +133,33 @@ def test_setup_attn_metadata_registers_unique_topk_indexers():
 
     metadata = PyTorchModelEngine._set_up_attn_metadata(engine, cache_manager)
 
-    assert metadata.indexers == (indexer, )
+    assert metadata.indexer is indexer
+    assert engine._top_k_indexers == (indexer, )
+
+
+def test_prepare_sparse_top_k_modules_prepares_every_indexer():
+    top_ks = (Mock(), Mock())
+    engine = SimpleNamespace(_top_k_indexers=tuple(
+        SimpleNamespace(top_k=top_k) for top_k in top_ks))
+    metadata = SimpleNamespace(
+        kv_lens_cuda=torch.empty(0),
+        get_indexer_max_seq_len=Mock(return_value=4096),
+        max_draft_tokens=3,
+        num_sms=148,
+        max_num_sequences=32,
+    )
+
+    PyTorchModelEngine._prepare_sparse_top_k_modules(engine, metadata)
+
+    for top_k in top_ks:
+        top_k.prepare.assert_called_once_with(
+            device=metadata.kv_lens_cuda.device,
+            max_num_columns=4096,
+            next_n=4,
+            input_dtype=torch.float32,
+            num_sms=148,
+            max_num_requests=32,
+        )
 
 
 class DummyMultimodalIndexModel(torch.nn.Module):
