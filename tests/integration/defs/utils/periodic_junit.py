@@ -153,7 +153,7 @@ class PeriodicJUnitXML:
         else:
             print(f"WARNING: {message}")
 
-    def pytest_configure(self, config: Config):
+    def pytest_configure(self, config: Config) -> None:
         """Configure and initialize the reporter."""
         # Store config for later use
         self.config = config
@@ -196,8 +196,16 @@ class PeriodicJUnitXML:
         self.logxml.node_reporters_ordered = []  # type: ignore
         self.logxml.global_properties = []
 
-    def pytest_runtest_logreport(self, report: TestReport):
+    def pytest_runtest_logreport(self, report: TestReport) -> None:
         """Handle test reports and trigger periodic saving."""
+        # The teardown report is emitted after every fixture finalizer has run, so
+        # the item is genuinely done here. Disarm before doing any work below:
+        # otherwise the timer stays armed across post-teardown reporting and the
+        # gap until the next test starts, and a slow gap would make _dump_hang()
+        # write a bogus hang record for a test that already completed.
+        if self.dump_hang_traceback and report.when == "teardown":
+            self._cancel_hang_timer()
+
         # Collect the report for later batch processing (fast)
         self.pending_reports.append(report)
 
@@ -256,7 +264,7 @@ class PeriodicJUnitXML:
                 except Exception as e:
                     self._log_warning(f"Error generating periodic report: {e}")
 
-    def pytest_sessionfinish(self):
+    def pytest_sessionfinish(self) -> None:
         """Generate final report at session end."""
         self._cancel_hang_timer()
         try:
@@ -450,9 +458,10 @@ class PeriodicJUnitXML:
     def pytest_runtest_setup(self, item: "Item") -> None:
         """Arm a watchdog that dumps all thread stacks just before a hang is killed.
 
-        The timer is armed once for the whole item at setup and only cancelled when
-        the next test starts (or at session end), so a hang anywhere in setup, call,
-        or a fixture finalizer/teardown is captured. This also makes ``func_only``
+        The timer is armed once for the whole item at setup and cancelled when the
+        teardown report arrives (see ``pytest_runtest_logreport``), so a hang
+        anywhere in setup, call, or a fixture finalizer/teardown is captured while a
+        completed test can never produce a dump. This also makes ``func_only``
         irrelevant: any phase overrunning the timeout dumps.
         """
         if not self.dump_hang_traceback or self._hang_file is None:
@@ -464,8 +473,10 @@ class PeriodicJUnitXML:
         # Dump slightly before the test is killed. The timer thread can still run
         # while the main thread is blocked in a CUDA/NCCL call, since torch releases
         # the GIL around those blocking calls -- which is exactly when the per-test
-        # timeout cannot unwind the hang.
-        dump_after = max(1.0, timeout * self.hang_dump_fraction)
+        # timeout cannot unwind the hang. No lower bound is applied: pytest-timeout
+        # accepts fractional seconds, and a floor would arm the timer *after* a
+        # subsecond timeout had already killed the test.
+        dump_after = timeout * self.hang_dump_fraction
         timer = threading.Timer(dump_after,
                                 self._dump_hang,
                                 args=(item.nodeid, ))
@@ -474,10 +485,10 @@ class PeriodicJUnitXML:
             self._hang_timer = timer
         timer.start()
 
-    def _register_signal_handlers(self):
+    def _register_signal_handlers(self) -> None:
         """Register signal handlers for graceful shutdown on interruption."""
 
-        def signal_handler(signum, frame):
+        def signal_handler(signum: int, frame) -> None:
             """Handle interrupt signals by saving current progress before exit."""
             signal_name = signal.Signals(signum).name
             self._log_warning(
