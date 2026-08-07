@@ -110,16 +110,24 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         comm = MPI.COMM_SELF
         tensor_shape = (16, 32)
         tensor_data = self.generate_tensor_data(0, tensor_shape)
+        flush_calls = []
+        original_flush = _FileBackedSharedMemory.flush
+
+        def tracked_flush(storage):
+            flush_calls.append(storage)
+            return original_flush(storage)
 
         with TemporaryDirectory() as directory, patch.dict(
                 "os.environ", {
                     "TRTLLM_EPLB_SHM_DIR": directory,
                     "TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL": "True",
-                }):
+                }), patch.object(_FileBackedSharedMemory, "flush",
+                                 tracked_flush):
             sharer = HostMoeTensorSharer(0, 1, comm)
             sharer.set_shared_memory_base_name("test_file_backed_sharer")
             sharer.share_host_tensor_with_shape(0, "weight", tensor_data)
             sharer.finalize_layer_weights()
+            self.assertEqual(len(flush_calls), 1)
             retrieved = {}
             sharer.finalize_host_tensor_sharing(
                 lambda expert_id, name, tensor: retrieved.setdefault(
@@ -134,8 +142,8 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             sharer.post_shutdown_cleanup()
             self.assertFalse(os.path.exists(backing_path))
 
-    def test_file_backed_mappings_are_coherent_without_flush(self):
-        """Peer mappings see writes without forcing the whole file to disk."""
+    def test_file_backed_mappings_are_coherent_after_flush(self):
+        """Completed file-backed layers are flushed before further loading."""
         with TemporaryDirectory() as directory:
             creator = _FileBackedSharedMemory("test_eplb_map",
                                               directory,
@@ -144,8 +152,10 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             peer = _FileBackedSharedMemory("test_eplb_map", directory)
             try:
                 creator.buf[:8] = b"EPLBTEST"
+                creator.flush()
                 self.assertEqual(peer.buf[:8], b"EPLBTEST")
                 peer.buf[:8] = b"PEERVIEW"
+                peer.flush()
                 self.assertEqual(creator.buf[:8], b"PEERVIEW")
             finally:
                 peer.close()
