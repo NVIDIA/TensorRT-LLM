@@ -48,6 +48,10 @@ SIZING_CASES = [
         ("deepseek_v4", True, False, 1, False, False),
         ("deepseek_v4", True, True, 2, False, False),
         ("deepseek_v4", True, True, 1, True, False),
+        # The widened ADP dummy gate must not leak into the headroom gate:
+        # doubling max_num_sequences changes the memory envelope and has only
+        # been validated on the DSv4 MTP overlap path.
+        ("qwen3_5_moe", True, True, 1, False, False),
     ],
 )
 def test_dsv4_overlap_headroom_gate(
@@ -71,6 +75,9 @@ def test_dsv4_overlap_headroom_gate(
         ("deepseek_v4", 1, True),
         ("deepseek_v3", 1, False),
         ("deepseek_v4", 2, False),
+        ("qwen3_5_moe", 1, True),
+        ("qwen3_5_moe", 2, False),
+        ("llama", 1, False),
     ],
 )
 def test_dsv4_adp_dummy_fix_gate(model_type, pp_size, expected):

@@ -90,6 +90,7 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
+from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
@@ -1139,6 +1140,12 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        # Ahead of the early returns below, since it holds regardless of why
+        # warmup is skipped: only the advanced-sampling CUDA graph capture pass
+        # exercises the non-greedy sampler, so with cuda_graph_config=None
+        # flashinfer's sampling kernels would be JIT-built mid-serving.
+        warmup_sampling_module()
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -2239,10 +2246,30 @@ class PyTorchModelEngine(ModelEngine):
         if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
 
-        blocks_to_use = num_full_seqs * math.ceil(
-            max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
-                num_left_over_tokens / kv_cache_manager.tokens_per_block
-            ) + num_gen_requests * self.max_beam_width
+        # Mirror add_dummy_requests' actual allocation: on top of the raw
+        # token count, every sequence gets num_extra_kv_tokens +
+        # num_extra_decoding_steps add_token calls, and generation dummies
+        # additionally reserve max_draft_loop_tokens for the draft loop.
+        # In one-engine spec modes that is (max_draft_len - 1) extra KV
+        # tokens plus max_draft_len draft-loop tokens per gen dummy, i.e.
+        # 2 * max_draft_len - 1 on top of the single prompt token.
+        # Under-counting these let warmup start an allocation that fails
+        # midway and, before the partial-allocation cleanup existed,
+        # permanently leaked most of the estimation-sized KV pool
+        # (TRTLLM-14903).
+        def blocks_for_seq(num_tokens: int) -> int:
+            return math.ceil(num_tokens / kv_cache_manager.tokens_per_block)
+
+        extra_ctx_tokens = (getattr(kv_cache_manager, "num_extra_kv_tokens", 0)
+                            or 0) + num_extra_decoding_steps
+        extra_gen_tokens = extra_ctx_tokens + self.max_draft_loop_tokens
+        blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len +
+                                                       extra_ctx_tokens)
+        if num_left_over_tokens > 0:
+            blocks_to_use += blocks_for_seq(num_left_over_tokens +
+                                            extra_ctx_tokens)
+        blocks_to_use += (num_gen_requests * self.max_beam_width *
+                          blocks_for_seq(1 + extra_gen_tokens))
 
         if blocks_to_use > available_blocks and isinstance(
                 kv_cache_manager, KVCacheManager):
@@ -2864,7 +2891,7 @@ class PyTorchModelEngine(ModelEngine):
         return default_max_seq_len
 
     def _init_max_num_tokens(self):
-        # Modified from tensorrt_llm/_common.py check_max_num_tokens
+        # Modified from tensorrt_llm/_bootstrap.py check_max_num_tokens
         if self.max_num_tokens is None:
             self.max_num_tokens = self.max_seq_len * self.batch_size
         if self.max_num_tokens > self.max_seq_len * self.batch_size:

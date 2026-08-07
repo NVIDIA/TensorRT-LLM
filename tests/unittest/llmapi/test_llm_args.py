@@ -70,6 +70,23 @@ from .test_llm import llama_model_path
 
 
 @pytest.mark.cpu_only
+def test_generation_config_mode_defaults_and_validation() -> None:
+    assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
+    assert (TorchLlmArgs(model=llama_model_path,
+                         generation_config="auto").generation_config == "auto")
+
+    with pytest.raises(ValidationError, match="generation_config"):
+        TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
+def test_generation_config_auto_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError,
+                       match="AutoDeploy does not support generation_config"):
+        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
+
+
+@pytest.mark.cpu_only
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,
@@ -719,8 +736,7 @@ def test_KvCacheConfig_declaration():
                            pool_ratio=[0.25, 0.75],
                            avg_seq_len=2048,
                            block_reuse_config=BlockReuseConfig(
-                               block_reuse_policy="per_request",
-                               max_num_turns=2),
+                               policy="per_request", max_num_turns=2),
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -739,7 +755,7 @@ def test_KvCacheConfig_declaration():
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
     assert config.pool_ratio == [0.25, 0.75]
     assert config.avg_seq_len == 2048
-    assert config.block_reuse_config.block_reuse_policy == "per_request"
+    assert config.block_reuse_config.policy == "per_request"
     assert config.block_reuse_config.max_num_turns == 2
     assert config.mamba_state_config.periodic_snapshot_interval == 0
     assert config.mamba_state_config.additional_snapshot_offsets_from_start == [
@@ -763,12 +779,21 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
-    assert (BlockReuseConfig(block_reuse_policy="per_conversation").
-            block_reuse_policy == "per_conversation")
+    assert BlockReuseConfig(
+        policy="per_conversation").policy == "per_conversation"
     with pytest.raises(ValidationError):
-        BlockReuseConfig(block_reuse_policy="invalid")
+        BlockReuseConfig(policy="invalid")
     with pytest.raises(ValidationError):
         BlockReuseConfig(max_num_turns=0)
+
+
+@pytest.mark.cpu_only
+def test_BlockReuseConfig_reports_renamed_policy_field():
+    with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
+        KvCacheConfig.model_validate(
+            {"block_reuse_config": {
+                "block_reuse_policy": "per_request"
+            }})
 
 
 @pytest.mark.cpu_only
@@ -855,8 +880,7 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
                         lambda message: warnings_seen.append(message))
 
     config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(
-            block_reuse_policy="per_conversation"),
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=64,
             additional_snapshot_offsets_from_end=[0],
@@ -867,13 +891,12 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
     assert config.mamba_state_config.additional_snapshot_offsets_from_end == [0]
     assert len(warnings_seen) == 1
     assert "periodic_snapshot_interval=64" in warnings_seen[0]
-    assert ("block_reuse_config.block_reuse_policy=per_conversation"
-            in warnings_seen[0])
+    assert ("block_reuse_config.policy=per_conversation" in warnings_seen[0])
     assert "setting it to 0" in warnings_seen[0]
 
     warnings_seen.clear()
     KvCacheConfig(block_reuse_config=BlockReuseConfig(
-        block_reuse_policy="per_conversation"))
+        policy="per_conversation"))
     assert warnings_seen == []
 
 
@@ -2517,6 +2540,50 @@ class TestServeDefaults:
         )
         assert merged["tensor_parallel_size"] == 1
 
+    def test_serve_generation_config_cli_over_yaml_precedence(self,
+                                                              tmp_path) -> None:
+        """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
+        from unittest import mock
+
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("generation_config: auto\n", encoding="utf-8")
+
+        with (
+                mock.patch(
+                    "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                    return_value=False),
+                mock.patch("tensorrt_llm.commands.serve.device_count",
+                           return_value=1),
+                mock.patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=["dummy/model", "--config",
+                      str(config_path)],
+                standalone_mode=False,
+            )
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
+            mock_launch_server.reset_mock()
+            config_path.write_text("generation_config: trtllm\n",
+                                   encoding="utf-8")
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--config",
+                    str(config_path),
+                    "--generation-config",
+                    "auto",
+                ],
+                standalone_mode=False,
+            )
+
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
         assert is_non_default_or_required("model", "test-model", "pytorch",
@@ -3092,7 +3159,7 @@ class TestSkipSoftmaxAttentionConfig:
     @staticmethod
     def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
         sparse_params = config.to_sparse_params(**kwargs)
-        return sparse_params.scheduler.get_kernel_params()
+        return sparse_params.scheduler.get_runtime_params()
 
     def test_python_api_parses_skip_softmax_config(self):
         args = TorchLlmArgs(
@@ -3530,7 +3597,7 @@ class TestMambaSnapshotConfigResolution:
             (
                 KvCacheConfig(
                     block_reuse_config=BlockReuseConfig(
-                        block_reuse_policy="per_conversation"),
+                        policy="per_conversation"),
                     mamba_state_config=MambaStateConfig(
                         periodic_snapshot_interval=64),
                     use_kv_cache_manager_v2=True,
