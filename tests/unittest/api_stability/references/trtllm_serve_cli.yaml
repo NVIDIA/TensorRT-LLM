@@ -166,6 +166,15 @@ commands:
         flags:
         - "--free_gpu_memory_fraction"
         - "--kv_cache_free_gpu_memory_fraction"
+      generation_config:
+        type: Choice(['auto', 'trtllm'])
+        default: trtllm
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--generation-config"
       gpus_per_node:
         type: int
         default: null

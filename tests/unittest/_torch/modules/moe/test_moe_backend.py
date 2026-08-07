@@ -1172,7 +1172,12 @@ def _make_bf16_routing_method(routing_kind: str, top_k: int, num_experts: int, d
 )
 @pytest.mark.parametrize("routing_kind", ["deepseekv3", "renormalize"])
 def test_trtllm_bf16_unquantized_moe(
-    routing_kind, activation_type, seq_len, trtllm_use_router_logits
+    routing_kind,
+    activation_type,
+    seq_len,
+    trtllm_use_router_logits,
+    num_experts=_BF16_UNQUANT_NUM_EXPERTS,
+    top_k=_BF16_UNQUANT_TOP_K,
 ):
     """TRTLLM-Gen BF16 (unquantized) MoE accuracy vs the reference impl."""
     backend_type = MoeBackendType.TRTLLM
@@ -1184,8 +1189,6 @@ def test_trtllm_bf16_unquantized_moe(
     if not can_impl:
         pytest.skip(skip_reason)
 
-    num_experts = _BF16_UNQUANT_NUM_EXPERTS
-    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
@@ -1261,6 +1264,24 @@ def test_trtllm_bf16_unquantized_moe(
         with torch.inference_mode():
             output = run_moe()
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.parametrize("seq_len", [1, 8])
+def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
+    """Kimi-K3 routing shape: 896 experts / top_k 16 without expert groups.
+
+    Exercises the (1024, 32) tier of the trtllm-gen DeepSeekV3 routing
+    kernels, including the cooperative small-batch kernel at num_tokens 1,
+    via the fused-routing path (router logits consumed in-kernel).
+    """
+    test_trtllm_bf16_unquantized_moe(
+        routing_kind="deepseekv3",
+        activation_type=ActivationType.Swiglu,
+        seq_len=seq_len,
+        trtllm_use_router_logits=True,
+        num_experts=896,
+        top_k=16,
+    )
 
 
 # ============================================================================

@@ -173,7 +173,7 @@ K-EXAONE supports the following MoE backends:
 |---------|-------------|
 | `CUTLASS` | Default backend, optimized for general use cases |
 | `TRTLLM` | TensorRT-LLM backend using TRT-LLM Gen kernels, optimized for low-latency inference |
-| `WIDEEP` | Wide expert parallelism backend for cases where EP size exceeds the number of experts |
+| `CUTEDSL` | CuTe DSL backend, used for wide expert parallelism where EP size exceeds the number of experts |
 
 You can specify the MoE backend using the `--moe_backend` argument:
 
