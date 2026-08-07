@@ -165,54 +165,41 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
         self.assertIn("params.InfraDryRun?.toString()?.toBoolean()", filter_setup)
         self.assertIn("(INFRA_DRY_RUN): infraDryRun", filter_setup)
 
-    def test_dry_run_helpers_share_parameters_and_do_not_fail_fast(self):
+    def test_dry_run_uses_one_combined_helper_without_inner_parallel(self):
         body = _function_body(
             PARENT_GROOVY,
-            "launchInfraDryRunTestJobs",
+            "launchInfraDryRunTestJob",
             "launchStages",
         )
-        self.assertEqual(body.count("def additionalParameters ="), 1)
+        launch_job = _function_body(
+            PARENT_GROOVY,
+            "launchJob",
+            "launchInfraDryRunTestJob",
+        )
         self.assertIn('"L0_Test-${arch}-Single-GPU"', body)
-        self.assertIn('"L0_Test-${arch}-Multi-GPU"', body)
-        self.assertEqual(body.count("additionalParameters)"), 2)
-        self.assertEqual(body.count(", false, false, globalVars,"), 2)
-        self.assertLess(
-            body.index("testJobs.failFast = false"),
-            body.index("pipeline.parallel testJobs"),
+        self.assertNotIn('"L0_Test-${arch}-Multi-GPU"', body)
+        self.assertIn(", false, false, globalVars,", body)
+        self.assertIn("'testFilter': testFilterJson", body)
+        self.assertIn("'testPhase2StageName': ''", body)
+        self.assertNotIn("pipeline.parallel", body)
+        self.assertIn(
+            "if (!additionalParameters.containsKey('testPhase2StageName') && "
+            "env.testPhase2StageName)",
+            launch_job,
         )
 
-    def test_helper_failure_propagates_after_parallel_siblings_finish(self):
-        helper = _function_body(
-            PARENT_GROOVY,
-            "launchInfraDryRunTestJobs",
-            "launchStages",
+        selection = GROOVY[GROOVY.index("singleGpuJobs = parallelJobs") :]
+        phase2_guard = selection.index("if (testPhase2StageName)")
+        single_start = selection.index("if (env.JOB_NAME ==~ /.*Single-GPU.*/)")
+        single_end = selection.index("} else if (env.JOB_NAME ==~ /.*Multi-GPU.*/)")
+        self.assertLess(phase2_guard, selection.index("singleGpuJobs = parallelJobs.findAll"))
+        self.assertIn("dgxJobs = [:]", selection[:phase2_guard])
+        self.assertIn(
+            "parallel singleGpuJobs",
+            selection[single_start:single_end],
         )
-        launch_job = _function_body(
-            PARENT_GROOVY,
-            "launchJob",
-            "launchInfraDryRunTestJobs",
-        )
-        self.assertNotIn("catchError", helper)
-        self.assertNotIn("catch (", helper)
-        self.assertIn('if (buildStatus != "SUCCESS")', launch_job)
-        self.assertIn('error "Downstream job did not succeed"', launch_job)
-        self.assertIn("testJobs.failFast = false", helper)
 
-    def test_shared_filter_and_image_parameters_are_read_only_and_match_normal_jobs(self):
-        helper = _function_body(
-            PARENT_GROOVY,
-            "launchInfraDryRunTestJobs",
-            "launchStages",
-        )
-        launch_job = _function_body(
-            PARENT_GROOVY,
-            "launchJob",
-            "launchInfraDryRunTestJobs",
-        )
-        self.assertNotIn("additionalParameters[", helper + launch_job)
-        self.assertNotIn("additionalParameters.put", helper + launch_job)
-        self.assertIn("parameters += [", launch_job)
-
+    def test_image_parameters_match_normal_jobs(self):
         start = PARENT_GROOVY.index("def launchStages")
         launch_stages = PARENT_GROOVY[start : PARENT_GROOVY.index("\npipeline {", start)]
         expected_keys = {
@@ -224,7 +211,7 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
             "SBSA": {"dockerImage", "wheelDockerImage"},
         }
         for arch, expected in expected_keys.items():
-            dry_call = launch_stages.index(f'launchInfraDryRunTestJobs(pipeline, "{arch}"')
+            dry_call = launch_stages.index(f'launchInfraDryRunTestJob(pipeline, "{arch}"')
             dry_map = launch_stages.rindex("def imageParameters = [", 0, dry_call)
             normal_stage = launch_stages.index(
                 f'testStageName = "[Test-{arch}-Single-GPU] Remote Run"',
@@ -244,7 +231,7 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
         start = PARENT_GROOVY.index("def launchStages")
         launch_stages = PARENT_GROOVY[start : PARENT_GROOVY.index("\npipeline {", start)]
         for arch in ("x86_64", "SBSA"):
-            dry_run_call = launch_stages.index(f'launchInfraDryRunTestJobs(pipeline, "{arch}"')
+            dry_run_call = launch_stages.index(f'launchInfraDryRunTestJob(pipeline, "{arch}"')
             build_call = launch_stages.rindex(
                 f'launchJob(pipeline, "/LLM/helpers/Build-{arch}"',
                 0,
@@ -258,9 +245,14 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
                 f'currentBuild.description?.contains("Require {arch} Multi-GPU Testing")',
                 normal_single,
             )
+            normal_multi = launch_stages.index(
+                f'launchJob(pipeline, "L0_Test-{arch}-Multi-GPU"',
+                marker,
+            )
             self.assertLess(build_call, dry_run_call)
             self.assertLess(dry_run_call, normal_single)
             self.assertLess(normal_single, marker)
+            self.assertLess(marker, normal_multi)
         self.assertIn(
             "parallelJobs.failFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast",
             launch_stages,
