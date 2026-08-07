@@ -139,12 +139,14 @@ def _make_creator(
     sliding_window=None,
     use_sliding_window=None,
     max_attention_window=None,
+    max_beam_width=1,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
     _get_token_num_for_estimation only."""
     c = object.__new__(KvCacheCreator)
 
     c._tokens_per_block = tokens_per_block
+    c._max_beam_width = max_beam_width
     c._net_max_seq_len = 2048
     c._speculative_config = None
     c._dummy_reqs = dummy_reqs
@@ -238,6 +240,23 @@ def test_without_adp_all_blocks_counted():
 
     # 4 reqs * 3 blocks * 64 tokens/block = 768
     assert c._get_token_num_for_estimation() == n_reqs * 3 * tpb
+
+
+def test_max_beam_width_scales_estimation_blocks():
+    """Warm-up capacity uses the same configured beam width as dummy requests."""
+    tpb = 64
+    beam_width = 4
+    c = _make_creator(
+        tpb,
+        [_make_mock_request(128, beam_width=beam_width)],
+        enable_attention_dp=False,
+        tp_size=1,
+        max_beam_width=beam_width,
+    )
+    # Beam search falls back to V1; exercise the V1 memory-cap path.
+    c._is_kv_cache_manager_v2 = False
+
+    assert c._get_token_num_for_estimation() == 3 * beam_width * tpb
 
 
 @pytest.mark.parametrize("tp_size", [2, 4, 8])
