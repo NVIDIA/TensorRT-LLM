@@ -19,6 +19,7 @@ import threading
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
+from weakref import WeakKeyDictionary
 
 import torch
 import triton  # type: ignore[import]
@@ -32,9 +33,9 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+from ..autotuner import (AutoTuner, AutoTunerProfilingCache, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -548,6 +549,171 @@ def _(
     output_dtype: torch.dtype,
     output_buffer_kind: int = int(BufferKind.DEFAULT),
     group: Optional[List[int]] = None,
+) -> torch.Tensor:
+    return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
+
+
+# The 8K-input workload produces one-, two-, and three/four-request context
+# batches in these bands; their endpoints are validated on SM100 and SM103.
+_MXFP8_LARGE_M_BUCKETS = (8192, 16384, 32768)
+_MXFP8_LARGE_M_BANDS = ((6553, 8192), (13106, 16384), (19659, 32768))
+_MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
+
+
+def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
+    """Map known large-M bands to stable native autotuning profiles."""
+    for (lower_bound, upper_bound), bucket in zip(_MXFP8_LARGE_M_BANDS,
+                                                  _MXFP8_LARGE_M_BUCKETS):
+        if lower_bound <= num_tokens <= upper_bound:
+            return bucket
+    return num_tokens
+
+
+def _get_mxfp8_large_m_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
+    """Return large-M profiles reachable by the configured token limit."""
+    mapped_max = _map_to_mxfp8_large_m_bucket(max_num_tokens)
+    return tuple(bucket for bucket in _MXFP8_LARGE_M_BUCKETS
+                 if bucket <= mapped_max)
+
+
+def _mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Infer the swizzled MXFP8 activation-scale storage size."""
+    _, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0], sf_vec_size=32)
+    return scale_shape
+
+
+class MXFP8GemmRunner(TunableRunner):
+    """Autotunable native MXFP8 GEMM runner with a serving tactic cache.
+
+    Args:
+        output_dtype: Output element type. Supported types are FP16, BF16, and
+            FP32.
+    """
+
+    runner_dict = dict()
+    synced_cache_keys: ClassVar[WeakKeyDictionary[AutoTunerProfilingCache, dict[
+        tuple[torch.dtype, int], tuple[int,
+                                       set[tuple]]]]] = WeakKeyDictionary()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, _get_mxfp8_large_m_tuning_buckets,
+        _map_to_mxfp8_large_m_bucket), ),
+                                 constraint_specs=(ConstraintSpec(
+                                     1, 0, _mxfp8_scale_infer_shape), ),
+                                 use_cuda_graph=False)
+
+    def __init__(self, output_dtype: torch.dtype) -> None:
+        self.output_dtype = output_dtype
+        self.sm_version = get_sm_version()
+        instance_key = (output_dtype, self.sm_version)
+        if instance_key not in MXFP8GemmRunner.runner_dict:
+            MXFP8GemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.MXFP8GemmRunner(
+                    output_dtype)
+        self.mxfp8_gemm_runner = MXFP8GemmRunner.runner_dict[instance_key]
+
+    def unique_id(self) -> tuple[torch.dtype, int]:
+        """Return the native tactic-cache identity for this runner."""
+        return (self.output_dtype, self.sm_version)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        """Return the generic fallback followed by every compiled tactic."""
+        return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
+
+    def sync_tactic_cache(self, tuner: AutoTuner) -> None:
+        """Register newly profiled tactics in the native serving cache."""
+        runner_name = self.__class__.__name__
+        unique_id = str(self.unique_id())
+        profiling_cache = tuner.profiling_cache
+        cache = profiling_cache.get_specific_custom_op(_MXFP8_AUTOTUNED_OP)
+        runner_sync_state = self.synced_cache_keys.setdefault(
+            profiling_cache, {})
+        generation, synced_cache_keys = runner_sync_state.get(
+            self.unique_id(), (-1, set()))
+        if generation != profiling_cache.generation:
+            generation, synced_cache_keys = profiling_cache.generation, set()
+            runner_sync_state[self.unique_id()] = (generation,
+                                                   synced_cache_keys)
+        for cache_key, (_runner_id, tactic, _min_time) in cache.items():
+            if cache_key in synced_cache_keys:
+                continue
+            # Each cache entry is immutable once profiled, so remember both
+            # matching and non-matching entries to avoid rescanning the full
+            # shared custom-op cache on every synchronization.
+            synced_cache_keys.add(cache_key)
+            _, cached_runner_name, cached_unique_id, profile = cache_key
+            if cached_runner_name != runner_name or cached_unique_id != unique_id:
+                continue
+            m, k = profile[0]
+            n, weight_k = profile[2]
+            if k != weight_k:
+                raise ValueError(
+                    f"MXFP8 autotuner cache has mismatched K dimensions: "
+                    f"activation K={k}, weight K={weight_k}")
+            self.mxfp8_gemm_runner.register_tactic(m, n, k, tactic)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        act, act_scale, weight, weight_scale, global_scale = inputs
+        return self.mxfp8_gemm_runner.run_gemm(
+            act,
+            act_scale,
+            weight,
+            weight_scale,
+            global_scale,
+            tactic,
+        )
+
+
+@torch.library.custom_op("trtllm::mxfp8_mxfp8_gemm_autotuned", mutates_args=())
+def mxfp8_mxfp8_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run an autotuned native MXFP8-by-MXFP8 matrix multiplication.
+
+    Args:
+        act: Row-major MXFP8 activation tensor with shape ``[M, K]``.
+        act_scale: Swizzled UE8M0 activation scales.
+        weight: MXFP8 weight tensor with logical shape ``[N, K]`` and the
+            column-major storage expected by CUTLASS.
+        weight_scale: Swizzled UE8M0 weight scales.
+        global_scale: FP32 scalar tensor applied by the GEMM epilogue.
+        output_dtype: Output element type. Supported types are FP16, BF16, and
+            FP32.
+
+    Returns:
+        Output tensor with shape ``[M, N]`` and dtype ``output_dtype``.
+    """
+    tuner = AutoTuner.get()
+    runner = MXFP8GemmRunner(output_dtype)
+    inputs = [act, act_scale, weight, weight_scale, global_scale]
+    _, best_tactic = tuner.choose_one(
+        _MXFP8_AUTOTUNED_OP,
+        [runner],
+        MXFP8GemmRunner.tuning_config,
+        inputs,
+    )
+    if tuner.is_tuning_mode:
+        runner.sync_tactic_cache(tuner)
+    return runner(inputs=inputs, tactic=best_tactic)
+
+
+@mxfp8_mxfp8_gemm_autotuned.register_fake
+def _(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
