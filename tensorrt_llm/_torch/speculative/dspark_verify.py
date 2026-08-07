@@ -524,6 +524,7 @@ class DSparkVerifyPlanner:
         rows: Optional[Sequence[int]] = None,
         all_rank_max: Optional[Callable[[int], int]] = None,
         reduce_across_ranks: bool = True,
+        budget_override: Optional[int] = None,
     ) -> Optional[List[int]]:
         """Per-request verify lengths for a ragged step, or None to stay uniform.
 
@@ -542,7 +543,22 @@ class DSparkVerifyPlanner:
             self.stats["fallback_no_gen_requests"] += 1
             return None
 
-        if self._forced_verify_len is not None:
+        if budget_override is not None:
+            # Diagnostic: spend a caller-supplied budget (e.g. the lag-2
+            # argmax's) through the normal CURRENT-snapshot top-k. Under
+            # cap-accept this measures a schedule's true acceptance cost --
+            # execution stays full-block, the window is only an accounting
+            # cap -- so two budgets can be compared with identical compute.
+            selected = self._gather_rows(num_gen_requests=num_gen_requests,
+                                         rows=rows)
+            if selected is None:
+                return None
+            self._note_snapshot_stats(selected, rows)
+            survival = compute_survival(self.apply_calibration(selected))
+            lens = schedule_verify_lens_topk(survival=survival,
+                                             budget=int(budget_override),
+                                             cfg=self.cfg).tolist()
+        elif self._forced_verify_len is not None:
             # Must stay ahead of the cost-table gate (the profiler runs without
             # a table) and must set `lens` rather than return, so the pinned
             # path still runs the cross-rank agreement below.

@@ -3398,6 +3398,24 @@ class PyExecutor:
                     fallback_reason = "planner_declined"
                 else:
                     device_budget, ragged_lens = pair
+            elif planner.device_windows:
+                # cap-accept + device mode: a pure measurement configuration.
+                # The lag-2 argmax picks the budget, the normal top-k spends
+                # it, and the block still executes IN FULL -- the windows ride
+                # py_verify_cap as accounting caps, so cap_trim_tokens reports
+                # exactly how many target-accepted tokens this budget would
+                # have discarded. Differencing against plain cap-accept
+                # (lag-1 budget) isolates the budget's true acceptance cost
+                # at identical compute.
+                pair = planner.decide_verify_budget(
+                    num_gen_requests=num_gen_requests, rows=confidence_rows)
+                ragged_lens = (planner.decide_verify_lens(
+                    num_gen_requests=num_gen_requests,
+                    rows=confidence_rows,
+                    reduce_across_ranks=False,
+                    budget_override=pair[0]) if pair is not None else None)
+                if ragged_lens is None:
+                    fallback_reason = "planner_declined"
             else:
                 ragged_lens = planner.decide_verify_lens(
                     num_gen_requests=num_gen_requests,
