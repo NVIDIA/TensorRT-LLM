@@ -116,11 +116,15 @@ if TYPE_CHECKING:
 def _is_visual_gen_instance(obj) -> bool:
     """isinstance(obj, VisualGen) without importing the visual_gen tree.
 
-    If tensorrt_llm.visual_gen was never imported in this process, obj
-    cannot be a VisualGen instance, so the LLM serving path never pays
-    the visual_gen import cost.
+    Probes the module that defines the class, not the (lazily loaded)
+    package: a process that only imported config leaves like
+    tensorrt_llm.visual_gen.args has the package in sys.modules, but
+    reading VisualGen off it would import the whole runtime tree via
+    __getattr__. If the defining module was never imported, obj cannot
+    be a VisualGen instance, so the LLM serving path never pays the
+    visual_gen import cost.
     """
-    visual_gen = sys.modules.get("tensorrt_llm.visual_gen")
+    visual_gen = sys.modules.get("tensorrt_llm.visual_gen.visual_gen")
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
