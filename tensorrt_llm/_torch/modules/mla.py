@@ -433,6 +433,8 @@ class MLA(nn.Module):
         reduce_output: bool = True,
         num_groups: int = 1,
         o_lora_rank: int = 1024,
+        fuse_qkv_a_proj: bool = True,
+        rms_norm_eps: Optional[float] = None,
     ):
         """
         Initialize the MLA module.
@@ -459,6 +461,12 @@ class MLA(nn.Module):
             config (ModelConfig): The model configuration.
             num_groups (int): The number of groups.
             o_lora_rank (int): The dimension of the compressed output.
+            fuse_qkv_a_proj (bool): Whether q_a and kv_a share one fused
+                projection. Set to ``False`` for checkpoints that store a
+                separate ``q_a_proj``.
+            rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
+                the pretrained config. If neither source provides a value
+                (e.g. config.pretrained_config is None), falls back to 1e-6.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -482,6 +490,7 @@ class MLA(nn.Module):
         self.dense_bias = dense_bias
         self.num_groups = num_groups
         self.o_lora_rank = o_lora_rank
+        self.fuse_qkv_a_proj = fuse_qkv_a_proj
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -523,6 +532,15 @@ class MLA(nn.Module):
         sparse_algorithm = getattr(sparse_params, "algorithm", None)
         self.is_dsa = sparse_algorithm == "dsa"
         self.is_deepseek_v4 = sparse_algorithm == "deepseek_v4"
+        if (self.is_dsa or self.is_deepseek_v4) and not fuse_qkv_a_proj:
+            # forward_dsa_proj assumes the fused [q_a | kv_a | k_pe]
+            # projection layout; the separate q_a_proj layout (Kimi K3 MLA)
+            # is not wired into the DSA / DeepSeek-V4 sparse paths.
+            raise NotImplementedError(
+                "DSA and DeepSeek-V4 sparse attention require "
+                "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
+                "supported with them."
+            )
         self._disable_dsv4_epilogue_fusion = self.is_deepseek_v4 and _is_env_truthy(
             "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION"
         )
@@ -584,7 +602,13 @@ class MLA(nn.Module):
                 )
         self.n_local_groups = self.num_groups // tp_size
 
-        rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
+        if rms_norm_eps is None:
+            rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", None)
+        if rms_norm_eps is None:
+            # No explicit value and pretrained_config is None or lacks
+            # rms_norm_eps (e.g. unit tests constructing MLA directly):
+            # keep the historical default.
+            rms_norm_eps = 1e-6
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -594,9 +618,12 @@ class MLA(nn.Module):
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         if not self.is_lite:
+            kv_a_out_features = self.kv_lora_rank + self.qk_rope_head_dim
+            if self.fuse_qkv_a_proj:
+                kv_a_out_features += self.q_lora_rank
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                kv_a_out_features,
                 bias=bias,
                 dtype=dtype,
                 quant_config=quant_config,
@@ -606,6 +633,20 @@ class MLA(nn.Module):
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
+
+            if not self.fuse_qkv_a_proj:
+                self.q_a_proj = Linear(
+                    hidden_size,
+                    self.q_lora_rank,
+                    bias=bias,
+                    dtype=dtype,
+                    quant_config=quant_config,
+                    skip_create_weights_in_init=config.skip_create_weights_in_init,
+                    use_custom_cublas_mm=True,
+                    force_dynamic_quantization=config.force_dynamic_quantization,
+                    use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                    use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                )
 
             self.q_a_layernorm = RMSNorm(
                 hidden_size=self.q_lora_rank, eps=rms_norm_eps, dtype=dtype
@@ -1427,9 +1468,15 @@ class MLA(nn.Module):
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
         else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-                [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
-            )
+            if self.fuse_qkv_a_proj:
+                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                    [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
+                )
+            else:
+                q = self.q_a_proj(hidden_states)
+                compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], -1
+                )
 
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self._q_a_layernorm_maybe_fused(q),
