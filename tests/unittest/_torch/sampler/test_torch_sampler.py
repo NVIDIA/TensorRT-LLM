@@ -751,6 +751,67 @@ def test_select_generated_logits(
     run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
+def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.MonkeyPatch):
+    sampler = object.__new__(TorchSampler)
+    sampler.max_beam_width = 1
+    sampler._stable_greedy_request_ids = []
+    sampler._stable_greedy_seq_slots = []
+    sampler._stable_greedy_seq_slots_host = None
+    sampler._stable_greedy_seq_slots_cuda = None
+    monkeypatch.setattr(sampler, "_copy_to_host", lambda tensor: tensor.clone())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.sampler.sampler.prefer_pinned", lambda: False
+    )
+
+    original_tensor_to = torch.Tensor.to
+
+    def copy_without_cuda(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", copy_without_cuda)
+
+    logits = torch.tensor([[0.0, 1.0, 2.0]])
+    new_tokens = torch.zeros((1, 2, 1), dtype=torch.int32)
+    requests = [
+        LlmRequest(
+            request_id=0,
+            max_new_tokens=4,
+            input_tokens=[1],
+            sampling_config=SamplingConfig(),
+            seq_slot=seq_slot,
+            is_streaming=False,
+            is_draft=is_draft,
+        )
+        for seq_slot, is_draft in ((0, False), (1, True))
+    ]
+
+    for seq_slot, request in enumerate(requests):
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.generation_requests = [request]
+
+        (
+            _,
+            seq_slots_host,
+            _,
+            seq_slots_cuda,
+            _,
+            _,
+            single_step_greedy,
+        ) = sampler._process_requests(
+            scheduled_requests,
+            {"logits": logits},
+            new_tokens,
+            [0],
+        )
+
+        assert single_step_greedy
+        assert seq_slots_host.tolist() == [seq_slot]
+        assert seq_slots_cuda.tolist() == [seq_slot]
+        assert new_tokens[0, seq_slot, 0].item() == 2
+
+
 @force_ampere
 def test_greedy_no_repeat_ngram_uses_token_ban_path():
     sampler = TorchSampler(
