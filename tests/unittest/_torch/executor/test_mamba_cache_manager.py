@@ -229,7 +229,7 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     assert params.mamba_ssm_cache_dtype is torch.float32
 
 
-def _kimi_model_config():
+def _kimi_model_config() -> SimpleNamespace:
     config = SimpleNamespace(
         architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
