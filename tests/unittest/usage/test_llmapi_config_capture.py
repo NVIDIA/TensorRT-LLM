@@ -697,6 +697,19 @@ def test_collect_llm_api_config_captures_gms_load_format():
     assert meta["capture_succeeded"] is True
 
 
+def test_collect_llm_api_config_captures_checkpoint_io_policy():
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        checkpoint_io_policy="rank_striped_read_ahead",
+    )
+
+    config, meta = _loads_payloads(args)
+
+    assert config["checkpoint_io_policy"] == "rank_striped_read_ahead"
+    assert meta["capture_succeeded"] is True
+
+
 def _walk_captured_keys(model) -> set[str]:
     """Capture a single nested config model and return its captured keys."""
     config, _ = _loads_payloads(model)

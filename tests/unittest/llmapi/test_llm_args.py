@@ -90,6 +90,68 @@ def test_generation_config_auto_rejects_autodeploy() -> None:
 
 
 @pytest.mark.cpu_only
+def test_checkpoint_io_policy_defaults_to_native() -> None:
+    args = TorchLlmArgs(model=llama_model_path)
+
+    assert args.checkpoint_io_policy == "native"
+    assert args.checkpoint_format == "HF"
+
+
+@pytest.mark.cpu_only
+def test_rank_striped_checkpoint_io_policy_accepts_hf_safetensors_path(
+) -> None:
+    args = TorchLlmArgs(
+        model=llama_model_path,
+        checkpoint_format="HF",
+        load_format="auto",
+        checkpoint_io_policy="rank_striped_read_ahead",
+    )
+
+    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({
+            "checkpoint_format": "MX"
+        }, "requires checkpoint_format='HF'"),
+        ({
+            "load_format": "dummy"
+        }, "requires load_format='auto'"),
+        ({
+            "checkpoint_loader": object()
+        }, "cannot be combined with a custom checkpoint_loader"),
+    ],
+)
+def test_rank_striped_checkpoint_io_policy_rejects_unsupported_loader_paths(
+        kwargs: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        TorchLlmArgs(
+            model=llama_model_path,
+            checkpoint_io_policy="rank_striped_read_ahead",
+            **kwargs,
+        )
+
+
+@pytest.mark.cpu_only
+def test_checkpoint_io_policy_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="checkpoint_io_policy"):
+        TorchLlmArgs(model=llama_model_path,
+                     checkpoint_io_policy="unknown_policy")
+
+
+@pytest.mark.cpu_only
+def test_rank_striped_checkpoint_io_policy_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError, match="only by the PyTorch backend"):
+        AutoDeployLlmArgs(
+            model=llama_model_path,
+            checkpoint_io_policy="rank_striped_read_ahead",
+        )
+
+
+@pytest.mark.cpu_only
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,

@@ -22,6 +22,7 @@ import pytest
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as weight_loader_module
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -223,6 +224,30 @@ def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
     assert load_weights_in_parallel.call_count == 2
 
 
+def test_native_prefetch_admission_uses_cgroup_capped_availability(tmp_path):
+    checkpoint_dir = tmp_path / "foo"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "model.safetensors").write_bytes(b"x" * 1024)
+    loader = HfWeightLoader()
+
+    with (
+        mock.patch.object(
+            HfWeightLoader,
+            "_get_effective_available_host_memory",
+            return_value=512,
+        ),
+        mock.patch.object(loader, "prefetch_files") as prefetch_files,
+        mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({}),
+        ),
+    ):
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+
+    prefetch_files.assert_not_called()
+
+
 def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch):
     # The cache shares raw tensors across loads (read-only by contract). A
     # consumer mutating one in place (e.g. an in-place transform in a weight
@@ -258,9 +283,8 @@ def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch
 
 def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
     # Rank-local caches can diverge, so a hit on one rank and a miss on
-    # another must enqueue the SAME collectives in the same order (Allreduce
-    # from _get_local_available_host_memory, then Barrier) or the job
-    # deadlocks. Record the sequence each path produces and compare.
+    # another must enqueue the same active-communicator collectives in the
+    # same order or the job deadlocks. Record each path and compare.
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
 
     checkpoint_dir = tmp_path / "foo"
@@ -271,14 +295,23 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
     sequences = {"miss": [], "hit": []}
     current: list = []
 
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.checkpoints.hf.weight_loader.local_mpi_barrier",
-        lambda: current.append("barrier"),
-    )
+    class _FakeActiveCommunicator:
+        @staticmethod
+        def Get_rank():
+            return 0
 
-    def record_allreduce():
-        current.append("allreduce")
-        return 1 << 60  # plenty of host memory
+        @staticmethod
+        def Get_size():
+            return 2
+
+        @staticmethod
+        def allgather(value):
+            current.append("allgather")
+            return [value, value]
+
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(weight_loader_module, "mpi_comm", _FakeActiveCommunicator)
 
     with (
         mock.patch.object(
@@ -289,8 +322,8 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
         mock.patch.object(loader, "prefetch_files"),
         mock.patch.object(
             HfWeightLoader,
-            "_get_local_available_host_memory",
-            side_effect=record_allreduce,
+            "_get_effective_available_host_memory",
+            return_value=1 << 60,
         ),
     ):
         current = sequences["miss"]
@@ -298,8 +331,8 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
         current = sequences["hit"]
         loader.load_weights(str(checkpoint_dir), mapping=Mapping())
 
-    assert sequences["miss"] == ["allreduce", "barrier"]
-    assert sequences["hit"] == sequences["miss"]  # divergence-safe ordering
+    assert sequences["miss"] == ["allgather"] * 5
+    assert sequences["hit"] == sequences["miss"]
 
 
 def test_prefetch_one_file_reports_full_file_in_bounded_windows(tmp_path, monkeypatch):
