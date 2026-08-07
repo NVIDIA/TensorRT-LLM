@@ -795,7 +795,7 @@ def _kernel_test(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
     @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
         with torch.device("cuda"):
             return fn(*args, **kwargs)
 
