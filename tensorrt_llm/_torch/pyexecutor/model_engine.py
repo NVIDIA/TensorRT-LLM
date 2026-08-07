@@ -1187,6 +1187,10 @@ class PyTorchModelEngine(ModelEngine):
                 self._run_cuda_graph_warmup(resource_manager)
             finally:
                 self.cuda_graph_runner.is_warmup_only = False
+            if getattr(self, "_use_mxfp8_graph_backend_selection", False):
+                # Drop profiling intermediates before allocating capture graphs.
+                gc.collect()
+                torch.cuda.empty_cache()
             self.cuda_graph_runner.padding_dummy_requests = {}
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -1462,34 +1466,39 @@ class PyTorchModelEngine(ModelEngine):
                 torch.cuda.synchronize()
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
-        """Runs a forward pass to populate the autotuner cache."""
+        """Configure autotuners and run eager warmup when required."""
         from ..modules.linear import (MXFP8LinearMethod,
                                       flashinfer_mxfp8_autotune)
 
         enable_trtllm_autotuner = self.llm_args.enable_autotuner
-        # The automatic FlashInfer dispatch keys off context state that Dynamo
-        # cannot trace, so a compiled model never reaches it (see
-        # MXFP8LinearMethod.apply); leave those layers on the native backend
-        # instead of tuning tactics that would go unused.
-        use_mxfp8_flashinfer_graph_default = (
-            self.cuda_graph_runner.enabled and not self._torch_compile_enabled
-            and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ and any(
+        # This is only the model-level opt-in. MXFP8LinearMethod owns explicit
+        # user overrides and backend capability checks.
+        mxfp8_decode_graph_default_requested = (
+            self.cuda_graph_runner.enabled and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))
+        self._use_mxfp8_graph_backend_selection = False
         flashinfer_mxfp8_methods = []
         native_mxfp8_methods = []
         for module in self.model.modules():
             quant_method = getattr(module, "quant_method", None)
             if not isinstance(quant_method, MXFP8LinearMethod):
                 continue
-            if use_mxfp8_flashinfer_graph_default:
-                quant_method.enable_flashinfer_auto()
-            elif self._torch_compile_enabled:
-                # Same reasoning for a user-requested
-                # TRTLLM_MXFP8_GEMM_BACKEND=auto: settle on native here so
-                # warmup tunes the backend that execution will pick.
+            if self._torch_compile_enabled:
+                # Automatic dispatch keys off context state that Dynamo cannot
+                # trace. Settle auto on native so warmup tunes the path that
+                # execution will use; an explicitly pinned backend is retained.
                 quant_method.disable_flashinfer_auto()
+            elif mxfp8_decode_graph_default_requested:
+                # Graph warmup has no pipeline-parallel cache handoff; retain
+                # the existing eager FlashInfer tuner when PP is enabled.
+                quant_method.configure_default_graph_dispatch(
+                    enable_backend_tuning=not self.mapping.has_pp())
+                if quant_method.uses_graph_backend_selection:
+                    self._use_mxfp8_graph_backend_selection = True
             if quant_method.needs_flashinfer_autotune:
+                # Includes the model-default fallback when per-stage graph
+                # backend tuning is unavailable.
                 flashinfer_mxfp8_methods.append(quant_method)
             if enable_trtllm_autotuner and quant_method.needs_native_autotune:
                 native_mxfp8_methods.append(quant_method)
@@ -1498,10 +1507,10 @@ class PyTorchModelEngine(ModelEngine):
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
+        if (enable_trtllm_autotuner or self._use_mxfp8_graph_backend_selection):
+            AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         if not enable_trtllm_autotuner and not enable_flashinfer_mxfp8_autotuner:
             return
-        if enable_trtllm_autotuner:
-            AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
@@ -1846,7 +1855,11 @@ class PyTorchModelEngine(ModelEngine):
 
         # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
         # Keep piecewise context/prefill graph capture on the native backend.
-        with flashinfer_mxfp8_decode_graph_capture():
+        tune_mxfp8_backends = (
+            self.cuda_graph_runner.is_warmup_only
+            and getattr(self, "_use_mxfp8_graph_backend_selection", False))
+        with flashinfer_mxfp8_decode_graph_capture(
+                tune_backends=tune_mxfp8_backends):
             self._capture_generation_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.

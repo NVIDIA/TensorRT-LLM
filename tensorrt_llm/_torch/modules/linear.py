@@ -15,7 +15,9 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    BufferKind, flashinfer_mxfp8_gemm_autotuned,
+    is_flashinfer_mxfp8_cute_dsl_available, mxfp8_quantize_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3048,6 +3050,8 @@ _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+_MXFP8_GRAPH_BACKEND_TUNING_ACTIVE = ContextVar(
+    "mxfp8_graph_backend_tuning_active", default=False)
 
 
 @contextmanager
@@ -3064,13 +3068,15 @@ def flashinfer_mxfp8_autotune():
 
 
 @contextmanager
-def flashinfer_mxfp8_decode_graph_capture():
-    """Enable auto-dispatched FlashInfer calls only for decode graph capture."""
-    token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+def flashinfer_mxfp8_decode_graph_capture(*, tune_backends: bool = False):
+    """Mark generation graph capture and optionally tune MXFP8 backends."""
+    capture_token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+    tuning_token = _MXFP8_GRAPH_BACKEND_TUNING_ACTIVE.set(tune_backends)
     try:
         yield
     finally:
-        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
+        _MXFP8_GRAPH_BACKEND_TUNING_ACTIVE.reset(tuning_token)
+        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(capture_token)
 
 
 class MXFP8LinearMethod(LinearMethodBase):
@@ -3084,15 +3090,15 @@ class MXFP8LinearMethod(LinearMethodBase):
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
         via trtllm::flashinfer_mm_mxfp8, which wraps mm_mxfp8 so a compiled
-        graph gets one opaque node. MiniMax-M3 enables this path automatically
-        only while tuning or capturing decode CUDA graphs, and that automatic
-        selection is skipped under torch.compile. A pinned flashinfer backend
-        applies everywhere.
+        graph gets one opaque node. MiniMax-M3 can independently tune
+        quantization and GEMM backends while warming its decode CUDA graphs.
+        Automatic selection is skipped under torch.compile; a pinned
+        FlashInfer backend applies everywhere.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``; ``auto`` settles on ``trtllm`` when the model
-    is compiled. The reference layout is 2D [O,K/32]; both
-    compiled backends consume the same 1D padded swizzled scale layout.
+    is compiled. The reference layout is 2D [O,K/32]; both compiled backends
+    consume the same 1D padded swizzled scale layout.
     When the TensorRT-LLM autotuner is enabled, the native backend profiles
     its compiled tactics during startup. Learned tactics are registered in
     the native op so serving avoids the Python autotuner lookup; the generic
@@ -3109,11 +3115,12 @@ class MXFP8LinearMethod(LinearMethodBase):
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
         self.use_native_autotuner = True
         self._native_autotuned = False
+        self._flashinfer_autotuned = False
+        self._use_graph_backend_selection = False
         if self.backend not in ("trtllm", "flashinfer", "auto"):
             raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
                              f"'flashinfer', or 'auto', got {self.backend!r}")
         self._flashinfer_mxfp8 = None
-        self._flashinfer_autotuned = False
         if self.backend == "flashinfer":
             self._load_flashinfer(required=True)
         elif self.backend == "auto" and not self._load_flashinfer(
@@ -3126,7 +3133,13 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     @property
     def needs_flashinfer_autotune(self) -> bool:
-        return self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+        return (self.uses_flashinfer and not self._use_graph_backend_selection
+                and self._flashinfer_mxfp8 is not None)
+
+    @property
+    def uses_graph_backend_selection(self) -> bool:
+        """Whether graph capture should use the per-stage backend winners."""
+        return self._use_graph_backend_selection
 
     @property
     def needs_native_autotune(self) -> bool:
@@ -3163,6 +3176,20 @@ class MXFP8LinearMethod(LinearMethodBase):
         self.backend = "auto"
         return True
 
+    def configure_default_graph_dispatch(self, *,
+                                         enable_backend_tuning: bool) -> None:
+        """Configure model-default generation-graph dispatch.
+
+        Leave explicit backend overrides untouched. When backend tuning is
+        unavailable, retain the eager-tuned FlashInfer graph path.
+        """
+        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return
+        if not self.enable_flashinfer_auto():
+            return
+        self._use_graph_backend_selection = (
+            enable_backend_tuning and is_flashinfer_mxfp8_cute_dsl_available())
+
     def mark_flashinfer_autotuned(self) -> None:
         self._flashinfer_autotuned = True
 
@@ -3177,6 +3204,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         if self.backend == "auto":
             self.backend = "trtllm"
             self._flashinfer_autotuned = False
+            self._use_graph_backend_selection = False
 
     @classmethod
     def _swizzled_scale_size(cls, out_features: int, in_features: int) -> int:
@@ -3220,8 +3248,16 @@ class MXFP8LinearMethod(LinearMethodBase):
         if self.use_cutlass:
             # Dynamic MXFP8 activation quantization (swizzled SF layout), then
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
-            act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
-                input.contiguous(), True)
+            input = input.contiguous()
+            use_graph_backend_selection = (
+                self._use_graph_backend_selection and not is_torch_compiling()
+                and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
+            if use_graph_backend_selection:
+                tune_backends = _MXFP8_GRAPH_BACKEND_TUNING_ACTIVE.get()
+                act_e4m3, act_sf = mxfp8_quantize_autotuned(input,
+                                                            tune=tune_backends)
+            else:
+                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
             # The automatic path switches per call on context state, which
             # Dynamo cannot trace and a compiled graph could not honor. A
             # pinned backend resolves before tracing, so only the automatic
@@ -3231,7 +3267,16 @@ class MXFP8LinearMethod(LinearMethodBase):
                 (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                  (self._flashinfer_autotuned
                   and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
-            if use_flashinfer:
+            if use_graph_backend_selection:
+                output = flashinfer_mxfp8_gemm_autotuned(
+                    act_e4m3,
+                    act_sf,
+                    module.weight,
+                    module.weight_scale,
+                    module.dtype,
+                    tune=tune_backends,
+                )
+            elif use_flashinfer:
                 flashinfer_mxfp8 = self._flashinfer_mxfp8
                 assert flashinfer_mxfp8 is not None
                 output = flashinfer_mxfp8(

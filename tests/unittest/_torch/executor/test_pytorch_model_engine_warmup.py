@@ -216,9 +216,15 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
 
-    def test_flashinfer_mxfp8_autotunes_before_graph_capture(self):
-        """An auto-enabled M3 linear tunes even when TRT autotuning is disabled."""
+    def _run_mxfp8_graph_default_warmup(
+        self,
+        *,
+        model_default=True,
+        cute_dsl_available=True,
+        pipeline_parallel=False,
+    ):
         calls = []
+        tuner = SimpleNamespace(setup_distributed_state=Mock())
 
         @contextlib.contextmanager
         def flashinfer_autotune():
@@ -228,7 +234,7 @@ class TestWarmupCleanup(unittest.TestCase):
 
         flashinfer_module = ModuleType("flashinfer")
         flashinfer_autotuner_module = ModuleType("flashinfer.autotuner")
-        flashinfer_autotuner_module.autotune = Mock(side_effect=flashinfer_autotune)
+        flashinfer_autotuner_module.autotune = flashinfer_autotune
         flashinfer_module.autotuner = flashinfer_autotuner_module
 
         with (
@@ -247,27 +253,32 @@ class TestWarmupCleanup(unittest.TestCase):
                 "tensorrt_llm._torch.modules.linear._flashinfer_mxfp8_op",
                 return_value=Mock(),
             ),
+            patch(
+                "tensorrt_llm._torch.modules.linear.is_flashinfer_mxfp8_cute_dsl_available",
+                return_value=cute_dsl_available,
+            ),
             patch.dict("os.environ", {}, clear=True),
         ):
             method = MXFP8LinearMethod()
-            self.assertEqual(method.backend, "trtllm")
+            modules = [SimpleNamespace(quant_method=method)]
+            if model_default:
+                modules.insert(
+                    0,
+                    SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
+                )
 
             engine = SimpleNamespace(
                 llm_args=SimpleNamespace(enable_autotuner=False),
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
-                model=SimpleNamespace(
-                    modules=lambda: [
-                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
-                        SimpleNamespace(quant_method=method),
-                    ]
-                ),
+                model=SimpleNamespace(modules=lambda: modules),
                 kv_cache_manager_key="kv_cache",
                 max_num_tokens=16,
                 batch_size=16,
                 max_seq_len=2,
                 original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=1),
+                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: pipeline_parallel),
+                dist=object(),
                 is_draft_model=False,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
@@ -277,23 +288,74 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.AutoTuner.get",
+                    return_value=tuner,
+                ),
                 patch("torch.cuda.synchronize"),
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
             ):
                 PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
 
-        self.assertEqual(
-            calls,
-            ["flashinfer_autotune_enter", "forward", "flashinfer_autotune_exit"],
-        )
-        self.assertEqual(method.backend, "auto")
-        self.assertTrue(method._flashinfer_autotuned)
-        flashinfer_autotuner_module.autotune.assert_called_once_with()
+        return calls, method, engine, tuner
+
+    def test_mxfp8_graph_default_routing(self):
+        """Use graph tuning only when the M3 default is fully eligible."""
+        eager_calls = [
+            "flashinfer_autotune_enter",
+            "forward",
+            "flashinfer_autotune_exit",
+        ]
+        cases = {
+            "eligible": ({}, [], True),
+            "missing_cutedsl": ({"cute_dsl_available": False}, eager_calls, False),
+            "pipeline_parallel": ({"pipeline_parallel": True}, eager_calls, False),
+            "other_model": ({"model_default": False}, [], False),
+        }
+        for name, (kwargs, expected_calls, graph_selection) in cases.items():
+            with self.subTest(name=name):
+                calls, method, engine, tuner = self._run_mxfp8_graph_default_warmup(**kwargs)
+
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(method.uses_graph_backend_selection, graph_selection)
+                self.assertEqual(engine._use_mxfp8_graph_backend_selection, graph_selection)
+                if graph_selection:
+                    tuner.setup_distributed_state.assert_called_once_with(
+                        engine.mapping, engine.dist
+                    )
+                else:
+                    tuner.setup_distributed_state.assert_not_called()
+
+    def test_graph_warmup_tunes_mxfp8_only_on_first_opted_in_pass(self):
+        tune_values = []
+
+        @contextlib.contextmanager
+        def graph_capture(*, tune_backends=False):
+            tune_values.append(tune_backends)
+            yield
+
+        for warmup_only in (True, False):
+            engine = SimpleNamespace(
+                cuda_graph_runner=SimpleNamespace(enabled=True, is_warmup_only=warmup_only),
+                _torch_compile_piecewise_cuda_graph=False,
+                _use_mxfp8_graph_backend_selection=True,
+                _capture_generation_cuda_graphs=Mock(),
+                _capture_piecewise_cuda_graphs=Mock(),
+            )
+            with patch(
+                "tensorrt_llm._torch.modules.linear.flashinfer_mxfp8_decode_graph_capture",
+                side_effect=graph_capture,
+            ):
+                PyTorchModelEngine._run_cuda_graph_warmup(engine, Mock())
+
+            engine._capture_generation_cuda_graphs.assert_called_once()
+
+        self.assertEqual(tune_values, [True, False])
 
     def _run_torch_compile_warmup_with_env(self, environ):
         """Run warmup for a compiled M3-style engine under the given environ."""
