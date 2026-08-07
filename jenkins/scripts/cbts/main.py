@@ -367,7 +367,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--coverage-db-lag",
         type=int,
         default=None,
-        help="Commits HEAD is ahead of --coverage-db-commit; recorded in the decision.",
+        help="Commits main gained since --coverage-db-commit; recorded in the decision.",
     )
     parser.add_argument(
         "--no-data-policy",

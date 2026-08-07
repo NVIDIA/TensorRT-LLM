@@ -928,11 +928,21 @@ def _cbtsCoverageAudit(pipeline)
         def covDir = "cbts_cov"
         // Selection is by collected revision, not build number; the JSON also carries
         // the commit and how far HEAD runs ahead of it, both recorded in the decision.
-        def selJson = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                    "--print-selection --repo-root ${LLM_ROOT} || true",
-            returnStdout: true,
-        ).trim()
+        // GITHUB_API_TOKEN: the checkout is depth-1, so lag comes from the compare API instead of git.
+        def selJson = ""
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'
+            ),
+        ]) {
+            selJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--print-selection --repo-root ${LLM_ROOT} || true",
+                returnStdout: true,
+            ).trim()
+        }
         if (!selJson) {
             pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
             return [path: "", build: null, commit: "", lag: null]
