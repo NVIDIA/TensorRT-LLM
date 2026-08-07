@@ -946,7 +946,7 @@ def _cbtsCoverageAudit(pipeline)
         def sel = new groovy.json.JsonSlurper().parseText(selJson)
         def url = sel.url
         pipeline.echo("CBTS audit: coverage DB from build ${sel.build}, " +
-                      "commit ${sel.commit ?: 'unknown'}, ${sel.lag == null ? 'lag unknown' : sel.lag + ' commit(s) behind HEAD'}")
+                      "commit ${sel.commit ?: 'unknown'}, ${sel.lag == null ? 'lag unknown' : sel.lag + ' commit(s) behind main'}")
         sh "cd ${LLM_ROOT} && mkdir -p ${covDir}"
         // wget the tarball (retrying) and extract the sqlite.
         trtllm_utils.llmExecStepWithRetry(pipeline, script:
