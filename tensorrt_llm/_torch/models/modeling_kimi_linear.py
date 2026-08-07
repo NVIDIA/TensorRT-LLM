@@ -1626,7 +1626,7 @@ class KimiKDARuntime(nn.Module):
             for conv in (mixer.q_conv1d, mixer.k_conv1d, mixer.v_conv1d)
         )
 
-    def _get_mtp_conv_weights(self):
+    def _get_mtp_conv_weights(self) -> Tuple[torch.Tensor, ...]:
         """fp32 ``[dim, W]`` conv weights for the fused verify kernel,
         prebuilt by ``_build_mtp_conv_weights()``."""
         cached = self._mtp_conv_weights
