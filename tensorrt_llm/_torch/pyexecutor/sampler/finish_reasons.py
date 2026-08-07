@@ -260,7 +260,7 @@ class FinishReasonsHandler:
         """
 
         self._temp_data.max_lens.append(
-            min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+            min(self._max_seq_len, request.py_orig_prompt_len + request.py_max_new_tokens)
         )
         self._temp_data.end_ids.append(end_id if (end_id := request.py_end_id) is not None else -1)
 
