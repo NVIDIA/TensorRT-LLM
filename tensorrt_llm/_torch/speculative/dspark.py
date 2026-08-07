@@ -296,6 +296,30 @@ class DSparkWorker(SpecWorkerBase):
         """
         return self._draft_seq_host - 1 if self._draft_seq_host > 1 else None
 
+    def verified_draft_seq_cuda(self) -> Optional[torch.Tensor]:
+        """:meth:`verified_draft_seq` as a device scalar, for the prologue.
+
+        ``_draft_seq_cuda`` already holds the CURRENT step's sequence by
+        launch time (``bump_draft_seq`` fills it before the forward is
+        enqueued), so the pass that stamped the block being verified is one
+        less. Passing the buffer itself would make every fresh row read as
+        stale and silently degrade the whole batch to neutral.
+        """
+        if self._draft_seq_cuda is None:
+            return None
+        return self._draft_seq_cuda - 1
+
+    def batch_slot_view(self, num_rows: int) -> Optional[torch.Tensor]:
+        """The batch-position -> confidence-row map staged this step.
+
+        ``[num_rows]`` int64 on device; rows past the real batch point at the
+        scratch row (their survival is zeroed by the prologue's ``num_real``
+        mask, so the content never matters).
+        """
+        if self._batch_to_slot is None:
+            return None
+        return self._batch_to_slot[:num_rows]
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -846,4 +870,18 @@ class DSparkWorker(SpecWorkerBase):
         cap_trim = spec_metadata.accept_cap_trim
         if cap_trim is not None and spec_metadata.accept_caps is not None:
             outputs["cap_trim_lens"] = cap_trim[:batch_size]
+        # Ragged steps: the TOKEN windows the step actually verified, straight
+        # off the persistent layout buffer. Rides the sampler's existing D2H
+        # batch; under device-window selection this is the ONLY place the host
+        # can learn the true windows (py_verify_len then holds only the host
+        # shape split), and the rewind arithmetic must use it.
+        #
+        # Gen-only steps only: the buffer is generation-indexed while every
+        # other output row is batch-indexed, so on a mixed step (eager ragged
+        # with finished contexts) the rows would misalign AND come up short.
+        # Mixed steps keep exact windows on py_verify_len, so the sampler's
+        # snapshot fallback stays correct there.
+        if (spec_metadata.verify_lens is not None
+                and spec_metadata.verify_lens.shape[0] >= batch_size):
+            outputs["verify_lens"] = spec_metadata.verify_lens[:batch_size]
         return outputs

@@ -3382,13 +3382,29 @@ class PyExecutor:
         # the single collective, and nothing after it may issue another one.
         ragged_lens = None
         fallback_reason = None
+        device_budget = None
+        # Cleared unconditionally: a budget left over from a previous step
+        # would re-rank a batch it was never computed for.
+        self.model_engine._dspark_device_budget = None
         if compute_windows:
-            ragged_lens = planner.decide_verify_lens(
-                num_gen_requests=num_gen_requests,
-                rows=confidence_rows,
-                reduce_across_ranks=False)
-            if ragged_lens is None:
-                fallback_reason = "planner_declined"
+            if planner.device_windows and mode.trims_submitted_tokens:
+                # Device-window mode: the host decides only the CAPACITY, from
+                # the lag-2 snapshot; the returned lens are a shape split used
+                # for the cross-rank agreement and the fit. The true windows
+                # are re-ranked on device just before the replay.
+                pair = planner.decide_verify_budget(
+                    num_gen_requests=num_gen_requests, rows=confidence_rows)
+                if pair is None:
+                    fallback_reason = "planner_declined"
+                else:
+                    device_budget, ragged_lens = pair
+            else:
+                ragged_lens = planner.decide_verify_lens(
+                    num_gen_requests=num_gen_requests,
+                    rows=confidence_rows,
+                    reduce_across_ranks=False)
+                if ragged_lens is None:
+                    fallback_reason = "planner_declined"
         else:
             fallback_reason = "mode_static"
             # Nothing to compute: the fallback verifies the full drafted block.
@@ -3482,6 +3498,13 @@ class PyExecutor:
                 ragged_active = bucket is not None
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
+                elif device_budget is not None:
+                    # The fit landed on a captured shape; hand the engine the
+                    # capacity so the pre-replay prologue re-ranks it with
+                    # fresh confidence. Published only here: every fallback
+                    # leaves it None and the step runs the host windows.
+                    self.model_engine._dspark_device_budget = int(
+                        device_budget)
             else:
                 # No rank can graph this step, so run the windows eagerly. Do
                 # not fit a bucket: the fit sizes pad rows _get_padded_batch

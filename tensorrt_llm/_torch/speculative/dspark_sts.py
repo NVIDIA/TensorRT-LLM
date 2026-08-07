@@ -294,6 +294,13 @@ def make_recorder_from_env(*, block_size: int, rank: int = 0,
             f"verify rows corrupt the per-position prefix label. Collect in "
             f"static mode (TLLM_DSPARK_RAGGED_VERIFY_MODE=static).")
 
+    if os.environ.get("TLLM_DSPARK_DEVICE_WINDOWS", "0") == "1":
+        raise ValueError(
+            f"{STS_COLLECT_ENV} is set with TLLM_DSPARK_DEVICE_WINDOWS=1. "
+            f"Device-selected windows trim per request on device, so every "
+            f"collected acceptance label is censored by a window the host "
+            f"never sees. Collect with device windows off.")
+
     frac = os.environ.get("TLLM_DSPARK_FORCE_BUDGET_FRAC", "").strip()
     if frac:
         try:

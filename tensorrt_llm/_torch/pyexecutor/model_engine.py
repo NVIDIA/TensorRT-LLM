@@ -3829,6 +3829,7 @@ class PyTorchModelEngine(ModelEngine):
         # _get_padded_batch.
         self._dspark_last_total_tokens = int(bucket)
         self._dspark_last_padded_bs = int(padded_bs)
+        self._dspark_last_num_real = int(n_real)
         runner.agreed_ragged_bucket = int(bucket)
         runner.ragged_pad_verify_len = pad_len - 1
 
@@ -3836,6 +3837,130 @@ class PyTorchModelEngine(ModelEngine):
                                    filled.verify_lens.tolist()):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
+
+    def _apply_device_window_prologue(self, inputs,
+                                      new_tensors_device) -> bool:
+        """Re-rank this step's verify windows on device, with fresh confidence.
+
+        Runs after ``_prepare_inputs`` and before the graph replay, all device
+        ops on the current stream -- stream order makes every write visible to
+        the replayed graph, and nothing here reads device data back to the
+        host. The host has already agreed ``(padded_bs, bucket)`` and staged a
+        SHAPE SPLIT of the (lagged) budget through the normal fit; this
+        prologue re-distributes the same real/pad token totals by the verified
+        block's OWN confidence (ranking lag zero) and overwrites the layout's
+        content: verify lens, qo_indptr, the per-token row maps, the packed
+        input/position/draft tokens, and the per-request kv-length delta from
+        the shape split to the true windows.
+
+        Returns True when applied; False when a precondition fails (the step
+        then runs the shape split as-is, which is a valid window assignment).
+        """
+        from ..speculative.dspark_device_select import select_windows_device
+
+        runner = self.cuda_graph_runner
+        budget = getattr(self, "_dspark_device_budget", None)
+        self._dspark_device_budget = None
+        if budget is None or runner.agreed_ragged_bucket is None:
+            return False
+        if not getattr(self, "_dspark_prev_covers_batch", False):
+            # The input gathers below address new_tokens_device by
+            # previous_batch_indices in batch order; a request without a
+            # previous device tensor breaks that addressing.
+            return False
+        worker = self._get_spec_worker()
+        planner = getattr(worker, "verify_planner", None)
+        if planner is None or worker.staged_confidence_buffer() is None:
+            return False
+        if worker.batch_slot_view(1) is None:
+            return False
+        spec_metadata = inputs.get('spec_metadata')
+        attn_metadata = inputs.get('attn_metadata')
+        if spec_metadata is None or attn_metadata is None:
+            return False
+        if int(attn_metadata.num_contexts) != 0:
+            return False
+
+        bucket = int(runner.agreed_ragged_bucket)
+        padded_bs = int(self._dspark_last_padded_bs)
+        n_real = int(self._dspark_last_num_real)
+        pad_len_tok = int(runner.ragged_pad_verify_len) + 1
+        real_tokens = bucket - (padded_bs - n_real) * pad_len_tok
+        cfg = planner.cfg
+        # The scheduler cannot grant more than the real rows can absorb under
+        # the published split; the fill tops up any shortfall.
+        budget = max(
+            0,
+            min(int(budget), real_tokens - n_real * (cfg.min_verify_len + 1)))
+
+        # Snapshot the shape split BEFORE overwriting: past_seen per row is
+        # the staged position at each row's first token, and the kv delta
+        # needs the split the host baked into kv_lens_cuda.
+        lens_buf = self.ragged_verify_lens_cuda
+        qo_buf = self.ragged_qo_indptr_cuda
+        split_lens = lens_buf[:padded_bs].clone()
+        split_qo = qo_buf[:padded_bs + 1].to(torch.long)
+        past_seen = self.position_ids_cuda[split_qo[:-1]].clone()
+
+        expected_stamp = worker.verified_draft_seq_cuda()
+        stamps = worker.confidence_stamp_buffer(
+        ) if expected_stamp is not None else None
+        result = select_windows_device(
+            confidence_logits=worker.staged_confidence_buffer(),
+            slot_idx=worker.batch_slot_view(padded_bs),
+            num_real=n_real,
+            budget=budget,
+            graph_num_tokens=bucket,
+            cfg=cfg,
+            apply_calibration=planner.apply_calibration,
+            stamp=stamps,
+            expected_stamp=expected_stamp,
+            pad_len=pad_len_tok,
+        )
+
+        lens_buf[:padded_bs].copy_(result.verify_lens)
+        qo_buf[:padded_bs + 1].copy_(result.qo_indptr)
+        # Every host-staged kv formula used the shape split consistently, so
+        # correcting by the difference lands on exactly the value the host
+        # path would have produced with these windows.
+        attn_metadata.kv_lens_cuda[:padded_bs] += result.verify_lens - split_lens
+
+        req_idx = result.req_idx
+        device = req_idx.device
+        flat = torch.arange(bucket, device=device)
+        offset = flat - result.qo_indptr.to(torch.long)[req_idx]
+        prev_slots = self.previous_batch_indices_cuda[:n_real].to(torch.long)
+        slots_tok = prev_slots[req_idx.clamp(max=n_real - 1)]
+
+        new_tokens_device = new_tensors_device.new_tokens
+        new_tokens_lens_device = new_tensors_device.new_tokens_lens
+        next_draft_tokens_device = new_tensors_device.next_draft_tokens
+
+        self.input_ids_cuda[:bucket] = new_tokens_device.transpose(
+            0, 1)[slots_tok, offset].flatten().to(self.input_ids_cuda.dtype)
+        self.position_ids_cuda[:bucket] = past_seen[req_idx] + offset.to(
+            past_seen.dtype)
+        # Overlap corrections gather by each token's OWNER; rebuild both the
+        # index and the per-token offset it feeds (mirrors the host staging at
+        # the previous_pos_indices block).
+        self.previous_pos_indices_cuda[:real_tokens] = slots_tok[:real_tokens].to(
+            self.previous_pos_indices_cuda.dtype)
+        self.previous_pos_id_offsets_cuda[:real_tokens].copy_(
+            new_tokens_lens_device[slots_tok[:real_tokens]])
+        # Draft tokens pack compactly: token t at in-window offset o >= 1 goes
+        # to slot t - owner - 1 (one bonus token per preceding row). Anchor
+        # tokens (o == 0) are parked one past the real draft region, where any
+        # valid token id is discard-territory.
+        real_draft = real_tokens - n_real
+        mask = offset >= 1
+        dst = torch.where(mask, flat - req_idx - 1,
+                          torch.full_like(req_idx, real_draft))
+        src = next_draft_tokens_device[slots_tok, (offset - 1).clamp_min(0)]
+        self.draft_tokens_cuda[dst] = src.to(self.draft_tokens_cuda.dtype)
+
+        attn_metadata.apply_device_ragged_layout(result.verify_lens, req_idx,
+                                                 result.kv_correction)
+        return True
 
     @staticmethod
     def _ragged_token_lens(generation_requests) -> Optional[List[int]]:
@@ -3875,6 +4000,12 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(attn_metadata, "ragged_verify_lens"):
             attn_metadata.ragged_verify_lens = self._ragged_token_lens(
                 generation_requests)
+        if hasattr(attn_metadata, "device_windows_mode"):
+            # Tells the attention prepare that the host window VALUES are a
+            # shape split (bounds only); the true windows land on device
+            # through apply_device_ragged_layout after prepare.
+            from ..speculative.dspark_verify import device_windows_enabled
+            attn_metadata.device_windows_mode = device_windows_enabled()
 
     def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
         """A persistent pinned staging buffer holding ``values``.
@@ -5087,6 +5218,15 @@ class PyTorchModelEngine(ModelEngine):
                     gen_request_seq_slots.append(request.py_seq_slot)
 
         previous_batch_len = len(previous_batch_indices)
+        # Device-window prologue precondition: it gathers this step's inputs
+        # by (slot, offset) through previous_batch_indices_cuda, which only
+        # covers requests that carried a previous device tensor and only in
+        # batch order when EVERY real generation request did. Recorded here,
+        # consumed by _apply_device_window_prologue.
+        self._dspark_prev_covers_batch = (
+            previous_batch_len > 0
+            and previous_batch_len == len(extend_requests) -
+            len(extend_dummy_requests))
 
         def previous_seq_slots_device():
             previous_batch_indices_host = torch.tensor(
@@ -6933,6 +7073,16 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager, can_run_graph)
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
+
+            # Device-window selection: re-rank the staged ragged layout by the
+            # verified block's own confidence, between input staging and the
+            # replay (stream-ordered, no host sync). Graph steps only: eager
+            # and capture steps run the host shape split, which is a valid
+            # window assignment.
+            if (can_run_graph and not self.is_warmup
+                    and getattr(self, "_dspark_device_budget", None)
+                    is not None):
+                self._apply_device_window_prologue(inputs, new_tensors_device)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:

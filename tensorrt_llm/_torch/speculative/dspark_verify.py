@@ -24,7 +24,7 @@ not ready degrades to verifying everything, never to a stale guess.
 """
 
 import os
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -50,6 +50,20 @@ FORCE_BUDGET_FRAC_ENV = "TLLM_DSPARK_FORCE_BUDGET_FRAC"
 #: Wire encoding for the frac's cross-rank agreement: fractions travel as
 #: fixed-point ints so the allgather payload stays homogeneous ints.
 _FRAC_WIRE_SCALE = 10_000
+
+#: Device-side window selection (the paper's dual-timescale split): the host
+#: decides only the CAPACITY -- (padded_bs, bucket, budget) -- from a snapshot
+#: one step older than today's (lag-2 by the block-relative count, matching
+#: SGLang), and a pre-replay device prologue re-ranks the batch with the
+#: verified block's own fresh confidence (lag-0). Constant per process, read
+#: once at init on every rank.
+DEVICE_WINDOWS_ENV = "TLLM_DSPARK_DEVICE_WINDOWS"
+
+
+def device_windows_enabled() -> bool:
+    """Whether device-side window selection is on (process-constant env)."""
+    return os.environ.get(DEVICE_WINDOWS_ENV, "0") == "1"
+
 
 __all__ = ["DSparkVerifyPlanner"]
 
@@ -106,6 +120,24 @@ class DSparkVerifyPlanner:
         self._host_stamps: Optional[torch.Tensor] = None
         self._staged_seq: Optional[int] = None
         self._snapshot_valid = False
+
+        # Device-window mode: ranking happens on device with fresh confidence,
+        # so the host snapshot serves ONLY the capacity argmax -- and that one
+        # deliberately reads a snapshot one staging older (lag-2), per the
+        # paper's design: capacity tolerates staleness, ranking does not.
+        # Two pinned buffers alternate; the pair we are NOT writing this step
+        # is the older, guaranteed-landed one.
+        self.device_windows = os.environ.get(DEVICE_WINDOWS_ENV, "0") == "1"
+        if self.device_windows and self._forced_verify_len is not None:
+            raise ValueError(
+                f"{DEVICE_WINDOWS_ENV}=1 is incompatible with "
+                f"{FORCE_VERIFY_LEN_ENV}: the pin fixes host windows that "
+                f"device selection would silently override")
+        self._prev_buffer: Optional[torch.Tensor] = None
+        self._prev_event: Optional[torch.cuda.Event] = None
+        self._prev_stamps: Optional[torch.Tensor] = None
+        self._prev_seq: Optional[int] = None
+        self._prev_valid = False
         # Count every path that declines to trim; degradation here is silent.
         self.stats = {
             "decisions": 0,
@@ -135,6 +167,19 @@ class DSparkVerifyPlanner:
         """
         if confidence_logits is None or confidence_logits.shape[0] == 0:
             return
+        if self.device_windows:
+            # Rotate before overwriting: what was current becomes the older
+            # (lag-2) snapshot the budget argmax reads; the old older buffer's
+            # storage is reused for this staging. Pure reference swaps.
+            self._host_buffer, self._prev_buffer = (self._prev_buffer,
+                                                    self._host_buffer)
+            self._copy_event, self._prev_event = (self._prev_event,
+                                                  self._copy_event)
+            self._host_stamps, self._prev_stamps = (self._prev_stamps,
+                                                    self._host_stamps)
+            self._staged_seq, self._prev_seq = self._prev_seq, self._staged_seq
+            self._prev_valid = self._snapshot_valid
+            self._snapshot_valid = False
         if self._host_buffer is None or self._host_buffer.shape != confidence_logits.shape:
             self._host_buffer = torch.empty(
                 confidence_logits.shape,
@@ -321,23 +366,29 @@ class DSparkVerifyPlanner:
             f"configuration.")
 
     def _note_snapshot_stats(self, selected: torch.Tensor,
-                             rows: Optional[Sequence[int]]) -> None:
+                             rows: Optional[Sequence[int]],
+                             stamps: Optional[torch.Tensor] = None,
+                             staged_seq: Optional[int] = None) -> None:
         """Record snapshot-quality stats: stamp-lag histogram (staleness per
         gathered row) and neutral-row count ("unknown" rows entering the
         argmax as certainties). Observability only; never changes behaviour.
+        ``stamps``/``staged_seq`` override the current snapshot's pair when the
+        caller read the older (lag-2) one.
         """
         try:
+            stamps = self._host_stamps if stamps is None else stamps
+            staged_seq = self._staged_seq if staged_seq is None else staged_seq
             n = int(selected.shape[0])
             self.stats["snap_rows"] = self.stats.get("snap_rows", 0) + n
             neutral = int((selected >= NEUTRAL_CONFIDENCE_LOGIT - 1.0).all(dim=1).sum())
             self.stats["snap_neutral_rows"] = (
                 self.stats.get("snap_neutral_rows", 0) + neutral)
-            if (self._host_stamps is not None and self._staged_seq is not None
+            if (stamps is not None and staged_seq is not None
                     and rows is not None):
                 idx = torch.as_tensor(list(rows), dtype=torch.long)
-                idx = idx.clamp_(0, self._host_stamps.shape[0] - 1)
-                lags = (int(self._staged_seq)
-                        - self._host_stamps[idx].to(torch.int64))
+                idx = idx.clamp_(0, stamps.shape[0] - 1)
+                lags = (int(staged_seq)
+                        - stamps[idx].to(torch.int64))
                 hist = self.stats.setdefault("stamp_lag_hist", {})
                 for lag, cnt in zip(*[t.tolist() for t in lags.unique(
                         return_counts=True)]):
@@ -349,8 +400,22 @@ class DSparkVerifyPlanner:
             if self.stats["snap_stats_errors"] == 1:
                 logger.warning(f"DSpark snapshot stats failed once: {exc}")
 
+    def _ready_older_snapshot(self) -> Optional[torch.Tensor]:
+        """The lag-2 snapshot (device-window mode's capacity input), or None.
+
+        By construction its copy was issued a full staging earlier, so its
+        event has practically always landed; the poll stays for the same
+        fail-closed reason as :meth:`_ready_snapshot`.
+        """
+        if not self._prev_valid or self._prev_buffer is None:
+            return None
+        if self._prev_event is not None and not self._prev_event.query():
+            return None
+        return self._prev_buffer
+
     def _gather_rows(
-        self, *, num_gen_requests: int, rows: Optional[Sequence[int]]
+        self, *, num_gen_requests: int, rows: Optional[Sequence[int]],
+        snapshot: Optional[torch.Tensor] = None
     ) -> Optional[torch.Tensor]:
         """This step's confidence, one row per generation request, or None.
 
@@ -359,9 +424,11 @@ class DSparkVerifyPlanner:
         lag, so positional reads (``rows=None``) are only correct for callers
         that own the ordering. Declines (None) rather than returning fewer
         rows than the batch, which would partially assign verify windows
-        downstream.
+        downstream. ``snapshot`` overrides the default (current) snapshot when
+        the caller already picked one (the lag-2 budget read).
         """
-        snapshot = self._ready_snapshot()
+        if snapshot is None:
+            snapshot = self._ready_snapshot()
         if snapshot is None:
             self.stats["fallback_no_snapshot"] += 1
             return None
@@ -379,6 +446,76 @@ class DSparkVerifyPlanner:
             self.stats["fallback_no_confidence"] += 1
             return None
         return selected
+
+    def decide_verify_budget(
+        self,
+        *,
+        num_gen_requests: int,
+        rows: Optional[Sequence[int]] = None,
+    ) -> Optional[Tuple[int, List[int]]]:
+        """Capacity only, for device-window mode: ``(budget, shape_lens)``.
+
+        The budget (verify tokens above the per-request floor) comes from the
+        cost-table argmax over the OLDER staged snapshot -- lag-2 by the
+        block-relative count, the paper's prescription: capacity tolerates
+        staleness, ranking does not. ``shape_lens`` is a canonical uniform
+        spread of the budget used ONLY for the cross-rank shape agreement and
+        bucket fit (both read totals, never the split); the true per-request
+        windows are chosen on device from the verified block's own confidence.
+        Fail-closed like :meth:`decide_verify_lens`: None means verify the
+        full block.
+        """
+        self.stats["decisions"] += 1
+        if num_gen_requests <= 0:
+            self.stats["fallback_no_gen_requests"] += 1
+            return None
+        n = int(num_gen_requests)
+        trimmable = self.cfg.resolved_max_verify_len - self.cfg.min_verify_len
+        if self._forced_budget_frac is not None:
+            # The frac sweep stays honest in device mode: it replaces only the
+            # argmax; the device top-k still spends the budget for real.
+            budget = int(round(self._forced_budget_frac * n * trimmable))
+            self.stats["forced_budget_steps"] = (
+                self.stats.get("forced_budget_steps", 0) + 1)
+        else:
+            if self.cost_table is None or self.cost_table.is_flat:
+                self.stats["fallback_flat_cost"] += 1
+                return None
+            snapshot = self._ready_older_snapshot()
+            if snapshot is None:
+                self.stats["fallback_no_snapshot"] += 1
+                return None
+            selected = self._gather_rows(num_gen_requests=n, rows=rows,
+                                         snapshot=snapshot)
+            if selected is None:
+                return None
+            self._note_snapshot_stats(selected, rows,
+                                      stamps=self._prev_stamps,
+                                      staged_seq=self._prev_seq)
+            survival = compute_survival(self.apply_calibration(selected))
+            budget = compute_verify_token_budget(
+                survival=survival.numpy().astype(np.float64),
+                num_gen_requests=n,
+                cost_table=self.cost_table,
+                min_verify_len=self.cfg.min_verify_len,
+                max_verify_len=self.cfg.resolved_max_verify_len,
+                allowed_lens=self.tiers,
+            )
+            floor_tokens = n * (self.cfg.min_verify_len + 1)
+            predicted = float(self.cost_table.step_times(
+                np.asarray([floor_tokens + int(budget)]), n)[0])
+            self.last_predicted_step_ms = predicted
+            self.stats["predicted_ms_sum"] = (
+                self.stats.get("predicted_ms_sum", 0.0) + predicted)
+            self.stats["predicted_steps"] = (
+                self.stats.get("predicted_steps", 0) + 1)
+        budget = max(0, min(int(budget), n * trimmable))
+        base, extra = divmod(budget, n)
+        shape_lens = [
+            min(self.cfg.min_verify_len + base + (1 if i < extra else 0),
+                self.cfg.resolved_max_verify_len) for i in range(n)
+        ]
+        return budget, shape_lens
 
     def decide_verify_lens(
         self,

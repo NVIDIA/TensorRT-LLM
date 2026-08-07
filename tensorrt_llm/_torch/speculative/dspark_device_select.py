@@ -81,6 +81,7 @@ def select_windows_device(
     apply_calibration: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     stamp: Optional[torch.Tensor] = None,
     expected_stamp: Optional[torch.Tensor] = None,
+    pad_len: Optional[int] = None,
 ) -> DeviceWindowResult:
     """Rank the batch by fresh confidence and pack it into the agreed bucket.
 
@@ -105,6 +106,11 @@ def select_windows_device(
             ``expected_stamp`` (0-d), rows whose stamp mismatches fall back
             to the neutral row (full survival: verify everything), the same
             fail-open the host planner applies to unknown slots.
+        pad_len: when given, pad rows carry EXACTLY this many tokens and all
+            fill slack goes to real rows -- the host fit's published split,
+            which its pre-launch copy widths depend on (see
+            :func:`fill_bucket_device`). The caller must clamp ``budget`` so
+            the real rows can absorb ``graph_num_tokens - n_pad * pad_len``.
 
     Returns:
         :class:`DeviceWindowResult`; every tensor is derived without a host
@@ -148,6 +154,7 @@ def select_windows_device(
         num_real=num_real,
         graph_num_tokens=graph_num_tokens,
         max_verify_len=max_token_len,
+        pad_fill=pad_len,
     )
     req_idx, correction = build_row_maps_device(
         filled, graph_num_tokens=graph_num_tokens)

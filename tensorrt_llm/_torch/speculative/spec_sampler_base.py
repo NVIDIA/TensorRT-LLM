@@ -49,6 +49,11 @@ class SampleStateTensorsSpec(SampleStateTensors):
     next_draft_tokens: torch.Tensor
     #: cap-accept only; None on every other path.
     cap_trim_lens: Optional[torch.Tensor] = None
+    #: ragged verification only; None on every other path. The TOKEN windows
+    #: the step actually verified (bonus included), slot-indexed. Under
+    #: device-window selection this D2H is the host's only source of the true
+    #: windows; zero marks "no window this step".
+    verify_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -112,6 +117,10 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         #: the batch each step -- a slot left alone would hand the previous
         #: occupant's loss to whoever holds it now.
         cap_trim_lens: torch.Tensor
+        #: ragged verification: the TOKEN windows the step actually verified,
+        #: slot-indexed; zeroed for every batch slot on non-ragged steps (the
+        #: same stale-slot discipline as cap_trim_lens).
+        verify_lens: torch.Tensor
 
     def __init__(self, args: TorchSampler.Args, *, draft_len: int):
         """
@@ -139,6 +148,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
             cap_trim_lens=int_tensor((seq_slots,)),
+            verify_lens=int_tensor((seq_slots,)),
         )
 
     def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
@@ -218,7 +228,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
     @staticmethod
     def _verified_len(request: LlmRequest, runtime_draft_len: int,
-                      verify_lens_snapshot: Optional[dict] = None) -> int:
+                      verify_lens_snapshot: Optional[dict] = None,
+                      ridden_verify_lens: Optional[list] = None) -> int:
         """How many draft positions THIS request was given to verify.
 
         Uniform scheduling gives every request the batch-wide
@@ -234,7 +245,16 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ``py_verify_len`` is set only by the ragged path, so this is exactly
         today's behavior for every other speculation mode.
         """
-        # Prefer the snapshot taken when this step's tokens were sampled. The
+        # First preference: the windows the device layout actually verified,
+        # ridden back on this step's sampler D2H (slot-indexed TOKEN windows;
+        # zero = no window). Under device-window selection the host attribute
+        # holds only a shape split, so this is the only correct source; under
+        # host windows the two agree.
+        if ridden_verify_lens is not None:
+            token_window = ridden_verify_lens[request.py_seq_slot]
+            if token_window > 0:
+                return int(token_window) - 1
+        # Second: the snapshot taken when this step's tokens were sampled. The
         # live attribute already belongs to the NEXT step by the time the
         # overlap scheduler rewinds this one.
         if verify_lens_snapshot is not None:
@@ -263,6 +283,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         cap_trim_list = (state.host.cap_trim_lens.tolist()
                          if state.host.cap_trim_lens is not None else None)
+        ridden_verify_lens = (state.host.verify_lens.tolist()
+                              if state.host.verify_lens is not None else None)
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
@@ -286,7 +308,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             verified_len = self._verified_len(req, runtime_draft_len,
-                                              state.verify_lens_snapshot)
+                                              state.verify_lens_snapshot,
+                                              ridden_verify_lens)
             req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
             # Acceptance against the window the request was actually given.
             # Recorded here because this is the only place both numbers are
@@ -405,6 +428,18 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_cap_trim = o_cap_trim[num_skip:num_skip + num_sampling_requests]
         self.store.cap_trim_lens.index_copy_(
             0, slots, o_cap_trim.to(self.store.cap_trim_lens.dtype))
+        # Ragged verification: the true token windows, same zero-then-write
+        # slot discipline as cap_trim_lens. Under device-window selection the
+        # host py_verify_len holds only a shape split, so the rewind
+        # arithmetic in update_requests must read THIS.
+        o_verify_lens = outputs.get("verify_lens")
+        if o_verify_lens is None:
+            o_verify_lens = torch.zeros_like(o_new_tokens_lens)
+        else:
+            o_verify_lens = o_verify_lens[num_skip:num_skip +
+                                          num_sampling_requests]
+        self.store.verify_lens.index_copy_(
+            0, slots, o_verify_lens.to(self.store.verify_lens.dtype))
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -420,6 +455,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # [max_num_sequences] int32 -- kilobytes next to new_tokens above,
             # and it rides the same event, so no extra synchronization.
             cap_trim_lens=self._copy_to_host(self.store.cap_trim_lens),
+            verify_lens=self._copy_to_host(self.store.verify_lens),
         )
         sampler_event = self._record_sampler_event()
 

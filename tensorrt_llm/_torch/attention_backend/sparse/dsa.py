@@ -662,6 +662,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # `1 + max_draft_tokens` the strided expansions assume. Host-side because
     # reading repeats off a device tensor would sync.
     ragged_verify_lens: Optional[List[int]] = None
+    # Device-window mode (TLLM_DSPARK_DEVICE_WINDOWS): on ragged steps the
+    # host list above is only a SHAPE split summing to the bucket; the true
+    # per-request windows are chosen on device after prepare() and written
+    # through apply_device_ragged_layout. Host reads of window values must
+    # then be treated as bounds (see _prepare_impl).
+    device_windows_mode: bool = False
     # Query tokens per generation request on a *uniform* batch this step
     # (`1 + runtime_draft_len`). Zero means "not published"; expansions then
     # fall back to the static `1 + max_draft_tokens`.
@@ -723,11 +729,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.ragged_verify_lens is None:
             stride = self.gen_token_stride
             return values.repeat_interleave(stride, dim=dim), num_tokens
-        repeats_host = torch.tensor(
-            repeats,
-            dtype=torch.long,
-            pin_memory=(prefer_pinned() and values.device.type == 'cuda'))
-        repeats_dev = repeats_host.to(values.device, non_blocking=True)
+        # Device values take repeats from the PERSISTENT staged buffer, never
+        # a per-call pinned temporary: that call site runs inside the captured
+        # graph (via on_update_kv_lens), where a temporary would bake its host
+        # pointer into the captured H2D copy. The buffer is staged by
+        # prepare_for_spec_decode and overwritten in place by the
+        # device-window prologue. Host-tensor calls (prepare-time expansions
+        # of host kv lens / block tables) keep a plain host repeats tensor.
+        if values.device == self.gen_token_repeats_cuda.device:
+            repeats_dev = self.gen_token_repeats_cuda[:self.num_generations]
+        else:
+            repeats_dev = torch.tensor(repeats,
+                                       dtype=torch.long,
+                                       device=values.device)
         return (values.repeat_interleave(repeats_dev,
                                          dim=dim,
                                          output_size=num_tokens), num_tokens)
@@ -846,6 +860,20 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv
+
+        if self.device_windows_mode and self.is_ragged_verify:
+            # Device-window steps: the host's per-request windows are only a
+            # SHAPE split; the true windows are chosen on device after
+            # prepare(). Every host-side read of kv_lens below is a bound or
+            # is rebuilt in-graph from kv_lens_cuda (on_update_kv_lens), so
+            # inflate the gen entries to the full drafted block -- a bound no
+            # device-chosen window can exceed. kv_lens_cuda keeps the exact
+            # shape-split values (staged by super().prepare() above); the
+            # prologue's per-request delta corrects it to the true windows.
+            nc, ns = self.num_contexts, self.num_seqs
+            kv_lens = kv_lens.clone()
+            kv_lens[nc:ns] += (1 + self.max_draft_tokens) - self.seq_lens_kv[nc:ns]
+            self.kv_lens[nc:ns] = kv_lens[nc:ns]
 
         # For mla_rope_append_paged_kv_assign_q
         self.prepare_for_mla_rope_append(cached_token_lens, kv_lens)
@@ -1226,6 +1254,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.host_req_idx_per_token = torch.empty_like(
             self.req_idx_per_token, device='cpu', pin_memory=prefer_pinned())
+        # Per-gen-request query-token counts as a PERSISTENT device tensor.
+        # The in-graph ragged expansion (``on_update_kv_lens`` ->
+        # ``expand_per_gen_token``) must read repeats from a stable address:
+        # a per-call pinned temporary would bake the temporary's host pointer
+        # into the captured H2D. Staged in prepare_for_spec_decode; the
+        # device-window prologue overwrites it in place.
+        self.gen_token_repeats_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences, ),
+            cache_name="gen_token_repeats_cuda",
+            dtype=torch.int64,
+            capture_graph=capture_graph,
+        )
+        self.host_gen_token_repeats = torch.empty_like(
+            self.gen_token_repeats_cuda,
+            device='cpu',
+            pin_memory=prefer_pinned())
         # Block table for topk_indices conversion (shared for context and generation)
         self.block_table = self.get_empty(
             self.cuda_graph_buffers,
@@ -1800,6 +1845,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                  ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
                   and get_sm_version() >= 100)))
         if self.use_expanded_buffers_for_mtp:
+            if self.is_ragged_verify:
+                # Stage the persistent device repeats the in-graph expansion
+                # reads (see expand_per_gen_token); must land before the
+                # expansions below and before any capture of this step.
+                n_gen = self.num_generations
+                self.host_gen_token_repeats[:n_gen].copy_(
+                    torch.tensor(self.gen_token_repeat_list(),
+                                 dtype=torch.int64))
+                self.gen_token_repeats_cuda[:n_gen].copy_(
+                    self.host_gen_token_repeats[:n_gen], non_blocking=True)
             # Expand kv_lens_cuda (only generation): one row per query token,
             # repeating each request's kv_len as many times as it has tokens.
             gen_kv_lens = self.get_indexer_kv_lens(
@@ -2082,6 +2137,57 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             f"and forward ({num_tokens}); the per-row extents would be read "
             f"past what was populated")
         return self.row_kv_lens_cuda[:num_tokens]
+
+    def apply_device_ragged_layout(self, verify_lens: torch.Tensor,
+                                   req_idx: torch.Tensor,
+                                   kv_correction: torch.Tensor) -> None:
+        """Rebind this step's ragged layout to device-chosen windows.
+
+        Pre-replay device ops only -- no host sync, stream-ordered before the
+        graph replay so every captured reader sees the new values. Overwrites
+        the same persistent buffers prepare() staged from the host shape
+        split; the per-row extents and every expanded/indexer artifact then
+        rebuild in-graph from them (``on_update_kv_lens``).
+
+        Preconditions (the engine's prologue guarantees them): gen-only batch
+        (``num_contexts == 0``), ``verify_lens`` sums to the staged bucket
+        (``_ragged_num_rows``), and ``kv_lens_cuda`` has already been
+        delta-corrected from the shape split to these windows.
+
+        Args:
+            verify_lens: ``[num_generations]`` int32 token windows.
+            req_idx: ``[bucket]`` int64 owning-row per packed token.
+            kv_correction: ``[bucket]`` int32, same ``1 - v .. 0`` convention
+                as the host staging (extent = kv_len + correction).
+        """
+        nc = self.num_contexts
+        rows = self._ragged_num_rows
+        n_gen = self.num_generations
+        # Request-major: the true query lengths. Everything on_update_kv_lens
+        # derives per token (slot mappings, indptrs, dense top-k) follows.
+        self.seq_lens_cuda[nc:self.num_seqs] = verify_lens.to(
+            self.seq_lens_cuda.dtype)
+        self.gen_token_repeats_cuda[:n_gen] = verify_lens.to(torch.int64)
+        # Token-major maps, both the indexer's rows and the attention view's.
+        self.row_req_idx_cuda[:rows] = req_idx
+        self.row_kv_correction_cuda[:rows] = kv_correction
+        self.attn_row_req_idx_cuda[:rows] = req_idx + nc
+        self.attn_row_kv_correction_cuda[:rows] = kv_correction
+        self.req_idx_per_token[nc:nc + rows] = (req_idx + nc).to(
+            self.req_idx_per_token.dtype)
+        # Extents (row_kv_lens/attn_row_kv_lens) are rebuilt in-graph by the
+        # refresh functions; the block-table expansions are gathered per row
+        # here because block IDs do not move within a step and their refresh
+        # is prepare-time only.
+        self.refresh_token_major_block_table()
+        block_table_expanded = getattr(self, "block_table_expanded", None)
+        indexer_offsets = getattr(self, "indexer_k_cache_block_offsets", None)
+        if block_table_expanded is not None and indexer_offsets is not None:
+            width = min(indexer_offsets.shape[-1],
+                        block_table_expanded.shape[-1])
+            block_table_expanded[:rows, :width] = (
+                indexer_offsets[nc:self.num_seqs, :width].index_select(
+                    0, req_idx).clamp_(min=0))
 
     def prepare_for_indexer_k_cache(self):
         # Build indexer_k_cache_block_offsets using pool block indices derived

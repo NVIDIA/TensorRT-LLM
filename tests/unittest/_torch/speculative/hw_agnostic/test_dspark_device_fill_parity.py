@@ -122,6 +122,74 @@ def test_row_maps_match_prepare_semantics():
         assert int(extents.min()) >= 1
 
 
+def test_fill_pad_fill_constrained_split():
+    """With pad_fill given, every pad row carries exactly that many tokens,
+    the real rows absorb all slack, and the total still hits the bucket --
+    the host fit's copy widths depend on this exact split."""
+    gen = torch.Generator().manual_seed(3)
+    max_verify_len = 6
+    for _ in range(100):
+        n_real = int(torch.randint(1, 65, (1,), generator=gen))
+        n_pad = int(torch.randint(0, 9, (1,), generator=gen))
+        padded_bs = n_real + n_pad
+        pad_fill = int(torch.randint(1, max_verify_len + 1, (1,),
+                                     generator=gen))
+        lens = torch.randint(2, max_verify_len + 1, (n_real,), generator=gen)
+        lo = int(lens.sum()) + n_pad * pad_fill
+        hi = n_real * max_verify_len + n_pad * pad_fill
+        if lo > hi:
+            continue
+        bucket = int(torch.randint(lo, hi + 1, (1,), generator=gen))
+        padded = torch.ones(padded_bs, dtype=torch.int32)
+        padded[:n_real] = lens.to(torch.int32)
+        filled = fill_bucket_device(padded,
+                                    num_real=torch.tensor(n_real),
+                                    graph_num_tokens=bucket,
+                                    max_verify_len=max_verify_len,
+                                    pad_fill=pad_fill)
+        assert int(filled.sum()) == bucket
+        assert (filled[n_real:] == pad_fill).all()
+        assert (filled[:n_real] >= lens.to(torch.int32)).all()
+        assert int(filled[:n_real].max()) <= max_verify_len
+
+
+def test_select_windows_respects_published_split():
+    """With pad_len the prologue must land on the host fit's real/pad token
+    split exactly: real tokens = bucket - n_pad * pad_len, pads = pad_len."""
+    gen = torch.Generator().manual_seed(41)
+    K = 5
+    cfg = DSparkScheduleConfig(block_size=K, min_verify_len=1)
+    max_tok = cfg.resolved_max_verify_len + 1
+    for _ in range(30):
+        n_real = int(torch.randint(1, 33, (1,), generator=gen))
+        n_pad = int(torch.randint(0, 5, (1,), generator=gen))
+        padded_bs = n_real + n_pad
+        pad_len = int(torch.randint(1, max_tok + 1, (1,), generator=gen))
+        real_target = int(
+            torch.randint(n_real * 2, n_real * max_tok + 1, (1,),
+                          generator=gen))
+        bucket = real_target + n_pad * pad_len
+        budget = max(0, min(int(torch.randint(0, n_real * K + 1, (1,),
+                                              generator=gen)),
+                            real_target - n_real * 2))
+        conf = torch.randn(padded_bs + 4, K, generator=gen) * 2
+        slot_idx = torch.arange(padded_bs, dtype=torch.long)
+        res = select_windows_device(
+            confidence_logits=conf,
+            slot_idx=slot_idx,
+            num_real=torch.tensor(n_real),
+            budget=torch.tensor(budget),
+            graph_num_tokens=bucket,
+            cfg=cfg,
+            pad_len=pad_len,
+        )
+        assert int(res.verify_lens.sum()) == bucket
+        assert int(res.verify_lens[:n_real].sum()) == real_target
+        assert (res.verify_lens[n_real:] == pad_len).all()
+        assert int(res.verify_lens[:n_real].min()) >= cfg.min_verify_len + 1
+        assert int(res.verify_lens[:n_real].max()) <= max_tok
+
+
 def test_topk_tensor_budget_matches_int():
     """The 0-d tensor budget path (in-graph capacity knob) must allocate
     identically to the host int path, including budget <= 0."""
@@ -138,6 +206,44 @@ def test_topk_tensor_budget_matches_int():
                                             budget=torch.tensor(budget),
                                             cfg=cfg)
             assert torch.equal(host, dev)
+
+
+def test_planner_lag2_ring_and_budget_split(monkeypatch):
+    """Device-window mode: the budget reads the snapshot one staging OLDER
+    (lag-2), and the shape lens spread the budget uniformly, summing to
+    floor + budget."""
+    monkeypatch.setenv("TLLM_DSPARK_DEVICE_WINDOWS", "1")
+    from tensorrt_llm._torch.speculative.dspark_verify import \
+        DSparkVerifyPlanner
+    cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
+    planner = DSparkVerifyPlanner(cfg=cfg)
+    assert planner.device_windows
+
+    snap_a = torch.full((4, 5), 1.0)
+    snap_b = torch.full((4, 5), 2.0)
+    snap_c = torch.full((4, 5), 3.0)
+    planner.stage_confidence(snap_a)
+    assert planner._ready_older_snapshot() is None
+    planner.stage_confidence(snap_b)
+    older = planner._ready_older_snapshot()
+    assert older is not None and float(older[0, 0]) == 1.0
+    planner.stage_confidence(snap_c)
+    older = planner._ready_older_snapshot()
+    assert float(older[0, 0]) == 2.0
+    # The current snapshot is the freshest staging, untouched by the ring.
+    assert float(planner._ready_snapshot()[0, 0]) == 3.0
+
+    # Budget arithmetic through the frac override (snapshot-independent):
+    # shape lens sum to floor + budget and stay inside the bounds.
+    planner._forced_budget_frac = 0.5
+    n = 7
+    trimmable = cfg.resolved_max_verify_len - cfg.min_verify_len
+    budget, lens = planner.decide_verify_budget(num_gen_requests=n)
+    assert budget == int(round(0.5 * n * trimmable))
+    assert len(lens) == n
+    assert sum(lens) == n * cfg.min_verify_len + budget
+    assert min(lens) >= cfg.min_verify_len
+    assert max(lens) <= cfg.resolved_max_verify_len
 
 
 def _host_select(rows, budget, bucket, padded_bs, cfg):

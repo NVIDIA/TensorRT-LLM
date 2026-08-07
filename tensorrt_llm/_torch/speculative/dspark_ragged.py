@@ -366,6 +366,7 @@ def fill_bucket_device(
     num_real: torch.Tensor,
     graph_num_tokens: int,
     max_verify_len: int,
+    pad_fill: Optional[int] = None,
 ) -> torch.Tensor:
     """Capture-safe :meth:`RaggedVerifyLayout.fill_bucket`: same allocation,
     computed entirely on device.
@@ -392,6 +393,12 @@ def fill_bucket_device(
             but not a capture constant -- it changes across replays).
         graph_num_tokens: the captured token bucket (capture constant).
         max_verify_len: per-row ceiling (capture constant).
+        pad_fill: when given, every pad row carries EXACTLY this many tokens
+            and all slack goes to real rows. The host fit publishes this split
+            (``ragged_pad_verify_len``) because its copy widths -- how many
+            flat tokens belong to real rows -- must be known before launch;
+            the device fill has to land on the same split or the host and
+            device disagree about where real tokens end.
     Returns:
         ``[padded_bs]`` int32 filled lengths.
     """
@@ -404,10 +411,12 @@ def fill_bucket_device(
     lens = torch.where(
         is_real,
         verify_lens.to(torch.int32),
-        torch.ones(padded_bs, dtype=torch.int32, device=device),
+        torch.full((padded_bs,), 1 if pad_fill is None else int(pad_fill),
+                   dtype=torch.int32, device=device),
     )
     spare = graph_num_tokens - lens.sum()
-    for phase_mask in (is_real, ~is_real):
+    phases = (is_real,) if pad_fill is not None else (is_real, ~is_real)
+    for phase_mask in phases:
         for _ in range(max(max_verify_len - 1, 0)):
             headroom = phase_mask & (lens < max_verify_len)
             in_cycle = torch.cumsum(headroom.to(torch.int64), dim=0) <= spare
