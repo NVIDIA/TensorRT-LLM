@@ -341,6 +341,11 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 - **真实 device windows 面(bia0123)**:64/64 干净(中位 4.07),样本输出为连贯诗歌。rowdiv 行仍存在但形态为**健康节奏错峰**——真实窗口下各行推进速度不同,滞后行在后续步逐字复现相同元组(`(1956,7633,989)` step#8→9、`(13132,)` step#16→20),即同一文本、不同进度;这也说明 rowdiv 仪表的"锁步"前提只在 identity/同窗口类内成立,判净以 census 为准。
 - 结论:**bug #2 定案闭环——机制、观测、修复、验证互相咬合**。后续:completion 指纹对照(96.6% host+steep 参照线)、GSM8K 大并发精度(512/1024 global,device vs notrim)、诚实 device 吞吐网格。
 
+### 【08-08 11:20】GSM8K 大并发精度判决:device 96.323 vs notrim 96.247 —— 无损
+
+- 双臂并行(1024 global = 8 rank × bs128,DEP8 + overlap + CUDA graph,TRTLLM MoE):**notrim 参照**(`test_gsm8k_dep8_static_verify_overlap`)= **96.247**;**device windows 臂**(`test_gsm8k_dep8_ragged_verify` + `TLLM_DSPARK_DEVICE_WINDOWS=1` + v2b 表)= **96.323**。两臂均过 96.0 参考线;差值 +0.08pp 远小于 GSM8K 抽样噪声(σ≈0.5pp)——**修复后的 device 窗口在大并发下精度无损**(用户要求的验证项完成)。
+- 进行中:三臂吞吐复跑(rounds 方法论,poetry+arena × bs512/1024 global × 5 reps + warm rep)——device(bia0047)/ host(bia0048)/ notrim(bia0123),回答 #30 的原始问题:干净生成下 device 收益是否真实存在。
+
 ### 备选修复方案评估(供评审;当前实施的是 A,标记为暂定)
 
 - **A(已实施,Python-only)**:捕获拷贝换 D2D 源(`_seq_lens_cuda`)+ NEXT_N 抬全局上界。最小爆炸半径,当场可在活挂载容器里验证;把双胞胎缓冲降级为 canonical 缓冲的衍生物。host 路径装填时刻数值逐位等价,uniform/eager 分支未触碰。
