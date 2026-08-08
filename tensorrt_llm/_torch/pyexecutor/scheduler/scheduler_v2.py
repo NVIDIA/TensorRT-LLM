@@ -315,16 +315,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             if req.state_value == self._gen_to_complete_state_value:
                 budget.pre_claim_peft(req)
 
-        # Sequences already holding a non-droppable state slot. Counted over all
-        # active requests (not just the ones scheduled this iteration) because a
-        # suspended sequence keeps its slot.
-        max_resident = self.max_resident_sequences
-        num_resident = (
-            sum(1 for req in requests_list if self._is_started_request(req))
-            if max_resident is not None
-            else 0
-        )
-
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
             req = requests_list[req_it]
@@ -416,6 +406,16 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
+        #
+        # Sequences already holding a non-droppable state slot. Counted over all
+        # active requests (not just the ones scheduled this iteration) because a
+        # suspended sequence keeps its slot.
+        max_resident = self.max_resident_sequences
+        num_resident = (
+            sum(1 for req in requests_list if self._is_started_request(req))
+            if max_resident is not None
+            else 0
+        )
         for req in pending_ctx:
             if budget.requests_full:
                 break

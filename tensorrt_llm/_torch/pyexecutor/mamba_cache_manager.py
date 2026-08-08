@@ -3197,6 +3197,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         The per-sequence cost counts live states *plus* the attention pages the
         sequence occupies: sizing on the state cost alone would admit sequences
         whose states consume the whole quota and leave nothing for attention.
+
+        Residency is a *guarantee*, so it is sized on the capacity a sequence
+        can actually reach -- max_seq_len -- not on the average one.
+        ``_get_typical_request_capacity`` is only a pool-ratio hint and defaults
+        to max_seq_len / 2, which over-admits by ~2x on workloads where every
+        sequence runs to max_seq_len: admission then fills the pool, and because
+        recurrent state is non-droppable and resume() is refused past
+        max_util_for_resume, the run has no way back out (nvbugs/6575476).
         """
         state_bytes = self._mamba_state_bytes_per_slot()
         if state_bytes <= 0:
@@ -3204,27 +3212,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # request itself so this rank stays neutral in the allreduce(MIN).
             return self._requested_resident_sequences()
 
-        attention_block_bytes = self._attention_block_bytes()
-        # Residency is a *guarantee*, so it must be sized on the capacity a
-        # sequence can actually reach -- max_seq_len -- not on the average one.
-        # ``_get_typical_request_capacity`` is only a pool-ratio hint and
-        # defaults to max_seq_len / 2, which over-admits by ~2x on workloads
-        # where every sequence runs to max_seq_len: admission then fills the
-        # pool, and because recurrent state is non-droppable and resume() is
-        # refused past max_util_for_resume, the run has no way back out
-        # (nvbugs/6575476).
         residency_capacity = self.max_seq_len
         num_states = self._num_ssm_states_per_typical_request(
             residency_capacity, self.kv_cache_config)
         attention_blocks = math.ceil(residency_capacity / self.tokens_per_block)
         per_sequence = (num_states * state_bytes +
-                        attention_blocks * attention_block_bytes)
-
-        # Reserved dummy slots and one attention page are charged up front:
-        # they exist regardless of how many real sequences are resident.
-        reserved = (self._num_reserved_dummy_slots * state_bytes +
-                    attention_block_bytes)
-        return (gpu_quota - reserved) // per_sequence
+                        attention_blocks * self._attention_block_bytes())
+        # Subtract the same residency-independent floor _minimum_live_gpu_quota
+        # charges, so a residency this returns always clears that check.
+        return (gpu_quota - self._fixed_live_gpu_quota()) // per_sequence
 
     def _mamba_state_bytes_per_slot(self) -> int:
         return self.local_num_mamba_layers * (self.ssm_bytes + self.conv_bytes)
@@ -3232,6 +3228,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _attention_block_bytes(self) -> int:
         """Bytes of one attention page across all local attention layers."""
         return self._attention_cache_bytes_per_token() * self.tokens_per_block
+
+    def _fixed_live_gpu_quota(self) -> int:
+        """Live-quota bytes that do not depend on how many sequences are resident."""
+        return (self._num_reserved_dummy_slots *
+                self._mamba_state_bytes_per_slot() +
+                self._attention_block_bytes())
 
     def _num_ssm_snapshots_for_capacity(
         self,
@@ -3340,12 +3342,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states and one attention page."""
-        num_state_slots = (self._max_resident_sequences() +
-                           self._num_reserved_dummy_slots)
-        state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
+        resident_state_quota = (self._max_resident_sequences() *
+                                self._mamba_state_bytes_per_slot())
         return max(
             self._get_quota_from_max_tokens(0),
-            state_quota + self._attention_block_bytes(),
+            resident_state_quota + self._fixed_live_gpu_quota(),
         )
 
     def _build_cache_config(

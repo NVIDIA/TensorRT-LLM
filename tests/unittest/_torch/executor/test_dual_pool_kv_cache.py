@@ -710,6 +710,9 @@ class TestKVCacheV2SchedulerCrossParam:
     def _make_mock_kv_mgr(self, tokens_per_block=64):
         mgr = Mock(spec=KVCacheManagerV2)
         mgr.tokens_per_block = tokens_per_block
+        # spec= auto-vivifies a truthy Mock, which the scheduler's residency
+        # gate would compare against an int; None is the real unbounded value.
+        mgr.max_resident_sequences.return_value = None
         return mgr
 
     def test_default_cross_is_none(self):
