@@ -124,7 +124,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._pool_cache_valid = False
         self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
-        self._cached_stride_factor = 0
         self._cached_tokens_per_block = 0
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
@@ -138,10 +137,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
-        from .cache_manager import DSACacheManager
+        from .cache_manager import DSACacheManager, DSACacheManagerV2
 
         super().__post_init__()
-        if not isinstance(self.kv_cache_manager, DSACacheManager):
+        if not isinstance(self.kv_cache_manager, (DSACacheManager, DSACacheManagerV2)):
             has_deepseek_v4_cache_interface = all(
                 hasattr(self.kv_cache_manager, attr)
                 for attr in ("compressed_block_sizes", "get_cache_indices")
@@ -570,6 +569,55 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        # Allocate separate indexer block-offset and slot-mapping buffers for
+        # the draft KV cache manager, mirroring draft_kv_cache_block_offsets:
+        # the draft-replay context swaps these in by rebinding, so CUDA graph
+        # capture bakes distinct addresses for the target and draft segments
+        # and both sides can be refreshed eagerly outside the graph.
+        if self.draft_kv_cache_manager is not None and all(
+            hasattr(self.draft_kv_cache_manager, attr)
+            for attr in (
+                "index_head_dim",
+                "get_pool_block_indices",
+                "indexer_k_cache_page_scale",
+            )
+        ):
+            self.draft_indexer_k_cache_block_offsets = self.get_empty(
+                self.cuda_graph_buffers,
+                [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
+                cache_name="draft_indexer_k_cache_block_offsets",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.host_draft_indexer_k_cache_block_offsets = torch.zeros_like(
+                self.draft_indexer_k_cache_block_offsets,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            self.draft_slot_mapping_fp8 = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name="draft_slot_mapping_fp8",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            self.host_draft_slot_mapping_fp8 = torch.zeros_like(
+                self.draft_slot_mapping_fp8,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            self.draft_slot_mapping_scale = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name="draft_slot_mapping_scale",
+                dtype=torch.int64,
+                capture_graph=capture_graph,
+            )
+            self.host_draft_slot_mapping_scale = torch.zeros_like(
+                self.draft_slot_mapping_scale,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
         # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
         if self.enable_context_mla_with_cached_kv:
@@ -594,6 +642,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        if self.draft_kv_cache_manager is not None and all(
+            hasattr(self.draft_kv_cache_manager, attr)
+            for attr in (
+                "index_head_dim",
+                "get_pool_block_indices",
+                "indexer_k_cache_page_scale",
+            )
+        ):
+            self.draft_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                [
+                    self.max_num_sequences,
+                    self.draft_kv_cache_manager.max_blocks_per_seq,
+                ],
+                cache_name="draft_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         self.scheduler_metadata_buffer = self.get_empty(
             self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
@@ -744,6 +810,29 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        if self.draft_kv_cache_manager is not None and all(
+            hasattr(self.draft_kv_cache_manager, attr)
+            for attr in (
+                "index_head_dim",
+                "get_pool_block_indices",
+                "indexer_k_cache_page_scale",
+            )
+        ):
+            self.draft_block_table_expanded = self.get_empty(
+                self.cuda_graph_buffers,
+                [
+                    self.max_num_sequences * (1 + self.max_draft_tokens),
+                    self.draft_kv_cache_manager.max_blocks_per_seq,
+                ],
+                cache_name="draft_block_table_expanded",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.host_draft_block_table_expanded = torch.zeros_like(
+                self.draft_block_table_expanded,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
         self.scheduler_metadata_buffer_expanded = self.get_empty(
             self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
@@ -805,31 +894,26 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # elements").
             self._create_radix_aux_buffers(capture_graph=capture_graph)
 
-    def _get_pool_block_indices(self) -> torch.Tensor:
-        """Extract memory pool block indices from host_kv_cache_block_offsets.
-
-        The C++ setOffsets() encodes offsets as:
-            encoded = memPoolBlockIndex * numLayers * kvFactor
-        For SELFKONLY (MLA/DSA), kvFactor=1, so:
-            memPoolBlockIndex = encoded // num_local_layers
-
-        Returns a (num_seqs, max_blocks_per_seq) int32 CPU tensor with valid
-        pool indices clamped to [0, blocks_in_primary_pool - 1].
-        """
-        num_local_layers = self.kv_cache_manager.num_local_layers
-        max_pool_idx = self.kv_cache_manager.blocks_in_primary_pool - 1
-        # DSA uses SELFKONLY mode where only key cache is stored (kv_factor=1).
-        # host_kv_cache_block_offsets shape: (num_pools, max_batch*beam, 2, max_blocks_per_seq)
-        # Note: dim=2 is always 2 in the tensor layout (K and V slots), but for
-        # SELFKONLY only the K slot (index 0) contains valid data.
-        assert self.kv_cache_manager.kv_factor == 1, (
-            f"DSA requires SELFKONLY mode (kv_factor=1), got kv_factor={self.kv_cache_manager.kv_factor}"
+    def _update_indexer_k_cache_block_offsets(self) -> torch.Tensor:
+        """Refresh INDEX_KEY offsets and return their physical pool slots."""
+        cache_manager = self.kv_cache_manager
+        # Raw block IDs can exceed the primary pool after host-cache offload;
+        # the manager resolves their current physical slots.
+        pool_indices = cache_manager.get_pool_block_indices(
+            self.num_seqs,
+            request_ids=self.request_ids,
+            num_contexts=self.num_contexts,
+            beam_width=self.beam_width,
         )
-        # Pool 0, first num_seqs entries, field 0 (key offsets)
-        encoded = self.kv_cache_manager.host_kv_cache_block_offsets[0, : self.num_seqs, 0, :]
-        pool_indices = encoded // num_local_layers
-        # Clamp for safety: handles garbage padding from torch.empty in uninitialized slots
-        pool_indices = pool_indices.clamp(min=0, max=max_pool_idx).to(torch.int32)
+        page_indices = pool_indices * cache_manager.indexer_k_cache_page_scale
+        num_blocks = page_indices.shape[1]
+        self.host_indexer_k_cache_block_offsets[: self.num_seqs, :num_blocks].copy_(page_indices)
+        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
+            self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
+        )
+        # Sanitize graph-padding entries that may be stale after cache
+        # eviction or host-cache onboarding.
+        self.indexer_k_cache_block_offsets.clamp_(min=0)
         return pool_indices
 
     def set_skip_topk(self, skip: bool) -> None:
@@ -853,10 +937,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Compute and cache values used by
         transform_local_topk_and_prepare_pool_view().
 
-        These values (pool view, stride factor, block table slices, request
-        index slices) are constant across all layers sharing the same KV pool
-        and batch dimensions within a forward pass. Caching them avoids
-        redundant Python/CUDA overhead per layer.
+        These values (pool view, block table slices, and request index slices)
+        are constant across all layers sharing the same KV pool and batch
+        dimensions within a forward pass. Caching them avoids redundant
+        Python/CUDA overhead per layer.
 
         Safety: _invalidate_pool_view_cache() is called unconditionally at the
         start of every step (prepare() and on_update_kv_lens()), so the boolean
@@ -867,11 +951,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
-        num_blocks, num_layers, _, _ = pool.shape
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
         self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
-        self._cached_stride_factor = num_layers * self._cached_tokens_per_block
         self._cached_block_table_ctx = self.block_table[: self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts : self.num_seqs]
         self._cached_req_idx_ctx = self.req_idx_per_token[: self.num_ctx_tokens]
@@ -969,24 +1051,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_lens_expanded_host[:num_tokens], non_blocking=True
             )
 
-            # Expand indexer_k_cache_block_offsets (only generation)
-            # host_indexer_k_cache_block_offsets already contains correct pool
-            # indices from _get_pool_block_indices() in prepare_for_indexer_k_cache().
-            if self.kv_cache_manager is not None and self.num_generations > 0:
-                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
-                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                    self.num_contexts : self.num_seqs, :max_len
-                ]
-                expanded_blocks = gen_block_tensor.repeat_interleave(
-                    1 + self.max_draft_tokens, dim=0
-                )
-                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                    expanded_blocks, non_blocking=True
-                )
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens], non_blocking=True
-                )
-                self.block_table_expanded.clamp_(min=0)
+            self._refresh_expanded_block_table(1 + self.max_draft_tokens)
 
         self.expand_for_dsl = (
             use_dsl and self.kv_cache_manager is not None and self.max_draft_tokens >= 1
@@ -1012,39 +1077,42 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_lens_expanded_cuda[:num_tokens].copy_(
                     self.kv_lens_expanded_host[:num_tokens], non_blocking=True
                 )
-                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
-                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                    self.num_contexts : self.num_seqs, :max_len
-                ]
-                expanded_blocks = gen_block_tensor.repeat_interleave(expand_factor, dim=0)
-                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                    expanded_blocks, non_blocking=True
-                )
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens], non_blocking=True
-                )
-                self.block_table_expanded.clamp_(min=0)
+                self._refresh_expanded_block_table(expand_factor)
         else:
             self.dsl_expand_factor = 1
             self.dsl_atom = 1 + self.max_draft_tokens
 
+    def _refresh_expanded_block_table(self, repeat_factor: Optional[int] = None):
+        """Refresh the active cache's expanded INDEX_KEY page table."""
+        if self.kv_cache_manager is None or self.num_generations == 0:
+            return
+        if repeat_factor is None:
+            if self.use_expanded_buffers_for_mtp:
+                repeat_factor = 1 + self.max_draft_tokens
+            elif self.expand_for_dsl and self.dsl_expand_factor > 1:
+                repeat_factor = self.dsl_expand_factor
+            else:
+                return
+
+        num_tokens = self.num_generations * repeat_factor
+        max_len = self.host_indexer_k_cache_block_offsets.shape[1]
+        gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+            self.num_contexts : self.num_seqs, :max_len
+        ]
+        expanded_blocks = gen_block_tensor.repeat_interleave(repeat_factor, dim=0)
+        self.host_block_table_expanded[:num_tokens, :max_len].copy_(
+            expanded_blocks, non_blocking=True
+        )
+        self.block_table_expanded[:num_tokens].copy_(
+            self.host_block_table_expanded[:num_tokens], non_blocking=True
+        )
+        self.block_table_expanded.clamp_(min=0)
+
     def prepare_for_indexer_k_cache(self):
-        # Build indexer_k_cache_block_offsets using pool block indices derived
-        # from host_kv_cache_block_offsets (populated by super().prepare()).
-        # This correctly resolves block IDs to memory pool indices, which is
-        # required when host cache offload is enabled (block IDs != pool indices
-        # for onboarded secondary blocks).
         if self.kv_cache_manager is None:
             return
-        pool_indices = self._get_pool_block_indices()
-        self.host_indexer_k_cache_block_offsets[: self.num_seqs].copy_(pool_indices)
-        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
-        )
-        # Safety clamp: prevent OOB from CUDA graph padding entries which
-        # may contain stale negative or out-of-range values after block
-        # eviction/onboarding with host cache offload.
-        self.indexer_k_cache_block_offsets.clamp_(min=0)
+        # Keep physical slots for the primary-pool TopK conversion below.
+        pool_indices = self._update_indexer_k_cache_block_offsets()
 
         # Build block_table for topk_indices conversion (actual block allocation)
         cached_token_lens = torch.tensor(

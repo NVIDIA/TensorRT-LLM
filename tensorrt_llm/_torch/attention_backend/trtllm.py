@@ -158,11 +158,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
-    # Block IDs per sequence; populated in __post_init__ when a KV cache
-    # manager is present. Declared here so encoder-only metadata (no KV cache)
-    # still exposes the attribute.
+    # Active block-ID buffers, defaulting to the target cache. Separate draft
+    # storage lets CUDA graphs bind stable target and draft addresses.
     block_ids_per_seq: Optional[torch.Tensor] = None
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
+    draft_block_ids_per_seq: Optional[torch.Tensor] = None
+    draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -335,6 +336,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
+            self.draft_block_ids_per_seq = None
+            self.draft_kv_block_ids_per_seq = None
 
             # Allocate separate block offset tensors for draft KV cache manager
             # Used in one-model speculative decoding with different KV cache layouts
@@ -374,6 +377,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+                if self.draft_kv_cache_manager is not None:
+                    self.draft_block_ids_per_seq = self.get_empty(
+                        buffers,
+                        [
+                            self.draft_kv_cache_manager.max_batch_size,
+                            self.draft_kv_cache_manager.max_blocks_per_seq
+                        ],
+                        cache_name="draft_block_ids_per_seq",
+                        dtype=torch.int32,
+                        capture_graph=capture_graph,
+                    )
+                    self.draft_kv_block_ids_per_seq = self.get_empty(
+                        buffers,
+                        [
+                            self.draft_kv_cache_manager.max_batch_size,
+                            self.draft_kv_cache_manager.max_blocks_per_seq
+                        ],
+                        cache_name="draft_kv_block_ids_per_seq",
+                        dtype=torch.int32,
+                        capture_graph=capture_graph,
+                    )
                 # Allocate fixed-size buffers for pre-computed FlashMLA metadata.
                 # These are pre-allocated so their GPU addresses are stable across CUDA graph captures.
                 sm_count = torch.cuda.get_device_properties(
@@ -703,9 +727,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens[0] = padded_num_tokens
 
     def prepare_flash_mla(self) -> None:
-        # Invalidate the pre-computed metadata so that forward() recomputes it
-        # for this forward pass before the first attention layer runs.
         self._flash_mla_metadata_valid = False
+        # Request-specific fills and H2D copies must happen before replay, not
+        # become fixed operations in the captured graph.
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         block_ids_per_seq = maybe_pin_memory(
             self.kv_cache_manager.get_block_ids_per_seq(self.request_ids))
         num_blocks = block_ids_per_seq.shape[1]
@@ -1647,9 +1674,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self, q, k, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
-        # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
-        # recomputation when cache_seq_lens change. The metadata must always match the
-        # compacted generation sub-batch, which is also the layout used by block_ids_per_seq.
+        # The flag is invalidated whenever FlashMLA inputs change. The metadata
+        # must always match the compacted generation sub-batch, which is also
+        # the layout used by block_ids_per_seq.
         if (metadata.enable_flash_mla and forward_args.attention_input_type
                 != AttentionInputType.context_only
                 and metadata.num_generations > 0

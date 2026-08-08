@@ -12,6 +12,7 @@
 
 import gc
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -20,7 +21,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -185,6 +186,63 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
                     self.assertEqual(roles, [Role.KEY, Role.VALUE])
                     self.assertNotIn(Role.INDEX_KEY, roles)
         finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_pool_mapping_ignores_reordered_layer_grouping(self):
+        mgr = KVCacheManagerV2(**_make_kwargs(num_layers=4, head_dim=[64, 192, 64, 192]))
+        real_impl = mgr.impl
+        try:
+            self.assertEqual(mgr.num_pools, 1)
+            pool_id = 0
+            config_group = tuple(
+                layer.layer_id
+                for layer in mgr.kv_cache_manager_py_config.layers
+                if int(real_impl.get_layer_group_id(layer.layer_id)) == pool_id
+            )
+            storage_variant = next(
+                variant
+                for pool_group in real_impl.pool_group_descs
+                for variant in pool_group.slot_desc.variants
+                if int(variant.layer_group_id) == pool_id
+            )
+            expected_layer_id = next(
+                int(buffer_id.layer_id)
+                for coalesced in storage_variant.coalesced_buffers
+                for buffer_id in coalesced.buffer_ids
+                if buffer_id.role == Role.KEY
+            )
+            self.assertGreater(len(config_group), 1)
+            self.assertNotEqual(expected_layer_id, int(config_group[0]))
+            reordered_group = tuple(
+                layer_id for layer_id in config_group if int(layer_id) != expected_layer_id
+            )
+            reordered_group += (expected_layer_id,)
+            reordered_grouping = (reordered_group,)
+            reordered_first_layer_id = reordered_grouping[pool_id][0]
+            self.assertNotEqual(expected_layer_id, reordered_first_layer_id)
+
+            expected_base_address = real_impl.get_mem_pool_base_address(
+                expected_layer_id, Role.KEY, PageIndexMode.SHARED
+            )
+
+            impl_proxy = Mock(wraps=real_impl)
+            impl_proxy.layer_grouping = reordered_grouping
+            mgr.impl = impl_proxy
+            mgr._prepare_page_table_tensor(index_mapper_capacity=1)
+
+            self.assertEqual(
+                impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
+                (expected_layer_id, Role.KEY, PageIndexMode.SHARED),
+                "the pool pointer origin must use the physical-layout representative",
+            )
+            self.assertEqual(
+                int(mgr.kv_cache_pool_pointers[pool_id, 0]),
+                int(expected_base_address),
+            )
+            impl_proxy.get_page_index_scale.assert_called_once_with(expected_layer_id, Role.KEY)
+        finally:
+            mgr.impl = real_impl
             mgr.shutdown()
             del mgr
 

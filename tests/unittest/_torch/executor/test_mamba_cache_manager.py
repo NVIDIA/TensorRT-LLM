@@ -67,7 +67,7 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
     apply_model_defaults_to_llm_args,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
@@ -841,9 +841,74 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator._max_beam_width = max_beam_width
 
     with pytest.raises(NotImplementedError, match=expected):
-        creator._fallback_if_unsupported_kv_cache_manager_v2(
+        creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, model_config, KvCacheConfig()
         )
+
+
+def test_dsa_star_rejects_v2_and_keeps_explicit_v1_selection():
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="dsa"),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 1
+    creator._mapping = SimpleNamespace(cp_config={"cp_type": CpType.STAR})
+
+    with pytest.raises(NotImplementedError, match="STAR context parallelism"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2,
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=True),
+        )
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManager,
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=False),
+        )
+        is KVCacheManager
+    )
+
+
+@pytest.mark.parametrize("zero_layer_hybrid", [False, True])
+@pytest.mark.parametrize(
+    ("manager_setting", "expected_use_v2"),
+    [(False, False), ("auto", False), (True, True)],
+)
+def test_sparse_cache_manager_factory_only_enables_explicit_v2(
+    monkeypatch, zero_layer_hybrid, manager_setting, expected_use_v2
+):
+    sparse_attn_config = SimpleNamespace(algorithm="dsa")
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=sparse_attn_config,
+        get_num_mamba_layers=lambda: 0,
+    )
+    expected_manager_cls = object()
+    sparse_manager_factory = MagicMock(return_value=expected_manager_cls)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.is_hybrid_linear",
+        lambda config: zero_layer_hybrid,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.get_sparse_attn_kv_cache_manager",
+        sparse_manager_factory,
+    )
+
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=manager_setting),
+        )
+        is expected_manager_cls
+    )
+    sparse_manager_factory.assert_called_once_with(
+        sparse_attn_config,
+        use_kv_cache_manager_v2=expected_use_v2,
+    )
 
 
 def _make_mgr(
