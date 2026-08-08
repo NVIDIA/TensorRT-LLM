@@ -4928,11 +4928,84 @@ class PyExecutor:
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
+            # Requests must run at exactly max_beam_width.
+            #
+            # TorchSampler can sample a narrower request (buffers are allocated
+            # at max_beam_width and it slices to the per-request width), but the
+            # layers around it are not ready: the attention metadata is stamped
+            # with max_beam_width while the generation rows are laid out at the
+            # per-request width, and the scheduler is not beam-width aware, so a
+            # narrower request can be batched with a wider one and fail at
+            # forward time. Keep rejecting until those agree; TRTLLM-14792.
             if sampling_config.beam_width != self.max_beam_width:
                 raise ValueError(
                     f"Request beam width {sampling_config.beam_width} "
-                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-                )
+                    f"is not equal to max_beam_width {self.max_beam_width}. "
+                    "This is not supported!")
+
+            # Variable-Beam-Width-Search is only defined for a non-decreasing
+            # array. The documented semantics (see getBeamWidthByIter in
+            # llmRequest.h) only cover widening, ending at the full width, and
+            # both samplers rely on that: the per-step ops write the leading
+            # beam_width_out rows while finalize reads py_beam_width (the
+            # array maximum) of them, so a narrowing array leaves the trailing
+            # rows holding ancestry from an earlier, wider step. The C++
+            # finalize path has the same gap -- it indexes with nBeamWidth
+            # only. Reject rather than emit silently stale beams; narrowing
+            # can be allowed once its semantics are defined (TRTLLM-14792).
+            beam_width_array = sampling_config.beam_width_array
+            if beam_width_array:
+                if isinstance(beam_width_array[0], (list, tuple)):
+                    beam_width_array = beam_width_array[0]
+                if any(b < a
+                       for a, b in zip(beam_width_array, beam_width_array[1:])):
+                    raise ValueError(
+                        f"beam_width_array {list(beam_width_array)} decreases; "
+                        "only non-decreasing arrays are supported for "
+                        "Variable-Beam-Width-Search.")
+
+            # length_penalty is an exponent on the generated length, and the
+            # ranking assumes it only ever shrinks the magnitude of a negative
+            # cum_log_prob. A negative exponent inverts that: dividing by
+            # length**negative multiplies instead, so longer beams score
+            # higher and the beam order is reversed.
+            length_penalty = sampling_config.length_penalty
+            if length_penalty is not None:
+                if isinstance(length_penalty, (list, tuple)):
+                    invalid = [p for p in length_penalty if p < 0]
+                else:
+                    invalid = [length_penalty] if length_penalty < 0 else []
+                if invalid:
+                    raise ValueError(
+                        f"length_penalty {invalid} is negative; only "
+                        "non-negative values are supported.")
+
+            # Beam search keeps a pool of finished candidates, which the
+            # context server can already populate on its first step. That pool
+            # is not part of the disaggregated handoff (ContextPhaseParams
+            # carries only the first generated tokens) and is cleared on the
+            # generation side, so a completion the context phase found would be
+            # silently dropped -- reachable under aggregation but not under
+            # disaggregation.
+            #
+            # This applies to every early_stopping mode and to both samplers:
+            # TorchSampler now serves all modes from the candidate-beams-array
+            # path, and the C++ decoder behind TRTLLMSampler maintains the pool
+            # unconditionally (beamSearchLayer.cu assigns numBeamsCBA with no
+            # mode check). Reject until the handoff carries the pool;
+            # TRTLLM-14792.
+            # NB: is_context_only_request is a property, but
+            # is_generation_only_request is a plain method -- it must be called,
+            # otherwise the bound method is truthy and this matches every request.
+            if (request.is_context_only_request
+                    or request.is_generation_only_request()):
+                if sampling_config.beam_width > 1:
+                    raise ValueError(
+                        "Beam search is not supported with disaggregated "
+                        "serving: the finished-candidate pool built during the "
+                        "context phase is not transferred to the generation "
+                        "server, so completions found there would be silently "
+                        "dropped. Use beam_width=1.")
 
         # Check token ID ranges
         self._validate_token_id_range(request)
@@ -6076,7 +6149,15 @@ class PyExecutor:
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
-        """Update beam sampler state with context-side first-token data."""
+        """Update beam sampler state with context-side first-token data.
+
+        NB: currently unreachable past the beam_width <= 1 guard. Admission
+        rejects beam search under disaggregated serving (see
+        _validate_request), because the finished-candidate pool the context
+        server builds is not part of the handoff. Kept rather than deleted:
+        this is the seeding half of that handoff and becomes live again once
+        the pool is transferred; TRTLLM-14792.
+        """
         if beam_width <= 1:
             return True
 
@@ -6151,6 +6232,11 @@ class PyExecutor:
                               device=cum_log_probs.device,
                               dtype=cum_log_probs.dtype)
         cum_log_probs[seq_slot, :beam_width].copy_(values)
+
+        # The handoff carries one token already produced upstream, seeded above
+        # at index prompt_len. No generated-length counter needs seeding to
+        # match: length_penalty normalizes by seq_lens - prompt_lens, which
+        # counts that token because it occupies the first generated slot.
         return True
 
     @staticmethod

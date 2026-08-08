@@ -144,6 +144,9 @@ class TestStrategySelection:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
         py_sampling_strategy: Strategy | None
+        # Read by the row_stride query in sampler_common; these tests are
+        # single-beam, so the static admission width is 1.
+        py_beam_width: int
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -167,6 +170,7 @@ class TestStrategySelection:
         request.sampling_config = SamplingConfig(params._get_sampling_config())
         request.is_context_init_state = False  # Not used in this test
         request.py_sampling_strategy = None  # used for caching
+        request.py_beam_width = 1
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -559,6 +563,8 @@ def test_select_generated_logits(
             def __init__(self, draft_len: int):
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
+                # Read by the row_stride query in sampler_common.
+                self.py_beam_width = 1
 
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
@@ -3235,6 +3241,9 @@ class TestTopPDecay:
             is_context_init_state=False,
             py_sampling_strategy=None,
             py_draft_tokens=draft_tokens,
+            # Read by the row_stride query in sampler_common; these tests are
+            # single-beam, so the static admission width is 1.
+            py_beam_width=1,
         )
         req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
         return cast(LlmRequest, req)
