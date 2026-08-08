@@ -31,6 +31,46 @@ REPLAY_WORK_CACHE_SLOT = 1
 REPLAY_WORK_PNAT = 2
 REPLAY_WORK_CACHE_BUF_IDX = 3
 REPLAY_WORK_ITEM_WIDTH = 4
+_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
+
+
+@triton.jit
+def _prepare_gdn_replay_work_items_kernel(
+    state_indices,
+    prev_num_accepted_tokens,
+    cache_buf_idx,
+    work_items,
+    n_writes_output,
+    num_decodes,
+    replay_step_width: tl.constexpr,
+    replay_history_size: tl.constexpr,
+    work_item_width: tl.constexpr,
+    position_field: tl.constexpr,
+    cache_slot_field: tl.constexpr,
+    pnat_field: tl.constexpr,
+    cache_buf_idx_field: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Build the write-first GDN replay partition in one launch."""
+    offsets = tl.arange(0, BLOCK_SIZE)
+    active = offsets < num_decodes
+    slots = tl.load(state_indices + offsets, mask=active, other=0)
+    pnat = tl.load(prev_num_accepted_tokens + slots, mask=active, other=0)
+    active_buffer = tl.load(cache_buf_idx + slots, mask=active, other=0)
+    writes = active & (pnat + replay_step_width > replay_history_size)
+    writes_i32 = writes.to(tl.int32)
+    inclusive_write_offsets = tl.cumsum(writes_i32, axis=0)
+    write_offsets = inclusive_write_offsets - writes_i32
+    n_writes = tl.sum(writes_i32, axis=0)
+    no_write_offsets = offsets - write_offsets
+    output_offsets = tl.where(writes, write_offsets,
+                              n_writes + no_write_offsets)
+    output_base = work_items + output_offsets * work_item_width
+    tl.store(output_base + position_field, offsets, mask=active)
+    tl.store(output_base + cache_slot_field, slots, mask=active)
+    tl.store(output_base + pnat_field, pnat, mask=active)
+    tl.store(output_base + cache_buf_idx_field, active_buffer, mask=active)
+    tl.store(n_writes_output, n_writes)
 
 
 @triton.jit
@@ -291,8 +331,9 @@ class Mamba2Metadata:
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
             return
-        if getattr(kv_cache_manager, 'use_gdn_cached_replay_all_layer_commit',
-                   False):
+        use_gdn_all_layer_commit = getattr(
+            kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
+        if use_gdn_all_layer_commit:
             from tensorrt_llm._torch.modules.fla.cached_replay import \
                 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
@@ -302,7 +343,6 @@ class Mamba2Metadata:
             if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
                 return
 
-        self.replay_n_writes.zero_()
         if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
             raise RuntimeError(
                 "Replay state update is enabled, but the KV cache manager "
@@ -318,6 +358,30 @@ class Mamba2Metadata:
         cache_buf_idx = replay_metadata.cache_buf_idx
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
+
+        if (use_gdn_all_layer_commit
+                and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
+            block_size = triton.next_power_of_2(num_decodes)
+            _prepare_gdn_replay_work_items_kernel[(1, )](
+                self.state_indices[num_contexts:batch_size],
+                prev_num_accepted_tokens,
+                cache_buf_idx,
+                self.replay_work_items,
+                self.replay_n_writes,
+                num_decodes,
+                replay_step_width=replay_step_width,
+                replay_history_size=replay_history_size,
+                work_item_width=REPLAY_WORK_ITEM_WIDTH,
+                position_field=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+                cache_slot_field=REPLAY_WORK_CACHE_SLOT,
+                pnat_field=REPLAY_WORK_PNAT,
+                cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
+                BLOCK_SIZE=block_size,
+                num_warps=4,
+            )
+            return
+
+        self.replay_n_writes.zero_()
 
         position_in_decode_batch = torch.arange(
             num_decodes, dtype=torch.int32, device=self.state_indices.device)
