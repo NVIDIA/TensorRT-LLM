@@ -210,6 +210,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
+            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )

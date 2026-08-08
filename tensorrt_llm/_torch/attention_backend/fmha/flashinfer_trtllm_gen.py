@@ -249,6 +249,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
     cum_seq_lens_q: Optional[torch.Tensor],
     kv_scale_pool: Optional[torch.Tensor],
     uses_shared_paged_kv_idx: bool,
+    value_pool: Optional[torch.Tensor] = None,
 ) -> None:
     if q_len_per_req is not None:
         decode_max_q_len = q_len_per_req
@@ -272,7 +273,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         None,  # out_scale_factor
         query,
         kv_pool,
-        kv_pool,
+        kv_pool if value_pool is None else value_pool,
         workspace_buffer,
         multi_ctas_kv_counter_buffer,
         block_tables,
@@ -324,6 +325,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
     kv_scale_pool: Optional[torch.Tensor],
     uses_shared_paged_kv_idx: bool,
     causal: bool,
+    value_pool: Optional[torch.Tensor] = None,
 ) -> None:
     bmm1_scale_arg = (
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
@@ -336,7 +338,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
         None,  # out_scale_factor
         query,
         kv_pool,
-        kv_pool,
+        kv_pool if value_pool is None else value_pool,
         workspace_buffer,
         multi_ctas_kv_counter_buffer,
         block_tables,

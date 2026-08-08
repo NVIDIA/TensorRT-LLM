@@ -254,6 +254,10 @@ Qwen/Qwen3.6-35B-A3B:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.0
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DFlash
+    accuracy: 95.0
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8

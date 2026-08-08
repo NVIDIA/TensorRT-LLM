@@ -2,13 +2,78 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
+
+
+def uses_vswa_kv_cache_layout(
+        max_attention_windows: Optional[Sequence[Optional[int]]]) -> bool:
+    """Return whether windows require a variable-window KV cache layout.
+
+    Recurrent-state cache sentinels are negative and do not represent
+    attention windows, so hybrid linear-attention layouts are not VSWA.
+    """
+    return (max_attention_windows is not None
+            and len(set(max_attention_windows)) > 1
+            and all(window is None or window > 0
+                    for window in max_attention_windows))
+
+
+def _is_sliding_attention_layer(layer_type: object) -> bool:
+    """Return whether a config layer type denotes sliding attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def get_layer_attention_window(
+    config: object,
+    layer_idx: int,
+) -> Optional[int]:
+    """Return the active sliding window for one layer, or ``None``.
+
+    An explicit ``use_sliding_window=False`` disables sliding attention.
+    Otherwise, infer it from ``sliding_window`` and ``layer_types`` so legacy
+    configs that omit the flag continue to work. Qwen2-style configs that omit
+    ``layer_types`` use ``max_window_layers`` as the first sliding-layer index.
+    """
+    use_sliding_window = getattr(config, "use_sliding_window", None)
+    if use_sliding_window is False:
+        return None
+
+    sliding_window = getattr(config, "sliding_window", None)
+    if isinstance(sliding_window, (list, tuple)):
+        raise NotImplementedError(
+            "Attention-window derivation assumes a single sliding-window "
+            f"size, got multiple: {sliding_window}")
+    if sliding_window is None:
+        if use_sliding_window is True:
+            raise ValueError(
+                "use_sliding_window=True requires a positive integer "
+                "sliding_window.")
+        return None
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        layer_type = layer_types[layer_idx % len(layer_types)]
+        if not _is_sliding_attention_layer(layer_type):
+            return None
+    else:
+        max_window_layers = getattr(config, "max_window_layers", None)
+        if (isinstance(max_window_layers, int)
+                and not isinstance(max_window_layers, bool)
+                and layer_idx < max_window_layers):
+            return None
+
+    if (not isinstance(sliding_window, int) or isinstance(sliding_window, bool)
+            or sliding_window <= 0):
+        raise ValueError(
+            "Sliding attention requires a positive integer sliding_window.")
+    return sliding_window
 
 
 def is_gemma4_hybrid(config):
