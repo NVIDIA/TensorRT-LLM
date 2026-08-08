@@ -367,7 +367,6 @@ unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_k
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[deepseekv3_mla-gen-bf16-HND-p32-v1] SKIP (https://nvbugs/6507109)
 unittest/_torch/executor/test_overlap_scheduler.py::test_overlap_scheduler_consistency[no_reuse-cpp_scheduler-TorchSampler] SKIP (https://nvbugs/6561559)
 unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_promoted_context_precedes_speculative_overlap_generation SKIP (https://nvbugs/6550803)
-unittest/_torch/misc/test_autotuner.py::test_cutedsl_nvfp4_heuristic_matches_full_sweep SKIP (https://nvbugs/6490028)
 unittest/_torch/misc/test_share_tensor.py::TestShareTensor::test_share_tensor_different_dtypes SKIP (https://nvbugs/6418021)
 unittest/_torch/modeling/test_modeling_qwen_moe.py::TestQwenMoe::test_qwen_moe_allclose_to_hf[backend:trtllm-use_cuda_graph:False] SKIP (https://nvbugs/6566765)
 unittest/_torch/modeling/test_modeling_qwen_moe.py::TestQwenMoe::test_qwen_moe_allclose_to_hf[backend:trtllm-use_cuda_graph:True] SKIP (https://nvbugs/6575012)
