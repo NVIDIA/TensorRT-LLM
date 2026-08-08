@@ -21,14 +21,26 @@ depends on how the cost behaves across the batch range, not at one point:
 
 Columns per shape and token count:
 
-* ``quantize`` -- ``mxfp8_quantize`` itself.
+* ``quantize`` -- ``mxfp8_quantize`` in the swizzled layout the GEMM wants.
+* ``linear``   -- the same op in the linear layout, which pads neither rows nor
+  the grid. See below.
 * ``cast``     -- ``x.to(e4m3)``, an empirical bandwidth reference over the same
   input bytes with no block scales. The gap is what computing the scales and
-  writing the swizzled SF layout costs.
+  writing the SF layout costs.
 * ``floor+``   -- time above the harness floor, which is the per-launch cost
   inside a CUDA graph. Near zero means launch-bound.
 * ``GB/s``     -- achieved bandwidth over bytes read plus written, to place the
   large-batch end against the device's roofline.
+
+A flat cost across small token counts has two possible causes, and separating
+them decides whether fusion is the only remedy. The swizzled layout pads the row
+count up to 128 and sizes the grid from the padded count, so one token still
+launches 128 blocks and writes a full 128 rows of SF padding one byte at a time.
+Two columns in this sweep tell those apart. Padding cost is quantized to 128
+rows, so if it dominates, 129 tokens costs about what 256 costs and far more
+than 128 does, whereas a launch-bound kernel shows 128 and 129 as identical. The
+``linear`` column is the independent check, since that layout skips row padding
+altogether and so pays only the launch.
 
 Many calls go into one CUDA graph, since a single-call graph measures the ~6us
 host cost of ``graph.replay()`` instead of the kernel.
@@ -102,7 +114,8 @@ def main() -> None:
         "--num-tokens",
         type=int,
         nargs="+",
-        default=[1, 4, 16, 64, 256, 1024, 4096],
+        # 128 and 129 straddle the SF row-padding boundary on purpose.
+        default=[1, 4, 16, 64, 128, 129, 256, 1024, 4096],
     )
     parser.add_argument("--layers", type=int, default=M3_LAYERS)
     parser.add_argument("--calls-per-graph", type=int, default=200)
@@ -129,20 +142,23 @@ def main() -> None:
     )
     print(
         f"{'shape':>8s} {'hidden':>7s} {'tokens':>7s} {'KB in':>8s} "
-        f"{'quantize':>9s} {'cast':>7s} {'floor+':>8s} {'GB/s':>7s} {'us/step':>8s}"
+        f"{'quantize':>9s} {'linear':>7s} {'cast':>7s} {'floor+':>8s} "
+        f"{'GB/s':>7s} {'us/step':>8s}"
     )
 
     for name, hidden in _parse_shapes(args.shapes):
         for num_tokens in args.num_tokens:
             x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
             quantize_us = _graph_time_us(lambda x=x: torch.ops.trtllm.mxfp8_quantize(x, True), args)
+            linear_us = _graph_time_us(lambda x=x: torch.ops.trtllm.mxfp8_quantize(x, False), args)
             cast_us = _graph_time_us(lambda x=x: x.to(torch.float8_e4m3fn), args)
             # bf16 in, e4m3 out, plus one UE8M0 scale byte per 32 elements.
             bytes_moved = x.numel() * (2 + 1 + 1 / 32)
             print(
                 f"{name:>8s} {hidden:7d} {num_tokens:7d} "
                 f"{x.numel() * x.element_size() / 1024.0:8.0f} "
-                f"{quantize_us:9.2f} {cast_us:7.2f} {quantize_us - floor:8.2f} "
+                f"{quantize_us:9.2f} {linear_us:7.2f} {cast_us:7.2f} "
+                f"{quantize_us - floor:8.2f} "
                 f"{bytes_moved / quantize_us / 1000.0:7.0f} "
                 f"{quantize_us * args.layers:8.0f}"
             )
@@ -156,6 +172,12 @@ def main() -> None:
         "approaching the device roofline at the large-batch end means the "
         "remaining cost is the round-trip, which fusion also removes. Far off "
         "both at every size means the kernel itself is the problem."
+    )
+    print(
+        "A jump between 128 and 129 tokens, or a linear column well under the "
+        "quantize one at small batch, means the small-batch cost is SF row "
+        "padding rather than the launch, and tuning that path recovers it "
+        "without an epilogue fusion."
     )
 
 
