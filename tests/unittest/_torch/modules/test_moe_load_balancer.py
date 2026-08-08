@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -507,6 +509,58 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
         mock_load_balancer_impl.return_value.reconfigure_mask_only.assert_not_called(
         )
+
+    def test_eplb_telemetry_records_lifecycle_and_placement(self):
+        """Test optional telemetry records phases and migrated bytes."""
+
+        previous_placement = [{
+            'layer_id': 7,
+            'rank_expert_ids': [[0, 1], [2, 3]],
+        }]
+        current_placement = [[0, 4], [2, 5]]
+        layer = MagicMock()
+        layer.get_layer_idx.return_value = 7
+        layer.get_old_rank_expert_ids.return_value = current_placement
+        layer.host_tensor_sharer.name_info = {
+            'weight': (torch.float16, (2, 3)),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            balancer = object.__new__(MoeLoadBalancer)
+            balancer.is_shutdown = True
+            balancer.ep_rank = 0
+            balancer.telemetry_path = os.path.join(temp_dir, 'lifecycle.jsonl')
+            balancer.forward_iter_id = 10
+            balancer.iter_id = 3
+            balancer.single_layer_load_balancers = [layer]
+            balancer._telemetry_previous_mode = None
+            balancer._telemetry_previous_placement = previous_placement
+            balancer._telemetry_counts = {
+                'sample': 0,
+                'update': 0,
+                'drain': 0,
+                'skip': 0,
+            }
+
+            for mode in ('sample', 'update', 'drain', 'skip'):
+                balancer.record_iter_mode(mode)
+
+            with open(balancer.telemetry_path,
+                      encoding='utf-8') as telemetry_file:
+                records = [json.loads(line) for line in telemetry_file]
+
+        self.assertEqual([record['event'] for record in records],
+                         ['sample', 'update', 'drain_complete', 'stable'])
+        self.assertEqual(records[2]['changed_slots'], 2)
+        self.assertEqual(records[2]['changed_bytes'], 24)
+        self.assertEqual(records[2]['placement'][0]['rank_expert_ids'],
+                         current_placement)
+        self.assertEqual(records[3]['counts'], {
+            'sample': 1,
+            'update': 1,
+            'drain': 1,
+            'skip': 1,
+        })
 
     def test_real_statistic_kernel(self):
         """Test the real statistic kernel functionality."""

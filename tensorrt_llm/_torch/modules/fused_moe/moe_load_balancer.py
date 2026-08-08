@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import gc
+import json
 import mmap
 import os
 import threading
@@ -993,6 +994,16 @@ class MoeLoadBalancer:
 
         self.next_layer_repeated_count = None
 
+        self.telemetry_path = os.getenv('TRTLLM_EPLB_TELEMETRY_PATH')
+        self._telemetry_previous_mode = None
+        self._telemetry_previous_placement = None
+        self._telemetry_counts = {
+            'sample': 0,
+            'update': 0,
+            'drain': 0,
+            'skip': 0,
+        }
+
     def __del__(self):
         if not self.is_shutdown:
             self.shutdown()
@@ -1086,6 +1097,93 @@ class MoeLoadBalancer:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
         torch.cuda.empty_cache()
+        self._telemetry_previous_placement = self._placement_snapshot()
+        self._write_telemetry('initialized',
+                              placement=self._telemetry_previous_placement)
+
+    def _placement_snapshot(self):
+        """Return all layer placements from the EPLB CPU control plane."""
+        if self.ep_rank != 0 or self.telemetry_path is None:
+            return None
+        return [{
+            'layer_id': layer.get_layer_idx(),
+            'rank_expert_ids': layer.get_old_rank_expert_ids(),
+        } for layer in self.single_layer_load_balancers]
+
+    @staticmethod
+    def _count_changed_slots(previous, current):
+        if previous is None or current is None:
+            return 0
+        changed = 0
+        for previous_layer, current_layer in zip(previous, current):
+            for previous_rank, current_rank in zip(
+                    previous_layer['rank_expert_ids'],
+                    current_layer['rank_expert_ids']):
+                changed += sum(previous_expert != current_expert
+                               for previous_expert, current_expert in zip(
+                                   previous_rank, current_rank))
+        return changed
+
+    def _expert_bytes_by_layer(self):
+        result = []
+        for layer in self.single_layer_load_balancers:
+            sharer = layer.host_tensor_sharer
+            expert_bytes = 0
+            if sharer is not None:
+                for dtype, shape in sharer.name_info.values():
+                    element_size = torch.empty((), dtype=dtype).element_size()
+                    expert_bytes += int(np.prod(shape)) * element_size
+            result.append(expert_bytes)
+        return result
+
+    def _write_telemetry(self, event: str, **fields) -> None:
+        if self.ep_rank != 0 or self.telemetry_path is None:
+            return
+        directory = os.path.dirname(self.telemetry_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        record = {
+            'event': event,
+            'forward_iter_id': self.forward_iter_id,
+            'iter_id': self.iter_id,
+            **fields,
+        }
+        with open(self.telemetry_path, 'a', encoding='utf-8') as telemetry_file:
+            telemetry_file.write(
+                json.dumps(record, separators=(',', ':')) + '\n')
+
+    def record_iter_mode(self, mode: str) -> None:
+        """Record batched Online-EPLB lifecycle and post-drain placement."""
+        if self.ep_rank != 0 or self.telemetry_path is None:
+            return
+        self._telemetry_counts[mode] += 1
+        if mode == 'skip':
+            if self._telemetry_previous_mode != 'skip':
+                self._write_telemetry('stable', counts=self._telemetry_counts)
+        elif mode == 'drain':
+            placement = self._placement_snapshot()
+            previous = self._telemetry_previous_placement
+            changed_slots = self._count_changed_slots(previous, placement)
+            changed_bytes = 0
+            if previous is not None and placement is not None:
+                for previous_layer, current_layer, expert_bytes in zip(
+                        previous, placement, self._expert_bytes_by_layer()):
+                    for previous_rank, current_rank in zip(
+                            previous_layer['rank_expert_ids'],
+                            current_layer['rank_expert_ids']):
+                        changed_bytes += expert_bytes * sum(
+                            previous_expert != current_expert
+                            for previous_expert, current_expert in zip(
+                                previous_rank, current_rank))
+            self._telemetry_previous_placement = placement
+            self._write_telemetry('drain_complete',
+                                  counts=self._telemetry_counts,
+                                  changed_slots=changed_slots,
+                                  changed_bytes=changed_bytes,
+                                  placement=placement)
+        else:
+            self._write_telemetry(mode, counts=self._telemetry_counts)
+        self._telemetry_previous_mode = mode
 
     def set_warm_up_iter_count(self, iter_count: int):
         """
@@ -1386,6 +1484,7 @@ class MoeLoadBalancerIterContext:
         ):
             if self.iter_mode != 'skip':
                 self.moe_load_balancer.end_iter()
+            self.moe_load_balancer.record_iter_mode(self.iter_mode)
             self.moe_load_balancer.advance_forward_iter()
         return False
 
