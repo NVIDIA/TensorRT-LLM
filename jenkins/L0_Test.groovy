@@ -3370,6 +3370,43 @@ def runLLMDocBuild(pipeline, config)
     )
 }
 
+def runLLMAgentFlowTest(pipeline, stageName)
+{
+    // agent-flow is a self-contained, pure-CPU sub-project: it needs neither a
+    // GPU nor the TRT-LLM wheel, only its own dependencies (pure-Python wheels
+    // declared in agent-flow/pyproject.toml).
+    sh "pwd && ls -alh"
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
+
+    def agentFlowRoot = "${LLM_ROOT}/agent-flow"
+
+    // Install agent-flow with its test extras (pytest, pytest-asyncio) and the
+    // runtime deps from pyproject.toml (claude-agent-sdk, openai-codex, ...).
+    // These resolve from the container's default PyPI mirror.
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${agentFlowRoot} && pip3 install -e \".[test]\"")
+
+    sh "mkdir -p ${WORKSPACE}/${stageName}"
+
+    // test_workflow_entrypoint_modules_run_without_import_warnings is deselected
+    // because importing agent_flow.workflows.modeling_bringup runs a live skill
+    // probe (a real Claude/Codex session) at module-import time, which stalls in
+    // headless CI. This is a known agent-flow bug slated for an upstream fix;
+    // remove the --deselect once that lands. The outer `timeout` guards against
+    // the same probe stalling the whole stage in-process.
+    def deselect = "--deselect tests/test_examples.py::test_workflow_entrypoint_modules_run_without_import_warnings"
+    sh """
+        cd ${agentFlowRoot} && \
+        timeout 1200 python3 -m pytest tests -v ${deselect} \
+            --junitxml=${WORKSPACE}/${stageName}/results.xml
+    """
+
+    // Rename the JUnit testsuite from pytest's default "pytest" to the stage
+    // name so CI reporting attributes these cases to this stage (mirrors the
+    // unittest path in runLLMTestlistOnPlatformImpl).
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results.xml || true"
+}
+
 def launchTestListCheck(pipeline)
 {
     stageName = "Test List Check"
@@ -5710,6 +5747,33 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
     }]]}
 
+    // agent-flow: pure-CPU pytest suite for the imported agent-flow sub-project.
+    // Runs on a CPU node ("build" pod type, kubernetes-cpu cloud) — it needs no
+    // GPU and no TRT-LLM wheel, only its own `pip install -e agent-flow[test]`.
+    // CBTS narrows this to agent-flow-only changes via
+    // jenkins/scripts/cbts/rules/agent_flow_rule.py; the stage key below MUST
+    // match AGENT_FLOW_STAGE in that rule or CBTS Layer 2 will drop it.
+    agentFlowTestSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    agentFlowTestConfigs = [
+        "CPU-AgentFlow-UnitTest": [agentFlowTestSpec, {
+            sh "rm -rf **/*.xml *.tar.gz"
+            runLLMAgentFlowTest(pipeline, "AgentFlow-UnitTest")
+        }],
+    ]
+
+    fullSet += agentFlowTestConfigs.keySet()
+
+    // agent-flow tests are architecture-independent; run them once on x86 only.
+    if (env.targetArch == AARCH64_TRIPLE) {
+        agentFlowTestConfigs = [:]
+    }
+
+    agentFlowTestJobs = agentFlowTestConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
+        stage("[${key}] Run") {
+            cacheErrorAndUploadResult("${key}", values[1], {}, false, attemptTag, isFinalAttempt, retryContext)
+        }
+    }]]}
+
     // Python version and OS for sanity check
     // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
     x86SanityCheckConfigs = [
@@ -5927,6 +5991,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
+    parallelJobs += agentFlowTestJobs
 
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
 
