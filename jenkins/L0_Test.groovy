@@ -56,7 +56,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-src-" : "tensorrt-llm-release-src-" ) + (env.artifactCommit ? env.artifactCommit : env.gitlabCommit) + ".tar.gz"
 
 // Container configuration
-// available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
+// available tags can be found in: https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
 X86_64_DOCKER_IMAGE = LLM_DOCKER_IMAGE.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
@@ -64,8 +64,14 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
+// Read-only artifactory pull credentials
+ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
+
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.07-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -786,6 +792,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
+            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName} || true",
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
@@ -984,8 +991,49 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
+                // Enroot needs artifactory auth. Use a per-job config dir (nodeName is
+                // unique) — never the shared ~/.config/enroot, which races across jobs.
+                // ENROOT_CONFIG_PATH is exported in the sbatch submit shell so Slurm
+                // propagates it into the agent setup script (--export=ALL by default).
+                def enrootConfigDir = null
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    enrootConfigDir = "${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName}"
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASSWORD'
+                    )]) {
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials_slurm-${nodeName}")
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${credsLocal}",
+                            "ARTIFACTORY_DOCKER_HOST=${ARTIFACTORY_DOCKER_HOST}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                ENROOT_CREDS_CONTENT="machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}"
+                                cat > "$ENROOT_CREDS_PATH" <<EOF
+                                $ENROOT_CREDS_CONTENT
+                                EOF
+                            '''.stripIndent())
+                        }
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd("mkdir -p '${enrootConfigDir}'")))
+                        Utils.copyFileToRemoteHost(
+                            pipeline,
+                            remote,
+                            credsLocal,
+                            "${enrootConfigDir}/.credentials"
+                        )
+                    }
+                }
+
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)
+                def imageForSlurm = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    imageForSlurm = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
+                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
@@ -997,12 +1045,17 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     }
                 }
 
+                def slurmSubmitCommand = slurmCommandWithExclusion
+                if (enrootConfigDir) {
+                    slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
+                }
+
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        "\"${slurmCommandWithExclusion}\""
+                        Utils.bashWrappedRemoteCmd(slurmSubmitCommand)
                     ),
                     returnStdout: true,
                     numRetries: 3
@@ -1068,7 +1121,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (Exception e) {
                         if (e.message?.contains("is no longer active")) {
                             def slurmLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
-                            echoRemoteLogTail(pipeline, remote, slurmLogPath)
+                            CloudManager.withSlurmFrontendFailover(pipeline, remotes) { logRemote ->
+                                echoRemoteLogTail(pipeline, logRemote, slurmLogPath)
+                            }
                             throw new InfraFailure(
                                 "${e.message}. Check SLURM logs at ${slurmLogPath} on ${cluster.host}",
                                 e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>"
@@ -1577,6 +1632,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def s3SecretKeyPathLocal = Utils.createTempLocation(pipeline, "./s3_secret_key")
             def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
+            // Per-job enroot config (never shared ~/.config/enroot — that races across jobs).
+            def enrootConfigDirNode = "${jobWorkspace}/enroot-config"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
@@ -1668,6 +1725,39 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     )
                 }
 
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASSWORD'
+                    )]) {
+                        // Unique per stage so parallel stages do not share one @tmp path.
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials-${stageName}")
+                        // Write via shell env (not writeFile/Groovy interpolation): keeps the
+                        // password out of process argv and avoids AccessDenied on pre-chmod'd files.
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${credsLocal}",
+                            "ARTIFACTORY_DOCKER_HOST=${ARTIFACTORY_DOCKER_HOST}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                ENROOT_CREDS_CONTENT="machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}"
+                                cat > "$ENROOT_CREDS_PATH" <<EOF
+                                $ENROOT_CREDS_CONTENT
+                                EOF
+                            '''.stripIndent())
+                        }
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${enrootConfigDirNode}\""), numRetries: 3)
+                        Utils.copyFileToRemoteHost(
+                            pipeline,
+                            remote,
+                            credsLocal,
+                            "${enrootConfigDirNode}/.credentials"
+                        )
+                    }
+                }
+
                 // Generate .coveragerc: CBTS stages render coveragerc.template; all other stages get an empty rcfile (no coverage).
                 if (isCbtsStage(stageName)) {
                     // @TRTLLM_WHEEL_PATH@ stays a placeholder; slurm_run.sh substitutes it on the worker.
@@ -1734,7 +1824,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 ).join(" ")
 
                 // Generate Job Launch Script
-                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                def container = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    container = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
@@ -1755,6 +1849,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+
+                    # Job-private enroot config (under jobWorkspace). Avoids racing on
+                    # the shared ~/.config/enroot/.credentials across concurrent jobs.
+                    export ENROOT_CONFIG_PATH="${enrootConfigDirNode}"
+                    cleanup_enroot_config() { rm -rf "\${ENROOT_CONFIG_PATH}"; }
+                    trap cleanup_enroot_config EXIT
 
                     containerDir="$containerDir"
                     mkdir -p "\$containerDir"
@@ -1819,6 +1919,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     }
 
                     importContainerWithRetries "$container" "\$enrootImagePath"
+                    cleanup_enroot_config
+                    trap - EXIT
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -1977,6 +2079,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     filesToKeepWhenRetry += [
                         s3SecretKeyPathNode
+                    ]
+                }
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    filesToKeepWhenRetry += [
+                        enrootConfigDirNode
                     ]
                 }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
@@ -2139,7 +2246,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     # Record the verdict and always exit 0: a re-run can't change a
                     # terminal state, so numRetries should only fire on transport loss.
-                    printf '%s %s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
+                    printf '%s|%s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                     else
@@ -2176,10 +2283,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     )
                 )
 
-                // Verdict: "<STATE> <EXIT_CODE>"; success is COMPLETED + exit 0.
+                // Verdict: "<STATE>|<EXIT_CODE>"; success is COMPLETED + exit 0.
+                // STATE may contain spaces.
                 def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName, 3)
-                def resultFields = jobResult ? jobResult.tokenize(' ') : []
-                def jobState = resultFields ? resultFields[0] : null
+                def resultFields = jobResult ? jobResult.tokenize('|') : []
+                def jobState = resultFields ? resultFields[0]?.tokenize(' ')?.getAt(0) : null
                 def jobExit = resultFields.size() > 1 ? resultFields[1] : null
                 if (jobState != "COMPLETED" || jobExit != "0") {
                     // Verdict unreadable: fall back to an authoritative sacct query.
@@ -3263,6 +3371,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:
@@ -3353,7 +3463,7 @@ def runLLMDocBuild(pipeline, config)
             script: """
                 cd ${LLM_ROOT}/docs && \
                 pip3 install -r requirements.txt && \
-                pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
+                pip3 install sphinx==7.4.7 && \
                 doxygen Doxygen && \
                 make html && \
                 cd build/html && \
@@ -3385,7 +3495,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.07 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -4746,10 +4856,8 @@ def runLLMBuild(
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
     if (pin_torch) {
-        // WAR: Upgrading to torch 2.12 conflicts with the current triton dependency, so we
-        // pin build_wheel to the public torch 2.11.0 here. Remove this WAR once triton is
-        // upgraded to 3.7.0 and torch is upgraded to 2.12.0.
-        sh "cd tensorrt_llm/ && sed -i 's#^torch[><=].*#torch==2.11.0#g' requirements.txt && cat requirements.txt"
+        // WAR: Pin build_wheel to the public torch matching the NGC stack floor.
+        sh "cd tensorrt_llm/ && sed -i 's#^torch[><=].*#torch==2.13.0#g' requirements.txt && cat requirements.txt"
     }
 
     // Random sleep to avoid resource contention
@@ -4931,6 +5039,16 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                     deleteDir()
                 }
                 stage('Pull Docker Image') {
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'PASSWORD'
+                    )]) {
+                        sh """
+                            set +x
+                            echo "\$PASSWORD" | docker login ${ARTIFACTORY_DOCKER_HOST} -u "\$USERNAME" --password-stdin
+                        """
+                    }
                     docker.image(image).pull()
                 }
                 // We submit the Slurm job with the Slurm partition's time spec.
@@ -5863,14 +5981,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-2")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-3")
                         }
-                        // Extra PyTorch CUDA 13.2 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Extra PyTorch CUDA 13 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
-                            echo "###### Extra PyTorch CUDA 13.2 install Start ######"
+                            echo "###### Extra PyTorch CUDA 13 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.11.0+cu130 torchvision==0.26.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
                         def libEnv = []

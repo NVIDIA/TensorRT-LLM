@@ -10,10 +10,10 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe
 def test_mxfp4_value_layout_uses_strided_layout_on_blackwell(monkeypatch):
     monkeypatch.setattr(mxfp4_moe, "cuda_capability_geq", lambda major, minor=0: major >= 10)
 
-    value_layout, value_layout_opts = mxfp4_moe._mxfp4_value_layout(mx_axis=1)
+    value_layout = mxfp4_moe._mxfp4_value_layout(mx_axis=-2)
 
-    assert value_layout is StridedLayout
-    assert value_layout_opts == {}
+    assert isinstance(value_layout, StridedLayout)
+    assert value_layout.major_dim == -2
 
 
 def test_mxfp4_value_layout_keeps_default_layout_pre_blackwell(monkeypatch):
@@ -21,13 +21,14 @@ def test_mxfp4_value_layout_keeps_default_layout_pre_blackwell(monkeypatch):
     monkeypatch.setattr(
         mxfp4_moe.layout,
         "make_default_matmul_mxfp4_w_layout",
-        lambda mx_axis: (HopperMXValueLayout, {"mx_axis": mx_axis}),
+        lambda mx_axis: HopperMXValueLayout(mx_axis=mx_axis, mma_version=3),
     )
 
-    value_layout, value_layout_opts = mxfp4_moe._mxfp4_value_layout(mx_axis=1)
+    value_layout = mxfp4_moe._mxfp4_value_layout(mx_axis=-2)
 
-    assert value_layout is HopperMXValueLayout
-    assert value_layout_opts == {"mx_axis": 1}
+    assert isinstance(value_layout, HopperMXValueLayout)
+    assert value_layout.mx_axis == -2
+    assert value_layout.mma_version == 3
 
 
 def test_mxfp4_weight_layout_cache_reuses_equivalent_views(monkeypatch):

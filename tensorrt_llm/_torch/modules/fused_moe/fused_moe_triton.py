@@ -23,11 +23,12 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 import triton_kernels.swiglu
-from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
-                                       PrecisionConfig, matmul_ogs)
+from triton_kernels.matmul import (FlexCtx, FnSpecs, FusedActivation,
+                                   PrecisionConfig, matmul)
 from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
-from triton_kernels.tensor import FP4
+from triton_kernels.reduce import reduce
+from triton_kernels.tensor import FP4, RaggedTensorMetadata
 from triton_kernels.tensor import Storage as TritonStorage
 from triton_kernels.tensor import Tensor as TritonTensor
 from triton_kernels.tensor import convert_layout, wrap_torch_tensor
@@ -150,6 +151,20 @@ def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn, cutoff,
                  mask=offs_n < shape_bn)
 
 
+class TritonMoERouting(NamedTuple):
+    """Routing tensors for Triton MoE matmul (gather / ragged / scatter)."""
+
+    gate_scal: torch.Tensor
+    n_expts_act: int
+    ragged_metadata: RaggedTensorMetadata
+    # Token row indices into X (expert-sorted), already divided by top-k.
+    gather_indx: torch.Tensor
+    # Writeback destinations into the M-row (token, expert) buffer.
+    scatter_indx: torch.Tensor
+    # Token-major validity mask source; -1 marks padded expert slots.
+    scatter_src_indx: torch.Tensor
+
+
 class TritonEPRouter():
 
     def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
@@ -190,9 +205,7 @@ class TritonEPRouter():
                  expt_indx=None,
                  ep=1,
                  node_idx=0,
-                 n_rows=None):
-        from triton_kernels.matmul_ogs import (GatherIndx, RoutingData,
-                                               ScatterIndx)
+                 n_rows=None) -> TritonMoERouting:
         from triton_kernels.tensor import make_ragged_tensor_metadata
         from triton_kernels.topk import topk
 
@@ -224,26 +237,70 @@ class TritonEPRouter():
         else:
             metadata = bitmatrix.mask_metadata
 
-        expt_data = make_ragged_tensor_metadata(metadata.col_sum,
-                                                logits.shape[0] * n_expts_act)
-        gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
-
-        rdata = RoutingData(
-            gate_scal=gate_scal_sorted,
-            expt_hist=metadata.col_sum,
-            n_expts_tot=n_expts_local,
+        ragged_metadata = make_ragged_tensor_metadata(
+            metadata.col_sum, logits.shape[0] * n_expts_act)
+        gate_scal = expt_scal.reshape(-1)[metadata.col_sorted_indx]
+        # Flattened (token, expert) indices → token rows into X.
+        gather_indx = torch.div(metadata.col_sorted_indx,
+                                n_expts_act,
+                                rounding_mode="trunc")
+        return TritonMoERouting(
+            gate_scal=gate_scal,
             n_expts_act=n_expts_act,
-            expt_data=expt_data,
+            ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            scatter_indx=metadata.col_sorted_indx,
+            scatter_src_indx=metadata.row_sorted_indx,
         )
-        gather_indx = GatherIndx(
-            src_indx=metadata.col_sorted_indx,
-            dst_indx=metadata.row_sorted_indx,
-        )
-        scatter_indx = ScatterIndx(
-            src_indx=metadata.row_sorted_indx,
-            dst_indx=metadata.col_sorted_indx,
-        )
-        return rdata, gather_indx, scatter_indx
+
+
+def moe_gather_matmul(x,
+                      w,
+                      bias,
+                      routing: Optional[TritonMoERouting],
+                      precision_config: PrecisionConfig,
+                      fused_activation: Optional[FusedActivation] = None):
+    """Expert GEMM that gathers tokens into expert-sorted order."""
+    return matmul(
+        x,
+        w,
+        bias,
+        a_ragged_metadata=None if routing is None else routing.ragged_metadata,
+        gather_indx=None if routing is None else routing.gather_indx,
+        precision_config=precision_config,
+        fused_activation=fused_activation,
+    )
+
+
+def moe_scatter_matmul(x,
+                       w,
+                       bias,
+                       routing: Optional[TritonMoERouting],
+                       precision_config: PrecisionConfig,
+                       gammas=None):
+    """Expert GEMM that scatters back to tokens and reduces over top-k."""
+    out = matmul(
+        x,
+        w,
+        bias,
+        a_ragged_metadata=None if routing is None else routing.ragged_metadata,
+        scatter_indx=None if routing is None else routing.scatter_indx,
+        precision_config=precision_config,
+        gammas=gammas,
+    )
+    if routing is None or routing.n_expts_act == 1:
+        return out
+
+    # Triton 3.7 no longer reduces top-k>1 inside matmul; do it here.
+    if out.ndim == 3:
+        out = out.squeeze(0)
+    n_tokens = out.shape[0] // routing.n_expts_act
+    out = out.view(n_tokens, routing.n_expts_act, -1)
+    mask = (routing.scatter_src_indx != -1).view(n_tokens, routing.n_expts_act,
+                                                 1)
+    mask = mask.expand_as(out)
+    reduced, _ = reduce(out, dim=1, mask=mask)
+    return reduced
 
 
 def update_weight_stride(weight):
@@ -389,13 +446,12 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         # Step 1: Routing
         num_experts = expert_logits.shape[1]
         if num_experts > 1:
-            rdata, gather_indx, scatter_indx = TritonEPRouter()(
-                expert_logits,
-                top_k,
-                ep=module.ep_size,
-                node_idx=module.ep_rank)
+            routing = TritonEPRouter()(expert_logits,
+                                       top_k,
+                                       ep=module.ep_size,
+                                       node_idx=module.ep_rank)
         else:
-            rdata, gather_indx, scatter_indx = None, None, None
+            routing = None
 
         # Step 2: Gemm1
         # Setup quantization context
@@ -411,20 +467,17 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 FnSpecs("swiglu",
                         triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
                         reduction_n=2), (alpha, module.swiglu_limit))
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1,
-                                 fused_activation=act)
+            act_out = moe_gather_matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                routing,
+                pc1,
+                fused_activation=act)
         else:
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1)
+            act_out = moe_gather_matmul(
+                hidden_states, gemm1_weights,
+                module.w3_w1_bias if module.bias else None, routing, pc1)
             act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         # Step 3: Gemm2
@@ -434,13 +487,13 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(act_out,
-                                  gemm2_weights,
-                                  module.w2_bias if module.bias else None,
-                                  rdata,
-                                  scatter_indx=scatter_indx,
-                                  precision_config=pc2,
-                                  gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = moe_scatter_matmul(
+            act_out,
+            gemm2_weights,
+            module.w2_bias if module.bias else None,
+            routing,
+            pc2,
+            gammas=None if routing is None else routing.gate_scal)
         return gemm2_output
 
 
@@ -625,13 +678,12 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Step 1: Routing
         num_experts = expert_logits.shape[1]
         if num_experts > 1:
-            rdata, gather_indx, scatter_indx = TritonEPRouter()(
-                expert_logits,
-                top_k,
-                ep=module.ep_size,
-                node_idx=module.ep_rank)
+            routing = TritonEPRouter()(expert_logits,
+                                       top_k,
+                                       ep=module.ep_size,
+                                       node_idx=module.ep_rank)
         else:
-            rdata, gather_indx, scatter_indx = None, None, None
+            routing = None
 
         # Step 2: Gemm1
         # Setup quantization context
@@ -651,20 +703,17 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 FnSpecs("swiglu",
                         triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
                         reduction_n=2), (alpha, module.swiglu_limit))
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1,
-                                 fused_activation=act)
+            act_out = moe_gather_matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                routing,
+                pc1,
+                fused_activation=act)
         else:
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1)
+            act_out = moe_gather_matmul(
+                hidden_states, gemm1_weights,
+                module.w3_w1_bias if module.bias else None, routing, pc1)
             act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
@@ -682,13 +731,13 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(act_out,
-                                  gemm2_weights,
-                                  module.w2_bias if module.bias else None,
-                                  rdata,
-                                  scatter_indx=scatter_indx,
-                                  precision_config=pc2,
-                                  gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = moe_scatter_matmul(
+            act_out,
+            gemm2_weights,
+            module.w2_bias if module.bias else None,
+            routing,
+            pc2,
+            gammas=None if routing is None else routing.gate_scal)
         return gemm2_output
 
 
@@ -726,18 +775,20 @@ MXFP4_SWIZZLE_CHUNK_BYTES = 64 * 1024 * 1024
 
 def convert_layout_expert_chunked(t: torch.Tensor,
                                   dtype,
-                                  layout_cls,
-                                  layout_opts: dict,
+                                  layout_obj,
                                   max_chunk_bytes=MXFP4_SWIZZLE_CHUNK_BYTES):
     """Memory-frugal equivalent of
-    ``convert_layout(wrap_torch_tensor(t, dtype=dtype), layout_cls, **layout_opts)``
+    ``convert_layout(wrap_torch_tensor(t, dtype=dtype), layout_obj)``
     for 3D ``(num_experts, K, N)`` tensors and layouts that treat the leading
     dim as a batch dim (Hopper MXFP4 value/scale layouts).
+
+    Triton 3.7 split Layout (shape-free) from LayoutTransformation (shape-bound);
+    ``layout_obj`` must already be a constructed ``Layout`` instance.
     """
     assert t.dim() == 3
     wrapped = wrap_torch_tensor(t, dtype=dtype) if dtype is not None \
         else wrap_torch_tensor(t)
-    new_layout = layout_cls(t.shape, **layout_opts)
+    is_fp4 = wrapped.dtype == FP4
     num_experts = t.shape[0]
     bytes_per_expert = t[:1].numel() * t.element_size()
     chunk = min(num_experts,
@@ -745,7 +796,9 @@ def convert_layout_expert_chunked(t: torch.Tensor,
                     int(max_chunk_bytes) // max(bytes_per_expert, 1)))
     new_data = None
     for i in range(0, num_experts, chunk):
-        piece = new_layout.swizzle_data(t[i:i + chunk])
+        chunk_t = t[i:i + chunk]
+        piece = layout_obj.make_transformation(list(chunk_t.shape),
+                                               is_fp4).swizzle_data(chunk_t)
         # Expert blocks must be dense and independent in storage for the
         # chunked reassembly to be equivalent to the one-shot swizzle.
         assert piece.stride(0) == piece[0].numel()
@@ -757,7 +810,7 @@ def convert_layout_expert_chunked(t: torch.Tensor,
                 device=piece.device)
         new_data[i:i + piece.shape[0]].copy_(piece)
         del piece
-    return TritonTensor(TritonStorage(new_data, new_layout),
+    return TritonTensor(TritonStorage(new_data, layout_obj),
                         dtype=wrapped.dtype,
                         shape=wrapped.shape,
                         shape_max=wrapped.shape_max)
@@ -786,39 +839,29 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
         f"TRITON_MOE_MXFP4_NUM_WARPS should be 4 or 8, got {num_warps}"
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1)
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps)
+    # Triton 3.7 Layouts use relative mx_axis (-1/-2), not absolute indices.
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps)
     if not is_swizzling_supported():
         from triton_kernels.tensor_details.layout_details.strided import \
             StridedLayout
-        value_layout = StridedLayout
-        value_layout_opts = dict()
-        scale_layout = StridedLayout
-        scale_layout_opts = dict()
-
-    opt = {"value_layout": value_layout, "value_layout_opts": value_layout_opts, \
-            "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
+        value_layout = StridedLayout(-2)
+        scale_layout = StridedLayout(-2)
 
     # w, w_scale = downcast_to_mxfp(tensor.to(torch.bfloat16), torch.uint8, axis=1)
     # The Hopper layouts are the ones whose one-shot swizzle needs several
     # times the tensor size in temporaries; other layouts (Strided alias,
     # Blackwell pad-only) are kept on the one-shot path to preserve their
     # storage-aliasing behavior.
-    if value_layout is layout.HopperMXValueLayout:
-        w = convert_layout_expert_chunked(w, FP4, value_layout,
-                                          value_layout_opts)
+    if isinstance(value_layout, layout.HopperMXValueLayout):
+        w = convert_layout_expert_chunked(w, FP4, value_layout)
     else:
-        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
-                           **opt["value_layout_opts"])
-    if scale_layout is layout.HopperMXScaleLayout:
-        w_scale = convert_layout_expert_chunked(w_scale, None, scale_layout,
-                                                scale_layout_opts)
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout)
+    if isinstance(scale_layout, layout.HopperMXScaleLayout):
+        w_scale = convert_layout_expert_chunked(w_scale, None, scale_layout)
     else:
-        w_scale = convert_layout(wrap_torch_tensor(w_scale),
-                                 opt["scale_layout"],
-                                 **opt["scale_layout_opts"])
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout)
     return w, w_scale
 
 
@@ -1348,13 +1391,12 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Step 1: Routing
         num_experts = expert_logits.shape[1]
         if num_experts > 1:
-            rdata, gather_indx, scatter_indx = TritonEPRouter()(
-                expert_logits,
-                top_k,
-                ep=module.ep_size,
-                node_idx=module.ep_rank)
+            routing = TritonEPRouter()(expert_logits,
+                                       top_k,
+                                       ep=module.ep_size,
+                                       node_idx=module.ep_rank)
         else:
-            rdata, gather_indx, scatter_indx = None, None, None
+            routing = None
 
         # Step 2: Gemm1
         # Setup quantization context
@@ -1370,7 +1412,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 lhs_data=InFlexData(scale=hidden_states_scale), )
         else:
             flex_ctx_1 = FlexCtx()
-        pc1 = PrecisionConfig(weight_scale=gemm1_scales,
+        pc1 = PrecisionConfig(b_mx_scale=gemm1_scales,
                               flex_ctx=flex_ctx_1,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1385,20 +1427,17 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                         triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
                         reduction_n=2), (alpha, module.swiglu_limit))
 
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1,
-                                 fused_activation=act)
+            act_out = moe_gather_matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                routing,
+                pc1,
+                fused_activation=act)
         else:
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1)
+            act_out = moe_gather_matmul(
+                hidden_states, gemm1_weights,
+                module.w3_w1_bias if module.bias else None, routing, pc1)
             act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         if self.activation_dtype == torch.float8_e4m3fn:
@@ -1417,19 +1456,19 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             flex_ctx_2 = FlexCtx(lhs_data=InFlexData(scale=act_scale), )
         else:
             flex_ctx_2 = FlexCtx()
-        pc2 = PrecisionConfig(weight_scale=gemm2_scales,
+        pc2 = PrecisionConfig(b_mx_scale=gemm2_scales,
                               flex_ctx=flex_ctx_2,
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(act_out,
-                                  gemm2_weights,
-                                  module.w2_bias if module.bias else None,
-                                  rdata,
-                                  scatter_indx=scatter_indx,
-                                  precision_config=pc2,
-                                  gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = moe_scatter_matmul(
+            act_out,
+            gemm2_weights,
+            module.w2_bias if module.bias else None,
+            routing,
+            pc2,
+            gammas=None if routing is None else routing.gate_scal)
 
         def _maybe_remove_padding(gemm_output, expected_size):
             assert gemm_output.dim() == 2

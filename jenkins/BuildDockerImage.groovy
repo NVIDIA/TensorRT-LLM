@@ -20,8 +20,10 @@ import java.lang.Exception
 import groovy.transform.Field
 
 // Docker image registry
-IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+IMAGE_NAME = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging"
 NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -172,7 +174,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202505221445_docker_dind_withbash
                     tty: true
                     resources:
                       requests:
@@ -218,6 +220,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
             spec:
                 qosClass: Guaranteed
                 ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -271,6 +275,50 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
+// Shared image tag / ref formula used by buildImage() and stage dedupe.
+// Returns arch, tag, stagingKey (${dockerfileStage}:${tag}), full image refs,
+// and the same fields for config.dependent when present.
+def resolveImageNames(config) {
+    def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
+    def imageType = TRIGGER_TYPE == "nightly-release" ?
+        "${config.target}-nightly" : config.target
+    def tag = "${arch}-${imageType}-torch_${config.torchInstallType}${config.postTag}-${LLM_DEFAULT_TAG}"
+    def useNgcRegistry = config.target == "ngc-release" &&
+        (TRIGGER_TYPE in ["post-merge", "nightly-release"])
+    if (useNgcRegistry) {
+        echo "Use the NGC staging registry for ${TRIGGER_TYPE} build"
+    }
+    def imageWithTag = useNgcRegistry
+        ? "${NGC_IMAGE_NAME}:${tag}"
+        : "${IMAGE_NAME}/${config.dockerfileStage}:${tag}"
+    def customImageWithTag = useNgcRegistry
+        ? "${NGC_IMAGE_NAME}:${config.customTag}"
+        : "${IMAGE_NAME}/${config.dockerfileStage}:${config.customTag}"
+    def result = [
+        arch: arch,
+        tag: tag,
+        stagingKey: "${config.dockerfileStage}:${tag}",
+        imageWithTag: imageWithTag,
+        customImageWithTag: customImageWithTag,
+        dependentTag: null,
+        dependentStagingKey: null,
+        dependentImageWithTag: null,
+    ]
+    if (config.dependent) {
+        def dependentImageType = TRIGGER_TYPE == "nightly-release" ?
+            "${config.dependent.target}-nightly" : config.dependent.target
+        def dependentTag = tag.replace(
+            "${arch}-${imageType}-",
+            "${arch}-${dependentImageType}-")
+        result.dependentTag = dependentTag
+        result.dependentStagingKey = "${config.dependent.dockerfileStage}:${dependentTag}"
+        result.dependentImageWithTag = useNgcRegistry
+            ? "${NGC_IMAGE_NAME}:${dependentTag}"
+            : "${IMAGE_NAME}/${config.dependent.dockerfileStage}:${dependentTag}"
+    }
+    return result
+}
+
 def buildImage(config, imageKeyToTag, versionOverride)
 {
     def target = config.target
@@ -278,30 +326,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
     def torchInstallType = config.torchInstallType
     def args = config.args ?: ""
     def customTag = config.customTag
-    def postTag = config.postTag
     def dependent = config.dependent
-    def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def dockerfileStage = config.dockerfileStage
-
-    def imageType = TRIGGER_TYPE == "nightly-release" ?
-        "${target}-nightly" : target
-    def dependentImageType = TRIGGER_TYPE == "nightly-release" ?
-        "${dependent.target}-nightly" : dependent.target
-    def tag = "${arch}-${imageType}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
-
-    def dependentTag = tag.replace(
-        "${arch}-${imageType}-", "${arch}-${dependentImageType}-")
-
-    def imageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${tag}"
-    def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
-    def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
-
-    if (target == "ngc-release" && (TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
-        echo "Use the NGC staging registry for ${TRIGGER_TYPE} build"
-        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-    }
+    def names = resolveImageNames(config)
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -350,9 +377,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
                     // earlier one fails, so a failure on one registry can't leave
                     // another still authenticated.
                     try {
-                        sh "docker logout urm.nvidia.com"
+                        sh "docker logout artifactory.nvidia.com"
                     } catch (Exception logoutEx) {
-                        echo "docker logout urm.nvidia.com failed: ${logoutEx}"
+                        echo "docker logout artifactory.nvidia.com failed: ${logoutEx}"
                     }
                     try {
                         sh "docker logout ${DEFAULT_GIT_URL}:5005"
@@ -363,8 +390,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
             }
         }) {
         stage ("Docker Login") {
-            withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+            // Read-write artifactory credentials (image push)
+            withCredentials([usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login artifactory.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
             }
 
             withCredentials([
@@ -395,7 +423,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
         if (dependent) {
-            stage ("make ${dependent.target}_${action} (${arch})") {
+            stage ("make ${dependent.target}_${action} (${names.arch})") {
                 def randomSleep = (Math.random() * 600 + 600).toInteger()
                 trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 trtllm_utils.llmExecStepWithRetry(this, script: """
@@ -403,27 +431,27 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${dependentImageWithTag} \
+                IMAGE_WITH_TAG=${names.dependentImageWithTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-                args += " DEVEL_IMAGE=${dependentImageWithTag}"
+                args += " DEVEL_IMAGE=${names.dependentImageWithTag}"
                 if (target == "ngc-release") {
-                    imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+                    imageKeyToTag["NGC Devel Image ${config.arch}"] = names.dependentImageWithTag
                 }
             }
         }
 
-        def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, arch)
+        def buildWheelArgs = prepareWheelFromBuildStage(dockerfileStage, names.arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
-            if (arch == "x86_64") {
+            if (names.arch == "x86_64") {
                 build_jobs = BUILD_JOBS_RELEASE_X86_64
             } else {
                 build_jobs = BUILD_JOBS_RELEASE_SBSA
             }
         }
-        stage ("make ${target}_${action} (${arch})") {
+        stage ("make ${target}_${action} (${names.arch})") {
             sh "env | sort"
             def randomSleep = (Math.random() * 600 + 600).toInteger()
             trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -433,7 +461,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${names.imageWithTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -450,24 +478,24 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${names.imageWithTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
-                imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+                imageKeyToTag["NGC Release Image ${config.arch}"] = names.imageWithTag
             }
         }
 
         if (customTag) {
-            stage ("Custom Tag: ${customTag} (${arch})") {
+            stage ("Custom Tag: ${customTag} (${names.arch})") {
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${customImageWithTag} \
+                IMAGE_WITH_TAG=${names.customImageWithTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
@@ -510,6 +538,12 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
+            // Build a matching tritondevel in this job and use it as DEVEL_IMAGE
+            // instead of the pinned tags in current_image_tags.properties.
+            dependent: [
+                target: "tritondevel",
+                dockerfileStage: "tritondevel",
+            ],
             dockerfileStage: "release",
         ],
         (stageNames.internalReleaseSBSA): [
@@ -518,6 +552,10 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
+            dependent: [
+                target: "tritondevel",
+                dockerfileStage: "tritondevel",
+            ],
             dockerfileStage: "release",
         ],
         (stageNames.ciImageX86): [:],
@@ -609,6 +647,25 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         }
         config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel)
     }
+
+    // Skip standalone stages whose staging image is already built+pushed as
+    // another stage's dependent (e.g. ciImage* vs internalRelease* → tritondevel).
+    def coveredByDependent = [] as Set
+    buildConfigs.each { key, config ->
+        def dependentKey = resolveImageNames(config).dependentStagingKey
+        if (dependentKey) {
+            coveredByDependent << dependentKey
+        }
+    }
+    buildConfigs = buildConfigs.findAll { key, config ->
+        def keyForStage = resolveImageNames(config).stagingKey
+        if (keyForStage in coveredByDependent) {
+            echo "Skipping ${key}: image already covered by another stage's dependent (${keyForStage})"
+            return false
+        }
+        return true
+    }
+
     echo "Build configs:"
     println buildConfigs
 

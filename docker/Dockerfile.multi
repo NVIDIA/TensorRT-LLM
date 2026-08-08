@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.05-py3
-ARG TRITON_BASE_TAG=26.05-py3
+ARG BASE_TAG=26.07-py3
+ARG TRITON_BASE_TAG=26.07-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -118,12 +118,19 @@ ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
     GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
 WORKDIR /app/tensorrt_llm
+ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \
     pip install "${TRTLLM_WHEEL}[mx]"

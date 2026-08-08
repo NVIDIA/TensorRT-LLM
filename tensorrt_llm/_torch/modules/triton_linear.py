@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
-from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig, matmul_ogs
+from triton_kernels.matmul import FlexCtx, PrecisionConfig, matmul
 from triton_kernels.numerics import InFlexData
 
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
@@ -44,13 +44,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        output = matmul_ogs(
-            input,
-            module.weight,
-            module.bias,
-            None,  # Routing data is not used here
-            gather_indx=None,
-            precision_config=None)
+        output = matmul(input, module.weight, module.bias)
         return output
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
@@ -130,13 +124,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
         pc = PrecisionConfig(flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)
-        output = matmul_ogs(
-            qinput,
-            module.weight,
-            module.bias,
-            None,  # Routing data is not used here
-            gather_indx=None,
-            precision_config=pc)
+        output = matmul(qinput, module.weight, module.bias, precision_config=pc)
         return output
 
     def load_weight_scales(self, weights: List[Dict]):
@@ -270,17 +258,11 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
             flex_ctx = FlexCtx(lhs_data=InFlexData(scale=input_scale), )
         else:
             flex_ctx = FlexCtx()
-        pc = PrecisionConfig(weight_scale=module.weight_scale,
+        pc = PrecisionConfig(b_mx_scale=module.weight_scale,
                              flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)
-        output = matmul_ogs(
-            input,
-            module.weight,
-            module.bias,
-            None,  # Routing data is not used here
-            gather_indx=None,
-            precision_config=pc)
+        output = matmul(input, module.weight, module.bias, precision_config=pc)
         return output
 
     def load_weights_common(self, module: Linear, weights_list: List[Dict]):
