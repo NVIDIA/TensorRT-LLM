@@ -702,7 +702,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 destination[:total_blocks].copy_(source[:total_blocks],
                                                  non_blocking=True)
                 self._vswa_pool_indices_cache[pool_id] = destination
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._vswa_layer_to_pool.get(
+                target._primary_kv_layer_idx, 0)
             self._vswa_active_pool_id = primary_pool_id
             self._host_paged_kv_indices = self._host_pool_indices[
                 primary_pool_id]
@@ -769,16 +770,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def _prepare_full_draft_page_table(self) -> None:
         """Expose every allocated draft page and use device KV lengths."""
-        if self._uses_full_draft_page_table:
+        if (self._uses_full_draft_page_table
+                or self._primary_kv_layer_idx is None):
             return
         assert self.request_ids is not None
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+            self.request_ids, layer_idx=self._primary_kv_layer_idx)
         self.num_blocks = [len(block_ids) for block_ids in block_ids_per_seq]
         self.num_context_blocks = 0
         self.num_generation_blocks = sum(self.num_blocks)
-        paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
-            self.request_ids, self.num_blocks)
+        paged_kv_indices = self._get_primary_kv_indices(self.request_ids,
+                                                        self.num_blocks)
         self._paged_kv_indices[:paged_kv_indices.numel()].copy_(
             paged_kv_indices, non_blocking=True)
         self._host_paged_kv_indices = paged_kv_indices
@@ -836,8 +838,34 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         super().__post_init__()
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
+    def _get_attention_layer_ids(self) -> list[int]:
+        """Return local layers backed by an attention KV cache."""
+        assert self.kv_cache_manager is not None
+        layer_offsets = getattr(self.kv_cache_manager, "layer_offsets", None)
+        num_kv_heads = getattr(self.kv_cache_manager, "num_kv_heads_per_layer",
+                               None)
+        if layer_offsets is None or num_kv_heads is None:
+            return [0]
+        return [
+            layer_idx for layer_idx, layer_offset in layer_offsets.items()
+            if num_kv_heads[layer_offset] > 0
+        ]
+
+    def _get_primary_kv_indices(self, request_ids: list[int],
+                                num_blocks: list[int]) -> torch.Tensor:
+        """Return page indices from the default attention KV pool."""
+        assert self.kv_cache_manager is not None
+        assert self._primary_kv_layer_idx is not None
+        return self.kv_cache_manager.get_batch_cache_indices_flat(
+            request_ids,
+            num_blocks,
+            layer_idx=self._primary_kv_layer_idx,
+        )
+
     def _post_init_with_buffers(self, buffers) -> None:
         capture_graph = self.is_cuda_graph
+
+        self._primary_kv_layer_idx: Optional[int] = None
 
         if self.workspace_buffer is None:
             # Note: even though flashinfer only recommends 128 MB, we have to push it
@@ -919,25 +947,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._vswa_pool_indices_cache: Optional[Dict[int, torch.Tensor]] = None
 
         if self.kv_cache_manager is not None:
-            blocks_in_primary_pool = self.kv_cache_manager.blocks_in_primary_pool
+            attention_layer_ids = self._get_attention_layer_ids()
+            self._primary_kv_layer_idx = next(iter(attention_layer_ids), None)
+            max_num_blocks = int(
+                getattr(self.kv_cache_manager, "blocks_in_primary_pool", 0))
+            for layer_idx in attention_layer_ids:
+                layer_buffer = self.kv_cache_manager.get_buffers(layer_idx)
+                if layer_buffer is not None:
+                    max_num_blocks = max(max_num_blocks, layer_buffer.shape[0])
             self._paged_kv_indices = self.get_empty(
                 buffers,
-                (blocks_in_primary_pool, ),
+                (max_num_blocks, ),
                 dtype=torch.int,
                 cache_name="_paged_kv_indices",
                 capture_graph=capture_graph,
             )
 
-            # Maximum block count across ALL pools: sizes the VSWA pool
-            # buffers below. Computed for every model, not just VSWA —
-            # non-VSWA managers have a single pool, so this stays
-            # blocks_in_primary_pool for them.
-            max_num_blocks = blocks_in_primary_pool
-            if hasattr(self.kv_cache_manager, 'layer_offsets'):
-                for lid in self.kv_cache_manager.layer_offsets:
-                    lbuf = self.kv_cache_manager.get_buffers(lid)
-                    if lbuf is not None:
-                        max_num_blocks = max(max_num_blocks, lbuf.shape[0])
             self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
 
             # Layers may share one page-index list only when they are in the
@@ -951,7 +976,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             layer_space: Dict[int, int] = {}
             if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
                 space_ids = {}
-                for layer_idx in getattr(mgr, 'layer_offsets', {}):
+                for layer_idx in attention_layer_ids:
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
                            get_scale(layer_idx))
@@ -1401,6 +1426,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         assert self.request_ids is not None
 
+        if self._primary_kv_layer_idx is None:
+            self.num_blocks = [0] * self.num_seqs
+            self.num_context_blocks = 0
+            self.num_generation_blocks = 0
+            self.num_ctx_cached_tokens = 0
+            self._cached_token_lens[:self.num_seqs].zero_()
+            self._clean_cached_plans(defer_plan=False)
+            return
+
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
         if self.is_cross:
@@ -1419,8 +1453,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
         # indices of used cache blocks for each sequence
-        paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
-            self.request_ids, self.num_blocks)
+        paged_kv_indices = self._get_primary_kv_indices(self.request_ids,
+                                                        self.num_blocks)
 
         self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
             paged_kv_indices, non_blocking=True)
@@ -1437,14 +1471,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # capturable).
         if self._vswa_layer_to_pool is not None:
             unique_pools = set(self._vswa_layer_to_pool.values())
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._vswa_layer_to_pool.get(
+                self._primary_kv_layer_idx, 0)
             # Use dedicated pre-allocated buffers for each pool's indices.
             # These buffers are created in __post_init__ so their addresses
             # stay stable across CUDA-graph replays.
             total_idx = paged_kv_indices.size(0)
             primary_buf = getattr(self, f'_vswa_pool_buf_{primary_pool_id}')
-            primary_buf[:total_idx].copy_(self._paged_kv_indices[:total_idx],
-                                          non_blocking=True)
+            primary_buf[:total_idx].copy_(paged_kv_indices, non_blocking=True)
             self._vswa_pool_indices_cache = {
                 primary_pool_id: primary_buf,
             }
@@ -1574,7 +1608,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # VSWA: restore primary pool indices as the default.
         if (self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None):
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._vswa_layer_to_pool.get(
+                self._primary_kv_layer_idx, 0)
             total_blocks = self.num_generation_blocks + self.num_context_blocks
             src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
