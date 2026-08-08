@@ -61,3 +61,4 @@ l0_cpu:
   - unittest/scripts
   - unittest/tools
   - unittest/utils/test_logger.py
+  - unittest/utils/test_confidential_compute.py
