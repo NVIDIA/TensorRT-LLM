@@ -6,6 +6,7 @@ import inspect
 import os
 import traceback
 import warnings
+from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -293,6 +294,7 @@ def _construct_checkpoint_loader(
     *,
     mx_config: Optional[ModelExpressConfig] = None,
     mx_model_name: Optional[str] = None,
+    checkpoint_io_policy: str = "native",
 ) -> Optional[BaseCheckpointLoader]:
     if backend == "_autodeploy":
         return None
@@ -303,8 +305,13 @@ def _construct_checkpoint_loader(
         get_checkpoint_weight_loader, get_config_loader)
 
     if checkpoint_loader is None:
-        checkpoint_weight_loader = get_checkpoint_weight_loader(
-            checkpoint_format)()
+        checkpoint_weight_loader_cls = get_checkpoint_weight_loader(
+            checkpoint_format)
+        if checkpoint_format == "HF":
+            checkpoint_weight_loader = checkpoint_weight_loader_cls(
+                checkpoint_io_policy=checkpoint_io_policy)
+        else:
+            checkpoint_weight_loader = checkpoint_weight_loader_cls()
         config_loader = get_config_loader(checkpoint_format)()
 
         # Pass extra kwargs for format-specific loaders (e.g. MX).
@@ -325,6 +332,16 @@ def _construct_checkpoint_loader(
             **extra_kwargs)
 
     return checkpoint_loader
+
+
+def _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir: str,
+                                    **kwargs):
+    """Open a checkpoint session without requiring it from duck loaders."""
+    open_session = getattr(type(checkpoint_loader), "open_weight_session", None)
+    if open_session is None:
+        return nullcontext(
+            checkpoint_loader.load_weights(checkpoint_dir, **kwargs))
+    return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
 
 
 def _apply_to_buffers_only(model: torch.nn.Module, fn):
@@ -668,6 +685,11 @@ class ModelLoader:
             # real GMS tensors are bound.
             gms_post_load_handled = False
             if load_format == LoadFormat.AUTO:
+                coordinate_checkpoint_io = getattr(
+                    checkpoint_loader, "coordinate_checkpoint_io_request", None)
+                if coordinate_checkpoint_io is not None:
+                    coordinate_checkpoint_io(self.mapping)
+
                 # Pass model= so format-specific loaders (e.g. MX) can
                 # write weights directly into parameter buffers via P2P.
                 # Generic loaders ignore model=; loaders that can consume a
@@ -689,38 +711,37 @@ class ModelLoader:
                         load_weights_kwargs[
                             "prepare_post_transform_receiver"] = self._setup_aliases
 
-                if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, **load_weights_kwargs)
-                else:
-                    weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, **load_weights_kwargs)
+                weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
+                    model, 'llm_checkpoint_dir') else checkpoint_dir)
+                with _open_checkpoint_weight_session(
+                        checkpoint_loader, weights_checkpoint_dir,
+                        **load_weights_kwargs) as weights:
+                    # When MX P2P succeeds, weights are already in model
+                    # params. A non-empty dict contains tensors that should be
+                    # merged through the standard materialization path.
+                    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
 
-                # When MX P2P succeeds, weights are already in model params.
-                # A non-empty dict contains size-mismatched tensors that
-                # should be merged via the standard disk pipeline.
-                weights_preloaded = checkpoint_loader.is_weights_preloaded()
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
-
-                if weights:
-                    self._call_load_weights(model.load_weights, weights,
-                                            self.weight_mapper)
+                    if weights:
+                        self._call_load_weights(model.load_weights, weights,
+                                                self.weight_mapper)
 
                 if loads_draft_weights:
-                    weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model,
-                        mapping=self.mapping)
+                    with _open_checkpoint_weight_session(
+                            checkpoint_loader,
+                            self.spec_config.speculative_model,
+                            mapping=self.mapping) as weights:
+                        draft_model_arch = model.draft_config.pretrained_config.architectures[
+                            0]
+                        draft_weight_mapper = AutoCheckpointMapper.get(
+                            checkpoint_loader.checkpoint_format,
+                            draft_model_arch)
+                        draft_weight_mapper.init_model_and_config(
+                            model.draft_model, model.draft_config)
 
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
-                        0]
-                    draft_weight_mapper = AutoCheckpointMapper.get(
-                        checkpoint_loader.checkpoint_format, draft_model_arch)
-                    draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
-
-                    self._call_load_weights(model.load_draft_weights, weights,
-                                            draft_weight_mapper)
+                        self._call_load_weights(model.load_draft_weights,
+                                                weights, draft_weight_mapper)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
