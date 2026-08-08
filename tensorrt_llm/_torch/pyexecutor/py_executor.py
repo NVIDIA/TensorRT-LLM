@@ -6009,6 +6009,16 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
+            # Reporting this mini-batch to the KV connector used to happen
+            # inside KVCacheManager.prepare_resources; it now runs after the
+            # token-budget trim, which this path does not go through. Kept here
+            # so the connector's per-request state advances exactly as before.
+            kv_cache_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
+                kv_cache_manager.publish_connector_scheduler_output(
+                    disagg_gen_init_to_prepare)
+
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
@@ -7192,30 +7202,47 @@ class PyExecutor:
         Only requests that sample new tokens should be added to the inflight set since their next iteration depends
         on these new tokens, so they should be skipped in the scheduler until the new tokens are generated.
         This includes context requests that finish context phase and generation requests.
+
+        The inserted ids are recorded on ``scheduled_requests`` so the paired
+        ``_remove_inflight_ids`` erases exactly what was added, rather than
+        re-deriving the set from a batch that has changed in between. An id left
+        behind is not recoverable: the scheduler skips inflight ids, so the
+        request is never scheduled again while still holding its KV blocks and
+        sequence slot.
+
+        This is load-bearing, not defensive. In this loop the next step is
+        ``resource_manager.prepare_resources``, which runs
+        ``ResourceManager.maybe_fit_token_budget`` at its end -- and that can
+        shrink a context request out of ``context_requests_last_chunk``. By
+        removal time the batch no longer agrees with what was inserted here.
         """
+        added: List[int] = []
         for req in scheduled_requests.context_requests_last_chunk:
             logger.debug(
                 f"Context request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
         for req in scheduled_requests.generation_requests:
             logger.debug(
                 f"Generation request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
+        scheduled_requests.added_inflight_req_ids = added
 
     def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
-        """Remove request IDs of current sampling requests from self.inflight_req_ids."""
-        for req in scheduled_requests.context_requests_last_chunk:
+        """Remove the request IDs this batch added to self.inflight_req_ids.
+
+        Erases the ids recorded by ``_add_inflight_ids`` rather than re-deriving
+        them from the batch, which may have been trimmed since (see there).
+        """
+        for req_id in scheduled_requests.added_inflight_req_ids:
             logger.debug(
-                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
+                f"Request with ID {req_id} removed from DECODER model inflight set"
             )
-            self.inflight_req_ids.erase(req.request_id)
-        for req in scheduled_requests.generation_requests:
-            logger.debug(
-                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
-            )
-            self.inflight_req_ids.erase(req.request_id)
+            self.inflight_req_ids.erase(req_id)
+        scheduled_requests.added_inflight_req_ids = []
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
