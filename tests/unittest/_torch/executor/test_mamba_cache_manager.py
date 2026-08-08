@@ -873,6 +873,44 @@ def test_dsa_star_rejects_v2_and_keeps_explicit_v1_selection():
     )
 
 
+@pytest.mark.parametrize("zero_layer_hybrid", [False, True])
+@pytest.mark.parametrize(
+    ("manager_setting", "expected_use_v2"),
+    [(False, False), ("auto", False), (True, True)],
+)
+def test_sparse_cache_manager_factory_only_enables_explicit_v2(
+    monkeypatch, zero_layer_hybrid, manager_setting, expected_use_v2
+):
+    sparse_attn_config = SimpleNamespace(algorithm="dsa")
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=sparse_attn_config,
+        get_num_mamba_layers=lambda: 0,
+    )
+    expected_manager_cls = object()
+    sparse_manager_factory = MagicMock(return_value=expected_manager_cls)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.is_hybrid_linear",
+        lambda config: zero_layer_hybrid,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.get_sparse_attn_kv_cache_manager",
+        sparse_manager_factory,
+    )
+
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=manager_setting),
+        )
+        is expected_manager_cls
+    )
+    sparse_manager_factory.assert_called_once_with(
+        sparse_attn_config,
+        use_kv_cache_manager_v2=expected_use_v2,
+    )
+
+
 def _make_mgr(
     max_batch_size=4, max_draft_len=2, enable_attention_dp=False, use_replay_state_update=False
 ):

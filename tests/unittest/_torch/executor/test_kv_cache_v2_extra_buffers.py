@@ -190,7 +190,7 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             del mgr
 
     def test_pool_mapping_ignores_reordered_layer_grouping(self):
-        mgr = KVCacheManagerV2(**_make_kwargs(num_layers=4))
+        mgr = KVCacheManagerV2(**_make_kwargs(num_layers=4, head_dim=[64, 192, 64, 192]))
         real_impl = mgr.impl
         try:
             self.assertEqual(mgr.num_pools, 1)
@@ -200,9 +200,25 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
                 for layer in mgr.kv_cache_manager_py_config.layers
                 if int(real_impl.get_layer_group_id(layer.layer_id)) == pool_id
             )
-            expected_layer_id = config_group[0]
+            storage_variant = next(
+                variant
+                for pool_group in real_impl.pool_group_descs
+                for variant in pool_group.slot_desc.variants
+                if int(variant.layer_group_id) == pool_id
+            )
+            expected_layer_id = next(
+                int(buffer_id.layer_id)
+                for coalesced in storage_variant.coalesced_buffers
+                for buffer_id in coalesced.buffer_ids
+                if buffer_id.role == Role.KEY
+            )
             self.assertGreater(len(config_group), 1)
-            reordered_grouping = (config_group[1:] + config_group[:1],)
+            self.assertNotEqual(expected_layer_id, int(config_group[0]))
+            reordered_group = tuple(
+                layer_id for layer_id in config_group if int(layer_id) != expected_layer_id
+            )
+            reordered_group += (expected_layer_id,)
+            reordered_grouping = (reordered_group,)
             reordered_first_layer_id = reordered_grouping[pool_id][0]
             self.assertNotEqual(expected_layer_id, reordered_first_layer_id)
 
@@ -218,7 +234,7 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             self.assertEqual(
                 impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
                 (expected_layer_id, Role.KEY, PageIndexMode.SHARED),
-                "the pool pointer origin must use the config-order representative",
+                "the pool pointer origin must use the physical-layout representative",
             )
             self.assertEqual(
                 int(mgr.kv_cache_pool_pointers[pool_id, 0]),
