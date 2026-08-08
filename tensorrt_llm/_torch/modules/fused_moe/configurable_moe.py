@@ -47,7 +47,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
-from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -410,8 +409,9 @@ class ConfigurableMoE(MoE):
             )
 
     def _should_enable_dwdp(self) -> bool:
-        # DWDP is currently supported only for CuteDslFusedMoE with NVFP4 quantization.
-        if not isinstance(self.backend, CuteDslFusedMoE):
+        # DWDP is currently supported only by CuteDSL backends, and only with
+        # NVFP4 quantization.
+        if not self.backend.capabilities.supports_dwdp:
             return False
 
         quant_config = getattr(self.backend, "quant_config", None)

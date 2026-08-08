@@ -61,7 +61,12 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    MoE,
+    MoESchedulerKind,
+    MoEWeightLoadingMode,
+)
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
@@ -241,7 +246,7 @@ def test_moe_post_load_weights_uses_idempotent_transform_hook():
         def quantize_input(self, x, **kwargs):
             return x, None
 
-        def run_moe(self, **kwargs):
+        def run_moe(self, ctx, *, workspace=None):
             raise NotImplementedError
 
     moe = HookTestMoE.__new__(HookTestMoE)
@@ -317,7 +322,7 @@ def test_configurable_moe_post_load_weights_uses_backend_staged_hooks():
         def quantize_input(self, x, **kwargs):
             return x, None
 
-        def run_moe(self, **kwargs):
+        def run_moe(self, ctx, *, workspace=None):
             raise NotImplementedError
 
     configurable_moe = HookTestConfigurableMoE.__new__(HookTestConfigurableMoE)
@@ -639,6 +644,7 @@ def run_backend_moe(
         token_final_scales=token_final_scales.to(torch.float32),
         x_sf=x_sf,
     )
+    workspace = None
 
     # Backend-specific overrides
     if backend_type == MoeBackendType.CUTLASS:
@@ -655,12 +661,25 @@ def run_backend_moe(
         import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
-        args["workspace"] = backend.get_workspace(m_max, 128)
+        workspace = backend.get_workspace(m_max, 128)
     elif backend_type in _MEGAMOE_BACKEND_TYPES:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
 
-    return backend.run_moe(**args)
+    # Mirror what each scheduler hands the backend: ExternalCommMoEScheduler
+    # builds a plan on every path, FusedCommMoEScheduler never does because the
+    # fused kernel owns the exchange. Single GPU with no comm strategy, so this
+    # is the no-comm plan: quantize_input ran locally and left the scale factors
+    # swizzled, no alltoall, and no workspace-backed output buffer.
+    if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
+        args["comm_plan"] = MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        )
+
+    return backend.run_moe(MoERunContext(**args), workspace=workspace)
 
 
 # ============================================================================
@@ -1237,6 +1256,12 @@ def test_trtllm_bf16_unquantized_moe(
             mapping=mapping,
             activation_type=activation_type,
         )
+        if trtllm_use_router_logits and backend._routes_outside_the_kernel():
+            # This config only routes outside the kernel, so run_moe drops
+            # router_logits and the scheduler never pairs the two. Asking for
+            # fused routing here tests a combination production cannot reach.
+            pytest.skip("routing happens outside the kernel; fused routing is unreachable")
+
         backend.load_weights([weights])
         backend.post_load_weights()
         backend.cuda()
