@@ -38,6 +38,20 @@ from torch import nn
 from .heads import confident_prefix_length
 
 
+def resolve_noise_token_id(mask_token_id: Optional[int], config, ckpt_attr: str) -> int:
+    """Resolve the DSpark noise/mask token id.
+
+    ``mask_token_id`` is the speculative config's value, either indicated in ``DSparkDecodingConfig``
+    validation. ``None`` falls back to the drafter checkpoint's ``ckpt_attr``,
+    else ``vocab_size``.
+    """
+    if mask_token_id is None:
+        mask_token_id = getattr(config, ckpt_attr, None)
+    if mask_token_id is None:
+        mask_token_id = config.vocab_size
+    return int(mask_token_id)
+
+
 def build_draft_input_ids(
     bonus_token_ids: torch.Tensor, *, block_size: int, noise_token_id: int
 ) -> torch.Tensor:
