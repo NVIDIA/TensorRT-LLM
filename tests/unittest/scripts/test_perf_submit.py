@@ -16,6 +16,7 @@
 
 import importlib.util
 import json
+import shlex
 from pathlib import Path
 from types import ModuleType
 
@@ -54,6 +55,11 @@ def submit_module(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.fixture
+def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(SUBMIT_PATHS[0], monkeypatch)
+
+
+@pytest.fixture
 def example_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return _load_module(EXAMPLE_SUBMIT_PATH, monkeypatch)
 
@@ -70,11 +76,6 @@ def test_get_benchmark_config_accepts_positive_integer(submit_module: ModuleType
     benchmark_config = _get_benchmark_config(submit_module, concurrency)
 
     assert benchmark_config["concurrency"] == int(concurrency)
-
-
-@pytest.fixture
-def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    return _load_module(SUBMIT_PATHS[0], monkeypatch)
 
 
 def _select_ci_test_case_line(
@@ -273,3 +274,45 @@ def test_ci_submit_rejects_missing_pytest_split_durations(
             pytest_options="--splits 1 --group 1 --durations-path /remote/.test_durations",
             split_group=1,
         )
+
+
+@pytest.mark.parametrize("quote_command", [False, True])
+@pytest.mark.parametrize("model_root", ["/scratch/llm-models", "/models/o'hare with spaces"])
+def test_ci_extracts_model_root_from_inbound_pytest_command(
+    ci_submit_module, model_root, quote_command
+):
+    command = (
+        f"LLM_ROOT=/repo LLM_MODELS_ROOT={shlex.quote(model_root)} "
+        "/repo/tensorrt_llm/llmapi/trtllm-llmapi-launch pytest -q"
+    )
+    command_value = shlex.quote(command) if quote_command else command
+    prefix_lines = [f"export pytestCommand={command_value}"]
+
+    assert (
+        ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT") == model_root
+    )
+
+
+def test_ci_single_token_with_escaped_whitespace_is_not_resplit(ci_submit_module):
+    # A bare (unwrapped) export value that parses to a single token with
+    # embedded whitespace is already final — re-splitting it would corrupt
+    # the value. Only quote-wrapped whole commands get a second parse.
+    prefix_lines = [r"export pytestCommand=LLM_MODELS_ROOT=/models\ with\ spaces"]
+
+    assert (
+        ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT")
+        == "/models with spaces"
+    )
+
+
+def test_ci_missing_model_root_is_detectable(ci_submit_module):
+    prefix_lines = ["export pytestCommand='LLM_ROOT=/repo pytest -q'"]
+
+    assert ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT") is None
+
+
+def test_ci_rejects_invalid_pytest_command(ci_submit_module):
+    prefix_lines = ['export pytestCommand="LLM_MODELS_ROOT=/models']
+
+    with pytest.raises(ValueError, match="Invalid inbound pytestCommand"):
+        ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT")

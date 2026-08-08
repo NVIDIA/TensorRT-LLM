@@ -83,10 +83,7 @@ def test_gpu_type_from_supported_gpus(
         ),
         (
             "oci-aga-cs-001",
-            "export UCX_TLS=^tcp,rc_gda,gga UCX_IB_MLX5_DEVX=n "
-            "UCX_NET_DEVICES="
-            "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1 "
-            "UCX_IB_TRAFFIC_CLASS=96 TRTLLM_NIXL_NUM_THREADS=1",
+            "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
         ),
         ("aws-cmh", "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp"),
         ("aws-dfw-prod", "export UCX_TLS=^gdr_copy"),

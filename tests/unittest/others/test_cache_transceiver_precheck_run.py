@@ -80,6 +80,36 @@ def test_seed_for_deterministic_and_distinct():
     assert all(0 <= s <= 0x7FFFFFFF for s in seeds)
 
 
+@pytest.mark.parametrize(("prompt_len", "expected_blocks"), ((1024, 8), (7408, 58)))
+def test_request_block_views_excludes_untransferred_speculative_page(prompt_len, expected_blocks):
+    """V2's reserved MTP tokens must not expand the verified transfer range."""
+    tokens_per_block = 128
+    num_allocated = (prompt_len + 2 + tokens_per_block - 1) // tokens_per_block
+    allocated = [-1] + list(range(num_allocated))
+    buffer = object()
+
+    def get_batch_cache_indices(request_ids, layer_idx):
+        assert request_ids == [7]
+        assert layer_idx == 4
+        return [allocated]
+
+    def get_buffers(global_layer, kv_layout):
+        assert global_layer == 4
+        assert kv_layout == "HND"
+        return buffer
+
+    kvm = types.SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        pp_layers=[4],
+        get_batch_cache_indices=get_batch_cache_indices,
+        get_buffers=get_buffers,
+    )
+
+    views = list(rp._request_block_views(kvm, rid=7, prompt_len=prompt_len))
+
+    assert views == [(4, buffer, list(range(expected_blocks)))]
+
+
 # --------------------------------------------------------------------------- #
 # HMAC control-channel wire format
 # --------------------------------------------------------------------------- #
@@ -396,6 +426,17 @@ class TestInternalApiContract:
         assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[2:])
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
+
+    def test_deepseek_v4_auto_selects_kv_cache_manager_v2(self, api, tmp_path):
+        model_dir = tmp_path / "deepseek-v4"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"architectures": ["DeepseekV4ForCausalLM"]})
+        )
+        side = {"use_kv_cache_manager_v2": "auto"}
+        cache_cfg = api.CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+
+        assert rp.resolve_model_prefs(str(model_dir), side, cache_cfg) is True
 
     def test_enum_members(self, api):
         for enum, members in (
