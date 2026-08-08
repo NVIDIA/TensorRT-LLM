@@ -11,7 +11,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -30,9 +30,11 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor,
                                           create_input_processor,
-                                          create_input_processor_with_hash)
+                                          create_input_processor_with_hash,
+                                          get_multimodal_encoder_item_metadata)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
+                                          MultimodalEncoderSchedulingPolicy,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
@@ -71,6 +73,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -82,7 +85,8 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+from .llm_request import (LlmRequest, LlmRequestState, _Unset,
+                          get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -141,6 +145,38 @@ def _make_single_token_context_graph_batch(
     promoted_context_request_ids = frozenset(request.py_request_id
                                              for request in context_requests)
     return graph_batch, promoted_context_request_ids
+
+
+def _resolve_mm_encoder_token_budget(base_budget: int,
+                                     model_max_atomic_item_tokens: int) -> int:
+    """Keep the model's largest indivisible MM item schedulable."""
+    return max(base_budget, model_max_atomic_item_tokens)
+
+
+def _validate_mm_encoder_scheduling_compatibility(
+        llm_args: TorchLlmArgs, item_scheduling_enabled: bool) -> None:
+    """Validate item-scheduling combinations after model capability is known."""
+    policy = llm_args.multimodal_config.encoder_scheduling_policy
+    if not item_scheduling_enabled:
+        return
+    if llm_args.multimodal_config.encoder_side_stream_max_ahead > 0:
+        raise ValueError(
+            "MM encoder item scheduling does not yet support side-stream "
+            "prefetch (multimodal_config.encoder_side_stream_max_ahead > 0); "
+            "set encoder_scheduling_policy=DISABLED or "
+            "encoder_side_stream_max_ahead=0")
+    if policy != MultimodalEncoderSchedulingPolicy.EAGER:
+        return
+    if llm_args.enable_attention_dp:
+        raise ValueError(
+            "multimodal_config.encoder_scheduling_policy=EAGER does not yet "
+            "support attention DP (enable_attention_dp=True)")
+    cache_transceiver_config = llm_args.cache_transceiver_config
+    if (cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        raise ValueError(
+            "multimodal_config.encoder_scheduling_policy=EAGER does not yet "
+            "support disaggregated serving (cache_transceiver_config)")
 
 
 class ModelEngine(ABC):
@@ -339,9 +375,10 @@ class PyTorchModelEngine(ModelEngine):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         # Multimodal encoder runtime sizes; fall back to LLM-side values when
-        # the encoder-specific knobs are unset.
+        # the encoder-specific knobs are unset. The token budget may be
+        # raised after model load because atomic MM items cannot be split.
         (
-            self.encoder_batch_size,
+            self.encoder_max_num_items,
             self.encoder_max_num_tokens,
         ) = llm_args.get_encoder_runtime_sizes()
 
@@ -471,6 +508,94 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+        # Item scheduling is declared once, as a model capability (the
+        # `MultimodalModelMixin` ClassVar). The engine stores only the
+        # actionable flag: whether the item-scheduling wiring is engaged this
+        # run (setup below, scheduler wrap, executor encoder step). A
+        # `DISABLED` policy keeps the capability but runs only the base LLM
+        # scheduler with legacy inline encode.
+        _mm_config = getattr(self.llm_args, "multimodal_config", None)
+        _mm_scheduling_policy = (_mm_config.encoder_scheduling_policy
+                                 if _mm_config is not None else
+                                 MultimodalEncoderSchedulingPolicy.DEFAULT)
+        self.mm_encoder_item_scheduling_enabled = (
+            isinstance(self.model, MultimodalModelMixin)
+            and self.model.supports_mm_encoder_item_scheduling and
+            _mm_scheduling_policy != MultimodalEncoderSchedulingPolicy.DISABLED)
+        _validate_mm_encoder_scheduling_compatibility(
+            self.llm_args, self.mm_encoder_item_scheduling_enabled)
+        self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
+                                                                   int]] = None
+        self.max_mm_encoder_output_embeddings: Optional[int] = None
+        self.mm_encoder_output_budget_bytes: Optional[int] = None
+        # Item scheduling bounds three distinct MM encoder resources. They are
+        # owned in different places and measured in different units, so they
+        # are enumerated here once:
+        #   (A) encoder-forward workspace — `encoder_max_num_tokens` (below),
+        #       in encoder attention tokens, clamped up to the largest atomic
+        #       item; profiled by a direct full-budget encoder warmup.
+        #   (B) resident output bytes — `mm_encoder_output_budget_bytes`
+        #       (`_resolve_mm_encoder_output_budget_bytes`), the maximum
+        #       post-encoder embeddings produced by one legal encoder iteration,
+        #       converted to bytes. Enforced by the scheduler; any capacity not
+        #       materialized by warmup is reserved in KV-capacity estimation.
+        #   (C) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
+        #       `TensorLRUCache`, self-bounded by LRU; unprofiled capacity is
+        #       reserved on top of (B) for cache-enabled models.
+        # Prefill currently waits for every item in a request, so admission
+        # rejects a request whose complete MM embedding exceeds (B).
+        if self.mm_encoder_item_scheduling_enabled:
+            if self.encoder_max_num_tokens is None:
+                raise ValueError(
+                    "MM encoder item scheduling requires a token budget; set "
+                    "encoder_max_num_tokens or max_num_tokens")
+            max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
+            )
+            if not max_tokens_per_item:
+                raise ValueError(
+                    "A model with MM encoder item scheduling must implement "
+                    "get_mm_max_tokens_per_item()")
+            if any(value <= 0 for value in max_tokens_per_item.values()):
+                raise ValueError(
+                    "get_mm_max_tokens_per_item() must return positive token "
+                    "counts")
+            model_max_atomic_item_tokens = max(max_tokens_per_item.values())
+            encoder_token_budget_base = self.encoder_max_num_tokens
+            effective_encoder_token_budget = _resolve_mm_encoder_token_budget(
+                encoder_token_budget_base, model_max_atomic_item_tokens)
+            if effective_encoder_token_budget > self.encoder_max_num_tokens:
+                logger.warning_once(
+                    f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
+                    "is smaller than the model's largest atomic "
+                    f"multimodal item ({model_max_atomic_item_tokens}); "
+                    f"using {model_max_atomic_item_tokens} as the "
+                    "effective encoder runtime budget.",
+                    key="raise_encoder_max_num_tokens_for_atomic_item",
+                )
+                self.encoder_max_num_tokens = effective_encoder_token_budget
+            attention_metadata_capacity = (
+                self.input_processor.get_mm_encoder_attention_metadata_capacity(
+                    self.encoder_max_num_items,
+                    self.encoder_max_num_tokens,
+                ))
+            if attention_metadata_capacity is not None:
+                if (not attention_metadata_capacity or any(
+                        value <= 0
+                        for value in attention_metadata_capacity.values())):
+                    raise ValueError(
+                        "get_mm_encoder_attention_metadata_capacity() must "
+                        "return nonempty positive capacities or None")
+                self.mm_encoder_attention_metadata_capacity = (
+                    attention_metadata_capacity)
+            logger.info("Multimodal encoder token budget: "
+                        f"configured={llm_args.encoder_max_num_tokens}, "
+                        f"base={encoder_token_budget_base}, "
+                        f"effective={self.encoder_max_num_tokens}, "
+                        f"model_atomic_max={model_max_atomic_item_tokens}, "
+                        "attention_capacity="
+                        f"{self.mm_encoder_attention_metadata_capacity}.")
+            self.mm_encoder_output_budget_bytes = (
+                self._resolve_mm_encoder_output_budget_bytes())
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -2681,10 +2806,221 @@ class PyTorchModelEngine(ModelEngine):
             return True
         return isinstance(self.input_processor, BaseMultimodalInputProcessor)
 
+    @torch.inference_mode()
+    def forward_multimodal_encoder_items(
+        self,
+        requests: List[LlmRequest],
+        scheduled_items: Dict[int, List[int]],
+    ) -> None:
+        """Forward selected MM encoder items and commit request-local outputs."""
+        if not scheduled_items:
+            return
+        if not isinstance(self.model, MultimodalModelMixin):
+            raise TypeError(
+                "Item-level MM scheduling requires MultimodalModelMixin")
+
+        # Read-through against the model's encoder cache when enabled
+        # (`supports_encoder_cache` + `encoder_cache_max_bytes > 0`): a hit
+        # records a clone and skips the encode; a miss encodes, records, and
+        # populates the cache. The hit/miss branch runs here — at encode time,
+        # on every rank against rank-local cache state — so ranks perform
+        # identical get/put sequences and stay in sync. When the cache is off
+        # (`encoder_cache` is None), every item is a miss and outputs live only
+        # on the request. Records take a clone regardless, so a recorded slot
+        # never aliases a batch output or an evictable cache entry.
+        encoder_cache = self.mm_encoder_cache
+        request_by_id = {request.request_id: request for request in requests}
+        miss_items = []
+        miss_owners: List[Tuple[LlmRequest, int, Optional[Hashable]]] = []
+        touched_requests: Dict[int, LlmRequest] = {}
+        for request_id, item_indices in scheduled_items.items():
+            request = request_by_id.get(request_id)
+            if request is None:
+                raise RuntimeError(
+                    f"Scheduled MM request {request_id} is no longer active")
+            state = request.py_mm_encoder_state
+            if state is None:
+                raise RuntimeError(
+                    f"Scheduled MM request {request_id} has no encoder "
+                    "item state")
+            touched_requests[request_id] = request
+            multimodal_param = MultimodalParams(
+                multimodal_data=request.py_multimodal_data)
+            # Scope the lookup to this iteration's items: probing an item the
+            # budget cannot encode yet would still refresh its LRU recency and
+            # reorder eviction against items actually in flight.
+            # Keys come from the request: the executor's params carry
+            # `py_multimodal_data` only, while the content hashes live on the
+            # `LlmRequest`.
+            item_keys = (self.get_mm_encoder_item_keys(request)
+                         if encoder_cache is not None else None)
+            partition = (self.model.partition_encoder_cache(
+                multimodal_param,
+                encoder_cache,
+                item_indices=item_indices,
+                keys=item_keys) if item_keys is not None else None)
+            if partition is None:
+                # No cache, or the request cannot build stable content keys:
+                # every scheduled item is a miss and its output lives only on
+                # the request.
+                for item_idx in item_indices:
+                    miss_items.append((multimodal_param, item_idx))
+                    miss_owners.append((request, item_idx, None))
+                continue
+            for item_idx, cached in partition.hits.items():
+                state.record(item_idx, cached)
+            for item_idx in partition.miss_indices:
+                miss_items.append((multimodal_param, item_idx))
+                miss_owners.append(
+                    (request, item_idx, partition.keys[item_idx]))
+
+        if miss_items:
+            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
+                miss_items)
+            for encoder_input, _, _ in encoder_inputs:
+                encoder_input.to_device(
+                    "multimodal_data",
+                    "cuda",
+                    pin_memory=prefer_pinned(),
+                    target_keywords=getattr(self.model,
+                                            "multimodal_data_device_paths",
+                                            None),
+                )
+
+            outputs = self.model.forward_multimodal_encoder_items(
+                encoder_inputs)
+            if len(outputs) != len(miss_owners):
+                raise RuntimeError(
+                    "MM item encoder must return one output per item")
+
+            for output, (request, item_idx, key) in zip(outputs,
+                                                        miss_owners,
+                                                        strict=True):
+                request.py_mm_encoder_state.record(item_idx, output)
+                if encoder_cache is not None and key is not None:
+                    encoder_cache.put(key, output)
+
+        for request in touched_requests.values():
+            request.py_mm_encoder_state.finalize(request.py_multimodal_data)
+
+    def _resolve_mm_encoder_output_budget_bytes(self) -> int:
+        """Resolve the byte budget for resident MM encoder outputs.
+
+        Encoder attention tokens and output embeddings use different units:
+        `encoder_max_num_tokens` bounds pre-merge encoder attention tokens in
+        one encoder iteration, while the input processor converts that runtime
+        capacity into a model-specific upper bound on aggregate post-encoder
+        embeddings. The byte budget is that embedding capacity multiplied by
+        bytes per encoder embedding; the LLM-side `max_num_tokens` does not
+        participate.
+
+        It caps outputs held between encode and prefill and is reserved during
+        KV-capacity estimation. It is separate from the optional reuse cache
+        (`encoder_cache_max_bytes`). A request whose total embedding exceeds
+        this budget is rejected at admission.
+        """
+        max_output_embeddings = (
+            self.input_processor.get_max_mm_encoder_output_embeddings(
+                self.encoder_max_num_items,
+                self.encoder_max_num_tokens,
+            ))
+        if max_output_embeddings is None or max_output_embeddings <= 0:
+            raise ValueError(
+                "A model with MM encoder item scheduling must implement "
+                "get_max_mm_encoder_output_embeddings() and return a positive "
+                "aggregate embedding capacity")
+        self.max_mm_encoder_output_embeddings = max_output_embeddings
+        bytes_per_embedding = self._resolve_bytes_per_mm_encoder_embedding()
+        self.bytes_per_mm_encoder_embedding = bytes_per_embedding
+        return max_output_embeddings * bytes_per_embedding
+
+    @property
+    def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
+        """The encoder cache the item path reads through, or `None`.
+
+        Only models that opt into the encoder cache
+        (`supports_encoder_cache` with `encoder_cache_max_bytes > 0`)
+        participate — the same lazily created `TensorLRUCache` instance the
+        legacy inline path uses. Item-scheduled models without the flag
+        (e.g. Qwen today) get `None` and never touch the cache; cross-request
+        reuse for them is out of scope here.
+        """
+        model = self.model
+        if not getattr(model, "supports_encoder_cache", False):
+            return None
+        getter = getattr(model, "_get_multimodal_encoder_cache", None)
+        return getter() if getter is not None else None
+
+    def get_mm_encoder_item_keys(
+            self, request: LlmRequest) -> Optional[List[Hashable]]:
+        """Return the request's per-item cache keys, or `None`.
+
+        `None` means the request cannot build stable content keys (no item
+        metadata, content hashes, or processor-kwargs hash), so its items
+        bypass the cache (always encoded; outputs live only on the request).
+        The key format is shared with the legacy full-request path
+        (`_encoder_cache_item_key`) so entries hit across both.
+        """
+        # `getattr`: unit tests exercise partially constructed engines.
+        if not getattr(self, "mm_encoder_item_scheduling_enabled", False):
+            return None
+        # Memoized on the request's encoder state: the inputs are fixed at
+        # admission, and a request whose items span several iterations would
+        # otherwise rebuild the same keys on each one.
+        state = request.py_mm_encoder_state
+        if state is not None and not isinstance(state.cache_item_keys, _Unset):
+            return state.cache_item_keys
+        mm_data = request.py_multimodal_data
+        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        keys = None if item_metadata is None else (
+            self.model.build_encoder_cache_item_keys(
+                request.multimodal_hashes,
+                item_metadata.item_refs,
+                item_metadata.output_embedding_lengths,
+                mm_data.get("mm_processor_kwargs_hash"),
+            ))
+        if state is not None:
+            state.cache_item_keys = keys
+        return keys
+
+    def _resolve_bytes_per_mm_encoder_embedding(self) -> int:
+        """Bytes occupied by one multimodal encoder output embedding.
+
+        Prefers the mixin's explicit `embedding_dim`/`embedding_dtype`
+        contract, then the text embedding layer's weight, then the
+        pretrained config's hidden size with the loaded weights' dtype —
+        both mixin properties are optional and most VLMs implement
+        neither.
+        """
+        model = self.model
+        try:
+            return (model.embedding_dim * torch.empty(
+                (), dtype=model.embedding_dtype).element_size())
+        except NotImplementedError:
+            pass
+        try:
+            weight = model.text_embedding_layer.weight
+            return weight.shape[-1] * weight.element_size()
+        except NotImplementedError:
+            pass
+        pretrained = model.model_config.pretrained_config
+        hidden_size = getattr(pretrained, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(getattr(pretrained, "text_config", None),
+                                  "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(
+                "Cannot derive the MM embedding row size: the model "
+                "implements neither embedding_dim/embedding_dtype nor "
+                "text_embedding_layer, and its pretrained config exposes "
+                "no (text_config.)hidden_size")
+        element_size = next(model.parameters()).dtype.itemsize
+        return hidden_size * element_size
+
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the
         loaded model, using the engine's encoder runtime sizes
-        (`encoder_max_batch_size` / `encoder_max_num_tokens`, falling back to
+        (`encoder_max_num_items` / `encoder_max_num_tokens`, falling back to
         the LLM-side `max_batch_size` / `max_num_tokens`).
 
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
@@ -2703,9 +3039,13 @@ class PyTorchModelEngine(ModelEngine):
 
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
-                module.setup_attn_metadata(
-                    max_num_requests=self.encoder_batch_size,
+                setup_kwargs: Dict[str, Any] = dict(
+                    max_num_items=self.encoder_max_num_items,
                     max_num_tokens=self.encoder_max_num_tokens)
+                if self.mm_encoder_attention_metadata_capacity is not None:
+                    setup_kwargs["attention_metadata_capacity"] = (
+                        self.mm_encoder_attention_metadata_capacity)
+                module.setup_attn_metadata(**setup_kwargs)
                 module.set_attn_max_seq_len(max_seq_len)
 
     def _set_up_spec_metadata(

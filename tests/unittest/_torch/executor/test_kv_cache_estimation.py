@@ -14,11 +14,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,73 @@ class _MultimodalModel(MultimodalModelMixin):
 
 class _EncoderCacheMultimodalModel(_MultimodalModel):
     supports_encoder_cache = True
+
+
+def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
+    monkeypatch,
+):
+    class _InputProcessor:
+        def __init__(self):
+            self.calls = []
+
+        def get_mm_max_tokens_per_item(self):
+            return {"image": 4096}
+
+        def get_dummy_mm_data(
+            self,
+            *,
+            max_num_encoder_tokens,
+            max_num_items,
+            dtype,
+        ):
+            self.calls.append((max_num_encoder_tokens, max_num_items, dtype))
+            return {"image": {"item_count": max_num_items}}
+
+    class _Model(MultimodalModelMixin):
+        dtype = torch.float16
+        mm_encoder = object()
+
+        def __init__(self):
+            self.forwarded_item_counts = []
+            self.last_output = None
+
+        def encode_multimodal_inputs(self, multimodal_params):
+            count = multimodal_params[0].multimodal_data["image"]["item_count"]
+            self.forwarded_item_counts.append(count)
+            self.last_output = torch.arange(count * 4).reshape(count, 4)
+            return self.last_output
+
+    input_processor = _InputProcessor()
+    model = _Model()
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=model,
+        input_processor=input_processor,
+        encoder_max_num_items=8,
+        encoder_max_num_tokens=8192,
+        use_mrope=False,
+    )
+    creator._profiling_stage_data = {"enable_mm_reqs": True}
+    creator._mapping = SimpleNamespace(enable_attention_dp=False)
+    creator._max_num_tokens = 18
+    creator._max_beam_width = 1
+
+    # The LLM dummy remains text-only and is not allowed to shrink the
+    # independent encoder profiling budget.
+    requests = creator._create_dummy_context_requests(input_seq_len=18)
+    assert sum(len(request.input_token_ids) for request in requests) == 18
+    assert input_processor.calls == []
+    assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
+
+    creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
+    assert input_processor.calls == [(8192, 2, torch.float16)]
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    retained_output = creator._encode_dummy_inputs()
+    assert model.forwarded_item_counts == [2]
+    assert retained_output.data_ptr() != model.last_output.data_ptr()
+    assert creator._dummy_encoder_inputs == []
 
 
 def _make_creator(
@@ -199,24 +268,33 @@ def test_regression_without_fix_would_overcount():
 
 
 @pytest.mark.parametrize(
-    ("model_cls", "encoder_cache_max_bytes", "expected"),
+    ("model_cls", "encoder_cache_max_bytes", "expected_reserve"),
     [
-        (_TextModel, 64, 1000),
-        (_MultimodalModel, 0, 1000),
-        (_MultimodalModel, 64, 1000),
-        (_EncoderCacheMultimodalModel, 0, 1000),
-        (_EncoderCacheMultimodalModel, 64, 1064),
+        (_TextModel, 64, 0),
+        (_MultimodalModel, 0, 0),
+        (_MultimodalModel, 64, 0),
+        (_EncoderCacheMultimodalModel, 0, 0),
+        (_EncoderCacheMultimodalModel, 64, 64),
     ],
 )
 def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     model_cls,
     encoder_cache_max_bytes,
-    expected,
+    expected_reserve,
 ):
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(model=model_cls(encoder_cache_max_bytes))
 
-    assert creator._reserve_multimodal_encoder_cache_memory(1000) == expected
+    assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
+
+
+def test_reserve_adds_only_unprofiled_output_capacity():
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        mm_encoder_output_budget_bytes=512,
+        model=_MultimodalModel(0),
+    )
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +564,6 @@ def test_kv_cache_manager_v2_float_max_seq_len_would_crash_torch_randint():
     """Pre-fix behaviour: a float max_seq_len propagating into
     torch.randint(size=(...,)) raises.  This test documents WHY the cast
     is necessary — if the cast is dropped, the following code crashes."""
-    import torch
 
     float_seq_len = 60160.0
     with pytest.raises((TypeError, RuntimeError)):
@@ -539,7 +616,6 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     11.92 GiB temp-quota inflation on DeepSeek-V4-Pro, raising peak memory
     and OOM risk during KV cache estimation).
     """
-    import torch
 
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
 
@@ -590,8 +666,6 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
 
 
 def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
-    import torch
-
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
     max_seq_len = 4096
@@ -607,6 +681,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     # Explicit False: try_prepare_estimation skips estimation for
     # encoder-decoder models, and a bare Mock attribute is truthy.
     model_engine.model.model_config.is_encoder_decoder = False
+    # A bare Mock would auto-create the attribute; real engines set it to
+    # None unless the model opted into MM item scheduling.
+    model_engine.mm_encoder_output_budget_bytes = None
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(

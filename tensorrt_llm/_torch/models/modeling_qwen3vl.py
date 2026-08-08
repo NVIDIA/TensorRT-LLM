@@ -267,6 +267,20 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     # `Qwen2VLInputProcessorBase` -- the grid math and the HF `smart_resize`
     # it defers to are identical for Qwen3-VL.
 
+    def get_mm_encoder_attention_metadata_capacity(
+        self, max_num_items: int, max_num_tokens: int
+    ) -> Optional[Dict[str, int]]:
+        """Bound temporal segments using Qwen3's hard geometry minimum.
+
+        ``max_num_items`` is intentionally not part of the bound: one atomic
+        video may contain enough temporal segments to consume the token
+        budget. Unlike Qwen2.5, Qwen3 clamps the aggregate temporal pixel
+        volume, so a long video can shrink each frame to one merged cell.
+        """
+        cfg = self.config.vision_config
+        merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size
+        return {"attention": max(1, max_num_tokens // merge_unit)}
+
     @classmethod
     def get_rope_index(
         cls,
@@ -819,19 +833,28 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def setup_attn_metadata(self, max_num_requests: int, max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_items: int,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override the mixin default: each image / video frame is its own
         # attention segment (``seq_lens.extend([h * w] * t)`` in ``forward``),
         # so a single multi-image or video request can produce many more
-        # segments than ``max_batch_size``. The number of segments in one
-        # encoder forward is bounded by the token budget (every segment holds
-        # at least one token), NOT by the request count -- so floor the
-        # metadata's request capacity at ``max_num_tokens`` to keep the
-        # per-request buffers (prompt_lens / host_request_types / kv_lens) from
-        # overflowing when ``num_contexts`` is set to the segment count.
-        max_num_requests = max(max_num_requests, max_num_tokens)
+        # segments than ``max_num_items``. The number of segments in one
+        # encoder forward is bounded by the token budget and each segment
+        # contains at least ``spatial_merge_unit`` physical tokens. Use the
+        # processor/model capacity contract to keep the per-request buffers
+        # (prompt_lens / host_request_types / kv_lens) from overflowing when
+        # ``num_contexts`` is set to the segment count.
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None
+            else self.get_encoder_attention_metadata_capacity(max_num_items, max_num_tokens)
+        )
         self.attn_metadata = self.metadata_cls(
-            max_num_requests=max_num_requests,
+            max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
@@ -851,6 +874,19 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                 f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
             )
         self._fixed_max_seq_len = max_seq_len
+
+    def get_encoder_attention_metadata_capacity(
+        self, max_num_items: int, max_num_tokens: int
+    ) -> Dict[str, int]:
+        """Conservatively bound temporal segments from the token budget.
+
+        ``max_num_items`` is intentionally ignored because one atomic video
+        item can expand to multiple temporal attention segments. Qwen3's
+        processor-derived capacity intentionally resolves to this same hard
+        geometry bound because long videos can reach one merged cell per
+        segment.
+        """
+        return {"attention": max(1, max_num_tokens // self.spatial_merge_unit)}
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -1164,6 +1200,8 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
+    supports_mm_encoder_item_scheduling = True
+
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:
@@ -1358,6 +1396,11 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     @property
     def embedding_dim(self) -> int:
+        """Width of each encoder output row (`MultimodalModelMixin` contract).
+
+        Qwen3-VL folds the deepstack feature maps into the hidden dim of every
+        embedding row, so accounting based on the text hidden size would undercount.
+        """
         return self.text_embedding_layer.embedding_dim * (self.deepstack_num_level + 1)
 
     @property

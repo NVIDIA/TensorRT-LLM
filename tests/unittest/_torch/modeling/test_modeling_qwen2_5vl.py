@@ -565,11 +565,11 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
     model = Qwen2VisionModelBase(model_config, Qwen2_5_VisionModel).visual
     model.metadata_cls = _StubVisionAttentionMetadata
 
-    max_num_requests = 8
+    max_num_items = 8
     max_num_tokens = 16
     fixed_max_seq_len = 65_536
     expected_window_max_seq_len = 64
-    model.setup_attn_metadata(max_num_requests=max_num_requests,
+    model.setup_attn_metadata(max_num_items=max_num_items,
                               max_num_tokens=max_num_tokens)
     model.set_attn_max_seq_len(fixed_max_seq_len)
 
@@ -582,7 +582,7 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
 #
 # CPU-only unit tests that reach into the InputProcessorBase classes directly
 # (no model load) and stub just enough of the HF config so the encoder-side
-# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data_*``
+# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data``
 # math runs. Token unit is pre-merger encoder attention, matching
 # ``encoder_max_num_tokens``.
 # ---------------------------------------------------------------------------
@@ -617,6 +617,7 @@ def _make_dummy_processor(
             "shortest_edge": min_pixels,
             "longest_edge": max_pixels
         }))
+    instance._dtype = torch.float16
     return instance
 
 
@@ -729,40 +730,6 @@ def test_get_size_rejects_non_positive_budget(processor_cls):
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_shapes_match_token_count(processor_cls):
-    """Direct tensor build: pixel_values rows and the grid_thw product match ``_num_vision_tokens`` per image."""
-    proc = _make_dummy_processor(processor_cls)
-    cfg = proc._config.vision_config
-    width = height = 224
-    per_image = proc._num_vision_tokens(width=width, height=height)
-    in_dim = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
-
-    data = proc.get_dummy_mm_data_for_size(width=width,
-                                           height=height,
-                                           num_images=3,
-                                           dtype=torch.float32)
-    image = data["image"]
-    assert image["pixel_values"].shape == (3 * per_image, in_dim)
-    assert image["pixel_values"].dtype == torch.float32
-    assert image["image_grid_thw"].shape == (3, 3)
-    # Each grid row's product equals the per-image token count.
-    grid = image["image_grid_thw"]
-    assert int(grid[0].prod().item()) == per_image
-    assert torch.equal(grid[0], grid[1]) and torch.equal(grid[1], grid[2])
-
-
-@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_single_image_default(processor_cls):
-    """Defaults to a single image; grid_thw is ``[1, 3]``."""
-    proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_size(width=224,
-                                           height=224,
-                                           dtype=torch.float16)
-    assert data["image"]["image_grid_thw"].shape == (1, 3)
-    assert data["image"]["pixel_values"].dtype == torch.float16
-
-
-@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 def test_mm_max_tokens_per_item_is_image_only(processor_cls):
     """Qwen-VL declares only ``image`` (image+video share one ViT), valued at the max single-image token count."""
     proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
@@ -775,18 +742,148 @@ def test_mm_max_tokens_per_item_is_image_only(processor_cls):
     assert demand["image"] > 0
 
 
+def test_qwen2_5_attention_metadata_capacity_uses_processor_geometry():
+    proc = _make_dummy_processor(
+        Qwen2VLInputProcessorBase,
+        patch_size=16,
+        spatial_merge_size=2,
+        min_pixels=32 * 32 * 4,
+        max_pixels=32 * 32 * 64,
+    )
+    proc.config.vision_config.window_size = 128
+
+    capacities = proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_items=8, max_num_tokens=160)
+
+    # One full-attention frame has at least 4 merged cells * 4 physical
+    # patches. For 4x4 windows the worst window/area ratio is a 1x4 merged
+    # grid: the encoder pads an exactly-divisible dimension by a whole window
+    # (see `_windows_along`), so it emits 2 windows for 16 physical patches.
+    # A 160-token batch therefore holds 10 such frames and 20 contexts.
+    assert capacities == {
+        "full_attention": 10,
+        "window_attention": 20,
+    }
+
+
+@pytest.mark.parametrize(
+    "merged_h,merged_w,expected_windows",
+    [
+        (1, 4, 2),  # width exactly divisible -> one all-padding window
+        (4, 4, 4),  # both exactly divisible -> ceil() would say 1
+        (2, 8, 3),
+        (8, 8, 9),
+        (3, 5, 2),  # neither divisible -> ceil() already agreed
+        (1, 3, 1),
+    ],
+)
+def test_window_count_matches_encoder_padding(merged_h, merged_w,
+                                              expected_windows):
+    """Capacity sizing must count windows the way the encoder emits them.
+
+    `get_window_index_by_thw` pads by `window - dim % window`, which is a
+    whole extra window when `dim` is an exact multiple. Those windows carry
+    only padding, so their sequence length is zero, but they still reach
+    `window_seq_lens` and still count as contexts -- so sizing the metadata
+    with `ceil()` under-allocates exactly on the divisible cases.
+    """
+    window_side = 4
+    windows = (Qwen2VLInputProcessorBase._windows_along(merged_h, window_side) *
+               Qwen2VLInputProcessorBase._windows_along(merged_w, window_side))
+    assert windows == expected_windows
+
+
+def test_qwen2_5_rejects_runtime_grid_below_startup_geometry():
+    proc = _make_dummy_processor(
+        Qwen2VLInputProcessorBase,
+        patch_size=16,
+        spatial_merge_size=2,
+        min_pixels=32 * 32 * 4,
+        max_pixels=32 * 32 * 64,
+    )
+    proc.config.vision_config.window_size = 128
+
+    proc._validate_encoder_attention_geometry(
+        {"image": torch.tensor([[1, 4, 4]])})
+    with pytest.raises(ValueError, match="startup processor geometry"):
+        proc._validate_encoder_attention_geometry(
+            {"image": torch.tensor([[1, 2, 2]])})
+
+
+def test_qwen3_attention_capacity_keeps_long_video_safe():
+    proc = _make_dummy_processor(Qwen3VLInputProcessorBase,
+                                 spatial_merge_size=2)
+
+    capacities = proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_items=1, max_num_tokens=160)
+
+    # Qwen3's video resize clamp applies to aggregate temporal pixels. A long
+    # atomic video can therefore reach the hard one-merged-cell minimum for
+    # each temporal segment, irrespective of the item-count budget.
+    assert capacities == {"attention": 40}
+
+
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 @pytest.mark.parametrize("budget", [1024, 4096, 16384])
-def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
-    """Agnostic entry: total pre-merger patches are ``<= budget`` and within one image of it (saturates the budget)."""
+def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
     proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float32)
-    grid = data["image"]["image_grid_thw"]
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        max_num_items=1,
+        dtype=torch.float32,
+    )["image"]
+    grid = image["image_grid_thw"]
     total_patches = int(grid.prod(dim=1).sum().item())
     per_image = int(grid[0].prod().item())
-    # pixel_values rows == total patches across all batched images.
-    assert data["image"]["pixel_values"].shape[0] == total_patches
-    # Saturates: within the budget, and adding one more image would exceed it.
+    assert image["pixel_values"].shape[0] == total_patches
+    assert image["pixel_values"].dtype == torch.float32
     assert total_patches <= budget
     assert total_patches + per_image > budget
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_dummy_mm_data_covers_many_item_boundary(processor_cls):
+    proc = _make_dummy_processor(processor_cls)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        max_num_items=8,
+        dtype=torch.float16,
+    )["image"]
+    token_lengths = image["image_grid_thw"].prod(dim=1).tolist()
+    assert token_lengths == [1024] * 8
+    assert image["pixel_values"].shape[0] == sum(token_lengths) == 8192
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_dummy_mm_data_satisfies_the_encoder_input_contract(processor_cls):
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real parsing step instead of restating its
+    key names here, so a rename on either side fails this test.
+    """
+    proc = _make_dummy_processor(processor_cls)
+    mm_data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        max_num_items=8,
+        dtype=torch.float16,
+    )
+
+    # `_parse_and_batch_multimodal_data` reads only its argument, so an unbound
+    # call exercises the contract without constructing vision weights.
+    content, extra = Qwen2VisionModelBase._parse_and_batch_multimodal_data(
+        None, [MultimodalParams(multimodal_data=mm_data)])
+
+    pixel_values = content["pixel_values"]
+    grid = extra["image_grid_thw"]
+    # The encoder derives its attention sequence lengths from the grid, so the
+    # patch rows it was handed have to match.
+    assert pixel_values.shape[0] == int(grid.prod(dim=1).sum())
+    # The trailing dim is what the patch embedding projects. The dummy builder
+    # recomputes it, so pin it against the config the encoder is built from.
+    cfg = proc.config.vision_config
+    assert pixel_values.shape[1] == (cfg.in_channels * cfg.temporal_patch_size *
+                                     cfg.patch_size * cfg.patch_size)
+    assert pixel_values.dtype == torch.float16

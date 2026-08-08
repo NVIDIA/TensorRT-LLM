@@ -489,7 +489,7 @@
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
-      "path": "encoder_max_batch_size"
+      "path": "encoder_max_num_items"
     },
     {
       "allowed_values": [],
@@ -1055,6 +1055,17 @@
       "converter": "",
       "kind": "value",
       "path": "multimodal_config.encoder_cache_max_bytes"
+    },
+    {
+      "allowed_values": [
+        "DISABLED",
+        "DEFAULT",
+        "EAGER"
+      ],
+      "annotation": "<enum 'MultimodalEncoderSchedulingPolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "multimodal_config.encoder_scheduling_policy"
     },
     {
       "allowed_values": [],

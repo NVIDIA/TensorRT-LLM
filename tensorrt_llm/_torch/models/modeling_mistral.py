@@ -1,6 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import dataclasses
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torchvision
@@ -47,7 +50,8 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
+                                          MultimodalEncoderItemMetadata)
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
@@ -406,6 +410,40 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_mm_encoder_item_metadata(
+        self,
+        _prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return Pixtral image items and physical ViT patch counts."""
+        image_data = multimodal_data.get("image")
+        if not isinstance(image_data, dict):
+            return None
+        image_sizes = image_data.get("image_sizes")
+        if image_sizes is None:
+            return None
+        patch, merge, _, _ = self._vision_geometry()
+        encoder_token_lengths = [
+            self._vit_tokens(width=int(width), height=int(height), patch=patch)
+            for height, width in image_sizes
+        ]
+        min_tokens_per_image = merge * merge
+        if any(token_length < min_tokens_per_image or token_length %
+               min_tokens_per_image for token_length in encoder_token_lengths):
+            raise ValueError(
+                "Processed Mistral image geometry must contain a nonempty "
+                f"multiple of {min_tokens_per_image} encoder tokens")
+        item_refs = [("image", item_idx)
+                     for item_idx in range(len(encoder_token_lengths))]
+        output_embedding_lengths = [
+            token_length // (merge * merge)
+            for token_length in encoder_token_lengths
+        ]
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
+
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -453,7 +491,7 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
     # Deterministic dummy sizing for KV-cache encoder profiling.
     #
     # These power the modality-agnostic dummy contract
-    # (``get_mm_max_tokens_per_item`` / ``get_dummy_mm_data_for_tokens``) and
+    # (``get_mm_max_tokens_per_item`` / ``get_dummy_mm_data``) and
     # are deliberately kept separate from the hashing path: the hashing path
     # (``get_num_tokens_per_image``) keeps using the processor's LLM-side
     # token count (Pixtral grid + ``[IMG_BREAK]``/``[IMG_END]`` framing), while
@@ -495,28 +533,29 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             edge -= unit
         return {"width": edge, "height": edge, "num_frames": 1}
 
-    def get_dummy_mm_data_for_size(
+    def _dummy_mm_data_for_size(
         self,
         *,
         width: int,
         height: int,
-        num_frames: int = 1,
         num_images: int = 1,
         dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
-        """Processed Pixtral encoder tensors for ``num_images`` identical
-        ``(width, height)`` images: a ``[num_images, C, H, W]`` ``pixel_values``
-        zero tensor (content is irrelevant for memory profiling) plus the
-        matching ``image_sizes`` list the vision tower consumes."""
+        """Build processed Pixtral vision tensors of the requested geometry.
+
+        Image-only: Pixtral has no temporal axis, so there is no frame count
+        to take here (contrast the Qwen helper, which grids over frames).
+        """
         _, _, channels, _ = self._vision_geometry()
         num_images = max(num_images, 1)
-        pixel_values = torch.zeros((num_images, channels, height, width),
-                                   dtype=dtype or self.dtype)
-        image_sizes = [[height, width]] * num_images
+        pixel_values = torch.zeros(
+            (num_images, channels, height, width),
+            dtype=dtype or self.dtype,
+        )
         return {
             "image": {
                 "pixel_values": pixel_values,
-                "image_sizes": image_sizes,
+                "image_sizes": [[height, width]] * num_images,
             }
         }
 
@@ -529,31 +568,54 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         edge = max((max_size // unit) * unit, unit)
         return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
 
-    def get_dummy_mm_data_for_tokens(
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_items: int, max_num_encoder_tokens: int) -> int:
+        """Bound post-merger embeddings from one Pixtral encoder iteration."""
+        _, merge, _, _ = self._vision_geometry()
+        return max_num_encoder_tokens // (merge * merge)
+
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_items: int,
+            max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Pixtral contexts by item and physical-token budgets."""
+        _, merge, _, _ = self._vision_geometry()
+        min_tokens_per_image = merge * merge
+        return {
+            "attention":
+            max(1, min(max_num_items, max_num_tokens // min_tokens_per_image))
+        }
+
+    def get_dummy_mm_data(
         self,
         *,
-        max_tokens_per_modality: Dict[str, int],
+        max_num_encoder_tokens: int,
+        max_num_items: int,
         dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
-        """Vision implementation of the agnostic profiler entry: fill the
-        ``"image"`` budget with identical worst-case images. ``num_images`` is
-        derived from the realized patch count so the batch saturates the
-        budget."""
-        budget = max_tokens_per_modality.get("image")
-        if not budget:
-            return {}
+        """Build a processed full-budget encoder profiling batch."""
+        if max_num_encoder_tokens <= 0:
+            raise ValueError("max_num_encoder_tokens must be positive")
+        if max_num_items <= 0:
+            raise ValueError("max_num_items must be positive")
+
+        per_image_budget = max(1, max_num_encoder_tokens // max_num_items)
         patch, _, _, _ = self._vision_geometry()
-        size = self.get_size_for_max_tokens(max_tokens=budget)
+        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
             1,
             self._vit_tokens(width=size["width"],
                              height=size["height"],
                              patch=patch))
-        num_images = max(1, budget // tokens_per_image)
-        return self.get_dummy_mm_data_for_size(width=size["width"],
-                                               height=size["height"],
-                                               num_images=num_images,
-                                               dtype=dtype)
+        if tokens_per_image > max_num_encoder_tokens:
+            return {}
+        num_images = min(max_num_items,
+                         max_num_encoder_tokens // tokens_per_image)
+        return self._dummy_mm_data_for_size(
+            width=size["width"],
+            height=size["height"],
+            num_images=num_images,
+            dtype=dtype,
+        )
 
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
@@ -711,6 +773,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     """
 
     supports_encoder_cache = True
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(
         self,
