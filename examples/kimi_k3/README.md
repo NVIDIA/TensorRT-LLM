@@ -193,4 +193,3 @@ default cache manager.
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
 - Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). Combining speculation with disaggregated serving is not yet supported.
-- Disaggregated serving is not yet supported.
