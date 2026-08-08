@@ -30,15 +30,16 @@ real model weights.
 """
 
 import gc
+import os
 import pathlib as _pl
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from typing import Any, Iterable
+from typing import Any, Generator, Iterable
 
 import pytest
+import torch
 from pydantic import ValidationError
 from test_beam_search_util import DummyConfigLoader, DummyWeightLoader
-from utils.util import assert_no_cuda_sync
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
@@ -421,6 +422,35 @@ def test_speculative_d2h_rejects_async_worker_combo(
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _assert_no_cuda_sync_locally() -> Generator[None, None, None]:
+    """Local stand-in for utils.util.assert_no_cuda_sync.
+
+    That helper parks a @hostfunc on the stream to block it, and only lowers
+    its cancel flag *after* the assertion. The hostfunc holds the GIL while it
+    spins, so anything that blocks before the cancel deadlocks the step: the
+    main thread waits on the stream, the stream waits on the hostfunc, and the
+    hostfunc waits for a cancel that the main thread never reaches. On the
+    speculative path -- side-stream copier plus the executor's own threads --
+    that race is live, and CI hangs here until the 3600s pytest timeout.
+
+    Detect the same thing without parking anything on the stream:
+    set_sync_debug_mode("error") makes torch raise on a synchronizing call,
+    which is the actual property under test. It misses syncs from non-torch
+    kernels, which the stream-blocking variant would catch; nothing in
+    sample_async/update_requests issues those today.
+    """
+    if int(os.environ.get("CUDA_LAUNCH_BLOCKING", 0)):
+        yield None
+        return
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield None
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+
 @pytest.mark.threadleak(enabled=False)
 def test_speculative_d2h_predictor_hit_is_sync_free(
     fixed_params: dict[str, Any],
@@ -431,7 +461,7 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
     inside `sample_async` or inside `update_requests` after the sampler
     event has been awaited.
 
-    Mirrors the `assert_no_cuda_sync()` hook used by
+    Mirrors the sync check used by
     `tests/unittest/_torch/sampler/test_beam_search.py::validate_outputs`,
     but pins the predictor to always-hit so every step routes through
     the side-stream copier and never reaches the `.cpu()` fallback.
@@ -444,17 +474,17 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
 
     def _sample_async_hook(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         hook_state["sample_async_called"] = True
-        with assert_no_cuda_sync():
+        with _assert_no_cuda_sync_locally():
             return sample_async_orig(self, *args, **kwargs)
 
     def _update_requests_hook(self, state: SampleStateTorch, *args, **kwargs):  # type: ignore[no-untyped-def]
         hook_state["update_requests_called"] = True
         # Sampler event awaits all device work (incl. side-stream copies)
-        # and is the one expected sync; do it outside assert_no_cuda_sync.
+        # and is the one expected sync; do it outside the guard below.
         sampler_event = state.sampler_event
         if sampler_event:
             sampler_event.synchronize()
-        with assert_no_cuda_sync():
+        with _assert_no_cuda_sync_locally():
             state.sampler_event = None
             try:
                 return update_requests_orig(self, state, *args, **kwargs)
