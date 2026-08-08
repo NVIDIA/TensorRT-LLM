@@ -335,6 +335,12 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 - **验证中**:双节点重发修复后 serve——bia0003 steep(最狠压力)、bia0123 真实 device windows,各挂 64 并发 temp0 census + rowdiv 收割。判净标准:census 64/64 chars/tok≥1.5;steep 下 rowdiv 每步至多 2 个签名组(奇偶配对类)且无退化 token。
 - 附:静态审计同时清点出两个**潜伏**(非本案)bug:① 图内逐 token 采样参数缓冲 (temperatures/top_ks/top_ps) 按 S 打包、非贪婪异参数批下 w≠S 会串染(temp0/force-argmax 不读,故与本案无关);② plain-DSA 的 block_table S 口径 −1 掩码对 device windows 不安全(V4 路径不可达)。修复后另行立项。
 
+### 【08-08 10:31】修复验证判决:双面 census 全净
+
+- **steep 面(bia0003,最大幅度 w≠S 每步)**:64/64 干净(chars/tok 中位 4.07,min 3.41),rowdiv 输出中退化 token 串计数 **0**。修复前同配置:63-64/64 腐蚀、大批行塌缩 `(0,0,0)`。
+- **真实 device windows 面(bia0123)**:64/64 干净(中位 4.07),样本输出为连贯诗歌。rowdiv 行仍存在但形态为**健康节奏错峰**——真实窗口下各行推进速度不同,滞后行在后续步逐字复现相同元组(`(1956,7633,989)` step#8→9、`(13132,)` step#16→20),即同一文本、不同进度;这也说明 rowdiv 仪表的"锁步"前提只在 identity/同窗口类内成立,判净以 census 为准。
+- 结论:**bug #2 定案闭环——机制、观测、修复、验证互相咬合**。后续:completion 指纹对照(96.6% host+steep 参照线)、GSM8K 大并发精度(512/1024 global,device vs notrim)、诚实 device 吞吐网格。
+
 ### 备选修复方案评估(供评审;当前实施的是 A,标记为暂定)
 
 - **A(已实施,Python-only)**:捕获拷贝换 D2D 源(`_seq_lens_cuda`)+ NEXT_N 抬全局上界。最小爆炸半径,当场可在活挂载容器里验证;把双胞胎缓冲降级为 canonical 缓冲的衍生物。host 路径装填时刻数值逐位等价,uniform/eager 分支未触碰。
