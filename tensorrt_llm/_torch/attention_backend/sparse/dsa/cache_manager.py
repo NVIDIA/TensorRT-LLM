@@ -421,8 +421,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
             for local_layer_idx in range(self.num_local_layers)
         ]
         self._primary_pool_page_index_params = [
-            (int(converter.scale), int(converter.layer_offset))
-            for converter in primary_converters
+            (int(converter.scale), int(converter.layer_offset)) for converter in primary_converters
         ]
         full_indexer_local_layers = [
             local_layer_idx
@@ -463,9 +462,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
         """Return the formal V2 page scale and layer offset for sparse MLA."""
         return self._primary_pool_page_index_params[local_layer_idx]
 
-    def _extra_buffers_per_layer(
-        self, *, tokens_per_block: int
-    ) -> dict[int, List[BufferConfig]]:
+    def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {
             local_layer_idx: [
                 BufferConfig(
@@ -574,10 +571,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
         element_per_container = 2 if self.dtype == DataType.NVFP4 else 1
         dtype = torch.int8 if self.dtype == DataType.NVFP4 else self.dtype
         elements_per_layer = (
-            self.tokens_per_block
-            * first_num_heads
-            * first_head_dim
-            // element_per_container
+            self.tokens_per_block * first_num_heads * first_head_dim // element_per_container
         )
         shape = [
             self.blocks_in_primary_pool,

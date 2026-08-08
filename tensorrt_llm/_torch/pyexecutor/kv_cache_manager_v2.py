@@ -1081,14 +1081,18 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         # Both backends build layer_grouping on demand, and the layer order
-        # within a group is not part of its contract. Cache a stable
-        # config-order representative for each role in each logical group.
+        # within a group is not part of its contract. Cache a stable physical-
+        # layout representative for each role from the public pool descriptors.
         self.num_pools = len(self.impl.layer_grouping)
         self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
-        for layer in config.layers:
-            pool_id = int(self.impl.get_layer_group_id(layer.layer_id))
-            for buffer in layer.buffers:
-                self._pool_layer_ids_by_role.setdefault((pool_id, buffer.role), layer.layer_id)
+        for pool_group in self.impl.pool_group_descs:
+            for variant in pool_group.slot_desc.variants:
+                pool_id = int(variant.layer_group_id)
+                for coalesced in variant.coalesced_buffers:
+                    for buffer_id in coalesced.buffer_ids:
+                        self._pool_layer_ids_by_role.setdefault(
+                            (pool_id, buffer_id.role), buffer_id.layer_id
+                        )
         # num_pools is the logical layer-group count. With SWA scratch reuse,
         # scratch slot IDs are only valid with per-layer page indices, so the
         # attention op sees one virtual pool per local layer while the

@@ -129,6 +129,7 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
+    use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid routes.
@@ -137,9 +138,7 @@ def get_kv_cache_manager_cls(
                         "KV cache manager without mamba caching")
             if sparse_attn_config is not None:
                 return get_sparse_attn_kv_cache_manager(
-                    sparse_attn_config,
-                    use_kv_cache_manager_v2=kv_cache_config.
-                    use_kv_cache_manager_v2)
+                    sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
         if (sparse_attn_config is not None
@@ -152,8 +151,6 @@ def get_kv_cache_manager_cls(
         has_additional_snapshots = bool(
             state_config.additional_snapshot_offsets_from_start
             or state_config.additional_snapshot_offsets_from_end)
-        use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
-
         if has_additional_snapshots and not use_v2:
             raise ValueError("Mamba additional snapshot offsets require "
                              "use_kv_cache_manager_v2=True; V1 supports only "
@@ -268,9 +265,8 @@ def get_kv_cache_manager_cls(
                 "yet model retained recurrent-state snapshots.")
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(
-            sparse_attn_config,
-            use_kv_cache_manager_v2=kv_cache_config.use_kv_cache_manager_v2)
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config,
+                                                use_kv_cache_manager_v2=use_v2)
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
