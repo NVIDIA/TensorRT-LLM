@@ -387,6 +387,13 @@ def _forward_dsa_attn(
             indexer_intermediates=indexer_intermediates,
         )
 
+    # Join the aux-stream heuristic prev_topk write-back forked in
+    # sparse_attn_indexer, now that this layer's core attention is
+    # enqueued (the copy overlaps with it). Must stay within this
+    # layer's forward: CUDA graph capture rejects unjoined forks.
+    if self.mqa.indexer is not None:
+        self.mqa.indexer.maybe_join_prev_topk_copy()
+
 
 def should_use_short_mha(
     self, attn_metadata: AttentionMetadata, position_ids: Optional[torch.Tensor]
