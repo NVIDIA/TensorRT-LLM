@@ -226,12 +226,12 @@ class DeepEP(Communication):
 
         else:
             # Post-quant dispatch (quantized data, nvfp4 only)
+            # hidden_states_sf is guaranteed non-None here (checked in condition above)
 
-            if hidden_states_sf is not None:
-                # Adapter between `hidden_states_sf` and DeepEP
-                # TODO: remove the adapter by adding dtype support to DeepEP
-                sf_dtype = hidden_states_sf.dtype
-                hidden_states_sf = hidden_states_sf.view(torch.float32)
+            # Adapter between `hidden_states_sf` and DeepEP
+            # TODO: remove the adapter by adding dtype support to DeepEP
+            sf_dtype = hidden_states_sf.dtype
+            hidden_states_sf = hidden_states_sf.view(torch.float32)
 
             (
                 (hidden_states, hidden_states_sf),
@@ -256,8 +256,7 @@ class DeepEP(Communication):
                 )
             )
 
-            if hidden_states_sf is not None:
-                hidden_states_sf = hidden_states_sf.view(sf_dtype)
+            hidden_states_sf = hidden_states_sf.view(sf_dtype)
 
             # Store dispatch state for combine
             self._dispatch_state = {
