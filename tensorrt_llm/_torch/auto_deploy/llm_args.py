@@ -424,6 +424,37 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def reject_unsupported_nanojet_attention(self):
+        """Refuse configurations the nanojet attention backend cannot serve, at config time.
+
+        It keeps no KV cache — every answer comes from the Q/K/V of the current call — so
+        anything that needs history is out of reach. Catching it here rather than at the
+        first forward means the user is told before loading weights and building the graph,
+        and is never handed a silently wrong result.
+        """
+        if self.attn_backend != "nanojet":
+            return self
+
+        unsupported = []
+        if self.enable_chunked_prefill:
+            unsupported.append(
+                "chunked prefill (a continuation chunk's earlier keys live in a cache)"
+            )
+        if self.speculative_config is not None:
+            unsupported.append("speculative decoding (needs cached history)")
+        if self.cuda_graph_config is not None:
+            unsupported.append(
+                "CUDA graph capture (the shapes it captures are decode shapes)"
+            )
+        if unsupported:
+            raise ValueError(
+                "attn_backend='nanojet' is prefill-only and keeps no KV cache, so it cannot "
+                "support: " + "; ".join(unsupported) + ". Use attn_backend='trtllm' or "
+                "'flashinfer', or disable the feature."
+            )
+        return self
+
+    @model_validator(mode="after")
     def reject_cudagraph_for_speculative_flashinfer(self):
         if (
             self.speculative_config is not None
