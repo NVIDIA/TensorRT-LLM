@@ -34,7 +34,7 @@ def _max_err(actual, reference):
     return (actual.double() - reference).abs().max().item()
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 7, 8, 9, 12, 15, 16])
 def test_matches_fp64_reference(num_tokens):
     x, w = _inputs(num_tokens, M3_HIDDEN, M3_EXPERTS)
     reference = x.double() @ w.double().t()
@@ -48,7 +48,7 @@ def test_matches_fp64_reference(num_tokens):
     assert _max_err(out, reference) < 2e-4
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_at_least_as_accurate_as_tf32_cublas(num_tokens):
     """The path being replaced rounds both operands to a 10-bit mantissa."""
     x, w = _inputs(num_tokens, M3_HIDDEN, M3_EXPERTS)
@@ -66,7 +66,7 @@ def test_at_least_as_accurate_as_tf32_cublas(num_tokens):
     assert _max_err(out, reference) <= _max_err(cublas_tf32, reference)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_tracks_true_fp32_cublas(num_tokens):
     x, w = _inputs(num_tokens, M3_HIDDEN, M3_EXPERTS)
 

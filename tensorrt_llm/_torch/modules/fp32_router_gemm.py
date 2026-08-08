@@ -31,9 +31,12 @@ import triton
 import triton.language as tl
 
 # Measured on B200 at 128 experts / 6144 hidden, against the cuBLAS sequence:
-# 3.4x at 1 token, 2.7x at 4, 1.8x at 8, and a loss by 16. One CTA per expert
-# stops paying once the batch is wide enough for cuBLAS to tile it.
-MAX_GEMV_TOKENS = 8
+# 3.4x at 4 tokens, 1.6x at 12, 1.5x at 16, and 0.85x by 32. The turn comes from
+# the register tile: the activation block is BLOCK_M x BLOCK_K, so past 16
+# tokens BLOCK_K has to shrink faster than the extra rows pay for, and cuBLAS'
+# tiling wins. Streaming K per token the way dsv3RouterGemm does would push this
+# out, at the cost of a C++ kernel with a separate instantiation per token count.
+MAX_GEMV_TOKENS = 16
 
 # Elements of the activation tile held in registers per CTA, which sets the K
 # block. Larger was monotonically better across the whole tuning sweep, all the
@@ -131,6 +134,8 @@ def fp32_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch
         out.stride(1),
         BLOCK_M=block_m,
         BLOCK_K=block_k,
-        num_warps=8,
+        # A wide block has enough loads to keep 8 warps busy; a narrow one only
+        # spreads thinner, and 4 measured faster at BLOCK_K=2048.
+        num_warps=8 if block_k >= 4096 else 4,
     )
     return out
