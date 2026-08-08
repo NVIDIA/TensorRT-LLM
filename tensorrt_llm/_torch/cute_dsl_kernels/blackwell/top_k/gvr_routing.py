@@ -104,8 +104,17 @@ RUNGS_ONLY_MAX_N = 49152
 # 1.5us there, which is enough to take the upper half of the band back
 # off the stock kernel (2 cells fall through now, down from 4).
 ASSIST_WEAK_MIN_N = 49152
-ASSIST_WEAK_MAX_N_SMALL_K = 98304  # k <= ASSIST_WEAK_K
-ASSIST_WEAK_MAX_N_LARGE_K = 98304
+# Narrowed again from 98304 to 65536: at n_comp 65536 the band's premise no
+# longer holds. Measured on the full grid (kernel-only, us/step), the stock
+# kernel is NOT the fastest arm there - counts beats it by 2.19 (flash) and
+# 2.38 (pro), and the counts emission at that batch costs only +0.27us on the
+# indexer (re-measured after the tight-line parking; the old table charged
+# +2.0us at batch 8, which is what kept the band this wide). Net +1.9 to
+# +2.1us per step, i.e. those cells go 1.11 -> ~1.31 against the baseline.
+# The interior of the band (49152 <= n_comp < 65536) is untouched: no grid
+# unit lands there, so it stays on the stock kernel until someone measures it.
+ASSIST_WEAK_MAX_N_SMALL_K = 65536  # k <= ASSIST_WEAK_K
+ASSIST_WEAK_MAX_N_LARGE_K = 65536
 ASSIST_WEAK_K = 512
 ASSIST_WEAK_MAX_B = 8
 
