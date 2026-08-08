@@ -1111,6 +1111,10 @@ class _ResponseStub:
         self.responses = {}
         self.is_shutdown = False
         self._event_loop_error = None
+        # Set when the stashed error is handed to a caller: that is what tells
+        # the rank-crash kill the crash was already reported and the world does
+        # not need tearing down.
+        self._event_loop_error_delivered = threading.Event()
 
     # Bind the real production method so the test exercises real code.
     _await_single_response = PyExecutor._await_single_response
@@ -1149,6 +1153,10 @@ class TestAwaitSingleResponseShutdown:
         with pytest.raises(RuntimeError, match="Event loop terminated"):
             stub._await_single_response(id=42, timeout=1.0)
 
+        # The caller now holds the original error, so the rank-crash kill must
+        # stand down: this is the signal it waits out its grace for.
+        assert stub._event_loop_error_delivered.is_set()
+
     def test_raises_on_shutdown_without_event_loop_error(self):
         """Shutdown without a stored error still raises rather than blocking
         — distinguishes "shutdown" from "timed out without shutdown"."""
@@ -1157,6 +1165,10 @@ class TestAwaitSingleResponseShutdown:
 
         with pytest.raises(RuntimeError, match="Event loop shut down"):
             stub._await_single_response(id=42, timeout=1.0)
+
+        # Nothing was delivered -- there was no error to deliver. Leaving the
+        # gate clear keeps the kill armed, which is correct here.
+        assert not stub._event_loop_error_delivered.is_set()
 
     def test_returns_empty_on_timeout(self):
         """Pre-fix behaviour: a bare timeout (no shutdown, no response) used

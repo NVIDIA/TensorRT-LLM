@@ -1152,6 +1152,15 @@ class AwaitResponseHelper:
         # thread in that case too — see nvbug 6038228.
         error = getattr(self.worker.engine, "_event_loop_error", None)
         if error is not None:
+            # Broadcasting wakes every pending GenerationResult with the real
+            # error, so the crash is reportable. Tell the rank-crash kill that,
+            # so a symmetric crash (every rank raised the same deterministic
+            # error, nobody stranded) ends in N tracebacks rather than in
+            # MPI_Abort replacing them with a bare exit 137.
+            delivered = getattr(self.worker.engine,
+                                "_event_loop_error_delivered", None)
+            if delivered is not None:
+                delivered.set()
             return self._broadcast_event_loop_error(error)
         return True
 
