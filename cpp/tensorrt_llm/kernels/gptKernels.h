@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
@@ -115,6 +116,10 @@ struct BuildDecoderInfoParams
     int* seqQOffsets;
     // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
     int* seqKVOffsets;
+    // Precomputed offsets to the 1st token in each sequence of Q buffer. Shape: [batchSize+1].
+    int const* precomputedSeqQOffsets;
+    // Precomputed offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
+    int const* precomputedSeqKVOffsets;
     // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
     // [numTokens].
     int* paddingOffsets;
@@ -223,11 +228,11 @@ struct BuildDecoderInfoParams
     std::string toString() const
     {
         std::stringstream ss;
-        auto printTensor = [&ss](char const* name, void* ptr, nvinfer1::Dims shape)
+        auto printTensor = [&ss](char const* name, void* ptr, tensorrt_llm::Dims shape)
         {
             ss << name << ": ";
             if (ptr)
-                ss << *(runtime::ITensor::wrap((void*) ptr, nvinfer1::DataType::kINT32, shape));
+                ss << *(runtime::ITensor::wrap((void*) ptr, tensorrt_llm::DataType::kINT32, shape));
             else
                 ss << "nullptr";
             ss << std::endl;

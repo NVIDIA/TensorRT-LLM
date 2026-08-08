@@ -953,7 +953,8 @@ def test_pd_disagg_with_image_input(
         pytest.param(_LLAVA_DIR, True, False, id="llava_7b-encoder_embeddings"),
         # Encoder embeddings routed back through default_multimodal_input_loader.
         pytest.param(_LLAVA_DIR, True, True, id="llava_7b-loader_embeddings"),
-        # Qwen models don't implement attach_multimodal_embeddings, so only the raw path is exercised.
+        # Keep Qwen rows on the raw path here; Qwen image-embedding attach is
+        # covered by dedicated input-processor and OpenAI image_embeds tests.
         pytest.param(_QWEN_2_5_VL_DIR, False, False,
                      id="qwen2.5_3b-raw_inputs"),
         pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_2b-raw_inputs"),
@@ -1033,9 +1034,10 @@ def test_multi_request_batch_chat(
                                                    inputs_with_embeddings):
                 assert isinstance(input, dict)
                 assert isinstance(input_with_embedding, dict)
-                assert list(
-                    set(input.keys())
-                    ^ set(input_with_embedding.keys())) == ["multi_modal_data"]
+                assert (set(input.keys())
+                        ^ set(input_with_embedding.keys())) == {
+                            "multi_modal_data", "mm_item_order"
+                        }
                 assert set(input_with_embedding.keys()) == set(
                     ["prompt", "multi_modal_embeddings"])
                 assert input["prompt"] == input_with_embedding["prompt"]

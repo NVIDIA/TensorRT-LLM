@@ -122,6 +122,7 @@ def torch_attention(
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
     layer_type: str = "mha",
+    enable_sharding: bool = False,
 ) -> torch.Tensor:
     """
     SDPA attention (with optional GQA) that supports two memory layouts via `layout`:
@@ -252,5 +253,6 @@ def torch_attention_fake(
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
     layer_type: str = "mha",
+    enable_sharding: bool = False,
 ):
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()

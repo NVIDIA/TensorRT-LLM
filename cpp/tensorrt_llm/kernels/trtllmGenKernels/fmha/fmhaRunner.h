@@ -34,7 +34,7 @@ public:
     // Constructor.
     explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
         int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
-        int numEltsPerSageAttnBlkV = 0);
+        int numEltsPerSageAttnBlkV = 0, bool fusesDsv4InvRopeFp8Quant = false);
 
     TllmGenFmhaRunner() = default;
 
@@ -64,6 +64,7 @@ private:
     int mNumEltsPerSageAttnBlkK;
     int mNumEltsPerSageAttnBlkP;
     int mNumEltsPerSageAttnBlkV;
+    bool mFusesDsv4InvRopeFp8Quant{false};
 };
 
 } // namespace kernels

@@ -1,11 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from collections import OrderedDict
 from typing import List, Optional
+from weakref import WeakSet
 
 import torch
 import torch._inductor.config as inductor_config
 from torch._functorch.aot_autograd import aot_module_simplified
-from torch._inductor.compile_fx import compile_fx, select_decomp_table
+from torch._inductor.compile_fx import compile_fx_inner, select_decomp_table
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule
@@ -19,7 +35,7 @@ from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import (register_add_norm,
                                          register_add_norm_quant)
-from .piecewise_optimizer import piecewise_optimizer
+from .piecewise_optimizer import PiecewiseRunner, piecewise_optimizer
 from .recover_pass import recover_pass
 from .remove_copy_pass import remove_copy_for_mutates_args
 
@@ -56,6 +72,7 @@ class Backend:
         self.enable_inductor = enable_inductor
         self.capture_num_tokens = sorted(capture_num_tokens or [])
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
+        self._piecewise_runners: WeakSet[PiecewiseRunner] = WeakSet()
         self.no_optimization = False
         self.num_streams = max_num_streams
         self.events = Backend.Events()
@@ -107,6 +124,21 @@ class Backend:
                 torch.cuda.Event() for _ in range(num_events - len(self.events))
             ]
 
+    def clear_piecewise_cuda_graphs(self) -> None:
+        runners = list(self._piecewise_runners)
+        for runner in runners:
+            runner.clear_cuda_graphs()
+
+        # CUDACachingAllocator does not allow a private pool handle to be
+        # reused after its last graph is reset. Preserve the sharing between
+        # runners from the same compiled graph while rotating dead handles.
+        replacement_pools: dict[tuple[int, int], tuple[int, int]] = {}
+        for runner in runners:
+            old_pool = runner.graph_pool_handle
+            if old_pool not in replacement_pools:
+                replacement_pools[old_pool] = torch.cuda.graph_pool_handle()
+            runner.graph_pool_handle = replacement_pools[old_pool]
+
     def optimize(
         self,
         gm: GraphModule,
@@ -141,7 +173,7 @@ class Backend:
         gm.recompile()
 
         if self.piecewise_cuda_graph:
-            gm, num_events = piecewise_optimizer(
+            gm, num_events, runners = piecewise_optimizer(
                 gm,
                 example_inputs,
                 self.enable_inductor,
@@ -150,10 +182,11 @@ class Backend:
                 self._graph_pool_handle,
                 self.num_streams,
             )
+            self._piecewise_runners.update(runners)
             self.generate_events(num_events)
             return gm
         elif self.enable_inductor:
-            return compile_fx(gm, example_inputs)
+            return compile_fx_inner(gm, example_inputs)
         else:
             return gm
 
@@ -167,9 +200,19 @@ class Backend:
             return gm
 
         self.input_num_tokens = None
+        # On multimodal wrappers (e.g. Qwen2/3-VL) the LM forward is
+        # invoked with `input_ids=None` and `inputs_embeds=<tensor>`,
+        # so dynamo eliminates the `input_ids` placeholder; the
+        # `inputs_embeds` placeholder carries the (num_tokens, H)
+        # tensor whose leading dim is the same num_tokens.
         for node in gm.graph.nodes:
             if node.op == "placeholder":
-                if node.name in ["l_input_ids_", "l_kwargs_input_ids_"]:
+                if node.name in [
+                        "l_input_ids_",
+                        "l_kwargs_input_ids_",
+                        "l_inputs_embeds_",
+                        "l_kwargs_inputs_embeds_",
+                ]:
                     example_value = node.meta["example_value"]
                     assert isinstance(example_value, FakeTensor)
                     self.input_num_tokens = example_value.shape[0]

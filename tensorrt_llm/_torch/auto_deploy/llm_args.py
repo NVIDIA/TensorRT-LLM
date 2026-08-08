@@ -16,17 +16,16 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
 
-import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.llmapi.llm_args import (
-    BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+from tensorrt_llm.llmapi.utils import get_device_count
 
 from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
@@ -75,13 +74,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
-    build_config: Optional[BuildConfig] = Field(
-        default_factory=BuildConfig,
-        description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
-        exclude_from_json=True,
-        frozen=True,
-        repr=False,
-    )
     backend: Literal["_autodeploy"] = Field(
         default="_autodeploy",
         description="The backend to use for this LLM instance.",
@@ -89,7 +81,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     gpus_per_node: int = Field(
-        default=torch.cuda.device_count(),
+        default=get_device_count(),
         description="The number of GPUs per node.",
         frozen=True,
     )
@@ -101,11 +93,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
 
-    @field_validator("build_config", mode="before")
+    @field_validator("generation_config", mode="after")
     @classmethod
-    def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
-        msg = "build_config is not in use by AutoDeploy's LlmArgs"
-        return _check_for_default_value_only(cls, value, info, msg)
+    def ensure_no_generation_config_defaults(cls, value: str) -> str:
+        if value != "trtllm":
+            raise ValueError("AutoDeploy does not support generation_config='auto'; use 'trtllm'.")
+        return value
 
     @field_validator(
         "tensor_parallel_size",
@@ -443,6 +436,27 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def reject_piecewise_cuda_graph_for_speculative_decoding(self):
+        compile_model = self.transforms.get("compile_model", {})
+        if (
+            self.speculative_config is not None
+            and self.is_cuda_graph_enabled()
+            and compile_model.get("piecewise_enabled", False)
+        ):
+            raise ValueError(
+                "Speculative decoding with AutoDeploy does not currently support piecewise CUDA "
+                "graph capture."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def disable_piecewise_for_non_piecewise_backend(self):
+        compile_model = self.transforms.get("compile_model")
+        if compile_model is not None and not self.is_cuda_graph_enabled():
+            compile_model["piecewise_enabled"] = False
+        return self
+
     ### UTILITY METHODS ############################################################################
     @property
     def requires_uniform_kv_caches(self) -> bool:
@@ -476,6 +490,15 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             `self.max_seq_len` so that all downstream consumers see the same value.
         """
 
+        # Resolve enable_attention_dp from the same source `init_dist_config`
+        # uses so the factory sees the same value the runtime will see.
+        # TODO remove it once this is fixed: https://github.com/NVIDIA/TensorRT-LLM/issues/13134
+        ash = self.transforms.get("apply_sharding_hints", {})
+        sharding_config = (
+            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
+        )
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+
         # TODO (lucaslie): consider supporting Path objects in the model factory
         factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
@@ -486,6 +509,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             max_seq_len=self.max_seq_len,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
             sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
+            enable_attention_dp=enable_attention_dp,
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
@@ -497,7 +521,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return factory
 
     def is_cuda_graph_enabled(self) -> bool:
-        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+        cuda_graph_backends = {"torch-cudagraph", "torch-opt"}
+        return self.compile_backend in cuda_graph_backends
 
     def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
         """Build DistConfig from YAML transform config and runtime MPI info.

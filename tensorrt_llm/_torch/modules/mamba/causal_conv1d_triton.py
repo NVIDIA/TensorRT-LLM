@@ -158,7 +158,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 conv_states_ptrs = prior_tokens - 3 * stride_conv_state_tok  # [BLOCK_N]
                 col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
         else:
-            # prior-tokens are zeros
+            # No cached prefix: start the convolution window from zeros.
             if KERNEL_WIDTH >= 2:  # STRATEGY1
                 # first chunk and does not have prior-token, so just set to 0
                 col0 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)

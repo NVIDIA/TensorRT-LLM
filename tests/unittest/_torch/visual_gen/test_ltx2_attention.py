@@ -190,8 +190,12 @@ class TestLTX2CrossAttention(unittest.TestCase):
         x = torch.randn(batch_size, q_seq, query_dim, device=self.DEVICE, dtype=dtype) * 0.02
         ctx = torch.randn(batch_size, kv_seq, context_dim, device=self.DEVICE, dtype=dtype) * 0.02
 
+        # Cross-attn must use the cached pattern: project K/V upstream, then
+        # call forward with pre_projected_kv (production text cross-attn does
+        # this via prepare_text_cache; AV cross-attn does it inline).
         with torch.no_grad():
-            output = attn(x, context=ctx, pe=None)
+            k, v = attn.project_kv(ctx, pe=None)
+            output = attn(x, pre_projected_kv=(k, v), pe=None)
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
 
@@ -229,7 +233,8 @@ class TestLTX2CrossAttention(unittest.TestCase):
         ctx = torch.randn(batch_size, kv_seq, context_dim, device=self.DEVICE, dtype=dtype) * 0.02
 
         with torch.no_grad():
-            output = attn(x, context=ctx, pe=None)
+            k, v = attn.project_kv(ctx, pe=None)
+            output = attn(x, pre_projected_kv=(k, v), pe=None)
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
 

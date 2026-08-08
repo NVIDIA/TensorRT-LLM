@@ -59,6 +59,14 @@ class FluxPipeline(BasePipeline):
                 "FluxPipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for FLUX."
+            )
+
         super().__init__(pipeline_config)
 
     @staticmethod
@@ -231,11 +239,13 @@ class FluxPipeline(BasePipeline):
                         "return_dict",
                     ],
                     return_dict_default=False,
+                    return_tuple_when_return_dict_false=True,
                 )
             )
 
-            # TeaCache or Cache-DiT
-            self._setup_cache_acceleration(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT: resolve coefficients here; the loader enables
+            # cache acceleration after torch.compile (see PipelineLoader.load).
+            self._apply_teacache_coefficients(FLUX_TEACACHE_COEFFICIENTS)
 
     @property
     def default_generation_params(self):
@@ -349,7 +359,12 @@ class FluxPipeline(BasePipeline):
 
         # Denoising loop
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for FLUX transformer."""
             return self.transformer(

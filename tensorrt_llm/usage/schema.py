@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.1"
+EVENT_SCHEMA_VER = "0.2"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -117,8 +117,10 @@ class TrtllmInitialReport(BaseModel):
     disagg_role: str = Field(default="", max_length=_SHORT_STR, alias="disaggRole")
     deployment_id: str = Field(default="", max_length=_SHORT_STR, alias="deploymentId")
 
-    # Feature flags (JSON-serialized dict of enabled features)
+    # Legacy feature summary and sanitized opt-in LLM API config capture.
     features_json: str = Field(default="{}", alias="featuresJson")
+    llm_api_config_json: str = Field(default="{}", alias="llmApiConfigJson")
+    llm_api_config_meta_json: str = Field(default="{}", alias="llmApiConfigMetaJson")
 
     model_config = {"populate_by_name": True}
 

@@ -27,14 +27,26 @@ The transform should:
   5. Be compatible with CUDA graph capture & replay.
 """
 
+import pytest
 import torch
 import torch.nn as nn
+from torch.fx import Graph, GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn import (
+    _AUX_WORKSPACE_ID,
+    _build_aux_stream_all_gather_args,
+    _execute_kv_path_in_aux_stream,
     _execute_kv_proj_in_aux_stream,
     _find_kv_proj_linears,
 )
 from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import cuda_stream_manager
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+_TRTLLM_AG_AVAILABLE = getattr(torch.ops.auto_deploy, "trtllm_dist_all_gather", None) is not None
+_skip_no_trtllm_ag = pytest.mark.skipif(
+    not _TRTLLM_AG_AVAILABLE,
+    reason="trtllm_dist_all_gather not registered (standalone mode)",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers -- mock MLA-like module
@@ -85,6 +97,108 @@ def _build_gm(model, example_input):
     """Export *model* to an FX GraphModule."""
     egm = torch.export.export(model, (example_input,))
     return egm.module()
+
+
+class _UnfusedMLAWeights(nn.Module):
+    def __init__(self, q_dim: int, kv_dim: int, hidden: int):
+        super().__init__()
+        self.q_w = nn.Parameter(torch.randn(q_dim, hidden))
+        self.kv_w = nn.Parameter(torch.randn(kv_dim, hidden))
+
+
+def _set_linear_meta(node: Node, out_features: int) -> None:
+    node.meta["val"] = torch.empty(2, out_features)
+
+
+def _make_unfused_mla_graph(backend: str) -> tuple[GraphModule, Node, Node]:
+    """Build a minimal unfused MLA graph: fork -> Q/KV linears + KV all_gather."""
+    weights = _UnfusedMLAWeights(q_dim=64, kv_dim=32, hidden=128)
+    graph = Graph()
+    fork = graph.placeholder("fork")
+    fork.meta["val"] = torch.empty(2, 128)
+
+    q_linear = graph.call_function(
+        torch.ops.aten.linear.default,
+        (fork, weights.q_w),
+    )
+    _set_linear_meta(q_linear, 64)
+
+    kv_linear = graph.call_function(
+        torch.ops.aten.linear.default,
+        (fork, weights.kv_w),
+    )
+    _set_linear_meta(kv_linear, 32)
+
+    if backend == "trtllm":
+        kv_ag = graph.call_function(
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            (kv_linear, "SYMM_MEM", -1, None),
+        )
+        ag_op = torch.ops.auto_deploy.trtllm_dist_all_gather
+    else:
+        kv_ag = graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            (kv_linear, -1, None),
+        )
+        ag_op = torch.ops.auto_deploy.torch_dist_all_gather
+    kv_ag.meta["val"] = torch.empty(2, 32)
+
+    out = graph.call_function(torch.ops.aten.add.Tensor, (q_linear, kv_ag))
+    graph.output((out,))
+
+    return GraphModule(weights, graph), kv_ag, ag_op
+
+
+@_skip_no_trtllm_ag
+def test_build_aux_stream_all_gather_args_trtllm():
+    gm, kv_ag, _ = _make_unfused_mla_graph("trtllm")
+    new_input = gm.graph.call_function(
+        torch.ops.aten.add.Tensor, args=(gm.graph.placeholder("x"),) * 2
+    )
+
+    args = _build_aux_stream_all_gather_args(kv_ag, new_input)
+    assert args == (new_input, "SYMM_MEM", -1, None, _AUX_WORKSPACE_ID)
+
+
+def test_build_aux_stream_all_gather_args_torch():
+    gm, kv_ag, _ = _make_unfused_mla_graph("torch")
+    new_input = gm.graph.call_function(
+        torch.ops.aten.add.Tensor, args=(gm.graph.placeholder("y"),) * 2
+    )
+
+    args = _build_aux_stream_all_gather_args(kv_ag, new_input)
+    assert args == (new_input, -1, None)
+
+
+@_skip_no_trtllm_ag
+def test_pattern0_kv_path_rewrite_trtllm_all_gather_args():
+    gm, kv_ag, ag_op = _make_unfused_mla_graph("trtllm")
+    kv_ag.args = (kv_ag.args[0], "AUTO", -1, None)
+
+    gm, num_matches = _execute_kv_path_in_aux_stream(gm, world_size=2)
+    assert num_matches == 1
+
+    ag_nodes = [n for n in gm.graph.nodes if is_op(n, ag_op)]
+    assert len(ag_nodes) == 1
+    ag = ag_nodes[0]
+    assert ag.args[1] == "AUTO"
+    assert ag.args[2] == -1
+    assert ag.args[3] is None
+    assert ag.args[4] == _AUX_WORKSPACE_ID
+
+
+def test_pattern0_kv_path_rewrite_torch_all_gather_args():
+    gm, kv_ag, ag_op = _make_unfused_mla_graph("torch")
+    kv_ag.args = (kv_ag.args[0], -1)
+
+    gm, num_matches = _execute_kv_path_in_aux_stream(gm, world_size=2)
+    assert num_matches == 1
+
+    ag_nodes = [n for n in gm.graph.nodes if is_op(n, ag_op)]
+    assert len(ag_nodes) == 1
+    ag = ag_nodes[0]
+    assert len(ag.args) == 2
+    assert ag.args[1] == -1
 
 
 def test_pattern_matching_single_block():

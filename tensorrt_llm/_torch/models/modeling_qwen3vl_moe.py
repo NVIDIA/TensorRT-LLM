@@ -45,6 +45,8 @@ from .modeling_utils import ModelConfig, register_auto_model, register_vision_en
     ),
 )
 class Qwen3MoeVLModel(Qwen3VLModelBase):
+    supports_encoder_cache = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
         kwargs["vision_model_class"] = Qwen3VisionModel
@@ -59,6 +61,8 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
             "image.pixel_values",
             "video.pixel_values_videos",
             "multimodal_embedding",
+            "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas",
         ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):

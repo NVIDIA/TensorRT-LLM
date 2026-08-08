@@ -24,6 +24,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
@@ -33,12 +36,33 @@ try:
     from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
         Cosmos3VFMTransformer,
     )
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
+
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
+
+# Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
+# requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
+# LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
+# attn2d tests skip cleanly when the kernels are not built (e.g. non-Blackwell CI).
+try:
+    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+        _flash_attn_fwd as _fa4_fwd,
+    )
+    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+        _flash_attn_combine as _fa_combine,
+    )
+
+    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+except ImportError:
+    _ATTN2D_AVAILABLE = False
 
 pytestmark = pytest.mark.cosmos3
 
@@ -65,6 +89,17 @@ _COSMOS3_TEST_CONFIG = dict(
     enable_fps_modulation=True,
 )
 
+# attn2d needs an LSE-capable backend (FA4); FA4's CUTE kernels run with head_dim=128.
+# Same architecture as _COSMOS3_TEST_CONFIG otherwise (heads still divisible by
+# Ulysses=2 for the attn2d+ulysses case). mrope_section is unchanged: the interleave
+# slices clip to head_dim//2 (=64 here), so [16, 12, 12] stays valid.
+_COSMOS3_FA4_CONFIG = dict(
+    _COSMOS3_TEST_CONFIG,
+    head_dim=128,
+    hidden_size=8 * 128,
+    intermediate_size=1024,
+)
+
 # Video: [B, C, T, H, W]. patch_size=2 → seq_len = T * (H/2) * (W/2).
 # T=2, H=W=4 → seq_len=8 (divisible by Ulysses=2). T>1 exercises fps modulation.
 _LATENT_T = 2
@@ -73,7 +108,26 @@ _LATENT_W = 4
 _TEXT_LEN = 8
 _MAX_TEXT_LEN = 16
 _TIMESTEP = 500.0
+_NUM_TRAIN_TIMESTEPS = 1000.0
 _FPS = 24.0
+
+# Audio (sound) modality: audio tokens are appended to the gen sequence, so the
+# combined seq becomes video_tokens (8) + T_audio. Keep T_audio even so the
+# combined length stays divisible by Ulysses=2 (the sharder also pads, but this
+# keeps the parity comparison free of padding artifacts).
+_AUDIO_DIM = 16
+_T_AUDIO = 4
+_SOUND_LATENT_FPS = 24.0
+
+# Same architecture as _COSMOS3_TEST_CONFIG, with the audio modality enabled.
+# The transformer reads audio attributes via the legacy ``sound_*`` keys.
+_COSMOS3_AUDIO_CONFIG = dict(
+    **_COSMOS3_TEST_CONFIG,
+    sound_gen=True,
+    sound_dim=_AUDIO_DIM,
+    sound_latent_fps=_SOUND_LATENT_FPS,
+    temporal_compression_factor_sound=1,
+)
 
 SEED_WEIGHTS = 123
 SEED_INPUT = 456
@@ -135,9 +189,13 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker, args=(world_size, backend, test_fn, port), nprocs=world_size, join=True
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, backend, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 
@@ -152,10 +210,12 @@ def _make_model_config(
     cfg_size=1,
     tp_size=1,
     ulysses_size=1,
+    attn2d_row_size=1,
+    attn2d_col_size=1,
     backend="VANILLA",
 ):
     pretrained_config = SimpleNamespace(**pretrained_dict)
-    ws = cfg_size * tp_size * ulysses_size
+    ws = cfg_size * tp_size * ulysses_size * attn2d_row_size * attn2d_col_size
     if ws > 1 and dist.is_initialized():
         ws = dist.get_world_size()
         rk = dist.get_rank()
@@ -167,6 +227,8 @@ def _make_model_config(
         cfg_size=cfg_size,
         tp_size=tp_size,
         ulysses_size=ulysses_size,
+        attn2d_row_size=attn2d_row_size,
+        attn2d_col_size=attn2d_col_size,
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
@@ -326,12 +388,42 @@ def _forward(model: Cosmos3VFMTransformer, device: torch.device, text_seed: int)
     with torch.inference_mode():
         return model(
             hidden_states=hs,
-            timestep=ts,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
             text_ids=text_ids,
             text_mask=text_mask,
             video_shape=video_shape,
             fps=_FPS,
+        ).video
+
+
+def _forward_with_audio(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward an audio-enabled model; returns (video_velocity, audio_velocity)."""
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed
+    )
+    # Deterministic audio noise, independent of the (seed-controlled) video/text
+    # inputs, so ref and parallel models see identical audio_latents.
+    torch.manual_seed(SEED_INPUT + 1)
+    audio_latents = (
+        torch.randn(hs.shape[0], _AUDIO_DIM, _T_AUDIO, device=device, dtype=hs.dtype) * 0.1
+    )
+    model.reset_cache()
+    with torch.inference_mode():
+        out = model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+            audio_latents=audio_latents,
         )
+    return out.video, out.audio
 
 
 def _build_ref_and_parallel(
@@ -339,11 +431,18 @@ def _build_ref_and_parallel(
     tp_size: int = 1,
     ulysses_size: int = 1,
     cfg_size: int = 1,
+    attn2d_row_size: int = 1,
+    attn2d_col_size: int = 1,
+    backend: str = "VANILLA",
+    pretrained_dict: dict = None,
 ) -> Tuple[Cosmos3VFMTransformer, Cosmos3VFMTransformer, VisualGenMapping, torch.device]:
+    pretrained_dict = pretrained_dict if pretrained_dict is not None else _COSMOS3_TEST_CONFIG
     device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
 
     torch.manual_seed(SEED_WEIGHTS)
-    ref_config = _make_model_config(_COSMOS3_TEST_CONFIG, tp_size=1, ulysses_size=1)
+    # Reference is the unsharded model on the same compute backend, so parity isolates
+    # the parallelism (e.g. FA4-full vs FA4+attn2d) rather than comparing backends.
+    ref_config = _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend=backend)
     # Do not .to(bfloat16) the whole module — RoPE inv_freq must stay fp32 (see
     # Qwen3VLTextRotaryEmbedding.forward). post_load_weights() sets Linear/MLP to bf16.
     ref_model = Cosmos3VFMTransformer(ref_config).to(device).eval()
@@ -352,10 +451,13 @@ def _build_ref_and_parallel(
 
     torch.manual_seed(SEED_WEIGHTS)
     parallel_config = _make_model_config(
-        _COSMOS3_TEST_CONFIG,
+        pretrained_dict,
         cfg_size=cfg_size,
         tp_size=tp_size,
         ulysses_size=ulysses_size,
+        attn2d_row_size=attn2d_row_size,
+        attn2d_col_size=attn2d_col_size,
+        backend=backend,
     )
     vgm = parallel_config.visual_gen_mapping
     parallel_model = Cosmos3VFMTransformer(parallel_config).to(device).eval()
@@ -429,6 +531,37 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_ulysses_audio_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(
+        ulysses_size=world_size, pretrained_dict=_COSMOS3_AUDIO_CONFIG
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_video, ref_audio = _forward_with_audio(ref_model, device, text_seed)
+    ulysses_video, ulysses_audio = _forward_with_audio(ulysses_model, device, text_seed)
+
+    if rank == 0:
+        vdiff = (ulysses_video.float() - ref_video.float()).abs()
+        adiff = (ulysses_audio.float() - ref_audio.float()).abs()
+        print(
+            f"[ulysses={world_size}+audio] "
+            f"video max_abs_diff={vdiff.max().item():.6e}, "
+            f"audio max_abs_diff={adiff.max().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_video,
+        ref_video,
+        msg=f"Rank {rank}: Ulysses+audio VIDEO differs from single-GPU reference",
+    )
+    _assert_parity(
+        ulysses_audio,
+        ref_audio,
+        msg=f"Rank {rank}: Ulysses+audio AUDIO differs from single-GPU reference",
+    )
+
+
 def _logic_cosmos3_tp_ulysses_vs_single_gpu(rank, world_size):
     tp_size = 2
     ulysses_size = 2
@@ -483,6 +616,74 @@ def _logic_cosmos3_cfg_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_attn2d_vs_single_gpu(rank, world_size):
+    # 2x1 attn2d mesh (Q gathered across rows, K/V kept local). FA4 backend since
+    # Attention2DAttention requires an LSE-capable inner backend.
+    try:
+        ref_model, attn2d_model, _, device = _build_ref_and_parallel(
+            attn2d_row_size=2,
+            attn2d_col_size=1,
+            backend="FA4",
+            pretrained_dict=_COSMOS3_FA4_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=1, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    attn2d_out = _forward(attn2d_model, device, text_seed)
+
+    if rank == 0:
+        diff = (attn2d_out.float() - ref_out.float()).abs()
+        print(
+            f"[attn2d=2x1] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        attn2d_out,
+        ref_out,
+        msg=f"Rank {rank}: Attention2D (2x1) output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_attn2d_ulysses_vs_single_gpu(rank, world_size):
+    # 2x1 attn2d mesh composed with Ulysses=2 (seq_size = attn2d * ulysses = 4).
+    attn2d_row_size = 2
+    ulysses_size = 2
+    try:
+        ref_model, parallel_model, _, device = _build_ref_and_parallel(
+            ulysses_size=ulysses_size,
+            attn2d_row_size=attn2d_row_size,
+            attn2d_col_size=1,
+            backend="FA4",
+            pretrained_dict=_COSMOS3_FA4_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=ulysses_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    parallel_out = _forward(parallel_model, device, text_seed)
+
+    if rank == 0:
+        diff = (parallel_out.float() - ref_out.float()).abs()
+        print(
+            f"[attn2d=2x1,ulysses={ulysses_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        parallel_out,
+        ref_out,
+        msg=f"Rank {rank}: Attention2D+Ulysses output differs from single-GPU reference",
+    )
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -504,6 +705,12 @@ class TestCosmos3TransformerParallel:
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
 
+    def test_ulysses2_audio_vs_single_gpu(self):
+        """Ulysses parity with the audio modality on: video + audio tokens are
+        sharded together across the sequence dimension."""
+        self._skip_if_unavailable()
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_audio_vs_single_gpu)
+
     @pytest.mark.gpu4
     def test_tp2_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
@@ -513,6 +720,19 @@ class TestCosmos3TransformerParallel:
     def test_cfg2_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_cfg_ulysses_vs_single_gpu)
+
+    def test_attn2d_2x1_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        if not _ATTN2D_AVAILABLE:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
+
+    @pytest.mark.gpu4
+    def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        if not _ATTN2D_AVAILABLE:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
 
 
 if __name__ == "__main__":

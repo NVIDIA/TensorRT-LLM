@@ -40,6 +40,11 @@ foreach(HEAD ${basic_heads})
   list(APPEND SRC_CU ${HEAD_SRCS})
 endforeach()
 
+# Cascade attention kernel. Compiled together with the basic heads so it lives
+# in the same shared library as the MMHA dispatcher that calls into it. Uses Dh
+# in {64, 128}.
+list(APPEND SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/cascadeAttentionKernel.cu)
+
 # skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
   set(extra_heads 256)
@@ -87,11 +92,3 @@ target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)
-
-# Embed cubins via INCBIN. Replaces the bin2c-style hex-array .cpp stubs that
-# previously lived under cubin/ and bloated the source tree by ~166 MB.
-include(tllm_cubin_archive)
-tllm_add_cubin_archive_sources(
-  decoder_attention_src "${CMAKE_CURRENT_SOURCE_DIR}/cubin"
-  ARCHS 80 86 89 90 120
-  IMPLICIT_FAMILY)

@@ -21,12 +21,13 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+    CUTE_AVAILABLE,
+)
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
 
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
@@ -222,6 +223,21 @@ class PipelineLoader:
             logger.info(f"Quantization: {config.quant_config.quant_algo.name}")
             logger.info(f"Dynamic weight quant: {config.dynamic_weight_quant}")
 
+        _attn_backend = config.attention.backend
+        _sa_cfg = config.attention.sparse_attention_config
+        if (
+            _attn_backend == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        ):
+            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            logger.info(
+                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
+            )
+        else:
+            logger.info(f"Attention backend: {_attn_backend}")
+
         # =====================================================================
         # STEP 1b: Build VisualGenMapping (must precede model creation)
         # =====================================================================
@@ -280,28 +296,23 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
-        sparse_cfg = config.attention.sparse_attention_config
-        if isinstance(sparse_cfg, SkipSoftmaxConfig) and (
-            sparse_cfg._layer_overrides or sparse_cfg._component_configs
-        ):
-            n = apply_skip_softmax_overrides(pipeline, sparse_cfg)
-            logger.info(f"Applied skip_softmax sparse config to {n} backends")
-
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")
 
+        # Cache acceleration (TeaCache / Cache-DiT) is enabled AFTER torch.compile
+        # on purpose: Cache-DiT captures references to the transformer block
+        # modules at enable time, while torch_compile() replaces the block lists
+        # with compiled copies. If Cache-DiT were enabled first, it would keep
+        # running the stale eager blocks and torch.compile would contribute
+        # nothing.
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline._setup_cache_acceleration()
+
         if not skip_warmup:
-            if config.torch_compile.enable_autotune:
-                with autotune(
-                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
-                    skip_dynamic_tuning_buckets=True,
-                ):
-                    pipeline.warmup()
-            else:
-                pipeline.warmup()
+            pipeline.warmup()
             logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
         else:
             logger.info("Warmup skipped (skip_warmup=True)")

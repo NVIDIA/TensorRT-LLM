@@ -22,6 +22,7 @@
 #include <cuda/cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 #include "CutlassPipeline.h"
 #include "CutlassBarrier.h"
 #include "CutlassUtils.h"
@@ -300,7 +301,8 @@ template <int32_t TileSizePerCtaQ,
           bool IsE4m3Bmm,
           bool UsesCgaReduction,
           typename DtypeO,
-          typename DtypePartialO>
+          typename DtypePartialO,
+          typename DtypeSfO = cutlass::float_e4m3_t>
 inline __device__ void reducePartialO(DtypeO* oPtr,
                                       DtypePartialO const* partialOPtr,
                                       float const* partialStatsPtr,
@@ -315,7 +317,7 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
                                       trtllm::dev::fast_mod_div numHeadsQPerKvDivisor,
                                       int32_t numValidRows,
                                       bool storesSoftmaxStats,
-                                      cutlass::float_e4m3_t* oSfPtr = nullptr,
+                                      DtypeSfO* oSfPtr = nullptr,
                                       float sfScale = 0.f,
                                       int32_t sfBaseRowIdx = 0) {
 
@@ -486,11 +488,14 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
     }
 
     // Convert the float values to DtypeO, and Store it to global memory.
-    if constexpr (std::is_same_v<DtypeO, cutlass::float_e2m1_t>) {
-      // The number of E2m1 elements packed in a byte.
-      int32_t constexpr NumE2m1EltsPerByte = 2;
+    constexpr bool IsMxE4m3Output = std::is_same_v<DtypeO, cutlass::float_e4m3_t> &&
+                                    std::is_same_v<DtypeSfO, cutlass::float_ue8m0_t>;
+    constexpr bool IsE2m1Output = std::is_same_v<DtypeO, cutlass::float_e2m1_t>;
+    if constexpr (IsMxE4m3Output || IsE2m1Output) {
+      // The number of output elements packed in a byte.
+      int32_t constexpr NumEltsPerDstByte = IsE2m1Output ? 2 : 1;
       // The number of elements per sf.
-      int32_t constexpr NumEltsPerSf = 16;
+      int32_t constexpr NumEltsPerSf = IsE2m1Output ? 16 : 32;
       // The number of cols of SF per block.
       int32_t constexpr NumColsPerSfBlock = 4;
       // The size of each SF block.
@@ -518,8 +523,9 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
         storeGmemSfOffset =
           sfColIdx / NumColsPerSfBlock * NumBytesPerSfBlock + sfColIdx % NumColsPerSfBlock;
       }
+
       convertAndStoreToGmem<DtypeO>(
-        reinterpret_cast<char*>(oPtr + gmemStoreOffset / NumE2m1EltsPerByte),
+        reinterpret_cast<char*>(oPtr + gmemStoreOffset / NumEltsPerDstByte),
         reinterpret_cast<char*>(oSfPtr) + storeGmemSfOffset,
         outputVals,
         sfScale,
@@ -543,7 +549,8 @@ template <int32_t TileSizePerCtaQ,
           bool UsesCgaReduction,
           typename DtypeO,
           typename DtypePartialO,
-          typename Barrier>
+          typename Barrier,
+          typename DtypeSfO = cutlass::float_e4m3_t>
 inline __device__ void reducePartialO(DtypeO* oPtr,
                                       DtypePartialO const* partialOPtr,
                                       float const* partialStatsPtr,
@@ -560,7 +567,7 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
                                       trtllm::dev::fast_mod_div numHeadsQPerKvDivisor,
                                       int32_t numValidRows,
                                       bool storesSoftmaxStats,
-                                      cutlass::float_e4m3_t* oSfPtr = nullptr,
+                                      DtypeSfO* oSfPtr = nullptr,
                                       float sfScale = 0.f,
                                       int32_t sfBaseRowIdx = 0) {
 

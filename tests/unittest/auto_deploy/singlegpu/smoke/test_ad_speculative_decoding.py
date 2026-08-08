@@ -45,6 +45,10 @@ def get_extra_seq_len_for_kv_cache(llm_args) -> int:
     return extra
 
 
+def piecewise_disabled_transforms():
+    return {"compile_model": {"piecewise_enabled": False}}
+
+
 def test_super_mtp_smoke():
     """Test one-model MTP/Eagle runtime with a tiny Nemotron SuperV3 target."""
     test_prompt = "What is the capital of France?"
@@ -74,6 +78,9 @@ def test_super_mtp_smoke():
     experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["disable_overlap_scheduler"] = True
     experiment_config["args"]["compile_backend"] = "torch-simple"
+    experiment_config["args"].setdefault("transforms", {}).setdefault("compile_model", {})[
+        "piecewise_enabled"
+    ] = False
     experiment_config["args"]["max_num_tokens"] = 256
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_prompt
@@ -187,6 +194,7 @@ def test_kv_cache_extra_seq_len_for_spec_dec():
         model="meta-llama/Meta-Llama-3.1-8B-Instruct",
         speculative_config=spec_config,
         disable_overlap_scheduler=True,
+        transforms=piecewise_disabled_transforms(),
     )
     extra = get_extra_seq_len_for_kv_cache(args_eagle)
     # Should include max_total_draft_tokens + get_num_extra_kv_tokens (max_draft_len - 1)
@@ -198,6 +206,7 @@ def test_kv_cache_extra_seq_len_for_spec_dec():
         model="meta-llama/Meta-Llama-3.1-8B-Instruct",
         speculative_config=spec_config,
         disable_overlap_scheduler=False,
+        transforms=piecewise_disabled_transforms(),
     )
     extra_overlap = get_extra_seq_len_for_kv_cache(args_eagle_overlap)
     # Should be more than without overlap
@@ -214,6 +223,7 @@ def test_mtp_autodeploy_uses_eagle_one_model_capture():
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
         ),
+        transforms=piecewise_disabled_transforms(),
     )
 
     assert isinstance(args.speculative_config, MTPDecodingConfig)
@@ -226,6 +236,9 @@ def test_detect_hidden_states_capture_last_layer_for_mtp_eagle_one_model():
     from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
     config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
+    config["args"].setdefault("transforms", {}).setdefault("compile_model", {})[
+        "piecewise_enabled"
+    ] = False
 
     args = LlmArgs(
         **config["args"],

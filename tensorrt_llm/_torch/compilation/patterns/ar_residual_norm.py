@@ -583,11 +583,13 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
     def register_ub_prologue_patterns(custom_pass: PatternMatcherPass):
 
         def register_scaled_mm_prologue(custom_pass: PatternMatcherPass):
+            output_buffer_kind_key = KeywordArg('output_buffer_kind')
             trtllm_cublas_scaled_mm_default = CallFunction(
                 torch.ops.trtllm.cublas_scaled_mm.default, KeywordArg('mm0_a'),
                 KeywordArg('mm0_b'), KeywordArg('mm0_a_scale'),
                 KeywordArg('mm0_b_scale'), KeywordArg('mm0_bias'),
-                KeywordArg('mm_dtype'))
+                KeywordArg('mm_dtype'), output_buffer_kind_key,
+                mapping.tp_group)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_cublas_scaled_mm_default)
 
@@ -598,6 +600,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 mm0_b_scale: torch.Tensor,
                 mm0_bias: Optional[torch.Tensor],
                 mm_dtype: torch.dtype,
+                output_buffer_kind: int,
             ):
                 return
 
@@ -608,10 +611,11 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 mm0_b_scale: torch.Tensor,
                 mm0_bias: Optional[torch.Tensor],
                 mm_dtype: torch.dtype,
+                output_buffer_kind: int,
             ):
                 scaled_mm_output = torch.ops.trtllm.cublas_scaled_mm(
                     mm0_a, mm0_b, mm0_a_scale, mm0_b_scale, mm0_bias, mm_dtype,
-                    True)
+                    int(BufferKind.USERBUFFERS), mapping.tp_group)
                 return scaled_mm_output
 
             # No extra check needed as the output dtype of scaled_mm has been verified when
@@ -635,15 +639,9 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             output_buffer_kind_key = KeywordArg('output_buffer_kind')
             allowed_backends_key = KeywordArg('allowed_backends')
             trtllm_nvfp4_gemm_default = CallFunction(
-                torch.ops.trtllm.nvfp4_gemm.default,
-                act_fp4_key,
-                weight_key,
-                act_sf_key,
-                weight_scale_key,
-                alpha_key,
-                output_dtype_key,
-                output_buffer_kind=output_buffer_kind_key,
-                allowed_backends=allowed_backends_key)
+                torch.ops.trtllm.nvfp4_gemm.default, act_fp4_key, weight_key,
+                act_sf_key, weight_scale_key, alpha_key, output_dtype_key,
+                output_buffer_kind_key, allowed_backends_key, mapping.tp_group)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
 
@@ -671,7 +669,48 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    int(BufferKind.USERBUFFERS), allowed_backends)
+                    int(BufferKind.USERBUFFERS), allowed_backends,
+                    mapping.tp_group)
+                return nvfp4_gemm_output
+
+            bias_key = KeywordArg('bias')
+            trtllm_nvfp4_gemm_with_bias_default = CallFunction(
+                torch.ops.trtllm.nvfp4_gemm.default, act_fp4_key, weight_key,
+                act_sf_key, weight_scale_key, alpha_key, output_dtype_key,
+                output_buffer_kind_key, allowed_backends_key, mapping.tp_group,
+                bias_key)
+            ub_copy_with_bias = CallFunction(
+                torch.ops.trtllm.copy_to_userbuffers,
+                trtllm_nvfp4_gemm_with_bias_default)
+
+            def empty_nvfp4_gemm_bias_prologue_pattern(
+                act_fp4: torch.Tensor,
+                weight: torch.Tensor,
+                act_sf: torch.Tensor,
+                weight_scale: torch.Tensor,
+                alpha: torch.Tensor,
+                output_dtype: torch.dtype,
+                output_buffer_kind: int,
+                allowed_backends: str,
+                bias: Optional[torch.Tensor],
+            ):
+                return
+
+            def target_nvfp4_gemm_bias_prologue_pattern(
+                act_fp4: torch.Tensor,
+                weight: torch.Tensor,
+                act_sf: torch.Tensor,
+                weight_scale: torch.Tensor,
+                alpha: torch.Tensor,
+                output_dtype: torch.dtype,
+                output_buffer_kind: int,
+                allowed_backends: str,
+                bias: Optional[torch.Tensor],
+            ):
+                nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
+                    act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
+                    int(BufferKind.USERBUFFERS), allowed_backends,
+                    mapping.tp_group, bias)
                 return nvfp4_gemm_output
 
             def extra_check(match: Match) -> bool:
@@ -700,6 +739,15 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 fwd_only,
                 custom_pass,
                 search_fn_pattern=ub_copy,
+                extra_check=extra_check,
+            )
+            register_replacement(
+                empty_nvfp4_gemm_bias_prologue_pattern,
+                target_nvfp4_gemm_bias_prologue_pattern,
+                [],
+                fwd_only,
+                custom_pass,
+                search_fn_pattern=ub_copy_with_bias,
                 extra_check=extra_check,
             )
 

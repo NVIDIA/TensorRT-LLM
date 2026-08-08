@@ -32,6 +32,7 @@
 #endif
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 #include <tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h>
@@ -2508,31 +2509,31 @@ constexpr static auto typeToDtypeID()
 {
     if constexpr (std::is_same_v<T, SafeFP8>)
     {
-        return nvinfer1::DataType::kFP8;
+        return tensorrt_llm::DataType::kFP8;
     }
     else if constexpr (std::is_same_v<T, SafeFP4>)
     {
-        return nvinfer1::DataType::kFP4;
+        return tensorrt_llm::DataType::kFP4;
     }
     else if constexpr (std::is_same_v<T, uint8_t>)
     {
-        return nvinfer1::DataType::kINT8;
+        return tensorrt_llm::DataType::kINT8;
     }
     else if constexpr (std::is_same_v<T, cutlass::uint4b_t>)
     {
-        return nvinfer1::DataType::kINT4;
+        return tensorrt_llm::DataType::kINT4;
     }
     else if constexpr (std::is_same_v<T, nv_bfloat16>)
     {
-        return nvinfer1::DataType::kBF16;
+        return tensorrt_llm::DataType::kBF16;
     }
     else if constexpr (std::is_same_v<T, half>)
     {
-        return nvinfer1::DataType::kHALF;
+        return tensorrt_llm::DataType::kHALF;
     }
     else if constexpr (std::is_same_v<T, float>)
     {
-        return nvinfer1::DataType::kFLOAT;
+        return tensorrt_llm::DataType::kFLOAT;
     }
     else
     {
@@ -2602,14 +2603,16 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         for (int ep : {1, 4, 8})
         {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-            backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 1024, 4096, mGroupSize, {},
-                false, mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
+            backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, tensorrt_llm::DataType::kHALF,
+                tensorrt_llm::DataType::kHALF, tensorrt_llm::DataType::kHALF, num_experts, k, 1024, 1024, 4096,
+                mGroupSize, {}, false, mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true,
+                MOEParallelismConfig{1, 0, ep, 0},
                 /*enable_alltoall=*/false);
 #else
-            backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1});
+            backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, tensorrt_llm::DataType::kHALF,
+                tensorrt_llm::DataType::kHALF, tensorrt_llm::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize,
+                {}, false, mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true,
+                MOEParallelismConfig{1, 0, ep, ep - 1});
 #endif
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);

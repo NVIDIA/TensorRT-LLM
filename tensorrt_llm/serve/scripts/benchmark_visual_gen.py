@@ -614,7 +614,6 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--visual-gen-args",
-        "--extra-visual-gen-options",
         dest="visual_gen_args",
         type=str,
         default=None,

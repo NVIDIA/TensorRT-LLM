@@ -53,7 +53,7 @@ from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrap
 from ..piecewise_utils import (
     SplitInfo,
     is_dynamic_cached_op,
-    is_metadata_prep,
+    needs_metadata_wrapper,
     needs_out_buffer,
     split_graph_at_dynamic_ops,
     submod_has_cuda_ops,
@@ -79,6 +79,19 @@ def _coalesce_output(
     return out if out is not None else op_result
 
 
+def _schema_out_arg_index(target: Any) -> Optional[int]:
+    """Return the positional schema index for an ``out`` argument, if available."""
+    schema = getattr(target, "_schema", None)
+    arguments = getattr(schema, "arguments", None)
+    if arguments is None:
+        return None
+
+    for idx, argument in enumerate(arguments):
+        if getattr(argument, "name", None) == "out":
+            return idx
+    return None
+
+
 def _is_resource_input(name: str, resource_input_names: Optional[Set[str]]) -> bool:
     return resource_input_names is not None and name in resource_input_names
 
@@ -101,8 +114,11 @@ def _order_kwargs_runtime_then_resources(
 def _inject_out_param(submod: GraphModule) -> None:
     """Rewrite a dynamic submodule's FX graph to accept and forward an ``out`` kwarg.
 
-    Adds an ``out`` placeholder (default ``None``) and wires it as a kwarg to
-    the dynamic custom-op ``call_function`` node.  Because custom ops must not
+    Adds an ``out`` placeholder (default ``None``) and wires it to the dynamic
+    custom-op ``call_function`` node.  If the op's schema already has the
+    ``out`` argument materialized positionally as ``None``, the placeholder
+    replaces that positional slot instead of also adding an ``out=`` kwarg.
+    Because custom ops must not
     return a tensor that aliases an input, the op returns a 0-element dummy
     tensor when ``out`` is provided.  A ``_coalesce_output`` node is inserted
     after the op call to select ``out`` (the mutated buffer) over the dummy.
@@ -133,7 +149,16 @@ def _inject_out_param(submod: GraphModule) -> None:
     with graph.inserting_after(last_placeholder):
         out_placeholder = graph.placeholder("out", default_value=None)
 
-    target_node.kwargs = {**dict(target_node.kwargs), "out": out_placeholder}
+    target_kwargs = dict(target_node.kwargs)
+    out_arg_index = _schema_out_arg_index(target_node.target)
+    if out_arg_index is not None and out_arg_index < len(target_node.args):
+        target_args = list(target_node.args)
+        target_args[out_arg_index] = out_placeholder
+        target_node.args = tuple(target_args)
+        target_kwargs.pop("out", None)
+    else:
+        target_kwargs["out"] = out_placeholder
+    target_node.kwargs = target_kwargs
 
     with graph.inserting_after(target_node):
         coalesce_node = graph.call_function(_coalesce_output, args=(target_node, out_placeholder))
@@ -175,7 +200,24 @@ class CapturedGraph(nn.Module):
         self._out_spec = None
 
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
-        return tuple(hash(a) for a in flat_args)
+        static_hash = []
+        for arg in flat_args:
+            if isinstance(arg, torch.Tensor):
+                static_hash.append(
+                    hash(
+                        (
+                            arg.data_ptr(),
+                            tuple(arg.shape),
+                            tuple(arg.stride()),
+                            arg.storage_offset(),
+                            arg.dtype,
+                            arg.device,
+                        )
+                    )
+                )
+            else:
+                static_hash.append(hash(arg))
+        return tuple(static_hash)
 
     def _normalize_args_kwargs(self, args: Tuple, kwargs: Dict[str, Any]) -> Tuple[Tuple, Dict]:
         return args, _order_kwargs_runtime_then_resources(kwargs, self.resource_input_names)
@@ -309,10 +351,16 @@ class CapturedGraph(nn.Module):
             args_batched = all_args_flat[:num_batched_inputs]
             args_static = all_args_flat[num_batched_inputs:]
 
-            # assert that static args match the stored hash
-            assert self._args_hash == self._get_hash(args_static), (
-                "Static args mismatch during capture"
-            )
+            # Static CUDA graph inputs must be shared across captured batch sizes.
+            # If a batch-size-specific metadata tensor lands in args_static, skip
+            # that graph instead of failing executor initialization. Runtime will
+            # fall back to eager for uncaptured or static-mismatched shapes.
+            if self._args_hash != self._get_hash(args_static):
+                ad_logger.warning(
+                    f"Skipping CUDA graph capture for batch size {bs} because static args "
+                    "do not match the canonical capture args."
+                )
+                continue
 
             # copy new inputs to input buffers along their respective dynamic dims
             input_sizes: List[int] = []
@@ -417,13 +465,14 @@ class CapturedGraph(nn.Module):
 class PiecewiseCapturedGraph(nn.Module):
     """Manages piecewise CUDA graph capture/replay for prefill/mixed batches.
 
-    The model is split at dynamic op boundaries (attention, SSM, conv, delta).
+    The model is split at registered dynamic op boundaries.
     Static segments are wrapped in ADPiecewiseRunner for CUDA graph capture.
-    Non-inplace dynamic ops are wrapped in DynamicOpWrapper, which passes a
-    pre-allocated output buffer (out=) from the preceding static runner's graph pool.
-    Metadata-prep ops are wrapped in MetadataWrapper to keep their output
-    addresses stable across capture and replay (prevents CUDA graph crashes).
-    Inplace dynamic ops (see _INPLACE_DYNAMIC_OPS) run eagerly without wrapping.
+    Dynamic submodules are handled according to DynamicOpPolicy:
+    - OUT_BUFFER: wrap with DynamicOpWrapper and pass a pre-allocated out= buffer
+      from the preceding static runner's graph pool.
+    - METADATA_WRAPPER: wrap with MetadataWrapper when metadata output addresses
+      must stay stable for downstream captured segments.
+    - EAGER: leave unwrapped and run eagerly as a split boundary.
     """
 
     def __init__(
@@ -472,11 +521,9 @@ class PiecewiseCapturedGraph(nn.Module):
 
         self.split_info = split_graph_at_dynamic_ops(gm)
 
-        # When multi-stream transforms reclassify ALL static partitions as
-        # dynamic (e.g. multi_stream_moe + multi_stream_mla_attn on every
-        # layer), there are zero capturable static segments.  Piecewise CUDA
-        # graphs are impossible — fall back to eager execution for
-        # prefill/mixed batches (monolithic CG still handles decode).
+        # If splitting leaves no capturable static segments, piecewise CUDA
+        # graphs are impossible; fall back to eager execution for prefill/mixed
+        # batches (monolithic CG still handles decode).
         if not self.split_info.static_submod_indices:
             ad_logger.warning(
                 "PiecewiseCapturedGraph: no static partitions after splitting "
@@ -541,9 +588,9 @@ class PiecewiseCapturedGraph(nn.Module):
             num_wrapped_static += 1
 
         # Phase 2: wrap dynamic ops.
-        # - Metadata-prep ops → MetadataWrapper (stable output addresses)
+        # - Metadata-prep ops → MetadataWrapper when downstream captures need stable addresses
         # - Attention/SSM/delta/logits → DynamicOpWrapper (out= pre-alloc)
-        # - Inplace ops (e.g. conv) → left unwrapped (mutate input, return None)
+        # - Inplace or runtime-shaped ops → left unwrapped
         # Iterate over all actual submod indices in order (not range(N), because
         # indices are partition IDs that may have gaps from empty partitions).
         dynamic_set = set(self.split_info.dynamic_submod_indices)
@@ -565,7 +612,7 @@ class PiecewiseCapturedGraph(nn.Module):
                 submod = getattr(self.split_gm, submod_name)
 
                 if not needs_out_buffer(submod):
-                    if is_metadata_prep(submod):
+                    if needs_metadata_wrapper(submod):
                         wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
                         setattr(self.split_gm, submod_name, wrapper)
                         num_metadata_wrapped += 1
@@ -661,23 +708,41 @@ class PiecewiseCapturedGraph(nn.Module):
             f"Cannot pre-allocate out= buffers — downstream static runners require stable addresses."
         )
 
+    def _static_runner_input_names(self) -> Set[str]:
+        """Return model-level input names consumed by captured static runners."""
+        names: Set[str] = set()
+        for runner in self._static_runners.values():
+            graph = getattr(runner.submodule, "graph", None)
+            if graph is None:
+                continue
+            for node in graph.nodes:
+                if node.op == "placeholder":
+                    names.add(str(node.target))
+        return names
+
     def _allocate_static_input_buffers(
         self,
         get_args_kwargs: Callable[[int], Any],
     ) -> None:
-        """Allocate static buffers for kwargs whose addresses change between calls.
+        """Allocate static buffers for captured static-runner kwargs with unstable addresses.
 
         Calls `get_args_kwargs` twice with the largest bucket to check address
         stability (data_ptr), and once with a different size to detect the
-        dynamic dimension by shape comparison.  Any kwarg with unstable
-        addresses gets a pre-allocated static buffer.
+        dynamic dimension by shape comparison.  Only kwargs consumed by captured
+        static runners get pre-allocated static buffers.
         """
+        static_input_names = self._static_runner_input_names()
+        if not static_input_names:
+            return
+
         max_bucket = max(self.piecewise_num_tokens)
         _, kw1 = get_args_kwargs(max_bucket)
         _, kw2 = get_args_kwargs(max_bucket)
         _, kw_probe = get_args_kwargs(max(1, max_bucket - 1))
 
         for key in kw1:
+            if key not in static_input_names:
+                continue
             v1, v2 = kw1.get(key), kw2.get(key)
             if (
                 isinstance(v1, torch.Tensor)
@@ -1015,7 +1080,7 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
 
     Args:
         seq_info: SequenceInfo object (duck-typed: needs max_seq_len, max_batch_size,
-            tokens_per_block, and nest_sequences method).
+            tokens_per_block, num_window_groups, and nest_sequences method).
         num_tokens: Total number of tokens for this piecewise bucket.
     """
     assert num_tokens >= 3, (
@@ -1053,12 +1118,14 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
     cache_loc = torch.arange(cu_num_pages[-1].item())
     slot_idx = torch.arange(bs)
 
+    # Replicate cache metadata per KV pool for VSWA (uniform block geometry).
+    n_pools = max(1, getattr(seq_info, "num_window_groups", 1))
     seq_info.nest_sequences(
         input_ids=input_ids_flat,
         cu_seqlen=cu_seqlen,
         input_pos=0,
-        cache_loc_per_pool=[cache_loc],
-        cu_num_pages_per_pool=[cu_num_pages],
+        cache_loc_per_pool=[cache_loc for _ in range(n_pools)],
+        cu_num_pages_per_pool=[cu_num_pages for _ in range(n_pools)],
         slot_idx=slot_idx,
     )
 
@@ -1089,7 +1156,7 @@ class TorchCudagraphCompiler(CompilerBackend):
     """Compiler that uses CUDA graphs.
 
     Supports two modes:
-    - piecewise_enabled=False (default): monolithic CG only (decode-only batches)
+    - piecewise_enabled=False: monolithic CG only (decode-only batches)
     - piecewise_enabled=True: dual-mode (monolithic for decode + piecewise for prefill/mixed)
 
     When the top-level model is a wrapper (not a GraphModule), the compiler

@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib.util
+import json
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+from pytest_split.algorithms import LeastDurationAlgorithm
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+SUBMIT_PATHS = (
+    REPO_ROOT / "jenkins" / "scripts" / "perf" / "submit.py",
+    REPO_ROOT / "jenkins" / "scripts" / "perf" / "local" / "submit.py",
+)
+EXAMPLE_SUBMIT_PATH = REPO_ROOT / "examples" / "disaggregated" / "slurm" / "benchmark" / "submit.py"
+
+
+class _FakePytestItem:
+    def __init__(self, nodeid: str) -> None:
+        self.nodeid = nodeid
+
+    def __str__(self) -> str:
+        return self.nodeid
+
+
+def _load_module(path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    monkeypatch.syspath_prepend(str(path.parent))
+    spec = importlib.util.spec_from_file_location(f"perf_submit_{path.parent.name}", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(params=SUBMIT_PATHS, ids=("ci", "local"))
+def submit_module(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(request.param, monkeypatch)
+
+
+@pytest.fixture
+def example_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(EXAMPLE_SUBMIT_PATH, monkeypatch)
+
+
+def _get_benchmark_config(module: ModuleType, concurrency):
+    config = {"benchmark": {"concurrency_list": concurrency}}
+    if Path(module.__file__).parent.name == "local":
+        return module.get_benchmark_config(config, "gen_only")
+    return module.get_benchmark_config(config)
+
+
+@pytest.mark.parametrize("concurrency", ("1", 1, "4301"))
+def test_get_benchmark_config_accepts_positive_integer(submit_module: ModuleType, concurrency):
+    benchmark_config = _get_benchmark_config(submit_module, concurrency)
+
+    assert benchmark_config["concurrency"] == int(concurrency)
+
+
+@pytest.fixture
+def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(SUBMIT_PATHS[0], monkeypatch)
+
+
+def _select_ci_test_case_line(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+    pytest_options: str,
+    split_group: int,
+) -> str:
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text(
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
+        encoding="utf-8",
+    )
+    script_prefix_lines = [
+        f'export pytestCommand="pytest --splitting-algorithm least_duration {pytest_options}"'
+    ]
+    return ci_submit_module.select_test_case_line(
+        test_list_path,
+        tmp_path,
+        script_prefix_lines,
+        split_group=split_group,
+    )
+
+
+@pytest.mark.parametrize(
+    "concurrency",
+    (True, 1.5, [], {}, "0", 0, "-1", -1, "1.5", "not-an-integer", None),
+)
+def test_get_benchmark_config_rejects_invalid_concurrency(submit_module: ModuleType, concurrency):
+    with pytest.raises(ValueError, match="benchmark.concurrency_list must be a positive integer"):
+        _get_benchmark_config(submit_module, concurrency)
+
+
+@pytest.mark.parametrize(
+    "concurrency",
+    (True, 1.5, [], {}, "0", 0, "-1", -1, "1.5", "not-an-integer", None),
+)
+def test_example_worker_environment_rejects_invalid_concurrency(
+    example_submit_module: ModuleType, concurrency
+):
+    with pytest.raises(ValueError, match="benchmark.concurrency_list must be a positive integer"):
+        example_submit_module.build_worker_environment(
+            worker_config={},
+            env_config={},
+            role="GEN",
+            benchmark_mode="gen_only",
+            nsys_on=False,
+            profile_range="",
+            concurrency=concurrency,
+        )
+
+
+def test_example_worker_environment_exports_positive_concurrency(example_submit_module: ModuleType):
+    worker_environment = example_submit_module.build_worker_environment(
+        worker_config={},
+        env_config={},
+        role="GEN",
+        benchmark_mode="gen_only",
+        nsys_on=False,
+        profile_range="",
+        concurrency="4301",
+    )
+
+    assert worker_environment["TLLM_BENCHMARK_REQ_QUEUES_SIZE"] == "4301"
+
+
+def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    test_lines = [
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-r1] TIMEOUT (90)",
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_kimi-k25] TIMEOUT (90)",
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-r1] TIMEOUT (90)",
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_kimi-k25] TIMEOUT (90)",
+    ]
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text("\n".join(test_lines), encoding="utf-8")
+
+    durations_dir = tmp_path / "tests" / "integration" / "defs"
+    durations_dir.mkdir(parents=True)
+    durations = {
+        ci_submit_module._test_nodeid(test_lines[0]): 836.268,
+        ci_submit_module._test_nodeid(test_lines[1]): 1462.754,
+        ci_submit_module._test_nodeid(test_lines[2]): 2211.1548,
+        ci_submit_module._test_nodeid(test_lines[3]): 2548.912,
+    }
+    (durations_dir / ".test_durations").write_text(json.dumps(durations), encoding="utf-8")
+    script_prefix_lines = [
+        'export pytestCommand="pytest --splitting-algorithm least_duration '
+        "--splits 4 --group 3 "
+        '--durations-path /remote/tests/integration/defs/.test_durations"'
+    ]
+
+    selected = ci_submit_module.select_test_case_line(
+        test_list_path,
+        tmp_path,
+        script_prefix_lines,
+        split_group=3,
+    )
+
+    assert selected == test_lines[1]
+
+
+def test_ci_submit_selector_matches_installed_pytest_split(
+    ci_submit_module: ModuleType,
+) -> None:
+    lines = [
+        f"perf/test_perf_sanity.py::test_e2e[case-{case_name}] TIMEOUT (90)"
+        for case_name in ("zeta", "alpha", "gamma", "beta", "epsilon", "delta")
+    ]
+    nodeids = [ci_submit_module._test_nodeid(line) for line in lines]
+    items = [_FakePytestItem(nodeid) for nodeid in nodeids]
+    duration_sets = (
+        {nodeid: float(index + 1) for index, nodeid in enumerate(nodeids)},
+        dict.fromkeys(nodeids, 4.0),
+        {nodeids[1]: 8.0, nodeids[4]: 2.0, "irrelevant::test": 1000.0},
+        {},
+    )
+
+    for durations in duration_sets:
+        for splits in (2, 3, 4):
+            expected_groups = LeastDurationAlgorithm()(splits, items, durations)
+            for group, expected_group in enumerate(expected_groups, start=1):
+                selected = ci_submit_module._select_least_duration_group(
+                    lines,
+                    durations,
+                    splits,
+                    group,
+                )
+                assert [ci_submit_module._test_nodeid(line) for line in selected] == [
+                    item.nodeid for item in expected_group.selected
+                ]
+
+
+@pytest.mark.parametrize(
+    ("splits", "group", "match"),
+    (
+        (0, 1, "--splits"),
+        (2, 0, "--group"),
+        (2, 3, "--group"),
+    ),
+)
+def test_ci_submit_rejects_invalid_least_duration_groups(
+    ci_submit_module: ModuleType,
+    splits: int,
+    group: int,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        ci_submit_module._select_least_duration_group(
+            ["perf/test_perf_sanity.py::test_e2e[case]"],
+            {},
+            splits,
+            group,
+        )
+
+
+def test_ci_submit_ignores_test_list_comments(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text(
+        "# section comment\n\nperf/test_perf_sanity.py::test_e2e[case]\n",
+        encoding="utf-8",
+    )
+
+    assert ci_submit_module._read_test_list_lines(test_list_path) == [
+        "perf/test_perf_sanity.py::test_e2e[case]"
+    ]
+
+
+def test_ci_submit_rejects_split_group_disagreement(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="disagrees with pytest --group"):
+        _select_ci_test_case_line(
+            ci_submit_module,
+            tmp_path,
+            pytest_options="--splits 1 --group 1",
+            split_group=2,
+        )
+
+
+def test_ci_submit_rejects_missing_pytest_split_durations(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    expected_path = tmp_path / "tests" / "integration" / "defs" / ".test_durations"
+    with pytest.raises(FileNotFoundError, match=f"durations file not found: {expected_path}"):
+        _select_ci_test_case_line(
+            ci_submit_module,
+            tmp_path,
+            pytest_options="--splits 1 --group 1 --durations-path /remote/.test_durations",
+            split_group=1,
+        )

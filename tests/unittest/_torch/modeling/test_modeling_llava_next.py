@@ -104,6 +104,7 @@ class TestLlavaNext(TestModelingMultimodal):
         return scenarios
 
 
+@pytest.mark.cpu_only
 def test_llava_next_expand_prompt_token_ids_for_mm():
     """Test LlavaNextInputProcessor.expand_prompt_token_ids_for_mm replaces image placeholders correctly."""
     model_path = LLAVA_NEXT_7B_CONFIG["_name_or_path"]
@@ -114,8 +115,10 @@ def test_llava_next_expand_prompt_token_ids_for_mm():
     input_processor = create_input_processor(model_path, tokenizer=tokenizer)
 
     image_token_id = LLAVA_NEXT_7B_CONFIG["image_token_index"]
-    vocab_size = LLAVA_NEXT_7B_CONFIG["vocab_size"]
-    placeholder_id = vocab_size + 1
+    # In-vocab contract: placeholders stay as the real image_token_id (no legacy
+    # ``vocab_size + 1`` OOV remap); the model engine locates mm positions via
+    # torch.isin(input_ids, mm_token_ids).
+    placeholder_id = image_token_id
 
     # prompt_token_ids: two image placeholders with text tokens in between
     prompt_token_ids = [1, 2, image_token_id, 3, image_token_id, 4]

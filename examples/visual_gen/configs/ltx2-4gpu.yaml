@@ -15,7 +15,7 @@
 
 # 4-GPU LTX-2 AudioVideo parallel config (precision-agnostic — picks up
 # whatever checkpoint is passed via --model_path). Shared by offline
-# examples (--extra_visual_gen_options) and trtllm-serve.
+# examples (--visual_gen_args) and trtllm-serve.
 attention_config:
   backend: VANILLA
 parallel_config:

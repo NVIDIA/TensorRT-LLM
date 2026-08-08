@@ -24,6 +24,7 @@ from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -34,7 +35,8 @@ llama_model_path = get_model_path(default_model_name)
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
-                                      max_tokens=256)
+                                      max_tokens=256,
+                                      use_kv_cache_manager_v2=False)
 
 
 def create_kv_cache_manager():
@@ -63,6 +65,17 @@ def create_llm(tensor_parallel_size=1):
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
                kv_cache_config=global_kvcache_config,
+               enable_autotuner=False)
+
+
+def create_v2_llm():
+    v2_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                      event_buffer_max_size=1024,
+                                      enable_block_reuse=True,
+                                      max_tokens=256,
+                                      use_kv_cache_manager_v2=True)
+    return LLM(model=llama_model_path,
+               kv_cache_config=v2_kvcache_config,
                enable_autotuner=False)
 
 
@@ -263,8 +276,8 @@ def test_apply_mm_hashes_with_uuids():
         0]  # UUID changes hash
     # Second hash should be content-only (same as without UUID)
     assert hashes_partial["image"][1] == hashes_no_uuid["image"][1]
-    # UUIDs list should have the UUID and None
-    assert uuids_partial == ["sku-1234-a", None]
+    # UUIDs are returned per-modality, parallel to mm_hashes.
+    assert uuids_partial == {"image": ["sku-1234-a", None]}
 
     # Test with all UUIDs
     mm_uuids_all = {"image": ["sku-1234-a", "sku-1234-b"]}
@@ -277,7 +290,7 @@ def test_apply_mm_hashes_with_uuids():
     assert hashes_all["image"][1] != hashes_no_uuid["image"][1]
     # Different UUIDs with different content should produce different hashes
     assert hashes_all["image"][0] != hashes_all["image"][1]
-    assert uuids_all == ["sku-1234-a", "sku-1234-b"]
+    assert uuids_all == {"image": ["sku-1234-a", "sku-1234-b"]}
 
 
 def test_apply_mm_hashes_uuid_content_combined():
@@ -768,8 +781,9 @@ def test_apply_mm_hashes_multiple_modalities():
     assert hashes["image"][0] != hashes_no_uuid["image"][0]
     assert hashes["video"][0] != hashes_no_uuid["video"][0]
 
-    # Check flattened UUID list (order may vary based on dict iteration)
-    assert set(uuids_list) == {"img-uuid-001", "vid-uuid-001"}
+    # UUIDs are returned per-modality; flatten across modalities to compare.
+    flat_uuids = [u for lst in uuids_list.values() for u in lst]
+    assert set(flat_uuids) == {"img-uuid-001", "vid-uuid-001"}
 
 
 def test_mm_keys_in_stored_events():
@@ -890,6 +904,38 @@ def test_expected_kv_cache_events():
                 assert event["data"]["type"] == "created"
             elif event["event_id"] == 1:
                 assert event["data"]["type"] == "stored"
+
+
+def test_expected_v2_kv_cache_events():
+    with create_v2_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = list(range(127))
+
+        _ = llm.generate(prompt, sampling_params=sampling_params)
+
+        events = llm.get_kv_cache_events(5)
+        assert events and len(events) >= 2
+        assert all(event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+                   for event in events if event)
+
+        created_events = [
+            event for event in events
+            if event and event["data"]["type"] == "created"
+        ]
+        stored_events = [
+            event for event in events
+            if event and event["data"]["type"] == "stored"
+        ]
+        assert created_events
+        assert stored_events
+        assert created_events[0]["event_id"] == 0
+
+        block_hashes = [
+            block["block_hash"] for event in stored_events
+            for block in event["data"]["blocks"]
+        ]
+        assert block_hashes
+        assert all(isinstance(block_hash, int) for block_hash in block_hashes)
 
 
 def test_kv_cache_event_async_api():

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -85,8 +85,10 @@ enum class RoutingMethodType : int64_t
     MiniMax2 = 5,
     // SigmoidRenorm: Sigmoid -> TopK -> Renormalize
     SigmoidRenorm = 6,
+    // DeepSeek-V4
+    DeepSeekV4 = 7,
     // Unspecified
-    Unspecified = 7,
+    Unspecified = 8,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -107,6 +109,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
     case RoutingMethodType::MiniMax2: return "MiniMax2";
     case RoutingMethodType::SigmoidRenorm: return "SigmoidRenorm";
+    case RoutingMethodType::DeepSeekV4: return "DeepSeekV4";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
@@ -162,13 +165,13 @@ public:
     explicit Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim = 1);
 
     void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-        int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
-        float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
-        int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert,
-        int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-        batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-        RoutingMethodType routingMethodType, cudaStream_t stream,
+        int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
+        int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
+        int32_t* expertCountHistogram, int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx,
+        int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* expertIds,
+        int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+        int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput,
+        bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
         batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16,
         batchedGemm::trtllm::gen::Dtype dtypeRoutingBias = batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
@@ -281,11 +284,20 @@ struct MoERunnerArgs
     float* gemm1_bias = nullptr;
     float* gemm1_alpha = nullptr;
     float* gemm1_beta = nullptr;
+    // Per-expert clamp tensor consumed by fused-activation GEMM cubins on the
+    // NVFP4 / MXFP4 paths. The FP8 separate-activation kernel uses the scalar
+    // variants below instead — see DevKernel.h::activation::Data::swigluLimit.
     float* gemm1_clamp_limit = nullptr;
+    // Uniform-across-experts scalar variant, only consumed by the FP8
+    // separate-activation kernel (DevKernel.cu::activationKernel /
+    // activationDeepSeekKernel). Avoids a per-CTA global load.
+    float gemm1_clamp_limit_value = 0.0f;
+    bool has_gemm1_clamp_limit_value = false;
     float* gemm2_bias = nullptr;
 
     int32_t num_tokens{0};
     int32_t num_experts{0};
+    int32_t num_fused_shared_experts{0};
     // Hidden dimension input of MoE block. It might be padded.
     int32_t hidden_size{0};
     // Hidden dimension output of MoE block. It might be padded.
@@ -407,6 +419,9 @@ private:
     PermuteGemm1::Runner mPermuteGemm1;
     Gemm2::Runner mGemm2;
     ActType mActType;
+    // Kept so setOpsData can tell the activation launcher how much per-expert
+    // tile padding the permuted row space carries.
+    int32_t mTileTokensDim;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately

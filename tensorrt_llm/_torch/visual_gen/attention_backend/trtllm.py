@@ -23,12 +23,12 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
+from ...attention_backend.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from .interface import AttentionBackend, AttentionTensorLayout
@@ -44,8 +44,6 @@ class TrtllmAttentionMetadata:
     - Automatically reallocates when batch_size or seq_len exceeds current capacity
 
     Args:
-        max_batch_size: Initial batch size hint. Will grow automatically if exceeded.
-        max_seq_len: Initial sequence length hint. Will grow automatically if exceeded.
         device: Target device for tensors.
         attention_metadata_state: Mutable model-scoped state shared by all
             attention layers in one model instance.
@@ -53,14 +51,9 @@ class TrtllmAttentionMetadata:
 
     def __init__(
         self,
-        max_batch_size: int = 16,
-        max_seq_len: int = 4096,
         device: Optional[torch.device] = None,
         attention_metadata_state: Optional[dict] = None,
     ):
-        # These are initial hints, not hard limits - capacity grows as needed
-        self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
         self.device = device or torch.device("cuda")
         if attention_metadata_state is None:
             raise ValueError(
@@ -69,22 +62,16 @@ class TrtllmAttentionMetadata:
             )
         self._metadata_state = attention_metadata_state
 
-        # Lazily created BaseTrtllmAttentionMetadata
-        self._metadata: Optional[BaseTrtllmAttentionMetadata] = self._metadata_state["metadata"]
+        # Lazily created BaseTrtllmAttentionMetadata objects. Diffusion blocks
+        # can launch video and audio attention back-to-back with different
+        # sequence lengths, so keep separate metadata buffers per shape instead
+        # of mutating one shared object while kernels may still be in flight.
+        self._metadata_cache = self._metadata_state.setdefault("metadata_cache", {})
+        self._metadata: Optional[BaseTrtllmAttentionMetadata] = None
 
         # Track prepared state
         self._cached_seq_lens: Optional[torch.Tensor] = None
         self._prepared = False
-
-    def _needs_new_metadata(self, batch_size: int, max_seq_len: int) -> bool:
-        """Check if we need to create new metadata (capacity change)."""
-        metadata = self._metadata_state["metadata"]
-        allocated_batch_size, allocated_max_seq_len = self._metadata_state["capacity"]
-        return (
-            metadata is None
-            or batch_size > allocated_batch_size
-            or max_seq_len > allocated_max_seq_len
-        )
 
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
         """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
@@ -105,7 +92,7 @@ class TrtllmAttentionMetadata:
         if not torch.equal(self._cached_seq_lens[:batch_size], seq_lens):
             return True
 
-        metadata = self._metadata_state["metadata"]
+        metadata = self._metadata
         if metadata is None:
             return True
         if getattr(metadata, "num_contexts", None) != batch_size:
@@ -125,20 +112,20 @@ class TrtllmAttentionMetadata:
 
     def _create_metadata(self, batch_size: int, max_seq_len: int) -> None:
         """Create new metadata with given capacity."""
-        prev_batch, prev_seq = self._metadata_state["capacity"]
-        alloc_batch = max(batch_size, prev_batch)
-        alloc_seq_len = max(max_seq_len, prev_seq)
         self._metadata = BaseTrtllmAttentionMetadata(
-            max_num_requests=alloc_batch,
-            max_num_tokens=alloc_batch * alloc_seq_len,
-            max_num_sequences=alloc_batch,
+            max_num_requests=batch_size,
+            max_num_tokens=batch_size * max_seq_len,
+            max_num_sequences=batch_size,
             kv_cache_manager=None,  # No KV cache for diffusion
             mapping=Mapping(),
             runtime_features=AttentionRuntimeFeatures(),
         )
-        self._metadata_state["metadata"] = self._metadata
-        self._metadata_state["capacity"] = (alloc_batch, alloc_seq_len)
         self._prepared = False  # Reset prepare state on new metadata
+
+    def _select_cached_metadata(self, cached) -> None:
+        self._metadata = cached["metadata"]
+        self._prepared = cached["prepared"]
+        self._cached_seq_lens = cached["seq_lens"]
 
     def prepare(
         self,
@@ -157,25 +144,34 @@ class TrtllmAttentionMetadata:
         else:
             seq_lens_tensor = seq_lens.to(dtype=torch.int32)
         max_seq_len = seq_lens_tensor.max().item()
+        # Keep CUDA graph-captured metadata buffers stable per batch/seq-lens shape.
+        cache_key = (batch_size, tuple(int(x) for x in seq_lens_tensor.tolist()))
 
-        if self._needs_new_metadata(batch_size, max_seq_len):
+        cached = self._metadata_cache.get(cache_key)
+        if cached is None:
             self._create_metadata(batch_size, max_seq_len)
-        else:
-            self._metadata = self._metadata_state["metadata"]
+            cached = {
+                "metadata": self._metadata,
+                "prepared": False,
+                "seq_lens": None,
+            }
+            self._metadata_cache[cache_key] = cached
+
+        self._select_cached_metadata(cached)
 
         if self._needs_prepare(batch_size, seq_lens_tensor):
-            self._metadata.seq_lens = seq_lens_tensor
+            cached_seq_lens = seq_lens_tensor.clone()
+            self._metadata.seq_lens = cached_seq_lens
             self._metadata.num_contexts = batch_size
             self._metadata.max_seq_len = max_seq_len
             self._metadata.request_ids = list(range(batch_size))
             self._metadata.prepare()
 
-            # Cache for next comparison
-            if self._cached_seq_lens is None or self._cached_seq_lens.shape[0] < batch_size:
-                self._cached_seq_lens = seq_lens_tensor.clone()
-            else:
-                self._cached_seq_lens[:batch_size].copy_(seq_lens_tensor)
-            self._prepared = True
+            # Cache per-shape state without sharing the tensor across entries.
+            cached["prepared"] = True
+            cached["seq_lens"] = cached_seq_lens
+
+            self._select_cached_metadata(cached)
 
         return self._metadata
 
@@ -203,7 +199,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_seq_len: int = 4096,
         quant_attention_config: Optional[QuantAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
-        sparse_attention_config: Optional[SkipSoftmaxAttentionConfig] = None,
+        sparse_params: Optional[SkipSoftmaxParams] = None,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -213,20 +209,14 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             quant_config=quant_config,
+            sparse_params=sparse_params,
             dtype=dtype,
         )
-        # Plain attribute (no construct-time caching). The kernel re-reads
-        # self.sparse_attention_config per forward call, so callers like
-        # apply_skip_softmax_overrides() can swap or clear it post-construction
-        # and the next forward picks up the change.
-        self.sparse_attention_config = sparse_attention_config
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
 
         self.metadata = TrtllmAttentionMetadata(
-            max_batch_size=max_batch_size,
-            max_seq_len=max_seq_len,
             attention_metadata_state=attention_metadata_state,
         )
 
@@ -292,6 +282,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
+        timestep = kwargs.pop("timestep", None)
 
         if self.quant_attention_config is not None:
             assert k is not None and v is not None, (
@@ -307,6 +298,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 v=v,
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
+                timestep=timestep,
                 sage_attn_num_elts_per_blk_q=quant_cfg.q_block_size,
                 sage_attn_num_elts_per_blk_k=quant_cfg.k_block_size,
                 sage_attn_num_elts_per_blk_v=quant_cfg.v_block_size,
@@ -323,6 +315,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 v=None,
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
+                timestep=timestep,
             )
         output = output.view(batch_size, seq_len, -1)
         return output

@@ -27,6 +27,8 @@ from tensorrt_llm.logger import (
     _parse_module_levels,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def capture_log():
@@ -257,10 +259,6 @@ class TestLoggerAPI:
     def test_has_rank_property(self):
         singleton = Logger()
         assert hasattr(singleton, "rank")
-
-    def test_has_trt_logger(self):
-        singleton = Logger()
-        assert hasattr(singleton, "trt_logger")
 
     def test_log_once_deduplication(self, capture_log):
         singleton = Logger()

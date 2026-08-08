@@ -151,21 +151,6 @@ bool forceXQAKernels()
     return forceXQA;
 }
 
-std::optional<bool> getEnvEnableXQAJIT()
-{
-    static std::optional<bool> val = []
-    {
-        std::optional<bool> val = std::nullopt;
-        auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
-        if (tmp.has_value())
-        {
-            val = static_cast<bool>(tmp.value());
-        }
-        return val;
-    }();
-    return val;
-}
-
 std::optional<int> getEnvXqaBlocksPerSequence()
 {
     static auto const xqaBlocksPerSeq = []()
@@ -272,6 +257,12 @@ bool getEnvEnablePDL()
             }
         });
     return enablePDL;
+}
+
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
 }
 
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
@@ -410,6 +401,12 @@ bool getEnvTryZCopyForKVCacheTransfer()
     return zcopyForSysmmetricKVCache;
 }
 
+bool getEnvDisaggEnableInflightCancel()
+{
+    static bool const enabled = getBoolEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+    return enabled;
+}
+
 bool getEnvForceDeterministic()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");
@@ -508,16 +505,22 @@ bool getEnvKVCacheTransferAllBlocksForWindow()
     return allBlocksForWindow;
 }
 
+bool getEnvKVCachePoolUseFabricMemory()
+{
+    static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
+    return useFabricMemory;
+}
+
 uint16_t getEnvNixlPort()
 {
     static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
     return nixlPort;
 }
 
-bool getEnvNixlEnableCoalesce()
+bool getEnvNixlDisableCoalesce()
 {
-    static bool const enableCoalesce = getBoolEnv("TRTLLM_NIXL_ENABLE_COALESCE");
-    return enableCoalesce;
+    static bool const disableCoalesce = getBoolEnv("TRTLLM_NIXL_DISABLE_COALESCE");
+    return disableCoalesce;
 }
 
 bool getEnvDisaggBenchmarkGenOnly()
