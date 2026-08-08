@@ -293,9 +293,10 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 // multiple of 32 (e.g. 200 threads leave the last warp with only 8 lanes);
 // that is undefined behavior.
 //
-// The group mask is always safe: blockDim and every column boundary (data,
-// padded, SF-padded) are multiples of the group size, so the lanes of one
-// group always reach the same set of shuffle calls together.
+// The group mask is always safe: blockDim, the per-block column offset (a
+// multiple of blockDim), and every column boundary (data, padded, SF-padded)
+// are multiples of the group size, so the lanes of one group always reach the
+// same set of shuffle calls together.
 template <int NUM_THREADS_PER_SF>
 inline __device__ uint32_t cvt_sf_group_shfl_mask()
 {
@@ -824,6 +825,12 @@ quantize_with_block_size(
     int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
     int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
+    // Columns are split over gridDim.y so that a row can be shared by several
+    // blocks. A caller that leaves gridDim.y at 1 gets the plain
+    // threadIdx.x-to-blockDim.x walk this used to do.
+    int const colStart = blockIdx.y * blockDim.x + threadIdx.x;
+    int const colStride = gridDim.y * blockDim.x;
+
     cudaGridDependencySynchronize();
     // Input tensor batch/row/col loops.
     // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
@@ -841,7 +848,7 @@ quantize_with_block_size(
             // they only exist in the swizzled scale factor layout. Do NOT write to output buffer here.
             for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
             {
-                for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+                for (int colIdx = colStart; colIdx < numColThreadsForSf; colIdx += colStride)
                 {
                     std::optional<int> optionalBatchIdx = batchIdx;
                     std::optional<int> optionalNumRows = numRows;
@@ -863,7 +870,7 @@ quantize_with_block_size(
             // Normal path: This row contains actual data
             for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
             {
-                for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+                for (int colIdx = colStart; colIdx < numColThreadsForSf; colIdx += colStride)
                 {
                     std::optional<int> optionalBatchIdx = batchIdx;
                     std::optional<int> optionalNumRows = numRows;

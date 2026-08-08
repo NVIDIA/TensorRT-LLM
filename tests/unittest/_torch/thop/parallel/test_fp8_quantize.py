@@ -201,6 +201,59 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
 
 
+# The launcher picks the block width and the row/column split of the grid from
+# the row count, so these straddle the points where that choice changes: a
+# single row, rows that do and do not fill the device, and the 128-row boundary
+# the swizzled scale-factor layout pads to.
+_MXFP8_GRID_SHAPE_ROWS = [1, 2, 4, 64, 128, 129, 256]
+
+
+@pytest.mark.parametrize("m", _MXFP8_GRID_SHAPE_ROWS)
+@pytest.mark.parametrize("k", [1024, 6144])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_is_invariant_to_grid_shape(m, k):
+    """A row must quantize the same no matter how many rows share the launch."""
+    torch.random.manual_seed(0)
+    reference_rows = max(_MXFP8_GRID_SHAPE_ROWS)
+    a = (torch.randn([reference_rows, k], dtype=torch.float) *
+         16).to(torch.bfloat16).cuda().contiguous()
+
+    # The linear layout stores scale factors as a dense m x k/32 block, so a row
+    # of the batched result is directly comparable to the same row quantized on
+    # its own.
+    full_fp8, full_sf = torch.ops.trtllm.mxfp8_quantize(a, False, 32)
+    rows_fp8, rows_sf = torch.ops.trtllm.mxfp8_quantize(a[:m].contiguous(),
+                                                        False, 32)
+
+    assert torch.equal(rows_fp8.view(torch.uint8),
+                       full_fp8[:m].view(torch.uint8))
+    assert torch.equal(rows_sf.view(torch.uint8),
+                       full_sf.view(torch.uint8)[:m * k // 32])
+
+
+@pytest.mark.parametrize("m", _MXFP8_GRID_SHAPE_ROWS)
+@pytest.mark.parametrize("k", [1024, 6144])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_swizzled_matches_linear(m, k):
+    """The two layouts differ in where scale factors land, not in their values."""
+    torch.random.manual_seed(0)
+    a = (torch.randn([m, k], dtype=torch.float) *
+         16).to(torch.bfloat16).cuda().contiguous()
+
+    swizzled_fp8, swizzled_sf = torch.ops.trtllm.mxfp8_quantize(a, True, 32)
+    linear_fp8, linear_sf = torch.ops.trtllm.mxfp8_quantize(a, False, 32)
+
+    assert torch.equal(swizzled_fp8.view(torch.uint8),
+                       linear_fp8.view(torch.uint8))
+    swizzled_dequant = torch.ops.tensorrt_llm.dequantize_mxe4m3_host(
+        swizzled_fp8.cpu().view(torch.uint8),
+        swizzled_sf.cpu().view(torch.uint8), True)
+    linear_dequant = torch.ops.tensorrt_llm.dequantize_mxe4m3_host(
+        linear_fp8.cpu().view(torch.uint8),
+        linear_sf.cpu().view(torch.uint8), False)
+    assert torch.equal(swizzled_dequant, linear_dequant)
+
+
 def _run_megamoe_prepare(hidden_states, token_selected_experts,
                          token_final_scales):
     m, k = hidden_states.shape

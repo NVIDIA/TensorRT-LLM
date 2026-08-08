@@ -196,14 +196,36 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     // Fixed SF_VEC_SIZE as 32
     static constexpr int SF_VEC_SIZE = 32;
 
+    auto const ceilDiv = [](int a, int b) { return (a + b - 1) / b; };
+
     // Grid, Block size.
-    // Each thread converts 8 values.
-    dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
+    // Each thread converts 8 values, so the column extent is counted in
+    // threads. The kernel walks the SF-padded width, not just the data width.
+    int const colThreads = (layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(padded_n, 4 * SF_VEC_SIZE) : padded_n)
+        / CVT_ELTS_PER_THREAD;
+
+    int blockX = std::min(colThreads, 512);
+    // A grid laid out over rows alone leaves most of the device idle when there
+    // are few rows, and the single block that owns a row then runs at the
+    // latency of its own loads with nothing to overlap them against. Decode at
+    // low concurrency sits exactly there, so give up block width to put more
+    // blocks on the row. Rounding the target up to a warp keeps whole warps.
+    int const wantColBlocks = ceilDiv(multiProcessorCount, std::max(m, 1));
+    if (wantColBlocks > 1)
+    {
+        blockX = std::min(blockX, std::max(64, PadUpFn(ceilDiv(colThreads, wantColBlocks), 32)));
+    }
+    dim3 block(blockX);
+
     // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+    int const numBlocksPerSM = std::max(1, 2048 / blockX);
     // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
-    int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
-    dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+    int const numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
+    int const colBlocks = ceilDiv(colThreads, blockX);
+    // Spend the same block budget the row grid used on its own, so splitting
+    // columns changes the shape of the grid rather than its size.
+    int const rowBlocks = std::min(numBlocksForM, std::max(1, multiProcessorCount * numBlocksPerSM / colBlocks));
+    dim3 grid(rowBlocks, colBlocks);
 
     // Launch the cvt kernel.
     cudaLaunchConfig_t config;
