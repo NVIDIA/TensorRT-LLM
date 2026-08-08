@@ -391,6 +391,9 @@ static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * Num
 static constexpr int BlockKernelMaxNumTokens = 4;
 static constexpr int DynBlockKernelMaxNumTokens = 16;
 static constexpr int DynBlockKernelMaxNumExperts = 256;
+// The classic block kernel is faster through the 512-expert tier. The cooperative
+// kernel avoids register spilling for the larger tiers.
+static constexpr int CoopBlockKernelMinNumExperts = 576;
 // Cooperative block kernel: one thread per expert, so at most 1024 experts (1 CUDA block).
 static constexpr int CoopBlockKernelMaxNumExperts = 1024;
 
