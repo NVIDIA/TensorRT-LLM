@@ -654,6 +654,14 @@ class WhisperInputProcessor(InputProcessor):
             forced = self.processor.get_decoder_prompt_ids(no_timestamps=True)
         return [int(start_id)] + [int(tok) for _, tok in sorted(forced)]
 
+    def get_decoder_prefix_len(self) -> int:
+        """Tokens every request's decoder prompt starts with.
+
+        Mixed encoder/decoder CUDA graphs capture at this query length, and a
+        mismatch makes every mixed batch miss its graph silently.
+        """
+        return len(self._build_decoder_prompt())
+
     def _resolve_decoder_prompt(self, prompt_text: Optional[str]) -> List[int]:
         """Checkpoint-default forced prompt, or the user's decoder prompt.
 
@@ -879,6 +887,27 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     @property
     def config(self):
         return self.model_config.pretrained_config
+
+    def encoder_graph_spec(self):
+        """Fixed-shape encoder contract for enc-dec encoder CUDA graphs.
+
+        Every Whisper encoder request is an fp32 waveform zero-padded by
+        `WhisperInputProcessor` to the fixed window that yields exactly
+        ``max_source_positions`` encoder positions — so the encoder graph key
+        degenerates to the batch size.
+
+        The window is derived rather than hardcoded: the conv stem halves the
+        STFT frame count, so ``n_samples = max_source_positions * 2 *
+        hop_length``. ``hop_length`` comes from the checkpoint's feature
+        extractor, the same source the input processor validates its own
+        window against.
+
+        Returns ``(per_request_feature_shape, dtype, fixed_seq_len)``.
+        """
+        fixed_seq_len = int(self.config.max_source_positions)
+        hop_length = int(self.model.encoder.log_mel.hop_length)
+        n_samples = fixed_seq_len * 2 * hop_length
+        return ((n_samples,), torch.float32, fixed_seq_len)
 
     def forward(
         self,

@@ -252,11 +252,41 @@ class BaseCudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
+class EncDecEncoderCudaGraphConfig(StrictBaseModel):
+    """CUDA-graph capture of the encoder step for encoder-decoder models.
+
+    Applies only to models whose encoder consumes fixed-shape per-request
+    feature tensors (e.g. Whisper's 30 s-padded waveform), where the graph
+    key degenerates to the encoder batch size. Token-driven encoders
+    (BART/T5) are not captured. Each captured batch size holds its own
+    static input buffer and graph pool memory; unseen batch sizes fall back
+    to eager.
+    """
+
+    batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description=(
+            "Encoder batch sizes to capture. None derives powers of two capped "
+            "by both max_batch_size and max_num_tokens // encoder_output_len "
+            "(the scheduler's encoder-batch bound)."),
+        status="prototype",
+    )
+
+
 class DecodeCudaGraphConfig(BaseCudaGraphConfig):
     """CUDA graph configuration for decode requests."""
 
     mode: Literal["decode"] = Field(
         default="decode", description="CUDA graph configuration mode.")
+
+    encoder: Optional[EncDecEncoderCudaGraphConfig] = Field(
+        default=None,
+        description=(
+            "Opt-in CUDA-graph capture of the encoder step for encoder-decoder "
+            "models with fixed-shape feature encoders (e.g. Whisper). None "
+            "(default) keeps the encoder step eager."),
+        status="prototype",
+    )
 
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
@@ -5083,6 +5113,25 @@ class TorchLlmArgs(BaseLlmArgs):
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
 
+    encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig] = Field(
+        default=None,
+        description=(
+            "CUDA graph configuration for the encoder forward pass of an "
+            "encoder-decoder model. Use `cuda_graph_config` for the decoder "
+            "and this field for the encoder. Encoder CUDA graphs require "
+            "`encoder_max_batch_size` to be set."),
+        status="prototype")
+
+    enable_encoder_decoder_mixed_cuda_graph: bool = Field(
+        default=True,
+        description=(
+            "Enable the mixed-batch CUDA graph performance optimization for "
+            "encoder-decoder models. The graph handles decoder iterations "
+            "containing both context and generation requests. It is enabled "
+            "by default when both `cuda_graph_config` and "
+            "`encoder_cuda_graph_config` produce usable graph shapes."),
+        status="prototype")
+
     @field_validator('cuda_graph_config', mode='before')
     @classmethod
     def infer_cuda_graph_config_mode(cls, v):
@@ -5136,21 +5185,21 @@ class TorchLlmArgs(BaseLlmArgs):
 
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
-            "Falls back to `max_batch_size` when unset. This budget is shared "
-            "proportionately across all modalities the model encodes, not set "
-            "per modality; per-modality knobs may be added later."),
+        description=
+        ("Maximum encoder batch size. For encoder-decoder models, this also "
+         "controls encoder microbatch admission and limits encoder CUDA graph "
+         "batch sizes. For multimodal models, this is the shared "
+         "AttentionMetadata budget across all encoded modalities. Falls back "
+         "to `max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
         description=(
-            "Maximum number of tokens for the multimodal encoder's "
-            "AttentionMetadata. Falls back to `max_num_tokens` when unset. This "
-            "budget is shared proportionately across all modalities the model "
-            "encodes, not set per modality; per-modality knobs may be added "
-            "later."),
+            "Maximum number of encoder tokens. For encoder-decoder models, this "
+            "limits encoder CUDA graph total-token buckets. For multimodal "
+            "models, this is the shared AttentionMetadata budget across all "
+            "encoded modalities. Falls back to `max_num_tokens` when unset."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
@@ -5159,6 +5208,28 @@ class TorchLlmArgs(BaseLlmArgs):
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer when set")
         return v
+
+    @model_validator(mode="after")
+    def validate_encoder_cuda_graph_config(self) -> 'TorchLlmArgs':
+        if self.encoder_cuda_graph_config is None:
+            return self
+        if self.encode_only:
+            raise ValueError(
+                "Use cuda_graph_config=EncodeCudaGraphConfig(...) when "
+                "encode_only=True; encoder_cuda_graph_config is for "
+                "encoder-decoder models.")
+        if self.encoder_max_batch_size is None:
+            raise ValueError(
+                "encoder_cuda_graph_config requires encoder_max_batch_size.")
+        missing = []
+        if not self.encoder_cuda_graph_config.num_tokens:
+            missing.append("num_tokens/max_num_token")
+        if not self.encoder_cuda_graph_config.seq_lens:
+            missing.append("seq_lens/max_seq_len")
+        if missing:
+            raise ValueError("encoder_cuda_graph_config requires "
+                             f"{' and '.join(missing)}.")
+        return self
 
     attn_backend: str = Field(
         default='TRTLLM',
