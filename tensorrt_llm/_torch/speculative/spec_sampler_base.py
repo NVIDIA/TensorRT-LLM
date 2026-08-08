@@ -26,7 +26,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
@@ -55,6 +55,13 @@ class SampleStateSpec(SampleState):
 
     device: SampleStateTensorsSpec
     host: SampleStateTensorsSpec
+    # Per-request draft-token counts of the step this state samples, captured
+    # in sample_async before dummy draft tokens are added (index-aligned with
+    # `requests`; 0 for finished-context requests). update_requests pairs
+    # them with py_num_accepted_draft_tokens: reading py_draft_tokens there
+    # instead would see the NEXT step's buffer, which update_requests itself
+    # installs.
+    draft_lens: Optional[list[int]] = None
 
 
 class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -219,7 +226,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
-        for req in state.requests:
+        for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
@@ -230,6 +237,14 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 ):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
+            # Pair the acceptance count with the draft count of the SAME step,
+            # snapshotted at sample_async time: _request_common_handling below
+            # replaces py_draft_tokens with the next step's buffer, so its
+            # length must not be used as the denominator (0 for the request's
+            # prefill step, where nothing was verified).
+            req.py_num_draft_tokens_verified = (
+                state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            )
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
@@ -259,6 +274,21 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         finished_context_requests = scheduled_requests.context_requests_last_chunk
         sampling_requests = finished_context_requests + scheduled_requests.generation_requests
         num_sampling_requests = len(sampling_requests)
+
+        # Snapshot each request's draft count for THIS step before
+        # _add_dummy_draft_tokens below installs placeholder drafts on
+        # finished-context requests; update_requests pairs these with the
+        # acceptance counts (see SampleStateSpec.draft_lens). Drafter-fed
+        # flows (NGram, SA) pad py_draft_tokens to the static max for CUDA
+        # graphs before the forward, so prefer the pre-padding count the
+        # drafter recorded; min() guards against a stale count when the
+        # buffer was since cleared (e.g. speculation dynamically disabled).
+        draft_lens = [
+            min(r.py_draft_tokens_effective_len, get_draft_token_length(r))
+            if r.py_draft_tokens_effective_len is not None
+            else get_draft_token_length(r)
+            for r in sampling_requests
+        ]
 
         slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
@@ -327,4 +357,5 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             host=host_tensors,
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
+            draft_lens=draft_lens,
         )
