@@ -16,13 +16,21 @@ Differences vs the Triton path are absorbed inside this wrapper:
     (the FlashInfer prefill kernel does NOT apply L2 norm internally; the
     ``use_qk_l2norm_in_kernel`` parameter on ``flashinfer.chunk_gated_delta_rule``
     is currently a dead arg, see ``flashinfer/gdn_prefill.py:317-356``).
-  * Pre-gather and post-scatter of indexed SSM state into FlashInfer's packed
-    ``[num_seqs, H, V, K]`` layout. TRT-LLM's GDN state pool uses the same
-    ``[N, H, V, K]`` logical layout, so the adapter gathers/scatters without
-    transposing the last two dims. The SM100/SM103 kernel carries the recurrent
-    state in fp32 in TMEM regardless of the initial/output-state I/O dtype, so
-    the round-trip stays in the native pool dtype (bf16/fp16) there with no
-    precision change; only SM90/SM120 need an fp32 up-cast/down-cast.
+  * SSM-state I/O, via one of two paths:
+    - **Indexed pool I/O** -- SM100/SM103 with ``inplace_indexed_state_update``
+      + ``initial_state_indices`` (the ``gdn_mixer`` prefill call site). Pool
+      and slot indices go straight to the kernel, which reads/writes the
+      indexed rows itself: no gather, no scatter, no packed scratch. FlashInfer
+      ships this only for the SM100/SM103 non-CP kernel (``NotImplementedError``
+      elsewhere, see ``flashinfer/gdn_prefill.py``) and it needs
+      flashinfer>=0.6.16, which ``requirements.txt`` pins exactly.
+    - **Gather/scatter** -- everything else, including the MTP target-verify
+      call site, which passes an already-packed state without indices. Gather
+      into FlashInfer's ``[num_seqs, H, V, K]`` layout, call, then scatter back
+      or return the final state. The pool shares that logical layout, so no
+      transpose. SM100/SM103 carry the recurrent state in fp32 in TMEM, so the
+      round-trip stays in the native pool dtype (bf16/fp16) with no precision
+      change; SM90/SM120 need an fp32 up-cast/down-cast.
 
 This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
@@ -61,7 +69,16 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Adapter for FlashInfer's chunk_gated_delta_rule."""
+    """Adapter for FlashInfer's ``chunk_gated_delta_rule``.
+
+    Takes the indexed-pool fast path when ``inplace_indexed_state_update`` and
+    ``initial_state_indices`` are set on SM100/SM103 -- ``initial_state`` is
+    then the full pool and the kernel updates exactly those slots in place,
+    leaving the rest untouched -- and gathers/scatters otherwise (see the
+    module docstring). ``final_state`` is non-``None`` only on the
+    gather/scatter path with ``output_final_state=True`` and no in-place
+    update; an in-place update reports through ``initial_state``.
+    """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
     import flashinfer
@@ -106,6 +123,32 @@ def chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
+
+    # --- Fast path: indexed state pool I/O (no gather/scatter) -----------
+    # Guard rationale in the module docstring. Steps 4 and 7 do not run here.
+    if inplace_indexed_state_update and initial_state_indices is not None and is_sm_100f():
+        num_o_heads = max(q3.shape[1], v3.shape[1])
+        output_buf = (
+            output.squeeze(0)
+            if output is not None
+            else q3.new_empty(q3.shape[0], num_o_heads, q3.shape[2])
+        )
+        flashinfer.chunk_gated_delta_rule(
+            q=q3,
+            k=k3,
+            v=v3,
+            g=g2,
+            beta=beta2,
+            scale=scale,
+            initial_state=initial_state,  # pool [N_pool, H, V, K]
+            state_indices=initial_state_indices,  # [num_seqs], indexed I/O
+            output_final_state=True,
+            output_state=initial_state,  # in-place update of the indexed rows
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output_buf,
+        )
+        return output_buf.unsqueeze(0), None
 
     # --- Step 4: gather initial state (+ cast dtype only when required) ---
     # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.
