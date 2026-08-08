@@ -586,10 +586,16 @@ def _resolve_kv_cache_manager_v2_auto(
         original_setting: Optional[Union[bool, str]] = None) -> bool:
     """Resolve the KV cache manager auto setting after model defaults are applied.
 
-    The transceiver runtime auto setting must be resolved first. In
-    disaggregated serving, hybrid Mamba V2 requires the Python transceiver with
-    NIXL, so an incompatible route falls back to V1 unless the user explicitly
-    selected V2.
+    A model default of V2 is demoted to V1 for routes V2 cannot serve; an
+    explicit user value always wins. The compatibility arms are:
+
+    - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
+      with NIXL, so any other route falls back to V1. The transceiver runtime
+      auto setting must be resolved first.
+    - Two-model speculative decoding: the draft model runs in a separate engine
+      with its own KV cache manager, and V2 cannot split the KV cache budget
+      between the two -- both managers would size their pools from the full
+      budget and double-allocate it -- so it falls back to V1.
     """
     setting = (llm_args.kv_cache_config.use_kv_cache_manager_v2
                if original_setting is None else original_setting)
@@ -616,6 +622,22 @@ def _resolve_kv_cache_manager_v2_auto(
                 "KV cache manager V2 is the model default, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "
                 "falling back to V1.", runtime, effective_backend)
+            model_default = False
+
+    spec_config = llm_args.speculative_config
+    if model_default and spec_config is not None:
+        # ``has_draft_model()`` is the same predicate py_executor_creator uses
+        # to decide whether to build a separate draft model engine, which is
+        # what forces the second KV cache manager.
+        spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+        if spec_dec_mode is not None and spec_dec_mode.has_draft_model():
+            decoding_type = getattr(spec_config, "decoding_type",
+                                    "speculative decoding")
+            logger.info(
+                "KV cache manager V2 is the model default, but %s runs the "
+                "draft model in a separate engine and V2 cannot split the KV "
+                "cache budget between the target and draft managers; falling "
+                "back to V1.", decoding_type)
             model_default = False
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
