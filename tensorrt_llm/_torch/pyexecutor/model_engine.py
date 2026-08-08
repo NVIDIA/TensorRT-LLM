@@ -301,6 +301,35 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
+@contextlib.contextmanager
+def _moe_a2a_steady_state_budget_for_capture():
+    """Force the steady-state MoE all-to-all budget across CUDA-graph capture.
+
+    The budget is a kernel launch argument, so it is frozen into each captured
+    graph. Capture happens inside the warmup window, so without this a replay
+    would keep warmup's relaxed deadline for the life of the process.
+    """
+    _set_moe_a2a_warmup(False)
+    try:
+        yield
+    finally:
+        _set_moe_a2a_warmup(True)
+
+
+def _set_moe_a2a_warmup(in_warmup: bool) -> None:
+    """Select the MoE all-to-all completion-flag budget for the current phase.
+
+    No-op when the op is unavailable (older bindings).
+    """
+    try:
+        torch.ops.trtllm.moe_a2a_set_warmup(in_warmup)
+        logger.info(f"moe_a2a completion-flag budget: in_warmup={in_warmup}")
+    except (AttributeError, RuntimeError) as e:
+        logger.warning(
+            f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
+            f"budget was not switched: {type(e).__name__}: {e}")
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -948,6 +977,11 @@ class PyTorchModelEngine(ModelEngine):
     def is_warmup(self, value: bool):
         self._is_warmup = value
 
+        # This setter is the one choke point every warmup transition passes
+        # through, including PyExecutor's, so select the MoE all-to-all budget
+        # here rather than in set_warmup_flag().
+        _set_moe_a2a_warmup(value)
+
         self.moe_load_balancer_iter_info = (not value, not value)
 
     @property
@@ -1187,6 +1221,11 @@ class PyTorchModelEngine(ModelEngine):
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
         log_mem_snapshot("warmup/before_warmup")
+        # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
+        # collective-bearing forward, so their JIT cost is not charged against the
+        # MoE all-to-all completion-flag deadline.
+        self._prewarm_cute_dsl_indexer_q()
+        log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
             self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
@@ -1229,14 +1268,17 @@ class PyTorchModelEngine(ModelEngine):
         # a larger workspace, so the first pass grows the workspace to its
         # maximum size. The second pass runs the final per-shape warmup and
         # captures without resizing the workspace.
-        with self.cuda_graph_runner.allow_capture():
-            self.cuda_graph_runner.is_warmup_only = True
-            try:
+        # Capture with the steady-state MoE all-to-all budget: the timeout is a
+        # launch argument and is baked into every later replay.
+        with _moe_a2a_steady_state_budget_for_capture():
+            with self.cuda_graph_runner.allow_capture():
+                self.cuda_graph_runner.is_warmup_only = True
+                try:
+                    self._run_cuda_graph_warmup(resource_manager)
+                finally:
+                    self.cuda_graph_runner.is_warmup_only = False
+                self.cuda_graph_runner.padding_dummy_requests = {}
                 self._run_cuda_graph_warmup(resource_manager)
-            finally:
-                self.cuda_graph_runner.is_warmup_only = False
-            self.cuda_graph_runner.padding_dummy_requests = {}
-            self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -1361,6 +1403,63 @@ class PyTorchModelEngine(ModelEngine):
                     f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}); "
                     f"skipping bucket. {type(e).__name__}: {e}")
         torch.cuda.synchronize()
+
+    def _prewarm_cute_dsl_indexer_q(self) -> None:
+        """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.
+
+        Runs before any collective-bearing forward so this op's first-touch
+        ``cute.compile`` is not charged against the MoE all-to-all
+        completion-flag deadline. It is a partial mitigation only: other
+        first-touch compiles remain inside collective-bearing forwards, and some
+        sit on the all-to-all path itself and cannot be pre-compiled this way.
+        The runtime budget (``moeA2AGetTimeoutCycles``) covers the general case.
+
+        Only the fallback tactics are compiled -- what an eager, cache-miss
+        forward selects. The runner's kernel cache key excludes m/n/k, so one
+        compile per tactic covers every shape. Uses the real module and weights,
+        so it cannot drift from what the model runs.
+
+        No-op on non-DSA models. See nvbugs/6482566.
+        """
+        try:
+            from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import \
+                DeepseekV4Indexer
+        except ImportError:
+            return
+
+        indexer = next(
+            (m
+             for m in self.model.modules() if isinstance(m, DeepseekV4Indexer)
+             and getattr(m, "wq_b", None) is not None), None)
+        if indexer is None:
+            return
+
+        weight = indexer.wq_b.weight
+        # _fallback_tactic() branches on m at 4 and 8, so these three token
+        # counts cover every fallback tactic it can return.
+        with torch.inference_mode():
+            for num_tokens in (4, 8, 16):
+                try:
+                    qr = torch.zeros((num_tokens, weight.shape[1]),
+                                     dtype=torch.bfloat16,
+                                     device=weight.device)
+                    position_ids = torch.zeros((num_tokens, ),
+                                               dtype=torch.int32,
+                                               device=weight.device)
+                    indexer._project_and_quantize_q(qr, position_ids)
+                except Exception as e:
+                    # Never fail startup for a prewarm miss; the kernel would
+                    # simply be compiled later, as it is today.
+                    logger.warning(
+                        f"indexer-Q CuTe DSL prewarm skipped for {num_tokens} "
+                        f"tokens. {type(e).__name__}: {e}")
+        torch.cuda.synchronize()
+
+        # Hold every rank here until the slowest has finished compiling, so the
+        # first MoE all-to-all dispatch is entered without JIT skew.
+        if self.mapping.tp_size > 1:
+            self.dist.tp_allgather(1)
+        logger.info("indexer-Q CuTe DSL prewarm complete")
 
     def _warmup_cute_dsl_radix_topk(self) -> None:
         """Pre-compile the DSA radix-filter CuTe DSL decode top-k for every
