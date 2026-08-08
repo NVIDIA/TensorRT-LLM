@@ -24,6 +24,8 @@ from typing import Optional
 
 import torch
 
+import os
+
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -294,6 +296,20 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            if os.environ.get("TLLM_DSPARK_RIDE_LOG") == "1" and (
+                    ridden_verify_lens is not None):
+                _win = ridden_verify_lens[req.py_seq_slot]
+                if _win > 0 and num_new_tokens > _win:
+                    logger.warning(
+                        f"[accept-bound] slot={req.py_seq_slot} accepted+1="
+                        f"{num_new_tokens} > token window {_win} -- in-graph "
+                        f"acceptance ran past this row's layout window")
+                elif _win == 0:
+                    logger.warning(
+                        f"[accept-bound] slot={req.py_seq_slot} ride window=0 "
+                        f"on a live request -- rewind falling back to the "
+                        f"S snapshot (py_verify_len="
+                        f"{getattr(req, 'py_verify_len', None)})")
             # cap-accept: `num_new_tokens` has ALREADY been capped, on device,
             # inside acceptance (`interface.apply_accept_caps`) -- it has to be,
             # because the drafter reads the same count later in that forward to
@@ -440,6 +456,13 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                                           num_sampling_requests]
         self.store.verify_lens.index_copy_(
             0, slots, o_verify_lens.to(self.store.verify_lens.dtype))
+        if os.environ.get("TLLM_DSPARK_RIDE_LOG") == "1":
+            self._ride_log_ctr = getattr(self, "_ride_log_ctr", 0) + 1
+            if self._ride_log_ctr % 64 == 0:
+                logger.info(
+                    f"[ride-log] sampler #{self._ride_log_ctr} "
+                    f"lens_buf[:4]={o_verify_lens[:4].tolist()} "
+                    f"slots[:4]={slots[:4].tolist()}")
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(

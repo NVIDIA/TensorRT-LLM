@@ -2005,7 +2005,9 @@ class PyTorchModelEngine(ModelEngine):
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
 
-        def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
+        def _run_capture_pass(force_non_greedy: bool,
+                              label: str,
+                              entries=None) -> None:
             spec_metadata = self.spec_metadata
             if force_non_greedy and spec_metadata is not None:
                 spec_metadata._force_non_greedy_for_capture = True
@@ -2015,11 +2017,17 @@ class PyTorchModelEngine(ModelEngine):
                 # in this pass uses the non-greedy key; populate's override
                 # below will keep it False on every subsequent iteration.
                 spec_metadata.is_all_greedy_sample = False
+            elif spec_metadata is not None:
+                # Symmetric pre-flip for interleaved capture: a greedy capture
+                # right after an advanced one would otherwise key on the stale
+                # False before populate corrects it.
+                spec_metadata.is_all_greedy_sample = True
             _graph_mem_before = (torch.cuda.memory_reserved(),
                                  torch.cuda.memory_allocated())
             _graph_count = 0
             try:
-                for entry in graphs_to_capture:
+                for entry in (graphs_to_capture
+                              if entries is None else entries):
                     # Ragged verification adds a token-count axis, so entries
                     # may be (bs, draft_len) or (bs, draft_len, token_bucket).
                     bs, draft_len = entry[0], entry[1]
@@ -2090,9 +2098,32 @@ class PyTorchModelEngine(ModelEngine):
         # the LAST shape's draft length; restore it after the passes, before
         # the generic token warmup builds requests at the full draft length.
         saved_runtime_draft_len = self.runtime_draft_len
+        needs_non_greedy_precheck = (
+            self.spec_config is not None
+            and self.spec_config.spec_dec_mode.use_one_engine()
+            and os.environ.get("TLLM_DSPARK_SKIP_ADVANCED_CAPTURE") != "1")
+        if (needs_non_greedy_precheck and os.environ.get(
+                "TLLM_DSPARK_INTERLEAVED_CAPTURE") == "1"):
+            # Debug/fix candidate: capture both sampling variants of each
+            # shape back-to-back, so the two graphs bind under identical
+            # pool/workspace/persistent-buffer conditions instead of a whole
+            # sweep apart.
+            for _entry in graphs_to_capture:
+                _run_capture_pass(force_non_greedy=False,
+                                  label="greedy",
+                                  entries=[_entry])
+                _run_capture_pass(force_non_greedy=True,
+                                  label="advanced sampling",
+                                  entries=[_entry])
+            self.enable_spec_decode = self.is_spec_decode
+            self.runtime_draft_len = saved_runtime_draft_len
+            if self.spec_metadata is not None:
+                self.spec_metadata.is_all_greedy_sample = True
+            return
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
-        _run_capture_pass(force_non_greedy=False, label="greedy")
+        if os.environ.get("TLLM_DSPARK_SKIP_GREEDY_CAPTURE") != "1":
+            _run_capture_pass(force_non_greedy=False, label="greedy")
         # Pass 2: advanced sampling variant. Required because on-the-fly capture
         # is disabled outside warmup, so any inference batch that contains a
         # non-greedy request would otherwise fall back to eager. Only meaningful
@@ -2101,7 +2132,8 @@ class PyTorchModelEngine(ModelEngine):
         # this variant.
         needs_non_greedy_capture = (
             self.spec_config is not None
-            and self.spec_config.spec_dec_mode.use_one_engine())
+            and self.spec_config.spec_dec_mode.use_one_engine()
+            and os.environ.get("TLLM_DSPARK_SKIP_ADVANCED_CAPTURE") != "1")
         if needs_non_greedy_capture:
             _run_capture_pass(force_non_greedy=True, label="advanced sampling")
         # Set the value back to the original value after cuda graph warmups are complete
@@ -3833,8 +3865,23 @@ class PyTorchModelEngine(ModelEngine):
         runner.agreed_ragged_bucket = int(bucket)
         runner.ragged_pad_verify_len = pad_len - 1
 
-        for request, tokens in zip(generation_requests,
-                                   filled.verify_lens.tolist()):
+        published = filled.verify_lens.tolist()
+        if os.environ.get("TLLM_DSPARK_HOST_STEEP") == "1" and n_real > 1:
+            # Debug bisector: force truly non-uniform windows through the
+            # HOST staging (the reference implementation, no device
+            # prologue). The production host scheduler only ever publishes
+            # uniform windows (budget quantized to the tier ladder), so the
+            # ragged consumers' non-uniform handling is otherwise exercised
+            # only by the device path -- this isolates them.
+            lo = 1 + getattr(self.spec_config, "min_verify_len", 1)
+            hi = max_verify_len
+            pairs = (n_real // 2) * 2
+            for i in range(0, pairs, 2):
+                give = min(published[i] - lo, hi - published[i + 1])
+                if give > 0:
+                    published[i] -= give
+                    published[i + 1] += give
+        for request, tokens in zip(generation_requests, published):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
 
@@ -3901,6 +3948,9 @@ class PyTorchModelEngine(ModelEngine):
         split_lens = lens_buf[:padded_bs].clone()
         split_qo = qo_buf[:padded_bs + 1].to(torch.long)
         past_seen = self.position_ids_cuda[split_qo[:-1]].clone()
+        if os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":
+            self._dbg_pre_kv = attn_metadata.kv_lens_cuda[:padded_bs].clone()
+            self._dbg_split = split_lens.clone()
 
         expected_stamp = worker.verified_draft_seq_cuda()
         stamps = worker.confidence_stamp_buffer(
@@ -3917,13 +3967,54 @@ class PyTorchModelEngine(ModelEngine):
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
         )
+        debug_mode = os.environ.get("TLLM_DSPARK_DEVICE_IDENTITY", "")
+        if debug_mode in ("1", "steep"):
+            # Debug bisectors. "1": exercise every prologue write with the
+            # shape split itself (w := S) -- corruption surviving this is in
+            # the rewrite mechanics, not the window semantics. "steep":
+            # deterministic max-amplitude ragged windows (adjacent real rows
+            # trade tokens pairwise, conserving the total) -- forces w != S
+            # while staying independent of the confidence-gather chain.
+            from ..speculative.dspark_ragged import (build_qo_indptr,
+                                                     build_row_maps_device)
+            id_lens = split_lens.clone()
+            if debug_mode == "steep" and n_real > 1:
+                lo = cfg.min_verify_len + 1
+                hi = cfg.resolved_max_verify_len + 1
+                pairs = (n_real // 2) * 2
+                a = id_lens[0:pairs:2]
+                b = id_lens[1:pairs:2]
+                give = torch.minimum(a - lo, hi - b).clamp_min(0)
+                a -= give
+                b += give
+            id_req, id_corr = build_row_maps_device(id_lens,
+                                                    graph_num_tokens=bucket)
+            result = type(result)(verify_lens=id_lens,
+                                  qo_indptr=build_qo_indptr(id_lens).to(
+                                      result.qo_indptr.dtype),
+                                  req_idx=id_req,
+                                  kv_correction=id_corr)
 
         lens_buf[:padded_bs].copy_(result.verify_lens)
         qo_buf[:padded_bs + 1].copy_(result.qo_indptr)
-        # Every host-staged kv formula used the shape split consistently, so
-        # correcting by the difference lands on exactly the value the host
-        # path would have produced with these windows.
-        attn_metadata.kv_lens_cuda[:padded_bs] += result.verify_lens - split_lens
+        # The host stages kv_lens as num_cached + seq_lens_kv, and BOTH terms
+        # bake the per-request token window (num_cached = past + tokens;
+        # seq_lens_kv = tokens), so kv_lens = past + 2*S -- the window counts
+        # TWICE. Moving to the true windows therefore needs 2*(w - S), not
+        # (w - S): the single-delta variant left every re-ranked request's
+        # kv_len off by (w - S), which shifted the indexer K-cache slot
+        # mapping (slot_mapping_fp8) and silently wrote K entries into the
+        # wrong cache slots. Established empirically by an A/B tensor diff
+        # against a full host restage with the same windows.
+        window_delta = result.verify_lens - split_lens
+        attn_metadata.kv_lens_cuda[:padded_bs] += 2 * window_delta
+        # The graph adds previous_kv_lens_offsets (staged as new_tokens_lens -
+        # shape_lens, per request) to kv_lens during replay; host-with-w
+        # stages new_tokens_lens - w there, so the offsets move by -(w - S).
+        # Combined: (past + 2S) + 2(w-S) + (new - S) - (w-S) = past + w + new,
+        # exactly the host-with-w in-graph sum.
+        self.previous_kv_lens_offsets_cuda[:padded_bs] -= window_delta.to(
+            self.previous_kv_lens_offsets_cuda.dtype)
 
         req_idx = result.req_idx
         device = req_idx.device
@@ -3960,7 +4051,107 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.apply_device_ragged_layout(result.verify_lens, req_idx,
                                                  result.kv_correction)
+        if os.environ.get("TLLM_DSPARK_RIDE_LOG") == "1":
+            self._ride_log_ctr = getattr(self, "_ride_log_ctr", 0) + 1
+            if self._ride_log_ctr % 64 == 0:
+                logger.info(
+                    f"[ride-log] prologue #{self._ride_log_ctr} "
+                    f"S={split_lens[:4].tolist()} w={result.verify_lens[:4].tolist()}")
         return True
+
+    def _dspark_ab_diff(self, padded_requests, kv_cache_manager, attn_metadata,
+                        spec_metadata, new_tensors_device,
+                        cache_indirection_buffer, num_accepted_tokens_device,
+                        req_id_to_old_request, resource_manager,
+                        can_run_graph) -> None:
+        """Debug: diff the prologue's rewritten staging against a host restage.
+
+        Runs once, eager-only. Snapshot every tensor the forward reads after
+        the prologue rewrote the layout to the device windows w; then stamp w
+        onto each request's py_verify_len and rerun the full host staging (the
+        reference implementation, proven correct for non-uniform windows);
+        diff. Any mismatch names the artifact the prologue fails to mirror.
+        """
+        torch.cuda.synchronize()
+        bucket = int(self.cuda_graph_runner.agreed_ragged_bucket or 0)
+        padded_bs = int(self._dspark_last_padded_bs)
+        gen_requests = padded_requests.generation_requests
+        n_real = int(self._dspark_last_num_real)
+        w_tokens = self.ragged_verify_lens_cuda[:padded_bs].tolist()
+
+        def snap():
+            fields = {
+                "input_ids": self.input_ids_cuda[:bucket],
+                "position_ids": self.position_ids_cuda[:bucket],
+                "draft_tokens": self.draft_tokens_cuda[:bucket],
+                "prev_pos_indices": self.previous_pos_indices_cuda[:bucket],
+                "prev_pos_offsets": self.previous_pos_id_offsets_cuda[:bucket],
+                "prev_kv_offsets": self.previous_kv_lens_offsets_cuda[:padded_bs],
+                "kv_lens": attn_metadata.kv_lens_cuda[:padded_bs],
+                "seq_lens_cuda": attn_metadata.seq_lens_cuda[:padded_bs],
+                "verify_lens": self.ragged_verify_lens_cuda[:padded_bs],
+                "qo_indptr": self.ragged_qo_indptr_cuda[:padded_bs + 1],
+            }
+            for name in ("gen_token_repeats_cuda", "row_req_idx_cuda",
+                         "row_kv_correction_cuda", "attn_row_req_idx_cuda",
+                         "attn_row_kv_correction_cuda", "req_idx_per_token",
+                         "kv_lens_expanded_cuda", "block_table_expanded",
+                         "slot_mapping_fp8", "gen_kv_indptr",
+                         "gen_cached_token_indptr"):
+                t = getattr(attn_metadata, name, None)
+                if isinstance(t, torch.Tensor):
+                    n = bucket if t.shape[0] >= bucket else t.shape[0]
+                    fields[name] = t[:n]
+            for name in ("temperatures", "top_ks", "top_ps", "batch_slot_ids"):
+                t = getattr(spec_metadata, name, None)
+                if isinstance(t, torch.Tensor):
+                    n = min(bucket, t.shape[0])
+                    fields["spec." + name] = t[:n]
+            return {k: v.detach().clone() for k, v in fields.items()}
+
+        snap_a = snap()
+        prev_idx = getattr(self, "_dspark_ab_prev_idx", {})
+        for request, tokens in zip(gen_requests, w_tokens):
+            request.py_verify_len = int(tokens) - 1
+            if request.py_request_id in prev_idx:
+                request.py_batch_idx = prev_idx[request.py_request_id]
+        try:
+            self._prepare_inputs(padded_requests, kv_cache_manager,
+                                 attn_metadata, spec_metadata,
+                                 new_tensors_device, cache_indirection_buffer,
+                                 num_accepted_tokens_device,
+                                 req_id_to_old_request, resource_manager,
+                                 can_run_graph)
+        except Exception as exc:
+            logger.warning(f"[ab-diff] restage failed, disabling: {exc}")
+            self._dspark_ab_prints = 999
+            return
+        torch.cuda.synchronize()
+        snap_b = snap()
+        self._dspark_ab_step = getattr(self, "_dspark_ab_step", 0) + 1
+        # Expected-divergent names: staged from the shape split at prepare
+        # and rebuilt in-graph from the corrected kv_lens before any read.
+        benign = {"kv_lens_expanded_cuda", "slot_mapping_fp8"}
+        for name, a in snap_a.items():
+            b = snap_b[name]
+            if name in benign or a.shape != b.shape:
+                continue
+            neq = (a != b)
+            cnt = int(neq.sum())
+            if cnt:
+                idx = int(neq.reshape(-1).nonzero()[0])
+                self._dspark_ab_prints = getattr(self, "_dspark_ab_prints",
+                                                 0) + 1
+                logger.info(
+                    f"[ab-diff] step#{self._dspark_ab_step} {name}: "
+                    f"{cnt}/{a.numel()} MISMATCH first@{idx} "
+                    f"prologue={a.reshape(-1)[idx].item()} "
+                    f"host={b.reshape(-1)[idx].item()} "
+                    f"(bs={padded_bs} n_real={n_real} bucket={bucket})")
+        if self._dspark_ab_step % 200 == 0:
+            logger.info(f"[ab-diff] step#{self._dspark_ab_step} checkpoint: "
+                        f"{getattr(self, '_dspark_ab_prints', 0)} mismatch "
+                        f"lines so far")
 
     @staticmethod
     def _ragged_token_lens(generation_requests) -> Optional[List[int]]:
@@ -7055,6 +7246,13 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager=spec_resource_manager,
             )
 
+            if (key is not None and not self.is_warmup and os.environ.get(
+                    "TLLM_DSPARK_FORCE_EAGER") == "1"):
+                # Debug bisector: capture normally (the ragged fit needs the
+                # captured bucket set) but veto every replay, so the exact
+                # same staged step runs eagerly. Splits capture-interaction
+                # bugs from layout-semantics bugs.
+                key = None
             can_run_graph = key is not None
             # A ragged step that misses its captured shape quietly runs eager;
             # count it. Only generation-only steps count: a batch with context
@@ -7084,6 +7282,15 @@ class PyTorchModelEngine(ModelEngine):
                     padded_requests.generation_requests,
                 )
 
+            if os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":
+                # The staging loop overwrites py_batch_idx (prev-batch index
+                # -> seq slot); the A/B restage must see the original or its
+                # reference staging reads the wrong new_tokens rows on any
+                # slot-churn step.
+                self._dspark_ab_prev_idx = {
+                    r.py_request_id: r.py_batch_idx
+                    for r in padded_requests.generation_requests
+                }
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
@@ -7097,10 +7304,27 @@ class PyTorchModelEngine(ModelEngine):
             # replay (stream-ordered, no host sync). Graph steps only: eager
             # and capture steps run the host shape split, which is a valid
             # window assignment.
-            if (can_run_graph and not self.is_warmup
+            if ((can_run_graph or os.environ.get(
+                    "TLLM_DSPARK_DEVICE_EAGER_OK") == "1")
+                    and not self.is_warmup
                     and getattr(self, "_dspark_device_budget", None)
                     is not None):
-                self._apply_device_window_prologue(inputs, new_tensors_device)
+                applied = self._apply_device_window_prologue(
+                    inputs, new_tensors_device)
+                if applied and os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":
+                    self._dspark_ab_applied = getattr(
+                        self, "_dspark_ab_applied", 0) + 1
+                if (applied and os.environ.get("TLLM_DSPARK_AB_DUMP") == "1"
+                        and getattr(self, "_dspark_ab_applied", 0) >= int(
+                            os.environ.get("TLLM_DSPARK_AB_AFTER", "0"))
+                        and getattr(self, "_dspark_ab_prints", 0) < 40):
+                    self._dspark_ab_diff(padded_requests, kv_cache_manager,
+                                         attn_metadata, spec_metadata,
+                                         new_tensors_device,
+                                         cache_indirection_buffer,
+                                         num_accepted_tokens_device,
+                                         req_id_to_old_request,
+                                         resource_manager, can_run_graph)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:

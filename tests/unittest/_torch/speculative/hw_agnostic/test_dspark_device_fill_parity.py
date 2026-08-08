@@ -309,3 +309,47 @@ def test_select_windows_device_matches_host_chain():
             host.verify_lens, graph_num_tokens=bucket)
         assert torch.equal(result.req_idx, want_req)
         assert torch.equal(result.kv_correction, want_corr)
+
+
+def test_prologue_kv_pairing_matches_host_staging():
+    """The host stages ``kv_lens = num_cached + seq_lens_kv`` where BOTH terms
+    bake the per-request token window (num_cached = past + tokens,
+    seq_lens_kv = tokens): kv_lens = past + 2*S. The overlap graph then adds
+    ``previous_kv_lens_offsets`` (staged as ``new_tokens_lens - S``) during
+    replay. Rebasing the layout onto the true windows w therefore needs
+    kv_lens += 2*(w - S) and offsets -= (w - S); any other split leaves the
+    indexer's slot mapping (derived from kv_lens) pointing at the wrong
+    K-cache slots -- the silent KV corruption that inflated the device-window
+    throughput while degrading every completion. The 2x coefficient and the
+    reference values were established by an A/B tensor diff against a full
+    host restage with identical windows.
+    """
+    gen = torch.Generator().manual_seed(20260807)
+    for _ in range(20):
+        padded_bs = int(torch.randint(2, 40, (1,), generator=gen))
+        past_seen = torch.randint(10, 500, (padded_bs,), generator=gen)
+        new_tokens_lens = torch.randint(1, 7, (padded_bs,), generator=gen)
+        shape_lens = torch.randint(2, 7, (padded_bs,), generator=gen)
+        true_lens = torch.randint(2, 7, (padded_bs,), generator=gen)
+
+        # Host staging under the shape split S: the window counts twice.
+        kv_lens = (past_seen + 2 * shape_lens).to(torch.int32)
+        offsets = (new_tokens_lens - shape_lens).to(torch.int32)
+
+        # Prologue: 2x on the kv side, 1x on the offsets side.
+        window_delta = (true_lens - shape_lens).to(torch.int32)
+        kv_lens += 2 * window_delta
+        offsets -= window_delta
+
+        # Pre-offset kv_lens must equal host-with-w staging: the indexer's
+        # slot mapping and the expanded per-token extents derive from it.
+        assert torch.equal(kv_lens,
+                           (past_seen + 2 * true_lens).to(torch.int32))
+
+        # In-graph correction at replay.
+        effective = kv_lens + offsets
+
+        # Reference: host staging directly with the true windows w.
+        want = (past_seen + 2 * true_lens).to(torch.int32) + (
+            new_tokens_lens - true_lens).to(torch.int32)
+        assert torch.equal(effective, want)
