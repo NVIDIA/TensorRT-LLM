@@ -55,7 +55,6 @@ from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
-TIMEOUT_KEEP_ALIVE = 10  # seconds.
 _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
@@ -251,10 +250,12 @@ class OpenAIDisaggServer:
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
             return await self._coordinator.get_disagg_request_id()
-        return OpenAIHttpClient(
+        client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
             disagg_id_generator=disagg_id_generator,
-            request_perf_metrics=self._collect_perf_metrics)
+            request_perf_metrics=self._collect_perf_metrics,
+            internal_disagg_auth_key=self._config.internal_request_auth_key)
+        return client
 
     def register_routes(self):
         # The disagg service owns only the request-serving endpoints (/v1/*) and
@@ -372,11 +373,12 @@ class OpenAIDisaggServer:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
+        keep_alive_timeout = self._config.server_keep_alive_timeout
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=keep_alive_timeout)
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):

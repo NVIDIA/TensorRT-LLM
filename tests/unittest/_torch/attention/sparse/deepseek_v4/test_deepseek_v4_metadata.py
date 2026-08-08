@@ -17,7 +17,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4CacheManager,
     DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
@@ -33,7 +34,7 @@ def test_prepare_computes_draft_sliding_block_tables_before_base_prepare(monkeyp
     """
     metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
     metadata.kv_cache_manager = MagicMock()
-    metadata.draft_kv_cache_manager = MagicMock()
+    metadata.draft_kv_cache_manager = MagicMock(spec=DeepseekV4CacheManager)
     metadata.request_ids = [11, 12, 13]
     metadata.num_contexts = 2
 
@@ -53,3 +54,40 @@ def test_prepare_computes_draft_sliding_block_tables_before_base_prepare(monkeyp
         metadata.request_ids,
         metadata.num_contexts,
     )
+
+
+def test_prepare_skips_non_deepseek_draft_sliding_table_lookalike(monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.kv_cache_manager = MagicMock()
+    metadata.draft_kv_cache_manager = MagicMock()
+    metadata.request_ids = [11]
+    metadata.num_contexts = 1
+
+    def _stop_at_base_prepare(self: TrtllmAttentionMetadata) -> None:
+        raise RuntimeError("base prepare reached")
+
+    monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", _stop_at_base_prepare)
+
+    with pytest.raises(RuntimeError, match="base prepare reached"):
+        DeepseekV4TrtllmAttentionMetadata.prepare(metadata)
+
+    metadata.draft_kv_cache_manager.compute_sliding_block_tables.assert_not_called()
+
+
+def test_prepare_allows_plain_draft_manager_without_sliding_tables(monkeypatch: pytest.MonkeyPatch) -> None:
+    class PlainDraftManager:
+        pass
+
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.kv_cache_manager = MagicMock()
+    metadata.draft_kv_cache_manager = PlainDraftManager()
+    metadata.request_ids = [11]
+    metadata.num_contexts = 1
+
+    def _stop_at_base_prepare(self: TrtllmAttentionMetadata) -> None:
+        raise RuntimeError("base prepare reached")
+
+    monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", _stop_at_base_prepare)
+
+    with pytest.raises(RuntimeError, match="base prepare reached"):
+        DeepseekV4TrtllmAttentionMetadata.prepare(metadata)
