@@ -178,6 +178,18 @@ class RayWorkerWrapper:
         id_mapping = list(map(int, visible_devices.split(",")))
         return id_mapping.index(phys_id)
 
+    # Methods that a user-supplied WorkerExtension is explicitly allowed
+    # to override on the worker class. These are designated extension
+    # points: their BaseWorker implementations forward to the engine and
+    # the extension's override is expected to win for Ray deployments
+    # (e.g. RL workflows using torch.cuda.profiler directly). When one of
+    # these names collides, the extension's method is copied into the
+    # derived class dict so MRO resolves to it regardless of base order.
+    _EXTENSION_OVERRIDABLE_METHODS = frozenset({
+        "start_profile",
+        "stop_profile",
+    })
+
     @staticmethod
     def _inject_worker_extension(
             worker_class: Type[BaseWorker],
@@ -193,9 +205,27 @@ class RayWorkerWrapper:
                 f"Failed to load worker extension '{extension_cls_name}'"
             ) from e
 
+        # Derived-class overrides: for explicitly overridable method
+        # names (see _EXTENSION_OVERRIDABLE_METHODS), copy the extension
+        # method into the derived class dict so it wins over the base
+        # worker's implementation regardless of MRO order.
+        derived_attrs = {'__module__': worker_class.__module__}
+        overridable = RayWorkerWrapper._EXTENSION_OVERRIDABLE_METHODS
+
         # Check for conflicts
         for attr in dir(extension_cls):
             if attr.startswith("__"):
+                continue
+            if attr in overridable:
+                # Extension is allowed to override; copy its attribute
+                # directly so MRO resolves to the extension version.
+                ext_attr = extension_cls.__dict__.get(attr)
+                if ext_attr is None:
+                    # Inherited from a base of extension_cls; fall back
+                    # to getattr which still returns the extension-side
+                    # implementation.
+                    ext_attr = getattr(extension_cls, attr)
+                derived_attrs[attr] = ext_attr
                 continue
             if hasattr(worker_class, attr):
                 raise ValueError(
@@ -204,7 +234,7 @@ class RayWorkerWrapper:
 
         derived_name = f"{worker_class.__name__}With{extension_cls.__name__}"
         ExtendedWorker = type(derived_name, (worker_class, extension_cls),
-                              {'__module__': worker_class.__module__})
+                              derived_attrs)
         return ExtendedWorker
 
 
