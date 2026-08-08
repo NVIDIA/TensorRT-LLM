@@ -1,0 +1,400 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Clean Up Stale Pull Requests
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report actions without commenting on or closing pull requests
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  cleanup-stale-prs:
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    concurrency:
+      group: cleanup-stale-prs
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Process stale pull requests
+        uses: actions/github-script@v8
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          script: |
+            const PING_AFTER_DAYS = 120;
+            const CLOSE_AFTER_DAYS = 180;
+            const MAX_ACTIONS_PER_RUN = 50;
+            const MAX_MERGEABILITY_ATTEMPTS = 3;
+            const MAX_WRITE_ATTEMPTS = 3;
+            const MERGEABILITY_RETRY_DELAY_MS = 2000;
+            const WRITE_RETRY_DELAY_MS = 2000;
+            const EXEMPT_LABEL = 'no-stale';
+            const DAY_IN_MS = 24 * 60 * 60 * 1000;
+            const dryRun =
+              context.eventName === 'workflow_dispatch' &&
+              process.env.DRY_RUN === 'true';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const now = Date.now();
+            const pullRequestsQuery = `
+              query($owner: String!, $repo: String!, $cursor: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequests(
+                    first: 100
+                    after: $cursor
+                    states: OPEN
+                    orderBy: { field: UPDATED_AT, direction: ASC }
+                  ) {
+                    nodes {
+                      number
+                      updatedAt
+                    }
+                    pageInfo {
+                      endCursor
+                      hasNextPage
+                    }
+                  }
+                }
+              }
+            `;
+            const pullRequestQuery = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    author {
+                      login
+                    }
+                    isDraft
+                    labels(first: 100) {
+                      nodes {
+                        name
+                      }
+                      pageInfo {
+                        endCursor
+                        hasNextPage
+                      }
+                    }
+                    mergeable
+                    number
+                    reviewDecision
+                    state
+                    updatedAt
+                    url
+                  }
+                }
+              }
+            `;
+            const pullRequestLabelsQuery = `
+              query(
+                $owner: String!
+                $repo: String!
+                $number: Int!
+                $cursor: String!
+              ) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    labels(first: 100, after: $cursor) {
+                      nodes {
+                        name
+                      }
+                      pageInfo {
+                        endCursor
+                        hasNextPage
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const wait = (milliseconds) =>
+              new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+            async function hasExemptLabel(number, firstPage) {
+              let labels = firstPage;
+              while (labels) {
+                if (
+                  labels.nodes.some(
+                    (label) => label.name.toLowerCase() === EXEMPT_LABEL
+                  )
+                ) {
+                  return true;
+                }
+                if (!labels.pageInfo.hasNextPage) {
+                  return false;
+                }
+                const result = await github.graphql(pullRequestLabelsQuery, {
+                  owner,
+                  repo,
+                  number,
+                  cursor: labels.pageInfo.endCursor,
+                });
+                labels = result.repository.pullRequest?.labels;
+              }
+              return false;
+            }
+
+            async function getCurrentPullRequest(number) {
+              for (
+                let attempt = 1;
+                attempt <= MAX_MERGEABILITY_ATTEMPTS;
+                attempt += 1
+              ) {
+                const result = await github.graphql(pullRequestQuery, {
+                  owner,
+                  repo,
+                  number,
+                });
+                const pullRequest = result.repository.pullRequest;
+                const isFresh =
+                  pullRequest &&
+                  (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS <=
+                    PING_AFTER_DAYS;
+                if (!pullRequest) {
+                  return null;
+                }
+                if (pullRequest.state !== 'OPEN' || isFresh) {
+                  return { ...pullRequest, isExempt: false };
+                }
+                if (
+                  pullRequest.mergeable !== 'UNKNOWN' ||
+                  attempt === MAX_MERGEABILITY_ATTEMPTS
+                ) {
+                  const isExempt = await hasExemptLabel(
+                    number,
+                    pullRequest.labels
+                  );
+                  return { ...pullRequest, isExempt };
+                }
+
+                console.log(
+                  `Mergeability for ${pullRequest.url} is UNKNOWN; ` +
+                    `retrying (${attempt}/${MAX_MERGEABILITY_ATTEMPTS}).`
+                );
+                await wait(MERGEABILITY_RETRY_DELAY_MS);
+              }
+              return null;
+            }
+
+            async function retryWrite(description, operation) {
+              for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  if (attempt === MAX_WRITE_ATTEMPTS) {
+                    throw error;
+                  }
+                  core.warning(
+                    `${description} failed: ${error.message}; ` +
+                      `retrying (${attempt}/${MAX_WRITE_ATTEMPTS}).`
+                  );
+                  await wait(WRITE_RETRY_DELAY_MS);
+                }
+              }
+            }
+
+            let actionCount = 0;
+            let closeCount = 0;
+            let exemptCount = 0;
+            let pingCount = 0;
+            let scannedCount = 0;
+            let skipCount = 0;
+            const candidates = [];
+            let cursor = null;
+            let reachedFreshPullRequest = false;
+
+            do {
+              const result = await github.graphql(pullRequestsQuery, {
+                owner,
+                repo,
+                cursor,
+              });
+              const connection = result.repository.pullRequests;
+
+              for (const candidate of connection.nodes) {
+                const candidateIdleDays =
+                  (now - Date.parse(candidate.updatedAt)) / DAY_IN_MS;
+                if (candidateIdleDays <= PING_AFTER_DAYS) {
+                  reachedFreshPullRequest = true;
+                  break;
+                }
+                candidates.push(candidate.number);
+              }
+
+              cursor = connection.pageInfo.hasNextPage
+                ? connection.pageInfo.endCursor
+                : null;
+            } while (cursor && !reachedFreshPullRequest);
+
+            for (const candidateNumber of candidates) {
+              if (actionCount >= MAX_ACTIONS_PER_RUN) {
+                break;
+              }
+
+              scannedCount += 1;
+              // Re-read mutable state immediately before acting. This prevents a
+              // comment, label, or push made during the run from being treated as stale.
+              const pullRequest = await getCurrentPullRequest(candidateNumber);
+              if (!pullRequest || pullRequest.state !== 'OPEN') {
+                skipCount += 1;
+                continue;
+              }
+
+              const idleDays =
+                (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS;
+              if (idleDays <= PING_AFTER_DAYS) {
+                skipCount += 1;
+                continue;
+              }
+
+              if (pullRequest.isExempt) {
+                console.log(`Skipping ${pullRequest.url}: labeled ${EXEMPT_LABEL}.`);
+                exemptCount += 1;
+                continue;
+              }
+
+              if (pullRequest.mergeable === 'UNKNOWN') {
+                core.warning(
+                  `Skipping ${pullRequest.url}: GitHub did not compute mergeability ` +
+                    `after ${MAX_MERGEABILITY_ATTEMPTS} attempts.`
+                );
+                skipCount += 1;
+                continue;
+              }
+
+              const hasConflicts = pullRequest.mergeable === 'CONFLICTING';
+              const isClean = pullRequest.mergeable === 'MERGEABLE';
+              const isApproved = pullRequest.reviewDecision === 'APPROVED';
+
+              if (idleDays > CLOSE_AFTER_DAYS && hasConflicts) {
+                const body =
+                  'This pull request has been automatically closed because it ' +
+                  `has had no activity for more than ${CLOSE_AFTER_DAYS} days ` +
+                  'and currently has merge conflicts. If the work is still ' +
+                  'relevant, please open a new pull request. You may also reopen ' +
+                  'this PR after resolving the conflicts if its source branch is ' +
+                  'still available.';
+                console.log(
+                  `${dryRun ? '[dry run] Would close' : 'Closing'} ` +
+                    `${pullRequest.url} (${idleDays.toFixed(1)} idle days).`
+                );
+                if (!dryRun) {
+                  await retryWrite(`Closing ${pullRequest.url}`, () =>
+                    github.rest.pulls.update({
+                      owner,
+                      repo,
+                      pull_number: pullRequest.number,
+                      state: 'closed',
+                    })
+                  );
+                  await retryWrite(`Commenting on ${pullRequest.url}`, () =>
+                    github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: pullRequest.number,
+                      body,
+                    })
+                  );
+                }
+                actionCount += 1;
+                closeCount += 1;
+                continue;
+              }
+
+              // Conflicting PRs stay on the close track. Pinging them would update
+              // updatedAt and prevent them from reaching the close threshold.
+              if (
+                !hasConflicts &&
+                idleDays > PING_AFTER_DAYS &&
+                (isClean || isApproved) &&
+                pullRequest.author?.login
+              ) {
+                const status =
+                  isClean && isApproved
+                    ? 'approved and mergeable'
+                    : isApproved
+                      ? 'approved'
+                      : 'mergeable';
+                const body =
+                  `@${pullRequest.author.login} this pull request has had no ` +
+                  `activity for more than ${PING_AFTER_DAYS} days and is ` +
+                  `currently ${status}. Is it still active? Please post an ` +
+                  'update when you can.';
+                console.log(
+                  `${dryRun ? '[dry run] Would ping' : 'Pinging'} ` +
+                    `${pullRequest.url} (${idleDays.toFixed(1)} idle days, ${status}).`
+                );
+                if (!dryRun) {
+                  await retryWrite(`Commenting on ${pullRequest.url}`, () =>
+                    github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: pullRequest.number,
+                      body,
+                    })
+                  );
+                }
+                actionCount += 1;
+                pingCount += 1;
+                continue;
+              }
+
+              skipCount += 1;
+            }
+
+            if (
+              actionCount >= MAX_ACTIONS_PER_RUN &&
+              scannedCount < candidates.length
+            ) {
+              core.warning(
+                `Reached the ${MAX_ACTIONS_PER_RUN}-action safety limit; ` +
+                  'remaining pull requests will be considered on the next run.'
+              );
+            }
+
+            const mode = dryRun ? 'Dry run' : 'Run';
+            await core.summary
+              .addHeading('Stale pull request cleanup')
+              .addTable([
+                [
+                  { data: 'Mode', header: true },
+                  { data: 'Closed', header: true },
+                  { data: 'Exempt', header: true },
+                  { data: 'Pinged', header: true },
+                  { data: 'Scanned', header: true },
+                  { data: 'Skipped', header: true },
+                ],
+                [
+                  mode,
+                  String(closeCount),
+                  String(exemptCount),
+                  String(pingCount),
+                  String(scannedCount),
+                  String(skipCount),
+                ],
+              ])
+              .write();

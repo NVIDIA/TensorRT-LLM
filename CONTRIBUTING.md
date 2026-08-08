@@ -118,6 +118,23 @@ For NVIDIA developers,  please submit feature or bug fixes to the dedicated bran
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 
+### Inactive pull requests
+
+TensorRT-LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
+ready-for-review pull requests:
+
+* After more than 120 days without activity, the workflow reminds the author when the pull request is approved or
+  mergeable and does not have merge conflicts.
+* Pull requests with merge conflicts remain on the closure track without a reminder, because an automated reminder
+  would reset their inactivity period.
+* After more than 180 days without activity, a pull request with merge conflicts is closed with an explanatory
+  comment. Age alone does not cause a pull request to be closed.
+
+Maintainers can apply the `no-stale` label to exempt an intentionally parked pull request from reminders and
+automatic closure. If an inactive pull request is closed and the work is still relevant, open a new pull request.
+The original pull request may instead be reopened after its conflicts are resolved if its source branch is still
+available.
+
 
 ## Tests and Code Review for Protected APIs
 
