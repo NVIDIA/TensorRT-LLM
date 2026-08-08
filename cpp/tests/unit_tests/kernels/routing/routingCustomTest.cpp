@@ -295,6 +295,30 @@ TYPED_TEST(RoutingCustomKernelTest, BlockLevelParallelizationWithExpertParalleli
     this->runTest(param);
 };
 
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelClassicBoundaryE512K16)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(512)
+                     .withTopK(16)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelCooperativeBoundaryE576K8)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(576)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
 TYPED_TEST(RoutingCustomKernelTest, BlockLevelParallelizationWithInvalidTopKInput)
 {
     auto param = RoutingKernelTestParam()

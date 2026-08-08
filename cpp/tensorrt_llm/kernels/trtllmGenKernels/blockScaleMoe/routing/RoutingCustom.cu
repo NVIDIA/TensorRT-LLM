@@ -1629,10 +1629,10 @@ void run(Data const& data, void* stream)
 
     bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
     int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
-    // Cooperative block kernel: fastest path for tiny batches. Requires an elementwise
-    // preprocess (any but softmax-over-experts) and one CUDA block's worth of experts.
-    // Critical for large expert counts, where the classic one-warp-per-token TopK spills
-    // registers under the 1024-thread launch bounds (e.g. 896 experts / topK 16 at decode).
+    // Cooperative block kernel: fastest path for tiny batches in the large-expert tiers.
+    // It requires an elementwise preprocess (any but softmax-over-experts) and one CUDA
+    // block's worth of experts. The classic one-warp-per-token TopK is faster through the
+    // 512-expert tier, but spills registers in larger tiers (e.g. 896 experts / topK 16).
     bool const preprocessIsElementwise = data.mPreprocessType == RoutingPreprocessType::None
         || data.mPreprocessType == RoutingPreprocessType::Sigmoid
         || data.mPreprocessType == RoutingPreprocessType::SigmoidBias;
@@ -1643,7 +1643,7 @@ void run(Data const& data, void* stream)
         return env != nullptr && env[0] == '1';
     }();
     bool const useCoopBlock = !disableCoopBlock && useStaticBlock && preprocessIsElementwise
-        && dispatchedMaxExperts <= CoopBlockKernelMaxNumExperts;
+        && dispatchedMaxExperts >= CoopBlockKernelMinNumExperts && dispatchedMaxExperts <= CoopBlockKernelMaxNumExperts;
     bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens
         && dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
     bool const useSingleBlock = useStaticBlock || useDynBlock;
