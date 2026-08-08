@@ -616,7 +616,52 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         runner._get_seq_len_mode.assert_called_once_with(
             batch, None, promoted_ids)
-        self.assertEqual(key, (1, 0, False, True, True))
+        self.assertEqual(key, (1, 0, False, True, True, None))
+
+    def test_graph_key_includes_peft_cache_dtype(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        model_dtype_key = CUDAGraphRunner.get_graph_key(
+            runner, batch, peft_cache_data_type=torch.bfloat16)
+        fp8_key = CUDAGraphRunner.get_graph_key(
+            runner, batch, peft_cache_data_type=torch.float8_e4m3fn)
+
+        self.assertNotEqual(model_dtype_key, fp8_key)
+        self.assertEqual(model_dtype_key[:-1], fp8_key[:-1])
+
+    def test_graph_dtype_change_falls_back_to_eager(self) -> None:
+        runner = Mock()
+        runner.enabled = True
+        runner.config = SimpleNamespace(
+            enable_attention_dp=False,
+            use_mrope=False,
+        )
+        model_dtype_key = (1, 0, False, False, True, torch.bfloat16)
+        fp8_key = (1, 0, False, False, True, torch.float8_e4m3fn)
+        runner.get_graph_key.return_value = fp8_key
+        runner.graph_metadata = {model_dtype_key: object()}
+        runner._capture_allowed = False
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
+                return_value=False):
+            result = CUDAGraphRunner.maybe_get_cuda_graph(
+                runner,
+                batch,
+                enable_spec_decode=False,
+                attn_metadata=object(),
+                peft_cache_data_type=torch.float8_e4m3fn,
+            )
+
+        self.assertEqual(result, (None, None, None))
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
@@ -653,7 +698,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids)
+                                                     promoted_ids, None)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
