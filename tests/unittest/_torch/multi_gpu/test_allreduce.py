@@ -317,36 +317,6 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
         assert r is True
 
 
-def run_single_rank_reporting(
-    tensor_parallel_size,
-    single_rank_forward_func,
-    input,
-    residual,
-    weights,
-    hidden_size,
-    dtype,
-    fusion_op,
-):
-    """As run_single_rank, but guarantees the failure survives the trip back.
-
-    Several exception types cannot be pickled to the parent process, so
-    re-raising them turns a real failure into an unrelated pickling error from
-    the executor. AttributeError is the common one: since 3.11 it retains the
-    object it was raised on, and anything raised off torch.ops therefore drags
-    an unpicklable _Ops along with it. Send the formatted traceback instead.
-    """
-    rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
-    try:
-        single_rank_forward_func(input, residual, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights, fusion_op)
-    except Exception:
-        traceback.print_exc()
-        raise AssertionError(f"rank {rank} failed:\n"
-                             f"{traceback.format_exc()}") from None
-    return True
-
-
 @torch.inference_mode()
 def run_nvfp4_linear_sf_op(
     x: torch.Tensor,
@@ -369,6 +339,18 @@ def run_nvfp4_linear_sf_op(
     epilogue's own bf16 norm output for the part that does.
     """
     del fusion_op
+
+    def fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0,
+                     is_sf_swizzled_layout):
+        # Nested so that "ops" stays out of this function's own co_names:
+        # these worker functions are shipped to the ranks by value, and
+        # cloudpickle pulls in any sys.modules entry under a referenced module
+        # whose name components all appear there. torch.ops is such an entry,
+        # and its type subclasses ModuleType rather than being it, so it misses
+        # cloudpickle's module reducer and fails as a plain unpicklable object.
+        return torch.ops.trtllm.fp4_quantize(x, global_scale, sf_vec_size,
+                                             sf_use_ue8m0,
+                                             is_sf_swizzled_layout)
 
     x = x.cuda()
     residual = residual.cuda()
@@ -424,8 +406,7 @@ def run_nvfp4_linear_sf_op(
 
     # The substitution this op exists for: quantizing the epilogue's own bf16
     # norm output must give back the epilogue's fp4 output and scale factors.
-    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(lin_norm, scale, 16, False,
-                                                    False)
+    ref_fp4, ref_sf = fp4_quantize(lin_norm, scale, 16, False, False)
     assert_same_bytes(lin_fp4, ref_fp4, "quant_fp4 vs standalone quantize")
     assert_same_bytes(lin_sf, ref_sf, "scale_out vs standalone quantize")
 
@@ -445,7 +426,7 @@ def test_allreduce_fusion_nvfp4_linear_sf(seq_len, hidden_size,
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)
     results = mpi_pool_executor.map(
-        run_single_rank_reporting,
+        run_single_rank,
         *zip(*[(tensor_parallel_size, run_nvfp4_linear_sf_op, x, residual, [],
                 hidden_size, dtype, AllReduceFusionOp.
                 RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)] *
