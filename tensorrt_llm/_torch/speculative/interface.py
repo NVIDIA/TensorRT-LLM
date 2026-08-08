@@ -156,46 +156,9 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
-    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer)
-    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
-        m = attn_metadata
-        saved['saved_dsa_state'] = {
-            'host_indexer_k_cache_block_offsets':
-            m.host_indexer_k_cache_block_offsets.clone(),
-            'indexer_k_cache_block_offsets':
-            m.indexer_k_cache_block_offsets.clone(),
-            'host_slot_mapping_fp8':
-            m.host_slot_mapping_fp8.clone(),
-            'host_slot_mapping_scale':
-            m.host_slot_mapping_scale.clone(),
-            'slot_mapping_fp8':
-            m.slot_mapping_fp8.clone(),
-            'slot_mapping_scale':
-            m.slot_mapping_scale.clone(),
-        }
-        # Derive pool indices from the draft manager's encoded block
-        # offsets (via _get_pool_block_indices) instead of using raw block
-        # IDs.  With host cache offload, block IDs can exceed
-        # blocks_in_primary_pool after offload swaps (the block keeps its
-        # original high ID even though its memory now lives in the primary
-        # GPU pool).  Using raw block IDs as pool indices causes OOB access
-        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
-        # decodes memPoolBlockIndex from the C++ encoded offsets.
-        # Note: kv_cache_manager was already swapped to draft above (line 67).
-        pool_indices = m._get_pool_block_indices()
-        num_blocks = pool_indices.shape[1]
-        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
-            pool_indices)
-        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
-            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
-            non_blocking=True)
-        # Safety clamp: sanitize stale padding entries beyond num_seqs
-        # that may contain negative or out-of-range values, matching the
-        # regular DSA prepare() flow.
-        m.indexer_k_cache_block_offsets.clamp_(min=0)
-        Indexer.recompute_slot_mappings(m)
+    backend_saved = attn_metadata.prepare_for_draft_replay()
+    if backend_saved is not None:
+        saved['saved_backend_state'] = backend_saved
     return saved
 
 
@@ -210,17 +173,8 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         saved_state['target_host_kv_cache_block_offsets'])
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
-    saved_dsa = saved_state.get('saved_dsa_state')
-    if saved_dsa is not None:
-        m = attn_metadata
-        m.host_indexer_k_cache_block_offsets.copy_(
-            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
-        m.indexer_k_cache_block_offsets.copy_(
-            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
-        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
-        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
-        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
-        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+    attn_metadata.restore_after_draft_replay(
+        saved_state.get('saved_backend_state'))
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -2178,9 +2132,14 @@ class SpecWorkerBase(nn.Module, ABC):
         if attn_metadata.enable_flash_mla:
             attn_metadata.prepare_flash_mla()
 
+        # Prepare backend-specific state for the eager/capture draft forward.
+        saved_backend_state = attn_metadata.prepare_for_draft_forward()
+
         try:
             yield attn_metadata
         finally:
+            # Restore backend-specific state after the draft forward.
+            attn_metadata.restore_after_draft_forward(saved_backend_state)
             # Restore main KV cache manager and block offsets
             attn_metadata.kv_cache_manager = target_kv_cache_manager
             attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets

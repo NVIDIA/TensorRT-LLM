@@ -518,6 +518,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = prompt_lens_cpu
         self.host_request_types_runtime = host_request_types
 
+    def prepare_for_draft_replay(self) -> dict | None:
+        """Prepare all backend state required for draft CUDA graph replay."""
+        return None
+
+    def restore_after_draft_replay(self, saved_state: dict | None) -> None:
+        """Restore backend state saved for draft CUDA graph replay."""
+        return None
+
+    def prepare_for_draft_forward(self) -> dict | None:
+        """Prepare backend state shared by draft-forward execution paths."""
+        return None
+
+    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+        """Restore backend state modified for draft-forward execution."""
+        return None
+
     def prepare(self) -> None:
         super().prepare()
         extra_attrs = get_model_extra_attrs()
