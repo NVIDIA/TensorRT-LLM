@@ -649,6 +649,34 @@ def get_test_output_dir(script_prefix_lines, test_case_name):
     return os.path.join(output_dir, test_case_name) if test_case_name else output_dir
 
 
+def extract_pytest_command_env(script_prefix_lines, name):
+    """Read a leading environment assignment from the exported pytest command."""
+    line = next((ln for ln in script_prefix_lines if "export pytestCommand=" in ln), None)
+    if line is None:
+        raise ValueError("launch prefix does not export pytestCommand")
+    try:
+        outer_tokens = shlex.split(line)
+    except ValueError as e:
+        raise ValueError(f"cannot parse exported pytestCommand: {e}") from e
+    command_assignment = next(
+        (token for token in outer_tokens if token.startswith("pytestCommand=")), None
+    )
+    if command_assignment is None:
+        raise ValueError("launch prefix has a malformed pytestCommand export")
+    command = command_assignment.partition("=")[2]
+    try:
+        command_tokens = shlex.split(command)
+    except ValueError as e:
+        raise ValueError(f"cannot parse pytestCommand payload: {e}") from e
+    for token in command_tokens:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            break
+        key, value = token.split("=", 1)
+        if key == name:
+            return value
+    raise ValueError(f"pytestCommand does not set leading environment variable {name}")
+
+
 def remove_whitespace_lines(lines):
     return [line.strip() for line in lines if line.strip()]
 
@@ -852,6 +880,12 @@ def main():
         # Enable/kill-switch policy and timeouts live in precheck_config
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
+        precheck_enabled = pcfg.precheck_enabled(config)
+        llm_models_root = (
+            extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+            if precheck_enabled
+            else None
+        )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -862,15 +896,15 @@ def main():
                     hardware_config["gpus_per_ctx_server"],
                     hardware_config["gpus_per_gen_server"],
                 ),
+                llm_models_root=llm_models_root,
                 stage_name=args.stage_name,
             )
         )
         srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=pytestCommand",
-            ]
+            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
         )
+        if precheck_enabled:
+            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
 
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)
