@@ -548,8 +548,16 @@ class ADEngine(ModelEngine):
 
     def _release_cuda_graphs(self) -> None:
         def _reset_cuda_graph(graph: object) -> None:
-            if isinstance(graph, torch.cuda.CUDAGraph):
+            if not isinstance(graph, torch.cuda.CUDAGraph):
+                return
+            # graph.reset() can raise (e.g. stale CUDA generator state after a
+            # failed capture); swallow it so one failing reset cannot abort
+            # the rest of the teardown from a C++ destructor path
+            # ("The graph should be registered to the state").
+            try:
                 graph.reset()
+            except Exception:
+                ad_logger.warning("Failed to reset CUDA graph during release.")
 
         model = getattr(self, "model", None)
         if model is not None:
