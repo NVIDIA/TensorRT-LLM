@@ -71,6 +71,13 @@ def _make_executor(
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
 
+    # CUDA-graph runner with no persistent padding dummies by default; a
+    # bare MagicMock would be truthy and non-iterable in the hook's
+    # padding-dummy cleanup.
+    exe.model_engine = MagicMock()
+    exe.model_engine.cuda_graph_runner = MagicMock()
+    exe.model_engine.cuda_graph_runner.padding_dummy_requests = {}
+
     # is_request_active returns True for every id we tracked, False for
     # everything else.  Tests set active_requests to a list of mocks with
     # py_request_id attributes.
@@ -195,6 +202,36 @@ class TestMaybeRebalanceKvPools:
 
         exe.kv_cache_manager.suspend_request.assert_called_once()
         exe.kv_cache_manager.resume_request.assert_called_once()
+
+    def test_frees_cuda_graph_padding_dummies_before_adjust(self, monkeypatch):
+        """Persistent CUDA-graph padding dummies hold ACTIVE KV caches that
+        are not in active_requests; adjust() asserts every living cache is
+        suspended. The hook must close them (and clear the runner's map so
+        they are lazily recreated) before calling adjust().
+
+        Regression test for an AssertionError in
+        ``_kv_cache_manager.py::adjust`` observed with gemma-3 VSWA +
+        CUDA-graph padding: the first live rebalance terminated the
+        executor event loop.
+        """
+        dummy = _make_request(999)
+        exe = _make_executor(active_requests=[_make_request(1)])
+        runner = exe.model_engine.cuda_graph_runner
+        runner.padding_dummy_requests = {0: dummy}
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        call_order = []
+        exe.kv_cache_manager.free_resources.side_effect = lambda req: call_order.append(
+            ("free", req.py_request_id)
+        )
+        exe.kv_cache_manager.impl.adjust.side_effect = lambda: call_order.append(("adjust", None))
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+        assert runner.padding_dummy_requests == {}
+        assert call_order.index(("free", 999)) < call_order.index(("adjust", None))
 
     def test_unexpected_adjust_failure_propagates(self, monkeypatch):
         """Any non-OutOfPagesError (programmer bug) must propagate.
