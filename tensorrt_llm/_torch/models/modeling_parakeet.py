@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import math
+from contextlib import redirect_stdout
 from functools import cache
 from typing import Dict, NamedTuple, Optional
 
@@ -21,15 +23,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import ParakeetEncoderConfig, PretrainedConfig
-from transformers.activations import ACT2FN
-from transformers.audio_utils import mel_filter_bank
-from transformers.models.parakeet.modeling_parakeet import (
-    ParakeetEncoderRelPositionalEncoding as HFParakeetEncoderRelPositionalEncoding,
-)
-from transformers.models.parakeet.modeling_parakeet import (
-    ParakeetEncoderSubsamplingConv2D as HFParakeetEncoderSubsamplingConv2D,
-)
+
+# Suppress spurious "Config not found for parakeet" prints emitted by the
+# transformers @auto_docstring decorator during import.
+with redirect_stdout(io.StringIO()):
+    from transformers import ParakeetEncoderConfig, PretrainedConfig
+    from transformers.activations import ACT2FN
+    from transformers.audio_utils import mel_filter_bank
+    from transformers.models.parakeet.modeling_parakeet import (
+        ParakeetEncoderRelPositionalEncoding as HFParakeetEncoderRelPositionalEncoding,
+    )
+    from transformers.models.parakeet.modeling_parakeet import (
+        ParakeetEncoderSubsamplingConv2D as HFParakeetEncoderSubsamplingConv2D,
+    )
 
 from ...logger import logger
 from ..model_config import ModelConfig
