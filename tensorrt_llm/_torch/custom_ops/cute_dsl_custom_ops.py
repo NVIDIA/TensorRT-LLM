@@ -207,6 +207,37 @@ class GroupedGemmInputsHelper:
         )
         return a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles, *others
 
+    def inputs_pre_hook_with_mn_limit(
+            self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Regenerate grouped GEMM routing metadata, including expert row limits."""
+        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, \
+            tile_idx_to_mn_limit, num_non_exiting_tiles, *others = inputs
+        num_tokens = self.infer_num_tokens(a.size(0))
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
+        token_selected_experts = self.generate_token_selected_experts(
+            num_tokens, num_tokens_per_expert).cuda()
+        token_final_scales = torch.ones_like(token_selected_experts,
+                                             dtype=torch.float32)
+        (
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+        )
+        return (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
+                tile_idx_to_mn_limit, num_non_exiting_tiles, *others)
+
     def inputs_pre_hook_finalize_fusion(
             self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         a, b, a_sf, b_sf, alpha, output, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
@@ -2214,6 +2245,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError(
                     f"{self.__class__.kernel_class.__name__} supports SM 100 (B200) and SM 103 (B300) only, but got SM {sm_version}"
                 )
+            self.epilogue_tile_n = 64 if sm_version == 103 else None
 
             if self.tile_size not in (128, 256):
                 raise ValueError(
@@ -2229,6 +2261,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
+                self.epilogue_tile_n,
             )
 
         def get_valid_tactics(
@@ -2236,7 +2269,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
             **kwargs,
-        ) -> List[Tuple[int, int]]:
+        ) -> List[tuple]:
             a, b, *_ = inputs
             b_list = b if isinstance(b, (list, tuple)) else [b]
             m, k = a.size(0), a.size(1) * 2
@@ -2248,6 +2281,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cluster_shape_mn_candidates = [(self.tile_size // 128, 1),
                                            (self.tile_size // 128, 2)]
 
+            sm_version = get_sm_version()
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
                     mma_tiler_mn_candidates, cluster_shape_mn_candidates):
@@ -2272,7 +2306,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_major="k",
                         c_major="n",
                 ):
-                    valid_tactics.append((mma_tiler_mn, cluster_shape_mn))
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, False))
+                    if (sm_version == 103 and n %
+                        (mma_tiler_mn[1] * cluster_shape_mn[1]) == 0):
+                        valid_tactics.append(
+                            (mma_tiler_mn, cluster_shape_mn, True))
+                        if (self.tile_size == 256 and m // self.tile_size
+                                == 4 * self.num_local_experts):
+                            valid_tactics.append(
+                                (mma_tiler_mn, cluster_shape_mn, True, True))
+                            # Keep workload-specific scheduling changes behind exact shape
+                            # guards so the already competitive larger-M cases retain their
+                            # existing tactic set and generated kernels.
+                            if (m == 131072 and n == 4608 and k == 6144
+                                    and l == 128
+                                    and self.num_local_experts == 128
+                                    and mma_tiler_mn == (256, 256)
+                                    and cluster_shape_mn == (2, 1)):
+                                valid_tactics.append(
+                                    (mma_tiler_mn, cluster_shape_mn, True, True,
+                                     4))
+                            if (m == 131072 and n == 6144 and k == 2304
+                                    and l == 128
+                                    and self.num_local_experts == 128
+                                    and mma_tiler_mn == (256, 256)
+                                    and cluster_shape_mn == (2, 1)):
+                                valid_tactics.append(
+                                    (mma_tiler_mn, cluster_shape_mn, True, True,
+                                     1, 4, 14))
 
             return valid_tactics
 
@@ -2291,15 +2353,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                      fp4_scale_infer_shape),
                                       ConstraintSpec(
                                           5, 0,
+                                          helper.infer_shape_max_num_tiles),
+                                      ConstraintSpec(
+                                          6, 0,
                                           helper.infer_shape_max_num_tiles)),
-                    inputs_pre_hook=helper.inputs_pre_hook,
+                    inputs_pre_hook=helper.inputs_pre_hook_with_mn_limit,
                     use_cold_l2_cache=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, num_non_exiting_tiles = inputs
+            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, \
+                tile_idx_to_mn_limit, num_non_exiting_tiles = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
             assert b.dtype == torch.float4_e2m1fn_x2
@@ -2326,8 +2392,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_tiles = m // self.tile_size
             assert tile_idx_to_group_idx.dtype == torch.int32
             assert tile_idx_to_group_idx.size() == (num_tiles, )
+            assert tile_idx_to_mn_limit.dtype == torch.int32
+            assert tile_idx_to_mn_limit.size() == (num_tiles, )
             assert num_non_exiting_tiles.dtype == torch.int32
             assert num_non_exiting_tiles.numel() == 1
+
+            direct_store_requested = False
+            predicated_tail_requested = False
+            scheduler_swizzle_size = 1
+            pipeline_stage_config = None
+            if isinstance(tactic, tuple) and len(tactic) == 7:
+                (mma_tiler_mn, cluster_shape_mn, direct_store_requested,
+                 predicated_tail_requested, scheduler_swizzle_size,
+                 num_ab_stage, num_sf_stage) = tactic
+                pipeline_stage_config = (num_ab_stage, num_sf_stage)
+            elif isinstance(tactic, tuple) and len(tactic) == 5:
+                (mma_tiler_mn, cluster_shape_mn, direct_store_requested,
+                 predicated_tail_requested, scheduler_swizzle_size) = tactic
+            elif isinstance(tactic, tuple) and len(tactic) == 4:
+                (mma_tiler_mn, cluster_shape_mn, direct_store_requested,
+                 predicated_tail_requested) = tactic
+            elif isinstance(tactic, tuple) and len(tactic) == 3:
+                mma_tiler_mn, cluster_shape_mn, direct_store_requested = tactic
+            elif isinstance(tactic, tuple) and len(tactic) == 2:
+                mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             c = torch.empty(m, n, dtype=self.output_dtype, device=a.device)
 
@@ -2352,40 +2445,118 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_idx_to_group_idx_ptr = make_ptr(
                 cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
                 cute.AddressSpace.gmem)
+            tile_idx_to_mn_limit_ptr = make_ptr(cutlass.Int32,
+                                                tile_idx_to_mn_limit.data_ptr(),
+                                                cute.AddressSpace.gmem)
             num_non_exiting_tiles_ptr = make_ptr(
                 cutlass.Int32, num_non_exiting_tiles.data_ptr(),
                 cute.AddressSpace.gmem)
+            use_direct_store = (direct_store_requested
+                                and get_sm_version() == 103
+                                and c.dtype == torch.bfloat16
+                                and c.is_contiguous() and c.stride(1) == 1
+                                and c.data_ptr() % 32 == 0
+                                and c.stride(0) * c.element_size() % 32 == 0
+                                and n %
+                                (mma_tiler_mn[1] * cluster_shape_mn[1]) == 0)
+            use_predicated_tail = (predicated_tail_requested
+                                   and use_direct_store
+                                   and self.tile_size == 256)
+            if not use_direct_store:
+                pipeline_stage_config = None
             c_ptr = make_ptr(cutlass.BFloat16,
                              c.data_ptr(),
                              cute.AddressSpace.gmem,
-                             assumed_align=16)
+                             assumed_align=32 if use_direct_store else 16)
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn = tactic
-            else:
-                mma_tiler_mn = (self.tile_size, 128)
-                cluster_shape_mn = (self.tile_size // 128, 1)
-            assert mma_tiler_mn[
-                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
-
-            cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+            cache_key = (get_sm_version(), self.scaling_vector_size,
+                         self.tile_size, mma_tiler_mn, cluster_shape_mn,
+                         use_direct_store, use_predicated_tail,
+                         scheduler_swizzle_size, pipeline_stage_config,
+                         self.epilogue_tile_n)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    use_direct_store=use_direct_store,
+                    use_predicated_tail=use_predicated_tail,
+                    scheduler_swizzle_size=scheduler_swizzle_size,
+                    pipeline_stage_config=pipeline_stage_config,
+                    epilogue_tile_n=self.epilogue_tile_n,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
+                if use_predicated_tail:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper_predicated,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_ptr,
+                        alpha_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        tile_idx_to_mn_limit_ptr,
+                        num_non_exiting_tiles_ptr,
+                        m,
+                        n,
+                        k,
+                        l,
+                        tile_size=self.tile_size,
+                        scaling_vector_size=self.scaling_vector_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                    )
+                else:
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_ptr,
+                        alpha_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        num_non_exiting_tiles_ptr,
+                        m,
+                        n,
+                        k,
+                        l,
+                        tile_size=self.tile_size,
+                        scaling_vector_size=self.scaling_vector_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                    )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            if use_predicated_tail:
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    num_non_exiting_tiles_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    stream=stream,
+                )
+            else:
+                compiled_gemm(
                     a_ptr,
                     b_ptr,
                     a_sf_ptr,
@@ -2398,30 +2569,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     n,
                     k,
                     l,
-                    tile_size=self.tile_size,
-                    scaling_vector_size=self.scaling_vector_size,
-                    max_active_clusters=max_active_clusters,
                     stream=stream,
                 )
-                self.__class__.kernel_cache[cache_key] = compiled_gemm
-            else:
-                compiled_gemm = self.__class__.kernel_cache[cache_key]
-
-            compiled_gemm(
-                a_ptr,
-                b_ptr,
-                a_sf_ptr,
-                b_sf_ptr,
-                c_ptr,
-                alpha_ptr,
-                tile_idx_to_group_idx_ptr,
-                num_non_exiting_tiles_ptr,
-                m,
-                n,
-                k,
-                l,
-                stream=stream,
-            )
             return c
 
     @torch.library.custom_op("trtllm::cute_dsl_nvfp4_grouped_gemm_blackwell",
@@ -2434,6 +2583,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
         num_non_exiting_tiles: torch.Tensor,
         num_experts: int,
         top_k: int,
@@ -2450,7 +2600,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size, output_dtype, scaling_vector_size)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
-            tile_idx_to_group_idx, num_non_exiting_tiles
+            tile_idx_to_group_idx, tile_idx_to_mn_limit, num_non_exiting_tiles
         ]
 
         _, best_tactic = tuner.choose_one(
@@ -2471,6 +2621,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
         num_non_exiting_tiles: torch.Tensor,
         num_experts: int,
         top_k: int,
