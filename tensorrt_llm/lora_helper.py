@@ -111,6 +111,12 @@ class LoraConfig(StrictBaseModel):
         "Whether to swap gate/up projection order in fused gate_up_proj LoRA B weights. "
         "Set to False for models like Phi-4-MM that use a different weight order."
     )
+    overlap_lora_and_base: bool = Field(
+        default=False,
+        description=
+        "Whether to place LoRA operations on a secondary CUDA stream and overlap them "
+        "with base model computations. Improves latency in memory-bound regimes."
+    )
 
     @property
     def missing_qkv_modules(self) -> List[str]:
