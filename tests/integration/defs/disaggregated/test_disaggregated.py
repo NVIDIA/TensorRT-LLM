@@ -47,6 +47,8 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
+MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
+
 
 @dataclass
 class TestConfig:
@@ -365,6 +367,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
+        "mamba_bs1_concurrency2":
+        f"{test_configs_root}/disagg_config_mamba_bs1_concurrency2.yaml",
     }
 
     if test_desc not in config_map:
@@ -657,6 +661,9 @@ def setup_disagg_cluster(
     startup_callback=None,
     startup_tick: int = 30,
     perf_metrics_output_dir: str | None = None,
+    ctx_env: dict[str, str] | None = None,
+    gen_env: dict[str, str] | None = None,
+    share_gpu: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -757,7 +764,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=env,
+                               env=ctx_env or env,
                                save_log=save_log,
                                worker_index=i)
             ctx_workers.append(w)
@@ -767,6 +774,8 @@ def setup_disagg_cluster(
             )
             next_device += gpus_per_ctx
 
+        if share_gpu:
+            next_device = 0
         for i in range(num_gen_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
@@ -776,7 +785,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=env,
+                               env=gen_env or env,
                                save_log=save_log,
                                worker_index=i)
             gen_workers.append(w)
@@ -936,7 +945,11 @@ def run_disaggregated_test(example_dir,
                            disagg_schedule_style=None,
                            post_client_test=None,
                            assert_gen_log_contains=None,
-                           perf_metrics_output_dir=None):
+                           perf_metrics_output_dir=None,
+                           ctx_env=None,
+                           gen_env=None,
+                           share_gpu=False,
+                           server_start_timeout=300):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
@@ -950,14 +963,23 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    ctx_run_env = run_env.copy()
+    if ctx_env:
+        ctx_run_env.update(ctx_env)
+    gen_run_env = run_env.copy()
+    if gen_env:
+        gen_run_env.update(gen_env)
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             server_start_timeout=server_start_timeout,
                              schedule_style=disagg_schedule_style,
                              save_log=assert_gen_log_contains is not None,
-                             perf_metrics_output_dir=perf_metrics_output_dir)
+                             perf_metrics_output_dir=perf_metrics_output_dir,
+                             ctx_env=ctx_run_env, gen_env=gen_run_env,
+                             share_gpu=share_gpu)
 
     server_host = config.get("hostname", "localhost")
 
@@ -1041,6 +1063,66 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+def _verify_mamba_bs1_concurrency2(server_url: str) -> None:
+
+    async def run() -> None:
+        timeout = aiohttp.ClientTimeout(total=120)
+        prompts = (
+            "Write one sentence about disaggregated inference.",
+            "Write one sentence about recurrent-state transfer.",
+        )
+
+        async def send(session: aiohttp.ClientSession, prompt: str) -> None:
+            payload = {
+                "model": MAMBA_BS1_CONCURRENCY2_MODEL,
+                "prompt": prompt,
+                "max_tokens": 16,
+                "temperature": 0,
+                "ignore_eos": True,
+            }
+            async with session.post(f"{server_url}/v1/completions",
+                                    json=payload,
+                                    timeout=timeout) as response:
+                body = await response.json()
+                assert response.status == 200, body
+                assert body.get("choices"), body
+
+        async with aiohttp.ClientSession() as session:
+            await asyncio.gather(*(send(session, prompt) for prompt in prompts))
+
+    asyncio.run(run())
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(900)
+def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
+                                              llm_venv):
+    model_path = f"{llm_models_root()}/{MAMBA_BS1_CONCURRENCY2_MODEL}"
+    env = llm_venv._new_env.copy()
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../../.."))
+    env["LLM_ROOT"] = repo_root
+    env["PYTHONPATH"] = os.pathsep.join(path for path in (repo_root,
+                                                          env.get("PYTHONPATH"))
+                                        if path)
+    env.pop("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", None)
+    env["TRTLLM_NIXL_NUM_THREADS"] = "1"
+    worker_env = {"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY": "1"}
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "mamba_bs1_concurrency2",
+        num_iters=0,
+        env=env,
+        model_path=model_path,
+        cwd=llm_venv.get_working_directory(),
+        post_client_test=_verify_mamba_bs1_concurrency2,
+        ctx_env=worker_env,
+        gen_env=worker_env,
+        share_gpu=True,
+        server_start_timeout=600,
+    )
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
