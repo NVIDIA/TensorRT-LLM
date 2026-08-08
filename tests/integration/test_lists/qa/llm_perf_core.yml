@@ -14,6 +14,7 @@ llm_perf_core:
 # 9: H100, H20, B200, B300, RTX6000-Server test cases
 # 10: H20, B200, B300, RTX6000-Server test cases
 # 10b: H20, B200, B300 test cases (>120G per GPU; excludes 96G RTX6000-Server)
+# 10c: H20, GB200, B200, B300, GB300, RTX6000-Server test cases (>90G per GPU, 4-GPU capable)
 # 11: RTX-6000 Server test cases
 # ===============================================================================
 
@@ -326,9 +327,6 @@ llm_perf_core:
       gpu_memory:
         gt: 90000
   tests:
-  #qwen3.5_122b_a10b (MoE BF16 234G, 4-GPU): OOM on 80G GPUs, needs >90G
-  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:128,128-ep:4-tp:4-gpus:4]
-  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:500,2000-ep:4-tp:4-gpus:4]
   #qwen3.5_397b_a17b_fp4 (MoE FP4 234G, 8-GPU ep=8)
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-input_output_len:500,2000-ep:8-tp:8-gpus:8]
@@ -355,6 +353,23 @@ llm_perf_core:
   # deepseek_r1_0528 (FP8 645G, 8-GPU ep=8)
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:8000,1000-reqs:20000-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:1000,2000-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+
+
+# 10c: H20, GB200, B200, B300, GB300, RTX6000-Server test cases - same memory gate
+# as 10, but only 4 GPUs are required, so the 4-GPU GB200/GB300 nodes qualify too.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        gte: 9.0
+        lte: 12.0
+      gpu_memory:
+        gt: 90000
+  tests:
+  #qwen3.5_122b_a10b (MoE BF16 234G, 4-GPU): OOM on 80G GPUs, needs >90G
+  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:128,128-ep:4-tp:4-gpus:4]
+  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:500,2000-ep:4-tp:4-gpus:4]
 
 
 # 11: RTX-6000 Server test cases
