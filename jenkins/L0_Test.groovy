@@ -1382,6 +1382,16 @@ def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     return args
 }
 
+def getVisualGenMultinodeParentNodeArgs(int nodeCount, int gpuCount) {
+    int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
+    return [
+        "--nodes=${nodeCount}",
+        "--ntasks=${nodeCount}",
+        "--ntasks-per-node=1",
+        "--gpus-per-node=${gpusPerNode}",
+    ]
+}
+
 def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
@@ -1692,7 +1702,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Pytest command
                 String pytestUtil = ""
-                if (nodeCount > 1) {
+                def visualGenMultinodeSlurmMode = testList == "l0_b200_visual_gen_multi_nodes"
+                if (nodeCount > 1 && !visualGenMultinodeSlurmMode) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
                 def uploadPath = "${env.JOB_NAME}/${env.BUILD_NUMBER}"
@@ -1736,7 +1747,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
+                String[] taskArgs = visualGenMultinodeSlurmMode ?
+                    getVisualGenMultinodeParentNodeArgs(nodeCount, gpuCount) :
+                    getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -1896,6 +1909,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT=${visualGenMultinodeSlurmMode ? "1" : "0"}
                     export HF_TOKEN=$HF_TOKEN
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
@@ -1944,7 +1958,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     """
                 } else {
                     if(nodeCount > 1) {
-                        srunArgs.add("--mpi=pmix")
+                        srunArgs.add(visualGenMultinodeSlurmMode ? "--mpi=none" : "--mpi=pmix")
                     }
 
                     def scriptContent = """
@@ -5335,6 +5349,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
+        "DGX_B200-16_GPUs-2_Nodes-PyTorch-VisualGen-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_multi_nodes", 1, 1, 16, 2],
         // Single-GPU Gemma4 PerfSanity regression gate and baseline
         "DGX_B200-PyTorch-PerfSanity-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests

@@ -16,7 +16,11 @@
 
 import glob
 import os
+import re
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 from typing import Callable
 
 import pytest
@@ -34,12 +38,17 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     WAN22_LPIPS_SEED,
     WAN22_LPIPS_WIDTH,
     _assert_lpips_below_threshold,
+    _cleanup_cuda,
+    _disable_inductor_compile_worker_quiesce,
     _golden_media_path,
+    _lpips_deterministic_algorithms,
     _lpips_model_path,
     _run_lpips_eval,
     _run_wan_lpips_pipeline,
     _save_lpips_video_mp4,
+    _skip_if_missing,
 )
+from defs.trt_test_alternative import popen
 
 
 def _parallel_config(**kwargs):
@@ -71,6 +80,16 @@ WAN22_LPIPS_TP_VARIANTS = [
     ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
     ("tp2_attn2d_2x1", {"tp_size": 2, "attn2d_size": (2, 1)}),
 ]
+
+WAN22_LPIPS_MULTINODE_WORLD_SIZE = 16
+WAN22_LPIPS_MULTINODE_NODES = 2
+WAN22_LPIPS_MULTINODE_GPUS_PER_NODE = 8
+WAN22_LPIPS_MULTINODE_PARALLEL = {
+    "cfg_size": 2,
+    "attn2d_size": (2, 2),
+    "ulysses_size": 2,
+}
+_MULTINODE_SLURM_CHILD_ENV = "TRTLLM_VISUAL_GEN_MULTINODE_SLURM_CHILD"
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -175,6 +194,250 @@ def _skip_if_insufficient_gpus_for_parallel(parallel):
         )
 
 
+def _slurm_rank_env():
+    if "SLURM_PROCID" not in os.environ or "SLURM_NTASKS" not in os.environ:
+        return None
+    return int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
+
+
+def _default_master_port():
+    job_id = int(os.environ.get("SLURM_JOB_ID", "0") or 0)
+    return str(20000 + job_id % 20000)
+
+
+def _slurm_node_count():
+    for var in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES"):
+        if var in os.environ:
+            return int(os.environ[var])
+    return None
+
+
+def _multinode_subprocess_timeout():
+    # Leave headroom for the outer 3600-second pytest timeout.
+    return int(os.environ.get("TRTLLM_VISUAL_GEN_MULTINODE_TIMEOUT", "3300"))
+
+
+def _resolve_slurm_master_addr():
+    if os.environ.get("MASTER_ADDR"):
+        return os.environ["MASTER_ADDR"]
+
+    nodelist = os.environ.get("SLURM_JOB_NODELIST")
+    if not nodelist:
+        pytest.skip("SLURM_JOB_NODELIST is required to resolve MASTER_ADDR")
+    if shutil.which("scontrol") is None:
+        pytest.skip("scontrol is required to resolve MASTER_ADDR from SLURM_JOB_NODELIST")
+
+    result = subprocess.run(
+        ["scontrol", "show", "hostnames", nodelist],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"Failed to resolve SLURM master host:\n{result.stdout}")
+
+    master_addr = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
+    if not master_addr:
+        pytest.fail(f"scontrol returned no hostnames for SLURM_JOB_NODELIST={nodelist!r}")
+    os.environ["MASTER_ADDR"] = master_addr
+    return master_addr
+
+
+def _ensure_slurm_external_launch_env():
+    os.environ["MASTER_ADDR"] = _resolve_slurm_master_addr()
+    os.environ.setdefault("MASTER_PORT", _default_master_port())
+
+    # Prefer SLURM ranks over inherited torchrun variables.
+    for var in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        os.environ.pop(var, None)
+
+
+def _run_wan22_multinode_slurm_rank(request, tmp_path):
+    rank_env = _slurm_rank_env()
+    if rank_env is None:
+        pytest.skip("This VisualGen multi-node case must run under SLURM rank env")
+    rank, world_size = rank_env
+    if world_size != WAN22_LPIPS_MULTINODE_WORLD_SIZE:
+        pytest.skip(f"Requires {WAN22_LPIPS_MULTINODE_WORLD_SIZE} SLURM tasks, got {world_size}")
+    node_count = _slurm_node_count()
+    if node_count is not None and node_count < WAN22_LPIPS_MULTINODE_NODES:
+        pytest.skip(
+            f"Requires at least {WAN22_LPIPS_MULTINODE_NODES} SLURM nodes, got {node_count}"
+        )
+
+    if rank == 0:
+        # Each srun rank gets a fresh container; rank 0 installs deps to avoid apt-lock races.
+        request.getfixturevalue("_visual_gen_deps")
+
+    _ensure_slurm_external_launch_env()
+    _disable_inductor_compile_worker_quiesce()
+    _parallel_config(**WAN22_LPIPS_MULTINODE_PARALLEL).validate_world_size(world_size)
+    model_path = _lpips_model_path("Wan2.2-T2V-A14B-Diffusers")
+    _skip_if_missing(model_path, "Wan 2.2 checkpoint", is_dir=True)
+
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm.visual_gen.args import AttentionConfig, CompilationConfig, TorchCompileConfig
+
+    visual_gen_args = VisualGenArgs(
+        model=model_path,
+        compilation_config=CompilationConfig(skip_warmup=True),
+        torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(backend="FA4"),
+        parallel_config=WAN22_LPIPS_MULTINODE_PARALLEL,
+    )
+
+    visual_gen = None
+    try:
+        with _lpips_deterministic_algorithms(fully_eager=True):
+            try:
+                visual_gen = VisualGen(model=model_path, args=visual_gen_args)
+            except SystemExit as exc:
+                assert rank != 0, "Only non-zero SLURM ranks should exit through worker mode"
+                assert exc.code in (0, None)
+                return
+
+            assert rank == 0
+            params = VisualGenParams(
+                height=WAN22_LPIPS_HEIGHT,
+                width=WAN22_LPIPS_WIDTH,
+                num_frames=WAN22_LPIPS_NUM_FRAMES,
+                num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
+                guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
+                seed=WAN22_LPIPS_SEED,
+                frame_rate=WAN22_LPIPS_FRAME_RATE,
+                negative_prompt=WAN22_LPIPS_NEGATIVE_PROMPT,
+            )
+            output = visual_gen.generate(inputs=WAN22_LPIPS_PROMPT, params=params)
+            assert output.error is None, (
+                f"unexpected error on Wan 2.2 multi-node run: {output.error}"
+            )
+            assert output.video is not None
+
+            generated_path = tmp_path / "wan22_t2v_generated_multinode_slurm.mp4"
+            output.save(generated_path, frame_rate=WAN22_LPIPS_FRAME_RATE)
+            assert generated_path.is_file(), (
+                f"VisualGen multi-node run did not produce {generated_path}"
+            )
+
+            golden_path = _golden_media_path(
+                tmp_path,
+                WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO,
+                "Wan 2.2 FA4 fully-eager LPIPS golden video",
+            )
+            score = _run_lpips_eval(
+                tmp_path,
+                "wan22_t2v_multinode_slurm",
+                "video",
+                WAN22_LPIPS_PROMPT,
+                golden_path,
+                generated_path,
+            )
+            _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
+    finally:
+        if visual_gen is not None:
+            # Capture before shutdown drops the executor; its 2s join is too short here.
+            worker_thread = getattr(visual_gen.executor, "_ext_worker_thread", None)
+            visual_gen.shutdown()
+            if worker_thread is not None and worker_thread.is_alive():
+                worker_thread.join(timeout=120)
+        _cleanup_cuda()
+
+
+def _run_wan22_multinode_slurm_parent():
+    # The wrapper strips SLURM_* at any scale, so do not gate this on world size.
+    if os.environ.get("TLLM_SPAWN_PROXY_PROCESS") == "1":
+        pytest.fail(
+            "VisualGen SLURM external-launch coverage cannot run under "
+            "trtllm-llmapi-launch because that wrapper removes SLURM_* env "
+            "before user code. Run this nodeid with direct srun so "
+            "_detect_external_launch() sees the real SLURM rank environment."
+        )
+
+    if os.environ.get("SLURM_JOB_ID") is None:
+        pytest.skip("A SLURM allocation is required for the VisualGen multi-node LPIPS case")
+    node_count = _slurm_node_count()
+    if node_count is not None and node_count < WAN22_LPIPS_MULTINODE_NODES:
+        pytest.skip(
+            f"Requires at least {WAN22_LPIPS_MULTINODE_NODES} SLURM nodes, got {node_count}"
+        )
+    if shutil.which("srun") is None:
+        pytest.skip("srun is required for the VisualGen multi-node LPIPS case")
+
+    # Avoid treating an all-skipped child run as a pass.
+    _skip_if_missing(
+        _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+        "Wan 2.2 checkpoint",
+        is_dir=True,
+    )
+
+    env = os.environ.copy()
+    env[_MULTINODE_SLURM_CHILD_ENV] = "1"
+    env["MASTER_ADDR"] = _resolve_slurm_master_addr()
+    env.setdefault("MASTER_PORT", _default_master_port())
+    env["PYTHONUNBUFFERED"] = "1"
+    for var in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        env.pop(var, None)
+
+    test_file = str(Path(__file__).resolve())
+    nodeid = f"{test_file}::test_wan22_t2v_multinode_slurm_lpips_against_golden"
+    cmd = [
+        "srun",
+        "-l",
+        "--overlap",
+        f"--nodes={WAN22_LPIPS_MULTINODE_NODES}",
+        f"--ntasks={WAN22_LPIPS_MULTINODE_WORLD_SIZE}",
+        f"--ntasks-per-node={WAN22_LPIPS_MULTINODE_GPUS_PER_NODE}",
+        "--export=ALL",
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        nodeid,
+    ]
+    try:
+        with popen(
+            cmd,
+            cwd=Path(__file__).resolve().parents[5],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ) as proc:
+            output, _ = proc.communicate(timeout=_multinode_subprocess_timeout())
+            returncode = proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output or ""
+        pytest.fail(
+            "VisualGen multi-node SLURM subprocess timed out after "
+            f"{exc.timeout} seconds:\n{output}"
+        )
+
+    if returncode != 0:
+        pytest.fail(
+            f"VisualGen multi-node SLURM subprocess failed with exit code {returncode}:\n{output}"
+        )
+
+    # Validate rank-prefixed pytest summaries, not incidental log text.
+    summary_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    rank_summaries = sorted(
+        (int(rank), int(count), outcome)
+        for rank, count, outcome in re.findall(
+            r"(?m)^\s*(\d+):\s+(?:=+\s*)?(\d+)\s+(passed|skipped)\b",
+            summary_output,
+        )
+    )
+    expected_summaries = [(rank, 1, "passed") for rank in range(WAN22_LPIPS_MULTINODE_WORLD_SIZE)]
+    if rank_summaries != expected_summaries:
+        pytest.fail(
+            "VisualGen multi-node SLURM run exited 0 but did not actually execute "
+            "(expected exactly one passing pytest summary for every rank):\n"
+            f"observed summaries: {rank_summaries}\n"
+            f"{output}"
+        )
+
+
 def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> None:
     parallel = kwargs["parallel"]
     _parallel_config(**parallel).validate_world_size(world_size)
@@ -265,3 +528,14 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(
 )
 def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_name, parallel):
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
+
+
+def test_wan22_t2v_multinode_slurm_lpips_against_golden(request, tmp_path):
+    if _slurm_rank_env() is not None:
+        _run_wan22_multinode_slurm_rank(request, tmp_path)
+        return
+
+    if os.environ.get(_MULTINODE_SLURM_CHILD_ENV):
+        pytest.skip("VisualGen SLURM child was not launched with SLURM rank env")
+
+    _run_wan22_multinode_slurm_parent()
