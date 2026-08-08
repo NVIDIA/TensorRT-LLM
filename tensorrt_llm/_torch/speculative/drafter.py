@@ -89,6 +89,11 @@ class Drafter(ABC):
         pad_to = self._static_max_total_draft_tokens
         for req in scheduled_requests.generation_requests:
             num_draft_tokens = get_draft_token_length(req)
+            # Record the real proposal count before padding: the sampler uses
+            # it as the acceptance-rate denominator (see
+            # py_num_draft_tokens_verified in LlmRequest), while py_rewind_len
+            # keeps using the padded length (padding occupies KV cache).
+            req.py_draft_tokens_effective_len = num_draft_tokens
             req.py_draft_tokens.extend(
                 0 for _ in range(pad_to - num_draft_tokens))
 

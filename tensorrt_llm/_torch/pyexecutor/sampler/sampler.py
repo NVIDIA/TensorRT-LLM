@@ -2806,6 +2806,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         if reason in _valid_finish_reasons:
                             req.finish_by(reason, DEFAULT_BEAM_IDX)
                     req.py_num_accepted_draft_tokens = 0
+                    req.py_num_draft_tokens_verified = 0
                     req.py_rewind_len = 0
                     req.py_decoding_iter += 1
                 return
@@ -2855,6 +2856,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     ]
                     req.py_result.set_first_gen_log_probs(first_gen_log_probs)
                 req.py_num_accepted_draft_tokens = 0
+                req.py_num_draft_tokens_verified = 0
                 req.py_rewind_len = 0
             else:
                 processed = 1
@@ -2868,9 +2870,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
+                    # Pair the acceptance count with the real proposal count
+                    # of the same step: py_draft_tokens is padded to the
+                    # static max for CUDA graphs, so use the pre-padding
+                    # length the drafter recorded. py_rewind_len keeps the
+                    # padded length (padding occupies KV cache).
+                    effective_len = req.py_draft_tokens_effective_len
+                    req.py_num_draft_tokens_verified = (
+                        min(effective_len, actual_draft_len)
+                        if effective_len is not None
+                        else actual_draft_len
+                    )
                     req.py_rewind_len = actual_draft_len - num_accepted
                 else:
                     req.py_num_accepted_draft_tokens = 0
+                    req.py_num_draft_tokens_verified = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
                 if actual_draft_len > 0:
