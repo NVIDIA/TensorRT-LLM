@@ -1784,6 +1784,8 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
+            torch.ops.trtllm.clear_allreduce_tactic_cache()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

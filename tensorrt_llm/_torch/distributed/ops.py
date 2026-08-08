@@ -34,6 +34,19 @@ _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
 _thread_local = threading.local()
 
+# Disabled only after the Python/C++ native-tactic contract cannot be honored.
+_ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
+
+
+def disable_native_allreduce_autotuner(reason: str) -> None:
+    """Use the Python AllReduce autotuner after a native compatibility failure."""
+    global _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
+    if _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+        _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = False
+        logger.warning(
+            "Disabling native AllReduce autotuner (%s); falling back to the Python autotuner.",
+            reason)
+
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
@@ -898,20 +911,41 @@ class AllReduce(nn.Module):
             "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
-            output = torch.ops.trtllm.tunable_allreduce(
-                input=input,
-                residual=all_reduce_params.residual,
-                norm_weight=all_reduce_params.norm_weight,
-                scale=all_reduce_params.scale,
-                bias=all_reduce_params.bias,
-                workspace=self.workspace,
-                group=self.mapping.tp_group,
-                strategy=allreduce_strategy,
-                op=all_reduce_params.fusion_op,
-                eps=all_reduce_params.eps,
-                trigger_completion_at_end=all_reduce_params.
-                trigger_completion_at_end,
-            )
+            # Use native lookup after tuning unless its Python/C++ contract
+            # failed; then retain the existing Python cache and selection path.
+            # Import lazily because AutoTuner imports the distributed package.
+            from tensorrt_llm._torch.autotuner import AutoTuner
+            is_tuning_mode = AutoTuner.get().is_tuning_mode
+            if is_tuning_mode or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+                output = torch.ops.trtllm.tunable_allreduce(
+                    input=input,
+                    residual=all_reduce_params.residual,
+                    norm_weight=all_reduce_params.norm_weight,
+                    scale=all_reduce_params.scale,
+                    bias=all_reduce_params.bias,
+                    workspace=self.workspace,
+                    group=self.mapping.tp_group,
+                    strategy=allreduce_strategy,
+                    op=all_reduce_params.fusion_op,
+                    eps=all_reduce_params.eps,
+                    trigger_completion_at_end=all_reduce_params.
+                    trigger_completion_at_end,
+                )
+            else:
+                output = torch.ops.trtllm.autotuned_allreduce(
+                    input=input,
+                    residual=all_reduce_params.residual,
+                    norm_weight=all_reduce_params.norm_weight,
+                    scale=all_reduce_params.scale,
+                    bias=all_reduce_params.bias,
+                    workspace=self.workspace,
+                    group=self.mapping.tp_group,
+                    strategy=allreduce_strategy,
+                    op=all_reduce_params.fusion_op,
+                    eps=all_reduce_params.eps,
+                    trigger_completion_at_end=all_reduce_params.
+                    trigger_completion_at_end,
+                )
         else:
             output = self.all_reduce_op(
                 input=input,

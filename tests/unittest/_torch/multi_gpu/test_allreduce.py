@@ -133,6 +133,7 @@ def run_allreduce_op(
         rank=tensor_parallel_rank,
     )
 
+    AutoTuner.get().clear_cache()
     AutoTuner.get().setup_distributed_state(mapping)
     linear = Linear(
         in_features=hidden_size,
@@ -261,16 +262,20 @@ def run_allreduce_op(
 
     # trigger autotune
     with autotune():
-        calc_output = calc_func(xs[tensor_parallel_rank], residual)
+        tuning_output = calc_func(xs[tensor_parallel_rank], residual)
 
+    native_output = calc_func(xs[tensor_parallel_rank], residual)
     ref_output = ref_func(xs[tensor_parallel_rank], residual)
 
-    for calc_output_tensor, ref_output_tensor in zip(calc_output, ref_output):
-        check_accuracy(calc_output_tensor,
-                       ref_output_tensor,
-                       atol=0.05,
-                       rtol=0.15,
-                       percent=0.99)
+    for calc_output in (tuning_output, native_output):
+        assert len(calc_output) == len(ref_output)
+        for calc_output_tensor, ref_output_tensor in zip(
+                calc_output, ref_output):
+            check_accuracy(calc_output_tensor,
+                           ref_output_tensor,
+                           atol=0.05,
+                           rtol=0.15,
+                           percent=0.99)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
