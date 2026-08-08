@@ -1521,9 +1521,16 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
+    # This test validates the C++ transceiver's timing-metric semantics. Force
+    # DEFAULT to UCX so Llama's Python preference falls back to C++.
+    env = llm_venv._new_env | {
+        "TRTLLM_USE_NIXL_KVCACHE": "0",
+        "TRTLLM_USE_UCX_KVCACHE": "1",
+        "UCX_TLS": get_ucx_tls(),
+    }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=llm_venv._new_env,
+                           env=env,
                            extra_endpoints_test=extra_endpoints_test,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory(),
@@ -1557,10 +1564,16 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    env = llm_venv._new_env.copy()
+    # This test validates the C++ transceiver's CSV format. Selecting UCX for
+    # the DEFAULT backend also resolves the automatic runtime to C++.
+    env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=llm_venv._new_env
-                           | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
