@@ -1670,20 +1670,30 @@ def _residency_clamp_manager(max_batch_size):
     return mgr
 
 
-def _quota_for_resident_sequences(num_sequences):
+def _quota_for_resident_sequences(num_sequences, blocks_per_sequence=4):
     """Quota that lets ``_residency_clamp_manager`` hold exactly N sequences.
 
-    A resident sequence costs one 96-byte state slot plus the attention pages
-    it can reach. Residency is a guarantee, so it is sized on max_seq_len (128
-    tokens = 4 blocks of 16 B/token * 32 tokens), not on the avg_seq_len pool
-    hint. One dummy slot and one attention page are reserved regardless of
-    residency.
+    A resident sequence costs one 96-byte state slot (ssm 64 + conv 32) plus the
+    ``blocks_per_sequence`` attention pages it can reach, each 16 B/token * 32
+    tokens. Residency is a guarantee, so the manager sizes it on max_seq_len
+    (128 tokens = 4 blocks), not on the avg_seq_len pool hint (2 blocks). One
+    dummy slot and one attention page are reserved regardless of residency.
     """
     state_bytes = 64 + 32
     attention_block_bytes = 16 * 32
-    per_sequence = state_bytes + 4 * attention_block_bytes
+    per_sequence = state_bytes + blocks_per_sequence * attention_block_bytes
     reserved = state_bytes + attention_block_bytes
     return reserved + num_sequences * per_sequence
+
+
+def _residency_clamp_config(quota, **kwargs):
+    """Base config for ``_residency_clamp_manager`` at the given GPU quota."""
+    kwargs.setdefault("layers", _base_attention_layer_configs(2))
+    return KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        **kwargs,
+    )
 
 
 def test_v2_hybrid_rejects_quota_below_single_live_state_floor():
@@ -1691,11 +1701,7 @@ def test_v2_hybrid_rejects_quota_below_single_live_state_floor():
     mgr = _residency_clamp_manager(max_batch_size=1)
     minimum_quota = mgr._minimum_live_gpu_quota()
 
-    base_config = KVCacheManagerConfig(
-        tokens_per_block=32,
-        cache_tiers=[GpuCacheTierConfig(quota=minimum_quota - 1)],
-        layers=[],
-    )
+    base_config = _residency_clamp_config(minimum_quota - 1, layers=[])
 
     with pytest.raises(ValueError, match="too small for live recurrent states"):
         mgr._build_cache_config(base_config)
@@ -1711,13 +1717,8 @@ def test_v2_hybrid_clamps_resident_sequences_to_quota():
     mgr = _residency_clamp_manager(max_batch_size=64)
     # Size the quota for exactly 10 sequences, far below max_batch_size.
     quota = _quota_for_resident_sequences(10)
-    base_config = KVCacheManagerConfig(
-        tokens_per_block=32,
-        cache_tiers=[GpuCacheTierConfig(quota=quota)],
-        layers=_base_attention_layer_configs(2),
-    )
 
-    config = mgr._build_cache_config(base_config)
+    config = mgr._build_cache_config(_residency_clamp_config(quota))
 
     resident = mgr._max_resident_sequences()
     assert resident == 10
@@ -1750,27 +1751,14 @@ def test_v2_hybrid_residency_sized_on_max_seq_len_not_avg_hint():
     assert mgr.kv_cache_config.avg_seq_len is None
     # Sized on the avg hint (max_seq_len/2 = 2 blocks), this quota would look
     # like it affords 10 sequences; at max_seq_len (4 blocks) it affords fewer.
-    hint_state_bytes = 64 + 32
-    hint_block_bytes = 16 * 32
-    quota_by_avg_hint = (hint_state_bytes + hint_block_bytes) + 10 * (
-        hint_state_bytes + 2 * hint_block_bytes
-    )
-    base_config = KVCacheManagerConfig(
-        tokens_per_block=32,
-        cache_tiers=[GpuCacheTierConfig(quota=quota_by_avg_hint)],
-        layers=_base_attention_layer_configs(2),
-    )
+    quota_by_avg_hint = _quota_for_resident_sequences(10, blocks_per_sequence=2)
 
-    mgr._build_cache_config(base_config)
+    mgr._build_cache_config(_residency_clamp_config(quota_by_avg_hint))
 
     resident = mgr._max_resident_sequences()
     assert resident < 10, "residency was sized on the avg_seq_len hint"
     # Every resident sequence must still fit when it reaches max_seq_len.
-    blocks_at_max_seq_len = mgr.max_seq_len // 32
-    worst_case = (resident + mgr._num_reserved_dummy_slots) * hint_state_bytes + (
-        resident * blocks_at_max_seq_len * hint_block_bytes
-    )
-    assert worst_case <= quota_by_avg_hint
+    assert _quota_for_resident_sequences(resident) <= quota_by_avg_hint
 
 
 def test_v2_hybrid_truncates_base_constraints_to_clamped_residency():
@@ -1785,14 +1773,8 @@ def test_v2_hybrid_truncates_base_constraints_to_clamped_residency():
     wide_constraint = BatchDesc(
         [KVCacheDesc(capacity=32, history_length=0) for _ in range(mgr.max_batch_size)]
     )
-    base_config = KVCacheManagerConfig(
-        tokens_per_block=32,
-        cache_tiers=[GpuCacheTierConfig(quota=quota)],
-        layers=_base_attention_layer_configs(2),
-        constraints=[wide_constraint],
-    )
 
-    config = mgr._build_cache_config(base_config)
+    config = mgr._build_cache_config(_residency_clamp_config(quota, constraints=[wide_constraint]))
 
     resident = mgr._max_resident_sequences()
     assert resident == 10
@@ -1808,13 +1790,8 @@ def test_v2_hybrid_truncates_base_constraints_to_clamped_residency():
 def test_v2_hybrid_keeps_requested_residency_when_quota_is_ample():
     mgr = _residency_clamp_manager(max_batch_size=4)
     quota = mgr._minimum_live_gpu_quota() * 1000
-    base_config = KVCacheManagerConfig(
-        tokens_per_block=32,
-        cache_tiers=[GpuCacheTierConfig(quota=quota)],
-        layers=_base_attention_layer_configs(2),
-    )
 
-    mgr._build_cache_config(base_config)
+    mgr._build_cache_config(_residency_clamp_config(quota))
 
     assert mgr._resident_sequence_cap is None
     assert mgr._max_resident_sequences() == 4

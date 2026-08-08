@@ -3206,16 +3206,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         attention_block_bytes = self._attention_block_bytes()
         # Residency is a *guarantee*, so it must be sized on the capacity a
-        # sequence can actually reach, not the average one. ``typical_capacity``
-        # is only a pool-ratio hint and defaults to max_seq_len / 2, which
-        # over-admits by ~2x on workloads where every sequence runs to
-        # max_seq_len: admission then fills the pool, and because recurrent
-        # state is non-droppable and resume() is refused past
-        # max_util_for_resume, the run has no way back out (nvbugs/6575476).
-        residency_capacity = max(
-            self._get_typical_request_capacity(self.kv_cache_config),
-            self.max_seq_len,
-        )
+        # sequence can actually reach -- max_seq_len -- not on the average one.
+        # ``_get_typical_request_capacity`` is only a pool-ratio hint and
+        # defaults to max_seq_len / 2, which over-admits by ~2x on workloads
+        # where every sequence runs to max_seq_len: admission then fills the
+        # pool, and because recurrent state is non-droppable and resume() is
+        # refused past max_util_for_resume, the run has no way back out
+        # (nvbugs/6575476).
+        residency_capacity = self.max_seq_len
         num_states = self._num_ssm_states_per_typical_request(
             residency_capacity, self.kv_cache_config)
         attention_blocks = math.ceil(residency_capacity / self.tokens_per_block)
