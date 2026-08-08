@@ -16,6 +16,8 @@ in OpenAIServer.register_visual_gen_routes():
 import asyncio
 import base64
 import os
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -307,6 +309,28 @@ class MockVisualGenResult:
 # ---------------------------------------------------------------------------
 
 
+class _ThreadSettlingTestClient(TestClient):
+    """TestClient that outwaits starlette's FileResponse reader thread.
+
+    pytest-threadleak samples running threads at the end of a test's call
+    phase. ``FileResponse`` reads the download on an anyio pool thread
+    ("AnyIO worker thread") that is told to stop when the request's portal
+    closes but exits a few milliseconds later -- inside the sampling window,
+    so any file-shipping test in this module can fail as a phantom leak
+    (pipeline #52355 did). Joining here, still in the call phase, waits out
+    those milliseconds deterministically; stop is already queued, so the
+    deadline is a guard, not an expected wait.
+    """
+
+    def request(self, *args, **kwargs):
+        response = super().request(*args, **kwargs)
+        deadline = time.monotonic() + 10.0
+        for thread in threading.enumerate():
+            if thread.name == "AnyIO worker thread":
+                thread.join(max(0.0, deadline - time.monotonic()))
+        return response
+
+
 def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
     """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
 
@@ -324,7 +348,7 @@ def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> 
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
         )
-    client = TestClient(server.app)
+    client = _ThreadSettlingTestClient(server.app)
     # Expose the mock so tests can assert captured generate() arguments.
     client.mock_gen = generator
     return client
