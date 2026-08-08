@@ -1325,9 +1325,7 @@ class MiniMaxM3Attention(Attention):
         output = q.new_empty(
             (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
         )
-        if self.register_to_config and (
-            is_torch_compiling() or is_in_breakable_cuda_graph()
-        ):
+        if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
             maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,

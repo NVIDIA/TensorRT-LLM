@@ -410,9 +410,7 @@ def forward_generation_sparse_attn(
     o_lora_bmm_input_scale = None
     inverse_rope_cos_sin = None
     if enable_dsv4_epilogue_fusion:
-        dsv4_output, o_lora_bmm_input_scale = _create_dsv4_epilogue_buffers(
-            self, q, num_tokens
-        )
+        dsv4_output, o_lora_bmm_input_scale = _create_dsv4_epilogue_buffers(self, q, num_tokens)
         inverse_rope_cos_sin = self.inverse_rotary_emb.rotary_cos_sin
 
     attn_out_latent = self._attn_forward_gen(
@@ -494,9 +492,7 @@ def forward_context_sparse_attn(
     o_lora_bmm_input_scale = None
     inverse_rope_cos_sin = None
     if enable_dsv4_epilogue_fusion:
-        dsv4_output, o_lora_bmm_input_scale = _create_dsv4_epilogue_buffers(
-            self, q, num_tokens
-        )
+        dsv4_output, o_lora_bmm_input_scale = _create_dsv4_epilogue_buffers(self, q, num_tokens)
         inverse_rope_cos_sin = self.inverse_rotary_emb.rotary_cos_sin
 
     attn_out_latent = self._attn_forward_gen(
@@ -820,12 +816,8 @@ def forward_sparse_attn(
         )
 
     if enable_dsv4_epilogue_fusion:
-        assert context_o_lora_bmm_input is None or isinstance(
-            context_o_lora_bmm_input, tuple
-        )
-        assert generation_o_lora_bmm_input is None or isinstance(
-            generation_o_lora_bmm_input, tuple
-        )
+        assert context_o_lora_bmm_input is None or isinstance(context_o_lora_bmm_input, tuple)
+        assert generation_o_lora_bmm_input is None or isinstance(generation_o_lora_bmm_input, tuple)
         # The fused kernel output is group-first, which BCG cannot slice on
         # dim 0. Write O-LoRA as token-first so replay can slice the bucket.
         _run_dsv4_o_lora_bmms(
