@@ -197,14 +197,20 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         physical_pools = [kv_physical]
         pool_views = [kv_view]
 
-        # Indexer K cache support. The DSA indexer K cache is identical on
-        # every TP rank (single index head), so its view is REPLICATED. With a
-        # per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2)
-        # only the "full" indexer-owning layers get a pool row, so the view
-        # covers that subset: one buffer entry per owning layer, each mapped to
-        # its packed row in the (possibly masked) pool. When the mask is absent
-        # every layer owns a row (dense/legacy layout) and this reduces to the
-        # equal-sized packing in local-layer order.
+        # Indexer K cache support. The view is INDEXED: it carries one buffer
+        # entry per owning layer, so disagg derives the pool's layer set from
+        # ``buffer_entries`` rather than assuming the pool covers the whole LG.
+        # With a per-layer indexer mask (cross-layer indexer sharing, e.g.
+        # GLM 5.2) only the "full" indexer-owning layers get a pool row, and the
+        # view covers exactly that subset, each entry mapped to its packed row in
+        # the masked pool. When the mask is absent every layer owns a row
+        # (dense/legacy layout) and this reduces to the equal-sized packing in
+        # local-layer order -- still carried explicitly, so the masked and
+        # unmasked cases take one code path.
+        #
+        # The pool's bytes are also identical on every TP rank (single index
+        # head), but that is not what MapperKind encodes here: this enum selects
+        # how the layer set is discovered, not how heads are matched.
         if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
             local_indexer_mask = getattr(kv_cache_manager, "indexer_k_cache_local_layer_mask", None)
             owning_layer_ids = [
@@ -246,7 +252,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                         dtype=BUFFER_ENTRY_DTYPE,
                     ),
                     pool_role=frozenset({"indexer_k"}),
-                    mapper_kind=MapperKind.REPLICATED,
+                    mapper_kind=MapperKind.INDEXED,
                     bytes_per_layer=indexer_bytes_per_layer,
                 )
                 physical_pools.append(indexer_physical)

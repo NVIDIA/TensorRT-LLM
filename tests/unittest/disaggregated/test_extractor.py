@@ -227,7 +227,7 @@ def _byte_view(ptr: int, nbytes: int):
 
 
 @pytest.mark.cuda
-def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
+def test_v1_dsa_indexer_page_table_is_indexed_with_per_layer_entries():
     manager = _make_v1_dsa_manager()
     try:
         page_table = build_page_table(manager)
@@ -236,7 +236,7 @@ def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
 
         kv_view, idx_view = lg.pool_views
         assert kv_view.mapper_kind == MapperKind.INDEXED
-        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.mapper_kind == MapperKind.INDEXED
         assert idx_view.pool_role == frozenset({"indexer_k"})
 
         # One synthesized entry per LG layer, equal-sized, contiguous from 0.
@@ -257,7 +257,7 @@ def test_v1_dsa_masked_indexer_page_table_covers_owning_layers():
     """The masked indexer view covers only the owning layers.
 
     A per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2) gives
-    only the owning layers a pool row, so the REPLICATED indexer view covers
+    only the owning layers a pool row, so the INDEXED indexer view covers
     exactly that subset -- one entry per owning layer mapped to its packed row
     -- instead of one entry per LG layer.
     """
@@ -268,7 +268,7 @@ def test_v1_dsa_masked_indexer_page_table_covers_owning_layers():
         lg = page_table.layer_groups[0]
         assert len(lg.pool_views) == 2
         _, idx_view = lg.pool_views
-        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.mapper_kind == MapperKind.INDEXED
         assert idx_view.pool_role == frozenset({"indexer_k"})
 
         # Only the two owning layers appear -- a strict subset of the LG.

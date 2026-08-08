@@ -26,9 +26,14 @@ class MapperKind(IntEnum):
         currently consumed at byte-transfer time.
     FLAT:    PoolView.buffer_entries is empty. Disagg assumes the pool
         covers *all* layers of the LG, packed equal-sized in
-        ``local_layers`` order. Used today by the DSA (DeepSeek Sparse
-        Attention, v3.2) indexer K cache pool, whose slot layout is a dense
-        ``(numLayers, kvFactor, blockSize)`` array.
+        ``local_layers`` order.
+
+    Note the DSA (DeepSeek Sparse Attention, v3.2) indexer K cache pool is
+    INDEXED, not FLAT, even though its slot layout is a dense
+    ``(numLayers, kvFactor, blockSize)`` array: a per-layer indexer mask
+    (cross-layer indexer sharing, e.g. GLM 5.2) gives only the owning layers
+    a pool row, so the layer set cannot be assumed to be the whole LG and is
+    carried explicitly in ``buffer_entries``.
 
     Byte arithmetic is the same for both kinds: per-layer stride is
     ``slot_bytes // num_layers``. The kind only affects how disagg discovers
