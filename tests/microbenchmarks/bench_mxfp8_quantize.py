@@ -40,6 +40,10 @@ import argparse
 
 import torch
 
+# Registers the torch.ops.trtllm namespace, without which mxfp8_quantize looks
+# absent no matter what the build contains.
+import tensorrt_llm  # noqa: F401  isort: skip
+
 # MiniMax-M3 at TP4, which is what the profile was taken at. qkv consumes the
 # full hidden state; o_proj is row-parallel, so its input is the sharded
 # attention output of 32 heads / 4 ranks x 128.
@@ -106,6 +110,11 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
 
+    if not hasattr(torch.ops, "trtllm"):
+        raise SystemExit(
+            "The torch.ops.trtllm namespace is missing, so the TensorRT-LLM "
+            "extension did not load. This is an import problem, not a missing op."
+        )
     if not hasattr(torch.ops.trtllm, "mxfp8_quantize"):
         raise SystemExit(
             "torch.ops.trtllm.mxfp8_quantize is not registered; this build "
