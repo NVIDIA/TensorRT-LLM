@@ -24,11 +24,12 @@ import shutil
 import socket
 import subprocess
 import time
+from collections import deque
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
-from test_common.error_utils import report_error
+from test_common.error_utils import check_error, report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
@@ -98,6 +99,142 @@ def ensure_bench_serving_repo() -> str:
 
 
 DEFAULT_TIMEOUT = 10800
+
+# Bound the benchmark client run.
+#
+# The client subprocess had no timeout at all, and every other harness wait is
+# bounded by DEFAULT_TIMEOUT (10800s) -- which sits *above* the pytest per-test
+# marker, so none of them can expire first. A stall anywhere below the HTTP
+# layer therefore surfaced only as "the client is still running", and the stage
+# burned its whole Slurm allocation before something external killed it with no
+# diagnostic. Measured: stages running 1.7-2.3h against 18-41 minute budgets,
+# producing no results XML at all.
+#
+# One hour is deliberately generous against the largest per-test budget in the
+# perf-sanity lists, so this bounds the pathological case without touching
+# healthy long runs. Set to 0 to disable.
+BENCHMARK_CLIENT_TIMEOUT_ENV_VAR_NAME = "TRTLLM_PERF_SANITY_CLIENT_TIMEOUT_SEC"
+DEFAULT_BENCHMARK_CLIENT_TIMEOUT = 3600
+
+# Grace period between SIGTERM and SIGKILL when stopping a server. A worker
+# wedged in a non-interruptible native call never runs the Python signal
+# handler, and the bare wait() this replaces would block teardown indefinitely.
+SERVER_TERMINATE_GRACE_SEC = 60
+
+# How much of each server log to attach when the client bound fires.
+SERVER_LOG_TAIL_LINES = 60
+
+
+def _benchmark_client_timeout() -> Optional[int]:
+    """Effective client bound in seconds, or None when explicitly disabled."""
+    raw = os.environ.get(BENCHMARK_CLIENT_TIMEOUT_ENV_VAR_NAME)
+    if raw is None:
+        return DEFAULT_BENCHMARK_CLIENT_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError:
+        print_info(
+            f"{BENCHMARK_CLIENT_TIMEOUT_ENV_VAR_NAME}={raw!r} is not an integer; "
+            f"falling back to {DEFAULT_BENCHMARK_CLIENT_TIMEOUT}s"
+        )
+        return DEFAULT_BENCHMARK_CLIENT_TIMEOUT
+    return None if value <= 0 else value
+
+
+def stop_process(proc, name: str, grace: int = SERVER_TERMINATE_GRACE_SEC) -> None:
+    """SIGTERM a server, then SIGKILL it if it has not exited within `grace`.
+
+    Replaces a bare ``terminate(); wait()``. Teardown must not be able to hang:
+    a rank blocked in native code never reaches the Python signal handler, and
+    the unbounded wait would hold the whole allocation until Slurm intervenes.
+    """
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        print_info(f"{name} did not exit within {grace}s of SIGTERM; escalating to SIGKILL")
+    proc.kill()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        print_info(f"{name} is still alive after SIGKILL; leaving it to the harness")
+
+
+def run_benchmark_client(cmd, env, server_logs) -> str:
+    """Run a benchmark client under a deadline.
+
+    Preserves ``check_output`` semantics -- combined stdout/stderr returned on
+    success, ``CalledProcessError`` on a nonzero exit -- and adds the bound that
+    was missing: if the client neither finishes nor fails within the budget,
+    kill it and raise naming what it was waiting on, with the partial client
+    output and the server-side context attached.
+
+    Without this the stage cannot fail on its own; only Slurm or Jenkins stops
+    it, hours later, with no results XML.
+    """
+    timeout_s = _benchmark_client_timeout()
+    started = time.monotonic()
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        raw, _ = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - started
+        proc.kill()
+        # Drain whatever the client wrote before it was killed -- that partial
+        # output is usually the only record of how far the run got.
+        try:
+            raw, _ = proc.communicate(timeout=SERVER_TERMINATE_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            raw = b""
+        partial = (raw or b"").decode(errors="replace")
+
+        # Two sources, because neither alone is sufficient. check_error()
+        # matches ERROR_KEYWORDS, which are Python exception names -- it does
+        # NOT match "[TRT-LLM] [E]" lines, so a server that died the TRT-LLM way
+        # surfaces nothing. Deliberately not widening ERROR_KEYWORDS here: it
+        # also drives wait_for_endpoint_ready()'s fast-fail, where a benign [E]
+        # during startup would start failing healthy runs. Keyword hits are
+        # best-effort; a raw tail is always attached.
+        keyword_hits = []
+        tails = []
+        for log_path in server_logs or []:
+            base = os.path.basename(log_path)
+            for line_idx, line in check_error(log_path):
+                keyword_hits.append(f"{base}:{line_idx}: {line}")
+            try:
+                with open(log_path, "r", errors="replace") as handle:
+                    # deque(maxlen=) streams the file and keeps only the tail.
+                    # readlines() would materialise the whole log first, and
+                    # measured perf-sanity gen logs reach 77-232 MB -- risking
+                    # an OOM on the rank that is already failing, which would
+                    # swallow the very timeout report we are assembling.
+                    tail = list(deque(handle, maxlen=SERVER_LOG_TAIL_LINES))
+            except OSError:
+                continue
+            if tail:
+                tails.append(f"--- tail of {base} ---\n" + "".join(tail))
+        detail = "\n".join(keyword_hits[-20:]) if keyword_hits else "<none matched>"
+        tail_blob = "\n".join(tails) if tails else "<no server logs readable>"
+
+        raise RuntimeError(
+            f"Benchmark client made no progress for {elapsed:.0f}s "
+            f"(bound {timeout_s}s, set {BENCHMARK_CLIENT_TIMEOUT_ENV_VAR_NAME} to change "
+            f"it, 0 disables). The client was killed so the stage fails here instead of "
+            f"running to the harness timeout.\n"
+            f"--- server-side error keywords ---\n{detail}\n"
+            f"{tail_blob}\n"
+            f"--- last client output ---\n{partial[-4000:]}"
+        ) from None
+
+    output = (raw or b"").decode(errors="replace")
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=output.encode())
+    return output
+
+
 # Defaults for the server *ready* wait, separate from the whole-test timeout:
 # a server that is not healthy after this long is not going to be, and failing
 # here (with server-log tails, see wait_for_endpoint_ready) instead of at the
@@ -1142,11 +1279,9 @@ class AggrTestCmds(NamedTuple):
                     client_env = copy.deepcopy(os.environ)
                     if client_config:
                         client_env.update(client_config.to_env())
-                    output = subprocess.check_output(
-                        client_cmd_with_port,
-                        stderr=subprocess.STDOUT,
-                        env=client_env,
-                    ).decode()
+                    output = run_benchmark_client(
+                        client_cmd_with_port, client_env, [server_file_path]
+                    )
 
                     with open(client_file_path, "w") as client_ctx:
                         client_ctx.write(output)
@@ -1172,8 +1307,7 @@ class AggrTestCmds(NamedTuple):
 
         finally:
             if server_proc:
-                server_proc.terminate()
-                server_proc.wait()
+                stop_process(server_proc, "server")
 
         return outputs
 
@@ -1484,8 +1618,7 @@ class DisaggTestCmds(NamedTuple):
                     )
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
-                server_proc.terminate()
-                server_proc.wait()
+                stop_process(server_proc, "server")
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
@@ -1513,8 +1646,7 @@ class DisaggTestCmds(NamedTuple):
                     )
             finally:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
-                disagg_server_proc.terminate()
-                disagg_server_proc.wait()
+                stop_process(disagg_server_proc, "disagg server")
 
         elif self.disagg_serving_type == "BENCHMARK":
             # Perf-benchmark clients whose gen-worker device step time must be
@@ -1572,11 +1704,11 @@ class DisaggTestCmds(NamedTuple):
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
-                        output = subprocess.check_output(
+                        output = run_benchmark_client(
                             client_cmd_with_port,
-                            env=bench_env,
-                            stderr=subprocess.STDOUT,
-                        ).decode()
+                            bench_env,
+                            self.get_server_logs(server_idx),
+                        )
 
                         with open(benchmark_file_path, "w") as benchmark_ctx:
                             benchmark_ctx.write(output)
