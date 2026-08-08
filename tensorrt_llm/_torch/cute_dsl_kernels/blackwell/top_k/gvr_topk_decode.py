@@ -3820,18 +3820,31 @@ class GvrTopKKernel:
                         bmax_r = bmin_r + cutlass.Float32(1e-6)
             if run_stock_range:
                 # ---- block min/max over candidates ----
+                # The accepted threshold is an EXACT lower bound: every
+                # candidate got here by comparing >= against it. So the min
+                # side of this scan buys nothing but a slightly tighter
+                # window - and the window only has to be tight where the
+                # k-th lives, which is the TOP of it. Taking the threshold
+                # instead drops half the scan, one warp reduce and one arm
+                # of the cross-warp fold. Only the assist tiers have a
+                # published threshold, hence the gate.
+                use_thr_min = cutlass.const_expr(self.p4_no_fine)
                 local_cmin = cutlass.Float32(self.FLT_MAX)
                 local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
                 i5 = tidx
                 while i5 < cand_count:
                     v = smem_keys[i5]
-                    local_cmin = _fmin_f32_inline(local_cmin, v)
+                    if cutlass.const_expr(not use_thr_min):
+                        local_cmin = _fmin_f32_inline(local_cmin, v)
                     local_cmax = cute.arch.fmax(local_cmax, v)
                     i5 = i5 + cutlass.Int32(num_threads)
-                cmin = self.warp_reduce_min_f32(local_cmin)
+                cmin = cutlass.Float32(0.0)
+                if cutlass.const_expr(not use_thr_min):
+                    cmin = self.warp_reduce_min_f32(local_cmin)
                 cmax = self.warp_reduce_max_f32(local_cmax)
                 if lane == cutlass.Int32(0):
-                    smem_wcnt[warp_id] = float_as_uint32(cmin)
+                    if cutlass.const_expr(not use_thr_min):
+                        smem_wcnt[warp_id] = float_as_uint32(cmin)
                     smem_hist[warp_id] = float_as_uint32(cmax)
                 cute.arch.barrier()
                 # lane-parallel cross-warp fold: lane w holds slot w and one
@@ -3842,13 +3855,17 @@ class GvrTopKKernel:
                 pmn = cutlass.Float32(self.FLT_MAX)
                 pmx = cutlass.Float32(self.NEG_FLT_MAX)
                 if lane < cutlass.Int32(self.num_warps):
-                    pmn = cutlass.Float32(
-                        llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[lane].ir_value())
-                    )
+                    if cutlass.const_expr(not use_thr_min):
+                        pmn = cutlass.Float32(
+                            llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[lane].ir_value())
+                        )
                     pmx = cutlass.Float32(
                         llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[lane].ir_value())
                     )
-                bmin_r = _fmin_f32_inline(bmin_r, self.warp_reduce_min_f32(pmn))
+                if cutlass.const_expr(use_thr_min):
+                    bmin_r = s_thr[0]
+                else:
+                    bmin_r = _fmin_f32_inline(bmin_r, self.warp_reduce_min_f32(pmn))
                 bmax_r = cute.arch.fmax(bmax_r, self.warp_reduce_max_f32(pmx))
                 if bmax_r <= bmin_r:
                     bmax_r = bmin_r + cutlass.Float32(1e-6)
@@ -3949,8 +3966,11 @@ class GvrTopKKernel:
                 # enough to resolve the straddling bin to ≤1 distinct value.
                 fbins = cutlass.const_expr(256)
                 # bin b* value range under the inv1 binning: [f_lo, f_lo + 1/inv1)
-                f_lo = bmin_r + cutlass.Float32(b_star) / inv1
-                finv = (cutlass.Float32(fbins - 1) + cutlass.Float32(0.99)) * inv1
+                f_lo = cutlass.Float32(0.0)
+                finv = cutlass.Float32(0.0)
+                if cutlass.const_expr(not self.p4_no_fine):
+                    f_lo = bmin_r + cutlass.Float32(b_star) / inv1
+                    finv = (cutlass.Float32(fbins - 1) + cutlass.Float32(0.99)) * inv1
                 if cutlass.const_expr(self.p4_no_fine):
                     # Sub-binning collapsed: finv 0 sends every member of the
                     # straddling coarse bin to sub-bin 0 == sb*, so the
@@ -4070,11 +4090,19 @@ class GvrTopKKernel:
                                 output_values_row[pos] = self.dtype(v)
                             output_indices_row[pos] = smem_vals[isc]
                     elif bin_i == b_star:
-                        sb = cutlass.Int32((v - f_lo) * finv)
-                        if sb < cutlass.Int32(0):
-                            sb = cutlass.Int32(0)
-                        if sb > cutlass.Int32(fbins - 1):
-                            sb = cutlass.Int32(fbins - 1)
+                        # With the fine level compiled out the sub-bin is a
+                        # constant 0 == sb*, so the whole three-way split
+                        # below collapses to the park arm and the per-
+                        # candidate recompute (a subtract, a multiply and two
+                        # clamps) is dead. Keep it a compile-time constant so
+                        # the scatter does not carry it.
+                        sb = cutlass.Int32(0)
+                        if cutlass.const_expr(not self.p4_no_fine):
+                            sb = cutlass.Int32((v - f_lo) * finv)
+                            if sb < cutlass.Int32(0):
+                                sb = cutlass.Int32(0)
+                            if sb > cutlass.Int32(fbins - 1):
+                                sb = cutlass.Int32(fbins - 1)
                         if sb > sb_star:
                             o = atomicAdd(s_iscalars.iterator + cutlass.Int32(0), cutlass.Int32(1))
                             pos = rank_above + o
