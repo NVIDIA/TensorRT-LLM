@@ -107,6 +107,85 @@ def resize_center_crop_uint8(frames: torch.Tensor, target_h: int, target_w: int)
     return x.round_().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
 
 
+def resize_fit_pad_uint8(frames: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Resize to fit inside the target, then pad bottom/right to fill it.
+
+    The counterpart to :func:`resize_center_crop_uint8`, for references whose
+    periphery carries signal — a robot gripper works at the frame edge, so
+    cropping it away costs the model the thing it is meant to act on.
+
+    Semantics mirror the action reference's ``reflection_pad_to_target``:
+    contain-scale by ``min(target/source, 1.0)`` (never enlarge — a small clip
+    keeps its own pixels and gets a wider border), round-rather-than-ceil
+    resize, then pad bottom/right by reflection, switching to edge replication
+    when a pad run reaches the resized extent (reflection has no source pixels
+    left to mirror). The resampling filter stays this module's Lanczos-3 rather
+    than the reference's bicubic: the geometry is what preserves content, and a
+    second filter would buy sub-pixel differences for a second code path.
+    """
+    t, h, w, c = frames.shape
+    if (h, w) == (target_h, target_w):
+        return frames
+    ratio = min(target_w / w, target_h / h, 1.0)
+    resize_w = min(int(ratio * w + 0.5), target_w)
+    resize_h = min(int(ratio * h + 0.5), target_h)
+
+    # Two passes with a uint8-quantized intermediate, as in the cover path.
+    x = frames.permute(0, 3, 1, 2).to(torch.float32)  # [T, C, H, W]
+    if resize_w != w:
+        weights, taps = _lanczos_taps(w, resize_w, str(frames.device))
+        x = _resample_last_dim(x, weights, taps)
+        x = x.round_().clamp_(0, 255)
+    if resize_h != h:
+        weights, taps = _lanczos_taps(h, resize_h, str(frames.device))
+        x = _resample_last_dim(x.transpose(-1, -2), weights, taps).transpose(-1, -2)
+    x = x.round_().clamp_(0, 255)
+
+    pad_w = target_w - resize_w
+    pad_h = target_h - resize_h
+    if pad_w or pad_h:
+        mode = "replicate" if (pad_w >= resize_w or pad_h >= resize_h) else "reflect"
+        x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+    return x.to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+
+
+_RESIZE_MODES = {"cover": resize_center_crop_uint8, "fit": resize_fit_pad_uint8}
+
+
+def probe_video_dimensions(data: bytes) -> tuple[int, int]:
+    """Return the reference's ``(height, width)`` without decoding a frame.
+
+    The container header carries the source resolution, so a caller that must
+    choose its target size from the source aspect ratio - Cosmos3 action picks
+    the canvas whose shape is closest to the reference - can do so before
+    committing to a decode.
+    """
+    try:
+        import PyNvVideoCodec as nvc
+    except ImportError as exc:
+        raise ImportError(
+            "PyNvVideoCodec is required for video-reference decoding; "
+            "install the declared dependency (pip install PyNvVideoCodec)."
+        ) from exc
+
+    position = 0
+
+    def _read(buf: bytearray) -> int:
+        nonlocal position
+        chunk = data[position : position + len(buf)]
+        buf[: len(chunk)] = chunk
+        position += len(chunk)
+        return len(chunk)
+
+    try:
+        demuxer = nvc.CreateDemuxer(_read)
+        return int(demuxer.Height()), int(demuxer.Width())
+    except nvc.PyNvVCException as exc:
+        raise ValueError(
+            f"Video reference could not be demuxed (corrupt or not a supported container): {exc}"
+        ) from exc
+
+
 def decode_video_reference_window(
     data: bytes,
     *,
@@ -115,12 +194,19 @@ def decode_video_reference_window(
     target_h: int,
     target_w: int,
     device: torch.device,
+    resize: str = "cover",
 ) -> torch.Tensor:
     """Decode frames ``[first_frame, last_frame]`` of a reference on device.
 
     Returns uint8 ``[T, target_h, target_w, 3]``. Indices are Python-style:
     non-negative counts from the start, negative from the end, so ``-1`` is
     the last frame and ``(-8, -1)`` the final eight. Both ends are inclusive.
+
+    ``resize`` selects how each frame reaches ``target_h x target_w``:
+    ``"cover"`` scales to fill and center-crops (the default, and what video
+    continuation wants); ``"fit"`` scales to fit and pads, for references whose
+    frame edges carry signal. See :func:`resize_center_crop_uint8` and
+    :func:`resize_fit_pad_uint8`.
 
     A negative index costs a decode to EOS — the memory-buffer demuxer is a
     forward-only feeder, seeking is not assumed — so the caller pays for the
@@ -140,6 +226,11 @@ def decode_video_reference_window(
     if first_frame > last_frame:
         raise ValueError(
             f"first_frame must not exceed last_frame, got ({first_frame}, {last_frame})."
+        )
+    resize_frames = _RESIZE_MODES.get(resize)
+    if resize_frames is None:
+        raise ValueError(
+            f"Unknown resize mode {resize!r}; expected one of {sorted(_RESIZE_MODES)}."
         )
     window = last_frame - first_frame + 1
     from_end = first_frame < 0
@@ -211,7 +302,7 @@ def decode_video_reference_window(
                         # Ownership copy off the NVDEC surface (recycled by
                         # the decoder) and resize-before-retain in one step.
                         ring[kept % tail].copy_(
-                            resize_center_crop_uint8(decoded.unsqueeze(0), target_h, target_w)[0]
+                            resize_frames(decoded.unsqueeze(0), target_h, target_w)[0]
                         )
                         kept += 1
                     count += 1
