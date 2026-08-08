@@ -346,6 +346,22 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 - 双臂并行(1024 global = 8 rank × bs128,DEP8 + overlap + CUDA graph,TRTLLM MoE):**notrim 参照**(`test_gsm8k_dep8_static_verify_overlap`)= **96.247**;**device windows 臂**(`test_gsm8k_dep8_ragged_verify` + `TLLM_DSPARK_DEVICE_WINDOWS=1` + v2b 表)= **96.323**。两臂均过 96.0 参考线;差值 +0.08pp 远小于 GSM8K 抽样噪声(σ≈0.5pp)——**修复后的 device 窗口在大并发下精度无损**(用户要求的验证项完成)。
 - 进行中:三臂吞吐复跑(rounds 方法论,poetry+arena × bs512/1024 global × 5 reps + warm rep)——device(bia0047)/ host(bia0048)/ notrim(bia0123),回答 #30 的原始问题:干净生成下 device 收益是否真实存在。
 
+### 【08-08 12:00】#30 终局:诚实三臂吞吐 —— device>host 不复现,原 +64% 判定为腐蚀假象(定案)
+
+修复后干净生成下的三臂对照(rounds 方法论,节点本地 asyncio 客户端,median tok/s,5 稳态 reps,warm rep 剔除;device=bia0047 / host=bia0048 / notrim=bia0123):
+
+| cell | notrim | host | device | host/notrim | device/host |
+|---|---|---|---|---|---|
+| poetry 512 | 12340 | 11840 | 11058 | −4.1% | −6.6% |
+| poetry 1024 | 12912 | 12703 | 12385 | −1.6% | −2.5% |
+| arena 512 | 16766 | 16221 | 16275 | −3.3% | +0.3% |
+| arena 1024 | 13526 | 13636 | 13350 | +0.8% | −2.1% |
+
+- **主问题答案(#30 "若 device>host 复现,搞清楚为什么")**:干净生成下**不复现**——device 相对 host 在 −6.6%~+0.3% 区间(本轮未做节点对调,±3-5% 内视为噪声;poetry 512 的 −6.6% 或含真实序幕开销成分)。原 +64% 完全由腐蚀假象制造(重复特殊 token + 零 EOS + 满批不排水)。
+- host trim vs notrim 仍 ≈ 0±4%,与此前四轮判决(0±3%)一致。**B300 agg DEP8 上,该校准配置下 host/device 动态裁剪均无可复现吞吐收益**,与 #28(SGLang 原生动态在 B300 高 bs 亏损)闭环互证。
+- 量具备注:首版登录节点线程池客户端因线程耗尽产生 6× 失真(1998 tok/s),已废弃;节点本地 asyncio 客户端复现旧轮次量程(warm rep 11954 vs 旧轮 10.4-11.9k)。散在失败请求 <2%/格、三臂均摊,不影响中位数。
+- 至此 #30 全链闭环:STS 校准 → 稳定性轮次 → device>host 根因(= bug #1 kv_lens 双份 + bug #2 compressor 捕获 H2D)→ 修复 → census/GSM8K/吞吐三重验证。
+
 ### 备选修复方案评估(供评审;当前实施的是 A,标记为暂定)
 
 - **A(已实施,Python-only)**:捕获拷贝换 D2D 源(`_seq_lens_cuda`)+ NEXT_N 抬全局上界。最小爆炸半径,当场可在活挂载容器里验证;把双胞胎缓冲降级为 canonical 缓冲的衍生物。host 路径装填时刻数值逐位等价,uniform/eager 分支未触碰。
