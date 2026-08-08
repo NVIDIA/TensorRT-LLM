@@ -1,0 +1,118 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm.serve.openai_server import OpenAIServer
+
+
+def _make_server(enabled: bool) -> OpenAIServer:
+    server = object.__new__(OpenAIServer)
+    server.app = FastAPI()
+    server.generator = MagicMock(spec=AsyncLLM)
+    server.generator.collective_rpc = AsyncMock()
+    server._enable_rl_control_endpoints = enabled
+    server._rl_control_api_key = "secret"
+    server._register_rl_control_routes()
+    return server
+
+
+def test_rl_control_routes_require_key():
+    with pytest.raises(ValueError, match="rl_control_api_key is required"):
+        OpenAIServer(
+            generator=MagicMock(spec=AsyncLLM),
+            model="model",
+            tool_parser=None,
+            server_role=None,
+            metadata_server_cfg=None,
+            enable_rl_control_endpoints=True,
+        )
+
+
+def test_rl_control_routes_require_async_llm():
+    with pytest.raises(ValueError, match="require AsyncLLM"):
+        OpenAIServer(
+            generator=MagicMock(),
+            model="model",
+            tool_parser=None,
+            server_role=None,
+            metadata_server_cfg=None,
+            enable_rl_control_endpoints=True,
+            rl_control_api_key="secret",
+        )
+
+
+def test_rl_control_routes_disabled_by_default():
+    server = _make_server(enabled=False)
+    paths = {route.path for route in server.app.routes}
+
+    assert "/release_memory" not in paths
+    assert "/resume_memory" not in paths
+    assert "/update_weights" not in paths
+
+
+@pytest.mark.parametrize("endpoint", [
+    "/release_memory",
+    "/resume_memory",
+    "/update_weights",
+])
+def test_rl_control_routes_require_auth(endpoint):
+    server = _make_server(enabled=True)
+
+    with TestClient(server.app) as client:
+        response = client.post(endpoint, json={"tags": ["kv_cache"]})
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    server.generator.collective_rpc.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("endpoint", "payload", "rpc_name", "rpc_args"), [
+    ("/release_memory", {"tags": ["kv_cache"]}, "sleep", (["kv_cache"], )),
+    ("/resume_memory", {"tags": ["model"]}, "wakeup", (["model"], )),
+    ("/update_weights", {"weights": None}, "update_weights", (None, )),
+])
+def test_rl_control_routes_accept_valid_token(endpoint, payload, rpc_name,
+                                              rpc_args):
+    server = _make_server(enabled=True)
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            endpoint,
+            json=payload,
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    server.generator.collective_rpc.assert_awaited_once_with(rpc_name,
+                                                             args=rpc_args)
+
+
+def test_release_memory_requires_tags():
+    server = _make_server(enabled=True)
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/release_memory",
+            json={},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 422
+    server.generator.collective_rpc.assert_not_awaited()
