@@ -17,6 +17,8 @@ quant_config:
   quant_algo: FP8_BLOCK_SCALES
   dynamic: true
 attention_config:
+  # Ulysses pads/shards Qwen-Image-Edit text and image streams, so the
+  # backend must support key padding masks; currently only VANILLA does.
   backend: VANILLA
 parallel_config:
   cfg_size: 1
