@@ -38,8 +38,10 @@ from typing import Optional
 
 # Make sibling modules importable when invoked as `python3 <path>/main.py ...`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "coverage_selection"))
 
 from blocks import (  # noqa: E402
+    ALWAYS_RUN_STAGE_PREFIX,
     Stage,
     YAMLIndex,
     compute_stage_split_counts,
@@ -47,6 +49,14 @@ from blocks import (  # noqa: E402
     load_durations,
     parse_stages_from_groovy,
     write_filtered_test_db,
+)
+from coverage_tier import (  # noqa: E402
+    DEFAULT_NO_DATA_POLICY,
+    NO_DATA_POLICIES,
+    apply_coverage_tier,
+    compute_coverage_stage_counts,
+    open_db,
+    write_coverage_test_db,
 )
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
@@ -57,6 +67,9 @@ from rules.test_list_rule import TestListRule  # noqa: E402
 from rules.tests_def_rule import TestsDefRule  # noqa: E402
 from rules.visual_gen_rule import VisualGenRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
+
+# Files the coverage tier maps to qualnames; without their diffs it stays file-level.
+COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
 
 # --- Rule registry -----------------------------------------------------------
 
@@ -100,7 +113,7 @@ class SelectionResult:
     # rolls these up; noop gives way to actionable scopes there).
     scopes: list[str] = field(default_factory=list)
     affected_stages: set[str] = field(default_factory=set)
-    reasons: list[str] = field(default_factory=list)
+    reasons: list[dict] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
     # Per-stage kept-entry count (decision telemetry / diagnostics).
@@ -113,6 +126,18 @@ class SelectionResult:
     # Aggregated `any(rule.perfsanity_relevant)`. Groovy Layer 2 keeps
     # *-PerfSanity-* stages only when True.
     perfsanity_required: bool = True
+    # set by coverage tier; Groovy re-adds multiGpuJobs under MULTI_GPU_FILE_CHANGED gate
+    enable_multi_gpu: bool = False
+    coverage_dropped_stages: list[str] = field(default_factory=list)
+    # Post-merge build the consulted touch DB came from; makes a decision replayable.
+    coverage_db_build: Optional[int] = None
+    # Revision the DB was collected at and HEAD's distance from it; None when unknown.
+    coverage_db_commit: Optional[str] = None
+    coverage_db_lag: Optional[int] = None
+    # Freshness verdict on that lag: ok / stale / unknown; empty when no DB was consulted.
+    coverage_freshness: str = ""
+    # Residual files the forge API returned no patch for; they fall back to file level.
+    coverage_no_diff_files: int = 0
 
     def to_json(self) -> str:
         data = {
@@ -125,8 +150,47 @@ class SelectionResult:
             "affected_stage_split_counts": dict(self.affected_stage_split_counts),
             "sanity_required": self.sanity_required,
             "perfsanity_required": self.perfsanity_required,
+            "enable_multi_gpu": self.enable_multi_gpu,
+            "coverage_dropped_stages": sorted(self.coverage_dropped_stages),
+            "coverage_db_build": self.coverage_db_build,
+            "coverage_db_commit": self.coverage_db_commit,
+            "coverage_db_lag": self.coverage_db_lag,
+            "coverage_freshness": self.coverage_freshness,
+            "coverage_no_diff_files": self.coverage_no_diff_files,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+# Tier 2 stands down past this many commits: what the DB says about who touches what
+# stops describing the code under test. Tune with --coverage-max-lag.
+DEFAULT_COVERAGE_MAX_LAG = 100
+
+
+def _coverage_freshness(lag: Optional[int], max_lag: int) -> tuple[str, str]:
+    """Verdict on the consulted DB's lag, plus the decline note (empty when usable)."""
+    if lag is None:
+        return "unknown", "coverage DB freshness unknown: its lag could not be measured"
+    if lag > max_lag:
+        return "stale", f"coverage DB is {lag} commit(s) behind main, over the {max_lag} limit"
+    return "ok", ""
+
+
+def _rule_reason(rule, r) -> dict:
+    """One rule's structured reason entry: `{source, blocks, stages}`."""
+    return {
+        "source": rule.name,
+        "blocks": len(r.block_filters),
+        "stages": len(r.affected_stages),
+    }
+
+
+def _fmt_reason(r) -> str:
+    """Render a structured reason dict as one human line: `[source] k=v, ...`."""
+    if not isinstance(r, dict):
+        return str(r)
+    src = r.get("source", "?")
+    rest = ", ".join(f"{k}={v}" for k, v in r.items() if k != "source")
+    return f"[{src}] {rest}" if rest else f"[{src}]"
 
 
 # Scopes that compose: a PR mixing waive + test-def + test-list edits
@@ -178,26 +242,35 @@ class Selector:
         handled: set[str] = set()
         for _, r in pairs:
             handled |= r.handled_files
+        # Expose for the coverage tier (Tier 2), which unions over the residual.
+        self.pairs = pairs
+        self.handled = handled
+        rule_reasons = [_rule_reason(rule, r) for rule, r in pairs]
+
         unhandled = sorted(set(pr.changed_files) - handled)
         if unhandled:
-            preview = unhandled[:5]
-            more = f" (+{len(unhandled) - 5} more)" if len(unhandled) > 5 else ""
-            return SelectionResult(scope=None, reasons=[f"Unhandled files: {preview}{more}"])
+            return SelectionResult(
+                scope=None,
+                reasons=rule_reasons
+                + [{"source": "fallback", "reason": "unhandled_files", "files": unhandled}],
+            )
 
         if not pairs:
-            return SelectionResult(scope=None, reasons=["No rule contributed"])
+            return SelectionResult(
+                scope=None,
+                reasons=[{"source": "fallback", "reason": "no_rule_contributed"}],
+            )
 
-        reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         scope = _combine_scopes([r.scope for _, r in pairs])
         if scope is None:
             # scope=None is a rule's force-fallback signal; attribute it, not a scope conflict.
             forced = sorted({rule.name for rule, r in pairs if r.scope is None})
             if forced:
-                summary = f"Fallback forced by rule(s): {', '.join(forced)}"
+                fb = {"source": "fallback", "reason": "forced_by_rules", "rules": forced}
             else:
                 actionable = sorted({r.scope for _, r in pairs if r.scope and r.scope != "noop"})
-                summary = f"Scopes cannot be combined: {', '.join(actionable)}"
-            return SelectionResult(scope=None, reasons=reasons + [summary])
+                fb = {"source": "fallback", "reason": "scopes_uncombinable", "scopes": actionable}
+            return SelectionResult(scope=None, reasons=rule_reasons + [fb])
 
         affected_stages: set[str] = set()
         for _, r in pairs:
@@ -212,11 +285,7 @@ class Selector:
         if not affected_stages and scope != "noop":
             return SelectionResult(
                 scope=None,
-                reasons=reasons
-                + [
-                    "Rules fired but no stages resolved (likely YAML/waive "
-                    "granularity mismatch); falling back to baseline."
-                ],
+                reasons=rule_reasons + [{"source": "fallback", "reason": "no_stages_resolved"}],
             )
 
         # Aggregate per-block prefix->{waive_ids} across rules.
@@ -234,7 +303,7 @@ class Selector:
             scope=scope,
             scopes=sorted({r.scope for _, r in pairs if r.scope}),
             affected_stages=affected_stages,
-            reasons=reasons,
+            reasons=rule_reasons,
             block_filters=block_filters,
             sanity_required=sanity_required,
             perfsanity_required=perfsanity_required,
@@ -293,10 +362,49 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Override path to the Jenkins test Groovy file "
         "(default: <repo-root>/jenkins/L0_Test.groovy).",
     )
+    parser.add_argument(
+        "--coverage-db",
+        default=None,
+        help="Path to cbts_touchmap.sqlite. When set, the coverage tier (Tier 2) "
+        "runs on fallbacks and may drop fully-safe single-GPU stages.",
+    )
+    parser.add_argument(
+        "--coverage-db-build",
+        type=int,
+        default=None,
+        help="Post-merge build the --coverage-db came from; recorded in the decision "
+        "so it can be traced back to its DB.",
+    )
+    parser.add_argument(
+        "--coverage-db-commit",
+        default=None,
+        help="Revision the --coverage-db was collected at (from the build's build_info.txt).",
+    )
+    parser.add_argument(
+        "--coverage-db-lag",
+        type=int,
+        default=None,
+        help="Commits main gained since --coverage-db-commit; recorded in the decision.",
+    )
+    parser.add_argument(
+        "--coverage-max-lag",
+        type=int,
+        default=DEFAULT_COVERAGE_MAX_LAG,
+        help="Decline the coverage tier when the DB trails main by more than this many commits.",
+    )
+    parser.add_argument(
+        "--no-data-policy",
+        choices=NO_DATA_POLICIES,
+        default=DEFAULT_NO_DATA_POLICY,
+        help="How to treat a changed function with no rows in the coverage DB: "
+        "'file' force-runs every test entering that file, 'importers' only the "
+        "file's <module> touch set, 'ignore' treats it as impacting nothing "
+        f"(default: {DEFAULT_NO_DATA_POLICY}).",
+    )
     args = parser.parse_args(argv)
 
     if args.list_needed_diffs:
-        patterns: set[str] = set()
+        patterns: set[str] = set(COVERAGE_NEEDS_DIFF_FOR)
         for cls in RULE_CLASSES:
             patterns.update(cls.needs_diff_for)
         for p in sorted(patterns):
@@ -336,7 +444,71 @@ def main(argv: Optional[list[str]] = None) -> int:
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path)
     rules = build_rules(yaml_index, stages, repo_root)
-    result = Selector(stages).run(pr, rules)
+    selector = Selector(stages)
+    result = selector.run(pr, rules)
+
+    result.coverage_db_build = args.coverage_db_build
+    result.coverage_db_commit = args.coverage_db_commit
+    result.coverage_db_lag = args.coverage_db_lag
+
+    if args.coverage_db and result.scope is None:
+        tier = None
+        result.coverage_freshness, note = _coverage_freshness(
+            args.coverage_db_lag, args.coverage_max_lag
+        )
+        if not note:  # the gate passed; a note here means it did not
+            try:
+                db = open_db(args.coverage_db)
+                tier, note = apply_coverage_tier(
+                    pr,
+                    selector.pairs,
+                    selector.handled,
+                    stages,
+                    yaml_index,
+                    repo_root,
+                    db,
+                    no_data_policy=args.no_data_policy,
+                )
+            except Exception as e:  # noqa: BLE001 — CBTS must never break CI
+                note = f"coverage tier errored: {e}"
+                tier = None
+        if tier is not None:
+            result.scope = "coverage"
+            result.scopes = sorted(
+                {r.scope for _, r in selector.pairs if r.scope and r.scope != "noop"} | {"coverage"}
+            )
+            result.affected_stages = tier.affected_stages
+            result.enable_multi_gpu = True
+            result.coverage_dropped_stages = sorted(tier.dropped)
+            result.coverage_no_diff_files = int(tier.detail.get("no_diff_files") or 0)
+            if tier.removed:
+                write_coverage_test_db(
+                    src_dir=test_db_dir,
+                    out_dir=repo_root / "cbts_test_db",
+                    removed=tier.removed,
+                )
+                result.test_db_dir_override = "cbts_test_db"
+                durations = load_durations(repo_root / "tests/integration/defs/.test_durations")
+                (
+                    result.affected_stage_test_counts,
+                    result.affected_stage_split_counts,
+                ) = compute_coverage_stage_counts(
+                    affected_stages=set(result.affected_stages),
+                    stages=stages,
+                    yaml_index=yaml_index,
+                    removed=tier.removed,
+                    durations=durations,
+                )
+            cov_reason = dict(tier.detail)
+            cov_reason["narrowed_stages"] = len(result.affected_stage_split_counts)
+            result.reasons = [x for x in result.reasons if x.get("source") != "fallback"] + [
+                cov_reason
+            ]
+        elif note:
+            for x in result.reasons:
+                if isinstance(x, dict) and x.get("source") == "fallback":
+                    x["coverage_declined"] = note
+                    break
 
     # Layer 3: write narrowed test-db when any block was filtered.
     if result.scope is not None and result.block_filters:
@@ -362,6 +534,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
             durations=durations,
         )
+
+    # Added before the trigger-mode filter, and outside the counts Layer 2.5 resizes.
+    if result.scope is not None:
+        result.affected_stages |= {s for s in stages if s.startswith(ALWAYS_RUN_STAGE_PREFIX)}
 
     # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
     # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
@@ -404,7 +580,7 @@ def _log_decision_to_stderr(
     if result.reasons:
         print("  reasons:", file=out)
         for r in result.reasons:
-            print(f"    - {r}", file=out)
+            print(f"    - {_fmt_reason(r)}", file=out)
     print(f"  block_filters ({len(result.block_filters)} blocks):", file=out)
     for (yaml_stem, idx), prefix_to_waives in sorted(result.block_filters.items()):
         print(f"    - {yaml_stem}#{idx}:", file=out)
