@@ -44,6 +44,11 @@ try:
     import cuda.bindings.driver  # noqa: F401
     import cutlass  # noqa: F401
     from fla.ops.kda import fused_recurrent_kda  # noqa: F401
+
+    # The model module transitively imports the optional deps above, so it
+    # must stay behind the guard too or collection fails instead of skipping.
+    from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
@@ -70,13 +75,18 @@ M = 2  # draft tokens per round
 LB = -5.0
 
 
+@torch.no_grad()
 def _make_runtime(seed):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
-
-    cfg = SimpleNamespace(
+    # A real KimiLinearConfig (not a SimpleNamespace) so the runtime sees the
+    # same config surface it does in production. ``linear_attn_config`` carries
+    # the per-layer KDA params the runtime reads plus the (unused here)
+    # kda_layers/full_attn_layers schedule the config's own validation requires.
+    cfg = KimiLinearConfig(
         hidden_size=HIDDEN,
         rms_norm_eps=1e-5,
         linear_attn_config=dict(
+            kda_layers=[1],
+            full_attn_layers=[],
             num_heads=H,
             head_dim=K,
             short_conv_kernel_size=W,
@@ -86,23 +96,17 @@ def _make_runtime(seed):
     )
     rt = KimiKDARuntime(cfg, layer_idx=0).to("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    with torch.no_grad():
-        for name, p in rt.named_parameters():
-            if name.endswith("A_log"):
-                p.copy_(
-                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+    for name, p in rt.named_parameters():
+        if name.endswith("A_log"):
+            p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5)
+        elif name.endswith("dt_bias"):
+            p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1)
+        else:
+            p.copy_(
+                (torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.03).to(
+                    p.dtype
                 )
-            elif name.endswith("dt_bias"):
-                p.copy_(
-                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1
-                )
-            else:
-                p.copy_(
-                    (
-                        torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32)
-                        * 0.03
-                    ).to(p.dtype)
-                )
+            )
     return rt
 
 
@@ -169,6 +173,7 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
+@torch.no_grad()
 def test_fused_vs_sequential_two_rounds():
     torch.manual_seed(0)
     B = 4
@@ -190,46 +195,39 @@ def test_fused_vs_sequential_two_rounds():
         ).to(torch.bfloat16)
 
     ok = True
-    with torch.no_grad():
-        # ---- Round 1 (no pending drafts) ----
-        x1 = tokens()
-        out1_seq = rt._forward_verify_sequential(
-            x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-        )
-        out1_fused = rt._forward_verify(
-            x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
-        )
-        print("round 1:")
-        ok &= _rep("out", out1_fused, out1_seq)
+    # ---- Round 1 (no pending drafts) ----
+    x1 = tokens()
+    out1_seq = rt._forward_verify_sequential(
+        x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+    )
+    out1_fused = rt._forward_verify(
+        x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+    )
+    print("round 1:")
+    ok &= _rep("out", out1_fused, out1_seq)
 
-        # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
-        accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
-        _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
-        cache_fused.prev_num_accepted_tokens.copy_(accept.to(torch.int32))
+    # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
+    accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
+    _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
+    cache_fused.prev_num_accepted_tokens.copy_(accept.to(torch.int32))
 
-        # ---- Round 2 (fused path replays the accepted drafts) ----
-        x2 = tokens()
-        out2_seq = rt._forward_verify_sequential(
-            x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-        )
-        out2_fused = rt._forward_verify(
-            x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
-        )
-        print("round 2 (mixed replay):")
-        ok &= _rep("out", out2_fused, out2_seq)
+    # ---- Round 2 (fused path replays the accepted drafts) ----
+    x2 = tokens()
+    out2_seq = rt._forward_verify_sequential(
+        x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+    )
+    out2_fused = rt._forward_verify(
+        x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+    )
+    print("round 2 (mixed replay):")
+    ok &= _rep("out", out2_fused, out2_seq)
 
-        # Committed pool state cross-check: fused pool holds the state after
-        # round-2's golden token; reproduce it in the sequential world by
-        # promoting with accept=0 (golden only).
-        _promote_sequential(
-            cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
-        )
-        ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
+    # Committed pool state cross-check: fused pool holds the state after
+    # round-2's golden token; reproduce it in the sequential world by
+    # promoting with accept=0 (golden only).
+    _promote_sequential(
+        cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
+    )
+    ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
 
     assert ok
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v", "-x", "-s"]))

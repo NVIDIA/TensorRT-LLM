@@ -90,6 +90,16 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  # ------------- Kimi K3 (KimiLinear) unit tests ---------------
+  - unittest/_torch/modeling/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modeling/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  # test_kda_prefill_op.py is NOT wired here: its compute cases produce
+  # NaN on B200 (cosine check fails; passes on GB300). Under
+  # investigation before enabling on this machine type (TRTLLM-15204).
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
