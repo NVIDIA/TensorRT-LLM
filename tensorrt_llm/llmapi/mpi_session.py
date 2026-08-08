@@ -64,7 +64,8 @@ class MPINodeState:
 
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
-    """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+    """Check if launched by mpirun without using MPIPoolExecutor to spawn processes.
+
     e.g. mpirun -np 4 python script.py
     """
     if ENABLE_MULTI_DEVICE:
