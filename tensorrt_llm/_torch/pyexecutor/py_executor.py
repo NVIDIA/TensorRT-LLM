@@ -2567,7 +2567,8 @@ class PyExecutor:
                 self._pad_attention_dp_dummy_request()
 
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
-                (scheduled_batch, fitting_disagg_gen_init_requests, _,
+                (scheduled_batch, fitting_disagg_gen_init_requests,
+                 num_fitting_reqs,
                  _) = self._pp_schedule_and_propagate(microbatch_id)
                 if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
@@ -2592,6 +2593,9 @@ class PyExecutor:
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
+                    if num_fitting_reqs == 0:
+                        logger.warning(
+                            "num_fitting_reqs=0, may not have enough kvCache")
                     self._check_disagg_transfer_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
@@ -3655,7 +3659,7 @@ class PyExecutor:
                     continue
                 request.draft_tokens = [0] * self.max_total_draft_tokens
 
-        scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
+        scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
         if self.drafter is not None and not self.use_spec_decode:
@@ -3671,6 +3675,9 @@ class PyExecutor:
             # into the transfer window this iteration.
             self._prepare_disagg_gen_init(admitted_disagg_gen_init_requests)
 
+            if num_fitting_reqs == 0:
+                logger.warning(
+                    "num_fitting_reqs=0, may not have enough kvCache")
             self._check_disagg_transfer_progress_when_idle()
 
             # In gen-only benchmark mode, all requests must fit in KV cache
