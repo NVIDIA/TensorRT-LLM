@@ -86,9 +86,19 @@ def _setup_model_symlinks(config):
     Verl tests expect models at {model_root}/Qwen/ModelName but the CI cache
     stores them at {ci_cache}/ModelName (flat structure). We create symlinks
     in a writable staging directory that point to the read-only CI cache.
+
+    When the configured ci_model_cache is unavailable on the current host,
+    fall back to LLM_MODELS_ROOT (the standard TRT-LLM env var pointing at
+    the model cache mount, e.g. /code/llm-models in the dev container).
     """
     model_root = os.environ.get("TRTLLM_TEST_MODEL_PATH_ROOT", "")
     ci_cache = config.get("ci_model_cache", "")
+    if not os.path.isdir(ci_cache):
+        fallback = os.environ.get("LLM_MODELS_ROOT", "")
+        if fallback and os.path.isdir(fallback):
+            print(f"[verl setup] ci_model_cache {ci_cache} unavailable; "
+                  f"falling back to LLM_MODELS_ROOT={fallback}")
+            ci_cache = fallback
     if not model_root or not ci_cache:
         return
     for model_id in config.get("required_models", []):
