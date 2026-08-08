@@ -23,7 +23,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
 
-def test_prepare_computes_draft_sliding_block_tables_before_base_prepare(monkeypatch):
+def test_prepare_computes_draft_sliding_block_tables_before_base_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
     """DeepSeek-V4 MTP draft KV managers need their sliding tables prepared.
 
     The base TRT-LLM metadata prepare path copies block offsets from both the
@@ -37,10 +37,10 @@ def test_prepare_computes_draft_sliding_block_tables_before_base_prepare(monkeyp
     metadata.request_ids = [11, 12, 13]
     metadata.num_contexts = 2
 
-    def stop_at_base_prepare(self):
+    def _stop_at_base_prepare(self: TrtllmAttentionMetadata) -> None:
         raise RuntimeError("base prepare reached")
 
-    monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", stop_at_base_prepare)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", _stop_at_base_prepare)
 
     with pytest.raises(RuntimeError, match="base prepare reached"):
         DeepseekV4TrtllmAttentionMetadata.prepare(metadata)
