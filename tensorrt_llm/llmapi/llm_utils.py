@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import transformers
+from pydantic import BaseModel
 
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
@@ -529,6 +530,52 @@ def _deep_merge(base: Dict[str, Any], *overlays: Dict[str,
     return result
 
 
+def _capture_pydantic_fields_set(value: Any) -> Any:
+    """Capture explicit-field state for nested Pydantic configurations."""
+    if isinstance(value, BaseModel):
+        return (
+            "model",
+            set(value.model_fields_set),
+            {
+                field_name:
+                _capture_pydantic_fields_set(getattr(value, field_name))
+                for field_name in type(value).model_fields
+            },
+        )
+    if isinstance(value, (list, tuple)):
+        return ("sequence",
+                [_capture_pydantic_fields_set(item) for item in value])
+    if isinstance(value, dict):
+        return (
+            "mapping",
+            {
+                key: _capture_pydantic_fields_set(item)
+                for key, item in value.items()
+            },
+        )
+    return None
+
+
+def _restore_pydantic_fields_set(value: Any, state: Any) -> None:
+    """Restore explicit-field state after validating reconstructed configs."""
+    if state is None:
+        return
+
+    kind = state[0]
+    if kind == "model" and isinstance(value, BaseModel):
+        object.__setattr__(value, "__pydantic_fields_set__", set(state[1]))
+        for field_name, child_state in state[2].items():
+            _restore_pydantic_fields_set(getattr(value, field_name),
+                                         child_state)
+    elif kind == "sequence" and isinstance(value, (list, tuple)):
+        for item, child_state in zip(value, state[1]):
+            _restore_pydantic_fields_set(item, child_state)
+    elif kind == "mapping" and isinstance(value, dict):
+        for key, child_state in state[1].items():
+            if key in value:
+                _restore_pydantic_fields_set(value[key], child_state)
+
+
 def apply_model_defaults_to_llm_args(
         llm_args: 'TorchLlmArgs',
         model_defaults_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -549,6 +596,7 @@ def apply_model_defaults_to_llm_args(
             "config the user did not turn on. Declare a runtime preference "
             "via get_preferred_transceiver_runtime() instead.")
 
+    explicit_fields_state = _capture_pydantic_fields_set(llm_args)
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
@@ -557,6 +605,11 @@ def apply_model_defaults_to_llm_args(
 
     for field_name in llm_args.model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
+    # Reconstructing from a complete model_dump marks every nested default as
+    # explicit. Preserve the original user-intent metadata after validation so
+    # later checkpoint resolution can still distinguish omitted values from
+    # overrides (for example DeepSeek index_topk).
+    _restore_pydantic_fields_set(llm_args, explicit_fields_state)
 
     def _compute_applied(defaults: Dict[str, Any],
                          overrides: Dict[str, Any]) -> Dict[str, Any]:

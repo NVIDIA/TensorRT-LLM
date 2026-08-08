@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -45,6 +46,100 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_mtp_eagle_refreshes_runtime_draft_slot_mappings_before_forward(
+) -> None:
+    """The first MTP-Eagle draft forward must use runtime-corrected mappings."""
+    events = []
+    target_manager = object()
+    target_block_table = object()
+    draft_block_table = object()
+    draft_manager = SimpleNamespace(
+        index_head_dim=128,
+        get_pool_block_indices=lambda *args, **kwargs: None,
+        indexer_k_cache_page_scale=1,
+    )
+
+    class _AttentionMetadata:
+
+        def __init__(self):
+            self.seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
+            self.num_ctx_tokens = 0
+            self.kv_cache_manager = target_manager
+            self.block_table = target_block_table
+
+        def set_in_mtp_draft_loop(self, active):
+            events.append(("set_in_mtp_draft_loop", active))
+
+        def set_mtp_num_accepted(self, value):
+            events.append(("set_mtp_num_accepted", value))
+
+        def set_skip_topk(self, value):
+            events.append(("set_skip_topk", value))
+
+        def on_update_kv_lens(self):
+            assert self.kv_cache_manager is draft_manager
+            assert self.block_table is draft_block_table
+            events.append(("on_update_kv_lens", draft_manager))
+
+    attn_metadata = _AttentionMetadata()
+
+    @contextmanager
+    def draft_context(metadata, manager):
+        assert metadata is attn_metadata
+        assert manager is draft_manager
+        assert metadata.kv_cache_manager is target_manager
+        assert metadata.block_table is target_block_table
+        metadata.kv_cache_manager = draft_manager
+        metadata.block_table = draft_block_table
+        events.append(("enter_draft_context", manager))
+        try:
+            yield metadata
+        finally:
+            metadata.kv_cache_manager = target_manager
+            metadata.block_table = target_block_table
+
+    class _StopAfterFirstDraftForward(Exception):
+        pass
+
+    def run_draft_forward(*args, **kwargs):
+        assert attn_metadata.kv_cache_manager is draft_manager
+        assert attn_metadata.block_table is draft_block_table
+        events.append(("run_draft_forward", draft_manager))
+        raise _StopAfterFirstDraftForward
+
+    worker = SimpleNamespace(
+        is_mtp_eagle=True,
+        draft_kv_cache_context=draft_context,
+        _run_draft_forward=run_draft_forward,
+    )
+    spec_metadata = SimpleNamespace(runtime_draft_len=1)
+    inputs = {"position_ids": torch.tensor([0], dtype=torch.int32)}
+
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+
+    with pytest.raises(_StopAfterFirstDraftForward):
+        Eagle3OneModelWorker._forward_linear_draft_loop(
+            worker,
+            inputs,
+            attn_metadata,
+            spec_metadata,
+            draft_model=object(),
+            draft_kv_cache_manager=draft_manager,
+            num_contexts=0,
+            batch_size=1,
+            num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
+            original_all_rank_num_tokens=None,
+        )
+
+    event_names = [name for name, _ in events]
+    assert event_names.index("enter_draft_context") < event_names.index(
+        "on_update_kv_lens")
+    assert event_names.index("on_update_kv_lens") < event_names.index(
+        "run_draft_forward")
+    assert attn_metadata.kv_cache_manager is target_manager
+    assert attn_metadata.block_table is target_block_table
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:

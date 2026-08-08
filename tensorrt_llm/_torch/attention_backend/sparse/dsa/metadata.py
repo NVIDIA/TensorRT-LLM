@@ -574,8 +574,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # the draft-replay context swaps these in by rebinding, so CUDA graph
         # capture bakes distinct addresses for the target and draft segments
         # and both sides can be refreshed eagerly outside the graph.
-        if self.draft_kv_cache_manager is not None and hasattr(
-            self.draft_kv_cache_manager, "index_head_dim"
+        if self.draft_kv_cache_manager is not None and all(
+            hasattr(self.draft_kv_cache_manager, attr)
+            for attr in (
+                "index_head_dim",
+                "get_pool_block_indices",
+                "indexer_k_cache_page_scale",
+            )
         ):
             self.draft_indexer_k_cache_block_offsets = self.get_empty(
                 self.cuda_graph_buffers,
@@ -637,6 +642,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        if self.draft_kv_cache_manager is not None and all(
+            hasattr(self.draft_kv_cache_manager, attr)
+            for attr in (
+                "index_head_dim",
+                "get_pool_block_indices",
+                "indexer_k_cache_page_scale",
+            )
+        ):
+            self.draft_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                [
+                    self.max_num_sequences,
+                    self.draft_kv_cache_manager.max_blocks_per_seq,
+                ],
+                cache_name="draft_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         self.scheduler_metadata_buffer = self.get_empty(
             self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
@@ -787,6 +810,29 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        if self.draft_kv_cache_manager is not None and all(
+            hasattr(self.draft_kv_cache_manager, attr)
+            for attr in (
+                "index_head_dim",
+                "get_pool_block_indices",
+                "indexer_k_cache_page_scale",
+            )
+        ):
+            self.draft_block_table_expanded = self.get_empty(
+                self.cuda_graph_buffers,
+                [
+                    self.max_num_sequences * (1 + self.max_draft_tokens),
+                    self.draft_kv_cache_manager.max_blocks_per_seq,
+                ],
+                cache_name="draft_block_table_expanded",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.host_draft_block_table_expanded = torch.zeros_like(
+                self.draft_block_table_expanded,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
         self.scheduler_metadata_buffer_expanded = self.get_empty(
             self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
@@ -1005,24 +1051,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_lens_expanded_host[:num_tokens], non_blocking=True
             )
 
-            # Expand indexer_k_cache_block_offsets (only generation)
-            # host_indexer_k_cache_block_offsets already contains INDEX_KEY
-            # page indices from prepare_for_indexer_k_cache().
-            if self.kv_cache_manager is not None and self.num_generations > 0:
-                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
-                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                    self.num_contexts : self.num_seqs, :max_len
-                ]
-                expanded_blocks = gen_block_tensor.repeat_interleave(
-                    1 + self.max_draft_tokens, dim=0
-                )
-                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                    expanded_blocks, non_blocking=True
-                )
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens], non_blocking=True
-                )
-                self.block_table_expanded.clamp_(min=0)
+            self._refresh_expanded_block_table(1 + self.max_draft_tokens)
 
         self.expand_for_dsl = (
             use_dsl and self.kv_cache_manager is not None and self.max_draft_tokens >= 1
@@ -1048,21 +1077,36 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_lens_expanded_cuda[:num_tokens].copy_(
                     self.kv_lens_expanded_host[:num_tokens], non_blocking=True
                 )
-                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
-                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                    self.num_contexts : self.num_seqs, :max_len
-                ]
-                expanded_blocks = gen_block_tensor.repeat_interleave(expand_factor, dim=0)
-                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                    expanded_blocks, non_blocking=True
-                )
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens], non_blocking=True
-                )
-                self.block_table_expanded.clamp_(min=0)
+                self._refresh_expanded_block_table(expand_factor)
         else:
             self.dsl_expand_factor = 1
             self.dsl_atom = 1 + self.max_draft_tokens
+
+    def _refresh_expanded_block_table(self, repeat_factor: Optional[int] = None):
+        """Refresh the active cache's expanded INDEX_KEY page table."""
+        if self.kv_cache_manager is None or self.num_generations == 0:
+            return
+        if repeat_factor is None:
+            if self.use_expanded_buffers_for_mtp:
+                repeat_factor = 1 + self.max_draft_tokens
+            elif self.expand_for_dsl and self.dsl_expand_factor > 1:
+                repeat_factor = self.dsl_expand_factor
+            else:
+                return
+
+        num_tokens = self.num_generations * repeat_factor
+        max_len = self.host_indexer_k_cache_block_offsets.shape[1]
+        gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+            self.num_contexts : self.num_seqs, :max_len
+        ]
+        expanded_blocks = gen_block_tensor.repeat_interleave(repeat_factor, dim=0)
+        self.host_block_table_expanded[:num_tokens, :max_len].copy_(
+            expanded_blocks, non_blocking=True
+        )
+        self.block_table_expanded[:num_tokens].copy_(
+            self.host_block_table_expanded[:num_tokens], non_blocking=True
+        )
+        self.block_table_expanded.clamp_(min=0)
 
     def prepare_for_indexer_k_cache(self):
         if self.kv_cache_manager is None:
