@@ -44,9 +44,8 @@ def _mentions_nvfp4_flag(node: ast.AST) -> bool:
     return False
 
 
-def _collect_nvfp4_aliases(node: ast.AST, aliases: set[str]) -> None:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-        return
+def _nvfp4_aliases_assigned_by_statement(node: ast.AST) -> set[str]:
+    aliases: set[str] = set()
     if isinstance(node, ast.Assign) and _mentions_nvfp4_flag(node.value):
         for target in node.targets:
             if isinstance(target, ast.Name):
@@ -55,16 +54,54 @@ def _collect_nvfp4_aliases(node: ast.AST, aliases: set[str]) -> None:
         target = node.target
         if isinstance(target, ast.Name):
             aliases.add(target.id)
-
-    for child in ast.iter_child_nodes(node):
-        _collect_nvfp4_aliases(child, aliases)
-
-
-def _forward_mlp_nvfp4_aliases(function_node: ast.FunctionDef) -> set[str]:
-    aliases: set[str] = set()
-    for stmt in function_node.body:
-        _collect_nvfp4_aliases(stmt, aliases)
     return aliases
+
+
+def _is_pre_mlp_nvfp4_branch(node: ast.If, aliases: set[str]) -> bool:
+    test_uses_nvfp4 = _mentions_nvfp4_flag(node.test) or (
+        isinstance(node.test, ast.Name) and node.test.id in aliases)
+    if not test_uses_nvfp4:
+        return False
+    if not _contains_attribute(node, "self.mlp.gate_up_proj.input_scale"):
+        return False
+    if not _contains_attribute(node, "AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4"):
+        return False
+    return any(
+        _contains_attribute(false_branch_node, "AllReduceFusionOp.RESIDUAL_RMS_NORM")
+        for false_branch_node in node.orelse)
+
+
+def _scan_statement_list_for_nvfp4_branch(statements: list[ast.stmt], aliases: set[str]) -> ast.If | None:
+    visible_aliases = set(aliases)
+    for stmt in statements:
+        if isinstance(stmt, ast.If):
+            if _is_pre_mlp_nvfp4_branch(stmt, visible_aliases):
+                return stmt
+            for branch in (stmt.body, stmt.orelse):
+                branch_match = _scan_statement_list_for_nvfp4_branch(branch, visible_aliases)
+                if branch_match is not None:
+                    return branch_match
+        elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+            branch_match = _scan_statement_list_for_nvfp4_branch(stmt.body, visible_aliases)
+            if branch_match is not None:
+                return branch_match
+            if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                branch_match = _scan_statement_list_for_nvfp4_branch(stmt.orelse, visible_aliases)
+                if branch_match is not None:
+                    return branch_match
+        elif isinstance(stmt, ast.Try):
+            for branch in (stmt.body, stmt.orelse, stmt.finalbody, *(handler.body for handler in stmt.handlers)):
+                branch_match = _scan_statement_list_for_nvfp4_branch(branch, visible_aliases)
+                if branch_match is not None:
+                    return branch_match
+        elif isinstance(stmt, ast.Match):
+            for case in stmt.cases:
+                branch_match = _scan_statement_list_for_nvfp4_branch(case.body, visible_aliases)
+                if branch_match is not None:
+                    return branch_match
+
+        visible_aliases.update(_nvfp4_aliases_assigned_by_statement(stmt))
+    return None
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -80,22 +117,11 @@ def _forward_mlp_has_nvfp4_branch(model_file: str, repo_root: Path) -> ast.If:
 
     for node in ast.walk(module):
         if isinstance(node, ast.FunctionDef) and node.name == "forward_mlp":
-            aliases = _forward_mlp_nvfp4_aliases(node)
-            for child in ast.walk(node):
-                if not isinstance(child, ast.If):
-                    continue
-                if not (_mentions_nvfp4_flag(child.test) or (
-                    isinstance(child.test, ast.Name) and child.test.id in aliases)):
-                    continue
-                if not _contains_attribute(child, "self.mlp.gate_up_proj.input_scale"):
-                    continue
-                if not _contains_attribute(child, "AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4"):
-                    continue
-                if not any(_contains_attribute(false_branch_node, "AllReduceFusionOp.RESIDUAL_RMS_NORM")
-                           for false_branch_node in child.orelse):
-                    continue
-                return child
+            nvfp4_branch = _scan_statement_list_for_nvfp4_branch(node.body, set())
+            if nvfp4_branch is not None:
+                return nvfp4_branch
     raise AssertionError(f"{model_file} does not guard PRE_MLP NVFP4 fusion")
+
 
 
 @pytest.mark.parametrize(
@@ -167,3 +193,68 @@ def test_forward_mlp_has_nvfp4_branch_supports_alias_and_getattr(tmp_path) -> No
     assert any(
         _contains_attribute(false_branch_node, "AllReduceFusionOp.RESIDUAL_RMS_NORM")
         for false_branch_node in nvfp4_branch.orelse)
+
+
+def _write_model_fixture(repo_root: Path, model_name: str, forward_mlp_body: str) -> None:
+    model_dir = repo_root / "tensorrt_llm" / "_torch" / "models"
+    model_dir.mkdir(parents=True)
+    (model_dir / model_name).write_text(
+        "class Dummy:\n" + textwrap.indent(textwrap.dedent(forward_mlp_body), "    ")
+    )
+
+
+def test_forward_mlp_alias_must_be_defined_before_candidate_branch(tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    _write_model_fixture(
+        repo_root,
+        "modeling_alias_use_before_assignment.py",
+        '''
+        def forward_mlp(self):
+            if use_nvfp4:
+                self.allreduce(
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        scale=self.mlp.gate_up_proj.input_scale,
+                    ),
+                )
+            else:
+                self.allreduce(
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    ),
+                )
+            use_nvfp4 = self.mlp.gate_up_proj.has_nvfp4
+        ''',
+    )
+
+    with pytest.raises(AssertionError, match="does not guard PRE_MLP NVFP4 fusion"):
+        _forward_mlp_has_nvfp4_branch("modeling_alias_use_before_assignment.py", repo_root)
+
+
+def test_forward_mlp_alias_must_not_leak_from_sibling_branch(tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    _write_model_fixture(
+        repo_root,
+        "modeling_alias_sibling_branch.py",
+        '''
+        def forward_mlp(self):
+            if self.fusion_config.PRE_MLP_FUSION:
+                use_nvfp4 = self.mlp.gate_up_proj.has_nvfp4
+            if use_nvfp4:
+                self.allreduce(
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        scale=self.mlp.gate_up_proj.input_scale,
+                    ),
+                )
+            else:
+                self.allreduce(
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    ),
+                )
+        ''',
+    )
+
+    with pytest.raises(AssertionError, match="does not guard PRE_MLP NVFP4 fusion"):
+        _forward_mlp_has_nvfp4_branch("modeling_alias_sibling_branch.py", repo_root)
