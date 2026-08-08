@@ -318,6 +318,7 @@ class GvrTopKKernel:
         p4_exact_tail: Optional[bool] = None,
         p4_tail_fast: Optional[bool] = None,  # [p4tt]
         p4_tail_v3: Optional[bool] = None,
+        p4_no_fine: Optional[bool] = None,
         p1r_rescue: bool = True,
         num_bins: Optional[int] = None,
         p4_warp_redundant: bool = True,
@@ -789,6 +790,22 @@ class GvrTopKKernel:
                 use_ext_counts or use_ext_cand or ext_rungs or self_scan or enable_block_skip
             )
         self.p4_tail_v3 = bool(p4_tail_v3)
+        # p4_no_fine: drop the 256-bin fine level from phase 4 outright and
+        # let the tail repair rank the whole straddling COARSE bin instead.
+        # Phase 4's cost is a chain of sequential stages, not work: its total
+        # barely moves when the candidate count triples, so the only way to
+        # cut it is to remove a stage. The coarse bin holds 11 candidates at
+        # the median and 49 at the max over 520 captured steps - inside the
+        # tail's pair buffer - and the tail now ranks with the whole block,
+        # so it absorbs the class cheaply. A class past the buffer falls into
+        # the tail's radix, which handles any size. Gated to the same
+        # configuration as that small-class route; the stock kernel keeps the
+        # fine level so its codegen is untouched.
+        if p4_no_fine is None:
+            p4_no_fine = bool(
+                self.p4_exact_tail and self.p4_tail_fast and self.p4_tail_v3
+            ) and not (self.p4_fine_rangetest or self.p4_scat_rangetest)
+        self.p4_no_fine = bool(p4_no_fine)
         # p1r_rescue: rebuild the refine bracket from the row when the
         # seed bracket is degenerate. ON by default - upstream's identity
         # shortcut is wrong on real data (every request's first decode
@@ -3934,6 +3951,18 @@ class GvrTopKKernel:
                 # bin b* value range under the inv1 binning: [f_lo, f_lo + 1/inv1)
                 f_lo = bmin_r + cutlass.Float32(b_star) / inv1
                 finv = (cutlass.Float32(fbins - 1) + cutlass.Float32(0.99)) * inv1
+                if cutlass.const_expr(self.p4_no_fine):
+                    # Sub-binning collapsed: finv 0 sends every member of the
+                    # straddling coarse bin to sub-bin 0 == sb*, so the
+                    # scatter parks the whole coarse class and the tail ranks
+                    # it. The re-zero, the build and the search below are not
+                    # traced at all - this is a compile-time removal, not a
+                    # runtime branch, because a runtime branch still costs the
+                    # stage (measured: 0.64us for a fine window whose work was
+                    # gated off).
+                    finv = cutlass.Float32(0.0)
+                    sb_star = cutlass.Int32(0)
+                    rank_above_fine = rank_above
                 # bin b* spans [f_lo, f_hi); the clamped ends fold
                 # out-of-range values into bin 0 and bin kBins-1, so those
                 # two drop the matching side. Only the range-test arms read
@@ -3942,61 +3971,62 @@ class GvrTopKKernel:
                     f_hi = f_lo + cutlass.Float32(1.0) / inv1
                     lo_edge = b_star == cutlass.Int32(0)
                     hi_edge = b_star == cutlass.Int32(kBins - 1)
-                # re-zero (only fbins slots) + build fine sub-hist of bin-b* cands
-                iz = tidx
-                while iz < cutlass.Int32(fbins):
-                    smem_hist[iz] = cutlass.Int32(0)
-                    iz = iz + cutlass.Int32(num_threads)
-                cute.arch.barrier()
-                if cutlass.const_expr(self.p4_fine_rangetest):
-                    # A candidate belongs to bin b* exactly when its value
-                    # lies in [f_lo, f_hi), so the filter is two compares -
-                    # the bin recompute (subtract + multiply + two clamps)
-                    # per candidate is redundant work. The clamped ends of
-                    # the binning fold out-of-range values INTO bin 0 and
-                    # bin kBins-1, so those two bins drop the matching side
-                    # of the range test to stay bit-identical.
-                    ifb = tidx
-                    while ifb < cand_count:
-                        vf = smem_keys[ifb]
-                        inb = vf >= f_lo and vf < f_hi
-                        if lo_edge:
-                            inb = vf < f_hi
-                        if hi_edge:
-                            inb = vf >= f_lo
-                        if inb:
-                            sb = cutlass.Int32((vf - f_lo) * finv)
-                            if sb < cutlass.Int32(0):
-                                sb = cutlass.Int32(0)
-                            if sb > cutlass.Int32(fbins - 1):
-                                sb = cutlass.Int32(fbins - 1)
-                            atomicAdd(smem_hist.iterator + sb, cutlass.Int32(1))
-                        ifb = ifb + cutlass.Int32(num_threads)
-                else:
-                    ifb = tidx
-                    while ifb < cand_count:
-                        vfo = smem_keys[ifb]
-                        cbo = cutlass.Int32((vfo - bmin_r) * inv1)
-                        if cbo < cutlass.Int32(0):
-                            cbo = cutlass.Int32(0)
-                        if cbo > cutlass.Int32(kBins - 1):
-                            cbo = cutlass.Int32(kBins - 1)
-                        if cbo == b_star:
-                            sbo = cutlass.Int32((vfo - f_lo) * finv)
-                            if sbo < cutlass.Int32(0):
-                                sbo = cutlass.Int32(0)
-                            if sbo > cutlass.Int32(fbins - 1):
-                                sbo = cutlass.Int32(fbins - 1)
-                            atomicAdd(smem_hist.iterator + sbo, cutlass.Int32(1))
-                        ifb = ifb + cutlass.Int32(num_threads)
-                cute.arch.barrier()
-                # fine sub-bin search, resolved lane-parallel on every
-                # warp (see _p4_fine_rw): the two publish barriers and the
-                # fbins/num_warps-deep single-lane walk that used to sit
-                # here are gone, and the answer comes back in registers.
-                sb_star, rank_above_fine = self._p4_fine_rw(
-                    smem_hist, smem_wcnt, fbins, rank_above, warp_id, lane
-                )
+                if cutlass.const_expr(not self.p4_no_fine):
+                    # re-zero (only fbins slots) + build fine sub-hist of bin-b* cands
+                    iz = tidx
+                    while iz < cutlass.Int32(fbins):
+                        smem_hist[iz] = cutlass.Int32(0)
+                        iz = iz + cutlass.Int32(num_threads)
+                    cute.arch.barrier()
+                    if cutlass.const_expr(self.p4_fine_rangetest):
+                        # A candidate belongs to bin b* exactly when its value
+                        # lies in [f_lo, f_hi), so the filter is two compares -
+                        # the bin recompute (subtract + multiply + two clamps)
+                        # per candidate is redundant work. The clamped ends of
+                        # the binning fold out-of-range values INTO bin 0 and
+                        # bin kBins-1, so those two bins drop the matching side
+                        # of the range test to stay bit-identical.
+                        ifb = tidx
+                        while ifb < cand_count:
+                            vf = smem_keys[ifb]
+                            inb = vf >= f_lo and vf < f_hi
+                            if lo_edge:
+                                inb = vf < f_hi
+                            if hi_edge:
+                                inb = vf >= f_lo
+                            if inb:
+                                sb = cutlass.Int32((vf - f_lo) * finv)
+                                if sb < cutlass.Int32(0):
+                                    sb = cutlass.Int32(0)
+                                if sb > cutlass.Int32(fbins - 1):
+                                    sb = cutlass.Int32(fbins - 1)
+                                atomicAdd(smem_hist.iterator + sb, cutlass.Int32(1))
+                            ifb = ifb + cutlass.Int32(num_threads)
+                    else:
+                        ifb = tidx
+                        while ifb < cand_count:
+                            vfo = smem_keys[ifb]
+                            cbo = cutlass.Int32((vfo - bmin_r) * inv1)
+                            if cbo < cutlass.Int32(0):
+                                cbo = cutlass.Int32(0)
+                            if cbo > cutlass.Int32(kBins - 1):
+                                cbo = cutlass.Int32(kBins - 1)
+                            if cbo == b_star:
+                                sbo = cutlass.Int32((vfo - f_lo) * finv)
+                                if sbo < cutlass.Int32(0):
+                                    sbo = cutlass.Int32(0)
+                                if sbo > cutlass.Int32(fbins - 1):
+                                    sbo = cutlass.Int32(fbins - 1)
+                                atomicAdd(smem_hist.iterator + sbo, cutlass.Int32(1))
+                            ifb = ifb + cutlass.Int32(num_threads)
+                    cute.arch.barrier()
+                    # fine sub-bin search, resolved lane-parallel on every
+                    # warp (see _p4_fine_rw): the two publish barriers and the
+                    # fbins/num_warps-deep single-lane walk that used to sit
+                    # here are gone, and the answer comes back in registers.
+                    sb_star, rank_above_fine = self._p4_fine_rw(
+                        smem_hist, smem_wcnt, fbins, rank_above, warp_id, lane
+                    )
                 if tidx == cutlass.Int32(0):
                     s_iscalars[4] = cutlass.Int32(0)  # cnt_above
                     s_iscalars[0] = cutlass.Int32(0)  # cnt_mid (b*, sub>sb*)
