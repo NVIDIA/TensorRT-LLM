@@ -344,9 +344,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             cache_name="gen_new_tokens_per_seq_cuda",
             capture_graph=capture_graph,
         )
-        self.gen_new_tokens_per_seq_host = torch.empty_like(
-            self.gen_new_tokens_per_seq_cuda, device="cpu", pin_memory=prefer_pinned()
-        )
         # Set per step by prepare(); None means "uniform, use next_n".
         self.gen_new_tokens_per_seq: Optional[torch.Tensor] = None
 
@@ -693,7 +690,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Overrides DSAtrtllmAttentionMetadata._prepare_impl, NOT prepare():
         # the base prepare() wraps this whole body in the write-after-read
         # guard for the pinned staging rewritten below (cached_token_lens_cpu,
-        # cu_seq_lens, gen_new_tokens_per_seq_host, and everything the called
+        # cu_seq_lens, and everything the called
         # helpers stage). Overriding prepare() directly would silently opt this
         # class out of that guard.
         assert self.kv_cache_manager is not None
@@ -754,8 +751,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Under ragged verification requests append different numbers of tokens,
         # so the integer division below is meaningless. The compressor kernel
         # still needs a compile-time loop bound, and its loops are already
-        # guarded, so the batch MAXIMUM is the correct scalar to hand it -- the
-        # exact per-request counts ride along in gen_new_tokens_per_seq.
+        # guarded, so the GLOBAL max window is the scalar to hand it (the
+        # device-window prologue may re-rank past this step's batch max) --
+        # the exact per-request counts ride along in gen_new_tokens_per_seq.
         num_gen_tokens_per_seq = self._sync_gen_tokens_per_seq(num_gen_tokens)
         num_contexts = self.num_contexts
         num_generations = self.num_generations
@@ -816,26 +814,33 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         Uniform batches divide the flat generation-token count by the request
         count. Ragged batches have no such quotient, so the scalar becomes the
-        batch *maximum* -- which is exactly what the compressor kernel wants,
-        since ``NEXT_N`` is a template loop bound whose iterations are already
-        guarded -- and the true per-request counts travel beside it on the
-        device.
+        GLOBAL max window -- ``NEXT_N`` is a template loop bound whose
+        iterations are already guarded, so any upper bound is correct, and it
+        must be the global one because the device-window prologue may re-rank
+        rows up to the config max AFTER this staging runs (this step's batch
+        max would truncate Phase 1/3 for such rows). The true per-request
+        counts travel beside it on the device.
+
+        The vector is a D2D copy from the seq-lens staging, NOT an H2D from a
+        pinned host list: this helper is captured inside ``on_update_kv_lens``,
+        and a captured H2D node would re-load the host's shape split S from
+        the pinned buffer on every replay -- silently clobbering the device
+        windows w and making the compressor place its persistent paged
+        KV/score state at positions shifted by (w - S). ``_seq_lens_cuda``
+        holds the same S at staging time and is rewritten to w by
+        ``apply_device_ragged_layout`` before replay, so sourcing from it is
+        exact for both host and device windows.
 
         Single writer on purpose: the scalar and the vector describe the same
         thing, and every place that recomputed one without the other was a way
         for them to disagree.
         """
         if self.is_ragged_verify and self.num_generations > 0:
-            gen_token_counts = self.gen_token_repeat_list()
-            self.num_gen_tokens_per_seq = max(gen_token_counts)
+            self.num_gen_tokens_per_seq = 1 + self.max_draft_tokens
             n = self.num_generations
-            self.gen_new_tokens_per_seq_host[:n].copy_(
-                torch.tensor(gen_token_counts, dtype=torch.int32)
-            )
+            nc = self.num_contexts
             gen_new_tokens = self.gen_new_tokens_per_seq_cuda[:n]
-            gen_new_tokens.copy_(
-                self.gen_new_tokens_per_seq_host[:n], non_blocking=True
-            )
+            gen_new_tokens.copy_(self._seq_lens_cuda[nc:nc + n])
             self.gen_new_tokens_per_seq = gen_new_tokens
         else:
             self.num_gen_tokens_per_seq = (
