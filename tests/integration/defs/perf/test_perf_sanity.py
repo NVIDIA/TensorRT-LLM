@@ -23,6 +23,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -1731,7 +1732,7 @@ class PerfSanityTestConfig:
     """Configuration for perf sanity tests."""
 
     def __init__(self, test_case_name: str, output_dir: str):
-        self._output_dir = output_dir
+        self._output_dir = output_dir or tempfile.mkdtemp(prefix="perf_sanity_")
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
 
         # Initialize server configs
