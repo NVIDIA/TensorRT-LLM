@@ -317,6 +317,36 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
         assert r is True
 
 
+def run_single_rank_reporting(
+    tensor_parallel_size,
+    single_rank_forward_func,
+    input,
+    residual,
+    weights,
+    hidden_size,
+    dtype,
+    fusion_op,
+):
+    """As run_single_rank, but guarantees the failure survives the trip back.
+
+    Several exception types cannot be pickled to the parent process, so
+    re-raising them turns a real failure into an unrelated pickling error from
+    the executor. AttributeError is the common one: since 3.11 it retains the
+    object it was raised on, and anything raised off torch.ops therefore drags
+    an unpicklable _Ops along with it. Send the formatted traceback instead.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(input, residual, hidden_size, dtype,
+                                 tensor_parallel_size, rank, weights, fusion_op)
+    except Exception:
+        traceback.print_exc()
+        raise AssertionError(f"rank {rank} failed:\n"
+                             f"{traceback.format_exc()}") from None
+    return True
+
+
 @torch.inference_mode()
 def run_nvfp4_linear_sf_op(
     x: torch.Tensor,
@@ -372,10 +402,22 @@ def run_nvfp4_linear_sf_op(
     lin_norm, lin_fp4, lin_sf, lin_res = fused(
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)
 
+    del swz_sf  # Swizzled scale factors are the thing that is meant to differ.
+
+    def assert_same_bytes(actual, expected, what):
+        # Byte-wise rather than torch.testing.assert_close: these are FP4 and
+        # FP8 scale-factor tensors, and the comparison wanted here is identity,
+        # not closeness.
+        a = actual.reshape(-1).view(torch.uint8)
+        b = expected.reshape(-1).view(torch.uint8)
+        assert a.shape == b.shape, f"{what}: {a.shape} vs {b.shape}"
+        assert torch.equal(a, b), (
+            f"{what}: {(a != b).sum().item()} of {a.numel()} bytes differ")
+
     # Only the scale factor layout changes, so everything else must be equal.
-    torch.testing.assert_close(lin_norm, swz_norm, atol=0, rtol=0)
-    torch.testing.assert_close(lin_res, swz_res, atol=0, rtol=0)
-    torch.testing.assert_close(lin_fp4, swz_fp4, atol=0, rtol=0)
+    assert_same_bytes(lin_norm, swz_norm, "norm_out vs swizzled")
+    assert_same_bytes(lin_res, swz_res, "residual_out vs swizzled")
+    assert_same_bytes(lin_fp4, swz_fp4, "quant_fp4 vs swizzled")
 
     # Linear layout is unpadded, unlike the swizzled layout's 128x4 blocks.
     assert lin_sf.numel() == x.shape[0] * (hidden_size // 16)
@@ -384,8 +426,8 @@ def run_nvfp4_linear_sf_op(
     # norm output must give back the epilogue's fp4 output and scale factors.
     ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(lin_norm, scale, 16, False,
                                                     False)
-    torch.testing.assert_close(lin_fp4, ref_fp4, atol=0, rtol=0)
-    torch.testing.assert_close(lin_sf, ref_sf.flatten(), atol=0, rtol=0)
+    assert_same_bytes(lin_fp4, ref_fp4, "quant_fp4 vs standalone quantize")
+    assert_same_bytes(lin_sf, ref_sf, "scale_out vs standalone quantize")
 
 
 @skip_pre_blackwell
@@ -403,7 +445,7 @@ def test_allreduce_fusion_nvfp4_linear_sf(seq_len, hidden_size,
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)
     results = mpi_pool_executor.map(
-        run_single_rank,
+        run_single_rank_reporting,
         *zip(*[(tensor_parallel_size, run_nvfp4_linear_sf_op, x, residual, [],
                 hidden_size, dtype, AllReduceFusionOp.
                 RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)] *
