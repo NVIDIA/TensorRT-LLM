@@ -23,8 +23,7 @@ from tensorrt_llm import logger
 
 _MIB = 1024 * 1024
 
-# Test/advanced override for the block-count gate below (users only tune the bounce size). Read on
-# the generation side, so set it there; unset uses the default.
+# Test override for the size gate (users only tune the bounce size). Read on the generation side.
 _MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"
 
 
@@ -107,7 +106,8 @@ def fit_within_free(
 class Config:
     sizing: Sizing = field(default_factory=FixedSizing)  # how much memory to reserve (pluggable)
     chunk_mb: int = 32  # physical chunk size; a large chunk keeps the write to a single descriptor
-    # skip bounce below this many blocks (roughly 12k tokens at 128 per block); heuristic, tunable
+    # Skip bounce below this many transfer fragments; a whole-slot copy makes one per block, so
+    # for those it is still a block count. Heuristic, tunable.
     min_blocks: int = 96
 
 
