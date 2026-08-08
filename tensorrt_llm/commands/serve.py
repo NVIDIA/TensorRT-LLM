@@ -990,8 +990,10 @@ def launch_visual_gen_server(
     "--backend",
     type=click.Choice(["pytorch", "_autodeploy"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.",
-    status="beta")
+    help="The backend to use to serve the model. Default is pytorch backend. "
+    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
+    "in a future release; please use the 'pytorch' backend instead.",
+    status="deprecated")
 @stability_option(
     "--generation-config",
     type=click.Choice(["auto", "trtllm"]),
@@ -1315,6 +1317,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if backend == "_autodeploy":
+        logger.warning(
+            "The '_autodeploy' backend is deprecated and will be discontinued in a "
+            "future release. No new features or models will be added. Please migrate "
+            "to the 'pytorch' backend. See "
+            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
