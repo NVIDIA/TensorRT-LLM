@@ -26,12 +26,55 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    WorkerCommIpcAddrs)
+                    WorkerCommIpcAddrs, worker_init_stall_warn_sec)
 from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
     "GenerationExecutorWorker",
 ]
+
+
+def _worker_init_stall_watchdog(init_done: threading.Event,
+                                period: float) -> None:
+    """Report where *this* rank is stuck while its initialization is pending.
+
+    Runs in a daemon thread in every rank.  During initialization the proxy
+    only has an IPC channel to the rank-0 leader, so a rank that is alive but
+    wedged -- typically inside a collective -- is invisible to it: the only
+    process that can say where rank N is stuck is rank N.  Dumping stacks is
+    read-only and never interferes with a slow-but-healthy startup, which is
+    why this is armed by default.
+
+    The dump relies on the wedged call having released the GIL (true for the
+    torch/NCCL collectives this targets).  A rank stuck while holding the GIL
+    cannot report, and simply stays silent.
+    """
+    rank = mpi_rank()
+    pid = os.getpid()
+    waited = 0.0
+    while not init_done.wait(period):
+        waited += period
+        # WARNING, not ERROR: a very large checkpoint loading from a cold mount
+        # is slow, not faulty, and this fires on that run too.
+        logger.warning(
+            f"Executor worker rank {rank} (pid {pid}) has not finished "
+            f"initialization after {waited:.0f}s; dumping the stacks of all "
+            f"threads on this rank.")
+        print_all_stacks(log=logger.warning)
+
+
+def _arm_worker_init_stall_watchdog(
+        init_done: threading.Event) -> Optional[threading.Thread]:
+    """Start the init stall watchdog unless it is disabled by configuration."""
+    period = worker_init_stall_warn_sec()
+    if period <= 0:
+        return None
+    watchdog = threading.Thread(target=_worker_init_stall_watchdog,
+                                args=(init_done, period),
+                                name="worker_init_stall_watchdog",
+                                daemon=True)
+    watchdog.start()
+    return watchdog
 
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
@@ -194,6 +237,11 @@ def worker_main(
                                                daemon=True)
         print_stacks_thread.start()
 
+    # Arm before the first collective: everything from here to the end of
+    # engine construction is init-phase work that can wedge a rank.
+    worker_init_done = threading.Event()
+    _arm_worker_init_stall_watchdog(worker_init_done)
+
     mpi_comm().barrier()
 
     if llm_args is not None and llm_args.env_overrides:
@@ -352,7 +400,17 @@ def worker_main(
             error_msg = (e, traceback.format_exc())
             if not worker_init_status_queue.notify_with_retry(error_msg):
                 logger.error("Failed to deliver error message to proxy")
+        worker_init_done.set()
         return
+
+    if not is_leader:
+        # A subordinate's startup ends with construction: it blocks in
+        # block_subordinates() below and has nothing further to report.  The
+        # leader stays armed until it has actually delivered the ready signal,
+        # because that -- not the end of construction -- is when the proxy's
+        # wait ends, and a leader wedged in between is exactly the case the
+        # proxy cannot see for itself.
+        worker_init_done.set()
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
@@ -372,10 +430,29 @@ def worker_main(
 
                 # Send ready signal with confirmation
                 ready_msg = (ready_signal, None, worker_process_identities)
-                if not worker_init_status_queue.notify_with_retry(ready_msg):
-                    logger.warning(
-                        "Failed to deliver ready signal to proxy, continuing anyway"
-                    )
+                ready_delivered = worker_init_status_queue.notify_with_retry(
+                    ready_msg)
+                if ready_delivered:
+                    # The proxy's startup wait has ended, so this rank has
+                    # nothing more to contribute to it.
+                    worker_init_done.set()
+                else:
+                    # Do NOT disarm here. Delivery failing is the one case
+                    # where the proxy is still blocked in its startup wait
+                    # with no idea why -- it is looking for a ready signal
+                    # that will never arrive. Disarming would remove the last
+                    # remaining source of information about that, leaving a
+                    # silent hang: this rank healthy and serving, the proxy
+                    # waiting forever, and nothing reporting either fact.
+                    # Leaving the watchdog armed keeps the per-rank stall
+                    # reports coming, which is exactly the diagnostic this PR
+                    # exists to provide.
+                    logger.error(
+                        "Failed to deliver the ready signal to the proxy. This "
+                        "rank is initialized and will continue serving, but the "
+                        "proxy may still be waiting for a signal it will never "
+                        "receive; leaving the init stall watchdog armed so the "
+                        "condition keeps being reported.")
                 if resource_governor_queue is not None:
                     # Swap rank 0 to the proxy IPC queue after construction.
                     # The resource-governor flag is already enabled on all

@@ -700,11 +700,19 @@ def is_flashinfer_gdn_supported_arch(sm_version=None):
     return sm_version in (90, 100, 103)
 
 
-def print_all_stacks():
-    """Print stack traces for all threads"""
+def print_all_stacks(log: Optional[Callable[[str], None]] = None) -> None:
+    """Print stack traces for all threads
+
+    Args:
+        log: logging callable used to emit the traces; defaults to
+            ``logger.error``.  Callers dumping stacks for a condition that is
+            not (yet) a fault -- e.g. a slow but healthy startup -- should pass
+            ``logger.warning`` instead.
+    """
+    log = logger.error if log is None else log
     for thread_id, frame in sys._current_frames().items():
-        logger.error(f"Thread {thread_id} stack trace:\n" +
-                     "".join(traceback.format_stack(frame)))
+        log(f"Thread {thread_id} stack trace:\n" +
+            "".join(traceback.format_stack(frame)))
 
 
 def is_trace_enabled(env_var: str):
