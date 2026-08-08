@@ -733,7 +733,7 @@ class MiniMaxM3MoE(nn.Module):
 
     def _resolve_routed_expert_input_scale(self) -> Optional[torch.Tensor]:
         experts = self.experts
-        if not getattr(experts, "has_nvfp4", False):
+        if not experts.has_nvfp4:
             return None
         if getattr(experts, "fc31_act_scale", None) is not None:
             # NVFP4_AWQ folds a per-channel pre-quant scale into the activation
