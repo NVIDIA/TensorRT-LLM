@@ -751,31 +751,6 @@ class TestImageEdit:
         if expected_status == 501:
             assert gen.last_params is None
 
-    def test_image_edit_returns_not_implemented(self, image_client):
-        """Valid request body short-circuits to 501 NotImplemented."""
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Make it blue",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
-        assert "not supported" in body.get("message", "").lower()
-
-    def test_image_edit_no_body_returns_not_implemented(self, image_client):
-        """The route doesn't parse a typed body; any incoming request still
-        gets 501, including ones that would have failed schema validation
-        before. Restore typed-body coverage when an edit pipeline lands."""
-        resp = image_client.post("/v1/images/edits", json={"prompt": "Edit without image"})
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
-
     def test_image_edit_accepts_json_base64_image(self, tmp_path, monkeypatch):
         """JSON edit requests materialize inputs and map OpenAI-shaped fields."""
         client, gen = self._client(
