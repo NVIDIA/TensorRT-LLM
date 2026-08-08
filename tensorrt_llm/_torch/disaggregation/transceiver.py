@@ -89,6 +89,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
+        transfer_timeout_s = (
+            self.kv_transfer_timeout_ms / 1000.0
+            if self.kv_transfer_timeout_ms is not None
+            else None
+        )
+        sender_wait_slice_s = (
+            self._sender_future_timeout_ms / 1000.0
+            if self._sender_future_timeout_ms is not None
+            else None
+        )
         self._check_compatible()
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
@@ -104,8 +114,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
                 # large multiplier is cheap.
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
-                tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
-                rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+                tx_timeout_s=sender_wait_slice_s,
+                tx_overall_timeout_s=transfer_timeout_s,
+                rx_timeout_s=transfer_timeout_s,
                 # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
             )
@@ -460,8 +471,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
         )
 
-    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, timed_out):
-        # TP first, then PP.  timed_out is local-only (back-off signal).
+    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed):
+        # TP first, then PP. A local timeout remains nonterminal, so it is
+        # represented by the absence of that request from completed.
         c, f, d = self._consensus_outcome(
             to_process,
             cancelled,
@@ -473,7 +485,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
             c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
-        return c, f, d, timed_out
+        return c, f, d
 
     def _sync_transfer_timing(self, reqs: list):
         """Allgather timing for a batch of completed requests in one collective.
@@ -692,7 +704,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_all,
         )
 
-        completed, timed_out, failed, cancelled = [], [], [], []
+        completed, failed, cancelled = [], [], []
         for rid in to_process:
             session = self._send_sessions[rid]
             result = session.wait_complete(blocking=block_all)
@@ -703,17 +715,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif result is None:
                 continue
             elif result == WaitResult.TIMEOUT:
-                logger.warning(
-                    f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
+                logger.debug(
+                    f"TxSession rid={session.disagg_request_id} exceeded the "
+                    f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms deadline; "
+                    "keeping it in progress"
                 )
-                timed_out.append(rid)
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
                 failed.append(rid)
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
-        cancelled, failed, completed, timed_out = self._ctx_consensus_outcome(
-            to_process, cancelled, failed, completed, timed_out
+        cancelled, failed, completed = self._ctx_consensus_outcome(
+            to_process, cancelled, failed, completed
         )
 
         for rid in cancelled:
