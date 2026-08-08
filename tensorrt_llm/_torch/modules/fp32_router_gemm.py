@@ -31,16 +31,17 @@ import triton
 import triton.language as tl
 
 # Measured on B200 at 128 experts / 6144 hidden, against the cuBLAS sequence:
-# 2.8x at 1 token, 2.0x at 4, 1.2x at 8, and a loss by 16. One CTA per expert
+# 3.4x at 1 token, 2.7x at 4, 1.8x at 8, and a loss by 16. One CTA per expert
 # stops paying once the batch is wide enough for cuBLAS to tile it.
 MAX_GEMV_TOKENS = 8
 
 # Elements of the activation tile held in registers per CTA, which sets the K
-# block. Larger is monotonically better in the tuning sweep -- at one CTA per
-# expert the kernel is latency-bound, so what helps is loads in flight per
-# thread -- until the tile stops fitting. This puts a 4-token batch at
-# BLOCK_K=2048, which also divides 6144 exactly.
-_TILE_ELEMS = 8192
+# block. Larger was monotonically better across the whole tuning sweep, all the
+# way to covering the hidden dimension in a single pass: at one CTA per expert
+# the kernel is latency-bound, occupancy is already capped by having fewer CTAs
+# than SMs, so the only lever is loads in flight per thread. This lets a 4-token
+# batch take the whole 6144 in one iteration, worth 4.26 -> 2.53 us.
+_TILE_ELEMS = 32768
 
 
 @triton.jit
@@ -110,7 +111,11 @@ def fp32_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch
     out = torch.empty((num_tokens, num_experts), dtype=torch.float32, device=hidden_states.device)
 
     block_m = triton.next_power_of_2(num_tokens)
-    block_k = max(128, triton.next_power_of_2(_TILE_ELEMS // block_m))
+    # No point blocking past the hidden dimension; the tail just masks off.
+    block_k = min(
+        triton.next_power_of_2(hidden_size),
+        max(128, triton.next_power_of_2(_TILE_ELEMS // block_m)),
+    )
 
     _fp32_router_gemm_kernel[(num_experts,)](
         hidden_states,
