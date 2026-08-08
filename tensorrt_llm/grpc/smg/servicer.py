@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""gRPC Servicer for TensorRT-LLM.
+"""SMG servicer for TensorRT-LLM.
 
 Implements the TrtllmService gRPC service for high-performance communication
 with external routers (e.g., sgl-router) using pre-tokenized input.
@@ -32,7 +32,7 @@ from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
-from .grpc_request_manager import (
+from .request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,

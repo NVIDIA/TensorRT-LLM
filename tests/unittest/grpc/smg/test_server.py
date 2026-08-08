@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for gRPC server components."""
+"""Unit tests for SMG gRPC server components."""
 
 import asyncio
 import io
@@ -25,18 +25,18 @@ import torch
 from PIL import Image
 
 from tensorrt_llm import LLM
-from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
-from tensorrt_llm.grpc.grpc_request_manager import (
+from tensorrt_llm.grpc.smg import trtllm_service_pb2 as pb2
+from tensorrt_llm.grpc.smg.request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,
     create_sampling_params_from_proto,
 )
-from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
+from tensorrt_llm.grpc.smg.servicer import TrtllmServiceServicer
 from tensorrt_llm.llmapi import KvCacheConfig
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../..")
 from utils.llm_data import llm_models_root
 
 # isort: on
