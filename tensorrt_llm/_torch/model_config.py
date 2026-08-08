@@ -422,12 +422,19 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
-        quant_config.kv_cache_quant_algo = (
-            QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
-            json_quant_configs.get('kv_cache_quant_algo') is not None else None)
+        def _algo_or_none(value):
+            # modelopt hf_quant_config.json may spell "no quantization" as JSON
+            # null or as the string "none"/"null"; both must map to None rather
+            # than QuantAlgo("none"), which is not a member.
+            if value is None or (isinstance(value, str) and
+                                 value.strip().lower() in ("none", "null", "")):
+                return None
+            return QuantAlgo(value)
+
+        quant_config.quant_algo = _algo_or_none(
+            json_quant_configs.get('quant_algo'))
+        quant_config.kv_cache_quant_algo = _algo_or_none(
+            json_quant_configs.get('kv_cache_quant_algo'))
         quant_config.group_size = json_quant_configs.get('group_size', None)
         quant_config.exclude_modules = json_quant_configs.get(
             'exclude_modules', None)
@@ -451,10 +458,8 @@ class ModelConfig(Generic[TConfig]):
                 )
             json_quant_configs.update(json_extended_quant_configs)
             # kv_cache_quant_algo is global regardless of MIXED_PRECISION
-            kv_cache_quant_algo = (QuantAlgo(
-                json_quant_configs['kv_cache_quant_algo']) if
-                                   json_quant_configs.get('kv_cache_quant_algo')
-                                   is not None else None)
+            kv_cache_quant_algo = _algo_or_none(
+                json_quant_configs.get('kv_cache_quant_algo'))
             mixed_quant_configs = json_quant_configs.get(
                 'quantized_layers', None)
             if (kv_quant_lhs := json_extended_quant_configs.get(

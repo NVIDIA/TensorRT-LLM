@@ -28,6 +28,12 @@ def get_attention_backend(
         if sparse_params is not None:
             return get_trtllm_sparse_attn_attention_backend(sparse_params)
         return TrtllmAttention
+    elif backend_name == "INKLING":
+        # Intentionally not added to the attn_backend telemetry categorical list
+        # in llm_args.py: "INKLING" is never user-supplied -- get_model_defaults
+        # selects it and an explicit override is rejected at load.
+        from .inkling import InklingTritonAttention
+        return InklingTritonAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_params is not None:

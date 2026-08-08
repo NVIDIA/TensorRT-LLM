@@ -48,6 +48,7 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -1484,6 +1485,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
+            # Reasoning parsers that key on special-token delimiters (e.g.
+            # Inkling's typed content blocks) need the raw special tokens
+            # preserved in the decoded text, like the tool-parser path below;
+            # otherwise the delimiters are stripped before the parser runs.
+            if self.generator.args.reasoning_parser:
+                reasoning_entry = ReasoningParserFactory._parsers.get(
+                    self.generator.args.reasoning_parser.lower())
+                if reasoning_entry and getattr(
+                        reasoning_entry[0], 'needs_raw_special_tokens', False):
+                    sampling_params.skip_special_tokens = False
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
