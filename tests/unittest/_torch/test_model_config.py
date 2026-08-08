@@ -1,15 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import struct
 import types
 
 import pytest
 import torch
+import transformers
 
 from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    TorchLlmArgs,
+)
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -228,6 +238,117 @@ def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="compress_ratios"):
         ModelConfig.from_pretrained(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "user_index_topk,expected_index_topk",
+    [(None, 2048), (1024, 1024)],
+)
+def test_deepseek_v32_model_defaults_preserve_index_topk_override(
+    tmp_path, monkeypatch, user_index_topk, expected_index_topk
+):
+    """Applying unrelated model defaults must preserve nested user intent."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    pretrained_config = transformers.PretrainedConfig(
+        architectures=["DeepseekV32ForCausalLM"],
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=2048,
+        indexer_rope_interleave=False,
+        dtype="bfloat16",
+        intermediate_size=1024,
+    )
+    monkeypatch.setattr(
+        model_config_module,
+        "load_pretrained_config",
+        lambda *args, **kwargs: pretrained_config,
+    )
+
+    sparse_kwargs = {}
+    if user_index_topk is not None:
+        sparse_kwargs["index_topk"] = user_index_topk
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(**sparse_kwargs),
+    )
+    apply_model_defaults_to_llm_args(
+        llm_args, {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+    )
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path), sparse_attention_config=llm_args.sparse_attention_config
+    )
+    sparse_config = model_config.sparse_attention_config
+    assert sparse_config.index_topk == expected_index_topk
+    assert sparse_config.needs_separate_short_long_cuda_graphs()
+    assert sparse_config.seq_len_threshold == expected_index_topk
+
+
+def test_model_defaults_preserve_explicit_nested_none(tmp_path):
+    """An explicit None must remain distinct from an omitted nested field."""
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_topk=None),
+    )
+    assert "index_topk" in llm_args.sparse_attention_config.model_fields_set
+
+    apply_model_defaults_to_llm_args(
+        llm_args, {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+    )
+
+    assert llm_args.sparse_attention_config.index_topk is None
+    assert "index_topk" in llm_args.sparse_attention_config.model_fields_set
+
+
+@pytest.mark.parametrize(
+    "sparse_kwargs,expected_index_topk",
+    [
+        pytest.param({}, 1024, id="omitted"),
+        pytest.param({"index_topk": 512}, 512, id="explicit"),
+    ],
+)
+def test_deepseek_v4_model_defaults_preserve_index_topk_override(
+    tmp_path, monkeypatch, sparse_kwargs, expected_index_topk
+):
+    """V4's default top-k must not hide a checkpoint or explicit override."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    pretrained_config = transformers.PretrainedConfig(
+        architectures=["DeepseekV4ForCausalLM"],
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=1024,
+        indexer_rope_interleave=False,
+        compress_ratios=[1, 4, 128, 4],
+        window_size=128,
+        num_hidden_layers=4,
+        dtype="bfloat16",
+        intermediate_size=1024,
+    )
+    monkeypatch.setattr(
+        model_config_module,
+        "load_pretrained_config",
+        lambda *args, **kwargs: pretrained_config,
+    )
+
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        sparse_attention_config=DeepSeekV4SparseAttentionConfig(
+            index_head_dim=128, **sparse_kwargs
+        ),
+    )
+    apply_model_defaults_to_llm_args(
+        llm_args, {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+    )
+    assert ("index_topk" in llm_args.sparse_attention_config.model_fields_set) is bool(
+        sparse_kwargs
+    )
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path), sparse_attention_config=llm_args.sparse_attention_config
+    )
+    assert model_config.sparse_attention_config.index_topk == expected_index_topk
 
 
 def test_model_config_sets_is_encoder_decoder_from_pretrained_config():

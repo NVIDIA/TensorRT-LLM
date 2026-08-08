@@ -172,8 +172,14 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
 
     from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
                                                 Indexer)
+
+    # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
+    # different dual-pool layout. Only enter the DSA replay path when the
+    # manager exposes DSA's indexer-cache page-mapping contract.
     if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
+            and hasattr(draft_kv_cache_manager, 'index_head_dim')
+            and hasattr(draft_kv_cache_manager, 'get_pool_block_indices')
+            and hasattr(draft_kv_cache_manager, 'indexer_k_cache_page_scale')):
         m = attn_metadata
         saved['saved_dsa_state'] = {
             'host_indexer_k_cache_block_offsets':
@@ -183,6 +189,9 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
             'host_slot_mapping_scale': m.host_slot_mapping_scale,
             'slot_mapping_fp8': m.slot_mapping_fp8,
             'slot_mapping_scale': m.slot_mapping_scale,
+            'block_table': m.block_table,
+            'block_table_expanded': m.block_table_expanded,
+            'host_block_table_expanded': m.host_block_table_expanded,
         }
         # The cached-KV feature owns these references even when an optimized
         # path aliases them to slot_mapping_*. With the feature disabled, the
@@ -206,6 +215,10 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         m.slot_mapping_fp8 = m.draft_slot_mapping_fp8
         m.host_slot_mapping_scale = m.host_draft_slot_mapping_scale
         m.slot_mapping_scale = m.draft_slot_mapping_scale
+        m.block_table = m.draft_block_table
+        m.block_table_expanded = m.draft_block_table_expanded
+        m.host_block_table_expanded = m.host_draft_block_table_expanded
+        m._invalidate_pool_view_cache()
         # Recording a capture executes no kernels, so the draft mappings only
         # need refreshing when the transfers actually run: eager forwards
         # (warmup) and the pre-replay call from model_engine. The per-step
@@ -213,7 +226,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         # device from the rebound block-offset buffer.
         # kv_cache_manager was already swapped to the draft manager above.
         if not torch.cuda.is_current_stream_capturing():
-            m._update_indexer_k_cache_block_offsets()
+            m.prepare_for_indexer_k_cache()
+            m._refresh_expanded_block_table()
             Indexer.recompute_slot_mappings(m)
         Indexer.recompute_context_kv_gather_mappings(m)
     return saved
@@ -248,6 +262,10 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         m.host_slot_mapping_scale = saved_dsa['host_slot_mapping_scale']
         m.slot_mapping_fp8 = saved_dsa['slot_mapping_fp8']
         m.slot_mapping_scale = saved_dsa['slot_mapping_scale']
+        m.block_table = saved_dsa['block_table']
+        m.block_table_expanded = saved_dsa['block_table_expanded']
+        m.host_block_table_expanded = saved_dsa['host_block_table_expanded']
+        m._invalidate_pool_view_cache()
         if 'slot_mapping_fp8_fullkv' in saved_dsa:
             m.slot_mapping_fp8_fullkv = saved_dsa['slot_mapping_fp8_fullkv']
             m.slot_mapping_scale_fullkv = saved_dsa['slot_mapping_scale_fullkv']

@@ -451,7 +451,9 @@ def create_indexer(sparse_attn_config, layer_idx=0):
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
-    with patch("tensorrt_llm._torch.attention_backend.sparse.dsa.RotaryEmbedding") as mock_rope:
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.RotaryEmbedding"
+    ) as mock_rope:
         # Create a mock instance with a simple forward method
         mock_rope_instance = Mock()
         mock_rope_instance.forward = Mock(side_effect=lambda pos_ids, tensors: tensors)
@@ -3539,9 +3541,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
     @staticmethod
     def _make_mock_draft_manager():
         """Create a mock draft KV cache manager with host block offsets."""
-        mgr = Mock(name="draft_kv_cache_manager")
-        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
-        return mgr
+        return SimpleNamespace(host_kv_cache_block_offsets=torch.tensor([100, 200, 300]))
 
     def test_prepare_swaps_and_restore_recovers(self):
         """Test that prepare swaps KV manager and restore recovers original state."""
@@ -3576,11 +3576,14 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
 
-    def test_draft_context_recomputes_and_restores_dsa_metadata(self):
+    @pytest.mark.parametrize("capturing", [False, True])
+    def test_draft_context_recomputes_and_restores_dsa_metadata(self, capturing):
         """Draft context rebinds preallocated DSA buffers and restores lazy aliases."""
         meta = self._make_mock_metadata()
         mgr = self._make_mock_draft_manager()
         mgr.index_head_dim = 128
+        mgr.get_pool_block_indices = Mock()
+        mgr.indexer_k_cache_page_scale = 1
         meta.enable_flash_mla = False
         meta.enable_context_mla_with_cached_kv = False
         meta.host_indexer_k_cache_block_offsets = torch.tensor([1, 2, 3])
@@ -3589,12 +3592,20 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         meta.host_slot_mapping_scale = torch.tensor([10, 11, 12])
         meta.slot_mapping_fp8 = torch.tensor([13, 14, 15])
         meta.slot_mapping_scale = torch.tensor([16, 17, 18])
-        meta.host_draft_indexer_k_cache_block_offsets = torch.tensor([25, 26, 27])
-        meta.draft_indexer_k_cache_block_offsets = torch.tensor([28, 29, 30])
-        meta.host_draft_slot_mapping_fp8 = torch.tensor([31, 32, 33])
-        meta.host_draft_slot_mapping_scale = torch.tensor([34, 35, 36])
-        meta.draft_slot_mapping_fp8 = torch.tensor([37, 38, 39])
-        meta.draft_slot_mapping_scale = torch.tensor([40, 41, 42])
+        meta.block_table = torch.tensor([19, 20, 21])
+        meta.block_table_expanded = torch.tensor([22, 23, 24])
+        meta.host_block_table_expanded = torch.tensor([25, 26, 27])
+        meta.host_draft_indexer_k_cache_block_offsets = torch.tensor([28, 29, 30])
+        meta.draft_indexer_k_cache_block_offsets = torch.tensor([31, 32, 33])
+        meta.host_draft_slot_mapping_fp8 = torch.tensor([34, 35, 36])
+        meta.host_draft_slot_mapping_scale = torch.tensor([37, 38, 39])
+        meta.draft_slot_mapping_fp8 = torch.tensor([40, 41, 42])
+        meta.draft_slot_mapping_scale = torch.tensor([43, 44, 45])
+        meta.draft_block_table = torch.tensor([46, 47, 48])
+        meta.draft_block_table_expanded = torch.tensor([49, 50, 51])
+        meta.host_draft_block_table_expanded = torch.tensor([52, 53, 54])
+        meta.prepare_for_indexer_k_cache = Mock()
+        meta._refresh_expanded_block_table = Mock()
         meta._update_indexer_k_cache_block_offsets = Mock()
         del meta.slot_mapping_fp8_fullkv
         del meta.slot_mapping_scale_fullkv
@@ -3606,6 +3617,9 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             "host_slot_mapping_scale": meta.host_slot_mapping_scale,
             "slot_mapping_fp8": meta.slot_mapping_fp8,
             "slot_mapping_scale": meta.slot_mapping_scale,
+            "block_table": meta.block_table,
+            "block_table_expanded": meta.block_table_expanded,
+            "host_block_table_expanded": meta.host_block_table_expanded,
         }
         draft_buffers = {
             "host_indexer_k_cache_block_offsets": meta.host_draft_indexer_k_cache_block_offsets,
@@ -3614,6 +3628,9 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             "host_slot_mapping_scale": meta.host_draft_slot_mapping_scale,
             "slot_mapping_fp8": meta.draft_slot_mapping_fp8,
             "slot_mapping_scale": meta.draft_slot_mapping_scale,
+            "block_table": meta.draft_block_table,
+            "block_table_expanded": meta.draft_block_table_expanded,
+            "host_block_table_expanded": meta.host_draft_block_table_expanded,
         }
 
         def is_attn_metadata(obj, cls):
@@ -3628,7 +3645,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             ),
             patch(
                 "tensorrt_llm._torch.speculative.interface.torch.cuda.is_current_stream_capturing",
-                return_value=False,
+                return_value=capturing,
             ),
             patch.object(Indexer, "recompute_slot_mappings") as recompute,
         ):
@@ -3642,8 +3659,45 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             assert getattr(meta, name) is buffer
         assert meta.slot_mapping_fp8_fullkv is meta.slot_mapping_fp8
         assert meta.slot_mapping_scale_fullkv is meta.slot_mapping_scale
-        meta._update_indexer_k_cache_block_offsets.assert_called_once_with()
-        recompute.assert_called_once_with(meta)
+        if capturing:
+            meta.prepare_for_indexer_k_cache.assert_not_called()
+            meta._refresh_expanded_block_table.assert_not_called()
+            recompute.assert_not_called()
+        else:
+            meta.prepare_for_indexer_k_cache.assert_called_once_with()
+            meta._refresh_expanded_block_table.assert_called_once_with()
+            recompute.assert_called_once_with(meta)
+        meta._update_indexer_k_cache_block_offsets.assert_not_called()
+
+    def test_non_dsa_manager_skips_inherited_dsa_replay_state(self):
+        """A DSA metadata subclass must not impose DSA layout on its manager."""
+        meta = self._make_mock_metadata()
+        mgr = self._make_mock_draft_manager()
+        target_manager = meta.kv_cache_manager
+        target_offsets = meta.kv_cache_block_offsets
+        target_host_offsets = meta.host_kv_cache_block_offsets
+        # DeepSeek-V4 cache managers expose this field but not the DSA page
+        # mapping contract used by _update_indexer_k_cache_block_offsets().
+        mgr.index_head_dim = 128
+
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
+        with patch(
+            "tensorrt_llm._torch.speculative.interface.isinstance",
+            side_effect=is_attn_metadata,
+        ):
+            saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
+
+        assert saved is not None
+        assert "saved_dsa_state" not in saved
+
+        restore_attn_metadata_after_draft_replay(meta, saved)
+        assert meta.kv_cache_manager is target_manager
+        assert meta.kv_cache_block_offsets is target_offsets
+        assert meta.host_kv_cache_block_offsets is target_host_offsets
 
 
 def test_recompute_context_kv_gather_mappings_does_not_alias_uncompressed_cached_mappings():

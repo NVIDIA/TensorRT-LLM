@@ -957,6 +957,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
+            if (reuse_mtp_topk and draft_kv_cache_manager is not None
+                    and hasattr(draft_kv_cache_manager, "index_head_dim") and
+                    hasattr(draft_kv_cache_manager, "get_pool_block_indices")
+                    and hasattr(draft_kv_cache_manager,
+                                "indexer_k_cache_page_scale")):
+                # Overlap scheduling corrects kv_lens_cuda from the runtime
+                # accepted-token counts inside the captured graph. The target
+                # forward refreshes target slot mappings during that correction;
+                # refresh once more after rebinding so the first draft forward
+                # writes the separate DSA indexer cache at the same positions.
+                attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
                 if reuse_mtp_topk:
                     attn_metadata.set_skip_topk(i > 0)
