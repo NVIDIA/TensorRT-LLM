@@ -1776,6 +1776,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Sweep a RUNNING trtllm-serve instead of building an engine. The "
              "verify length is pinned over /dspark/verify_len_pin, so walking "
              "the ladder costs no engine rebuild.")
+    source.add_argument(
+        "--control-url",
+        help="Where the pin endpoint and /metrics live when they differ from "
+        "--base-url: under disaggregated serving the LOAD goes through the "
+        "proxy, but /dspark/verify_len_pin and the iteration stats belong to "
+        "the GENERATION server. Defaults to --base-url.",
+    )
     source.add_argument("--server-settle-s", type=float, default=20.0,
                         help="Seconds to let admission reach the plateau "
                              "before a cell is measured (--base-url).")
@@ -2161,6 +2168,7 @@ def samples_from_iter_log(
 def samples_from_server(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     batch_sizes: Sequence[int],
     verify_lens: Sequence[int],
     input_len: int,
@@ -2197,6 +2205,7 @@ def samples_from_server(
     """
     import requests
 
+    control_url = control_url or base_url
     rng = random.Random(seed)
     out: List[StepSample] = []
 
@@ -2228,7 +2237,7 @@ def samples_from_server(
                 post_errors.append(f"{type(exc).__name__}: {exc}")
 
     def pin(verify_len: Optional[int]) -> None:
-        response = requests.post(f"{base_url}/dspark/verify_len_pin",
+        response = requests.post(f"{control_url}/dspark/verify_len_pin",
                                  json={"verify_len": verify_len}, timeout=60)
         if response.status_code != 200:
             raise RuntimeError(
@@ -2236,7 +2245,7 @@ def samples_from_server(
                 f"{response.status_code} {response.text}")
 
     def drain_metrics() -> List[dict]:
-        response = requests.get(f"{base_url}/metrics", timeout=60)
+        response = requests.get(f"{control_url}/metrics", timeout=60)
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, list) else [payload]
@@ -2391,6 +2400,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.base_url:
         samples = samples_from_server(
             base_url=args.base_url.rstrip("/"),
+            control_url=(args.control_url.rstrip("/")
+                         if args.control_url else None),
             batch_sizes=batch_sizes,
             verify_lens=verify_lens,
             input_len=args.input_len,

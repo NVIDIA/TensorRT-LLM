@@ -302,6 +302,48 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 - **新仪表(只读不变量审计,`TLLM_DSPARK_INVARIANT_LOG=1`)**:序幕末尾 D2H 少量派生量,对照 host-with-w 的解析公式验证不变量(首个:`kv_lens[r] == (max_beam_num_tokens−1) + 2×w_r`),零突变、零集合通信、零重装配——任意规模可常开。违规打印现场 (row, past, w, S, n_real, padded_bs, bucket);每 100 步打检查点(正向确认仪表存活)。
 - 协查提示:kv 不变量若稳态全绿,后续只读不变量按序追加:anchor 对位(`input_ids[qo[r]] == next_new_tokens[slot,0]`)、draft 对位、position 基。序幕输出面逐项排掉后,嫌疑收缩到图内消费方与跨步状态链。
 
+## 【08-08 07:35-08:10】kv 不变量稳态全绿;扩展不变量 × 双线并行(steep 猎场 + identity 对照)
+
+- **kv 不变量:200+ 稳态步 0 违规**,检查点机制同时正向确认仪表存活——序幕 kv 输出面(修复后)在规模下逐请求正确。
+- **第二批只读不变量上线**(steep,739901):`kvoff == new_lens − w`、anchor 对位(`input_ids[qo[r]] == next_new_tokens[0,slot]`)、draft0 对位、`prev_pos_idx/off` 首尾 token 对位——覆盖序幕的全部 token 级输出。
+- **仪表对照组**(identity,739900):同一套不变量在 w=S 下应全绿——排除仪表自身假阳性;若对照组报违规则仪表公式有错。
+- 若 steep 全绿:第三批备选不变量 = row maps 解析重算(req_idx/kv_correction 是 w 的纯函数)、`seq_lens_cuda == w`、`gen_token_repeats == w`、pad 行窗口 == pad_len;全绿穿透后嫌疑正式移交图内消费方与跨步链。
+
+## 【08-08 08:15-08:40】第二批全绿 + 对照全绿;batch-3 在跑;跨行分歧检测器上线
+
+- **steep 第二批不变量:300+ 步 0 违规**(kvoff/anchor/draft0/prev_pos 首尾对位)——序幕 token 级输出面全部无罪;**identity 对照同样全绿**——仪表无假阳性,判定有效。
+- **batch-3(740252 加载中)**:row maps 解析重算、seq_lens==w、repeats==w、position 打包(行内位差)。
+- **新杀器(`TLLM_DSPARK_ROWDIV_LOG=1`,下个 serve 周期生效)**:census 的 64 个请求完全相同 → temp0 下所有行每步接受的 token 必须一致(窗口只改变验证量、不改变内容)。sampler 内纯 host 检查:行间 token 元组分歧即腐蚀现行,直接给出**首个分歧步 + 分歧行的窗口类别(w=2 vs w=6)**——回答"哪类窗口先烂",并把腐蚀定位从"输出面"推进到"图内效果"层。
+
+## 【08-08 09:15-09:25】rowdiv serve 重发 ×2;守恒论证解释单请求永净;图内消费方静态围剿启动
+
+- **rowdiv serve(740252)warmup 挂死**:日志冻结于 09:15:37,进程活但 20+ 分钟无进展 → 杀掉,双节点并行重发(740252→p25rowdiv2_serve.log,740251→p25rowdiv3_serve.log,同配置 steep+ROWDIV_LOG),first-ready-wins 收割流水线挂上(先 ready 者压 64 并发 temp0 census → grep `[rowdiv]`)。若二次 warmup 挂死 → 实锤 rowdiv 仪表自身与 warmup 步的交互问题。
+- **结构性论证(新)**:窗口守恒 sum(w)=sum(S) 意味着 **n_real=1 时数学上强制 w=S** —— 单请求下序幕是恒等变换。这解释了单请求探针为什么永净:不是运气,是结构。任何 w≠S 敏感的凶手**只可能**在多请求下现形,与全部观测(多并发 63-64/64 腐蚀、单请求净)精确吻合。
+- **静态围剿(并行 workflow)**:4 个读者分扫 ① host staging 面(_prepare_tp_inputs + spec_metadata.prepare)② attention+indexer 面(apply_device_ragged_layout 覆盖清单 vs MLA/索引器 replay 时全部读取)③ 图内 worker 面(fused verify+draft 的每个 gather/scatter 索引、confidence 装填索引、捕获期烘焙常量)④ 跨步链(host 簿记以 S 推进而 device 以 w 运行之处)。汇总产出"w 敏感 ∧ replay 消费 ∧ 序幕未重写"嫌疑排名 + 每个的最廉价判决实验。已知热点候选:`spec_metadata.gather_ids`(interface.py:478,drafting_loops 以它选 logits 行——若 DSpark 路径同类索引按 S 装填且未被序幕重写,则 w≠S 时采样/验证读错行,跨请求串染,恰好匹配全部现象)。
+
+## 【08-08 10:15-10:50】BUG #2 根因定案:compressor 的逐请求新 token 数被捕获的 H2D 钉死在 S
+
+- **双线判决同时落地,互相咬合。**
+  - **rowdiv(动态,steep+temp0+64 相同请求)**:step#3-4 起行间 token 元组即分歧,同窗口类 (w=6) 行内容也互不相同,大批行迅速塌缩为 `(0,0,0)` 退化 token——腐蚀即时发生、按请求永久化,是"逐请求持久状态被写坏"的指纹。
+  - **静态围剿(4+1 workflow,60 个缓冲逐一分类)**:唯一同时满足全部观测(多请求 only / identity 净 / temp0+force-argmax 也腐蚀 / 与捕获结构无关 / 序幕输出面逐项正确)的嫌疑就是 **`gen_new_tokens_per_seq_cuda`**。
+- **机制(全链路代码实证)**:host staging 在 `_sync_gen_tokens_per_seq`(deepseek_v4.py)把 host 形状split S 写入 pinned 缓冲并 H2D 到 `gen_new_tokens_per_seq_cuda`;该调用同时在捕获区 `on_update_kv_lens` 内执行,于是 **H2D memcpy 成为图内节点,每次 replay 从 pinned 缓冲重新加载当步的 S**——序幕改了也会被 replay 覆盖(序幕本来也没改它:`apply_device_ragged_layout` 写的是双胞胎 `seq_lens_cuda`/`gen_token_repeats_cuda`)。compressor kernel 算 `nn = new_tokens_per_seq[b]`、`sp = kv_len − nn`,而 `kv_len` 已被序幕修到 w 口径 → **`sp = past + (w−S)`**:Phase 1 把**持久分页 KV/score 递归状态**写错位(w>S 尾巴永远缺失;w<S 吞进邻行 token 并覆写已提交位置),Phase 2/3 压缩窗口边界同错——主压缩层与 indexer FP8 K-cache 压缩器同时中招,且逐步累积、永不自愈。deepseek_v4.py 自己的注释甚至描述过此失败模式。
+- **为什么之前所有仪表都看不见**:腐蚀不在序幕的输出面(全部不变量真绿),而在 replay 时被图内 memcpy 重新装填的**平行缓冲**;单请求时窗口守恒强制 w=S,故单探针永净。
+- **修复(deepseek_v4.py `_sync_gen_tokens_per_seq`,两件套)**:
+  1. **向量**:pinned H2D → **D2D copy 自 `_seq_lens_cuda`**(staging 时同为 S,replay 前被 `apply_device_ragged_layout` 改写为 w → 捕获的 D2D 节点天然跟随 device 真值;host 路径语义不变)。死掉的 pinned 缓冲一并删除。
+  2. **标量(next_n 模板上界)**:本步 batch max → **全局最大窗口 `1+max_draft_tokens`**。捕获时 ragged warmup 是均匀 tier 分布,按 batch max 烘焙会把 NEXT_N 钉在 tier+1;序幕可在任意 bucket 上分出 w=6,修好向量后若上界不抬,Phase 1 循环截断 = 换一扇门的同款腐蚀(kernel 循环有守卫,上界任意抬安全)。
+- **单测**:新增 `test_dspark_compressor_gen_counts.py`(4 例:D2D 源判别/全局上界/ctx 行偏移/uniform 分支不变),连同原序幕平价测试 15/15 通过。
+- **验证中**:双节点重发修复后 serve——bia0003 steep(最狠压力)、bia0123 真实 device windows,各挂 64 并发 temp0 census + rowdiv 收割。判净标准:census 64/64 chars/tok≥1.5;steep 下 rowdiv 每步至多 2 个签名组(奇偶配对类)且无退化 token。
+- 附:静态审计同时清点出两个**潜伏**(非本案)bug:① 图内逐 token 采样参数缓冲 (temperatures/top_ks/top_ps) 按 S 打包、非贪婪异参数批下 w≠S 会串染(temp0/force-argmax 不读,故与本案无关);② plain-DSA 的 block_table S 口径 −1 掩码对 device windows 不安全(V4 路径不可达)。修复后另行立项。
+
+### 备选修复方案评估(供评审;当前实施的是 A,标记为暂定)
+
+- **A(已实施,Python-only)**:捕获拷贝换 D2D 源(`_seq_lens_cuda`)+ NEXT_N 抬全局上界。最小爆炸半径,当场可在活挂载容器里验证;把双胞胎缓冲降级为 canonical 缓冲的衍生物。host 路径装填时刻数值逐位等价,uniform/eager 分支未触碰。
+- **B(否)**:序幕直写该缓冲 + 把 H2D 挪出捕获区。可行但延续"平行缓冲靠写集纪律同步"的模式——本 bug 正是写集漏项造成,管理双胞胎不如消灭双胞胎。
+- **C(架构终态,需 C++ 重编译,建议后续立项)**:改 kernel 删掉 `new_tokens_per_seq` 输入,`nn` 由 kernel 内从 `cu_seq_lens[b+1]−cu_seq_lens[b]`(或 `sp` 直接取图内重算的 `cached_tokens`)导出——冗余输入消失,永不可能再失同步。与 A 不冲突,A 先落地验证机制,C 作 PR 收尾清理候选。
+- **D(否)**:钳制序幕 w ≤ bucket tier。功能倒退且不修主 bug。
+- **E(否)**:仅 device-windows 模式走 D2D。零收益模式分叉,制造未来漂移面。
+- NEXT_N 抬全局上界同时排掉一个 host 侧潜伏雷:#19(取消 tier 阶梯量化)实施后 host 也可能在小 tier bucket 发超 tier 窗口,同样会截断 Phase 1。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)

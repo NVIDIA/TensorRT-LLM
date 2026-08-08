@@ -4068,19 +4068,64 @@ class PyTorchModelEngine(ModelEngine):
             w = result.verify_lens[:n_real].tolist()
             qo = result.qo_indptr[:n_real + 1].tolist()
             kv = attn_metadata.kv_lens_cuda[:n_real].tolist()
+            kvoff = self.previous_kv_lens_offsets_cuda[:n_real].tolist()
+            slots_l = prev_slots.tolist()
+            ids = self.input_ids_cuda[:bucket].tolist()
+            drafts_l = self.draft_tokens_cuda[:bucket].tolist()
+            ppi = self.previous_pos_indices_cuda[:bucket].tolist()
+            ppo = self.previous_pos_id_offsets_cuda[:bucket].tolist()
+            anchors = new_tokens_device[0].squeeze(-1).tolist()
+            nlens = new_tokens_lens_device.tolist()
+            ndraft = next_draft_tokens_device.tolist()
             self._dspark_inv_step = getattr(self, "_dspark_inv_step", 0) + 1
+
+            def _viol(i, msg):
+                self._dspark_inv_prints = getattr(self, "_dspark_inv_prints",
+                                                  0) + 1
+                logger.warning(
+                    f"[invariant] step#{self._dspark_inv_step} row {i}: {msg} "
+                    f"(w={w[i]} S={split_lens[i].item()} n_real={n_real} "
+                    f"padded_bs={padded_bs} bucket={bucket})")
+
+            # Batch 3: layout-derived tensors recomputed analytically from w.
+            from ..speculative.dspark_ragged import build_row_maps_device
+            want_req, want_corr = build_row_maps_device(
+                result.verify_lens[:padded_bs], graph_num_tokens=bucket)
+            if not torch.equal(attn_metadata.row_req_idx_cuda[:bucket],
+                               want_req):
+                _viol(-1, "row_req_idx mismatch vs analytic recompute")
+            if not torch.equal(attn_metadata.row_kv_correction_cuda[:bucket],
+                               want_corr):
+                _viol(-1, "row_kv_correction mismatch vs analytic recompute")
+            seq_l = attn_metadata.seq_lens_cuda[:n_real].tolist()
+            reps_l = attn_metadata.gen_token_repeats_cuda[:n_real].tolist()
+            pos = self.position_ids_cuda[:bucket].tolist()
             for i, req in enumerate(gen_requests[:n_real]):
                 past = int(req.max_beam_num_tokens) - 1
-                want_kv = past + 2 * w[i]
-                if kv[i] != want_kv:
-                    self._dspark_inv_prints = getattr(
-                        self, "_dspark_inv_prints", 0) + 1
-                    logger.warning(
-                        f"[invariant] step#{self._dspark_inv_step} row {i}: "
-                        f"kv={kv[i]} want past+2w={want_kv} "
-                        f"(past={past} w={w[i]} S={split_lens[i].item()} "
-                        f"n_real={n_real} padded_bs={padded_bs} "
-                        f"bucket={bucket})")
+                s = slots_l[i]
+                if seq_l[i] != w[i]:
+                    _viol(i, f"seq_lens={seq_l[i]} want w={w[i]}")
+                if reps_l[i] != w[i]:
+                    _viol(i, f"repeats={reps_l[i]} want w={w[i]}")
+                if pos[qo[i] + w[i] - 1] - pos[qo[i]] != w[i] - 1:
+                    _viol(i, f"position packing: pos[last]-pos[first]="
+                          f"{pos[qo[i]+w[i]-1]-pos[qo[i]]} want {w[i]-1}")
+                if kv[i] != past + 2 * w[i]:
+                    _viol(i, f"kv={kv[i]} want past+2w={past + 2 * w[i]}")
+                if kvoff[i] != nlens[s] - w[i]:
+                    _viol(i, f"kvoff={kvoff[i]} want nlens-w={nlens[s]-w[i]}")
+                if ids[qo[i]] != anchors[s]:
+                    _viol(i, f"anchor ids[{qo[i]}]={ids[qo[i]]} "
+                          f"want new_tokens[0,{s}]={anchors[s]}")
+                if w[i] > 1 and drafts_l[qo[i] - i] != ndraft[s][0]:
+                    _viol(i, f"draft0 {drafts_l[qo[i]-i]} want {ndraft[s][0]}")
+                for o in (0, w[i] - 1):
+                    if ppi[qo[i] + o] != s:
+                        _viol(i, f"prev_pos_idx[{qo[i]+o}]={ppi[qo[i]+o]} "
+                              f"want slot {s}")
+                    if ppo[qo[i] + o] != nlens[s]:
+                        _viol(i, f"prev_pos_off[{qo[i]+o}]={ppo[qo[i]+o]} "
+                              f"want nlens={nlens[s]}")
             if self._dspark_inv_step % 100 == 0:
                 logger.info(
                     f"[invariant] step#{self._dspark_inv_step} checkpoint: "

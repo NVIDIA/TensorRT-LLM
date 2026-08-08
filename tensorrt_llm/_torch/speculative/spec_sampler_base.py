@@ -291,6 +291,36 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
+        if os.environ.get("TLLM_DSPARK_ROWDIV_LOG") == "1":
+            # Identical-request divergence detector: under a census load all
+            # requests share one prompt, so at temp 0 every row's accepted
+            # tokens must match its peers each step (windows change how MUCH
+            # is verified, never WHAT is accepted). The first divergent step
+            # names the corrupted rows and their window class.
+            sigs = {}
+            for _req in state.requests:
+                if _req.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                _s = _req.py_seq_slot
+                _n = new_tokens_lens_list[_s]
+                _toks = tuple(new_tokens[i][_s][0] for i in range(_n))
+                _w = (ridden_verify_lens[_s]
+                      if ridden_verify_lens is not None else -1)
+                sigs.setdefault(_toks, []).append((_s, _w))
+            self._rowdiv_step = getattr(self, "_rowdiv_step", 0) + 1
+            if len(sigs) > 1 and getattr(self, "_rowdiv_prints", 0) < 30:
+                self._rowdiv_prints = getattr(self, "_rowdiv_prints", 0) + 1
+                desc = "; ".join(
+                    f"{len(v)}rows(w={sorted(set(x[1] for x in v))})"
+                    f"toks={k[:3]}" for k, v in list(sigs.items())[:4])
+                logger.warning(
+                    f"[rowdiv] step#{self._rowdiv_step} {len(sigs)} distinct "
+                    f"token-tuples across identical requests: {desc}")
+            if self._rowdiv_step % 100 == 0:
+                logger.info(f"[rowdiv] step#{self._rowdiv_step} checkpoint: "
+                            f"{getattr(self, '_rowdiv_prints', 0)} "
+                            f"divergent steps")
+
         caps = state.verify_caps_snapshot
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
