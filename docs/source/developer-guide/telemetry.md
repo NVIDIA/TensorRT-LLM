@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-270 captured fields.
+271 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -152,7 +152,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_stats_len` | `<class 'int'>` | `value` |  |  |
 | `mm_encoder_only` | `<class 'bool'>` | `value` |  |  |
 | `moe_cluster_parallel_size` | `Optional[int]` | `value` |  |  |
-| `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `WIDEEP`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM` |
+| `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `WIDEEP`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `moe_config.disable_finalize_fusion` | `<class 'bool'>` | `value` |  |  |
 | `moe_config.max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `moe_config.use_low_precision_moe_combine` | `<class 'bool'>` | `value` |  |  |
@@ -192,7 +192,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `ray_placement_config.defer_workers_init` | `<class 'bool'>` | `value` |  |  |
 | `ray_placement_config.per_worker_gpu_share` | `Optional[float]` | `value` |  |  |
 | `ray_placement_config.placement_bundle_indices` | `Optional[List[List[int]]]` | `value` |  |  |
-| `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
+| `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `poolside_v1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
 | `reorder_policy_config.policy_args.agent_inflight_seq_num` | `<class 'int'>` | `value` |  |  |
 | `reorder_policy_config.policy_args.agent_percentage` | `<class 'float'>` | `value` |  |  |
 | `reorder_policy_config.policy_name` | `Optional[Literal['AgentTree']]` | `categorical` |  | `AgentTree` |
@@ -243,6 +243,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.acceptance_rate_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.acceptance_rate_window_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
+| `speculative_config.advanced_sampling_mode` | `<enum 'AdvancedSamplingMode'>` | `categorical` |  | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
