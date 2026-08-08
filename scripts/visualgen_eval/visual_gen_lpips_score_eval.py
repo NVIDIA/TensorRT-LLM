@@ -63,12 +63,24 @@ import tempfile
 import time
 from typing import Any
 
-import cv2
 import lpips
 import numpy as np
 import torch
 import yaml
 from PIL import Image
+
+
+def _get_cv2():
+    """Import OpenCV on demand for the optional cv2-backed video decode path."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV (cv2) is required for video LPIPS scoring but is not installed. "
+            "Install it with `pip install opencv-python-headless`."
+        ) from exc
+    return cv2
+
 
 MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "flux1": ("FLUX.1-dev", "black-forest-labs/FLUX.1-dev"),
@@ -492,6 +504,7 @@ def _decode_video_to_lpips_batch(
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found for LPIPS comparison: {video_path}")
 
+    cv2 = _get_cv2()
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video for LPIPS comparison: {video_path}")
