@@ -78,9 +78,6 @@ class Backend:
         self.events = Backend.Events()
         inductor_config.enable_auto_functionalized_v2 = False
 
-        if Backend._graph_pool_handle is None:
-            Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
-
         self.match_count = []
         self.match_count_by_pass = OrderedDict()
 
@@ -123,6 +120,21 @@ class Backend:
             self.events += [
                 torch.cuda.Event() for _ in range(num_events - len(self.events))
             ]
+
+    @classmethod
+    def get_graph_pool_handle(cls) -> tuple[int, int]:
+        # Minted lazily, not in __init__, so that a retired handle is replaced.
+        if cls._graph_pool_handle is None:
+            cls._graph_pool_handle = torch.cuda.graph_pool_handle()
+        return cls._graph_pool_handle
+
+    @classmethod
+    def retire_graph_pool_handle(cls) -> None:
+        # A private pool cannot outlive the graphs captured into it: once they
+        # have all been reset, CUDACachingAllocator refuses to incref it again.
+        # Call this after resetting them so the next capture generation gets a
+        # fresh pool instead of reusing a handle the allocator has dropped.
+        cls._graph_pool_handle = None
 
     def clear_piecewise_cuda_graphs(self) -> None:
         runners = list(self._piecewise_runners)
@@ -179,7 +191,7 @@ class Backend:
                 self.enable_inductor,
                 self.input_num_tokens,
                 self.capture_num_tokens,
-                self._graph_pool_handle,
+                self.get_graph_pool_handle(),
                 self.num_streams,
             )
             self._piecewise_runners.update(runners)
