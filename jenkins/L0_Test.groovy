@@ -47,7 +47,6 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
-ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -1475,9 +1474,6 @@ def getPytestBaseCommandLine(
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
-    if (ENABLE_UPLOAD_TEST_RESULTS) {
-        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
-    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1710,17 +1706,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
-                        "-s",
+                        "--capture=fd",
                         "--s3-upload-path=${uploadPath}/${stageName}",
+                        "--s3-upload-mode=deferred",
                     ]
-                    if (ENABLE_S3_ECHO_STDOUT) {
-                        extraArgs += [
-                            "--s3-echo-stdout",
-                            "--s3-capture-mode=timestamped",
-                        ]
-                    }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -4376,17 +4367,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Temporarily disable to reduce the log size
         // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def extraArgs = [*clusterDurationsArgs]
-        if (ENABLE_UPLOAD_TEST_RESULTS) {
+        if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
-                "-s",
+                "--capture=fd",
                 "--s3-upload-path=${uploadPath}/${stageName}",
+                "--s3-upload-mode=deferred",
             ]
-            if (ENABLE_S3_ECHO_STDOUT) {
-                extraArgs += [
-                    "--s3-echo-stdout",
-                    "--s3-capture-mode=timestamped",
-                ]
-            }
         }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
@@ -4472,6 +4458,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
                 if (noRegularTests && noIsolateTests) {
                     error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                }
+
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    sh """
+                        python3 ${llmSrc}/tests/test_common/s3_output.py \
+                            --drain-spool "${WORKSPACE}/${stageName}" || true
+                    """
                 }
             }
 
