@@ -2165,11 +2165,23 @@ class KVCacheManagerV2(BaseResourceManager):
         evictable pages, so once every sequence is suspended the pool can no
         longer drain and the scheduler makes no further progress.
 
-        Returns None when no such non-droppable pool exists, keeping the
-        unbounded MAX_UTILIZATION behavior for plain attention models.
+        Returns None when no rank has such a non-droppable pool, keeping the
+        unbounded MAX_UTILIZATION behavior for plain attention models. When
+        one exists, every rank contributes its local full-sequence capacity
+        so pipeline-parallel ranks admit the same request set even when some
+        ranks contain only attention layers or no local layers.
         """
         life_cycle_metadata = self._stats_life_cycle_metadata()
-        if not any(kind != "attention" for _, _, kind in life_cycle_metadata.values()):
+        has_non_droppable_pool = any(
+            kind != "attention" for _, _, kind in life_cycle_metadata.values()
+        )
+        dist = None
+        if self.mapping.world_size > 1:
+            dist = Distributed.get(self.mapping)
+            has_non_droppable_pool = bool(
+                dist.allreduce(int(has_non_droppable_pool), op=ReduceOp.MAX)
+            )
+        if not has_non_droppable_pool:
             return None
 
         # A physical group can host multiple lifecycle variants. V2 allocates
@@ -2179,14 +2191,20 @@ class KVCacheManagerV2(BaseResourceManager):
         for pool_group_id, _, kind in life_cycle_metadata.values():
             slots_per_pool_group[pool_group_id] += attention_slots if kind == "attention" else 1
 
-        storage_stats = self._get_storage_statistics(GPU_LEVEL)
-        return max(
-            1,
-            min(
+        if slots_per_pool_group:
+            storage_stats = self._get_storage_statistics(GPU_LEVEL)
+            local_capacity = min(
                 storage_stats[pool_group_id].total // slots_per_sequence
                 for pool_group_id, slots_per_sequence in slots_per_pool_group.items()
-            ),
-        )
+            )
+        else:
+            # A PP rank with no local cache layers must not constrain ranks
+            # that do own physical cache pools.
+            local_capacity = sys.maxsize
+
+        if dist is not None:
+            local_capacity = dist.allreduce(local_capacity, op=ReduceOp.MIN)
+        return max(1, int(local_capacity))
 
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.

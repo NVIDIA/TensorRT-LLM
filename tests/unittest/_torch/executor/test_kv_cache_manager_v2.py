@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -48,8 +50,10 @@ def _make_residency_manager(
     reserve_draft_tokens: int,
     life_cycle_metadata: dict[int, tuple[int, int | None, str]],
     pool_group_totals: list[int],
+    world_size: int = 1,
 ) -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = SimpleNamespace(world_size=world_size)
     manager.max_seq_len = max_seq_len
     manager.tokens_per_block = tokens_per_block
     manager.num_extra_kv_tokens = num_extra_kv_tokens
@@ -101,6 +105,74 @@ def test_max_resident_sequences_sums_coalesced_life_cycles() -> None:
 
     # Each sequence consumes 2 + 1 + 2 slots from the shared physical group.
     assert manager.max_resident_sequences() == 10
+
+
+def test_max_resident_sequences_returns_none_for_attention_only() -> None:
+    manager = _make_residency_manager(
+        max_seq_len=31,
+        tokens_per_block=16,
+        num_extra_kv_tokens=0,
+        reserve_draft_tokens=0,
+        life_cycle_metadata={0: (0, 31, "attention")},
+        pool_group_totals=[4],
+    )
+
+    assert manager.max_resident_sequences() is None
+
+
+def test_max_resident_sequences_floors_zero_capacity_at_one() -> None:
+    manager = _make_residency_manager(
+        max_seq_len=31,
+        tokens_per_block=16,
+        num_extra_kv_tokens=0,
+        reserve_draft_tokens=0,
+        life_cycle_metadata={0: (0, None, "ssm")},
+        pool_group_totals=[0],
+    )
+
+    assert manager.max_resident_sequences() == 1
+
+
+def test_max_resident_sequences_syncs_attention_only_pp_rank() -> None:
+    manager = _make_residency_manager(
+        max_seq_len=31,
+        tokens_per_block=16,
+        num_extra_kv_tokens=0,
+        reserve_draft_tokens=0,
+        life_cycle_metadata={0: (0, 31, "attention")},
+        pool_group_totals=[8],
+        world_size=2,
+    )
+
+    with patch("tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.Distributed.get") as get_dist:
+        get_dist.return_value.allreduce.side_effect = [1, 3]
+
+        assert manager.max_resident_sequences() == 3
+
+        get_dist.return_value.allreduce.assert_has_calls(
+            [call(0, op=ReduceOp.MAX), call(4, op=ReduceOp.MIN)]
+        )
+
+
+def test_max_resident_sequences_ignores_pp_rank_without_cache_layers() -> None:
+    manager = _make_residency_manager(
+        max_seq_len=31,
+        tokens_per_block=16,
+        num_extra_kv_tokens=0,
+        reserve_draft_tokens=0,
+        life_cycle_metadata={},
+        pool_group_totals=[],
+        world_size=2,
+    )
+
+    with patch("tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.Distributed.get") as get_dist:
+        get_dist.return_value.allreduce.side_effect = [1, 7]
+
+        assert manager.max_resident_sequences() == 7
+
+        get_dist.return_value.allreduce.assert_has_calls(
+            [call(0, op=ReduceOp.MAX), call(sys.maxsize, op=ReduceOp.MIN)]
+        )
 
 
 class _FakeKVCache:
