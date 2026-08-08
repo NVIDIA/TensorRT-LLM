@@ -79,6 +79,25 @@ class MetaInitMode(TorchDispatchMode):
         aten.log.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
+    # Value-irrelevant in-place initializers that stock torch modules run in
+    # __init__ (e.g. nn.LayerNorm.reset_parameters -> init.ones_ ->
+    # aten.fill_.Scalar). Raising on these aborts meta init for the WHOLE
+    # model, and model_loader's broad-except fallback then constructs the
+    # full model on CPU memory: a load-time slowdown everywhere, and a
+    # permanent host-RSS regression on aarch64 builds where torch's CPU
+    # allocator (mimalloc) retains the freed weight-shard-sized arena for
+    # process lifetime (measured 142 GiB/rank for a ~554 GB checkpoint at
+    # TP4 on GB300). Their results are placeholders that are overwritten
+    # after construction (dummy init or checkpoint load), so they are safe
+    # to run on meta tensors (their meta kernels are value-no-ops). Do NOT
+    # add ops whose results are consumed (e.g. ops computing non-persistent
+    # buffers): the conservative MetaInitException fallback below still
+    # protects those.
+    deterministic_init_ops = frozenset({
+        aten.fill_.Scalar,
+        aten.fill_.Tensor,
+        aten.zero_.default,
+    })
 
     def _has_meta_tensor(self, args, kwargs):
         if kwargs is None:
@@ -94,8 +113,9 @@ class MetaInitMode(TorchDispatchMode):
                 kwargs = {}
             kwargs['device'] = torch.device('meta')
             return func(*args, **kwargs)
-        elif func not in self.random_init_ops and self._has_meta_tensor(
-                args, kwargs):
+        elif func not in self.random_init_ops and \
+                func not in self.deterministic_init_ops and \
+                self._has_meta_tensor(args, kwargs):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
