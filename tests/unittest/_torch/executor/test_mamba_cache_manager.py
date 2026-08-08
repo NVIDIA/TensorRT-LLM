@@ -1644,23 +1644,51 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     assert "workload's average total sequence length" in warnings_seen[0]
 
 
-def test_v2_hybrid_rejects_quota_below_live_state_floor():
+def _residency_clamp_manager(max_batch_size):
+    """A hybrid V2 manager stub whose recurrent state dominates the quota."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr.max_batch_size = 2
+    mgr.max_batch_size = max_batch_size
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
     mgr.ssm_bytes = 64
     mgr.conv_bytes = 32
     mgr._num_reserved_dummy_slots = 1
+    mgr._resident_sequence_cap = None
     mgr.tokens_per_block = 32
     mgr.num_local_layers = 2
     mgr.pp_layers = [0, 1]
-    mgr.max_attention_window_vec = [128, 128]
+    mgr._mamba_layer_mask = [True, False]
+    # Full attention (no sliding window), matching the hybrid Qwen3.5 layout
+    # where the recurrent state is the only per-sequence fixed cost.
+    mgr.max_attention_window_vec = [None, None]
+    mgr.max_seq_len = 128
     mgr.max_num_tokens = 128
     mgr.enable_swa_scratch_reuse = False
     mgr.get_layer_bytes_per_token = lambda **kwargs: 8
     mgr._attention_cache_bytes_per_token = lambda: 16
     mgr.kv_cache_config = KvCacheConfig(enable_partial_reuse=False)
+    return mgr
+
+
+def _quota_for_resident_sequences(num_sequences):
+    """Quota that lets ``_residency_clamp_manager`` hold exactly N sequences.
+
+    A resident sequence costs one 96-byte state slot plus the attention pages
+    it can reach. Residency is a guarantee, so it is sized on max_seq_len (128
+    tokens = 4 blocks of 16 B/token * 32 tokens), not on the avg_seq_len pool
+    hint. One dummy slot and one attention page are reserved regardless of
+    residency.
+    """
+    state_bytes = 64 + 32
+    attention_block_bytes = 16 * 32
+    per_sequence = state_bytes + 4 * attention_block_bytes
+    reserved = state_bytes + attention_block_bytes
+    return reserved + num_sequences * per_sequence
+
+
+def test_v2_hybrid_rejects_quota_below_single_live_state_floor():
+    """A quota too small for even one sequence is still fatal."""
+    mgr = _residency_clamp_manager(max_batch_size=1)
     minimum_quota = mgr._minimum_live_gpu_quota()
 
     base_config = KVCacheManagerConfig(
@@ -1671,6 +1699,132 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
     with pytest.raises(ValueError, match="too small for live recurrent states"):
         mgr._build_cache_config(base_config)
+
+
+def test_v2_hybrid_clamps_resident_sequences_to_quota():
+    """max_batch_size is a ceiling, not an allocation floor: clamp, don't raise.
+
+    The recurrent state of a hybrid sequence is fixed-size and non-droppable, so
+    a quota that cannot hold max_batch_size states must bound residency instead
+    of failing initialization (nvbugs/6550276).
+    """
+    mgr = _residency_clamp_manager(max_batch_size=64)
+    # Size the quota for exactly 10 sequences, far below max_batch_size.
+    quota = _quota_for_resident_sequences(10)
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        layers=_base_attention_layer_configs(2),
+    )
+
+    config = mgr._build_cache_config(base_config)
+
+    resident = mgr._max_resident_sequences()
+    assert resident == 10
+    # The clamped floor now fits the quota, so initialization can proceed.
+    assert mgr._minimum_live_gpu_quota() <= quota
+    # Every sizing path agrees on the clamped residency.
+    assert mgr.max_resident_sequences() == resident
+    ssm_floor = [
+        batch
+        for batch in config.constraints
+        if batch.kv_caches and all(kv.capacity == 0 for kv in batch.kv_caches)
+    ]
+    assert ssm_floor
+    assert all(
+        len(batch.kv_caches) == resident + mgr._num_reserved_dummy_slots for batch in ssm_floor
+    )
+
+
+def test_v2_hybrid_residency_sized_on_max_seq_len_not_avg_hint():
+    """Residency must be sized on reachable capacity, not the avg_seq_len hint.
+
+    ``_get_typical_request_capacity`` is a pool-*ratio* hint that falls back to
+    max_seq_len / 2 when avg_seq_len is unset. Sizing the residency guarantee on
+    it admits roughly twice the sequences the quota can actually hold once every
+    sequence grows to max_seq_len. Recurrent state is non-droppable and resume()
+    is refused past max_util_for_resume, so the over-admitted run cannot recover
+    (nvbugs/6575476).
+    """
+    mgr = _residency_clamp_manager(max_batch_size=64)
+    assert mgr.kv_cache_config.avg_seq_len is None
+    # Sized on the avg hint (max_seq_len/2 = 2 blocks), this quota would look
+    # like it affords 10 sequences; at max_seq_len (4 blocks) it affords fewer.
+    hint_state_bytes = 64 + 32
+    hint_block_bytes = 16 * 32
+    quota_by_avg_hint = (hint_state_bytes + hint_block_bytes) + 10 * (
+        hint_state_bytes + 2 * hint_block_bytes
+    )
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota_by_avg_hint)],
+        layers=_base_attention_layer_configs(2),
+    )
+
+    mgr._build_cache_config(base_config)
+
+    resident = mgr._max_resident_sequences()
+    assert resident < 10, "residency was sized on the avg_seq_len hint"
+    # Every resident sequence must still fit when it reaches max_seq_len.
+    blocks_at_max_seq_len = mgr.max_seq_len // 32
+    worst_case = (resident + mgr._num_reserved_dummy_slots) * hint_state_bytes + (
+        resident * blocks_at_max_seq_len * hint_block_bytes
+    )
+    assert worst_case <= quota_by_avg_hint
+
+
+def test_v2_hybrid_truncates_base_constraints_to_clamped_residency():
+    """Inherited warmup constraints must not re-impose the unclamped floor.
+
+    Every entry of a constraint costs one SSM slot, so a base-class constraint
+    built from the requested max_batch_size would restore the very state floor
+    the residency clamp removed (nvbugs/6550276).
+    """
+    mgr = _residency_clamp_manager(max_batch_size=64)
+    quota = _quota_for_resident_sequences(10)
+    wide_constraint = BatchDesc(
+        [KVCacheDesc(capacity=32, history_length=0) for _ in range(mgr.max_batch_size)]
+    )
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        layers=_base_attention_layer_configs(2),
+        constraints=[wide_constraint],
+    )
+
+    config = mgr._build_cache_config(base_config)
+
+    resident = mgr._max_resident_sequences()
+    assert resident == 10
+    truncated = config.constraints[0]
+    assert len(truncated.kv_caches) == resident + mgr._num_reserved_dummy_slots
+    # No constraint may demand more state slots than the pool floor allows.
+    assert all(
+        len(batch.kv_caches) <= resident + mgr._num_reserved_dummy_slots
+        for batch in config.constraints
+    )
+
+
+def test_v2_hybrid_keeps_requested_residency_when_quota_is_ample():
+    mgr = _residency_clamp_manager(max_batch_size=4)
+    quota = mgr._minimum_live_gpu_quota() * 1000
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        layers=_base_attention_layer_configs(2),
+    )
+
+    mgr._build_cache_config(base_config)
+
+    assert mgr._resident_sequence_cap is None
+    assert mgr._max_resident_sequences() == 4
+
+
+def test_v2_attention_only_manager_reports_unbounded_residency():
+    """Droppable attention pages need no residency cap."""
+    mgr = object.__new__(KVCacheManagerV2)
+
+    assert mgr.max_resident_sequences() is None
 
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():

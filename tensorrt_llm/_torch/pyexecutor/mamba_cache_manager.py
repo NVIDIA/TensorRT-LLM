@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -2835,6 +2836,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     _supports_additional_snapshot_offsets = True
 
+    # Bound on concurrently resident sequences, set in _build_cache_config when
+    # the GPU cache quota cannot hold the requested max_batch_size. ``None``
+    # means no bound applies and max_batch_size is used as requested.
+    _resident_sequence_cap: Optional[int] = None
+
     def __init__(
         self,
         # mamba cache parameters
@@ -3164,11 +3170,70 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return MambaRole.SSM_STATE, None
         return super()._get_pool_roles(pool_id)
 
-    def _max_resident_sequences(self) -> int:
+    def _requested_resident_sequences(self) -> int:
+        """Sequences the configured ``max_batch_size`` asks to keep resident."""
         return self.max_batch_size * self.mapping.pp_size
+
+    def _max_resident_sequences(self) -> int:
+        if self._resident_sequence_cap is not None:
+            return self._resident_sequence_cap
+        return self._requested_resident_sequences()
+
+    def max_resident_sequences(self) -> Optional[int]:
+        """Number of sequences whose recurrent state can be resident at once."""
+        if self.local_num_mamba_layers == 0:
+            return None
+        return self._max_resident_sequences()
+
+    def _resident_sequences_for_quota(self, gpu_quota: int) -> int:
+        """Return how many sequences the GPU quota can keep resident.
+
+        A recurrent state is fixed-size per sequence and cannot be recomputed
+        from tokens, so every resident sequence permanently occupies one state
+        slot. ``max_batch_size`` is a ceiling, not an allocation contract, so a
+        request for more sequences than the quota can hold is bounded here
+        instead of becoming a hard allocation floor.
+
+        The per-sequence cost counts live states *plus* the attention pages the
+        sequence occupies: sizing on the state cost alone would admit sequences
+        whose states consume the whole quota and leave nothing for attention.
+        """
+        state_bytes = self._mamba_state_bytes_per_slot()
+        if state_bytes <= 0:
+            # Attention-only rank: nothing non-droppable to bound. Return the
+            # request itself so this rank stays neutral in the allreduce(MIN).
+            return self._requested_resident_sequences()
+
+        attention_block_bytes = self._attention_block_bytes()
+        # Residency is a *guarantee*, so it must be sized on the capacity a
+        # sequence can actually reach, not the average one. ``typical_capacity``
+        # is only a pool-ratio hint and defaults to max_seq_len / 2, which
+        # over-admits by ~2x on workloads where every sequence runs to
+        # max_seq_len: admission then fills the pool, and because recurrent
+        # state is non-droppable and resume() is refused past
+        # max_util_for_resume, the run has no way back out (nvbugs/6575476).
+        residency_capacity = max(
+            self._get_typical_request_capacity(self.kv_cache_config),
+            self.max_seq_len,
+        )
+        num_states = self._num_ssm_states_per_typical_request(
+            residency_capacity, self.kv_cache_config)
+        attention_blocks = math.ceil(residency_capacity / self.tokens_per_block)
+        per_sequence = (num_states * state_bytes +
+                        attention_blocks * attention_block_bytes)
+
+        # Reserved dummy slots and one attention page are charged up front:
+        # they exist regardless of how many real sequences are resident.
+        reserved = (self._num_reserved_dummy_slots * state_bytes +
+                    attention_block_bytes)
+        return (gpu_quota - reserved) // per_sequence
 
     def _mamba_state_bytes_per_slot(self) -> int:
         return self.local_num_mamba_layers * (self.ssm_bytes + self.conv_bytes)
+
+    def _attention_block_bytes(self) -> int:
+        """Bytes of one attention page across all local attention layers."""
+        return self._attention_cache_bytes_per_token() * self.tokens_per_block
 
     def _num_ssm_snapshots_for_capacity(
         self,
@@ -3251,8 +3316,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # attention page per request lineage. This remains conservative when
         # the plan contains fewer than one non-live slot per lineage.
         extra_attention_quota = (num_request_lineages *
-                                 self._attention_cache_bytes_per_token() *
-                                 self.tokens_per_block
+                                 self._attention_block_bytes()
                                  if snapshot_slots > 0 else 0)
         return attention_quota + state_quota + extra_attention_quota
 
@@ -3278,14 +3342,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states and one attention page."""
-        attention_block_quota = (self._attention_cache_bytes_per_token() *
-                                 self.tokens_per_block)
         num_state_slots = (self._max_resident_sequences() +
                            self._num_reserved_dummy_slots)
         state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
         return max(
             self._get_quota_from_max_tokens(0),
-            state_quota + attention_block_quota,
+            state_quota + self._attention_block_bytes(),
         )
 
     def _build_cache_config(
@@ -3293,6 +3355,24 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         kv_cache_config = self.kv_cache_config
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
+        requested_resident = self._requested_resident_sequences()
+        affordable_resident = self._resident_sequences_for_quota(gpu_quota)
+        if self.mapping.world_size > 1:
+            # Quotas and per-rank state costs differ across ranks (uneven mamba
+            # layer splits, attention-only PP ranks). Every rank must apply the
+            # same bound or the schedulers admit different batches and desync.
+            affordable_resident = Distributed.get(self.mapping).allreduce(
+                affordable_resident, op=ReduceOp.MIN)
+        if affordable_resident < requested_resident:
+            self._resident_sequence_cap = max(1, affordable_resident)
+            logger.warning(
+                f"The V2 Mamba GPU cache quota ({gpu_quota} bytes) cannot keep "
+                f"{requested_resident} sequences resident: each one holds a "
+                f"fixed {self._mamba_state_bytes_per_slot()} bytes of recurrent "
+                "state that cannot be evicted. Limiting concurrently resident "
+                f"sequences to {self._resident_sequence_cap}. Reduce "
+                "max_batch_size, or raise free_gpu_memory_fraction / "
+                "max_gpu_total_bytes, to run the requested batch size.")
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > gpu_quota:
             raise ValueError(
@@ -3316,14 +3396,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     ],
                 )
 
+        max_resident = self._max_resident_sequences()
         dummy_requests = [
             KVCacheDesc(capacity=0, history_length=0)
             for _ in range(self._num_reserved_dummy_slots)
         ]
+        # The base class sizes its warmup constraints from the requested
+        # max_batch_size. Every entry of a constraint costs one SSM slot (the
+        # planner never shares recurrent state between requests), so a
+        # constraint wider than the clamped residency would restore the very
+        # floor the clamp removed. Truncate to what can actually be resident.
         constraints = [
             replace(
                 batch,
-                kv_caches=[*batch.kv_caches, *dummy_requests],
+                kv_caches=[*batch.kv_caches[:max_resident], *dummy_requests],
             ) for batch in config.constraints
         ]
 
@@ -3333,8 +3419,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 kv_cache_config)
             request_descs = self._typical_request_descs(typical_capacity,
                                                         kv_cache_config)
-            typical_step = BatchDesc(request_descs *
-                                     self._max_resident_sequences() +
+            typical_step = BatchDesc(request_descs * max_resident +
                                      dummy_requests)
         # The recurrent (SSM) state pool must hold one slot per resident
         # sequence plus every reserved dummy slot. Unlike attention pages, a
@@ -3346,8 +3431,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # / __init__). Add a min-slots constraint of zero-capacity requests:
         # these cost no attention pages but reserve one SSM slot each.
         if any(isinstance(layer, SsmLayerConfig) for layer in layers):
-            ssm_floor_slots = (self._max_resident_sequences() +
-                               self._num_reserved_dummy_slots)
+            ssm_floor_slots = max_resident + self._num_reserved_dummy_slots
             constraints = [
                 *constraints,
                 BatchDesc([
