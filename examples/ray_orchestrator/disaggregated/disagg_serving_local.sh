@@ -1,11 +1,14 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # Parse command line arguments
 BACKEND="ray"
 ATTACH_MODE=false
 MODEL_DIR="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TP_SIZE=1
-USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--help]"
+TRANSCEIVER_RUNTIME="CPP"
+USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_runtime CPP|PYTHON] [--help]"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -25,6 +28,10 @@ while [[ $# -gt 0 ]]; do
             TP_SIZE="$2"
             shift 2
             ;;
+        --transceiver_runtime)
+            TRANSCEIVER_RUNTIME="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "$USAGE"
             echo "Options:"
@@ -32,6 +39,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --attach             Attach to existing ray cluster (skip ray start/stop)"
             echo "  --model model_dir    Model directory (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)"
             echo "  --tp_size N          Tensor parallel size (default: 1)"
+            echo "  --transceiver_runtime CPP|PYTHON  Cache transceiver runtime (default: CPP)"
             echo "  --help, -h           Show this help message"
             exit 0
             ;;
@@ -49,8 +57,15 @@ if [[ "$BACKEND" != "ray" && "$BACKEND" != "mpi" ]]; then
     exit 1
 fi
 
+if [[ "$TRANSCEIVER_RUNTIME" != "CPP" && "$TRANSCEIVER_RUNTIME" != "PYTHON" ]]; then
+    echo "Error: Cache transceiver runtime must be either 'CPP' or 'PYTHON'"
+    echo "$USAGE"
+    exit 1
+fi
+
 echo "Executor: $BACKEND"
 echo "Tensor parallel size: $TP_SIZE"
+echo "Cache transceiver: NIXL ($TRANSCEIVER_RUNTIME runtime)"
 if [[ "$ATTACH_MODE" == "true" ]]; then
     echo "Attach mode enabled - will not manage ray cluster"
 fi
@@ -61,7 +76,8 @@ if [[ "$BACKEND" == "ray" ]]; then
     cat > extra_llm_config.yaml << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
 cache_transceiver_config:
-    backend: "UCX"
+    backend: "NIXL"
+    transceiver_runtime: "$TRANSCEIVER_RUNTIME"
     max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 # Ray executor configuration
@@ -71,7 +87,8 @@ else
     cat > extra_llm_config.yaml << EOF
 # extra_llm_config.yaml when launching disaggregated server instances.
 cache_transceiver_config:
-    backend: "UCX"
+    backend: "NIXL"
+    transceiver_runtime: "$TRANSCEIVER_RUNTIME"
     max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 # Using default executor MPI (no orchestrator_type specified)
@@ -94,7 +111,8 @@ context_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
   cache_transceiver_config:
-    backend: "UCX"
+    backend: "NIXL"
+    transceiver_runtime: "$TRANSCEIVER_RUNTIME"
   urls:
       - "localhost:8001"
 generation_servers:
@@ -102,7 +120,8 @@ generation_servers:
   tensor_parallel_size: $TP_SIZE
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: "UCX"
+    backend: "NIXL"
+    transceiver_runtime: "$TRANSCEIVER_RUNTIME"
   urls:
       - "localhost:8002"
 EOF
