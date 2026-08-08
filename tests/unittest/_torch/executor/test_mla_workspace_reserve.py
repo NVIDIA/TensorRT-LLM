@@ -27,9 +27,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import _util
+from tensorrt_llm._torch.attention_backend import trtllm as trtllm_backend
 from tensorrt_llm._torch.pyexecutor._util import (
-    get_mla_context_workspace_bytes_per_token,
+    get_attention_workspace_bytes_per_token,
     get_mla_context_workspace_kv_len_cap,
     get_mla_context_workspace_reserve,
 )
@@ -171,9 +171,25 @@ def test_kv_len_cap_none_when_reuse_cannot_grow_workspace(
 
 
 def test_workspace_bytes_zero_for_non_mla_model():
-    # No kv_lora_rank on the config -> not MLA -> 0 (early return, no binding call needed).
-    model_config = SimpleNamespace(pretrained_config=SimpleNamespace(), quant_config=None)
-    assert get_mla_context_workspace_bytes_per_token(model_config, Mock()) == 0
+    # No kv_lora_rank on the config -> the TRTLLM backend declares no reservation -> 0 (early return, no
+    # binding call needed). Exercises the full resolve-backend path, not just the TRTLLM classmethod.
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(), quant_config=None, attn_backend="TRTLLM"
+    )
+    assert get_attention_workspace_bytes_per_token(model_config, Mock()) == 0
+
+
+def test_workspace_bytes_zero_for_backend_without_declaration():
+    # A backend that stages no runtime-scaled workspace inherits the default 0 from AttentionBackend, so
+    # the estimator reserves nothing and the scheduler applies no admission cap for it -- even for an MLA
+    # model that the TRTLLM backend would charge for. VANILLA is used because it always resolves (FLASHINFER
+    # silently falls back to TRTLLM when flashinfer is not installed).
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=None,
+        attn_backend="VANILLA",
+    )
+    assert get_attention_workspace_bytes_per_token(model_config, Mock()) == 0
 
 
 def _fp8_mla_model_config(sparse_algorithm):
@@ -191,6 +207,7 @@ def _fp8_mla_model_config(sparse_algorithm):
         ),
         quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp8_kv_cache=lambda: True)),
         sparse_attention_config=sparse_cfg,
+        attn_backend="TRTLLM",
     )
 
 
@@ -216,9 +233,9 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
 ):
     # Reporting w == 0 for a config that still stages the fp8 K/V buffers reserves nothing and installs no
     # admission cap -- exactly the mid-forward OOM this reservation exists to prevent.
-    monkeypatch.setattr(_util, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: sm)
     monkeypatch.setenv("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", short_seq_mha)
-    w = get_mla_context_workspace_bytes_per_token(
+    w = get_attention_workspace_bytes_per_token(
         _fp8_mla_model_config(sparse_algorithm),
         SimpleNamespace(enable_attention_dp=False, tp_size=8),
     )
@@ -307,6 +324,16 @@ def test_ctx_cap_none_when_no_reservation(manager):
     # A carried None (or absent) cap means no headroom to enforce -> admission disabled, no crash.
     exe = _executor_with_manager(manager)
     assert exe._get_ctx_mla_kv_len_cap() is None
+
+
+def test_ctx_cap_zero_is_a_cap_not_no_cap():
+    # A budget so tight the reserve covers under one token carries 0. Collapsing that into None would
+    # disable admission control for exactly the case it is most needed -- it must stay a real cap.
+    exe = _executor_with_manager(SimpleNamespace(fp8_ctx_mla_kv_len_cap=0))
+    assert exe._get_ctx_mla_kv_len_cap() == 0
+    # Enforced as a cap: everything past the first request (the forward-progress guard) is deferred.
+    reqs = [_ctx_req(0, True, 0, 50, 50) for _ in range(3)]
+    assert len(exe._cap_context_by_total_kv_len(reqs)) == 1
 
 
 def test_ctx_cap_no_cap_during_warmup():
