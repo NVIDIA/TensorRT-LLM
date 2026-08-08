@@ -114,8 +114,10 @@ def _run_tune(args) -> None:
     block_m = triton.next_power_of_2(num_tokens)
 
     floor = _measure_floor(args)
+    baseline = _time_cublas(x, w, args, tf32=True)
     print(f"\nTuning at {num_tokens} tokens, {args.num_experts} experts, ", end="")
-    print(f"hidden {args.hidden_size}; harness floor {floor:.2f} us/call\n")
+    print(f"hidden {args.hidden_size}; harness floor {floor:.2f} us/call")
+    print(f"cublas tf32 baseline at this token count: {baseline:.2f} us\n")
     print(f"{'BLOCK_K':>8s} {'warps':>6s} {'us':>8s}")
 
     results = []
@@ -147,7 +149,10 @@ def _run_tune(args) -> None:
             print(f"{block_k:8d} {num_warps:6d} {elapsed:8.2f}")
 
     best = min(results)
-    print(f"\nbest: BLOCK_K={best[1]} num_warps={best[2]} at {best[0]:.2f} us")
+    print(
+        f"\nbest: BLOCK_K={best[1]} num_warps={best[2]} at {best[0]:.2f} us, "
+        f"{baseline / best[0]:.2f}x the cublas baseline"
+    )
 
 
 def main() -> None:
