@@ -201,7 +201,6 @@ class BaseWorker(GenerationExecutor):
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
-                    mx_model_name=self.llm_args.model,
                 )
 
             self.max_seq_len = self.llm_args.max_seq_len
