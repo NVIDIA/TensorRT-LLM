@@ -480,6 +480,27 @@ def test_moe_allreduce_patterns(mpi_pool_executor):
         assert r is True
 
 
+def make_moe_finalize_inputs(seq_len, hidden_size, top_k, dtype):
+    """Build the host-side inputs for the deferred MoE finalize tests.
+
+    Returned in the order run_moe_finalize_single_rank takes them. Seeded here
+    so a given shape yields the same tensors for every caller.
+    """
+    torch.manual_seed(42)
+
+    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
+    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
+    scale = torch.randn((seq_len, top_k), dtype=dtype)
+    expanded_idx_to_permuted_idx = torch.randint(0,
+                                                 seq_len * top_k,
+                                                 (seq_len, top_k),
+                                                 dtype=torch.int32)
+    residual = torch.randn_like(shared_expert_output)
+
+    return (fc2_output, residual, shared_expert_output,
+            expanded_idx_to_permuted_idx, scale)
+
+
 def run_moe_finalize_single_rank(tensor_parallel_size, single_rank_forward_func,
                                  fc2_output, residual, shared_expert_output,
                                  expanded_idx_to_permuted_idx, scale):
@@ -565,30 +586,128 @@ def run_moe_finalize_allreduce_op(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_moe_finalize_allreduce_patterns(mpi_pool_executor):
+def run_moe_finalize_allreduce_accumulation_precision_op(
+        fc2_output: torch.Tensor, residual: torch.Tensor,
+        shared_expert_output: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor, scale: torch.Tensor,
+        tensor_parallel_rank: int, tensor_parallel_size: int):
+    """The deferred MoE finalize must accumulate the top-k sum in fp32.
+
+    Rounding after every top_k term instead is silent per-kernel but compounds
+    across routed MoE layers into a large accuracy loss (https://nvbugs/6483369:
+    MMLU 87.2 -> 61.9), and the rtol/atol=0.2 of the sibling pattern tests
+    passes either accumulator, so they cannot catch a regression.
+
+    An absolute error bound would be hardware- and top_k-dependent, so instead
+    compare the kernel against BOTH candidate references and assert it is
+    closer to the fp32 one: the two bracket it, so the check self-calibrates.
+    """
+    # Every rank must derive the same norm_weight below, as in the sibling ops.
     torch.manual_seed(42)
 
-    seq_len = 16
-    hidden_size = 7168
-    dtype = torch.bfloat16
-    tensor_parallel_size = mpi_pool_executor.num_workers
-    top_k = 8
+    fc2_output = fc2_output.cuda()
+    residual = residual.cuda()
+    shared_expert_output = shared_expert_output.cuda()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
+    scale = scale.cuda()
 
-    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
-    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
-    scale = torch.randn((seq_len, top_k), dtype=dtype)
-    expanded_idx_to_permuted_idx = torch.randint(0,
-                                                 seq_len * top_k,
-                                                 (seq_len, top_k),
-                                                 dtype=torch.int32)
-    residual = torch.randn_like(shared_expert_output)
+    dtype = fc2_output.dtype
+    hidden_size = residual.shape[1]
+    top_k = scale.shape[1]
+    eps = 1e-5
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+
+    moe_allreduce = MoEAllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    ))
+
+    moe_all_reduce_params = MoEAllReduceParams(
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        expert_scale_factor=scale,
+        shared_expert_output=shared_expert_output,
+        residual=residual,
+        norm_weight=norm_weight,
+        eps=eps,
+        is_cutlass_min_latency=False,
+    )
+
+    output_hidden_states, _ = moe_allreduce(
+        fc2_output, all_reduce_params=moe_all_reduce_params)
+
+    permuted = fc2_output[expanded_idx_to_permuted_idx]
+
+    # Reference A: fp32 accumulation, rounded to dtype once (correct kernel).
+    acc_fp32 = (permuted.float() * scale.unsqueeze(-1).float()).sum(dim=1)
+    acc_fp32 = (acc_fp32 + shared_expert_output.float()).to(dtype)
+
+    # Reference B: dtype accumulation, rounded after every term (the bug).
+    # Staying in dtype throughout is what rounds each term, so no casts here.
+    acc_dtype = torch.zeros_like(shared_expert_output)
+    for k in range(top_k):
+        acc_dtype = acc_dtype + permuted[:, k] * scale[:, k].unsqueeze(-1)
+    acc_dtype = acc_dtype + shared_expert_output
+
+    def rel_rms_vs(expert_sum):
+        """Relative RMS distance from the kernel to a reference expert sum."""
+        pre_norm = expert_sum.float() * tensor_parallel_size + residual.float()
+        ref = rms_norm(pre_norm, norm_weight.float(), eps)
+        actual = output_hidden_states.float()
+        return ((actual - ref).pow(2).mean().sqrt() /
+                ref.pow(2).mean().sqrt()).item()
+
+    err_vs_fp32 = rel_rms_vs(acc_fp32)
+    err_vs_dtype = rel_rms_vs(acc_dtype)
+
+    # The two references differ by ~2.4x (top_k=8) up to ~8x (top_k=128) in
+    # relative RMS error, so an fp32-accumulating kernel sits much nearer
+    # reference A. Requiring a 1.5x margin keeps this robust to the remaining
+    # bf16 rounding of the single final store.
+    assert err_vs_fp32 * 1.5 < err_vs_dtype, (
+        "Deferred MoE finalize appears to accumulate in "
+        f"{dtype} rather than fp32: relative RMS error vs the fp32 reference "
+        f"({err_vs_fp32:.3e}) is not clearly below the error vs the "
+        f"{dtype} reference ({err_vs_dtype:.3e}). See https://nvbugs/6483369.")
+
+    return True
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("top_k", [8, 32])
+def test_moe_finalize_allreduce_accumulation_precision(mpi_pool_executor,
+                                                       top_k):
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    inputs = make_moe_finalize_inputs(seq_len=16,
+                                      hidden_size=7168,
+                                      top_k=top_k,
+                                      dtype=torch.bfloat16)
 
     results = mpi_pool_executor.map(
         run_moe_finalize_single_rank,
-        *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_op, fc2_output,
-                residual, shared_expert_output, expanded_idx_to_permuted_idx,
-                scale)] * tensor_parallel_size),
+        *zip(
+            *[(tensor_parallel_size,
+               run_moe_finalize_allreduce_accumulation_precision_op, *inputs)] *
+            tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_finalize_allreduce_patterns(mpi_pool_executor):
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    inputs = make_moe_finalize_inputs(seq_len=16,
+                                      hidden_size=7168,
+                                      top_k=8,
+                                      dtype=torch.bfloat16)
+
+    results = mpi_pool_executor.map(
+        run_moe_finalize_single_rank,
+        *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_op, *inputs)] *
+             tensor_parallel_size),
     )
     for r in results:
         assert r is True
