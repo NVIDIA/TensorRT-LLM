@@ -162,6 +162,12 @@ class BaseResourceManager(ABC):
     def shutdown(self):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()
+
 
 def get_pp_layers(
     num_layers: int,

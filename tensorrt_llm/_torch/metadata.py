@@ -30,6 +30,11 @@ class KVCacheParams:
     # The number of extra kv for draft tokens
     num_extra_kv_tokens: Optional[int] = 0
 
+    # Stage every reserved generation page when device-resident speculative
+    # state can advance the runtime KV length past the host logical snapshot.
+    # The attention backend must carry the logical length independently.
+    use_full_generation_page_table: bool = False
+
 
 class CacheType(Enum):
     # Linear KV cache stores all the cached tokens of a sequence in a single page.

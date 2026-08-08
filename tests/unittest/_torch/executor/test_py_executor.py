@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1955,12 +1956,17 @@ class TestOneModelMTPDraftTokenScheduling:
     forward then builds a uniform ``1 + runtime_draft_len`` per gen request and
     overshoots ``max_num_tokens`` (``total_num_tokens > max_num_tokens``).
 
-    The fix populates ``request.draft_tokens = [0] * max_total_draft_tokens``
-    on every in-progress generation request so scheduling reserves the correct
-    token budget. This test drives ``_prepare_and_schedule_batch`` for a
-    one-model-MTP executor and asserts generation requests get
-    ``num_draft_tokens == max_total_draft_tokens`` while context requests are
-    left untouched.
+    The fix populates both the Python and C++ draft-token representations on
+    every in-progress generation request so both schedulers reserve the
+    correct token budget. This test drives ``_prepare_and_schedule_batch`` for
+    a one-model-MTP executor and asserts generation requests get the full
+    draft-token budget while context requests are left untouched.
+
+    The Python-side fill is placeholder-only: with the overlap scheduler
+    disabled, `_prepare_tp_inputs` sources a generation request's draft
+    tokens from `py_draft_tokens`, which the one-model spec sampler wrote at
+    the end of the previous iteration. Overwriting a populated list here would
+    feed zeros to the target model and collapse the acceptance rate.
 
     NOTE: Like ``test_fetch_called_once_even_in_benchmark_disagg`` in
     ``test_benchmark_disagg.py``, this uses ``object.__new__(PyExecutor)`` to
@@ -2034,6 +2040,8 @@ class TestOneModelMTPDraftTokenScheduling:
         # Precondition: no draft tokens reserved yet on either gen request.
         assert gen.num_draft_tokens == 0
         assert disagg_gen.num_draft_tokens == 0
+        assert gen.py_draft_tokens == []
+        assert disagg_gen.py_draft_tokens == []
 
         ex = self._make_one_model_mtp_executor([gen, disagg_gen, ctx])
         scheduled_batch, _ = ex._prepare_and_schedule_batch()
@@ -2043,7 +2051,103 @@ class TestOneModelMTPDraftTokenScheduling:
         # full draft-token budget so the micro-batch scheduler reserves
         # beam + max_total_draft_tokens.
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Disaggregated case: decode-worker request awaiting KV also normalized.
         assert disagg_gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert disagg_gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Context requests are not generation requests and must be left alone.
         assert ctx.num_draft_tokens == 0
+        assert ctx.py_draft_tokens == []
+
+    def test_one_model_mtp_preserves_sampler_draft_tokens(self):
+        """Normalization must not clobber real draft tokens.
+
+        With `disable_overlap_scheduler=True` the one-model spec sampler writes the next iteration's
+        draft tokens into `py_draft_tokens`, and `_prepare_tp_inputs` reads them straight back into
+        `input_ids` / `draft_tokens_cuda` (there is no previous-iteration device tensor to source
+        them from). Overwriting them with the zero placeholder leaves the target model verifying
+        token id 0, silently dropping the acceptance rate to chance.
+        Only the C++ count needs unconditional normalization.
+        """
+        sampler_drafts = [7, 8, 9]
+        assert len(sampler_drafts) == self.MAX_TOTAL_DRAFT_TOKENS
+
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.py_draft_tokens = list(sampler_drafts)
+
+        ex = self._make_one_model_mtp_executor([gen])
+        ex._prepare_and_schedule_batch()
+
+        assert gen.py_draft_tokens == sampler_drafts
+        # The C++ count is still normalized for the micro-batch scheduler.
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+
+    @classmethod
+    def _make_runtime_draft_executor(cls, disable_overlap_scheduler: bool):
+        ex = object.__new__(PyExecutor)
+        spec_config = MTPDecodingConfig(
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            mtp_eagle_one_model=True,
+        )
+        ex.model_engine = Mock(
+            spec_config=spec_config,
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            max_total_draft_tokens=cls.MAX_TOTAL_DRAFT_TOKENS,
+        )
+        ex.disable_overlap_scheduler = disable_overlap_scheduler
+        ex.speculation_permanently_disabled = False
+        ex.max_seq_len = 16
+        return ex
+
+    @classmethod
+    def _make_generation_batch(cls, *sequence_lengths: int):
+        batch = ScheduledRequests()
+        for request_id, sequence_length in enumerate(sequence_lengths):
+            request = LlmRequest(
+                request_id=request_id,
+                max_new_tokens=10,
+                input_tokens=list(range(sequence_length)),
+                sampling_config=SamplingConfig(1),
+                is_streaming=False,
+                draft_tokens=None,
+            )
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            request.py_draft_tokens = [7, 8, 9]
+            batch.append_generation_request(request)
+        return batch
+
+    @pytest.mark.parametrize(
+        "disable_overlap_scheduler,sequence_length",
+        [
+            (False, 10),
+            (True, 14),
+        ],
+    )
+    def test_one_model_mtp_uses_zero_draft_near_sequence_limit(
+        self, disable_overlap_scheduler, sequence_length
+    ):
+        ex = self._make_runtime_draft_executor(disable_overlap_scheduler)
+        batch = self._make_generation_batch(sequence_length, 4)
+
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == 0
+        assert all(request.py_draft_tokens == [] for request in batch.generation_requests)
+
+    @pytest.mark.parametrize(
+        "disable_overlap_scheduler,sequence_length",
+        [
+            (False, 9),
+            (True, 13),
+        ],
+    )
+    def test_one_model_mtp_keeps_drafting_with_position_headroom(
+        self, disable_overlap_scheduler, sequence_length
+    ):
+        ex = self._make_runtime_draft_executor(disable_overlap_scheduler)
+        batch = self._make_generation_batch(sequence_length)
+
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert batch.generation_requests[0].py_draft_tokens == [7, 8, 9]

@@ -20,7 +20,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, List, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -87,6 +87,29 @@ def _slice_paged_kv_cache_heads(
     index = [slice(None)] * 5
     index[head_axis] = slice(start, end)
     return paged_kv_cache[tuple(index)]
+
+
+def _get_page_table_num_blocks(kv_cache_manager, request_ids,
+                               logical_num_blocks: List[int],
+                               num_contexts: int) -> List[int]:
+    """Keep context rows logical and expose every reserved generation page."""
+    if hasattr(kv_cache_manager, "kv_cache_map"):
+        reserved_num_blocks = [
+            kv_cache_manager.kv_cache_map[req_id].num_blocks
+            for req_id in request_ids
+        ]
+    else:
+        # V1 keeps allocation state behind the C++ manager.  Asking for the
+        # untrimmed page tables is its public equivalent of V2's num_blocks.
+        reserved_num_blocks = [
+            len(block_ids) for block_ids in
+            kv_cache_manager.get_batch_cache_indices(request_ids)
+        ]
+    return list(logical_num_blocks[:num_contexts]) + [
+        max(logical, reserved)
+        for logical, reserved in zip(logical_num_blocks[num_contexts:],
+                                     reserved_num_blocks[num_contexts:])
+    ]
 
 
 def _append_paged_kv_cache(
@@ -767,6 +790,78 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             num_accepted_tokens[num_contexts:num_seqs])
         self._update_draft_kv_lengths()
 
+    def apply_spec_decode_kv_lens_offsets(
+        self,
+        offsets: torch.Tensor,
+        num_generations: int,
+        tokens_per_generation: int,
+        *,
+        restore: bool = False,
+    ) -> None:
+        """Apply overlap-scheduler KV rewinds to FlashInfer decode state.
+
+        ``prepare()`` builds the target page-table metadata from the maximum
+        speculative step width.  With the overlap scheduler, the actual number
+        of accepted tokens is still device-resident, so generation rows can be
+        shorter than that host-side upper bound.  Keep every device consumer of
+        the runtime KV length in lockstep without synchronizing back to the host.
+        """
+        if self._is_shared_kv_draft_view or self._is_separate_kv_draft_view:
+            raise RuntimeError(
+                "Speculative KV offsets must be applied to target metadata")
+        if num_generations == 0:
+            return
+
+        direction = -1 if restore else 1
+        num_contexts = self.num_contexts
+        row_slice = slice(num_contexts, num_contexts + num_generations)
+        generation_offsets = offsets[:num_generations]
+
+        self._cached_token_lens[row_slice].add_(generation_offsets,
+                                                alpha=direction)
+
+        # Keep the host-preallocated page structure intact. In particular,
+        # last_page_len must stay consistent with paged_kv_indptr: changing
+        # only one of them at a page boundary would describe a different KV
+        # length. Appends use the corrected explicit positions below, while
+        # trtllm-gen decode uses its corrected _kv_lens_buffer.
+
+        num_ctx_tokens = self.num_ctx_tokens
+        num_generation_tokens = num_generations * tokens_per_generation
+        token_offsets = generation_offsets.repeat_interleave(
+            tokens_per_generation)
+        self._positions[num_ctx_tokens:num_ctx_tokens +
+                        num_generation_tokens].add_(token_offsets,
+                                                    alpha=direction)
+
+        # trtllm-gen decode wrappers own a separate persistent logical-length
+        # buffer, including under CUDA graphs. Publish the exact lengths rather
+        # than incrementing the existing values: mixed prefill/decode batches
+        # may have re-planned a wrapper from the structural page-table upper
+        # bound after overlap preprocessing.
+        for wrappers in self._plan_params_to_wrappers.values():
+            self._publish_decode_wrapper_kv_lens(wrappers.decode_wrapper)
+
+    def _publish_decode_wrapper_kv_lens(self, decode_wrapper) -> None:
+        """Publish device-logical lengths after a trtllm-gen decode plan."""
+        kv_lens_buffer = getattr(decode_wrapper, "_kv_lens_buffer", None)
+        if kv_lens_buffer is None or self.num_generations == 0:
+            return
+        start = self.num_contexts
+        end = start + self.num_generations
+        if self._is_shared_kv_draft_view:
+            # The external assistant is Q-only and does not append its query to
+            # the target KV cache. Its cached length is already the full
+            # accepted target prefix.
+            kv_lens_buffer[:self.num_generations].copy_(
+                self._cached_token_lens[start:end])
+        else:
+            torch.add(
+                self._cached_token_lens[start:end],
+                self.seq_lens_kv_cuda[start:end],
+                out=kv_lens_buffer[:self.num_generations],
+            )
+
     def _prepare_full_draft_page_table(self) -> None:
         """Expose every allocated draft page and use device KV lengths."""
         if self._uses_full_draft_page_table:
@@ -812,19 +907,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         self.page_size,
                         out=self._paged_kv_last_page_len[:num_seqs])
         self._paged_kv_last_page_len[:num_seqs].add_(1)
-        if self._is_shared_kv_draft_view:
-            return
+        if not self._is_shared_kv_draft_view:
+            self._cached_token_lens[:num_seqs].sub_(1)
+            self._positions[:num_seqs].copy_(self._cached_token_lens[:num_seqs])
+            torch.arange(num_seqs + 1,
+                         dtype=torch.int32,
+                         device=self._qo_indptr.device,
+                         out=self._qo_indptr[:num_seqs + 1])
+            torch.arange(num_seqs,
+                         dtype=torch.int32,
+                         device=self._batch_indices.device,
+                         out=self._batch_indices[:num_seqs])
 
-        self._cached_token_lens[:num_seqs].sub_(1)
-        self._positions[:num_seqs].copy_(self._cached_token_lens[:num_seqs])
-        torch.arange(num_seqs + 1,
-                     dtype=torch.int32,
-                     device=self._qo_indptr.device,
-                     out=self._qo_indptr[:num_seqs + 1])
-        torch.arange(num_seqs,
-                     dtype=torch.int32,
-                     device=self._batch_indices.device,
-                     out=self._batch_indices[:num_seqs])
+        # CUDA-graph draft wrappers retain the plan's private logical-length
+        # buffer. Keep it synchronized with every accepted-prefix update.
+        for wrappers in self._plan_params_to_wrappers.values():
+            self._publish_decode_wrapper_kv_lens(wrappers.decode_wrapper)
 
     def update_for_spec_dec(self) -> None:
         if not self._is_separate_kv_draft_view:
@@ -886,6 +984,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
+        self._logical_kv_lens = self.get_empty(
+            buffers,
+            (self.max_num_requests, ),
+            dtype=torch.int,
+            cache_name="_logical_kv_lens",
+            capture_graph=capture_graph,
+        )
         self._draft_kv_runtime_lens = self.get_empty(
             buffers,
             (self.max_num_requests, ),
@@ -909,6 +1014,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_pool_indices: Dict[int, torch.Tensor] = {}
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
+        self._uses_full_generation_page_table = False
         self._max_num_blocks_per_seq = 0
 
         # VSWA (Variable Sliding Window Attention): models with per-layer
@@ -1396,9 +1502,25 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # so a device-side computation would force a sync per step.
         kv_lens_host = np.asarray(num_cached_tokens_per_seq,
                                   dtype=np.int64) + self.seq_lens_kv.numpy()
-        num_blocks = (kv_lens_host + self.page_size - 1) // self.page_size
+        logical_num_blocks = ((kv_lens_host + self.page_size - 1) //
+                              self.page_size)
+        num_blocks = logical_num_blocks
+        use_full_generation_page_table = bool(
+            getattr(self.kv_cache_params, "use_full_generation_page_table",
+                    False))
+        self._uses_full_generation_page_table = use_full_generation_page_table
+        if use_full_generation_page_table:
+            assert self.request_ids is not None
+            num_blocks = np.asarray(
+                _get_page_table_num_blocks(
+                    self.kv_cache_manager,
+                    self.request_ids,
+                    logical_num_blocks.tolist(),
+                    self.num_contexts,
+                ),
+                dtype=np.int64,
+            )
         self.num_blocks = num_blocks.tolist()
-
         assert self.request_ids is not None
 
         # start and end indices of each sequence in the ragged key and value
@@ -1464,9 +1586,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_active_pool_id = primary_pool_id
 
         # number of tokens in the last cache block used by each sequence,
-        # derived on the host so no GPU arithmetic or sync is needed.
+        # derived from the logical (not reservation-width) page count.
         paged_kv_last_page_len = _to_int32_tensor(kv_lens_host -
-                                                  (num_blocks - 1) *
+                                                  (logical_num_blocks - 1) *
                                                   self.page_size)
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
@@ -1509,11 +1631,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # For cross attention, num_tokens is 0 during decode, and we don't need to update kv cache.
         if self.num_tokens > 0:
+            if use_full_generation_page_table:
+                logical_kv_lens = _to_int32_tensor(kv_lens_host)
+                self._logical_kv_lens[:logical_kv_lens.numel()].copy_(
+                    logical_kv_lens, non_blocking=True)
+                position_kv_lens = self._logical_kv_lens[:self.num_seqs]
+            else:
+                position_kv_lens = flashinfer.get_seq_lens(
+                    self.paged_kv_indptr,
+                    self.paged_kv_last_page_len,
+                    self.page_size,
+                )
             batch_indices, positions = flashinfer.get_batch_indices_positions(
                 self.kv_indptr,
-                flashinfer.get_seq_lens(self.paged_kv_indptr,
-                                        self.paged_kv_last_page_len,
-                                        self.page_size),
+                position_kv_lens,
                 self.num_tokens,
             )
             self._batch_indices[:batch_indices.size(0)].copy_(batch_indices,
@@ -1858,6 +1989,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         def decode_plan():
             assert decode_wrapper is not None
+            if (self._uses_full_generation_page_table
+                    and decode_wrapper._backend != "trtllm-gen"):
+                raise ValueError(
+                    "Reservation-width FlashInfer page tables require the "
+                    "trtllm-gen decode backend's independent KV lengths.")
             # Host int32 indptr (retained by prepare, which always runs
             # before plans): flashinfer moves it to the device itself, and
             # its indptr.cpu()/get_seq_lens calls stay free of D2H syncs.
@@ -1885,6 +2021,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 o_data_type=o_dtype,
                 block_tables=block_tables,
             )
+            # plan() rebuilds trtllm-gen's private KV-length buffer from the
+            # structural page table. In a mixed overlap batch this plan can run
+            # after _preprocess_inputs() has applied the device acceptance
+            # rewind, so republish the corrected logical lengths immediately.
+            self._publish_decode_wrapper_kv_lens(decode_wrapper)
 
         # Must sync after append_paged_kv_cache and before plan.
         torch.cuda.current_stream().synchronize()

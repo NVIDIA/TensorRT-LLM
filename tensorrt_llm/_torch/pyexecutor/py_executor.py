@@ -3303,6 +3303,39 @@ class PyExecutor:
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
 
+        if self._one_model_mtp_batch_needs_zero_draft(scheduled_batch):
+            # The target input width is batch-wide, so one unsafe request must
+            # disable drafting for every generation request in this batch.
+            for request in scheduled_batch.generation_requests:
+                request.py_draft_tokens = []
+            self.model_engine.runtime_draft_len = 0
+
+    def _one_model_mtp_batch_needs_zero_draft(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        """Return whether drafting could produce an out-of-range position."""
+        spec_config = self.model_engine.spec_config
+        runtime_draft_len = self.model_engine.runtime_draft_len
+        if (runtime_draft_len == 0 or spec_config is None
+                or not spec_config.spec_dec_mode.is_mtp_eagle_one_model()):
+            return False
+
+        # With overlap, the host request has not incorporated the previous
+        # iteration's accepted tokens yet. _preprocess_inputs adds that count
+        # to every target position on device. Use the maximum possible count
+        # because reading the exact value here would synchronize the GPU.
+        max_pending_tokens = (0 if self.disable_overlap_scheduler else
+                              self.model_engine.max_draft_len + 1)
+        target_position_width = spec_config.get_runtime_tokens_per_gen_step(
+            runtime_draft_len)
+
+        for request in scheduled_batch.generation_requests:
+            max_target_position = (request.max_beam_num_tokens - 1 +
+                                   max_pending_tokens + target_position_width -
+                                   1)
+            if max_target_position >= self.max_seq_len:
+                return True
+        return False
+
     @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
@@ -3697,6 +3730,15 @@ class PyExecutor:
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+                # Only fill in a placeholder when the Python-side list is empty (e.g. a
+                # DISAGG_GENERATION_INIT request, which never gets a draft snapshot). Overwriting it
+                # unconditionally would clobber the real draft tokens the one-model spec sampler
+                # wrote at the end of the previous iteration - which the overlap-disabled path
+                # reads back in `_prepare_tp_inputs` - and would also suppress the
+                # `current_num_draft_tokens == 0` signal that `_handle_dynamic_draft_len` uses to
+                # request a one-hot draft-probs placeholder under rejection sampling.
+                if not request.py_draft_tokens:
+                    request.py_draft_tokens = [0] * self.max_total_draft_tokens
                 request.draft_tokens = [0] * self.max_total_draft_tokens
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
