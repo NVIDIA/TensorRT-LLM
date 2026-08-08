@@ -2238,6 +2238,7 @@ class TestVideoZeroFrameDerivationRejected:
         declares a ``frame_rate``: the parser must reject the request with
         HTTP 400 instead of silently dropping the duration and returning the
         pipeline's default ``num_frames``."""
+        video_client.mock_gen.executor.default_generation_params.pop("frame_rate", None)
         resp = video_client.post(
             "/v1/videos/generations",
             json={
