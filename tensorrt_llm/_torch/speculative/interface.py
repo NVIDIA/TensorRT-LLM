@@ -1032,6 +1032,7 @@ class SpecWorkerBase(nn.Module, ABC):
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
+        self._saved_num_contexts: Optional[int] = None
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
         self._d2t: Optional[torch.Tensor] = None
@@ -1198,17 +1199,23 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+    def _prepare_attn_metadata_for_spec_dec(
+            self, attn_metadata: AttentionMetadata) -> None:
         """
         Prepare attention metadata before speculative decoding draft token generation.
         Saves current state for later restoration.
         """
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._saved_num_contexts = attn_metadata.num_contexts
 
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+    def _restore_attn_metadata_from_spec_dec(
+            self, attn_metadata: AttentionMetadata) -> None:
         """
         Restore attention metadata after speculative decoding draft token generation.
         """
+        if self._saved_num_contexts is not None:
+            attn_metadata.num_contexts = self._saved_num_contexts
+            self._saved_num_contexts = None
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 

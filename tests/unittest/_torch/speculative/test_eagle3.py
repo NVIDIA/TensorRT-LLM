@@ -21,7 +21,8 @@ from tensorrt_llm._torch.pyexecutor._util import \
     _derive_draft_max_attention_window
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
+from tensorrt_llm._torch.speculative.eagle3 import (Eagle3OneModelSpecMetadata,
+                                                    Eagle3OneModelWorker)
 from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
     MTPEagleDynamicTreeWorker
 from tensorrt_llm.executor.request import LoRARequest
@@ -30,6 +31,38 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_eagle_metadata_restore_preserves_context_metadata() -> None:
+    metadata = TrtllmAttentionMetadata(
+        seq_lens=None,
+        seq_lens_kv=None,
+        num_contexts=1,
+        max_num_requests=2,
+        max_num_tokens=4,
+    )
+    metadata._seq_lens = torch.tensor([3, 1], dtype=torch.int32)
+    metadata._seq_lens_cuda = metadata._seq_lens.clone()
+    metadata.on_update()
+    worker = object.__new__(Eagle3OneModelWorker)
+    worker._saved_num_contexts = None
+    worker._prepare_attn_metadata_for_spec_dec(metadata)
+    metadata._seq_lens.fill_(1)
+    metadata._seq_lens_cuda.fill_(1)
+    metadata.on_update()
+    metadata.num_contexts = 0
+    assert metadata.num_contexts == 0
+    assert metadata.num_ctx_tokens == 0
+    assert metadata.num_generations == 2
+
+    worker._restore_attn_metadata_from_spec_dec(metadata)
+
+    assert metadata._num_tokens == 4
+    assert metadata.num_contexts == 1
+    assert metadata.num_ctx_tokens == 3
+    assert metadata._num_generations == 1
+    assert metadata.context_lens.tolist() == [3]
+    assert worker._saved_num_contexts is None
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
