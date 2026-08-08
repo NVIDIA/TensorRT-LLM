@@ -278,6 +278,18 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    nccl_buffer_reg: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Enable NCCL CUMEM mode for zero-copy-ready collectives by setting "
+            "NCCL_CUMEM_ENABLE=1 before init_process_group. "
+            "Requires NCCL >= 2.21. "
+            "Most effective with Ulysses or ring-attention sequence parallelism "
+            "where all-to-all / all-gather dominate step latency. "
+            "See tensorrt_llm/_torch/visual_gen/nccl_ub_reg.py."
+        ),
+    )
 
     @property
     def seq_parallel_size(self) -> int:
