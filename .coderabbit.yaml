@@ -22,6 +22,10 @@ reviews:
   auto_title_placeholder: '@coderabbitai title'
   auto_title_instructions: 'Format: "[<category>] <title>". Category must be one of: fix, feat, doc, infra, style, refactor, perf, test, chore, revert. Enclose the category in square brackets. Title should be concise (<= 60 chars). Example: "[feat] Add logit_bias support".'
   commit_status: false
+  # Post the high-level summary in the walkthrough comment instead of writing it
+  # into the PR description, so author-written description text is never replaced
+  # or pushed down by generated content.
+  high_level_summary_in_walkthrough: true
   high_level_summary_instructions: |
     Always produce two review sections in the summary:
 
