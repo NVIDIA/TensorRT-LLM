@@ -53,7 +53,7 @@ parser.add_argument(
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
-parser.add_argument("--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM"])
+parser.add_argument("--moe-backend-for-prefill", type=str, choices=["AUTO", "CUTLASS", "DEEPGEMM"])
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
 group.add_argument(
@@ -133,7 +133,9 @@ if args.load_format is None:
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
 if args.moe_backend_for_prefill is None:
-    args.moe_backend_for_prefill = "CUTLASS"
+    # Let prefill resolve like decode when decode is AUTO; the "CUTLASS" default cannot
+    # serve every checkpoint (see README limitations).
+    args.moe_backend_for_prefill = "AUTO" if args.moe_backend == "AUTO" else "CUTLASS"
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:

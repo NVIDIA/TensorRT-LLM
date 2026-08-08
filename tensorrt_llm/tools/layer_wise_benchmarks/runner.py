@@ -2,6 +2,7 @@ import contextlib
 import functools
 import inspect
 import itertools
+import math
 import os
 import weakref
 from enum import IntEnum
@@ -571,7 +572,6 @@ class Runner:
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
         sparse_attention_config = self.model_config.sparse_attention_config
         sparse_params = (
@@ -604,6 +604,9 @@ class Runner:
             ]
             * batch_size,
             max_num_tokens=batch_size * seq_len_q,
+            # One entry per attention-DP rank, not per world rank: with attention DP
+            # off `dp_size` is 1 and the MoE non-DP path requires a single-element list.
+            all_rank_num_tokens=[batch_size * seq_len_q] * self.model_config.mapping.dp_size,
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
@@ -613,7 +616,6 @@ class Runner:
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
         )
-        attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
         # serving the executor announces that via update_spec_dec_param(), the only
         # place max_draft_tokens is set. Without it the DSA indexer's context_lens
@@ -791,10 +793,18 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
-        kv_cache_config = KvCacheConfig(
-            max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
-            enable_block_reuse=False,
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        # `max_tokens` must cover what the manager reserves per request, not just the
+        # rounded sequence length, or the pools cannot hold `max_batch_size` requests.
+        # Mirror `KVCacheManagerV2.max_blocks_per_seq` -- room for one extra decode
+        # token, padded to a multiple of 4 blocks by the copy_block_offsets kernel --
+        # then scale by 1/max_util_for_resume, since only that fraction of the derived
+        # quota is resumable.
+        blocks_per_seq = math.ceil(
+            round_up(ceil_div(max_seq_len + 1, tokens_per_block), 4)
+            / kv_cache_config.max_util_for_resume
         )
+        kv_cache_config.max_tokens = max_batch_size * blocks_per_seq * tokens_per_block
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
             "FP8": tensorrt_llm.bindings.DataType.FP8,
@@ -896,8 +906,15 @@ class Runner:
             )
         else:
             raise NotImplementedError("Unsupported config")
-        kv_cache_manager.add_dummy_requests(
+        # A short pool frees the whole batch and returns None, leaving every request ID
+        # unregistered; without this check the miss only surfaces later as an opaque
+        # "Request ID not found in IndexMapper" assert inside the C++ IndexMapper.
+        requests = kv_cache_manager.add_dummy_requests(
             list(range(max_batch_size)), token_nums=[max_seq_len] * max_batch_size
+        )
+        assert requests is not None and len(requests) == max_batch_size, (
+            f"kv cache manager could not admit {max_batch_size} requests of "
+            f"{max_seq_len} tokens; raise kv_cache_config.max_tokens"
         )
         return kv_cache_manager
 
