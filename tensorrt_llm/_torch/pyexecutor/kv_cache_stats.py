@@ -137,6 +137,8 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
         "iterIntraDeviceCopyBytes": stats.iter_intra_device_copy_bytes,
         "iterHostDroppedBlocks": stats.iter_host_dropped_blocks,
         "iterHostDroppedBytes": stats.iter_host_dropped_bytes,
+        "iterScratchBlocks": stats.iter_scratch_blocks,
+        "iterScratchSlots": stats.iter_scratch_slots,
     }
     if keys is None:
         return fields

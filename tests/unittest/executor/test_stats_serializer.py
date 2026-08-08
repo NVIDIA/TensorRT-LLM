@@ -117,6 +117,8 @@ def _make_mock_kv_iter_stats(
         iter_intra_device_copy_bytes=8192,
         iter_host_dropped_blocks=0,
         iter_host_dropped_bytes=0,
+        iter_scratch_blocks=0,
+        iter_scratch_slots=0,
     )
     return {window_size: s}
 

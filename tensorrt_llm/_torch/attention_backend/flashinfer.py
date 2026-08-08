@@ -533,6 +533,34 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self._paged_kv_indices[:self.num_generation_blocks +
                                       self.num_context_blocks]
 
+    @property
+    def kv_page_index_mode(self):
+        """Addressing contract for this manager's page indices.
+
+        SWA scratch reuse rotates a scratch block's sub-page with the block
+        position, so the layer offset cannot be folded into a per-layer base
+        pointer and both the indices and the buffer must be PER_LAYER. Managers
+        without scratch keep the historical SHARED addressing.
+        """
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+        if getattr(self.kv_cache_manager, 'enable_swa_scratch_reuse', False):
+            return PageIndexMode.PER_LAYER
+        return PageIndexMode.SHARED
+
+    def get_kv_buffers(self, layer_idx: int, kv_layout: Optional[str] = None):
+        """``get_buffers`` for this layer under the right addressing mode.
+
+        ``index_mode`` is only passed when it is PER_LAYER, so V1, hybrid Mamba
+        and sparse cache managers -- whose overrides take ``(layer_idx,
+        kv_layout)`` only -- keep their existing call shape.
+        """
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+        mgr = self.kv_cache_manager
+        kwargs = {} if kv_layout is None else {'kv_layout': kv_layout}
+        if self.kv_page_index_mode == PageIndexMode.PER_LAYER:
+            kwargs['index_mode'] = PageIndexMode.PER_LAYER
+        return mgr.get_buffers(layer_idx, **kwargs)
+
     def get_paged_kv_indices_for_layer(self, layer_idx: int) -> torch.Tensor:
         """Return page indices for the pool that *layer_idx* belongs to.
 
@@ -935,7 +963,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             max_num_blocks = blocks_in_primary_pool
             if hasattr(self.kv_cache_manager, 'layer_offsets'):
                 for lid in self.kv_cache_manager.layer_offsets:
-                    lbuf = self.kv_cache_manager.get_buffers(lid)
+                    lbuf = self.get_kv_buffers(lid)
                     if lbuf is not None:
                         max_num_blocks = max(max_num_blocks, lbuf.shape[0])
             self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
@@ -951,13 +979,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             layer_space: Dict[int, int] = {}
             if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
                 space_ids = {}
+                # With SWA scratch reuse the page index is genuinely per-layer:
+                # a scratch block's sub-page rotates with block position, so it
+                # cannot be folded into a per-layer base pointer the way a fixed
+                # layer offset can. Give every layer its own index space; the
+                # per-space buffers and the per-layer swap below then work
+                # unchanged, just with more spaces.
+                per_layer_spaces = getattr(mgr, 'enable_swa_scratch_reuse',
+                                           False)
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
-                    key = (mgr.layer_to_pool_mapping_dict[layer_offset],
-                           get_scale(layer_idx))
+                    key = layer_idx if per_layer_spaces else (
+                        mgr.layer_to_pool_mapping_dict[layer_offset],
+                        get_scale(layer_idx))
                     space_ids.setdefault(key, len(space_ids))
                     layer_space[layer_idx] = space_ids[key]
             if layer_space and (getattr(mgr, 'is_vswa', False)
+                                or per_layer_spaces
                                 or len(set(layer_space.values())) > 1):
                 self._vswa_layer_to_pool = {}
                 self._vswa_pool_to_rep_layer: Dict[int, int] = {}
@@ -2279,9 +2317,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 )
             return
 
-        # Key and Value
-        kv_cache = metadata.kv_cache_manager.get_buffers(
-            self.layer_idx, kv_layout=metadata.kv_layout)
+        # Key and Value. Scratch reuse makes page indices per-layer, so the
+        # buffer must be based at the pool group rather than at this layer's
+        # sub-page (see KVCacheManagerV2.get_buffers).
+        kv_cache = metadata.get_kv_buffers(self.layer_idx,
+                                           kv_layout=metadata.kv_layout)
 
         # VSWA: swap in the correct pool's page indices for this layer
         # before both the KV cache append and the attention plan/run.

@@ -379,6 +379,13 @@ struct KvCacheIterationStats
     // to GPU during their stay at that tier (i.e. fully dropped from the hierarchy).
     SizeType32 iterHostDroppedBlocks{0};
     std::size_t iterHostDroppedBytes{0};
+
+    // KVCacheManagerV2 SWA scratch reuse: blocks served from shared scratch sub-pages during
+    // prefill, and the scratch slots those blocks consumed. Scratch blocks take no per-request
+    // KV page and are therefore excluded from iterAlloc*; these counters are the attribution
+    // for that exclusion. Always 0 for the V1 manager, which has no scratch reuse.
+    SizeType32 iterScratchBlocks{0};
+    SizeType32 iterScratchSlots{0};
 };
 
 // Basic building block of a paged KV cache - a single

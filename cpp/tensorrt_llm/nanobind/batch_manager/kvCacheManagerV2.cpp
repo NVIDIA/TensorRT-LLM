@@ -429,7 +429,9 @@ static std::string iterationStatsDeltaRepr(kv::KVCacheIterationStatsDelta const&
            << ", iter_intra_device_copy_blocks=" << stats.iterIntraDeviceCopyBlocks
            << ", iter_intra_device_copy_bytes=" << stats.iterIntraDeviceCopyBytes
            << ", iter_host_dropped_blocks=" << stats.iterHostDroppedBlocks
-           << ", iter_host_dropped_bytes=" << stats.iterHostDroppedBytes << ')';
+           << ", iter_host_dropped_bytes=" << stats.iterHostDroppedBytes
+           << ", iter_scratch_blocks=" << stats.iterScratchBlocks << ", iter_scratch_slots=" << stats.iterScratchSlots
+           << ')';
     return stream.str();
 }
 
@@ -900,7 +902,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 int64_t iterMissedBlocks, int64_t iterGenAllocBlocks, int64_t iterOnboardBlocks,
                 int64_t iterOnboardBytes, int64_t iterOffloadBlocks, int64_t iterOffloadBytes,
                 int64_t iterIntraDeviceCopyBlocks, int64_t iterIntraDeviceCopyBytes, int64_t iterHostDroppedBlocks,
-                int64_t iterHostDroppedBytes)
+                int64_t iterHostDroppedBytes, int64_t iterScratchBlocks, int64_t iterScratchSlots)
             {
                 new (self) kv::KVCacheIterationStatsDelta{};
                 self->iterAllocTotalBlocks = iterAllocTotalBlocks;
@@ -918,6 +920,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 self->iterIntraDeviceCopyBytes = iterIntraDeviceCopyBytes;
                 self->iterHostDroppedBlocks = iterHostDroppedBlocks;
                 self->iterHostDroppedBytes = iterHostDroppedBytes;
+                self->iterScratchBlocks = iterScratchBlocks;
+                self->iterScratchSlots = iterScratchSlots;
             },
             nb::arg("iter_alloc_total_blocks") = 0, nb::arg("iter_alloc_new_blocks") = 0,
             nb::arg("iter_reused_blocks") = 0, nb::arg("iter_full_reused_blocks") = 0,
@@ -925,7 +929,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("iter_gen_alloc_blocks") = 0, nb::arg("iter_onboard_blocks") = 0, nb::arg("iter_onboard_bytes") = 0,
             nb::arg("iter_offload_blocks") = 0, nb::arg("iter_offload_bytes") = 0,
             nb::arg("iter_intra_device_copy_blocks") = 0, nb::arg("iter_intra_device_copy_bytes") = 0,
-            nb::arg("iter_host_dropped_blocks") = 0, nb::arg("iter_host_dropped_bytes") = 0)
+            nb::arg("iter_host_dropped_blocks") = 0, nb::arg("iter_host_dropped_bytes") = 0,
+            nb::arg("iter_scratch_blocks") = 0, nb::arg("iter_scratch_slots") = 0)
         .def_rw("iter_alloc_total_blocks", &kv::KVCacheIterationStatsDelta::iterAllocTotalBlocks)
         .def_rw("iter_alloc_new_blocks", &kv::KVCacheIterationStatsDelta::iterAllocNewBlocks)
         .def_rw("iter_reused_blocks", &kv::KVCacheIterationStatsDelta::iterReusedBlocks)
@@ -941,6 +946,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("iter_intra_device_copy_bytes", &kv::KVCacheIterationStatsDelta::iterIntraDeviceCopyBytes)
         .def_rw("iter_host_dropped_blocks", &kv::KVCacheIterationStatsDelta::iterHostDroppedBlocks)
         .def_rw("iter_host_dropped_bytes", &kv::KVCacheIterationStatsDelta::iterHostDroppedBytes)
+        .def_rw("iter_scratch_blocks", &kv::KVCacheIterationStatsDelta::iterScratchBlocks)
+        .def_rw("iter_scratch_slots", &kv::KVCacheIterationStatsDelta::iterScratchSlots)
         .def("add", &kv::KVCacheIterationStatsDelta::add, nb::arg("other"))
         .def("subtract", &kv::KVCacheIterationStatsDelta::subtract, nb::arg("other"))
         .def("clear", &kv::KVCacheIterationStatsDelta::clear)
@@ -954,7 +961,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "iter_alloc_new_blocks", "iter_reused_blocks", "iter_full_reused_blocks", "iter_partial_reused_blocks",
         "iter_missed_blocks", "iter_gen_alloc_blocks", "iter_onboard_blocks", "iter_onboard_bytes",
         "iter_offload_blocks", "iter_offload_bytes", "iter_intra_device_copy_blocks", "iter_intra_device_copy_bytes",
-        "iter_host_dropped_blocks", "iter_host_dropped_bytes");
+        "iter_host_dropped_blocks", "iter_host_dropped_bytes", "iter_scratch_blocks", "iter_scratch_slots");
 
     nb::class_<kv::SsmSnapshotIterationStatsDelta>(m, "SsmSnapshotIterationStatsDelta")
         .def(

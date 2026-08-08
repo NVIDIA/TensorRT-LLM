@@ -446,6 +446,13 @@ class KVCacheManager(BaseResourceManager):
         # values (negative) used by hybrid linear attention models.
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
             w > 0 for w in self.max_attention_window_vec)
+
+        if kv_cache_config.enable_swa_scratch_reuse:
+            logger.warning(
+                "kv_cache_config.enable_swa_scratch_reuse is set but the V1 KV cache "
+                "manager is in use; SWA scratch reuse is a V2-only feature and is "
+                "silently ignored here. Set kv_cache_config.use_kv_cache_manager_v2=True "
+                "to use it.")
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
