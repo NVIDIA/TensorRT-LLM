@@ -84,10 +84,11 @@ inline std::string checkErrorStr(Args const&... args) {
 #endif
 
 #ifndef TLLM_CHECK_INFO
+// DEBUG, not INFO: KernelTraits<> is constructed per kernel launch, so INFO would spam CI logs.
 #define TLLM_CHECK_INFO(cond, ...)                                                                 \
   do {                                                                                             \
     if (!static_cast<bool>(cond)) {                                                                \
-      TLLM_LOG_INFO("[FMHA] %s", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());              \
+      TLLM_LOG_DEBUG("[FMHA] %s", ::fmha::detail::checkErrorStr(__VA_ARGS__).c_str());             \
     }                                                                                              \
   } while (0)
 #endif
