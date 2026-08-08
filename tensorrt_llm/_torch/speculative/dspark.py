@@ -266,7 +266,10 @@ class DSparkWorker(SpecWorkerBase):
 
         if self._win_inited:
             return
-        max_batch = spec_metadata.max_num_requests
+        # Worker-owned and allocated once, so this must span the full seq-slot
+        # pool rather than max_num_requests, which create_cuda_graph_metadata
+        # shrinks to the captured graph bucket (see the DFlash counterpart).
+        max_batch = spec_metadata.num_seq_slots or spec_metadata.max_num_requests
         num_stages = draft_model.num_stages
         self._win = int(draft_model._attn_params["window_size"])
         head_dim = int(draft_model._attn_params["head_dim"])
