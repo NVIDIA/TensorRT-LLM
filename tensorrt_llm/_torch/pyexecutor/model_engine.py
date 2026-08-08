@@ -4057,6 +4057,34 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info(
                     f"[ride-log] prologue #{self._ride_log_ctr} "
                     f"S={split_lens[:4].tolist()} w={result.verify_lens[:4].tolist()}")
+        if (os.environ.get("TLLM_DSPARK_INVARIANT_LOG") == "1"
+                and getattr(self, "_dspark_inv_prints", 0) < 40):
+            # Read-only invariant audit against host-with-w formulas: no
+            # restage, no request mutation, no collectives -- safe at scale.
+            torch.cuda.synchronize()
+            gen_requests = [
+                r for r in (self._dspark_inv_requests or [])
+            ] if getattr(self, "_dspark_inv_requests", None) else []
+            w = result.verify_lens[:n_real].tolist()
+            qo = result.qo_indptr[:n_real + 1].tolist()
+            kv = attn_metadata.kv_lens_cuda[:n_real].tolist()
+            self._dspark_inv_step = getattr(self, "_dspark_inv_step", 0) + 1
+            for i, req in enumerate(gen_requests[:n_real]):
+                past = int(req.max_beam_num_tokens) - 1
+                want_kv = past + 2 * w[i]
+                if kv[i] != want_kv:
+                    self._dspark_inv_prints = getattr(
+                        self, "_dspark_inv_prints", 0) + 1
+                    logger.warning(
+                        f"[invariant] step#{self._dspark_inv_step} row {i}: "
+                        f"kv={kv[i]} want past+2w={want_kv} "
+                        f"(past={past} w={w[i]} S={split_lens[i].item()} "
+                        f"n_real={n_real} padded_bs={padded_bs} "
+                        f"bucket={bucket})")
+            if self._dspark_inv_step % 100 == 0:
+                logger.info(
+                    f"[invariant] step#{self._dspark_inv_step} checkpoint: "
+                    f"{getattr(self, '_dspark_inv_prints', 0)} violations")
         return True
 
     def _dspark_ab_diff(self, padded_requests, kv_cache_manager, attn_metadata,
@@ -7309,6 +7337,10 @@ class PyTorchModelEngine(ModelEngine):
                     and not self.is_warmup
                     and getattr(self, "_dspark_device_budget", None)
                     is not None):
+                if os.environ.get("TLLM_DSPARK_INVARIANT_LOG") == "1":
+                    # Read-only reference for the prologue's invariant audit.
+                    self._dspark_inv_requests = list(
+                        padded_requests.generation_requests)
                 applied = self._apply_device_window_prologue(
                     inputs, new_tensors_device)
                 if applied and os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":

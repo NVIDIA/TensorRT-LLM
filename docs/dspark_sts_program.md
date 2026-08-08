@@ -296,6 +296,12 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 - force-argmax 普查(判"eager 非贪婪主机侧代码 vs 图内 advanced 采样计算")因节点到期未完成;739900/739901 已排队,落地重跑。
 - **普查仪表沉淀**:`percreq_payload.json` + 64 并发 curl + chars/tok 分类——今后所有验证以此为准(单探针不再作为判据)。
 
+## 【08-08 06:45-07:45】重装配差分在规模下判死;转只读不变量审计
+
+- **at-scale A/B(AB_AFTER=150)**:跨过阈值后开火即崩——executor 死于与猎手 v1 相同的响应管道错误(`'int' object is not iterable`)。**结论:重装配式差分只能在安静的 ramp 步上活着,规模下对请求态的突变不可控,该路线放弃**(其 ramp 步"21 张量全等"的判决仍有效,但只覆盖小批步)。
+- **新仪表(只读不变量审计,`TLLM_DSPARK_INVARIANT_LOG=1`)**:序幕末尾 D2H 少量派生量,对照 host-with-w 的解析公式验证不变量(首个:`kv_lens[r] == (max_beam_num_tokens−1) + 2×w_r`),零突变、零集合通信、零重装配——任意规模可常开。违规打印现场 (row, past, w, S, n_real, padded_bs, bucket);每 100 步打检查点(正向确认仪表存活)。
+- 协查提示:kv 不变量若稳态全绿,后续只读不变量按序追加:anchor 对位(`input_ids[qo[r]] == next_new_tokens[slot,0]`)、draft 对位、position 基。序幕输出面逐项排掉后,嫌疑收缩到图内消费方与跨步状态链。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
