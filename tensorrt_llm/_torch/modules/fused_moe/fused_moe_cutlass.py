@@ -844,6 +844,41 @@ class CutlassFusedMoE(MoE):
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
 
+        # K-EXAONE2 uses one clamp value for every routed expert. CUTLASS
+        # consumes local per-expert tensors, so materialize them only after the
+        # final EP/EPLB layout and weight device are known.
+        #
+        # Supplying `swiglu_limit` promotes the op to ActivationType::SwigluBias,
+        # whose adaptor evaluates
+        #     min(gate, limit) * sigmoid(min(gate, limit) * alpha)
+        #         * (clamp(linear, -limit, limit) + beta)
+        # Materialize alpha=1.0 and beta=0.0 explicitly rather than relying on
+        # the null-pointer defaults, so the three tensors are always supplied
+        # together as the GPT-OSS and MiniMax-M3 paths do. alpha=1 / beta=0
+        # reduce the expression to plain silu(gate) * linear with clamping,
+        # which is what K-EXAONE2 specifies.
+        if self.swiglu_limit is None and self.swiglu_limit_scalar is not None:
+            local_experts = (self.expert_size_per_partition, )
+            # Allocate on the current CUDA device rather than following
+            # `w3_w1_weight.device`: weights can still be on meta here and are
+            # materialized later. These are plain attributes, not parameters or
+            # buffers, so a later `module.to(...)` would not move them and the
+            # op would be handed a meta/CPU pointer. GPT-OSS allocates its
+            # equivalents with `.cuda()` for the same reason.
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.swiglu_limit = torch.full(local_experts,
+                                           self.swiglu_limit_scalar,
+                                           dtype=torch.float32,
+                                           device=device)
+            if self.swiglu_alpha is None:
+                self.swiglu_alpha = torch.ones(local_experts,
+                                               dtype=torch.float32,
+                                               device=device)
+            if self.swiglu_beta is None:
+                self.swiglu_beta = torch.zeros(local_experts,
+                                               dtype=torch.float32,
+                                               device=device)
+
         self._weights_created = True
         self._check_configs()
 

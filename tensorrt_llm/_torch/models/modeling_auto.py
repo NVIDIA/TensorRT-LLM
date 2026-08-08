@@ -36,7 +36,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
 
         if model_arch in (
                 "DeepseekV3ForCausalLM", "Glm4MoeForCausalLM",
-                "ExaoneMoEForCausalLM"
+                "ExaoneMoEForCausalLM", "ExaoneMoeForCausalLM"
         ) and config.spec_config is not None and config.spec_config.max_draft_len == 0:
             model_arch = "MTPDraftModelForCausalLM"
 
