@@ -413,6 +413,23 @@ class AttentionPolicy:
         self_pool_slot_bytes: int,
         peer_pool_slot_bytes: int,
     ) -> RegionMapperBase:
+        # REPLICATED bytes are identical on every TP rank (single index head),
+        # so head matching is not merely unnecessary, it is wrong: duplicating
+        # or splitting by the TP ratio would move the wrong fragment. Dispatch
+        # before head_match is consulted, and allow a head mismatch through --
+        # unlike FLAT, which rejects it below.
+        if mapper_kind == MapperKind.REPLICATED:
+            if transfer_layers == self_pool_num_layers == peer_pool_num_layers:
+                return IdentityMapper()
+            return IndexerKCacheHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=self_layer_offset,
+                dst_layer_off=peer_layer_offset,
+                self_ri=self._ri,
+                peer_ri=peer_ri,
+                block_size_per_layer=self_pool_slot_bytes // self_pool_num_layers,
+            )
+
         head_match, _ = self.head_match(peer_ri)
 
         if head_match and transfer_layers == self_pool_num_layers == peer_pool_num_layers:

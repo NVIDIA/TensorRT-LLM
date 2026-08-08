@@ -247,8 +247,12 @@ class PeerRegistrar:
         # the order must reflect the actual physical layout. We derive it from
         # the KV-cache manager's layout rather than assuming ``global_layer_id``
         # is monotonic with the layer's byte offset in the slot:
-        #   INDEXED: ``get_pool_view_global_layer_ids`` orders layers by their
-        #            ``buffer_entries`` offsets (the V2 pool-view layout).
+        #   INDEXED /
+        #   REPLICATED: ``get_pool_view_global_layer_ids`` orders layers by
+        #            their ``buffer_entries`` offsets (the V2 pool-view
+        #            layout). Both carry an explicit layer set; they differ
+        #            only in whether the transfer is head-aware, which is
+        #            decided later in ``build_kv_mapper``.
         #   FLAT:    the pool has no per-buffer layer info; it packs the whole
         #            layer group equal-sized in ``local_layers`` order, so that
         #            order already *is* the physical order.
@@ -257,7 +261,7 @@ class PeerRegistrar:
             peer_global_ids = get_global_layer_ids(peer_lg)
             self_num_layers = get_layer_group_num_layers(self_lg)
             peer_num_layers = get_layer_group_num_layers(peer_lg)
-        elif self_pv.mapper_kind == MapperKind.INDEXED:
+        elif self_pv.mapper_kind in (MapperKind.INDEXED, MapperKind.REPLICATED):
             self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
             peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
             self_num_layers = get_pool_view_num_layers(self_pv)

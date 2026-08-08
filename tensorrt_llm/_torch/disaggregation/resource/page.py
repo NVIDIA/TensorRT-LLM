@@ -16,28 +16,45 @@ BUFFER_ENTRY_DTYPE = np.dtype(
 
 
 class MapperKind(IntEnum):
-    """Slot metadata shape — selects how disagg derives the pool's layer set.
+    """Slot metadata shape — selects how disagg derives the pool's layer set
+    AND whether the byte transfer is head-aware.
+
+    Those are two independent axes, and each member fixes both:
+
+    ==========  ====================  ==============================
+    kind        layer set             transfer
+    ==========  ====================  ==============================
+    INDEXED     from buffer_entries   head-aware (HeadMatchMapper)
+    FLAT        whole layer group     head-agnostic (contiguous)
+    REPLICATED  from buffer_entries   head-agnostic (contiguous)
+    ==========  ====================  ==============================
 
     INDEXED: PoolView.buffer_entries lists ``(local_layer_id, offset, size)``
         per buffer. Disagg reads ``local_layer_id`` to know *which* layers
         from the LG live in this pool (a pool may cover a subset when V2
         splits an LG into multiple pools by buffer-size class). The
         ``offset`` / ``size`` columns are carried for future use but are not
-        currently consumed at byte-transfer time.
+        currently consumed at byte-transfer time. Heads are matched between
+        peers, duplicating or splitting as the TP ratio requires.
     FLAT:    PoolView.buffer_entries is empty. Disagg assumes the pool
         covers *all* layers of the LG, packed equal-sized in
-        ``local_layers`` order.
+        ``local_layers`` order. Used by the dense DSA (DeepSeek Sparse
+        Attention, v3.2) indexer K cache pool, whose slot layout is a dense
+        ``(numLayers, kvFactor, blockSize)`` array.
+    REPLICATED: the pool's bytes are identical on every TP rank, so head
+        matching is skipped entirely and the transfer is a contiguous copy —
+        but the layer set is still read from ``buffer_entries`` because the
+        pool may cover a subset of the LG. This is the *masked* DSA indexer
+        K cache: with a per-layer indexer mask (cross-layer indexer sharing,
+        e.g. GLM 5.2) only the indexer-owning layers get a pool row, so
+        FLAT's "covers the whole LG" assumption is wrong, while INDEXED's
+        head arithmetic is wrong for a single-index-head cache. REPLICATED is
+        the combination those two cannot express.
 
-    Note the DSA (DeepSeek Sparse Attention, v3.2) indexer K cache pool is
-    INDEXED, not FLAT, even though its slot layout is a dense
-    ``(numLayers, kvFactor, blockSize)`` array: a per-layer indexer mask
-    (cross-layer indexer sharing, e.g. GLM 5.2) gives only the owning layers
-    a pool row, so the layer set cannot be assumed to be the whole LG and is
-    carried explicitly in ``buffer_entries``.
-
-    Byte arithmetic is the same for both kinds: per-layer stride is
-    ``slot_bytes // num_layers``. The kind only affects how disagg discovers
-    the pool's layer set during pool matching.
+    Byte arithmetic is the same for all three kinds: per-layer stride is
+    ``slot_bytes // num_layers``, where ``num_layers`` is the pool view's own
+    layer count (the buffer-entry count for INDEXED / REPLICATED). A pool
+    therefore never needs to carry an explicit per-layer size.
 
     Mamba state pools do not use this enum: Mamba's transfer is dispatched
     through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
@@ -46,6 +63,7 @@ class MapperKind(IntEnum):
 
     INDEXED = 0
     FLAT = 1
+    REPLICATED = 2
 
 
 @dataclass
