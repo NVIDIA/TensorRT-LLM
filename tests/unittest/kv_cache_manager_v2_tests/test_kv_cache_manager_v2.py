@@ -28,6 +28,8 @@ from random import randbytes
 from statistics import median
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, cast, get_type_hints
 
+import pytest
+
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
@@ -4302,6 +4304,7 @@ class TestSlotAllocatorShrink(unittest.TestCase):
             allocator.release(s)
 
 
+@pytest.mark.cpu_only
 class TestBlockKeyHashing(unittest.TestCase):
     """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
 
