@@ -293,6 +293,10 @@ struct KVCacheManagerConfig
     // Collect V2 KV cache allocation, reuse, and transfer statistics.
     bool enableStats = true;
 
+    // Publish a finalized partial block for reuse when committing stops.
+    // Beam search disables this while retaining full-block reuse.
+    bool enablePartialCommit = true;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

@@ -194,6 +194,7 @@ else:
         swa_scratch_reuse: object = None
         commit_min_snapshot: bool = False
         enable_stats: bool = True
+        enable_partial_commit: bool = True
 
     KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
     del _KVCacheManagerConfigFieldSpec, _dataclasses
