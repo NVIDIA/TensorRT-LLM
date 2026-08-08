@@ -19,16 +19,16 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=02:00:00
-#SBATCH -o log/compile.sbatch.%j.out
+#SBATCH -o log/build.sbatch.%j.out
 #
-# compile.slurm — SLURM batch script that launches a container and runs compile.sh.
-# Usage: sbatch [sbatch_flags...] compile.slurm <container_image> <user_root_dir> <scripts_dir> <repo_dir> [build_wheel_args...]
+# build.slurm — SLURM batch script that launches a container and runs build.sh.
+# Usage: sbatch [sbatch_flags...] build.slurm <container_image> <user_root_dir> <scripts_dir> <repo_dir> [build_wheel_args...]
 
 container_image=$1
 user_root_dir=$2
 scripts_dir=$3
 repo_dir=$4
-shift 4  # remaining args forwarded to compile.sh
+shift 4  # remaining args forwarded to build.sh
 
 logdir=${scripts_dir}/log
 mkdir -p "${logdir}"
@@ -37,6 +37,5 @@ srun \
     --container-image="${container_image}" \
     --container-mounts="${user_root_dir}:${user_root_dir}" \
     --no-container-mount-home \
-    --mpi=pmix \
-    bash "${scripts_dir}/compile.sh" "${repo_dir}" "$@" \
-    2>&1 | tee "${logdir}/compile_${SLURM_JOB_ID}.srun.log"
+    bash "${scripts_dir}/build.sh" "${repo_dir}" "$@" \
+    2>&1 | tee "${logdir}/build_${SLURM_JOB_ID}.srun.log"
