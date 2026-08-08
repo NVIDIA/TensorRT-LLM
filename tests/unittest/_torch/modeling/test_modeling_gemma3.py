@@ -684,3 +684,12 @@ class TestGemma3(unittest.TestCase):
             ],
             device=device).bool()
         torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+
+def test_gemma3_model_defaults_select_v2():
+    defaults = Gemma3ForCausalLM.get_model_defaults(object())
+    assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+
+
+def test_gemma3_prefers_python_transceiver():
+    assert Gemma3ForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
