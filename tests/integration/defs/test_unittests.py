@@ -18,6 +18,9 @@ import warnings
 from subprocess import CalledProcessError
 
 from defs.conftest import tests_path
+from defs.process_cleanup import (PROCESS_OWNER_ENV_VAR,
+                                  cleanup_owned_processes,
+                                  new_process_owner_token)
 
 
 def merge_report(base_file, extra_file, output_file, is_retry=False):
@@ -237,8 +240,20 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         return os.pathsep.join(pythonpath_entries)
 
     def run_command(cmd, num_workers=1):
+        """Run one unittest command, returning (tests_passed, cleanup_ok).
+
+        The two results are kept apart on purpose: a cleanup failure must not look like a test
+        failure, or it would send an otherwise green parallel run into the `--lf` retry, which
+        re-runs the whole case when nothing failed.
+        """
+        passed = True
+        cleanup_ok = True
+        owner_token = new_process_owner_token()
         try:
-            env = {'PYTHONPATH': build_pythonpath()}
+            env = {
+                'PYTHONPATH': build_pythonpath(),
+                PROCESS_OWNER_ENV_VAR: owner_token,
+            }
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
@@ -261,13 +276,30 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                     f"STDERR:\n{e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}"
                 )
             print(f"{'='*60}\n")
-            return False
-        return True
+            passed = False
+        finally:
+            try:
+                remaining_pids = cleanup_owned_processes(
+                    owner_token,
+                    description=f"unittest command {' '.join(cmd)}",
+                )
+            except Exception as cleanup_error:
+                # Deliberately broad: cleanup runs in a `finally`, so letting anything escape here
+                # would replace the real test outcome with a cleanup traceback.
+                print(f"Unittest cleanup raised "
+                      f"{type(cleanup_error).__name__}: {cleanup_error}")
+                cleanup_ok = False
+            else:
+                if remaining_pids:
+                    print(f"Unittest cleanup failed; processes still alive: "
+                          f"{remaining_pids}")
+                    cleanup_ok = False
+        return passed, cleanup_ok
 
     if num_workers == 1:
         # Do not bother with pytest-xdist at all if we don't need parallel execution
         command += ["-p", "no:xdist", f"--periodic-junit-xmlpath={output_xml}"]
-        passed = run_command(command)
+        passed, cleanup_ok = run_command(command)
     else:
         # Avoid .xml extension to prevent CI from reading failures from it
         parallel_output_xml = os.path.join(
@@ -277,7 +309,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             "-n", f"{num_workers}",
             f"--periodic-junit-xmlpath={parallel_output_xml}"
         ]
-        passed = run_command(parallel_command, num_workers)
+        passed, cleanup_ok = run_command(parallel_command, num_workers)
 
         assert os.path.exists(
             parallel_output_xml
@@ -295,7 +327,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 "-p", "no:xdist", '--lf',
                 f"--periodic-junit-xmlpath={retry_output_xml}"
             ]
-            passed = run_command(retry_command)
+            passed, retry_cleanup_ok = run_command(retry_command)
+            # A leak in the parallel phase still has to fail the case even if the retry is clean.
+            cleanup_ok = cleanup_ok and retry_cleanup_ok
 
             if os.path.exists(retry_output_xml):
                 merge_report(parallel_output_xml, retry_output_xml, output_xml,
@@ -305,3 +339,4 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 assert False, "no report generated, fatal failure happened in unittests (retry phase)"
 
     assert passed, "failure reported in unittests"
+    assert cleanup_ok, "leftover processes or GPU contexts remained after unittests"
