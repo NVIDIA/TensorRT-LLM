@@ -26,8 +26,8 @@ TestLlama3_1_8BInstruct::test_pard[overlap_scheduler_False]:
   ref_al: 3.4026915113871636
   min_al: 3.2325569358178052
 TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
-  ref_al: null
-  min_al: null
+  ref_al: 4.3677141163915
+  min_al: 4.1493284105719255
 TestLlama3_1_8BInstruct::test_ngram:
   ref_al: 1.3345782200927057
   min_al: 1.2678493090880703
