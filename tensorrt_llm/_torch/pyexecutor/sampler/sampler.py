@@ -82,8 +82,6 @@ from tensorrt_llm.sampling_params import (
     check_logprobs_limit,
 )
 
-from ...speculative.interface import get_force_num_accepted_tokens
-from ...speculative.spec_tree_manager import SpecTreeManager
 from ...utils import torch_multi_arange
 from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -137,6 +135,14 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+
+    # Type-only: importing the speculative package at module level would
+    # re-create the import cycle sampler.sampler -> speculative ->
+    # (draft_target/mtp) -> pyexecutor.sampler that this package's lazy
+    # __init__ exists to avoid. The cycle only resolves when speculative is
+    # imported first; a process whose first touch is sampler.sampler (e.g. a
+    # test module, with the top-level package now lazy) would break.
+    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
     _ModelType = TypeVar("_ModelType", bound=DecoderModel)
     _ConfigType = TypeVar("_ConfigType", bound=PretrainedConfig)
@@ -1633,7 +1639,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             global_seed=self._global_seed,
         )
 
-        # Force number of accepted tokens for speculative decoding testing
+        # Force number of accepted tokens for speculative decoding testing.
+        # Imported here (not at module level) to keep sampler.sampler off the
+        # speculative import cycle; see the TYPE_CHECKING note above.
+        from ...speculative.interface import get_force_num_accepted_tokens
+
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
 
         self._async_worker_init(args.enable_async_worker)
@@ -1693,7 +1703,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     def get_spec_tree_manager(
         self, resource_manager: Optional[ResourceManager]
-    ) -> Optional[SpecTreeManager]:
+    ) -> Optional["SpecTreeManager"]:
         if resource_manager is None:
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -1935,7 +1945,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_tensor: torch.Tensor,
         new_tokens_list: list[list[list[int]]],
         finish_reasons: FinishReasonsList,
-        spec_tree_manager: SpecTreeManager,
+        spec_tree_manager: "SpecTreeManager",
     ) -> int:
         """Tree verification for draft token tree based speculative decoding.
 
