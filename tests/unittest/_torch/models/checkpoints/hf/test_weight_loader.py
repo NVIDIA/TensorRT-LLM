@@ -282,3 +282,98 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
 
     assert sequences["miss"] == ["allreduce", "barrier"]
     assert sequences["hit"] == sequences["miss"]  # divergence-safe ordering
+
+
+def test_load_safetensors_file_uses_mmap_by_default(monkeypatch):
+    # Default (env unset): the fast mmap path (safetensors.torch.load_file) is
+    # used and the no-mmap read path is not touched. This keeps behavior
+    # byte-for-byte unchanged on local/NFS checkpoints.
+    monkeypatch.delenv("TRTLLM_HF_SAFETENSORS_NO_MMAP", raising=False)
+
+    sentinel = object()
+    with (
+        mock.patch("safetensors.torch.load_file",
+                   return_value=sentinel) as load_file,
+        mock.patch("safetensors.torch.load") as load,
+    ):
+        result = HfWeightLoader._load_safetensors_file("/some/shard.safetensors")
+
+    assert result is sentinel
+    load_file.assert_called_once_with("/some/shard.safetensors")
+    load.assert_not_called()
+
+
+def test_load_safetensors_file_no_mmap_roundtrip(tmp_path, monkeypatch):
+    # The no-mmap path must produce tensors byte-identical to the mmap path.
+    # This also proves the returned tensors stay valid after the in-function
+    # `data` buffer goes out of scope (torch.frombuffer holds a reference to
+    # the bytes), which is the correctness risk of reading into memory.
+    import safetensors.torch
+    import torch
+
+    tensors = {
+        "a.weight": torch.randn(8, 4),
+        "b.bias": torch.arange(16, dtype=torch.float32),
+    }
+    path = str(tmp_path / "shard.safetensors")
+    safetensors.torch.save_file(tensors, path)
+
+    monkeypatch.delenv("TRTLLM_HF_SAFETENSORS_NO_MMAP", raising=False)
+    mmap_loaded = HfWeightLoader._load_safetensors_file(path)
+
+    monkeypatch.setenv("TRTLLM_HF_SAFETENSORS_NO_MMAP", "1")
+    no_mmap_loaded = HfWeightLoader._load_safetensors_file(path)
+
+    assert set(no_mmap_loaded) == set(tensors)
+    for key, expected in tensors.items():
+        assert torch.equal(no_mmap_loaded[key], expected)
+        assert torch.equal(no_mmap_loaded[key], mmap_loaded[key])
+
+
+def test_load_safetensors_file_no_mmap_retries_transient_oserror(monkeypatch):
+    # A transient network-filesystem read error (BrokenPipeError [Errno 108] is
+    # the observed sibling failure) is retried, and the shard loads on retry.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setenv("TRTLLM_HF_SAFETENSORS_NO_MMAP", "1")
+    monkeypatch.setattr(wl.time, "sleep", lambda *_: None)
+
+    sentinel = object()
+    handle = mock.mock_open()
+    handle.return_value.read.side_effect = [
+        BrokenPipeError(108, "shutdown"),
+        b"payload",
+    ]
+    with (
+        mock.patch("builtins.open", handle),
+        mock.patch("safetensors.torch.load", return_value=sentinel) as load,
+        mock.patch("safetensors.torch.load_file") as load_file,
+    ):
+        result = HfWeightLoader._load_safetensors_file("/some/shard.safetensors")
+
+    assert result is sentinel
+    load.assert_called_once_with(b"payload")
+    load_file.assert_not_called()
+    assert handle.return_value.read.call_count == 2
+
+
+def test_load_safetensors_file_no_mmap_raises_after_exhausting_retries(monkeypatch):
+    # A persistent read error is retried a bounded number of times and then
+    # surfaces as a clean RuntimeError (not an infinite loop, not a swallowed
+    # failure). SIGBUS itself is uncatchable, but read()-path OSErrors are not.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setenv("TRTLLM_HF_SAFETENSORS_NO_MMAP", "1")
+    monkeypatch.setattr(wl.time, "sleep", lambda *_: None)
+
+    handle = mock.mock_open()
+    handle.return_value.read.side_effect = OSError(108, "shutdown")
+    with (
+        mock.patch("builtins.open", handle),
+        mock.patch("safetensors.torch.load") as load,
+        pytest.raises(RuntimeError, match="after 3 attempts"),
+    ):
+        HfWeightLoader._load_safetensors_file("/some/shard.safetensors")
+
+    load.assert_not_called()
+    assert handle.return_value.read.call_count == wl._SAFETENSORS_READ_RETRIES
