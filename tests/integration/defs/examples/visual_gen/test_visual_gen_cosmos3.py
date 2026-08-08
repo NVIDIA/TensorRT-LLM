@@ -400,7 +400,10 @@ def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, request, tmp_path):
+def test_cosmos3_nano_t2i_lpips_against_golden(request, tmp_path):
+    # No _visual_gen_deps: this case is single-frame throughout (PIL save_image
+    # plus the eval script's image branch), so it needs none of that fixture's
+    # video codecs -- matching test_cosmos3_feature_accuracy_against_golden.
     generated_path = tmp_path / "cosmos3_nano_t2i_generated.png"
     golden_path = _golden_media_path(
         tmp_path, "cosmos3_nano_t2i_lpips_golden.png", "Cosmos3-Nano T2I LPIPS golden image"
