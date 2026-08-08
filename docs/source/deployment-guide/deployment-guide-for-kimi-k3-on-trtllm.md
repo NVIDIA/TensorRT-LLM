@@ -224,6 +224,8 @@ When the `Status: 200` code is returned, the server is ready for queries. Note t
 
 ### Basic Test
 
+> **Note:** The `/v1/chat/completions` endpoint requires the Kimi K3 chat template and serving parsers, which are being added in [TRTLLM-14814](https://github.com/NVIDIA/TensorRT-LLM/pull/17327). Until that change lands, use the `/v1/completions` endpoint with a plain `prompt` string instead.
+
 After the TensorRT LLM server is set up and shows `Application startup complete`, you can send requests to the server:
 
 ```shell
