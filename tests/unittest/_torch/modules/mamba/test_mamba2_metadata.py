@@ -39,6 +39,44 @@ skip_no_cuda = pytest.mark.skipif(
 )
 
 
+class _GdnReplayCacheManager:
+    use_replay_state_update = True
+    use_gdn_cached_replay_all_layer_commit = True
+
+    def __init__(self, prev_num_accepted_tokens, cache_buf_idx):
+        self.prev_num_accepted_tokens = prev_num_accepted_tokens
+        self.cache_buf_idx = cache_buf_idx
+
+    def get_replay_state_update_metadata(self):
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=self.prev_num_accepted_tokens,
+            cache_buf_idx=self.cache_buf_idx,
+            replay_step_width=6,
+            replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+        )
+
+
+def _reference_gdn_replay_work_items(state_indices, prev_num_accepted_tokens, cache_buf_idx):
+    positions = torch.arange(state_indices.numel(), dtype=torch.int32, device="cuda")
+    cache_slots = state_indices.to(torch.int32)
+    slot_indices = cache_slots.to(torch.long)
+    pnat = prev_num_accepted_tokens[slot_indices].to(torch.int32)
+    active_cache_buf_idx = cache_buf_idx[slot_indices].to(torch.int32)
+    writes = pnat + 6 > MIN_REPLAY_HISTORY_SIZE
+    writes_i32 = writes.to(torch.int32)
+    write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
+    n_writes = torch.sum(writes_i32, dim=0, keepdim=True).to(torch.int32)
+    output_offsets = torch.where(writes, write_offsets, n_writes + positions - write_offsets).to(
+        torch.long
+    )
+    output = torch.empty(state_indices.numel(), 4, dtype=torch.int32, device="cuda")
+    output[output_offsets, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = positions
+    output[output_offsets, REPLAY_WORK_CACHE_SLOT] = cache_slots
+    output[output_offsets, REPLAY_WORK_PNAT] = pnat
+    output[output_offsets, REPLAY_WORK_CACHE_BUF_IDX] = active_cache_buf_idx
+    return output, n_writes
+
+
 @skip_no_cuda
 class TestCuSeqlensToChunkIndicesOffsets:
     """Tests for cu_seqlens_to_chunk_indices_offsets_triton function."""
@@ -154,6 +192,60 @@ class TestMamba2Metadata:
         assert actual[0, REPLAY_WORK_CACHE_SLOT] == 3
         assert actual[0, REPLAY_WORK_PNAT] == 11
         assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
+
+    @pytest.mark.parametrize("num_decodes", [16, 40, 256, 257])
+    def test_prepare_gdn_replay_work_items_matches_reference(self, num_decodes):
+        num_slots = num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
+        manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata.state_indices.copy_(state_indices)
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+        expected_items, expected_n_writes = _reference_gdn_replay_work_items(
+            state_indices, prev_num_accepted_tokens, cache_buf_idx
+        )
+
+        torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
+        torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
+
+    def test_prepare_gdn_replay_work_items_cuda_graph_replay(self):
+        num_decodes = 40
+        num_slots = num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            metadata._prepare_replay_work_items(manager, num_decodes, 0)
+
+        updated_state_indices = torch.arange(
+            num_slots - 1,
+            num_slots - num_decodes - 1,
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        metadata.state_indices.copy_(updated_state_indices)
+        prev_num_accepted_tokens.copy_(
+            (torch.arange(num_slots, dtype=torch.int32, device="cuda") * 7) % 21
+        )
+        cache_buf_idx.bitwise_xor_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected_items, expected_n_writes = _reference_gdn_replay_work_items(
+            updated_state_indices, prev_num_accepted_tokens, cache_buf_idx
+        )
+        torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
+        torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
 
     def test_single_sequence_unaligned(self):
         """Test with a single sequence that doesn't align with chunk size."""

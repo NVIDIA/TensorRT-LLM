@@ -16,6 +16,8 @@ _SMALL_GRID_HEAD_TILES = 512
 _BV16_MAX_HEAD_TILES = 64
 _BV32_MAX_HEAD_TILES = 128
 _RATIO2_FINE_MAPPING_MAX_HEAD_TILES = 256
+_RATIO8_FINE_MAPPING_MAX_HEAD_TILES = 512
+_RATIO8_ROLLOVER_FINE_HEAD_TILES = 32
 _EIGHT_WARP_COMMIT_HEAD_TILES = 1024
 _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
@@ -48,6 +50,17 @@ def _supports_fine_grained_replay_tiling(
     """Return whether the measured fine-grained value tiling applies."""
     return num_value_heads == 4 * num_key_heads or (
         num_value_heads == 2 * num_key_heads and head_tiles <= _RATIO2_FINE_MAPPING_MAX_HEAD_TILES
+    )
+
+
+def _supports_ratio8_replay_tiling(
+    num_key_heads: int,
+    num_value_heads: int,
+    head_tiles: int,
+) -> bool:
+    """Return whether the measured B300 8:1 mapping applies."""
+    return (
+        num_value_heads == 8 * num_key_heads and head_tiles <= _RATIO8_FINE_MAPPING_MAX_HEAD_TILES
     )
 
 
@@ -612,6 +625,13 @@ def commit_gdn_cached_replay_history_layers(
         and V == 128
         and ssm_states.dtype == torch.bfloat16
     )
+    use_ratio8_bf16_mapping = (
+        history_size <= 16
+        and HV == 8 * H
+        and K == 128
+        and V == 128
+        and ssm_states.dtype == torch.bfloat16
+    )
     use_small_grid_mapping = (
         use_tuned_bf16_mapping and per_layer_head_tiles <= _SMALL_GRID_HEAD_TILES
     )
@@ -636,6 +656,8 @@ def commit_gdn_cached_replay_history_layers(
         commit_pipeline_stages = (
             5
             if use_tuned_bf16_mapping and per_layer_head_tiles >= _PIPELINED_COMMIT_HEAD_TILES
+            else 5
+            if use_ratio8_bf16_mapping and N >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
             else 5
             if not use_tuned_bf16_mapping and use_large_workload_mapping
             else 1
@@ -770,15 +792,29 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     )
     head_tiles = N * HV
     use_tuned_bf16_mapping = use_production_bf16_shape and HV == 4 * H
+    use_ratio8_mapping = use_production_bf16_shape and _supports_ratio8_replay_tiling(
+        H, HV, head_tiles
+    )
     use_fine_grained_mapping = use_production_bf16_shape and _supports_fine_grained_replay_tiling(
         H, HV, head_tiles
     )
     use_small_grid_mapping = use_fine_grained_mapping and head_tiles <= _SMALL_GRID_HEAD_TILES
     if block_v is None:
-        block_v = _default_cached_replay_block_v(use_fine_grained_mapping, head_tiles, V)
+        # The 8:1 B300 shape needs finer tiling at very small N to keep its
+        # periodic checkpoint-commit path occupied. The wider tile wins from
+        # N=16 and remains tied on ordinary steps below that boundary.
+        block_v = (
+            (16 if head_tiles <= _RATIO8_ROLLOVER_FINE_HEAD_TILES else 64)
+            if use_ratio8_mapping
+            else _default_cached_replay_block_v(use_fine_grained_mapping, head_tiles, V)
+        )
     if num_warps is None:
         num_warps = (
-            2 if use_fine_grained_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
+            (2 if head_tiles <= _RATIO8_ROLLOVER_FINE_HEAD_TILES else 4)
+            if use_ratio8_mapping
+            else (
+                2 if use_fine_grained_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
+            )
         )
     BV = block_v
     use_large_workload_mapping = (
