@@ -43,6 +43,9 @@ def _make_executor(
     *,
     enable_kv_pool_rebalance: bool = True,
     pp_size: int = 1,
+    tp_size: int = 1,
+    cp_size: int = 1,
+    enable_attention_dp: bool = False,
     kv_cache_transceiver=None,
     is_warmup: bool = False,
     is_shutdown: bool = False,
@@ -51,19 +54,34 @@ def _make_executor(
     need_adjustment: bool = True,
     active_requests=None,
     previous_batch=None,
+    rebalance_check_interval: int = 1,
 ) -> MagicMock:
     """Construct a MagicMock shaped like PyExecutor with exactly the
     attributes the rebalance code path reads.
+
+    ``rebalance_check_interval`` defaults to 1 so the iteration throttle is
+    transparent for tests that are not about the throttle itself; the throttle
+    gets its own coverage in ``TestRebalanceCheckThrottle``.
     """
     exe = MagicMock(spec=PyExecutor)
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
-    exe.dist = MagicMock(pp_size=pp_size)
+    exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
+    exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
     exe.is_warmup = is_warmup
     exe.is_shutdown = is_shutdown
     exe.drafter = drafter
+
+    # Iteration throttle state.  The throttle keys on iter_counter, the
+    # loop-wide iteration index, so tests drive that directly.
+    exe._rebalance_check_interval = rebalance_check_interval
+    exe.iter_counter = 0
+
+    # Bind the real agreement helper so _maybe_rebalance_kv_pools exercises it
+    # rather than getting a truthy MagicMock back.
+    exe._agreed_need_adjustment = lambda: PyExecutor._agreed_need_adjustment(exe)
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()
@@ -243,6 +261,214 @@ class TestConsumePreviousBatch:
         exe._process_previous_batch.assert_called_once()
         exe.perf_manager.compute_batch_gpu_times.assert_called_once()
         assert exe.previous_batch is None
+
+
+# --------------------------------------------------------------------------- #
+# Iteration throttle
+# --------------------------------------------------------------------------- #
+
+
+class TestRebalanceCheckThrottle:
+    """``_can_pause_for_rebalance`` only lets a check through every N iterations.
+
+    The throttle keys on ``iter_counter``, the loop-wide iteration index, rather
+    than on a counter of its own.  That makes the set of iterations a rank fires
+    the agreement collective on a pure function of the iteration number, so it
+    cannot drift between ranks.
+    """
+
+    @staticmethod
+    def _fired_on(exe: MagicMock, iterations: int) -> list[int]:
+        """Run ``iterations`` executor iterations and report which ones opened
+        the gate.
+
+        Args:
+            exe: The PyExecutor stand-in to drive.
+            iterations: How many iterations to step through.
+
+        Returns:
+            The ``iter_counter`` values on which the gate returned ``True``.
+        """
+        fired = []
+        for i in range(iterations):
+            exe.iter_counter = i
+            if PyExecutor._can_pause_for_rebalance(exe):
+                fired.append(i)
+        return fired
+
+    def test_fires_once_per_interval(self) -> None:
+        exe = _make_executor(rebalance_check_interval=4)
+        assert self._fired_on(exe, 12) == [0, 4, 8]
+
+    def test_interval_of_one_checks_every_iteration(self) -> None:
+        exe = _make_executor(rebalance_check_interval=1)
+        assert self._fired_on(exe, 5) == [0, 1, 2, 3, 4]
+
+    def test_config_gate_suppresses_every_iteration(self) -> None:
+        exe = _make_executor(enable_kv_pool_rebalance=False, rebalance_check_interval=2)
+        assert self._fired_on(exe, 10) == []
+
+    def test_gate_rejection_does_not_shift_the_schedule(self) -> None:
+        """Regression guard for the cadence-drift deadlock.
+
+        A throttle counting its own eligible iterations would only advance on
+        iterations that cleared every gate, so a rank that bailed out early even
+        once would fire on a different set of iterations than its peers from
+        then on -- and the two would meet ``_agreed_need_adjustment``'s
+        broadcast out of step.  Keying on ``iter_counter`` makes the schedule
+        independent of that history: a rank that skips a check rejoins the
+        common cadence instead of being permanently offset from it.
+        """
+        interval = 4
+        iterations = 16
+        # A peer rank that never bails out: the cadence everyone must share.
+        reference = self._fired_on(_make_executor(rebalance_check_interval=interval), iterations)
+
+        # This rank alone is briefly shut down, over a window that straddles one
+        # of its firing iterations.
+        window = (3, 4, 5)
+        exe = _make_executor(rebalance_check_interval=interval)
+        fired = []
+        for i in range(iterations):
+            exe.iter_counter = i
+            exe.is_shutdown = i in window
+            if PyExecutor._can_pause_for_rebalance(exe):
+                fired.append(i)
+
+        # The property that matters: this rank may *miss* checks, but it must
+        # never fire on an iteration its peers do not.  Anything else means it
+        # carried a lasting offset out of the window and would meet them at
+        # _agreed_need_adjustment's broadcast out of step.
+        assert set(fired) <= set(reference), (
+            f"rank drifted off the shared cadence: fired on {fired}, peers fire "
+            f"on {reference}; the extra iterations {sorted(set(fired) - set(reference))} "
+            "would enter the agreement collective alone"
+        )
+        # And it really did skip the check inside the window (not vacuous).
+        assert [i for i in reference if i not in fired] == [4]
+        assert fired == [0, 8, 12]
+
+
+# --------------------------------------------------------------------------- #
+# Cross-rank agreement on the rebalance trigger
+# --------------------------------------------------------------------------- #
+
+
+class TestAgreedNeedAdjustment:
+    """Rank 0 of the TP group decides; the decision is broadcast.
+
+    Rationale: every input to ``need_adjustment`` is deterministic given the
+    request stream except the 120s cooldown, which reads a per-rank
+    ``steady_clock``.  Two TP ranks straddling that boundary would rebalance on
+    different iterations, and TP ranks schedule independently, so their batches
+    could then diverge.
+    """
+
+    def test_single_rank_reads_locally_without_broadcast(self):
+        exe = _make_executor(tp_size=1, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_tp_broadcasts_rank0_decision(self):
+        exe = _make_executor(tp_size=4, need_adjustment=True)
+        exe.dist.tp_broadcast.return_value = True
+
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.tp_broadcast.assert_called_once_with(True, root=0)
+
+    def test_tp_rank_follows_broadcast_over_its_own_reading(self):
+        # This is the case the whole mechanism exists for: the local read says
+        # "rebalance" but rank 0 says no, so this rank must not rebalance.
+        exe = _make_executor(tp_size=2, need_adjustment=True)
+        exe.dist.tp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+
+    def test_tp_rank_follows_broadcast_when_local_says_no(self):
+        exe = _make_executor(tp_size=2, need_adjustment=False)
+        exe.dist.tp_broadcast.return_value = True
+
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+
+    def test_cp_broadcasts_even_when_tp_size_is_one(self):
+        # A pure-CP job has mapping.tp_size == 1, so keying the agreement on
+        # tp_size alone would leave CP unsynchronized -- yet a request is split
+        # across CP ranks, and CP runs on the same executor loops as TP (loop
+        # choice keys only on pp_size), so CP ranks also schedule independently.
+        exe = _make_executor(tp_size=1, cp_size=4, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_tp_and_cp_chain_propagates_global_rank0(self):
+        # CP first, then TP: after the CP step a rank holds V(its tp_rank, cp0),
+        # and the TP step replaces it with V(tp0, cp0) -- global rank 0's value.
+        #
+        # The local reading and the CP result are deliberately *different* here.
+        # If they matched, the final assertion would pass whether or not the TP
+        # step actually consumes the CP step's result, and the chaining -- the
+        # whole point of this test -- would go unverified.
+        exe = _make_executor(tp_size=2, cp_size=2, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+        exe.dist.tp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        # Called with the CP result (False), not the local reading (True).
+        exe.dist.tp_broadcast.assert_called_once_with(False, root=0)
+
+    def test_single_rank_touches_no_collective(self):
+        exe = _make_executor(tp_size=1, cp_size=1, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.cp_broadcast.assert_not_called()
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_attention_dp_still_broadcasts_over_cp(self):
+        """ADP suppresses the TP hop only -- CP ranks must still agree.
+
+        Under ADP the TP dimension is the DP dimension, so those ranks own
+        independent request streams and decide independently.  But CP is
+        orthogonal: inside one DP replica the CP ranks split the *same* request
+        along the sequence dimension, so they have to admit it together.
+        Skipping the CP hop here would reintroduce the divergence this whole
+        mechanism exists to remove, once per replica.  This mirrors the
+        scheduler's own propagation, which gates ``tp_broadcast`` on
+        ``not enable_attention_dp`` but runs ``cp_broadcast`` unconditionally.
+        """
+        exe = _make_executor(tp_size=2, cp_size=2, enable_attention_dp=True, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+
+        # The CP result wins over this rank's own reading...
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        # ...but the TP hop stays suppressed, so replicas remain independent.
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_attention_dp_without_cp_touches_no_collective(self):
+        exe = _make_executor(tp_size=2, cp_size=1, enable_attention_dp=True, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.cp_broadcast.assert_not_called()
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_attention_dp_decides_independently(self):
+        # ADP ranks own independent request streams and independent KV caches,
+        # so forcing rank 0's decision on them would starve a rank that needs
+        # to rebalance when rank 0 does not.
+        exe = _make_executor(tp_size=4, enable_attention_dp=True, need_adjustment=True)
+        assert PyExecutor._agreed_need_adjustment(exe) is True
+        exe.dist.tp_broadcast.assert_not_called()
+
+    def test_no_rebalance_when_agreement_says_no(self, monkeypatch):
+        exe = _make_executor(tp_size=2, need_adjustment=True, active_requests=[_make_request(1)])
+        exe.dist.tp_broadcast.return_value = False
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
 
 
 if __name__ == "__main__":
