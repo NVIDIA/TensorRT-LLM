@@ -23,9 +23,11 @@ const workflow = fs.readFileSync(
 const marker = '          script: |\n';
 const start = workflow.indexOf(marker);
 assert.notEqual(start, -1, 'workflow must contain an inline github-script');
-const script = workflow
-  .slice(start + marker.length)
-  .split('\n')
+const lines = workflow.slice(start + marker.length).split('\n');
+const end = lines.findIndex(
+  (line) => line.trim() !== '' && !line.startsWith(' '.repeat(12))
+);
+const script = (end === -1 ? lines : lines.slice(0, end))
   .map((line) => line.replace(/^ {12}/, ''))
   .join('\n');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -41,6 +43,13 @@ const execute = new AsyncFunction(
 
 const oldDate = (days) =>
   new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+function summaryCounts(summaries) {
+  const [headers, values] = summaries.at(-1);
+  return Object.fromEntries(
+    headers.map((header, index) => [header.data, values[index]])
+  );
+}
 
 function pullRequest(number, overrides = {}) {
   return {
@@ -186,12 +195,20 @@ async function main() {
       reviewDecision: 'APPROVED',
       updatedAt: oldDate(181),
     });
-    const { events } = await run({ pullRequests: { 1: pr } });
+    const { events, summaries } = await run({ pullRequests: { 1: pr } });
     assert.deepEqual(
       events.filter((event) => event.startsWith('close:') || event.startsWith('comment:')).map((event) => event.split(':')[0]),
       ['close', 'comment'],
       'an old conflicting PR must close before it is commented on'
     );
+    assert.deepEqual(summaryCounts(summaries), {
+      Mode: 'Run',
+      Closed: '1',
+      Exempt: '0',
+      Pinged: '0',
+      Scanned: '1',
+      Skipped: '0',
+    });
   }
 
   {
@@ -211,16 +228,34 @@ async function main() {
 
   {
     const unknown = pullRequest(6, { mergeable: 'UNKNOWN' });
-    const resolved = pullRequest(6);
+    const resolved = pullRequest(6, {
+      labels: {
+        nodes: Array.from({ length: 100 }, (_, index) => ({
+          name: `label-${index}`,
+        })),
+        pageInfo: { endCursor: '1', hasNextPage: true },
+      },
+    });
     const unresolved = pullRequest(7, { mergeable: 'UNKNOWN' });
-    const { events, reads, warnings } = await run({
+    const { events, reads, summaries, warnings } = await run({
       pullRequests: { 6: [unknown, unknown, resolved], 7: unresolved },
+      labelPages: {
+        6: [null, { nodes: [], pageInfo: { endCursor: null, hasNextPage: false } }],
+      },
     });
     assert.equal(reads.get(6), 3);
     assert.equal(reads.get(7), 3);
+    assert.equal(events.filter((event) => event === 'labels:6:1').length, 1);
     assert(events.some((event) => event.startsWith('comment:6:')));
     assert(!events.some((event) => event.startsWith('comment:7:')));
     assert(warnings.some((warning) => warning.includes('did not compute mergeability')));
+    assert.deepEqual(
+      {
+        Pinged: summaryCounts(summaries).Pinged,
+        Skipped: summaryCounts(summaries).Skipped,
+      },
+      { Pinged: '1', Skipped: '1' }
+    );
   }
 
   {
@@ -229,7 +264,7 @@ async function main() {
       pageInfo: { endCursor: '1', hasNextPage: true },
     };
     const pr = pullRequest(8, { labels: firstLabels });
-    const { events } = await run({
+    const { events, summaries } = await run({
       pullRequests: { 8: pr },
       labelPages: {
         8: [null, { nodes: [{ name: 'no-stale' }], pageInfo: { endCursor: null, hasNextPage: false } }],
@@ -237,6 +272,7 @@ async function main() {
     });
     assert(events.some((event) => event === 'labels:8:1'));
     assert(!events.some((event) => event.startsWith('comment:8:')));
+    assert.equal(summaryCounts(summaries).Exempt, '1');
   }
 
   {
@@ -257,8 +293,15 @@ async function main() {
         return [number, pullRequest(number)];
       })
     );
-    const { events, warnings } = await run({ pullRequests: prs });
+    const { events, summaries, warnings } = await run({ pullRequests: prs });
     assert.equal(events.filter((event) => event.startsWith('comment:')).length, 50);
+    assert.deepEqual(
+      {
+        Pinged: summaryCounts(summaries).Pinged,
+        Scanned: summaryCounts(summaries).Scanned,
+      },
+      { Pinged: '50', Scanned: '50' }
+    );
     assert(warnings.some((warning) => warning.includes('50-action safety limit')));
   }
 

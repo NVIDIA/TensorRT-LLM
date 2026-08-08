@@ -170,22 +170,25 @@ jobs:
                   number,
                 });
                 const pullRequest = result.repository.pullRequest;
-                const isExempt = pullRequest
-                  ? await hasExemptLabel(number, pullRequest.labels)
-                  : false;
                 const isFresh =
                   pullRequest &&
                   (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS <=
                     PING_AFTER_DAYS;
+                if (!pullRequest) {
+                  return null;
+                }
+                if (pullRequest.state !== 'OPEN' || isFresh) {
+                  return { ...pullRequest, isExempt: false };
+                }
                 if (
-                  !pullRequest ||
-                  pullRequest.state !== 'OPEN' ||
-                  isExempt ||
-                  isFresh ||
                   pullRequest.mergeable !== 'UNKNOWN' ||
                   attempt === MAX_MERGEABILITY_ATTEMPTS
                 ) {
-                  return pullRequest ? { ...pullRequest, isExempt } : null;
+                  const isExempt = await hasExemptLabel(
+                    number,
+                    pullRequest.labels
+                  );
+                  return { ...pullRequest, isExempt };
                 }
 
                 console.log(
@@ -194,6 +197,7 @@ jobs:
                 );
                 await wait(MERGEABILITY_RETRY_DELAY_MS);
               }
+              return null;
             }
 
             async function retryWrite(description, operation) {
@@ -217,7 +221,6 @@ jobs:
             let closeCount = 0;
             let exemptCount = 0;
             let pingCount = 0;
-            let processedCandidateCount = 0;
             let scannedCount = 0;
             let skipCount = 0;
             const candidates = [];
@@ -252,7 +255,6 @@ jobs:
                 break;
               }
 
-              processedCandidateCount += 1;
               scannedCount += 1;
               // Re-read mutable state immediately before acting. This prevents a
               // comment, label, or push made during the run from being treated as stale.
@@ -366,7 +368,7 @@ jobs:
 
             if (
               actionCount >= MAX_ACTIONS_PER_RUN &&
-              processedCandidateCount < candidates.length
+              scannedCount < candidates.length
             ) {
               core.warning(
                 `Reached the ${MAX_ACTIONS_PER_RUN}-action safety limit; ` +
