@@ -15,8 +15,9 @@ cannot give up.
 This is a GEMV band instead. One CTA per expert reduces over the hidden
 dimension with plain FP32 FMA, widening the BF16 activation in-register, so the
 cast disappears, there are no partials to reduce, and the multiply keeps the
-full FP32 mantissa. It is deliberately shaped for a handful of tokens; anything
-larger falls back to ``F.linear``, which is what prefill wants anyway.
+full FP32 mantissa. It is deliberately shaped for a handful of tokens, which is
+where decode lives; anything wider falls back to ``F.linear``, both because
+cuBLAS wins there and because prefill should keep the numerics it has.
 
 Numerics move, and in the direction of the reference: this is closer to a true
 FP32 router than the TF32 split-K it replaces, so it wants an eval rather than a
@@ -29,13 +30,17 @@ import torch
 import triton
 import triton.language as tl
 
-# Above this the GEMV shape stops paying and cuBLAS' tiling wins; prefill lands
-# here and keeps its current kernel and its current numerics.
-MAX_GEMV_TOKENS = 32
+# Measured on B200 at 128 experts / 6144 hidden, against the cuBLAS sequence:
+# 2.8x at 1 token, 2.0x at 4, 1.2x at 8, and a loss by 16. One CTA per expert
+# stops paying once the batch is wide enough for cuBLAS to tile it.
+MAX_GEMV_TOKENS = 8
 
-# Elements of the activation tile held in registers per CTA. Caps the K block so
-# that a 32-token batch does not spill.
-_TILE_ELEMS = 4096
+# Elements of the activation tile held in registers per CTA, which sets the K
+# block. Larger is monotonically better in the tuning sweep -- at one CTA per
+# expert the kernel is latency-bound, so what helps is loads in flight per
+# thread -- until the tile stops fitting. This puts a 4-token batch at
+# BLOCK_K=2048, which also divides 6144 exactly.
+_TILE_ELEMS = 8192
 
 
 @triton.jit

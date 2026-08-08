@@ -119,7 +119,7 @@ def _run_tune(args) -> None:
     print(f"{'BLOCK_K':>8s} {'warps':>6s} {'us':>8s}")
 
     results = []
-    for block_k in (128, 256, 512, 1024, 2048):
+    for block_k in (128, 256, 512, 1024, 2048, 4096, 8192):
         for num_warps in (4, 8, 16):
             if block_m * block_k > 65536:  # would spill
                 continue
@@ -155,7 +155,7 @@ def main() -> None:
     parser.add_argument("--hidden-size", type=int, default=M3_HIDDEN)
     parser.add_argument("--num-experts", type=int, default=M3_EXPERTS)
     parser.add_argument("--layers", type=int, default=M3_SPARSE_LAYERS)
-    parser.add_argument("--num-tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    parser.add_argument("--num-tokens", type=int, nargs="+", default=[1, 2, 4, 8, 12, 16, 32])
     parser.add_argument("--calls-per-graph", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
