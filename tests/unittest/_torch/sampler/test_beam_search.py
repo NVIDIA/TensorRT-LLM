@@ -799,7 +799,10 @@ def _kernel_test(fn: Callable[..., Any]) -> Callable[..., Any]:
         with torch.device("cuda"):
             return fn(*args, **kwargs)
 
-    return wrapper
+    # functools.wraps is untyped, so `wrapper` decays to Any; name the type
+    # again on the way out to satisfy the declared return.
+    typed_wrapper: Callable[..., Any] = wrapper
+    return typed_wrapper
 
 
 class GeneralTestParams:
