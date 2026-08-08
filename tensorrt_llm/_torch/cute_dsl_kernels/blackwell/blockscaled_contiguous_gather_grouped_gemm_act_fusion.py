@@ -47,6 +47,7 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    round_f32x2_via_bf16,
     silu_f32,
 )
 
@@ -2600,7 +2601,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``
 
         ``up`` and ``gate`` come from the two interleaved accumulator
-        subtiles loaded by the caller.
+        subtiles loaded by the caller. When generating FP4 output and scale
+        factors, the alpha-scaled FC1 result is rounded through BF16 before
+        SwiGLU to match the unfused BF16 intermediate boundary.
         """
         if cutlass.const_expr(self.vectorized_f32):
             # Packed f32x2: compute silu via 1 / (1 + exp2(-log2_e * x))
@@ -2614,6 +2617,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
                     (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
                 )
+                if cutlass.const_expr(self.generate_sfc):
+                    acc_vec_up_alpha = round_f32x2_via_bf16(*acc_vec_up_alpha)
+                    acc_vec_gate_alpha = round_f32x2_via_bf16(*acc_vec_gate_alpha)
                 # SwiGLU clamp
                 if cutlass.const_expr(self.has_swiglu_limit):
                     gate_lo = fmin(acc_vec_gate_alpha[0], self.swiglu_limit)
@@ -2656,6 +2662,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                if cutlass.const_expr(self.generate_sfc):
+                    acc_vec_up_alpha = acc_vec_up_alpha.to(cutlass.BFloat16).to(cutlass.Float32)
+                    acc_vec_gate_alpha = acc_vec_gate_alpha.to(cutlass.BFloat16).to(cutlass.Float32)
                 if cutlass.const_expr(self.has_swiglu_limit):
                     acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
                     acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)

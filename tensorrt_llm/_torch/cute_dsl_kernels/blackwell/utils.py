@@ -245,6 +245,45 @@ def fclip_xorsign(a: Union[float, cutlass.Float32],
         ))
 
 
+@dsl_user_op
+def round_f32x2_via_bf16(
+    a: float | cutlass.Float32,
+    b: float | cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> tuple[cutlass.Float32, cutlass.Float32]:
+    """Round two FP32 values through BF16 with non-saturating RNE.
+
+    Returns the rounded values as FP32 in the original ``(a, b)`` order.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+        ],
+        """{
+            .reg .b32 packed;
+            cvt.rn.bf16x2.f32 packed, $3, $2;
+            shl.b32 $0, packed, 16;
+            and.b32 $1, packed, 0xFFFF0000;
+        }""",
+        "=r,=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    a_bits = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    b_bits = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return (
+        cutlass.Float32(llvm.bitcast(T.f32(), a_bits, loc=loc, ip=ip)),
+        cutlass.Float32(llvm.bitcast(T.f32(), b_bits, loc=loc, ip=ip)),
+    )
+
+
 def sigmoid_f32(a: Union[float, cutlass.Float32],
                 fastmath: bool = False) -> Union[float, cutlass.Float32]:
     """
