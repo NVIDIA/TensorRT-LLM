@@ -1130,9 +1130,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
         # Account for max single-sequence capacity = seq_len + extra KV tokens +
         # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
-        max_seq_capacity = (
-            self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
-        )
+        max_seq_capacity = self._max_sequence_capacity()
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
@@ -2163,6 +2161,63 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return True if *request_id* has a live, non-suspended KV cache."""
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
+
+    def _max_sequence_capacity(self) -> int:
+        """Return the largest capacity passed to the V2 cache."""
+        return self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+
+    def max_resident_sequences(self) -> Optional[int]:
+        """Upper bound on sequences that can co-reside at ``max_seq_len``.
+
+        MAX_UTILIZATION admits new sequences up to ``max_batch_size`` and
+        relies on suspend/resume to survive over-subscription. That recovery
+        only works while some resident sequence can still be evicted to free
+        the pages a suspended one needs to resume. A sequence whose state is
+        non-droppable (a hybrid Mamba recurrent state is fixed-size per
+        sequence and cannot be recomputed from tokens) contributes no
+        evictable pages, so once every sequence is suspended the pool can no
+        longer drain and the scheduler makes no further progress.
+
+        Returns None when no rank has such a non-droppable pool, keeping the
+        unbounded MAX_UTILIZATION behavior for plain attention models. When
+        one exists, every rank contributes its local full-sequence capacity
+        so pipeline-parallel ranks admit the same request set even when some
+        ranks contain only attention layers or no local layers.
+        """
+        life_cycle_metadata = self._stats_life_cycle_metadata()
+        has_non_droppable_pool = any(
+            kind != "attention" for _, _, kind in life_cycle_metadata.values()
+        )
+        dist = None
+        if self.mapping.world_size > 1:
+            dist = Distributed.get(self.mapping)
+            has_non_droppable_pool = bool(
+                dist.allreduce(int(has_non_droppable_pool), op=ReduceOp.MAX)
+            )
+        if not has_non_droppable_pool:
+            return None
+
+        # A physical group can host multiple lifecycle variants. V2 allocates
+        # each variant separately from the shared group, so their costs add.
+        attention_slots = math.ceil(self._max_sequence_capacity() / self.tokens_per_block)
+        slots_per_pool_group: dict[int, int] = defaultdict(int)
+        for pool_group_id, _, kind in life_cycle_metadata.values():
+            slots_per_pool_group[pool_group_id] += attention_slots if kind == "attention" else 1
+
+        if slots_per_pool_group:
+            storage_stats = self._get_storage_statistics(GPU_LEVEL)
+            local_capacity = min(
+                storage_stats[pool_group_id].total // slots_per_sequence
+                for pool_group_id, slots_per_sequence in slots_per_pool_group.items()
+            )
+        else:
+            # A PP rank with no local cache layers must not constrain ranks
+            # that do own physical cache pools.
+            local_capacity = sys.maxsize
+
+        if dist is not None:
+            local_capacity = dist.allreduce(local_capacity, op=ReduceOp.MIN)
+        return max(1, int(local_capacity))
 
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.

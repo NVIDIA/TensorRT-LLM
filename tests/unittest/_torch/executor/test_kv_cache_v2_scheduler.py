@@ -160,6 +160,7 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
+    max_resident_sequences=None,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
@@ -169,7 +170,15 @@ def make_kv_cache_manager(
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
-    mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
+    if max_resident_sequences is None:
+        mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
+    else:
+        mgr.is_request_active.side_effect = (
+            lambda req_id: req_id in mgr.kv_cache_map and mgr.kv_cache_map[req_id].is_active
+        )
+    # Must be pinned: a bare Mock() is not None, so the scheduler's residency
+    # gate would compare an int against a child Mock and raise TypeError.
+    mgr.max_resident_sequences.return_value = max_resident_sequences
     return mgr
 
 
@@ -1359,30 +1368,19 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [1, 3]
 
-    def test_disagg_cross_iteration_slot_overflow(self):
-        """Reproduce IndexMapper slot overflow across iterations.
-
-        Simulates the real crash scenario:
-          Iter 1: disagg_gen_init scheduled → slots consumed → state becomes
-                  DISAGG_GENERATION_TRANS_IN_PROGRESS (value=9).
-          Iter 2: TRANS_IN_PROGRESS (9) is invisible to both the disagg branch
-                  (checks ==8) and state gating ([10,14)), so budget resets to
-                  0. New disagg_gen_init passes budget → prepare_disagg_gen_init
-                  called again → IndexMapper would crash in production.
-
-        This test counts prepare_disagg_gen_init calls across two iterations.
-        With scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
-        correct implementation should cap total prepare_disagg_gen_init calls to
-        2 (the IndexMapper capacity). The bug allows 4.
-        """
+    def test_disagg_transfer_counts_against_residency_across_iterations(self):
+        """In-progress transfers retain residency and defer new init requests."""
         prepare_count = [0]
 
         def counting_prepare(req):
             prepare_count[0] += 1
             return True
 
-        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=counting_prepare)
-        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
+        mgr = make_kv_cache_manager(
+            prepare_disagg_gen_init_fn=counting_prepare,
+            max_resident_sequences=2,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=200)
 
         # Iteration 1: two disagg_gen_init requests
         reqs_iter1 = [make_disagg_request(0), make_disagg_request(1)]
@@ -1395,18 +1393,14 @@ class TestDisagg:
         for req in reqs_iter1:
             req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
 
-        # Iteration 2: old requests (now TRANS_IN_PROGRESS) + 2 new disagg.
-        # TRANS_IN_PROGRESS (9) is invisible to scheduler: not ==8, not in [10,14).
+        # Iteration 2: old transfers still occupy both resident slots.
         new_reqs = [make_disagg_request(2), make_disagg_request(3)]
         all_active = reqs_iter1 + new_reqs
 
         out2 = sched.schedule_request(all_active, set())
 
-        # BUG: budget resets to 0, TRANS_IN_PROGRESS not counted, so
-        # both new disagg pass → prepare_disagg_gen_init called 4 times total.
-        # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
-        assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
-        assert prepare_count[0] == 4  # <-- proves the overflow
+        assert ids(out2.fitting_disagg_gen_init_requests) == []
+        assert prepare_count[0] == 2
 
 
 # ===========================================================================
@@ -2215,6 +2209,81 @@ class TestEdgeCases:
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
         assert ids(out.generation_requests) == [2]
         assert ids(out.context_requests) == [4]
+
+
+# ===========================================================================
+# Residency Cap (non-droppable state pools)
+# ===========================================================================
+
+
+class TestResidencyCap:
+    """A manager reporting max_resident_sequences bounds newly started
+    sequences, so a pool whose state cannot be evicted never over-subscribes.
+    """
+
+    def test_none_leaves_admission_unbounded(self):
+        """Plain attention models report None and keep MAX_UTILIZATION behavior."""
+        mgr = make_kv_cache_manager(max_resident_sequences=None)
+        sched = make_scheduler(mgr)
+        reqs = [make_ctx_request(i, context_remaining_length=10) for i in range(20)]
+        out = sched.schedule_request(reqs, set())
+        assert len(out.context_requests) == 20
+
+    def test_caps_newly_started_sequences(self):
+        mgr = make_kv_cache_manager(max_resident_sequences=3)
+        sched = make_scheduler(mgr)
+        reqs = [make_ctx_request(i, context_remaining_length=10) for i in range(20)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1, 2]
+
+    def test_already_started_sequences_consume_the_cap(self):
+        """In-progress generation holds its slot, so no new context is admitted."""
+        mgr = make_kv_cache_manager(max_resident_sequences=2)
+        sched = make_scheduler(mgr)
+        reqs = [
+            make_gen_request(0),
+            make_gen_request(1),
+            make_ctx_request(2, context_remaining_length=10),
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.context_requests) == []
+
+    def test_continuing_chunk_is_not_charged_again(self):
+        """Only a first chunk starts a sequence; later chunks keep their slot."""
+        mgr = make_kv_cache_manager(max_resident_sequences=1)
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=10, is_first_context_chunk=False)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_caps_successful_disagg_init_in_phase_one(self):
+        mgr = make_kv_cache_manager(max_resident_sequences=2)
+        sched = make_scheduler(mgr)
+
+        out = sched.schedule_request([make_disagg_request(i) for i in range(3)], set())
+
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+        assert mgr.prepare_disagg_gen_init.call_count == 2
+
+    def test_disagg_init_does_not_block_continuing_context(self):
+        mgr = make_kv_cache_manager(max_resident_sequences=2)
+        sched = make_scheduler(mgr)
+        continuing = make_ctx_request(
+            2,
+            context_remaining_length=10,
+            is_first_context_chunk=False,
+        )
+        reqs = [
+            make_disagg_request(0),
+            make_ctx_request(1, context_remaining_length=10),
+            continuing,
+        ]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+        assert ids(out.context_requests) == [2]
 
 
 # ===========================================================================
