@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
@@ -399,6 +402,11 @@ class MiniMaxM2Model(DecoderModel):
 
 @register_auto_model("MiniMaxM2ForCausalLM")
 class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Use KV cache manager V2 by default."""
+        return {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(
             MiniMaxM2Model(model_config),

@@ -26,6 +26,12 @@ from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
+WIDEEP_DEPRECATION_MESSAGE = (
+    "The WIDEEP MoE backend is deprecated and can no longer be selected. Wide "
+    "expert parallelism and EPLB are supported by the other backends: use "
+    "DEEPGEMM for FP8 block-scale checkpoints, or TRTLLM / CUTEDSL / CUTLASS "
+    "otherwise.")
+
 
 def _get_pretrained_megamoe_capability_args(
         model_config: ModelConfig) -> Dict[str, Optional[object]]:
@@ -78,17 +84,28 @@ def get_moe_cls(
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
     elif moe_backend.upper() == "CUTEDSL":
+        has_w4a16_nvfp4 = (quant_config is not None
+                           and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4)
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4()):
-            # On SM120 / SM121 + NVFP4 the cuteDSL family member is the
+                or quant_config.quant_mode.has_nvfp4() or has_w4a16_nvfp4):
+            # On SM120 / SM121 + NVFP4/W4A16_NVFP4 the cuteDSL family member is the
             # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
             # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
             # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
-            if quant_config.quant_mode.has_nvfp4():
+            has_nvfp4 = (quant_config.quant_mode.has_nvfp4()
+                         and not has_w4a16_nvfp4)
+            if has_nvfp4 or has_w4a16_nvfp4:
                 from tensorrt_llm._utils import get_sm_version
                 sm_version = get_sm_version()
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                    mapping = model_config.mapping
+                    if mapping.moe_ep_size > 1 or mapping.dp_size > 1:
+                        logger.warning(
+                            "CuteDslB12xFusedMoE does not support expert "
+                            "parallelism or attention-DP/all-to-all; selecting "
+                            "CutlassFusedMoE.")
+                        return CutlassFusedMoE
                     try:
                         import flashinfer  # noqa: F401
                         logger.info(
@@ -101,13 +118,24 @@ def get_moe_cls(
                     except ImportError:
                         logger.warning(
                             "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
-                            "but flashinfer is not importable; using CuteDslFusedMoE.",
+                            "but flashinfer is not importable; using %s.",
                             sm_version,
+                            "CutlassFusedMoE"
+                            if has_w4a16_nvfp4 else "CuteDslFusedMoE",
                         )
+                        if has_w4a16_nvfp4:
+                            return CutlassFusedMoE
+                elif has_w4a16_nvfp4:
+                    logger.warning(
+                        "CuteDslB12xFusedMoE requires SM120/121 for W4A16_NVFP4 "
+                        "(got SM%d). Using CutlassFusedMoE.",
+                        sm_version,
+                    )
+                    return CutlassFusedMoE
             return CuteDslFusedMoE
         else:
             logger.warning(
-                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales, nvfp4, and w4a16_nvfp4. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -154,7 +182,7 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
     elif moe_backend.upper() == "WIDEEP":
-        return WideEPMoE
+        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
     elif moe_backend.upper() == "MEGAMOE_DEEPGEMM":
@@ -294,6 +322,9 @@ def create_moe_backend(
     Returns:
         MoE: MoE backend instance
     """
+    if moe_cls is WideEPMoE:
+        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
+
     # Get parameters from pretrained_config if not explicitly provided
     pretrained_config = model_config.pretrained_config
     if num_experts is None:
@@ -316,7 +347,6 @@ def create_moe_backend(
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
         supported_load_balancer_backends = (
-            WideEPMoE,
             CutlassFusedMoE,
             TRTLLMGenFusedMoE,
             CuteDslFusedMoE,
@@ -342,7 +372,7 @@ def create_moe_backend(
 
     if swiglu_limit is not None:
         assert moe_cls in [
-            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
+            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE,
             DeepGemmFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
 
@@ -350,7 +380,7 @@ def create_moe_backend(
         # MegaMoECuteDsl uses the scalar only as a fallback when no per-expert
         # tensor limit is given (see the MegaMoE branch below).
         assert moe_cls in [
-            CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
+            CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
             MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
@@ -410,22 +440,6 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
         )
-    elif moe_cls == WideEPMoE:
-        return moe_cls(
-            routing_method=routing_method,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            dtype=dtype,
-            reduce_results=reduce_results,
-            model_config=model_config,
-            aux_stream_dict=aux_stream_dict,
-            weight_loading_mode=weight_loading_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
-            activation_type=activation_type)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
 

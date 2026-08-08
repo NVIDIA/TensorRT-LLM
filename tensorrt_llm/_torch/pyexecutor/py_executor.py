@@ -5870,13 +5870,40 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
+        expected_num_active_requests = self.expected_num_active_requests
+        if expected_num_active_requests < len(self.active_requests):
+            # Not fatal, and not a capacity violation. The router derives this
+            # value as
+            #   min(max(ceil(multiplier * fair_share), max(per_rank_loads)),
+            #       max_num_active_requests)
+            # (adp_router.AttentionDpRouter._expected_num_active_requests), so
+            # the per-rank-load floor normally keeps it at or above this rank's
+            # own load -- but the hard cap is applied last. Any rank that ends
+            # up holding max_num_active_requests + 1 requests therefore breaks
+            # the relation, e.g. when an attention-DP pad dummy survives an
+            # iteration that was skipped fleet-wide (can_queue False skips both
+            # _forward_step and _update_request_states, and
+            # _update_request_states_tp is the only place the dummy is removed)
+            # and the next gather_all_rank_states counts it.
+            #
+            # Inside this method the value is consumed only by the idle-rank
+            # test below, and a rank holding surplus requests needs no dummy,
+            # so tolerate the surplus. Asserting here took down the executor
+            # event loop on every affected rank at once, leaving the survivors
+            # to HangDetector-abort.
+            logger.warning(
+                f"active_requests ({len(self.active_requests)}) exceeds "
+                f"expected_num_active_requests "
+                f"({expected_num_active_requests}); tolerating (a busy rank "
+                f"needs no attention-DP dummy).")
+            expected_num_active_requests = len(self.active_requests)
+
         num_active_request = self._count_schedulable_active_requests()
 
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        needs_dummy = (self.expected_num_active_requests > 0
+        needs_dummy = (expected_num_active_requests > 0
                        and num_active_request == 0)
         if not needs_dummy:
             return
@@ -5998,6 +6025,24 @@ class PyExecutor:
                 ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
                     requests)
             self._setup_sampler_step(requests)
+            # KDA fused-verify replay caches: the ctx->gen state transfer
+            # populates only the base mamba conv/ssm pools; with one-model
+            # spec decoding (e.g. SA) the first forward for these requests
+            # takes the fused verify path, which reads the per-slot
+            # kda_conv_* replay caches instead of the conv pool. Seed them
+            # from the transferred conv states before the first step
+            # (otherwise the recurrent state is permanently contaminated by
+            # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
+            if self.model_engine.enable_spec_decode:
+                kv_mgr = self.resource_manager.resource_managers.get(
+                    ResourceManagerType.KV_CACHE_MANAGER)
+                seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
+                               None)
+                if seed is not None:
+                    seed([
+                        req.py_request_id
+                        for req in cache_trans_complete_requests
+                    ])
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -6571,11 +6616,49 @@ class PyExecutor:
                          resource_manager: Optional[ResourceManager] = None):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+
+    def _accumulate_spec_dec_stats(self, sample_state: SampleState) -> None:
+        """Accumulate per-request spec-decode acceptance stats for one step.
+
+        Runs right after Sampler.update_requests, which writes the paired
+        (py_num_accepted_draft_tokens, py_num_draft_tokens_verified) counters
+        for exactly the requests in sample_state. Consuming (and resetting)
+        py_num_draft_tokens_verified here counts each verified step exactly
+        once, immune to scheduling gaps, response-emission skips, and the
+        samplers/drafters replacing py_draft_tokens with the next step's
+        (padded) buffer before responses are handled.
+        """
+        requests = getattr(sample_state, 'requests', None)
+        if not requests:
+            return
+        for request in requests:
+            drafted_step = getattr(request, 'py_num_draft_tokens_verified', 0)
+            if drafted_step <= 0:
+                continue
+            request.py_num_draft_tokens_verified = 0
+            py_num_accepted = request.py_num_accepted_draft_tokens
+            # Mirror C++ LlmRequest::updateNumTokensPerIteration, which
+            # clamps the drafted count to getMaxDraftPathLen(): with
+            # tree-based drafting the request carries up to
+            # max_total_draft_tokens draft tokens, but at most
+            # max_draft_len (the max path length) of them can be accepted
+            # in one step, so the acceptance-rate denominator counts paths,
+            # not trees. No-op for linear chains (drafted_step <=
+            # max_draft_len there).
+            drafted = (min(drafted_step, self.max_draft_len)
+                       if self.max_draft_len > 0 else drafted_step)
+            request.py_total_draft_tokens += drafted
+            request.py_total_accepted_draft_tokens += py_num_accepted
+            for pos in range(min(drafted_step, MAX_SPEC_DECODE_POSITIONS)):
+                request.py_per_pos_drafted[pos] += 1
+            for pos in range(min(py_num_accepted, MAX_SPEC_DECODE_POSITIONS)):
+                request.py_per_pos_accepted[pos] += 1
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
@@ -6968,16 +7051,6 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
-            py_num_accepted = getattr(request, 'py_num_accepted_draft_tokens',
-                                      0)
-            draft_len = get_draft_token_length(request)
-            if draft_len > 0:
-                for pos in range(min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
-                    request.py_per_pos_drafted[pos] += 1
-                for pos in range(min(py_num_accepted,
-                                     MAX_SPEC_DECODE_POSITIONS)):
-                    request.py_per_pos_accepted[pos] += 1
-
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
@@ -7007,6 +7080,14 @@ class PyExecutor:
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
+                    if request.py_total_draft_tokens > 0:
+                        # Backfills RequestPerfMetrics.speculative_decoding on
+                        # the client side; the C++ section is only populated
+                        # by updateNumTokensPerIteration, which the PyTorch
+                        # flow never calls.
+                        response.result.spec_dec_totals = (
+                            request.py_total_accepted_draft_tokens,
+                            request.py_total_draft_tokens)
                     new_responses.append((req_id, response))
 
             if request_done:
