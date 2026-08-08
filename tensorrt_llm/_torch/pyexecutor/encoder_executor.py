@@ -33,6 +33,7 @@ class EncoderExecutor:
     def __init__(self, model_engine, dist):
         self.model_engine = model_engine
         self.dist = dist
+        self._cleanup_done = False
 
         logger.info(
             "encode_only path enabled: using EncoderExecutor. "
@@ -57,5 +58,16 @@ class EncoderExecutor:
         return self.model_engine.encoder_forward(inputs, **kwargs)
 
     def shutdown(self):
-        """No background thread to stop — just release model engine resources."""
-        del self.model_engine
+        """Collectively release userbuffers, then drop the model engine."""
+        if getattr(self, "_cleanup_done", False):
+            return
+
+        engine = self.model_engine
+        engine._release_cuda_graphs()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        try:
+            engine.shutdown_userbuffers()
+        finally:
+            del self.model_engine
+            self._cleanup_done = True

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +34,8 @@ void UserBuffersManager::initialize(
     int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank, int64_t gpus_per_node, int64_t buffer_size)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    TLLM_CHECK_WITH_INFO(
+        buffers_.empty(), "UserBuffersManager must be shut down before it is initialized for another engine");
     tensorrt_llm::runtime::WorldConfig world_config(tp_size, pp_size, cp_size, rank, gpus_per_node);
     tensorrt_llm::runtime::ub::ub_initialize(world_config);
     TLLM_CHECK(tensorrt_llm::runtime::ub::ub_is_initialized());
@@ -43,7 +45,9 @@ void UserBuffersManager::initialize(
 std::pair<UBBufferPtr, UBBuffer> UserBuffersManager::allocate_userbuffers(int64_t buffer_size)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    TLLM_CHECK(buffer_size <= buffer_size_);
+    TLLM_CHECK_WITH_INFO(buffer_size <= buffer_size_,
+        "Requested userbuffer size (%ld bytes) exceeds the manager buffer capacity (%ld bytes)", buffer_size,
+        buffer_size_);
 
     // Check for all unused buffers
     int i = 0;
@@ -79,6 +83,21 @@ void UserBuffersManager::release_buffer(void* addr)
     buffer_iter->second = false;
 }
 
+void UserBuffersManager::shutdown()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto const& buffer : buffers_)
+    {
+        TLLM_CHECK_WITH_INFO(!buffer.second, "Cannot shut down UserBuffersManager while buffers are still in use");
+    }
+    for (auto buffer = buffers_.rbegin(); buffer != buffers_.rend(); ++buffer)
+    {
+        tensorrt_llm::runtime::ub::ub_deallocate(buffer->first.addr);
+    }
+    buffers_.clear();
+    buffer_size_ = 0;
+}
+
 tensorrt_llm::runtime::ub::UBBuffer UserBuffersManager::search_buffer(void* addr)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -100,6 +119,11 @@ void initialize_userbuffers_manager(
     int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank, int64_t gpus_per_node, int64_t buffer_size)
 {
     UserBuffersManager::get_instance().initialize(tp_size, pp_size, cp_size, rank, gpus_per_node, buffer_size);
+}
+
+void shutdown_userbuffers_manager()
+{
+    UserBuffersManager::get_instance().shutdown();
 }
 
 } // namespace tensorrt_llm::runtime::ub

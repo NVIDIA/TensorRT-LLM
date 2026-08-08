@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,10 +38,22 @@ TEST(UserBuffer, basic)
     EXPECT_NE(tr::ub::ub_comm(), nullptr);
     void* p0 = tr::ub::ub_allocate(1024).addr;
     void* p1 = tr::ub::ub_allocate(1024).addr;
+    void* p2 = tr::ub::ub_allocate(1024).addr;
     EXPECT_NE(p0, nullptr);
     EXPECT_NE(p1, nullptr);
+    EXPECT_NE(p2, nullptr);
     EXPECT_EQ(tr::ub::ub_get(0).invalid(), false);
     EXPECT_EQ(tr::ub::ub_get(1).invalid(), false);
-    tr::ub::ub_deallocate(p0);
+    EXPECT_EQ(tr::ub::ub_get(2).invalid(), false);
+
+    // Releasing a non-tail buffer defers its unregistration until the tail is released.
     tr::ub::ub_deallocate(p1);
+    EXPECT_EQ(tr::ub::ub_get(2).addr, p2);
+    tr::ub::ub_deallocate(p2);
+
+    // The deferred buffer and tail have both been removed, so the next allocation occupies index 1.
+    void* p3 = tr::ub::ub_allocate(1024).addr;
+    EXPECT_EQ(tr::ub::ub_get(1).addr, p3);
+    tr::ub::ub_deallocate(p3);
+    tr::ub::ub_deallocate(p0);
 }
