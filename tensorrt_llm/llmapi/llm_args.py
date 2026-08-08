@@ -1386,16 +1386,18 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM",
+                      "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+                      "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
-    backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL"] = Field(
-            default='AUTO',
-            description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
-        )
+    backend: _MoeBackend = Field(
+        default='AUTO',
+        description="MoE backend to use. "
+        "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -1740,6 +1742,12 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
+    )
+
+    moe_backend: Optional[_MoeBackend] = Field(
+        default=None,
+        description=
+        "MoE backend override for the speculative (draft) model on the PyTorch backend. None preserves the existing behavior, AUTO selects a backend from the draft model configuration, and a concrete backend applies only to the draft model. The resolved backend may fall back based on model, quantization, and hardware support. One-engine MTP does not support this override because its target and draft layers share quantization metadata."
     )
 
     max_concurrency: Optional[PositiveInt] = Field(
@@ -5571,6 +5579,24 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            if self.speculative_config.moe_backend is not None:
+                spec_mode = self.speculative_config.spec_dec_mode
+                if spec_mode.is_mtp_one_model():
+                    raise ValueError(
+                        "speculative_config.moe_backend does not support "
+                        "one-engine MTP because target and MTP layers share "
+                        "quantization metadata. Leave moe_backend unset to "
+                        "inherit the target backend, or use two-engine MTP.")
+                has_neural_drafter = (spec_mode.has_draft_model()
+                                      or (spec_mode.use_one_engine()
+                                          and not spec_mode.is_sa()))
+                if not has_neural_drafter:
+                    raise ValueError(
+                        "speculative_config.moe_backend requires a neural "
+                        "draft model or draft layers, but decoding_type "
+                        f"{self.speculative_config.decoding_type} does not use one."
+                    )
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
