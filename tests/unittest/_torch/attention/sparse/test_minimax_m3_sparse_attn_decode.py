@@ -304,10 +304,11 @@ def test_sparse_decode_zero_length_rows_are_zero_not_nan():
 
 def _mxfp8_out_buffers(total_q, hidden):
     fp8 = torch.empty(total_q, hidden, dtype=torch.float8_e4m3fn, device="cuda")
-    # Zeroed because the merge kernel writes only the live rows; the rows up to
-    # the next multiple of 128 are scale-factor padding the caller owns.
-    sf = torch.zeros(
-        swizzled_sf_numel(total_q, hidden // MXFP8_BLOCK_SIZE),
+    # Deliberately poisoned rather than zeroed: the kernel owns the padding
+    # rows too, so anything left behind here has to be overwritten.
+    sf = torch.full(
+        (swizzled_sf_numel(total_q, hidden // MXFP8_BLOCK_SIZE),),
+        0xCD,
         dtype=torch.uint8,
         device="cuda",
     )

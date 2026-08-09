@@ -38,6 +38,7 @@ from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm._torch.modules.triton_mxfp8_quantize import (
     MXFP8_BLOCK_SIZE,
     mxfp8_quantize_tile,
+    swizzled_sf_numel,
     swizzled_sf_offset,
 )
 
@@ -247,6 +248,7 @@ def _merge_topk_attn_out_kernel(
     stride_out_d,
     stride_qout_n,
     num_sf_k_tiles,
+    sf_padded_rows,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     QUANT_MXFP8: tl.constexpr,
@@ -302,6 +304,14 @@ def _merge_topk_attn_out_kernel(
         k_idx = pid_h * NUM_SF_BLOCKS + tl.arange(0, NUM_SF_BLOCKS)
         tl.store(out_sf_ptr + swizzled_sf_offset(pid_b, k_idx, num_sf_k_tiles), sf)
 
+        # The swizzled layout rounds rows up to 128 and the reference quantizer
+        # zeroes the rows it invents. Spreading those over the live programs
+        # keeps the buffer self-contained for a few bytes each, rather than
+        # making the caller hold a persistently zeroed one.
+        zero = tl.zeros((NUM_SF_BLOCKS,), tl.uint8)
+        for pad_row in range(pid_b + tl.num_programs(0), sf_padded_rows, tl.num_programs(0)):
+            tl.store(out_sf_ptr + swizzled_sf_offset(pad_row, k_idx, num_sf_k_tiles), zero)
+
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -353,9 +363,8 @@ def minimax_m3_sparse_attn_decode(
     Both describe rows ``[0, total_q)`` of the o_proj input, laid out as
     ``[total_q, num_heads * head_dim]``. A caller running only the generation
     suffix of a mixed batch must therefore not pass them: the rows this kernel
-    skips would reach the GEMM unquantized. The scale buffer's padding rows,
-    from total_q up to the next multiple of 128, are the caller's to zero
-    once, as no program here writes them.
+    skips would reach the GEMM unquantized. The scale buffer is written in
+    full, padding rows included, so plain uninitialized memory will do.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -404,12 +413,19 @@ def minimax_m3_sparse_attn_decode(
                 f"output_mxfp8 must be [{total_q}, {num_heads * head_dim}] covering "
                 f"the whole o_proj input; got {tuple(output_mxfp8.shape)}."
             )
+        expect_sf = swizzled_sf_numel(total_q, num_heads * head_dim // MXFP8_BLOCK_SIZE)
+        if output_mxfp8_sf.numel() != expect_sf:
+            raise ValueError(
+                f"output_mxfp8_sf must hold {expect_sf} swizzled scale factors; "
+                f"got {output_mxfp8_sf.numel()}."
+            )
     # Unused pointers still have to be real ones.
     fp8_arg = output_mxfp8 if quant_mxfp8 else output
     sf_arg = output_mxfp8_sf if quant_mxfp8 else output
     num_sf_blocks = head_dim // MXFP8_BLOCK_SIZE if quant_mxfp8 else 1
     num_sf_k_tiles = triton.cdiv(num_heads * num_sf_blocks, 4)
     stride_qout_n = output_mxfp8.stride(0) if quant_mxfp8 else 0
+    sf_padded_rows = triton.cdiv(total_q, 128) * 128 if quant_mxfp8 else 0
 
     # Persistent arena rather than torch.empty, so the partials keep one address
     # across CUDA graph replays.
@@ -497,6 +513,7 @@ def minimax_m3_sparse_attn_decode(
         output.stride(2),
         stride_qout_n,
         num_sf_k_tiles,
+        sf_padded_rows,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         QUANT_MXFP8=quant_mxfp8,
         NUM_SF_BLOCKS=num_sf_blocks,

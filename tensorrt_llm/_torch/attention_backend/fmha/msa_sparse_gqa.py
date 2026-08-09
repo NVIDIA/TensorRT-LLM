@@ -117,6 +117,8 @@ def run_msa_paged_gqa(
     *,
     kv_block_indexes: Optional[torch.Tensor],
     plan: Optional[tuple],
+    output_mxfp8: Optional[torch.Tensor] = None,
+    output_mxfp8_sf: Optional[torch.Tensor] = None,
 ) -> None:
     """Write the new-token main K/V, then run paged GQA into output in place.
 
@@ -133,6 +135,12 @@ def run_msa_paged_gqa(
     path covers both. The split lives here rather than in a PhasedFmha subclass
     because MiniMaxM3MsaSparseAttention.forward_prepopulated_kv also calls this
     helper directly, bypassing TrtllmAttention.forward.
+
+    output_mxfp8 / output_mxfp8_sf ask the ported sparse decode kernel to also
+    emit output in MXFP8, so the o_proj skips a standalone quantize. Only that
+    one kernel can, and only when it owns every row, so the caller must have
+    established that with msa_ported_decode_owns_batch; anything else here is a
+    partially quantized tensor the GEMM would silently consume.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_decode_span_bounds,
@@ -175,6 +183,14 @@ def run_msa_paged_gqa(
     fmha_tokens = num_tokens
     ported = msa_ported_decode_active(metadata)
 
+    if output_mxfp8 is not None and not (ported and kv_block_indexes is not None and gen_tok0 == 0):
+        raise RuntimeError(
+            "MiniMax-M3 paged GQA was asked for an MXFP8 output on a step the "
+            "ported sparse decode kernel does not own end to end, which would "
+            "leave part of the o_proj input unquantized; see "
+            "msa_ported_decode_owns_batch."
+        )
+
     if kv_block_indexes is not None and ported:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
             minimax_m3_sparse_attn_decode,
@@ -198,6 +214,8 @@ def run_msa_paged_gqa(
             sm_scale=sm_scale,
             output=out_view[gen_tok0:],
             decode_query_len=decode_query_len,
+            output_mxfp8=output_mxfp8,
+            output_mxfp8_sf=output_mxfp8_sf,
         )
         fmha_tokens = gen_tok0
 
@@ -370,6 +388,8 @@ class MsaSparseGqaFmha(Fmha):
             output,
             kv_block_indexes=kv_block_indexes,
             plan=plan,
+            output_mxfp8=forward_args.output_mxfp8,
+            output_mxfp8_sf=forward_args.output_mxfp8_sf,
         )
 
 
