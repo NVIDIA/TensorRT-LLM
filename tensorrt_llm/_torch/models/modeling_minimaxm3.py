@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from typing import Mapping as TMapping
 
 import torch
@@ -47,6 +47,7 @@ from ..attention_backend.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
+from ..attention_backend.sparse.minimax_m3.msa_utils import msa_ported_decode_owns_batch
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -55,6 +56,7 @@ from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
+    MXFP8LinearMethod,
     TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
@@ -63,11 +65,13 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..modules.triton_mxfp8_quantize import MXFP8_BLOCK_SIZE, swizzled_sf_numel
 from ..speculative import SpecMetadata
 from ..utils import (
     ActivationType,
     AuxStreamType,
     EventType,
+    MXFP8QuantizedTensor,
     get_model_extra_attrs,
     is_torch_compiling,
 )
@@ -84,6 +88,10 @@ _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 # Experimental A/B gate for producing compact FP8 Q while inserting main K/V
 # directly into the MSA paged cache during supported eager pure-prefill steps.
 _FUSED_MAIN_KV_WRITE_ENV = "TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE"
+
+# Kill switch for folding the o_proj activation quantize into the sparse decode
+# kernel. Read once, so the decision cannot change under a traced graph.
+_FUSE_O_PROJ_MXFP8 = os.environ.get("TRTLLM_M3_FUSE_O_PROJ_MXFP8", "1") == "1"
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -799,7 +807,25 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
     return metadata, attn_layer
 
 
-@torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
+def _quantize_o_proj_input(
+    attn_out: torch.Tensor, out_mxfp8: torch.Tensor, out_mxfp8_sf: torch.Tensor
+) -> None:
+    """Fill the o_proj MXFP8 buffers for a step the attention could not.
+
+    The same standalone quantize o_proj would have run on its own, plus a copy
+    into buffers that were allocated before the step's shape was known. Paying
+    that copy keeps o_proj's input one type across every step, which is what
+    lets the fold exist at all under torch.compile: see _alloc_o_proj_mxfp8.
+    """
+    fp8, sf = torch.ops.trtllm.mxfp8_quantize(attn_out.contiguous(), True)
+    out_mxfp8.copy_(fp8)
+    out_mxfp8_sf.copy_(sf.view(torch.uint8).reshape(-1))
+
+
+@torch.library.custom_op(
+    "trtllm::minimax_m3_attn_custom_op_inplace",
+    mutates_args=("output", "output_mxfp8", "output_mxfp8_sf"),
+)
 def minimax_m3_attn_custom_op_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -808,11 +834,17 @@ def minimax_m3_attn_custom_op_inplace(
     idx_k: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
+    output_mxfp8: Optional[torch.Tensor],
+    output_mxfp8_sf: Optional[torch.Tensor],
 ) -> None:
     """Run MiniMax-M3 cache and attention work behind a compile boundary."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
-    attn_layer._dispatch_attention_backend(
+    # The MXFP8 buffers span the padded activation while the attention runs
+    # over the live rows, so the attention can only speak for them when the two
+    # agree; a padding tail means quantizing the whole thing below instead.
+    whole = output_mxfp8 is not None and int(output_mxfp8.shape[0]) == num_tokens
+    folded = attn_layer._dispatch_attention_backend(
         q[:num_tokens],
         k[:num_tokens],
         v[:num_tokens],
@@ -820,7 +852,11 @@ def minimax_m3_attn_custom_op_inplace(
         idx_k[:num_tokens] if idx_k is not None else None,
         attn_metadata,
         output[:num_tokens],
+        output_mxfp8 if whole else None,
+        output_mxfp8_sf if whole else None,
     )
+    if output_mxfp8 is not None and not folded:
+        _quantize_o_proj_input(output, output_mxfp8, output_mxfp8_sf)
 
 
 class MiniMaxM3Attention(Attention):
@@ -1817,13 +1853,21 @@ class MiniMaxM3Attention(Attention):
         idx_q: Optional[torch.Tensor],
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, MXFP8QuantizedTensor]:
+        """Run the attention core and return the o_proj input.
+
+        Normally the bf16 output, but an MXFP8QuantizedTensor on the steps where
+        the sparse decode kernel could quantize it on the way out; see
+        _alloc_o_proj_mxfp8. Every caller hands the result straight to o_proj,
+        which accepts either.
+        """
         # Attention output is always the compute dtype (bf16); q may be FP8 when
         # the MSA FP8-KV path emits FP8 q/k/v, so pin the dtype rather than
         # inheriting it from q.
         output = q.new_empty(
             (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
         )
+        output_mxfp8, output_mxfp8_sf = self._alloc_o_proj_mxfp8(q)
         if self.register_to_config and is_torch_compiling():
             minimax_m3_attn_custom_op_inplace(
                 q,
@@ -1833,10 +1877,90 @@ class MiniMaxM3Attention(Attention):
                 idx_k,
                 self.layer_idx_str,
                 output,
+                output_mxfp8,
+                output_mxfp8_sf,
             )
         else:
-            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
+            folded = self._dispatch_attention_backend(
+                q,
+                k,
+                v,
+                idx_q,
+                idx_k,
+                attn_metadata,
+                output,
+                output_mxfp8,
+                output_mxfp8_sf,
+            )
+            if output_mxfp8 is not None and not folded:
+                _quantize_o_proj_input(output, output_mxfp8, output_mxfp8_sf)
+        if output_mxfp8 is not None:
+            return MXFP8QuantizedTensor(output_mxfp8, output_mxfp8_sf)
         return output
+
+    def _o_proj_mxfp8_fold(self) -> bool:
+        """Whether o_proj's activation quantize can move into the attention.
+
+        Recomputed rather than cached on the layer: every term is settled by
+        the time weights are loaded, but not by __init__, and a lazy cache
+        would be a first-call attribute write that torch.compile traces.
+        """
+        quant_method = getattr(self.o_proj, "quant_method", None)
+        return (
+            _FUSE_O_PROJ_MXFP8
+            and self.is_sparse_attention_layer
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and isinstance(quant_method, MXFP8LinearMethod)
+            # The dequant reference path needs the high-precision input.
+            and quant_method.use_cutlass
+            # One merge program owns one head, so a head has to be whole
+            # scale-factor blocks for its amax to be program-local.
+            and self.head_dim % MXFP8_BLOCK_SIZE == 0
+            # LoRA reads the un-quantized activation alongside the GEMM.
+            and getattr(self.o_proj, "lora", None) is None
+            # The fused GEMM+AllReduce takes its own path into the quant method,
+            # which has no pre-quantized entry.
+            and not getattr(self.o_proj, "use_fused_gemm_allreduce", False)
+        )
+
+    def _alloc_o_proj_mxfp8(
+        self, q: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """MXFP8 buffers for o_proj, or (None, None) when the fold cannot apply.
+
+        Deliberately blind to the step: only the sparse decode kernel can fill
+        these, but whether it runs is known one compile boundary further in,
+        and o_proj sits outside that boundary. Deciding here on anything
+        per-step would bake one step's answer into the traced graph. So
+        allocate on the static configuration alone, and let whoever ran the
+        attention fill them, by folding or by _quantize_o_proj_input.
+        """
+        if not self._o_proj_mxfp8_fold():
+            return None, None
+        num_rows, hidden = int(q.shape[0]), self.num_heads * self.head_dim
+        return (
+            torch.empty((num_rows, hidden), dtype=torch.float8_e4m3fn, device=q.device),
+            # Uninitialized is fine: whichever path writes these covers the
+            # scale-factor padding rows as well as the live ones.
+            torch.empty(
+                swizzled_sf_numel(num_rows, hidden // MXFP8_BLOCK_SIZE),
+                dtype=torch.uint8,
+                device=q.device,
+            ),
+        )
+
+    def _sparse_decode_fills_mxfp8(self, attn_metadata: AttentionMetadata, num_rows: int) -> bool:
+        """Whether this step's attention can emit the o_proj input in MXFP8.
+
+        Only the ported sparse decode kernel has the epilogue, and only when it
+        owns every row: a mixed batch leaves the context prefix to fmha_sm100,
+        whose rows would reach the GEMM unquantized.
+        """
+        return (
+            self.is_sparse_attention_layer
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and msa_ported_decode_owns_batch(attn_metadata, num_rows)
+        )
 
     def _dispatch_attention_backend(
         self,
@@ -1847,7 +1971,9 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
-    ) -> torch.Tensor:
+        output_mxfp8: Optional[torch.Tensor] = None,
+        output_mxfp8_sf: Optional[torch.Tensor] = None,
+    ) -> bool:
         """Route the attention core to the configured backend.
 
         ``self.attn`` is either a :class:`MiniMaxM3MsaSparseAttention` (MSA
@@ -1858,15 +1984,36 @@ class MiniMaxM3Attention(Attention):
         * MSA → :meth:`_msa_attention_core`
         * Triton sparse → :meth:`_triton_sparse_attention_core`
         * SDPA dense → :meth:`_sdpa_dense_attention_core`
+
+        Returns whether the MXFP8 buffers were written, which only the ported
+        sparse decode kernel does and only on the steps it owns; the caller
+        fills them itself otherwise.
         """
+        fold = output_mxfp8 is not None and self._sparse_decode_fills_mxfp8(
+            attn_metadata, int(output.shape[0])
+        )
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
-            return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+            self._msa_attention_core(
+                q,
+                k,
+                v,
+                idx_q,
+                idx_k,
+                attn_metadata,
+                output,
+                output_mxfp8 if fold else None,
+                output_mxfp8_sf if fold else None,
+            )
+            return fold
+        assert not fold
         assert k is not None and v is not None
         if self.is_sparse_attention_layer:
             assert idx_q is not None and idx_k is not None
-            return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
-        assert idx_q is None and idx_k is None
-        return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+            self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        else:
+            assert idx_q is None and idx_k is None
+            self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        return False
 
     def _msa_attention_core(
         self,
@@ -1877,6 +2024,8 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        output_mxfp8: Optional[torch.Tensor] = None,
+        output_mxfp8_sf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the MSA backend (:class:`MiniMaxM3MsaSparseAttention`).
 
@@ -1902,9 +2051,16 @@ class MiniMaxM3Attention(Attention):
                 attn_metadata,
                 idx_k_prewritten=(not prewritten_main_kv or idx_k is None),
             )
-            forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+            forward_args = AttentionForwardArgs(
+                output=output,
+                topk_indices=kv_block_indexes,
+                output_mxfp8=output_mxfp8,
+                output_mxfp8_sf=output_mxfp8_sf,
+            )
         else:
             assert idx_q is None and idx_k is None
+            # Only the sparse decode kernel carries the MXFP8 epilogue.
+            assert output_mxfp8 is None and output_mxfp8_sf is None
             if not prewritten_main_kv:
                 # Dense layers retain the same general #16755 K/V scatter.
                 attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)

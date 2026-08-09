@@ -117,6 +117,8 @@ def run_msa_paged_gqa(
     *,
     kv_block_indexes: Optional[torch.Tensor],
     plan: Optional[tuple],
+    output_mxfp8: Optional[torch.Tensor] = None,
+    output_mxfp8_sf: Optional[torch.Tensor] = None,
 ) -> None:
     """Write the new-token main K/V, then run paged GQA into output in place.
 
@@ -133,11 +135,18 @@ def run_msa_paged_gqa(
     path covers both. The split lives here rather than in a PhasedFmha subclass
     because MiniMaxM3MsaSparseAttention.forward_prepopulated_kv also calls this
     helper directly, bypassing TrtllmAttention.forward.
+
+    output_mxfp8 / output_mxfp8_sf ask the ported sparse decode kernel to also
+    emit output in MXFP8, so the o_proj skips a standalone quantize. Only that
+    one kernel can, and only when it owns every row, so the caller must have
+    established that with msa_ported_decode_owns_batch; anything else here is a
+    partially quantized tensor the GEMM would silently consume.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_decode_span_bounds,
         msa_paged_kv,
         msa_ported_decode_active,
+        msa_ported_decode_owns_batch,
         write_msa_main_kv,
     )
 
@@ -145,6 +154,19 @@ def run_msa_paged_gqa(
     head_dim = attn.head_dim
     kv_cache_manager = metadata.kv_cache_manager
     num_tokens = int(q.shape[0])
+
+    # Ahead of the cache write, so a caller that got this wrong is told before
+    # anything about the step has moved.
+    if output_mxfp8 is not None and not (
+        kv_block_indexes is not None and msa_ported_decode_owns_batch(metadata, num_tokens)
+    ):
+        raise RuntimeError(
+            "MiniMax-M3 paged GQA was asked for an MXFP8 output on a step the "
+            "ported sparse decode kernel does not own end to end, which would "
+            "leave part of the o_proj input unquantized; see "
+            "msa_ported_decode_owns_batch."
+        )
+
     # The fused per-layer scatter (msa_write_layer_caches) may have written
     # this layer's K/V already; consume the marker so it never goes stale.
     prewritten = getattr(metadata, "_msa_prewritten_layer", None) == layer_idx
@@ -200,6 +222,8 @@ def run_msa_paged_gqa(
             sm_scale=sm_scale,
             output=out_view[gen_tok0:],
             decode_query_len=decode_query_len,
+            output_mxfp8=output_mxfp8,
+            output_mxfp8_sf=output_mxfp8_sf,
         )
         fmha_tokens = gen_tok0
 
@@ -372,6 +396,8 @@ class MsaSparseGqaFmha(Fmha):
             output,
             kv_block_indexes=kv_block_indexes,
             plan=plan,
+            output_mxfp8=forward_args.output_mxfp8,
+            output_mxfp8_sf=forward_args.output_mxfp8_sf,
         )
 
 
