@@ -7875,6 +7875,97 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         return None
 
+    # ------------------------------------------------------------------ #
+    #  CuTe DSL MiniMax-M3 MoE gate projection (Blackwell SM100)          #
+    # ------------------------------------------------------------------ #
+    from ..cute_dsl_kernels.blackwell import \
+        minimax_m3_gate_gemm_runner as _m3_gate
+
+    _m3_gate_gemm = _m3_gate.gate_gemm
+    # Re-exported so callers reach the gate GEMM's load-time weight split and
+    # its term count without importing the runner, which pulls in cutlass.
+    minimax_m3_gate_split_weight = _m3_gate.split_weight
+    MINIMAX_M3_GATE_GEMM_TERMS = _m3_gate.DEFAULT_TERMS
+    # The architecture gate, kept apart from the shape checks below so it can
+    # be answered once when the weight is split. It is lru_cached, and Dynamo
+    # traces through an lru_cache rather than honouring it, so calling it from
+    # the forward would cost a warning on every graph.
+    minimax_m3_gate_arch_is_supported = is_sm_100f
+
+    # One MMA tile of K for a BF16 operand. The kernel gives every split-K
+    # partition whole tiles and does no predication at the seams.
+    _M3_GATE_K_TILE = 64
+
+    def minimax_m3_gate_gemm_is_supported(
+        hidden_states: torch.Tensor,
+        w_split: Optional[torch.Tensor],
+        terms: int,
+    ) -> bool:
+        """Whether the CuTe DSL gate GEMM can serve this call.
+
+        Callers use this to choose between the CuTe path and the fallback
+        rather than catching an exception on the hot path. Everything here is
+        a property of the shapes and the loaded weight, so a traced graph sees
+        the same answer it saw when it was captured.
+
+        The architecture is not among them. It is settled when the weight is
+        split, which leaves ``w_split`` None where the kernel cannot run, so
+        this stays free of the lru_cached arch query that Dynamo would trace
+        through and warn about once per graph.
+        """
+        return (w_split is not None and hidden_states.dim() == 2
+                and hidden_states.dtype == torch.bfloat16
+                and w_split.dtype == torch.bfloat16
+                and hidden_states.is_contiguous() and w_split.is_contiguous()
+                and hidden_states.shape[1] == w_split.shape[1]
+                and hidden_states.shape[1] % _M3_GATE_K_TILE == 0
+                and w_split.shape[0] % terms == 0)
+
+    @torch.library.custom_op("trtllm::cute_dsl_minimax_m3_gate_gemm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_minimax_m3_gate_gemm(
+        hidden_states: torch.Tensor,
+        w_split: torch.Tensor,
+        terms: int,
+    ) -> torch.Tensor:
+        """Router logits from a BF16 activation and a split BF16 router weight.
+
+        Args:
+            hidden_states: [num_tokens, hidden_size] BF16, contiguous.
+            w_split: [terms * num_experts, hidden_size] BF16, the FP32 router
+                weight rewritten by ``split_weight`` as a sum of ``terms``
+                BF16 tensors so the tensor cores can take it without the
+                activation being widened first.
+            terms: how many BF16 terms ``w_split`` stacks.
+
+        Returns:
+            [num_tokens, num_experts] FP32 logits.
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL MiniMax-M3 gate GEMM only supports SM 100 family.")
+        logger.info_once(
+            f"cute_dsl_minimax_m3_gate_gemm inputs: "
+            f"hidden_states dtype={hidden_states.dtype} "
+            f"shape={tuple(hidden_states.shape)} "
+            f"stride={hidden_states.stride()}; "
+            f"w_split shape={tuple(w_split.shape)}; terms={terms}",
+            key="cute_dsl_minimax_m3_gate_gemm_inputs",
+        )
+        return _m3_gate_gemm(hidden_states, w_split, terms=terms)
+
+    @torch.library.register_fake("trtllm::cute_dsl_minimax_m3_gate_gemm")
+    def _(
+        hidden_states: torch.Tensor,
+        w_split: torch.Tensor,
+        terms: int,
+    ) -> torch.Tensor:
+        return hidden_states.new_empty(
+            (hidden_states.shape[0], w_split.shape[0] // terms),
+            dtype=torch.float32)
+
     # ======================================================================
     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell
     # ======================================================================
