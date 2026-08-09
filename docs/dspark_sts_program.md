@@ -390,6 +390,26 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 
 **结论**:B300 agg 大并发下动态裁剪无收益不是 bug,是**成本结构性的**:不可裁地板占一半以上 + θ 宽平台 + 桶阶梯,使"省下的 token"折不成时间;而任何裁剪都真金白银付 accept。收益 regime 在低并发/延迟场景(SGLang 原生 bs1 +17.8% 亦证)与 θ 更陡的硬件上。
 
+### 【08-08 23:00】跨栈对照(SGLang × 我们的负载):**不复现我们的无收益——结论修正**
+
+用户指令:让 SGLang 跑与我们完全相同的负载,表用他们自己的采集方法。设置:他们的 #28 镜像 + 他们的最优配置(Flash tp4/dp4、dsv4 后端、禁 autotune;Pro 在其镜像图捕获阶段崩溃 `Inplace update to inference tensor`,栈级兼容性 bug,已记录)+ 他们的 profiler 现采表(17 探针自检通过)+ **我们的 rounds 负载**(poetry/arena × 512/1024 global × warm+5 reps,同一客户端)。
+
+| cell | notrim | compact(表)| delta |
+|---|---|---|---|
+| poetry 512 | 8744 | 9419 | **+7.7%** |
+| poetry 1024 | 6293 | 6455 | +2.6% |
+| arena 512 | 7959 | 7933 | −0.3% |
+| arena 1024 | 6307 | 6493 | +2.9% |
+
+- **机制数据(poetry512,decode 日志逐步统计)**:notrim accept_len 2.79 @ cap 6.00;compact accept_len 2.52 @ cap 3.58。即:裁掉 ~40% verify token,付出 −9.7% tokens/step,**净 +7.7%**——他们把省下的 token 兑换成了时间。
+- **与我们的同工况对比**:我们在 128/rank(poetry1024)裁剪深度 (33%) 与 accept 代价 (~−10%) 几乎相同,但净 −1.6%。**两边的"贸易条款"一样,差在结算汇率**——我们的省 token 没有变成省时间。
+- **结论修正**:昨判"B300 结构性无收益"过强。正确表述:**在我们的实现里无收益;SGLang 在同硬件同负载上能兑现 +2.6~+7.7%**(高 accept 的 arena 512 例外 ≈ 0,方向与我们一致)。差距候选(按嫌疑排序):
+  1. **图形状经济学**:他们 `align_verify_tokens_to_graph_tier=False` + 每步**均匀 cap**(标量 cap len)——裁剪直接改变每行 token 数,步进更小的图形状;我们是 per-request ragged 窗口 + tier 桶阶梯(#19/#21),裁剪常被桶取整吞掉。
+  2. **每 GPU 负载 regime**:他们 tp4/dp4 = 每 GPU 负载是我们 DEP8 的 2×,θ 份额更陡,兑换率天然更好。**建议补一个对照:我们的栈跑 4 卡 DEP4 @128/rank**,若收益出现则确认 regime 项,若仍无则全归实现项。
+  3. 机制税:他们不裁时 ≈ 0 损耗(arena −0.3%),我们 −3.3%。
+- Caveats:模型不同(Flash accept 2.79 vs Pro 1.45 于 poetry;Pro 在其栈不可跑),per-rank 并发不同(128/256 vs 我们 64/128);+2.6~+2.9% 的两格在 ±3% 噪声边缘,+7.7% 超出噪声带。
+- 后续实验队列:① 我们的栈 DEP4×128/rank 复测;② #19 连续预算(去 tier 量化)原型;③ 均匀 cap 模式(替代 ragged)可行性评估——若三者叠加能兑现 SGLang 级别收益,#25/#30 产品线复活。
+
 ### 备选修复方案评估(供评审;当前实施的是 A,标记为暂定)
 
 - **A(已实施,Python-only)**:捕获拷贝换 D2D 源(`_seq_lens_cuda`)+ NEXT_N 抬全局上界。最小爆炸半径,当场可在活挂载容器里验证;把双胞胎缓冲降级为 canonical 缓冲的衍生物。host 路径装填时刻数值逐位等价,uniform/eager 分支未触碰。
