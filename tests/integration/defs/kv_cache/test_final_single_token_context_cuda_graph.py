@@ -104,7 +104,7 @@ class _CudaGraphExecutionProbe:
             draft_tokens_cuda,
             new_tensors_device,
             spec_resource_manager,
-            promoted_context_request_ids,
+            promoted_context_request_ids=promoted_context_request_ids,
         )
         if promoted_context_request_ids:
             execution = _PromotedContextGraphExecution(

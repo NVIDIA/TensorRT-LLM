@@ -51,6 +51,16 @@ void launchFusedQKNormRope(
     int mrope_section1,     // mrope_section[1] (height)
     int mrope_section2);    // mrope_section[2] (width)
 
+// Out-of-place FP8 variant of launchFusedQKNormRope, folding the FP8
+// activation-quant into the norm+RoPE epilogue. Q and K get RMSNorm + RoPE; V is
+// copy-cast only.
+void launchFusedQKNormRopeToFp8(void const* qkv_in, // BF16 input [num_tokens, total_heads*head_dim]
+    void* qkv_out,                                  // FP8 E4M3 output buffer, same layout as input
+    int const num_tokens, int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim,
+    int const rotary_dim, float const eps, void const* q_weight, void const* k_weight, float const base,
+    bool const interleave, int const* position_ids, float factor, float low, float high, float attention_factor,
+    cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope, int mrope_section1, int mrope_section2);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
