@@ -48,6 +48,7 @@ jobs:
             const PING_AFTER_DAYS = 120;
             const CLOSE_AFTER_DAYS = 180;
             const MAX_ACTIONS_PER_RUN = 50;
+            const MAX_RUNTIME_MS = 12 * 60 * 1000;
             const MAX_MERGEABILITY_ATTEMPTS = 3;
             const MAX_WRITE_ATTEMPTS = 3;
             const MERGEABILITY_RETRY_DELAY_MS = 2000;
@@ -100,7 +101,6 @@ jobs:
                     }
                     mergeable
                     number
-                    reviewDecision
                     state
                     updatedAt
                     url
@@ -217,6 +217,19 @@ jobs:
               }
             }
 
+            async function tryWrite(description, operation) {
+              try {
+                await retryWrite(description, operation);
+                return true;
+              } catch (error) {
+                core.warning(
+                  `${description} failed after ${MAX_WRITE_ATTEMPTS} attempts: ` +
+                    `${error.message}. Continuing with the next pull request.`
+                );
+                return false;
+              }
+            }
+
             let actionCount = 0;
             let closeCount = 0;
             let exemptCount = 0;
@@ -226,8 +239,26 @@ jobs:
             const candidates = [];
             let cursor = null;
             let reachedFreshPullRequest = false;
+            let runtimeLimitWarningEmitted = false;
+
+            function reachedRuntimeLimit() {
+              if (Date.now() - now < MAX_RUNTIME_MS) {
+                return false;
+              }
+              if (!runtimeLimitWarningEmitted) {
+                core.warning(
+                  'Reached the 12-minute processing limit; remaining pull ' +
+                    'requests will be considered on the next run.'
+                );
+                runtimeLimitWarningEmitted = true;
+              }
+              return true;
+            }
 
             do {
+              if (reachedRuntimeLimit()) {
+                break;
+              }
               const result = await github.graphql(pullRequestsQuery, {
                 owner,
                 repo,
@@ -254,11 +285,24 @@ jobs:
               if (actionCount >= MAX_ACTIONS_PER_RUN) {
                 break;
               }
+              if (reachedRuntimeLimit()) {
+                break;
+              }
 
               scannedCount += 1;
               // Re-read mutable state immediately before acting. This prevents a
               // comment, label, or push made during the run from being treated as stale.
-              const pullRequest = await getCurrentPullRequest(candidateNumber);
+              let pullRequest;
+              try {
+                pullRequest = await getCurrentPullRequest(candidateNumber);
+              } catch (error) {
+                core.warning(
+                  `Reading pull request #${candidateNumber} failed: ` +
+                    `${error.message}. Continuing with the next pull request.`
+                );
+                skipCount += 1;
+                continue;
+              }
               if (!pullRequest || pullRequest.state !== 'OPEN') {
                 skipCount += 1;
                 continue;
@@ -288,7 +332,6 @@ jobs:
 
               const hasConflicts = pullRequest.mergeable === 'CONFLICTING';
               const isClean = pullRequest.mergeable === 'MERGEABLE';
-              const isApproved = pullRequest.reviewDecision === 'APPROVED';
 
               if (idleDays > CLOSE_AFTER_DAYS && hasConflicts) {
                 const body =
@@ -303,7 +346,7 @@ jobs:
                     `${pullRequest.url} (${idleDays.toFixed(1)} idle days).`
                 );
                 if (!dryRun) {
-                  await retryWrite(`Closing ${pullRequest.url}`, () =>
+                  const closed = await tryWrite(`Closing ${pullRequest.url}`, () =>
                     github.rest.pulls.update({
                       owner,
                       repo,
@@ -311,7 +354,13 @@ jobs:
                       state: 'closed',
                     })
                   );
-                  await retryWrite(`Commenting on ${pullRequest.url}`, () =>
+                  if (!closed) {
+                    skipCount += 1;
+                    continue;
+                  }
+                  actionCount += 1;
+                  closeCount += 1;
+                  await tryWrite(`Commenting on ${pullRequest.url}`, () =>
                     github.rest.issues.createComment({
                       owner,
                       repo,
@@ -319,26 +368,23 @@ jobs:
                       body,
                     })
                   );
+                } else {
+                  actionCount += 1;
+                  closeCount += 1;
                 }
-                actionCount += 1;
-                closeCount += 1;
                 continue;
               }
 
               // Conflicting PRs stay on the close track. Pinging them would update
               // updatedAt and prevent them from reaching the close threshold.
               if (
-                !hasConflicts &&
                 idleDays > PING_AFTER_DAYS &&
-                (isClean || isApproved) &&
+                isClean &&
                 pullRequest.author?.login
               ) {
-                const status =
-                  isClean && isApproved
-                    ? 'approved and mergeable'
-                    : isApproved
-                      ? 'approved'
-                      : 'mergeable';
+                const status = pullRequest.isDraft
+                  ? 'free of merge conflicts'
+                  : 'mergeable';
                 const body =
                   `@${pullRequest.author.login} this pull request has had no ` +
                   `activity for more than ${PING_AFTER_DAYS} days and is ` +
@@ -349,14 +395,20 @@ jobs:
                     `${pullRequest.url} (${idleDays.toFixed(1)} idle days, ${status}).`
                 );
                 if (!dryRun) {
-                  await retryWrite(`Commenting on ${pullRequest.url}`, () =>
-                    github.rest.issues.createComment({
-                      owner,
-                      repo,
-                      issue_number: pullRequest.number,
-                      body,
-                    })
+                  const commented = await tryWrite(
+                    `Commenting on ${pullRequest.url}`,
+                    () =>
+                      github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pullRequest.number,
+                        body,
+                      })
                   );
+                  if (!commented) {
+                    skipCount += 1;
+                    continue;
+                  }
                 }
                 actionCount += 1;
                 pingCount += 1;

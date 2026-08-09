@@ -123,8 +123,8 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 TensorRT-LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
 ready-for-review pull requests:
 
-* After more than 120 days without activity, the workflow reminds the author when the pull request is approved or
-  mergeable and does not have merge conflicts.
+* After more than 120 days without activity, the workflow reminds the author when the pull request does not have
+  merge conflicts.
 * Pull requests with merge conflicts remain on the closure track without a reminder, because an automated reminder
   would reset their inactivity period.
 * After more than 180 days without activity, a pull request with merge conflicts is closed with an explanatory

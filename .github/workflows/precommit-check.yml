@@ -34,7 +34,6 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref }}
 
       - name: Test stale pull request cleanup workflow
-        if: hashFiles('.github/scripts/cleanup_stale_prs.test.js') != ''
         run: node .github/scripts/cleanup_stale_prs.test.js
 
       - uses: actions/setup-python@v6

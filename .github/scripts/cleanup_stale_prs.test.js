@@ -38,6 +38,7 @@ const execute = new AsyncFunction(
   'console',
   'process',
   'setTimeout',
+  'Date',
   script
 );
 
@@ -61,7 +62,6 @@ function pullRequest(number, overrides = {}) {
     },
     mergeable: 'MERGEABLE',
     number,
-    reviewDecision: null,
     state: 'OPEN',
     updatedAt: oldDate(121),
     url: `https://example.test/pull/${number}`,
@@ -75,8 +75,11 @@ async function run({
   labelPages = {},
   dryRun = false,
   closeFailures = 0,
+  commentFailures = {},
+  stateFailures = {},
   requireCompleteListingBeforeWrites = false,
   eventLog = [],
+  nowValues = [],
 }) {
   const events = eventLog;
   const warnings = [];
@@ -92,6 +95,18 @@ async function run({
     listingPages || [Object.values(pullRequests).map((value) => (Array.isArray(value) ? value[0] : value))];
   let listedPages = 0;
   let remainingCloseFailures = closeFailures;
+  const remainingCommentFailures = new Map(
+    Object.entries(commentFailures).map(([number, count]) => [
+      Number(number),
+      count,
+    ])
+  );
+  const remainingStateFailures = new Map(
+    Object.entries(stateFailures).map(([number, count]) => [
+      Number(number),
+      count,
+    ])
+  );
 
   const github = {
     graphql: async (query, variables) => {
@@ -130,6 +145,11 @@ async function run({
       const read = reads.get(variables.number) || 0;
       reads.set(variables.number, read + 1);
       events.push(`state:${variables.number}:${read}`);
+      const failures = remainingStateFailures.get(variables.number) || 0;
+      if (failures > 0) {
+        remainingStateFailures.set(variables.number, failures - 1);
+        throw new Error('simulated state read failure');
+      }
       return {
         repository: {
           pullRequest: values[Math.min(read, values.length - 1)],
@@ -143,6 +163,11 @@ async function run({
             assert.equal(listedPages, pages.length);
           }
           events.push(`comment:${issue_number}:${body}`);
+          const failures = remainingCommentFailures.get(issue_number) || 0;
+          if (failures > 0) {
+            remainingCommentFailures.set(issue_number, failures - 1);
+            throw new Error('simulated comment failure');
+          }
         },
       },
       pulls: {
@@ -176,6 +201,19 @@ async function run({
     callback();
     return 0;
   };
+  const defaultNow = Date.now();
+  let nowIndex = 0;
+  const fakeDate = {
+    now: () => {
+      if (nowValues.length === 0) {
+        return defaultNow;
+      }
+      const value = nowValues[Math.min(nowIndex, nowValues.length - 1)];
+      nowIndex += 1;
+      return value;
+    },
+    parse: Date.parse,
+  };
 
   await execute(
     github,
@@ -183,7 +221,8 @@ async function run({
     core,
     quietConsole,
     { env: { DRY_RUN: String(dryRun) } },
-    immediateTimeout
+    immediateTimeout,
+    fakeDate
   );
   return { events, reads, summaries, warnings };
 }
@@ -192,7 +231,6 @@ async function main() {
   {
     const pr = pullRequest(1, {
       mergeable: 'CONFLICTING',
-      reviewDecision: 'APPROVED',
       updatedAt: oldDate(181),
     });
     const { events, summaries } = await run({ pullRequests: { 1: pr } });
@@ -214,7 +252,7 @@ async function main() {
   {
     const cases = {
       2: pullRequest(2),
-      3: pullRequest(3, { mergeable: 'CONFLICTING', reviewDecision: 'APPROVED' }),
+      3: pullRequest(3, { mergeable: 'CONFLICTING' }),
       4: pullRequest(4, { isDraft: true }),
       5: pullRequest(5, { updatedAt: oldDate(100) }),
     };
@@ -223,6 +261,11 @@ async function main() {
     assert(comments.some((event) => event.startsWith('comment:2:')));
     assert(!comments.some((event) => event.startsWith('comment:3:')));
     assert(comments.some((event) => event.startsWith('comment:4:')));
+    assert(
+      comments.find((event) => event.startsWith('comment:4:')).includes(
+        'free of merge conflicts'
+      )
+    );
     assert(!events.some((event) => event.startsWith('state:5:')));
   }
 
@@ -317,11 +360,83 @@ async function main() {
     assert.equal(events.filter((event) => event === 'close:81').length, 3);
     assert(events.findIndex((event) => event.startsWith('comment:81:')) > events.lastIndexOf('close:81'));
     const failedEvents = [];
-    await assert.rejects(
-      run({ pullRequests: { 81: pr }, closeFailures: 3, eventLog: failedEvents }),
-      /simulated close failure/
-    );
+    const next = pullRequest(82);
+    const { summaries, warnings } = await run({
+      pullRequests: { 81: pr, 82: next },
+      closeFailures: 3,
+      eventLog: failedEvents,
+    });
     assert(!failedEvents.some((event) => event.startsWith('comment:81:')));
+    assert(failedEvents.some((event) => event.startsWith('comment:82:')));
+    assert.equal(summaryCounts(summaries).Skipped, '1');
+    assert(warnings.some((warning) => warning.includes('Continuing with the next')));
+  }
+
+  {
+    const closing = pullRequest(83, {
+      mergeable: 'CONFLICTING',
+      updatedAt: oldDate(181),
+    });
+    const next = pullRequest(84);
+    const { events, summaries, warnings } = await run({
+      pullRequests: { 83: closing, 84: next },
+      commentFailures: { 83: 3 },
+    });
+    assert.equal(events.filter((event) => event === 'close:83').length, 1);
+    assert.equal(
+      events.filter((event) => event.startsWith('comment:83:')).length,
+      3
+    );
+    assert(events.some((event) => event.startsWith('comment:84:')));
+    assert.equal(summaryCounts(summaries).Closed, '1');
+    assert.equal(summaryCounts(summaries).Pinged, '1');
+    assert(warnings.some((warning) => warning.includes('simulated comment failure')));
+  }
+
+  {
+    const first = pullRequest(90);
+    const second = pullRequest(91);
+    const baseNow = Date.now();
+    const { events, summaries, warnings } = await run({
+      pullRequests: { 90: first, 91: second },
+      nowValues: [baseNow, baseNow, baseNow, baseNow + 12 * 60 * 1000],
+    });
+    assert(events.some((event) => event.startsWith('state:90:')));
+    assert(!events.some((event) => event.startsWith('state:91:')));
+    assert.equal(summaryCounts(summaries).Scanned, '1');
+    assert(warnings.some((warning) => warning.includes('12-minute processing limit')));
+  }
+
+  {
+    const first = pullRequest(92);
+    const second = pullRequest(93);
+    const baseNow = Date.now();
+    const { events, summaries, warnings } = await run({
+      pullRequests: { 92: first, 93: second },
+      listingPages: [[first], [second]],
+      nowValues: [baseNow, baseNow, baseNow + 12 * 60 * 1000],
+    });
+    assert(events.includes('list:0'));
+    assert(!events.includes('list:1'));
+    assert(!events.some((event) => event.startsWith('state:')));
+    assert.equal(summaryCounts(summaries).Scanned, '0');
+    assert.equal(
+      warnings.filter((warning) => warning.includes('12-minute processing limit')).length,
+      1
+    );
+  }
+
+  {
+    const first = pullRequest(94);
+    const second = pullRequest(95);
+    const { events, summaries, warnings } = await run({
+      pullRequests: { 94: first, 95: second },
+      stateFailures: { 94: 1 },
+    });
+    assert(events.some((event) => event.startsWith('comment:95:')));
+    assert.equal(summaryCounts(summaries).Pinged, '1');
+    assert.equal(summaryCounts(summaries).Skipped, '1');
+    assert(warnings.some((warning) => warning.includes('simulated state read failure')));
   }
 
   console.log('cleanup_stale_prs tests passed');
