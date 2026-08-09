@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.linear import (
     get_quant_method,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
+from tensorrt_llm._torch.utils import MXFP8QuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -253,6 +254,87 @@ def test_mxfp8_auto_stays_native_under_torch_compile(monkeypatch):
         assert method.apply(module, activation, bias=None) is native_output
     native_gemm.assert_called_once()
     flashinfer_gemm.assert_not_called()
+
+
+def _prequantized_module():
+    return SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+
+
+def test_mxfp8_prequantized_activation_skips_the_quantize(monkeypatch):
+    """A producer-quantized activation reaches the GEMM without a quantize."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    _, _, quantize, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    act_e4m3 = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
+    act_sf = torch.empty(512, dtype=torch.uint8)
+    activation = MXFP8QuantizedTensor(act_e4m3, act_sf)
+
+    method = MXFP8LinearMethod()
+    method.disable_native_autotune()
+    output = method.apply(_prequantized_module(), activation, bias=None)
+
+    assert output is native_output
+    quantize.assert_not_called()
+    passed_act, passed_sf = native_gemm.call_args.args[:2]
+    assert passed_act is act_e4m3
+    assert passed_sf is act_sf
+
+
+def test_mxfp8_prequantized_activation_is_flattened_and_restored(monkeypatch):
+    """A 3D carrier is flattened for the GEMM and the batch dims come back."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    _, _, quantize, native_gemm, _, _, _ = _mock_mxfp8_ops(monkeypatch)
+    native_gemm.return_value = torch.empty((6, 3), dtype=torch.bfloat16)
+
+    act_sf = torch.empty(512, dtype=torch.uint8)
+    activation = MXFP8QuantizedTensor(torch.empty((2, 3, 4), dtype=torch.float8_e4m3fn), act_sf)
+
+    method = MXFP8LinearMethod()
+    method.disable_native_autotune()
+    output = method.apply(_prequantized_module(), activation, bias=None)
+
+    quantize.assert_not_called()
+    assert native_gemm.call_args.args[0].shape == (6, 4)
+    assert output.shape == (2, 3, 3)
+
+
+def test_mxfp8_prequantized_activation_rejects_linear_scale_factors(monkeypatch):
+    """The block-scaled GEMMs read swizzled scales; a linear carrier is a bug."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    _mock_mxfp8_ops(monkeypatch)
+
+    activation = MXFP8QuantizedTensor(
+        torch.empty((2, 4), dtype=torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=False,
+    )
+
+    method = MXFP8LinearMethod()
+    with pytest.raises(RuntimeError, match="swizzled"):
+        method.apply(_prequantized_module(), activation, bias=None)
+
+
+def test_mxfp8_prequantized_activation_rejects_the_dequant_path(monkeypatch):
+    """The reference path dequantizes the weight and needs a wide activation."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: False)
+
+    activation = MXFP8QuantizedTensor(
+        torch.empty((2, 4), dtype=torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+    )
+
+    method = MXFP8LinearMethod()
+    assert not method.use_cutlass
+    with pytest.raises(RuntimeError, match="dequant reference path"):
+        method.apply(_prequantized_module(), activation, bias=None)
 
 
 @pytest.mark.parametrize(

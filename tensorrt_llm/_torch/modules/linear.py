@@ -34,9 +34,10 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled, is_torch_compiling,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, MXFP8QuantizedTensor,
+                     get_model_extra_attrs, is_nvfp4_marlin_enabled,
+                     is_torch_compiling, replace_parameter_and_save_metadata,
+                     unswizzle_sf)
 
 
 class WeightMode(str, enum.Enum):
@@ -3239,25 +3240,51 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
+    def apply(self, module: Linear, input: Union[torch.Tensor,
+                                                 MXFP8QuantizedTensor],
               bias: Optional[torch.Tensor]):
+        prequantized = isinstance(input, MXFP8QuantizedTensor)
+        if prequantized and not self.use_cutlass:
+            raise RuntimeError(
+                "MXFP8LinearMethod received a pre-quantized activation but is "
+                "on the dequant reference path, which needs the high-precision "
+                "input. Disable the producer-side MXFP8 fusion for this layer.")
+        if prequantized and not input.is_sf_swizzled:
+            raise RuntimeError(
+                "MXFP8LinearMethod requires swizzled block scales; the "
+                "pre-quantized activation carries the linear layout.")
+
         original_shape = input.shape
         if input.dim() > 2:
-            input = input.reshape(-1, input.shape[-1])
+            if prequantized:
+                input = MXFP8QuantizedTensor(
+                    input.fp8_tensor.reshape(-1, input.fp8_tensor.shape[-1]),
+                    input.scaling_factor,
+                    input.is_sf_swizzled,
+                )
+            else:
+                input = input.reshape(-1, input.shape[-1])
 
         if self.use_cutlass:
-            # Dynamic MXFP8 activation quantization (swizzled SF layout), then
-            # the CUTLASS block-scaled e4m3xe4m3 GEMM.
-            input = input.contiguous()
             use_graph_backend_selection = (
                 self._use_graph_backend_selection and not is_torch_compiling()
                 and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
-            if use_graph_backend_selection:
-                tune_backends = _MXFP8_GRAPH_BACKEND_TUNING_ACTIVE.get()
-                act_e4m3, act_sf = mxfp8_quantize_autotuned(input,
-                                                            tune=tune_backends)
+            tune_backends = (_MXFP8_GRAPH_BACKEND_TUNING_ACTIVE.get()
+                             if use_graph_backend_selection else False)
+            # Dynamic MXFP8 activation quantization (swizzled SF layout), then
+            # the CUTLASS block-scaled e4m3xe4m3 GEMM. A producer that already
+            # emitted both hands them over and the quantize is skipped; the
+            # backend selection below still applies to the GEMM.
+            if prequantized:
+                act_e4m3, act_sf = input.fp8_tensor, input.scaling_factor
             else:
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                input = input.contiguous()
+                if use_graph_backend_selection:
+                    act_e4m3, act_sf = mxfp8_quantize_autotuned(
+                        input, tune=tune_backends)
+                else:
+                    act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
+                        input, True)
             # The automatic path switches per call on context state, which
             # Dynamo cannot trace and a compiled graph could not honor. A
             # pinned backend resolves before tracing, so only the automatic
@@ -3290,7 +3317,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
                 global_scale = torch.ones([1],
                                           dtype=torch.float32,
-                                          device=input.device)
+                                          device=act_e4m3.device)
                 gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
                         if self.needs_native_autotune else
                         torch.ops.trtllm.mxfp8_mxfp8_gemm)
@@ -3890,7 +3917,7 @@ class Linear(nn.Module):
 
     def forward(
         self,
-        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        input: Union[torch.Tensor, Fp4QuantizedTensor, MXFP8QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,

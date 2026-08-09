@@ -178,6 +178,38 @@ class Fp4QuantizedTensor:
         return self.fp4_tensor.shape
 
 
+@dataclass
+class MXFP8QuantizedTensor:
+    """An activation a producer already quantized to MXFP8.
+
+    ``MXFP8LinearMethod`` otherwise calls ``torch.ops.trtllm.mxfp8_quantize``
+    itself before every GEMM, which at decode is a standalone launch reading an
+    activation the producing kernel had in registers a moment earlier. A
+    producer that can emit E4M3 values and their UE8M0 per-32-element block
+    scales directly passes this instead, and the linear layer skips its own
+    quantize.
+
+    ``scaling_factor`` must be in the swizzled layout the block-scaled GEMMs
+    read, which is what ``mxfp8_quantize(x, True)`` produces; ``is_sf_swizzled``
+    exists to make a linear-layout carrier fail loudly rather than silently
+    feed a GEMM the wrong scale order.
+    """
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = True
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self):
+        return self.fp8_tensor.dtype
+
+    def dim(self) -> int:
+        return self.fp8_tensor.dim()
+
+
 def compute_swizzled_sf_shape(row: int, col: int):
     padded_row = pad_up(row, 128)
     padded_col = pad_up(col, 4)
