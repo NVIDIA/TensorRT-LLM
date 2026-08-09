@@ -88,16 +88,19 @@ regions first, followed by all 8-byte scale regions. The shadow state
 consists of:
 
 - `_fp8_shadows[attention_type]`: MODEL1 data plus one dummy block;
-- `_fp8_block_fill_gpu[attention_type]`: the converted token count for
-  each physical block;
 - `_fp8_update_grids`: cached request/block/token grids; and
+- `_fp8_token_update_grids`: cached request/token grids for decode; and
 - `_fp8_offsets_cache`: cached byte offsets used by vectorized scatter.
 
-Context invalidates the fill trackers. The first decode then repopulates
-all referenced tokens, while steady-state decode converts only newly
-filled token positions. Invalid grid entries write to the extra dummy
-block, keeping the tensor shapes and scatter pattern stable for CUDA
-graph capture.
+The first decode after a BF16 context or fallback call rebuilds only the
+valid tokens in the active cache pages, bounded by the batch's actual KV
+length instead of the configured block-table capacity. Steady-state
+decode converts the exact newly appended SWA positions and newly produced
+compressed positions. It does not infer freshness from a physical page's
+previous fill level, so a page reassigned to another request cannot retain
+stale MODEL1 data. Invalid incremental grid entries write to the extra
+dummy block, keeping the decode tensor shapes and scatter pattern stable
+for CUDA graph capture.
 
 ## Key files
 
