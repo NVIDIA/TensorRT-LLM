@@ -77,7 +77,12 @@ def test_matches_reference_at_the_reciprocal_boundary():
 
 
 def test_matches_reference_on_saturating_and_zero_blocks():
-    """Blocks that clamp at e4m3 max, and all-zero blocks that take scale 0."""
+    """Blocks at the ends of the range, where the scale stops being a normal float.
+
+    An amax near bfloat16's tiny drives the scale denormal, and the reference
+    reciprocal flushes denormals to zero, so the block saturates rather than
+    scaling by 2^127. An all-zero block instead takes scale 0.
+    """
     _skip_without_op()
     k = 1024
     x = torch.zeros(8, k, dtype=torch.bfloat16, device="cuda")

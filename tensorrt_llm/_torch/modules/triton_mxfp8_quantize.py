@@ -33,9 +33,9 @@ and the standalone op are interchangeable:
   integer bit arithmetic to avoid the ``exp2(ceil(log2(x)))`` idiom, which is
   correctly rounded only by luck.
 
-Inputs whose block amax is denormal after the ``* rcp(448)`` (below ``2^-118``
-or so), and non-finite inputs, are outside that guarantee; the CUDA path routes
-them through ``rcp.approx.ftz`` of a denormal and through E8M0 NaN respectively.
+A NaN block amax is the one case left outside that guarantee: the CUDA path
+emits the E8M0 NaN encoding where this saturates. Everything else matches,
+including the denormal scales that make the reciprocal infinite.
 """
 
 import torch
@@ -44,6 +44,11 @@ import triton.language as tl  # type: ignore[import]
 
 MXFP8_BLOCK_SIZE = 32
 _E4M3_MAX = 448.0
+
+# A jit'ed function can only reach a global that is a tl.constexpr, so the two
+# constants above are mirrored for use inside the kernels.
+_TL_MXFP8_BLOCK_SIZE = tl.constexpr(MXFP8_BLOCK_SIZE)
+_TL_E4M3_MAX = tl.constexpr(_E4M3_MAX)
 
 # The swizzled scale-factor layout is [numMTiles, numKTiles, 32, 4, 4], indexed
 # by [mTile, kTile, outerM, innerM, innerK]; see get_sf_out_offset_128x4.
@@ -86,11 +91,11 @@ def mxfp8_quantize_tile(x, NUM_BLOCKS: tl.constexpr, BLOCK_ELEMS: tl.constexpr):
     Returns the E4M3 values in the same order and the ``NUM_BLOCKS`` UE8M0
     scale bytes.
     """
-    tl.static_assert(BLOCK_ELEMS == MXFP8_BLOCK_SIZE)
+    tl.static_assert(BLOCK_ELEMS == _TL_MXFP8_BLOCK_SIZE)
     xb = tl.reshape(x, (NUM_BLOCKS, BLOCK_ELEMS))
     amax = tl.max(tl.abs(xb), axis=1)
 
-    sf = amax * _rcp_approx_ftz(tl.full((NUM_BLOCKS,), _E4M3_MAX, tl.float32))
+    sf = amax * _rcp_approx_ftz(tl.full((NUM_BLOCKS,), _TL_E4M3_MAX, tl.float32))
     bits = sf.to(tl.int32, bitcast=True)
     biased_exp = (bits >> 23) & 0xFF
     mantissa = bits & 0x7FFFFF
@@ -105,9 +110,15 @@ def mxfp8_quantize_tile(x, NUM_BLOCKS: tl.constexpr, BLOCK_ELEMS: tl.constexpr):
     sf_byte = tl.minimum(sf_byte, 254)
 
     # 1 / 2^(byte - 127) is 2^(127 - byte), exact, so build it from the
-    # exponent field directly. An all-zero block takes scale 0, as the CUDA
-    # path does, rather than scaling by 2^127.
+    # exponent field directly. Byte 254 lands on a denormal and comes out zero,
+    # which is what the flush-to-zero reciprocal gives too.
     out_scale = ((254 - sf_byte) << 23).to(tl.float32, bitcast=True)
+    # Byte 0 stands for 2^-127, also denormal, so ftz sends the reciprocal to
+    # infinity rather than 2^127 and every element of the block saturates. Only
+    # a vanishing amax gets here, but the two forms have to agree even so.
+    out_scale = tl.where(sf_byte == 0, tl.full((NUM_BLOCKS,), float("inf"), tl.float32),
+                         out_scale)
+    # An all-zero block takes scale 0, as the CUDA path does.
     out_scale = tl.where(amax != 0.0, out_scale, 0.0)
 
     xq = xb * out_scale[:, None]
