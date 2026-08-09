@@ -135,7 +135,9 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # an FP8 (e4m3) weight with 128x128 block scales roughly halves those bytes.
 # The MLA projections and the routed MXFP4 experts are left untouched (the KDA
 # q/k/v/g/o projections have their own switch below). The FP8 weight read is
-# lossy relative to BF16; set this to "0" to keep BF16.
+# lossy relative to BF16, so it is opt-in: set this to "1" to trade accuracy
+# for decode bandwidth. Default "0" keeps BF16, which is what the published
+# accuracy numbers are measured against.
 _KIMI_K3_FP8_WEIGHT_READ_ENV = "KIMI_K3_FP8_WEIGHT_READ"
 
 # Also read the KDA linear-attention q/k/v/g/o projections at FP8 block-scale.
@@ -176,6 +178,20 @@ _KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
 # parallel layout (on under attention DP, off under TP — see the conversion
 # helper's comment); set 0/1 to force either.
 _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
+
+
+def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
+    """Resolve the FP8 weight-read switches into (master, kda, kda_glue).
+
+    The master switch is opt-in: FP8 weight reads are lossy relative to BF16,
+    so a default run keeps BF16 and matches the published accuracy numbers.
+    The KDA and KDA-glue switches only narrow an already-enabled master, so
+    they stay default-on and are inert while the master is off.
+    """
+    fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "0") != "0"
+    kda_fp8 = fp8_weight_read and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
+    kda_glue_fp8 = kda_fp8 and os.environ.get(_KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
+    return fp8_weight_read, kda_fp8, kda_glue_fp8
 
 
 # ---------------------------------------------------------------------------
@@ -2568,9 +2584,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # the bf16 wrapper fast path; KIMI_K3_KDA_GLUE_FP8=1 instead rebuilds
         # the wrapper fast path on top of the FP8 modules after the
         # conversion (finalize_decode_weights_fp8), so neither is traded away.
-        fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "1") != "0"
-        kda_fp8 = fp8_weight_read and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
-        kda_glue_fp8 = kda_fp8 and os.environ.get(_KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
+        fp8_weight_read, kda_fp8, kda_glue_fp8 = _resolve_fp8_weight_read_gates()
 
         # Build the KDA decode fast-path constants (fused in-projection
         # weight views + kernel-layout conv weights + fp32 params). Must
