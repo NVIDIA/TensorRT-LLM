@@ -7430,8 +7430,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row_fake = (cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ), stride_order=(0, )) if seqlen_sorted else None)
-            # emission-assisted tiers (list/counts/rungs, see
-            # gvr_routing): fake shapes mirror the harness wrapper
+            # emission-assisted tier fake tensors (list/counts/rungs)
             block_max_fake = (cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32, (n_rows, cute.sym_int()),
                 stride_order=(1, 0),
@@ -7482,8 +7481,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cand_cap=cand_cap,
                 accept_cap=accept_cap,
                 kc_override=kc_override,
-                # ext modes need 3 rung slots (M_thr == 3); the qfrac
-                # VALUES are irrelevant (P1b skipped), only slot count
+                # ext modes need 3 rung slots (M_thr == 3); only the
+                # slot count matters, not the qfrac values (P1b skipped)
                 r0_qfracs=((0.85, 0.35) if
                            (use_ext_counts or ext_rungs) else None),
             )
@@ -7768,6 +7767,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     or enable_block_skip):
                 assert not lb_mode and order_row is None, (
                     "ext tiers are single-CTA/sort-path only")
+                assert logits.dtype == torch.float32 and next_n == 1, (
+                    "ext tiers are compiled for fp32 logits and next_n==1; "
+                    f"got dtype={logits.dtype} next_n={next_n}")
             if num_threads is not None:
                 tuning = dict(tuning, num_threads_per_block=num_threads)
             elif use_ext_cand and top_k <= 512:
@@ -9039,10 +9041,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seed_counts_fake = None
             if emit_seed_counts:
                 if seed_packed:
-                    # single [rows, 8] fp32 packed seed row: lines at
-                    # cols 0..2 (kernel reads (row, j<=2) unchanged),
-                    # counts accumulate as fp32 at cols 3..5; the same
-                    # tensor is bound to both params.
+                    # [rows, 8] fp32 packed seed row: lines at cols 0..2,
+                    # counts at cols 3..5; same tensor bound to both params.
                     seed_thr_fake = cute.runtime.make_fake_compact_tensor(
                         cutlass.Float32, (cute.sym_int(), 8),
                         stride_order=(1, 0),
@@ -9097,11 +9097,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sm_fake,
                 cutlass.Int32(1),
                 cutlass.Int32(1),
-                # stream sits before the emission tensors in __call__ -
-                # upstream's positional order, with the emission slots
-                # appended after it. Keep this list in that order: the
-                # runtime call below drops the stream (the TVM FFI env
-                # stream is used) and is otherwise the same sequence.
+                # keep __call__'s argument order: stream, then emission
+                # slots (the runtime call drops the stream, same sequence)
                 fake_stream,
                 block_max_fake,
                 hit_stats_fake,
@@ -9164,10 +9161,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output_dtype: output logits dtype
                 emit_block_meta: also emit per-128-block metadata for the
                     fused GVR top-k. Requires ``hit_bitmap``
-                    [B, nb_pad*4] int32 (1 bit per compressed kv position,
-                    request-level). ``block_max_out``/``hit_stats_out``
-                    ([B*next_n, nb_pad] fp32 / [B*next_n, nb_pad, 4] fp32)
-                    are allocated when not supplied.
+                    [B, >= nb_pad*4] int32 (1 bit per compressed kv
+                    position, request-level). ``block_max_out``
+                    [B*next_n, nb_pad*4] fp32 (4 warp-partial records per
+                    block) is allocated when not supplied;
+                    ``hit_stats_out`` [B*next_n, 4] fp32 must be supplied
+                    when ``emit_hit_stats`` is set.
             Returns:
                 logits [B*next_n, max_context_len]; with emit_block_meta,
                 the tuple (logits, block_max, hit_stats).
@@ -9265,10 +9264,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     "emit_seed_counts requires emit_block_meta")
                 if seed_counts_out is None:
                     # Packed contract: seed_thr IS the [rows, 8] fp32 seed
-                    # row (top-k pre-packed layout). Lines at cols 0..2;
-                    # counts accumulate as fp32 at cols 3..5 - the caller
-                    # zeroes cols 3..7 and writes lines each step. The
-                    # same buffer then feeds the top-k launch directly.
+                    # row; lines at cols 0..2, counts accumulate as fp32 at
+                    # cols 3..5. Caller zeroes cols 3..7 and writes lines
+                    # each step.
                     seed_packed = True
                     assert (
                         seed_thr is not None and seed_thr.dtype == torch.float32
@@ -9325,7 +9323,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             elif emit_cand_bucketed:
                 assert emit_seed_counts, (
                     "emit_cand_bucketed requires emit_seed_counts")
-                # SoA v5 contract: cand_out = fp32 VALUES [rows, 2*segA+capC],
+                # SoA contract: cand_out = fp32 VALUES [rows, 2*segA+capC],
                 # cand_idx_out = int32 positions (same width), cand_cur_out =
                 # int32 [rows, 4] cursors (caller-zeroed), cand_ctl_out =
                 # int32 [rows, 4] {n0, void, n1, n2} (caller-zeroed)
@@ -9407,11 +9405,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      None, None, None, None, None, None, None, None)
             return logits
 
-    # NOTE: the optional emission tensors ARE written by the kernel but
-    # deliberately not in mutates_args - torch.library's in-place
-    # bookkeeping IndexErrors on optional mutates left at their None
-    # default (same precedent as heuristic_scratch on
-    # trtllm::indexer_topk_decode).
+    # NOTE: the optional emission tensors ARE written by the kernel but must
+    # stay out of mutates_args (torch.library IndexErrors on None defaults).
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",
                              mutates_args=(),
                              device_types="cuda")
@@ -9484,9 +9479,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cand_idx_out=cand_idx_out,
             cand_ctl_out=cand_ctl_out,
             cand_cur_out=cand_cur_out)
-        # with emission on, the runner returns (logits, block_max,
-        # hit_stats) - the emission buffers are caller-owned mutates,
-        # the op face stays logits-only
+        # with emission on the runner returns a tuple; the op returns
+        # logits only (emission buffers are caller-owned)
         return ret[0] if isinstance(ret, tuple) else ret
 
     @torch.library.register_fake("trtllm::cute_dsl_fp4_paged_mqa_logits")

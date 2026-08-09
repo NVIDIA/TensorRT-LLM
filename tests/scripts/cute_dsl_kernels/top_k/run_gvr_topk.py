@@ -230,9 +230,8 @@ def _compile(
         kc_override=kc_override,
         self_scan=self_scan,
         cap_c=cap_c,
-        # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
-        # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
-        # the slot count matters.
+        # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed;
+        # the qfrac values are unused here — only the slot count matters.
         r0_qfracs=(0.85, 0.35) if (use_ext_counts or ext_rungs) else None,
     )
     return cute.compile(
@@ -289,15 +288,11 @@ def emu_block_max(
       "pad_inf": a partially-valid tail unit is forced to +FLT_MAX, the
                  worst legal inflation (the indexer masks by request-level
                  ctx >= N_eff, so tail positions can inflate the bound).
-                 Tests use this to prove inflated bounds only *disable*
-                 skipping, never break correctness.
     records:
       "rotate":     fold-correctness fixture — the 128-block max lands in
                     ONE slot rotated by blk % 4, the other 3 hold
-                    -FLT_MAX. Any 4 values folding to the block max are
-                    legal; the rotation makes a consumer that drops or
-                    mis-reads partial slots fail the tests. Valid ONLY
-                    for grain-128 consumers (slots are NOT positional).
+                    -FLT_MAX. Valid ONLY for grain-128 consumers (slots
+                    are NOT positional).
       "positional": production semantics — record r is the exact max of
                     positions [r*32, r*32+32) (the indexer's TMEM T2R
                     partition gives warp w of a tile the contiguous
@@ -338,9 +333,7 @@ def emu_block_max(
 
 
 # Rung offsets below each 32-position record's max for the meta-seed
-# metadata (L6_geo.25 — offline-validated: 1.00 real scans on synth +
-# real captures for both V4 models with the kernel's S=16 x 2-pass
-# quantized search).
+# metadata.
 _META_DELTAS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 
 
@@ -359,8 +352,6 @@ def emu_block_meta(
     upper bound 32). Positions beyond the row's effective length are
     excluded. Layout matches ``block_max``: ``[num_rows, nrec]`` int32
     with ``nrec = ceil(N/128)*4`` (one record per 32 positions).
-    On the indexer side this is ~L ballots+popcounts per record in the
-    epilogue, same shape as the +1.3% block_max emission.
     """
     assert next_n == 1, "emu_block_meta: next_n == 1 only"
     x = logits.float()
@@ -394,8 +385,7 @@ def derive_seed_rungs(
     Estimates the per-row local slope of log2(count) vs threshold from the
     PREVIOUS step's 3 rung measurements and places the next step's guard
     rungs ``count_octaves`` octaves away from the mid rung (= the previous
-    accepted threshold). Real-chain validation (V4-Pro/Flash captures):
-    in-band admission 0.958/0.975 vs 0.82-0.97 for any fixed spread.
+    accepted threshold).
 
     Args:
         prev_thr: [rows] previous accepted threshold (xstate[:, 2]).
@@ -418,10 +408,8 @@ def derive_seed_rungs(
             count_octaves / slope.clamp(min=0.05),
             torch.full_like(slope, fallback_spread),
         ).clamp(0.1, 4.0)
-        # undershoot hysteresis: a row whose PREVIOUS loose rung caught
-        # fewer than K cannot use its list (fallback ~26us); widen only
-        # that row's next down-guard by +2 octaves. Rows in band keep the
-        # tight spread (a fat list taxes every step's walk).
+        # undershoot hysteresis: a row whose previous loose rung caught
+        # fewer than K widens only its next down-guard by +2 octaves.
         oct_lo = torch.full_like(slope, count_octaves)
         if top_k is not None:
             oct_lo = torch.where(prev_counts[:, 0].float() < float(top_k), oct_lo + 2.0, oct_lo)
@@ -770,17 +758,12 @@ def gvr_topk_decode(
     cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
 
     num_rows = logits.shape[0]
-    # Host dispatch gate: the compact walk only wins when the per-row
-    # compressed length is large (protocol: >= 2x at N=262k, 4-14% LOSS at
-    # N <= 131k). Below skip_min_n (compressed-index space, shape-based so
-    # no device sync) drop block_max and run the dense arms. None disables
-    # the gate (A/B probes).
+    # Host dispatch gate: below skip_min_n (compressed-index space,
+    # shape-based so no device sync) drop block_max; None disables the gate.
     if block_max is not None and skip_min_n is not None and logits.shape[1] < skip_min_n:
         block_max = None
-    # K > 512 at tiny batch: the acceptance band is proportionally tighter
-    # (kC/K = 6 vs 10), the bounds prune less, and the row-split configs
-    # win outright (cold protocol, pro 262k BS1: skip 21.3-21.6us at
-    # cs1/cs8 vs stock cs8 19.7us) -> keep the stock path.
+    # K > 512 at tiny batch: drop block_max (stock path) unless the admitted
+    # line is known up front (ext counts / packed seed / self_scan).
     if (
         block_max is not None
         and num_rows < 8
@@ -789,20 +772,12 @@ def gvr_topk_decode(
         and not (seed_thr is not None and seed_counts is not None)
         and not (seed_thr is not None and seed_thr.shape[1] >= 6)
     ):
-        # Stock-path small-batch gate, tuned in the loose-rung era (the
-        # sample-quantile list kept 60%+ of the blocks at K>512). It does
-        # NOT apply when the admitted line is known up front: ext counts
-        # park the tight line in every rung slot, so the list forms at
-        # the accepted threshold and skips by the real band density
-        # (pro-1M: 12.7% pass -> the list is live again). self_scan owns
-        # its own skip economics likewise.
         block_max = None
     if self_scan:
         # fused self-contained mode: kernel scans/buckets the row itself.
         # Inputs: seed_thr (three closed-loop lines) + a write-only gmem
-        # POSITION column passed through the cand_idx slot. seed_counts is
-        # a dummy (the ext-counts preview reads it but zeros never pass
-        # the [K, kC] admission, so routing is owned by the phase-0 gate).
+        # POSITION column passed through the cand_idx slot; seed_counts is
+        # a dummy (zeros never pass the [K, kC] admission).
         assert seed_thr is not None, "self_scan requires seed_thr"
         assert cand_vals is None and cand_ctl is None, (
             "self_scan excludes external candidate values/control"
@@ -906,17 +881,12 @@ def gvr_topk_decode(
     N_dec = max_seq_len if max_seq_len is not None else N_cols
     if num_threads_per_block is None:
         if use_ext_cand and top_k <= 512:
-            # list-hit rows do O(list) work (~2-4K entries at K<=512),
-            # not O(N): the N-keyed 1024-thread pick pays barrier-heavy
-            # phases for no parallel gain (flash-512k v5: 8.4 -> 7.1us
-            # at 512 threads; K=1024 lists are big enough to keep the
-            # N-keyed pick).
+            # list-hit rows do O(list) work, not O(N): use 512 threads
+            # (K=1024 lists are big enough to keep the N-keyed pick).
             num_threads_per_block = 512
         elif self_scan:
-            # self_scan owns the whole row scan in one CTA: the phase-0
-            # cp.async pipeline scales with warp count at every N (the
-            # 512-thread short-row heuristic below is tuned for the
-            # stock multi-pass kernel and costs ~5us/cell here).
+            # self_scan scans the whole row in one CTA; the phase-0
+            # cp.async pipeline scales with warp count at every N.
             num_threads_per_block = 1024
         else:
             if max_seq_len is not None and logits.dtype != torch.float32:

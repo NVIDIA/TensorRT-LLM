@@ -64,21 +64,16 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
 
-# Reduction identities for the emit_block_meta epilogue path; match the GVR
-# kernel's FLT_MAX/NEG_FLT_MAX sentinels (gvr_topk_decode.py) so the fused
-# Phase 1's degenerate checks behave identically to the gather path.
+# Reduction identities for emit_block_meta; must match the GVR kernel's
+# FLT_MAX/NEG_FLT_MAX sentinels (gvr_topk_decode.py).
 _META_FLT_MAX = 3.4028235e38
 _META_NEG_FLT_MAX = -3.4028235e38
 
 
-# ---------------------------------------------------------------------------
 # Global-memory reductions for the per-row hit aggregate (emit_hit_stats).
-# fp32 has no native atomic min/max; we use the standard order-preserving
-# int encoding enc(f) = bits(f) >= 0 ? bits(f) : bits(f) ^ 0x7FFFFFFF
-# (an involution; signed-int order == float order, -0.0 quirk harmless for
-# min/max seeding) and red.global.{min,max}.s32. Sum uses red.global.add.f32
-# (order-nondeterministic — perturbs only the heuristic mean seed).
-# ---------------------------------------------------------------------------
+# fp32 min/max use the order-preserving int encoding
+# enc(f) = bits(f) >= 0 ? bits(f) : bits(f) ^ 0x7FFFFFFF (an involution)
+# with red.global.{min,max}.s32; sum uses red.global.add.f32.
 @dsl_user_op
 def _red_global_fmin_ordered(addr_i64, fval, *, loc=None, ip=None):
     llvm.inline_asm(
@@ -519,84 +514,69 @@ class FP4MQALogitsKernel:
         # one contiguous LSU phase after the for-t loop (epilogue micro-opt).
         self.use_batched_store = use_batched_store
         # When True, the epilogue additionally emits per-128-token-block
-        # metadata consumed by the fused GVR top-k (gvr_topk_decode.py —
-        # fused_preidx_stats / enable_block_skip). Emission is fully
-        # WARP-AUTONOMOUS: each of the WG's 4 warps writes one partial
-        # record per tile per t (record index = tile*4 + warp); the GVR
-        # consumer folds the 4 partials per block. No cross-warp barrier —
-        # a per-tile named-barrier fold costs +53% indexer wall-clock.
-        #   block_max [num_rows, nb_pad*4]    fp32 — warp-partial max of
-        #     f32(stored logit) over valid positions (kv_pos < ctx);
-        #     fold(4) is the lossless block-skip upper bound. Computed on
-        #     the POST-conversion value so it bounds what GVR reads back,
-        #     bit-exactly.
-        #   hit_agg [num_rows, 4] fp32 — PER-ROW aggregate
+        # metadata consumed by the fused GVR top-k (gvr_topk_decode.py).
+        # Emission is warp-autonomous: each of the WG's 4 warps writes one
+        # partial record per tile per t (record index = tile*4 + warp);
+        # the GVR consumer folds the 4 partials per block. No cross-warp
+        # barrier.
+        #   block_max [num_rows, nb_pad*4] fp32 — warp-partial max of
+        #     f32(stored logit) over valid positions (kv_pos < ctx),
+        #     computed on the POST-conversion value so it bounds what GVR
+        #     reads back bit-exactly.
+        #   hit_agg [num_rows, 4] fp32 — per-row aggregate
         #     {enc_min, enc_max, sum, cnt} of stored logits at positions
         #     flagged in hit_bitmap; min/max slots hold the
         #     order-preserving int encoding (see _red_global_fmin_ordered).
         #     Buffer must be pre-initialized to
-        #     {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} per step. Replaces GVR
-        #     Phase 1's random gather.
-        #   hit_bitmap [batch, nb_pad*4]      int32 — 1 bit per kv
-        #     position (request-level; from the previous step's top-k).
-        # Cost per tile per t: 1 bitmap LDG/thread + 1 warp redux + 1
-        # lane-0 STG (block_max) + <= 4 LANE-LOCAL accumulator ops (hit
-        # stats); the hit accumulators flush ONCE per q-transition via
-        # atomics (_flush_hit_agg). A per-tile warp-redux emission of the
-        # hit stats was tried first and cost +72% indexer wall-clock.
+        #     {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} per step.
+        #   hit_bitmap [batch, nb_pad*4] int32 — 1 bit per kv position
+        #     (request-level; from the previous step's top-k).
+        # Hit accumulators are lane-local and flush once per q-transition
+        # via atomics (_flush_hit_agg).
         #
         # emit_hit_stats sub-knob (only meaningful with emit_block_meta):
-        # False emits block_max ONLY (no bitmap read, no hit aggregate) —
-        # sufficient for GVR block-skip without the fused Phase 1.
+        # False emits block_max ONLY (no bitmap read, no hit aggregate).
         self.emit_block_meta = emit_block_meta
         self.emit_hit_stats = emit_hit_stats
-        # emit_seed_counts (L1 of the epilogue suite; requires
-        # emit_block_meta): per row, count stored logits >= each of the
-        # T=3 caller-provided thresholds (cross-step seed thresholds from
-        # the GVR xstate). Lane-local accumulation across tiles + one
-        # warp-redux + lane-0 red.global.add.s32 per threshold per row
-        # transition — the hit-stats cost profile. Counts are computed on
-        # the POST-conversION value over valid positions only, matching
-        # the top-k consumer's verification semantics
-        # (workspace/epilogue_topk_interface.md).
+        # emit_seed_counts (requires emit_block_meta): per row, count
+        # stored logits >= each of the T=3 caller-provided thresholds.
+        # Counts are computed on the POST-conversion value over valid
+        # positions only.
         if emit_seed_counts and not emit_block_meta:
             raise ValueError("emit_seed_counts requires emit_block_meta")
         self.emit_seed_counts = emit_seed_counts
         # seed_packed: single [num_rows, 8] fp32 seed row per the top-k
-        # pre-packed contract - lines at cols 0..2, counts ACCUMULATED AS
-        # FLOATS at cols 3..5 (exact to 2^24; red.global.add.f32). The
-        # caller zeroes cols 3..7 and writes the lines each step; the
-        # same buffer feeds the top-k launch with no host repack.
+        # pre-packed contract - lines at cols 0..2, counts accumulated as
+        # floats at cols 3..5 (exact to 2^24; red.global.add.f32). The
+        # caller zeroes cols 3..7 and writes the lines each step.
         if seed_packed and not emit_seed_counts:
             raise ValueError("seed_packed requires emit_seed_counts")
         self.seed_packed = seed_packed
-        # emit_cand (L2 of the epilogue suite): unordered pre-collect of all
-        # (value, index) pairs >= the t_0 seed threshold via warp ballot +
-        # lane0 batch atomic claim. claimed >= K certifies the candidate
-        # set covers the true top-K (contract in epilogue_topk_interface.md).
+        # emit_cand: unordered pre-collect of all (value, index) pairs >=
+        # the t_0 seed threshold. claimed >= K certifies the candidate set
+        # covers the true top-K.
         if emit_cand and not emit_seed_counts:
             raise ValueError("emit_cand requires emit_seed_counts (t_0 source)")
         self.emit_cand = emit_cand
         self.cand_cap = cand_cap
-        # emit_cand_bucketed (v5 list contract): three fixed SoA segments
-        # (A=[0,segA) holds >= t2, B=[segA,2segA) holds [t1,t2), C=
-        # [2segA,2segA+capC) holds [t0,t1)); a full segment spills to the
-        # next looser one. A/B use EXACT ballot claims (their prefixes
-        # must stay pad-free - the consumer's prefix math assumes it), C
-        # keeps the claim-window scheme (pads are legal there). Cursors
-        # live in caller-zeroed cand_cur [rows,4]; ctl [rows,4] carries
-        # {n0 incl C pads, void, n1, n2} with n1/n2 flushed from the L1
-        # seed counters.
+        # emit_cand_bucketed: three fixed SoA segments (A=[0,segA) holds
+        # >= t2, B=[segA,2segA) holds [t1,t2), C=[2segA,2segA+capC) holds
+        # [t0,t1)); a full segment spills to the next looser one. A/B use
+        # EXACT ballot claims (their prefixes must stay pad-free - the
+        # consumer's prefix math assumes it), C keeps the claim-window
+        # scheme (pads are legal there). Cursors live in caller-zeroed
+        # cand_cur [rows,4]; ctl [rows,4] carries {n0 incl C pads, void,
+        # n1, n2} with n1/n2 flushed from the seed counters.
         if emit_cand_bucketed and not emit_seed_counts:
             raise ValueError("emit_cand_bucketed requires emit_seed_counts")
         if emit_cand_bucketed and emit_cand:
             raise ValueError("emit_cand_bucketed and emit_cand are exclusive")
         self.emit_cand_bucketed = emit_cand_bucketed
         self.accept_cap = accept_cap
-        # Per-warp claim window: one atomic claims (hits + CAND_WIN) slots;
-        # subsequent hits consume the window latency-free. The unconsumed
-        # tail is sentinel-filled (idx = -1) at q-transition/loop end, so
-        # `claimed` over-approximates the true count (counts[r][0] exact).
+        # Per-warp claim window: one atomic claims (hits + CAND_WIN) slots.
+        # The unconsumed tail is sentinel-filled (idx = -1) at
+        # q-transition/loop end, so `claimed` over-approximates the true
+        # count (counts[r][0] exact).
         self.CAND_WIN = 8
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
@@ -819,8 +799,8 @@ class FP4MQALogitsKernel:
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
         stream: cuda.CUstream,
-        # everything below is emission-only and defaulted, so the
-        # positional signature stays the one callers already use
+        # emission-only tensors; defaulted so the positional signature
+        # stays the one callers already use
         block_max: cute.Tensor = None,  # [num_rows, nb_pad*4] fp32 warp-partials
         hit_stats: cute.Tensor = None,  # [num_rows, 4] fp32 (emit_hit_stats)
         hit_bitmap: cute.Tensor = None,  # [batch, nb_pad*4] int32 (emit_block_meta)
@@ -1073,10 +1053,8 @@ class FP4MQALogitsKernel:
         """Warp-reduce the per-lane hit accumulators and merge them into the
         per-row global aggregate via one set of atomics (encoded-int
         min/max + fp32 adds), then reset to identities. Called once per
-        q-transition per warp — atomic traffic is negligible. The
-        aggregate buffer must be pre-initialized to
-        {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} per step (prototype: test
-        harness; production: folded into the bitmap prepare kernel)."""
+        q-transition per warp. The aggregate buffer must be pre-initialized
+        to {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} per step."""
         next_n = cutlass.const_expr(self.next_n)
         base_addr = mHitAgg.iterator.toint()
         for t in cutlass.range_constexpr(next_n):
@@ -1133,8 +1111,7 @@ class FP4MQALogitsKernel:
                             _red_global_add_s32(ctl_a, w_cnt)
                 scnt[t * 3 + j] = cutlass.Int32(0)
         if cutlass.const_expr(self.seed_packed and spass is not None):
-            # packed col 6: adaptive-skip pass count (lane0-accumulated,
-            # so the warp redux is exactly the warp's record total)
+            # packed col 6: adaptive-skip pass count (lane0-accumulated)
             for t in cutlass.range_constexpr(next_n):
                 w_bp = cute.arch.warp_redux_sync(spass[t], "add")
                 if meta_lane == cutlass.Int32(0):
@@ -1148,7 +1125,7 @@ class FP4MQALogitsKernel:
     @cute.jit
     def _flush_cand_window_bucketed(self, mCand, mCandIdx, q_idx, cwbase, cwleft, meta_lane):
         """Sentinel-fill the unconsumed C-window tail in BOTH SoA columns
-        (score -inf, idx -1: the v5 consumer pads by score) and invalidate
+        (score -inf, idx -1: the consumer pads by score) and invalidate
         the window. Segment C sits at base 2*segA in each row."""
         next_n = cutlass.const_expr(self.next_n)
         segA_f = cutlass.const_expr(self.accept_cap)
@@ -1486,12 +1463,9 @@ class FP4MQALogitsKernel:
             layout=sf_kv_smem_layout_staged,
             byte_alignment=128,
         )
-        # Block-meta emission is fully warp-autonomous (each warp's lane 0
-        # writes its own warp-partial record straight to GMEM; the GVR
-        # side folds 4 partials per block) — no SMEM scratch, no named
-        # barrier. A cross-warp SMEM fold + per-tile named barrier was
-        # tried first and cost +53% indexer wall-clock by serializing the
-        # epilogue's warp pipelining.
+        # Block-meta emission is warp-autonomous: each warp's lane 0 writes
+        # its own warp-partial record straight to GMEM; the GVR side folds
+        # 4 partials per block. No SMEM scratch, no named barrier.
 
         a_mcast_mask = cpasync.create_tma_multicast_mask(
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
@@ -2214,18 +2188,14 @@ class FP4MQALogitsKernel:
                 else:  # fp32, 4-byte weights
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 if cutlass.const_expr(self.emit_block_meta):
-                    # Free ~8 registers for the meta accumulators/fragments
-                    # — the epilogue's weight cache is tuned to the spill
-                    # edge (see MAX_NUM_W_IN_REG SASS notes above).
+                    # Free ~8 registers for the meta accumulators/fragments;
+                    # the epilogue's weight cache sits at the spill edge.
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
                         # registers across the tile loop.
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
-                    # emit_seed_counts: no budget cut — ncu shows the cost
-                    # is epilogue ALU/issue, not registers (occupancy and
-                    # block limits identical with or without a -8 cut; the
-                    # cut itself measured neutral-to-slower).
+                    # emit_seed_counts needs no extra budget cut.
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2256,10 +2226,9 @@ class FP4MQALogitsKernel:
                             cwbase[_i] = cutlass.Int32(0)
                             cwleft[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_hit_stats):
-                        # Per-lane hit accumulators, carried across ALL
+                        # Per-lane hit accumulators, carried across all
                         # tiles of the same q and flushed once per
-                        # q-transition — zero warp-wide ops per tile (the
-                        # per-tile redux version cost +72% wall-clock).
+                        # q-transition — no warp-wide ops per tile.
                         hacc_min = cute.make_fragment(next_n, cutlass.Float32)
                         hacc_max = cute.make_fragment(next_n, cutlass.Float32)
                         hacc_sum = cute.make_fragment(next_n, cutlass.Float32)
@@ -2269,13 +2238,10 @@ class FP4MQALogitsKernel:
                             hacc_max[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
                             hacc_sum[_t] = cutlass.Float32(0.0)
                             hacc_cnt[_t] = cutlass.Int32(0)
-                        # Batched bitmap read state: a per-tile LDG's
-                        # ~300cy L2 trip lands on the critical path every
-                        # tile (isolated at +42% kernel time; one-ahead
-                        # prefetch did not help). All 32 lanes of a warp
-                        # need the SAME word per tile, so instead lane l
-                        # loads the word for tile j+l once per 32 tiles
-                        # and each tile takes its word via one shuffle.
+                        # Batched bitmap read state: all 32 lanes of a warp
+                        # need the SAME word per tile, so lane l loads the
+                        # word for tile j+l once per 32 tiles and each tile
+                        # takes its word via one shuffle.
                         meta_j = cutlass.Int32(0)
                         hitw_batch = cutlass.Int32(0)
 
@@ -2559,18 +2525,15 @@ class FP4MQALogitsKernel:
                             mLogits[(out_row, kv_pos)] = stored_t
                         if cutlass.const_expr(self.emit_block_meta):
                             # Meta reduction on the POST-conversion value so
-                            # block_max bounds what GVR reads back bit-exactly
-                            # (pre-conversion fp32 max could round up past a
-                            # stored logit's converted value's block max).
+                            # block_max bounds what GVR reads back bit-exactly.
                             f32_t = cutlass.Float32(stored_t)
                             bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
                             if meta_valid:
                                 bmax_v = f32_t
                             r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
                             # Warp-autonomous store: record index =
-                            # tile*4 + warp; the GVR consumer folds the 4
-                            # warp-partials per block (fold of partials ==
-                            # block stat — associative + identity-padded).
+                            # tile*4 + warp; the GVR consumer folds the
+                            # 4 warp-partials per block.
                             if meta_lane == cutlass.Int32(0):
                                 out_row_m = q_idx * next_n + t
                                 rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
@@ -2588,26 +2551,20 @@ class FP4MQALogitsKernel:
                                     # adaptive-skip pass count: one record
                                     # per (tile, warp); r_bmax is warp-
                                     # uniform so lane0 alone accumulates
-                                    # (the flush redux then sums warps)
                                     if meta_lane == cutlass.Int32(0):
                                         spass[t] = spass[t] + cutlass.Int32(
                                             r_bmax >= sthr[t * 3 + 0]
                                         )
                             if cutlass.const_expr(self.emit_cand):
-                                # L2 pre-collect at t_0 with per-warp claim
-                                # WINDOWS: refills claim (hits + CAND_WIN)
-                                # slots in ONE atomic; between refills the
-                                # warp consumes its window latency-free (a
-                                # per-hit atomic round-trip stalled the
-                                # epilogue 2x at 131k ctx). Unconsumed tail
-                                # is sentinel-filled on flush; counts[r][0]
-                                # stays the exact count. Gated on the
-                                # already-computed warp-uniform 32-position
-                                # bound: r_bmax < t_0 proves zero hits, so
-                                # the common no-hit iteration costs ONE fp
-                                # compare (no ballot, no select). bound >=
-                                # t_0 guarantees a nonzero ballot (exact
-                                # per-lane max, invalid -> -FLT_MAX).
+                                # Candidate pre-collect at t_0 with per-warp
+                                # claim windows: one atomic claims
+                                # (hits + CAND_WIN) slots per refill.
+                                # Unconsumed tail is sentinel-filled on
+                                # flush; counts[r][0] stays the exact count.
+                                # Gated on the warp-uniform 32-position
+                                # bound: r_bmax < t_0 proves zero hits;
+                                # bound >= t_0 guarantees a nonzero ballot
+                                # (exact per-lane max, invalid -> -FLT_MAX).
                                 if r_bmax >= sthr[t * 3 + 0]:
                                     pred_c = cutlass.Int32(0)
                                     if meta_valid:
@@ -2687,7 +2644,7 @@ class FP4MQALogitsKernel:
                                     cwbase[t] = cwbase[t] + cnt_c
                                     cwleft[t] = cwleft[t] - cnt_c
                             if cutlass.const_expr(self.emit_cand_bucketed):
-                                # v5 bucketed SoA: A/B EXACT ballot claims
+                                # Bucketed SoA: A/B EXACT ballot claims
                                 # (their prefixes must stay pad-free for
                                 # the consumer's prefix math), C keeps the
                                 # claim-window; a full segment spills to
@@ -2901,14 +2858,12 @@ class FP4MQALogitsKernel:
                                     cwbase[t] = cwbase[t] + cntC_k
                                     cwleft[t] = cwleft[t] - cntC_k
                             if cutlass.const_expr(self.emit_hit_stats):
-                                # Lane-local accumulation, fully BRANCHLESS
-                                # (data-dependent `if meta_hit` compiled to
-                                # real divergent branches whose condition
-                                # waits on the bitmap LDG — 43% of all warp
-                                # stall samples). Bit-mask select is also
-                                # NaN-safe for OOB-tile garbage logits. No
-                                # valid-mask needed: the bitmap contract
-                                # only sets bits inside [0, ctx).
+                                # Lane-local accumulation; keep it branchless
+                                # (`if meta_hit` compiles to real divergent
+                                # branches). Bit-mask select is NaN-safe for
+                                # OOB-tile garbage logits. No valid-mask
+                                # needed: the bitmap contract only sets bits
+                                # inside [0, ctx).
                                 meta_hit = (
                                     hit_word >> (kv_pos & cutlass.Int32(31))
                                 ) & cutlass.Int32(1)
@@ -3007,18 +2962,14 @@ class FP4MQALogitsKernel:
                 else:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 if cutlass.const_expr(self.emit_block_meta):
-                    # Free ~8 registers for the meta accumulators/fragments
-                    # — the epilogue's weight cache is tuned to the spill
-                    # edge (see MAX_NUM_W_IN_REG SASS notes above).
+                    # Free ~8 registers for the meta accumulators/fragments;
+                    # the epilogue's weight cache sits at the spill edge.
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
                         # registers across the tile loop.
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
-                    # emit_seed_counts: no budget cut — ncu shows the cost
-                    # is epilogue ALU/issue, not registers (occupancy and
-                    # block limits identical with or without a -8 cut; the
-                    # cut itself measured neutral-to-slower).
+                    # emit_seed_counts needs no extra budget cut.
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -3049,10 +3000,9 @@ class FP4MQALogitsKernel:
                             cwbase[_i] = cutlass.Int32(0)
                             cwleft[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_hit_stats):
-                        # Per-lane hit accumulators, carried across ALL
+                        # Per-lane hit accumulators, carried across all
                         # tiles of the same q and flushed once per
-                        # q-transition — zero warp-wide ops per tile (the
-                        # per-tile redux version cost +72% wall-clock).
+                        # q-transition — no warp-wide ops per tile.
                         hacc_min = cute.make_fragment(next_n, cutlass.Float32)
                         hacc_max = cute.make_fragment(next_n, cutlass.Float32)
                         hacc_sum = cute.make_fragment(next_n, cutlass.Float32)
@@ -3062,13 +3012,10 @@ class FP4MQALogitsKernel:
                             hacc_max[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
                             hacc_sum[_t] = cutlass.Float32(0.0)
                             hacc_cnt[_t] = cutlass.Int32(0)
-                        # Batched bitmap read state: a per-tile LDG's
-                        # ~300cy L2 trip lands on the critical path every
-                        # tile (isolated at +42% kernel time; one-ahead
-                        # prefetch did not help). All 32 lanes of a warp
-                        # need the SAME word per tile, so instead lane l
-                        # loads the word for tile j+l once per 32 tiles
-                        # and each tile takes its word via one shuffle.
+                        # Batched bitmap read state: all 32 lanes of a warp
+                        # need the SAME word per tile, so lane l loads the
+                        # word for tile j+l once per 32 tiles and each tile
+                        # takes its word via one shuffle.
                         meta_j = cutlass.Int32(0)
                         hitw_batch = cutlass.Int32(0)
 
@@ -3345,18 +3292,15 @@ class FP4MQALogitsKernel:
                             mLogits[(out_row, kv_pos)] = stored_t
                         if cutlass.const_expr(self.emit_block_meta):
                             # Meta reduction on the POST-conversion value so
-                            # block_max bounds what GVR reads back bit-exactly
-                            # (pre-conversion fp32 max could round up past a
-                            # stored logit's converted value's block max).
+                            # block_max bounds what GVR reads back bit-exactly.
                             f32_t = cutlass.Float32(stored_t)
                             bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
                             if meta_valid:
                                 bmax_v = f32_t
                             r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
                             # Warp-autonomous store: record index =
-                            # tile*4 + warp; the GVR consumer folds the 4
-                            # warp-partials per block (fold of partials ==
-                            # block stat — associative + identity-padded).
+                            # tile*4 + warp; the GVR consumer folds the
+                            # 4 warp-partials per block.
                             if meta_lane == cutlass.Int32(0):
                                 out_row_m = q_idx * next_n + t
                                 rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
@@ -3374,26 +3318,20 @@ class FP4MQALogitsKernel:
                                     # adaptive-skip pass count: one record
                                     # per (tile, warp); r_bmax is warp-
                                     # uniform so lane0 alone accumulates
-                                    # (the flush redux then sums warps)
                                     if meta_lane == cutlass.Int32(0):
                                         spass[t] = spass[t] + cutlass.Int32(
                                             r_bmax >= sthr[t * 3 + 0]
                                         )
                             if cutlass.const_expr(self.emit_cand):
-                                # L2 pre-collect at t_0 with per-warp claim
-                                # WINDOWS: refills claim (hits + CAND_WIN)
-                                # slots in ONE atomic; between refills the
-                                # warp consumes its window latency-free (a
-                                # per-hit atomic round-trip stalled the
-                                # epilogue 2x at 131k ctx). Unconsumed tail
-                                # is sentinel-filled on flush; counts[r][0]
-                                # stays the exact count. Gated on the
-                                # already-computed warp-uniform 32-position
-                                # bound: r_bmax < t_0 proves zero hits, so
-                                # the common no-hit iteration costs ONE fp
-                                # compare (no ballot, no select). bound >=
-                                # t_0 guarantees a nonzero ballot (exact
-                                # per-lane max, invalid -> -FLT_MAX).
+                                # Candidate pre-collect at t_0 with per-warp
+                                # claim windows: one atomic claims
+                                # (hits + CAND_WIN) slots per refill.
+                                # Unconsumed tail is sentinel-filled on
+                                # flush; counts[r][0] stays the exact count.
+                                # Gated on the warp-uniform 32-position
+                                # bound: r_bmax < t_0 proves zero hits;
+                                # bound >= t_0 guarantees a nonzero ballot
+                                # (exact per-lane max, invalid -> -FLT_MAX).
                                 if r_bmax >= sthr[t * 3 + 0]:
                                     pred_c = cutlass.Int32(0)
                                     if meta_valid:
@@ -3473,7 +3411,7 @@ class FP4MQALogitsKernel:
                                     cwbase[t] = cwbase[t] + cnt_c
                                     cwleft[t] = cwleft[t] - cnt_c
                             if cutlass.const_expr(self.emit_cand_bucketed):
-                                # v5 bucketed SoA: A/B EXACT ballot claims
+                                # Bucketed SoA: A/B EXACT ballot claims
                                 # (their prefixes must stay pad-free for
                                 # the consumer's prefix math), C keeps the
                                 # claim-window; a full segment spills to
@@ -3687,14 +3625,12 @@ class FP4MQALogitsKernel:
                                     cwbase[t] = cwbase[t] + cntC_k
                                     cwleft[t] = cwleft[t] - cntC_k
                             if cutlass.const_expr(self.emit_hit_stats):
-                                # Lane-local accumulation, fully BRANCHLESS
-                                # (data-dependent `if meta_hit` compiled to
-                                # real divergent branches whose condition
-                                # waits on the bitmap LDG — 43% of all warp
-                                # stall samples). Bit-mask select is also
-                                # NaN-safe for OOB-tile garbage logits. No
-                                # valid-mask needed: the bitmap contract
-                                # only sets bits inside [0, ctx).
+                                # Lane-local accumulation; keep it branchless
+                                # (`if meta_hit` compiles to real divergent
+                                # branches). Bit-mask select is NaN-safe for
+                                # OOB-tile garbage logits. No valid-mask
+                                # needed: the bitmap contract only sets bits
+                                # inside [0, ctx).
                                 meta_hit = (
                                     hit_word >> (kv_pos & cutlass.Int32(31))
                                 ) & cutlass.Int32(1)
