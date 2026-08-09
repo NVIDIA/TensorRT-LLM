@@ -17,6 +17,7 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 
+from .cache_manager import is_dsa_cache_manager
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
@@ -137,10 +138,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
-        from .cache_manager import DSACacheManager, DSACacheManagerV2
-
         super().__post_init__()
-        if not isinstance(self.kv_cache_manager, (DSACacheManager, DSACacheManagerV2)):
+        if not is_dsa_cache_manager(self.kv_cache_manager):
             has_deepseek_v4_cache_interface = all(
                 hasattr(self.kv_cache_manager, attr)
                 for attr in ("compressed_block_sizes", "get_cache_indices")
@@ -574,14 +573,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # the draft-replay context swaps these in by rebinding, so CUDA graph
         # capture bakes distinct addresses for the target and draft segments
         # and both sides can be refreshed eagerly outside the graph.
-        if self.draft_kv_cache_manager is not None and all(
-            hasattr(self.draft_kv_cache_manager, attr)
-            for attr in (
-                "index_head_dim",
-                "get_pool_block_indices",
-                "indexer_k_cache_page_scale",
-            )
-        ):
+        if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_indexer_k_cache_block_offsets = self.get_empty(
                 self.cuda_graph_buffers,
                 [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
@@ -642,14 +634,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        if self.draft_kv_cache_manager is not None and all(
-            hasattr(self.draft_kv_cache_manager, attr)
-            for attr in (
-                "index_head_dim",
-                "get_pool_block_indices",
-                "indexer_k_cache_page_scale",
-            )
-        ):
+        if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_block_table = self.get_empty(
                 self.cuda_graph_buffers,
                 [
@@ -810,14 +795,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        if self.draft_kv_cache_manager is not None and all(
-            hasattr(self.draft_kv_cache_manager, attr)
-            for attr in (
-                "index_head_dim",
-                "get_pool_block_indices",
-                "indexer_k_cache_page_scale",
-            )
-        ):
+        if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_block_table_expanded = self.get_empty(
                 self.cuda_graph_buffers,
                 [

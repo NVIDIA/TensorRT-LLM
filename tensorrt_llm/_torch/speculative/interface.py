@@ -171,15 +171,13 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         attn_metadata.prepare_flash_mla()
 
     from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer)
+                                                Indexer, is_dsa_cache_manager)
 
     # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
-    # different dual-pool layout. Only enter the DSA replay path when the
-    # manager exposes DSA's indexer-cache page-mapping contract.
+    # different dual-pool layout. Only native DSA cache managers use the DSA
+    # draft-replay buffers below.
     if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and hasattr(draft_kv_cache_manager, 'index_head_dim')
-            and hasattr(draft_kv_cache_manager, 'get_pool_block_indices')
-            and hasattr(draft_kv_cache_manager, 'indexer_k_cache_page_scale')):
+            and is_dsa_cache_manager(draft_kv_cache_manager)):
         m = attn_metadata
         saved['saved_dsa_state'] = {
             'host_indexer_k_cache_block_offsets':

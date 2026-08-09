@@ -615,3 +615,8 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self.indexer_k_cache_pool_per_layer = []
         self._unique_primary_pool = None
         super().shutdown()
+
+
+def is_dsa_cache_manager(cache_manager: object) -> bool:
+    """Return whether a manager uses native DSA indexer page mapping."""
+    return isinstance(cache_manager, (DSACacheManager, DSACacheManagerV2))

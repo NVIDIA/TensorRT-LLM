@@ -31,6 +31,8 @@ from utils.util import (skip_blackwell, skip_num_gpus_less_than,
                         skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+    DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor._util import \
@@ -55,17 +57,13 @@ def test_mtp_eagle_refreshes_runtime_draft_slot_mappings_before_forward(
     target_manager = object()
     target_block_table = object()
     draft_block_table = object()
-    draft_manager = SimpleNamespace(
-        index_head_dim=128,
-        get_pool_block_indices=lambda *args, **kwargs: None,
-        indexer_k_cache_page_scale=1,
-    )
+    draft_manager = object.__new__(DSACacheManagerV2)
 
-    class _AttentionMetadata:
+    class _AttentionMetadata(DSAtrtllmAttentionMetadata):
 
         def __init__(self):
-            self.seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
-            self.num_ctx_tokens = 0
+            self._seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
+            self._num_ctx_tokens = 0
             self.kv_cache_manager = target_manager
             self.block_table = target_block_table
 

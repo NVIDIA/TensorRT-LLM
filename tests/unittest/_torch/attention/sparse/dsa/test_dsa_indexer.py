@@ -40,6 +40,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams,
     RopeParams,
 )
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
+    DeepseekV4CacheManager,
+)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSABackendForwardArgs,
     DSACacheManager,
@@ -50,6 +53,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     _effective_compress_ratio_divisor,
     _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
+    is_dsa_cache_manager,
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
@@ -81,6 +85,28 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+@pytest.mark.parametrize("cache_manager_cls", [DSACacheManager, DSACacheManagerV2])
+def test_is_dsa_cache_manager_accepts_native_managers(cache_manager_cls):
+    assert is_dsa_cache_manager(object.__new__(cache_manager_cls))
+
+
+@pytest.mark.parametrize(
+    "cache_manager",
+    [
+        None,
+        object.__new__(DeepseekV4CacheManager),
+        SimpleNamespace(
+            index_head_dim=128,
+            get_pool_block_indices=Mock(),
+            indexer_k_cache_page_scale=1,
+        ),
+    ],
+    ids=["none", "deepseek-v4", "structural-lookalike"],
+)
+def test_is_dsa_cache_manager_rejects_non_native_managers(cache_manager):
+    assert not is_dsa_cache_manager(cache_manager)
 
 
 def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
@@ -3580,10 +3606,8 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
     def test_draft_context_recomputes_and_restores_dsa_metadata(self, capturing):
         """Draft context rebinds preallocated DSA buffers and restores lazy aliases."""
         meta = self._make_mock_metadata()
-        mgr = self._make_mock_draft_manager()
-        mgr.index_head_dim = 128
-        mgr.get_pool_block_indices = Mock()
-        mgr.indexer_k_cache_page_scale = 1
+        mgr = object.__new__(DSACacheManagerV2)
+        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
         meta.enable_flash_mla = False
         meta.enable_context_mla_with_cached_kv = False
         meta.host_indexer_k_cache_block_offsets = torch.tensor([1, 2, 3])
@@ -3679,6 +3703,8 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         # DeepSeek-V4 cache managers expose this field but not the DSA page
         # mapping contract used by _update_indexer_k_cache_block_offsets().
         mgr.index_head_dim = 128
+        mgr.get_pool_block_indices = Mock()
+        mgr.indexer_k_cache_page_scale = 1
 
         def is_attn_metadata(obj, cls):
             if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
