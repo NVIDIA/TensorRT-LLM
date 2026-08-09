@@ -1806,7 +1806,10 @@ class MLA(nn.Module):
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
-        if self.register_to_config:
+        use_custom_op = self.register_to_config and (
+            self.sparse_attn_hooks is None or self.sparse_attn_hooks.supports_custom_op(self)
+        )
+        if use_custom_op:
             output_hidden_states = hidden_states
             if isinstance(hidden_states, Fp4QuantizedTensor):
                 assert hidden_states.unquantized_hidden_states is not None, (

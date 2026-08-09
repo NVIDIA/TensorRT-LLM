@@ -54,6 +54,10 @@ class MLASparseHooks(ABC):
     def create_weights(self, mla: "MLA") -> None:
         """Create algorithm-specific weights."""
 
+    def supports_custom_op(self, mla: "MLA") -> bool:
+        """Return whether algorithm state is fully represented by custom-op inputs."""
+        return True
+
     def transform_weights(self, mla: "MLA") -> None:
         """Transform algorithm-specific weights."""
 

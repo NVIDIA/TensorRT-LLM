@@ -23,6 +23,8 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
+from .backend import DeepseekV4TrtllmAttention
+from .metadata import DeepseekV4TrtllmAttentionMetadata
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
@@ -631,7 +633,25 @@ def forward_generation_sparse_attn(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 generation absorption path."""
     if get_sm_version() < 100:
-        raise RuntimeError("DeepSeek-V4 is not supported on pre-Blackwell GPUs")
+        if latent_cache is None:
+            raise ValueError("DeepSeek-V4 Hopper generation requires a latent cache")
+        if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
+            raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
+        if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
+            raise TypeError(
+                "DeepSeek-V4 Hopper generation requires DeepseekV4TrtllmAttentionMetadata"
+            )
+        return self.mqa.forward_hopper_generation(
+            q,
+            latent_cache,
+            attn_metadata,
+            output,
+            topk_indices,
+            self.softmax_scale,
+            position_ids=position_ids,
+            rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin,
+            is_neox=self.inverse_rotary_emb.is_neox,
+        )
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
     q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
@@ -800,7 +820,24 @@ def forward_context_sparse_attn(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 context absorption path."""
     if get_sm_version() < 100:
-        raise RuntimeError("DeepSeek-V4 is not supported on pre-Blackwell GPUs")
+        if latent_cache is None:
+            raise ValueError("DeepSeek-V4 Hopper context requires a latent cache")
+        if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
+            raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
+        if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
+            raise TypeError("DeepSeek-V4 Hopper context requires DeepseekV4TrtllmAttentionMetadata")
+        return self.mqa.forward_hopper_bf16(
+            q,
+            latent_cache,
+            attn_metadata,
+            output,
+            topk_indices,
+            self.softmax_scale,
+            is_generation=False,
+            position_ids=position_ids,
+            rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin,
+            is_neox=self.inverse_rotary_emb.is_neox,
+        )
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
     q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
@@ -995,6 +1032,7 @@ def forward_sparse_attn(
     # construction rather than by assertion.
     _use_q_b_cute = (
         self.has_dsv4_indexer
+        and get_sm_version() >= 100
         and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
         and self.q_b_proj.bias is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
@@ -1247,6 +1285,12 @@ class DeepSeekV4Hooks(MLASparseHooks):
 
     def create_weights(self, mla: MLA) -> None:
         create_sparse_attn_weights(mla)
+
+    def supports_custom_op(self, mla: MLA) -> bool:
+        # Hopper ratio-4 decode updates persistent MODEL1 shadow-cache tensors
+        # that are not explicit custom-op arguments. This is also true when
+        # the source KV pool is BF16 because MODEL1 always consumes FP8 data.
+        return get_sm_version() >= 100 or not _has_dsv4_indexer(mla)
 
     def prepare_outputs(
         self,
