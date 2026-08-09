@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/thop/mxFp8Quantize.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -36,8 +38,7 @@ namespace torch_ext
 // returns self_mxfp8, self_block_scale_factors
 // self_mxfp8: [M, K], Float8_e4m3fn
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(
-    at::Tensor const& self, bool isSfSwizzledLayout, int64_t alignment = 32)
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool isSfSwizzledLayout, int64_t alignment)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);

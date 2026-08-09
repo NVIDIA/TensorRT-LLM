@@ -318,6 +318,129 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
 
 
 @torch.inference_mode()
+def run_mxfp8_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    weights: torch.Tensor,
+    fusion_op: AllReduceFusionOp,
+):
+    """The MXFP8 epilogue must match the standalone quantize bitwise.
+
+    RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 exists so a Linear whose activation is
+    MXFP8 can have that quantize done inside the AllReduce rather than in a
+    kernel of its own. The substitution is only valid if it produces exactly
+    what the standalone kernel would have, including the scale-factor rows the
+    swizzled layout pads to a multiple of 128 -- those are written by the
+    AllReduce grid rather than by a row-padded one, which is the part of this
+    most likely to be wrong.
+    """
+    del fusion_op, weights
+
+    def mxfp8_quantize(x, swizzled):
+        # Nested so that "ops" stays out of this function's own co_names:
+        # these worker functions are shipped to the ranks by value, and
+        # cloudpickle pulls in any sys.modules entry under a referenced module
+        # whose name components all appear there. torch.ops is such an entry,
+        # and its type subclasses ModuleType rather than being it, so it misses
+        # cloudpickle's module reducer and fails as a plain unpicklable object.
+        return torch.ops.trtllm.mxfp8_quantize(x, swizzled)
+
+    x = x.cuda()
+    residual = residual.cuda()
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+    eps = 1e-5
+
+    mapping = Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    )
+    AutoTuner.get().setup_distributed_state(mapping)
+
+    def assert_same_bytes(actual, expected, what):
+        # Byte-wise rather than torch.testing.assert_close: these are FP8
+        # value and scale-factor tensors, and the comparison wanted here is
+        # identity, not closeness.
+        a = actual.reshape(-1).view(torch.uint8)
+        b = expected.reshape(-1).view(torch.uint8)
+        assert a.shape == b.shape, f"{what}: {a.shape} vs {b.shape}"
+        assert torch.equal(
+            a,
+            b), (f"{what}: {(a != b).sum().item()} of {a.numel()} bytes differ")
+
+    # Both fused kernels carry their own copy of the scale-factor padding loop,
+    # and AUTO would pick only one of them (or NCCL, whose fallback calls the
+    # very quantize this compares against and so proves nothing).
+    for strategy in (AllReduceStrategy.ONESHOT, AllReduceStrategy.TWOSHOT):
+        allreduce = AllReduce(mapping=mapping, strategy=strategy).cuda()
+        norm_out, quant_out, scale_out, residual_out = allreduce(
+            x,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
+                residual=residual,
+                norm_weight=norm_weight,
+                # MXFP8 block scales come from the data, none to pass.
+                scale=None,
+                bias=None,
+                eps=eps,
+            ),
+        )
+
+        assert quant_out.shape == x.shape, "MXFP8 keeps one byte per element"
+        assert quant_out.dtype == torch.float8_e4m3fn
+
+        ref_quant, ref_sf = mxfp8_quantize(norm_out, True)
+        assert_same_bytes(quant_out, ref_quant, f"{strategy} quant_out")
+        assert_same_bytes(scale_out, ref_sf, f"{strategy} scale_out")
+
+        # A plain residual+norm on the same inputs, to catch the epilogue
+        # quantizing something other than what it reported as the norm.
+        ref_norm, ref_residual = allreduce(
+            x,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm_weight,
+                bias=None,
+                eps=eps,
+            ),
+        )
+        assert_same_bytes(norm_out, ref_norm, f"{strategy} norm_out")
+        assert_same_bytes(residual_out, ref_residual,
+                          f"{strategy} residual_out")
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+# seq_len 4 leaves 124 of the 128 scale-factor rows as padding, 128 leaves
+# none, and 130 pushes into a second tile with 126 padding rows.
+@pytest.mark.parametrize("seq_len", [4, 128, 130], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [128, 6144],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_allreduce_fusion_mxfp8(seq_len, hidden_size, mpi_pool_executor):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    x = torch.randn((seq_len, hidden_size), dtype=dtype)
+    residual = torch.randn_like(x)
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(
+            *[(tensor_parallel_size, run_mxfp8_op, x, residual, [], hidden_size,
+               dtype, AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)] *
+            tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
 def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
                          active_experts_token_input: torch.Tensor,
                          scale: torch.Tensor, tensor_parallel_size: int,

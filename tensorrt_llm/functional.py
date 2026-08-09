@@ -129,6 +129,10 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
+    # Residual + RMSNorm emitting both the norm result and its MXFP8 form: E4M3 values
+    # with one E8M0 block scale per 32 elements, in the SWIZZLED layout the CUTLASS
+    # block-scaled GEMM reads. MXFP8 needs no global scale, so `scale` is unused.
+    RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 10
 
 
 class AllReduceParams:

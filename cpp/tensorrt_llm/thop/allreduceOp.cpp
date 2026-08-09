@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/thop/fp8Op.h"
+#include "tensorrt_llm/thop/mxFp8Quantize.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 
@@ -787,6 +788,45 @@ private:
                     = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
             }
         }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            int64_t constexpr sf_vec_size = 32;
+            auto const& input_shape = input.sizes();
+            auto const r = input_shape.size();
+            TORCH_CHECK(r >= 2, "Input should be >=2D tensor.");
+            int64_t m = 1;
+            for (size_t i = 0; i < r - 1; i++)
+            {
+                m *= input_shape[i];
+            }
+            auto const k = input_shape[r - 1];
+            TORCH_CHECK(k % sf_vec_size == 0, "Input should be divisible by sfVecSize.");
+            // The epilogue writes one scale factor per group of four threads on
+            // the row, so it covers exactly the scale columns that carry data.
+            // A hidden size that made the swizzled layout pad columns as well
+            // would leave those uninitialized for the GEMM to read.
+            TORCH_CHECK(k / sf_vec_size % 4 == 0,
+                "RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 needs a hidden size that is a multiple of ", 4 * sf_vec_size,
+                ", got ", k);
+
+            // The kernel writes the scale-factor rows the swizzled layout pads
+            // to a multiple of 128, so this does not have to be zeroed here.
+            auto const sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size);
+
+            // One E4M3 byte per element, so unlike NVFP4 the shape is unchanged.
+            quant_out = at::detail::empty_cuda(input_shape, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+            scale_out = at::detail::empty_cuda({sf_size}, SF_DTYPE, input.device(), std::nullopt);
+            norm_out = torch::empty_like(input);
+            residual_out = torch::empty_like(residual.value());
+
+            allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+            allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
+            allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+            allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            allreduce_fusion_params.layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
+            allreduce_fusion_params.pattern
+                = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant;
+        }
         else
         {
             TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
@@ -833,6 +873,7 @@ private:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return {quant_out, scale_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8:
             return {norm_out, quant_out, scale_out, residual_out};
         default: TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         }
@@ -879,6 +920,14 @@ private:
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             return {norm_out, reduce_output};
+        }
+
+        // MXFP8 derives its block scales from the data, so it is the one
+        // quantization op here that takes no calibrated scale.
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            auto [quant_out, scale_out] = torch_ext::mxfp8_quantize(norm_out, /*isSfSwizzledLayout=*/true);
+            return {norm_out, quant_out, scale_out, reduce_output};
         }
 
         int64_t const sf_vecsize = 16;
