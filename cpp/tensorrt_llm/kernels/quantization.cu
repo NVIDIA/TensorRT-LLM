@@ -204,28 +204,24 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     int const colThreads = (layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(padded_n, 4 * SF_VEC_SIZE) : padded_n)
         / CVT_ELTS_PER_THREAD;
 
-    int blockX = std::min(colThreads, 512);
-    int colBlocks = 1;
-    // A grid laid out over rows alone leaves most of the device idle when there
-    // are few rows, and the single block that owns a row then runs at the
-    // latency of its own loads with nothing to overlap them against. Decode at
-    // low concurrency sits exactly there, so give up block width to put more
-    // blocks on the row. Rounding the target up to a warp keeps whole warps.
-    //
-    // Only when the rows fall short of the device, though. Splitting columns
-    // once the row grid already fills it costs ~30% on a 4096-row quantize.
-    int const wantColBlocks = ceilDiv(multiProcessorCount, std::max(m, 1));
-    if (wantColBlocks > 1)
-    {
-        blockX = std::min(blockX, std::max(64, PadUpFn(ceilDiv(colThreads, wantColBlocks), 32)));
-        colBlocks = ceilDiv(colThreads, blockX);
-    }
+    int const blockX = std::min(colThreads, 512);
     dim3 block(blockX);
 
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1, 2048 / blockX);
     // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
     int const numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
+    // A grid laid out over rows alone leaves most of the device idle when there
+    // are few rows, and the block that owns a row then runs at the latency of
+    // its own loads with nothing to overlap them against. Decode at low
+    // concurrency sits exactly there, so hand each row to several blocks.
+    //
+    // Two limits, both measured on B200. Splitting once the row grid already
+    // fills the device costs a 4096-row quantize 30%, so only split below that.
+    // And the split has to keep the block width: narrowing it to win more
+    // column blocks speeds the data row up but slows the padding rows, which
+    // walk the same width, by more than it gains.
+    int const colBlocks = m < multiProcessorCount ? ceilDiv(colThreads, blockX) : 1;
     // Spend the same block budget the row grid used on its own, so splitting
     // columns changes the shape of the grid rather than its size.
     int const rowBlocks = std::min(numBlocksForM, std::max(1, multiProcessorCount * numBlocksPerSM / colBlocks));
