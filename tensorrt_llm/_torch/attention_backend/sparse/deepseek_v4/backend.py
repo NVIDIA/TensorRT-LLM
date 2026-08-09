@@ -585,8 +585,10 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         is_neox: bool = True,
     ) -> torch.Tensor:
         """Run dual-pool sparse MLA on Hopper using BF16 prefill kernels."""
-        if not is_generation:
-            self._fp8_shadow_needs_bulk = True
+        # This path appends to the source KV pools without updating their
+        # MODEL1 shadows. Rebuild the active shadow pages before the next FP8
+        # decode, whether this call contains context or generation tokens.
+        self._fp8_shadow_needs_bulk = True
 
         self._prepare_hopper_q_and_cache(
             q,
@@ -857,118 +859,203 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         else:
             raise ValueError(f"Unsupported DeepSeek-V4 FP8 shadow type: {attn_type}")
 
-        kv_lens = metadata.kv_lens_cuda_runtime
-        num_requests = kv_lens.shape[0]
-        max_blocks_per_sequence = block_table.shape[1]
-        self._ensure_hopper_shadow_state(
+        shadow_reinitialized = self._ensure_hopper_shadow_state(
             attn_type,
             num_blocks,
             tokens_per_block,
             bytes_per_token,
             device,
         )
-
-        if getattr(self, "_fp8_shadow_needs_bulk", False):
-            for block_fill in self._fp8_block_fill_gpu.values():
-                block_fill.zero_()
-            self._fp8_shadow_needs_bulk = False
-
         shadow = self._fp8_shadows[attn_type]
-        block_fill_gpu = self._fp8_block_fill_gpu[attn_type]
-        if num_requests == 0 or max_blocks_per_sequence == 0:
+        if block_table.shape[1] == 0:
             return shadow[:num_blocks].reshape(num_blocks, tokens_per_block, 1, bytes_per_token)
 
         with nvtx_range_debug("deepseek_v4_fp8_shadow_update"):
-            effective_kv_lens = (
-                kv_lens // compress_ratio
-                if attn_type == DeepseekV4AttentionType.COMPRESS and compress_ratio > 1
-                else kv_lens
+            bulk_update = getattr(self, "_fp8_shadow_needs_bulk", False) or shadow_reinitialized
+            physical_block, token_offset, valid = self._get_hopper_fp8_shadow_update_slots(
+                metadata,
+                block_table,
+                attn_type,
+                compress_ratio,
+                num_blocks,
+                tokens_per_block,
+                bulk_update,
             )
-            request_grid, block_grid, token_grid = self._get_fp8_shadow_update_grid(
-                num_requests, max_blocks_per_sequence, tokens_per_block, device
-            )
-            kv_len_per_slot = effective_kv_lens.to(torch.long)[request_grid]
-            token_position = block_grid * tokens_per_block + token_grid
-            physical_block = block_table.to(torch.long)[request_grid, block_grid]
-
-            physical_valid = (physical_block >= 0) & (physical_block < num_blocks)
-            physical_safe = torch.where(
-                physical_valid, physical_block, torch.zeros_like(physical_block)
-            )
-            current_fill = block_fill_gpu[physical_safe].to(torch.long)
-            valid = (
-                (token_position < kv_len_per_slot)
-                & (kv_len_per_slot > 0)
-                & physical_valid
-                & (token_grid >= current_fill)
-            )
-
-            scatter_block = torch.where(
+            self._update_hopper_fp8_shadow(
+                pool,
+                shadow,
+                physical_block,
+                token_offset,
                 valid,
-                physical_safe,
-                torch.full_like(physical_safe, num_blocks),
-            )
-            gather_block = torch.where(
-                physical_valid, physical_safe, torch.zeros_like(physical_safe)
-            )
-            token_data = pool[gather_block, token_grid]
-            if is_fp8_pool:
-                token_bf16 = (
-                    token_data.view(torch.float8_e4m3fn).to(torch.bfloat16) * kv_scale
-                ).to(torch.bfloat16)
-            else:
-                token_bf16 = token_data
-
-            num_slots = token_bf16.shape[0]
-            nope = token_bf16[:, :nope_dim].float()
-            rope = token_bf16[:, nope_dim:]
-            nope_blocked = nope.reshape(num_slots, num_scales, quant_block)
-            block_max = nope_blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-            scale_log2 = torch.log2((block_max / 448.0).clamp(min=1e-4)).ceil()
-            scale = torch.exp2(scale_log2)
-            nope_fp8 = (nope_blocked / scale).reshape(num_slots, nope_dim).to(torch.float8_e4m3fn)
-
-            scale_e8m0 = (scale_log2.squeeze(-1) + 127).clamp(0, 255).byte()
-            scale_padding = self._get_fp8_scale_padding(num_slots, device)
-            scale_padding.zero_()
-            scale_padding[:, :num_scales] = scale_e8m0
-
-            nope_bytes = nope_fp8.view(torch.uint8).reshape(num_slots, nope_dim)
-            rope_bytes = rope.contiguous().view(torch.uint8).reshape(num_slots, rope_dim * 2)
-            row_stride = tokens_per_block * bytes_per_token
-            row_base = scatter_block * row_stride
-            shadow_flat = shadow.view(-1)
-
-            data_start = row_base + token_grid * data_bytes
-            nope_indices = (
-                data_start.unsqueeze(1)
-                + self._get_fp8_shadow_offsets(nope_dim, device).unsqueeze(0)
-            ).reshape(-1)
-            shadow_flat[nope_indices] = nope_bytes.reshape(-1)
-
-            rope_start = data_start + nope_dim
-            rope_indices = (
-                rope_start.unsqueeze(1)
-                + self._get_fp8_shadow_offsets(rope_dim * 2, device).unsqueeze(0)
-            ).reshape(-1)
-            shadow_flat[rope_indices] = rope_bytes.reshape(-1)
-
-            scale_start = row_base + tokens_per_block * data_bytes + token_grid * 8
-            scale_indices = (
-                scale_start.unsqueeze(1) + self._get_fp8_shadow_offsets(8, device).unsqueeze(0)
-            ).reshape(-1)
-            shadow_flat[scale_indices] = scale_padding.reshape(-1)
-
-            update_value = torch.where(valid, token_grid + 1, torch.zeros_like(token_grid))
-            block_fill_gpu.scatter_reduce_(
-                0,
-                physical_safe,
-                update_value.to(block_fill_gpu.dtype),
-                reduce="amax",
-                include_self=True,
+                is_fp8_pool,
+                kv_scale,
+                tokens_per_block,
+                nope_dim,
+                rope_dim,
+                quant_block,
+                num_scales,
+                data_bytes,
+                bytes_per_token,
+                num_blocks,
             )
 
         return shadow[:num_blocks].reshape(num_blocks, tokens_per_block, 1, bytes_per_token)
+
+    def _get_hopper_fp8_shadow_update_slots(
+        self,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        block_table: torch.Tensor,
+        attn_type: DeepseekV4AttentionType,
+        compress_ratio: int,
+        num_blocks: int,
+        tokens_per_block: int,
+        bulk_update: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return physical pages and offsets that need shadow conversion."""
+        kv_lens = metadata.kv_lens_cuda_runtime
+        num_requests = kv_lens.shape[0]
+        device = block_table.device
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        if num_requests == 0:
+            return empty, empty, empty.bool()
+
+        if bulk_update:
+            host_kv_lens = metadata.kv_lens_runtime
+            if attn_type == DeepseekV4AttentionType.COMPRESS and compress_ratio > 1:
+                host_kv_lens = host_kv_lens // compress_ratio
+                kv_lens = kv_lens // compress_ratio
+            max_kv_len = int(host_kv_lens.max().item())
+            max_blocks = min(
+                (max_kv_len + tokens_per_block - 1) // tokens_per_block,
+                block_table.shape[1],
+            )
+            if max_blocks == 0:
+                return empty, empty, empty.bool()
+            request_grid, block_grid, token_grid = self._get_fp8_shadow_update_grid(
+                num_requests, max_blocks, tokens_per_block, device
+            )
+            token_position = block_grid * tokens_per_block + token_grid
+            valid = token_position < kv_lens.to(torch.long)[request_grid]
+        else:
+            num_generations = metadata.num_generations
+            if num_generations == 0 or metadata.num_gen_tokens_per_seq == 0:
+                return empty, empty, empty.bool()
+            if attn_type == DeepseekV4AttentionType.COMPRESS:
+                max_new_tokens = (
+                    metadata.num_gen_tokens_per_seq + compress_ratio - 1
+                ) // compress_ratio
+            else:
+                max_new_tokens = metadata.num_gen_tokens_per_seq
+            request_grid, token_grid = self._get_fp8_shadow_token_update_grid(
+                num_generations, max_new_tokens, device
+            )
+            request_grid = request_grid + metadata.num_contexts
+            if attn_type == DeepseekV4AttentionType.COMPRESS:
+                token_position = (
+                    metadata.past_kv_lens_cuda[compress_ratio][request_grid].to(torch.long)
+                    + token_grid
+                )
+                valid = token_grid < metadata.new_comp_kv_lens_cuda[compress_ratio][
+                    request_grid
+                ].to(torch.long)
+            else:
+                token_position = (
+                    kv_lens.to(torch.long)[request_grid]
+                    - metadata.num_gen_tokens_per_seq
+                    + token_grid
+                )
+                valid = token_grid < metadata.num_gen_tokens_per_seq
+            block_grid = token_position // tokens_per_block
+            token_grid = token_position % tokens_per_block
+
+        block_valid = (block_grid >= 0) & (block_grid < block_table.shape[1])
+        block_grid_safe = block_grid.clamp(min=0, max=block_table.shape[1] - 1)
+        physical_block = block_table[request_grid, block_grid_safe].to(torch.long)
+        valid = valid & block_valid & (physical_block >= 0) & (physical_block < num_blocks)
+        physical_block = physical_block.clamp(min=0, max=max(num_blocks - 1, 0))
+
+        # Bulk rebuilds run outside CUDA graphs and can compact the update to
+        # exactly the active cache tokens. Incremental decode keeps a fixed
+        # candidate shape and redirects its few padded slots to a sentinel row.
+        if bulk_update:
+            physical_block = physical_block[valid]
+            token_grid = token_grid[valid]
+            valid = torch.ones_like(physical_block, dtype=torch.bool)
+        return physical_block, token_grid, valid
+
+    def _update_hopper_fp8_shadow(
+        self,
+        pool: torch.Tensor,
+        shadow: torch.Tensor,
+        physical_block: torch.Tensor,
+        token_offset: torch.Tensor,
+        valid: torch.Tensor,
+        is_fp8_pool: bool,
+        kv_scale: torch.Tensor,
+        tokens_per_block: int,
+        nope_dim: int,
+        rope_dim: int,
+        quant_block: int,
+        num_scales: int,
+        data_bytes: int,
+        bytes_per_token: int,
+        num_blocks: int,
+    ) -> None:
+        if physical_block.numel() == 0:
+            return
+
+        scatter_block = torch.where(
+            valid,
+            physical_block,
+            torch.full_like(physical_block, num_blocks),
+        )
+        token_data = pool[physical_block, token_offset]
+        if is_fp8_pool:
+            token_bf16 = (token_data.view(torch.float8_e4m3fn).to(torch.bfloat16) * kv_scale).to(
+                torch.bfloat16
+            )
+        else:
+            token_bf16 = token_data
+
+        num_slots = token_bf16.shape[0]
+        nope = token_bf16[:, :nope_dim].float()
+        rope = token_bf16[:, nope_dim:]
+        nope_blocked = nope.reshape(num_slots, num_scales, quant_block)
+        block_max = nope_blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+        scale_log2 = torch.log2((block_max / 448.0).clamp(min=1e-4)).ceil()
+        scale = torch.exp2(scale_log2)
+        nope_fp8 = (nope_blocked / scale).reshape(num_slots, nope_dim).to(torch.float8_e4m3fn)
+
+        scale_e8m0 = (scale_log2.squeeze(-1) + 127).clamp(0, 255).byte()
+        scale_padding = self._get_fp8_scale_padding(num_slots, pool.device)
+        scale_padding.zero_()
+        scale_padding[:, :num_scales] = scale_e8m0
+
+        nope_bytes = nope_fp8.view(torch.uint8).reshape(num_slots, nope_dim)
+        rope_bytes = rope.contiguous().view(torch.uint8).reshape(num_slots, rope_dim * 2)
+        row_stride = tokens_per_block * bytes_per_token
+        row_base = scatter_block * row_stride
+        shadow_flat = shadow.view(-1)
+
+        data_start = row_base + token_offset * data_bytes
+        nope_indices = (
+            data_start.unsqueeze(1)
+            + self._get_fp8_shadow_offsets(nope_dim, pool.device).unsqueeze(0)
+        ).reshape(-1)
+        shadow_flat[nope_indices] = nope_bytes.reshape(-1)
+
+        rope_start = data_start + nope_dim
+        rope_indices = (
+            rope_start.unsqueeze(1)
+            + self._get_fp8_shadow_offsets(rope_dim * 2, pool.device).unsqueeze(0)
+        ).reshape(-1)
+        shadow_flat[rope_indices] = rope_bytes.reshape(-1)
+
+        scale_start = row_base + tokens_per_block * data_bytes + token_offset * 8
+        scale_indices = (
+            scale_start.unsqueeze(1) + self._get_fp8_shadow_offsets(8, pool.device).unsqueeze(0)
+        ).reshape(-1)
+        shadow_flat[scale_indices] = scale_padding.reshape(-1)
 
     def _ensure_hopper_shadow_state(
         self,
@@ -977,29 +1064,28 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         tokens_per_block: int,
         bytes_per_token: int,
         device: torch.device,
-    ) -> None:
+    ) -> bool:
         if not hasattr(self, "_fp8_shadows"):
             self._fp8_shadows = {}
-            self._fp8_block_fill_gpu = {}
             self._fp8_update_grids = {}
+            self._fp8_token_update_grids = {}
             self._fp8_offsets_cache = {}
             self._fp8_scale_pad_buf = torch.zeros(1, 8, dtype=torch.uint8, device=device)
 
         required_rows = num_blocks + 1
         shadow = self._fp8_shadows.get(shadow_key)
-        if shadow is None or shadow.shape[0] != required_rows:
+        reinitialized = shadow is None or shadow.shape != (
+            required_rows,
+            tokens_per_block * bytes_per_token,
+        )
+        if reinitialized:
             self._fp8_shadows[shadow_key] = torch.zeros(
                 required_rows,
                 tokens_per_block * bytes_per_token,
                 dtype=torch.uint8,
                 device=device,
             )
-
-        block_fill = self._fp8_block_fill_gpu.get(shadow_key)
-        if block_fill is None or block_fill.shape[0] != num_blocks:
-            self._fp8_block_fill_gpu[shadow_key] = torch.zeros(
-                num_blocks, dtype=torch.int32, device=device
-            )
+        return reinitialized
 
     def _get_fp8_shadow_update_grid(
         self,
@@ -1019,6 +1105,21 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         request_grid = all_slots // (max_blocks * tokens_per_block)
         grids = (request_grid, block_grid, token_grid)
         self._fp8_update_grids[key] = grids
+        return grids
+
+    def _get_fp8_shadow_token_update_grid(
+        self,
+        num_requests: int,
+        max_tokens: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (num_requests, max_tokens)
+        cached = self._fp8_token_update_grids.get(key)
+        if cached is not None:
+            return cached
+        all_slots = torch.arange(num_requests * max_tokens, device=device, dtype=torch.long)
+        grids = (all_slots // max_tokens, all_slots % max_tokens)
+        self._fp8_token_update_grids[key] = grids
         return grids
 
     def _get_fp8_shadow_offsets(self, size: int, device: torch.device) -> torch.Tensor:
