@@ -17,7 +17,10 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
+
+#include <c10/cuda/CUDAGuard.h>
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
     && ((TORCH_VERSION_MAJOR > 1) || ((TORCH_VERSION_MAJOR == 1) && (TORCH_VERSION_MINOR >= 9)))
@@ -283,7 +286,6 @@ Tensor add_bias_and_interleave_int8s(Tensor weight)
 
 Tensor unpack_int4_packed_tensor_to_int8(Tensor weight)
 {
-    CHECK_CPU(weight);
     CHECK_CONTIGUOUS(weight);
     TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
     TORCH_CHECK(weight.dtype() == torch::kInt8, "Weight must be a packed int8 tensor");
@@ -294,6 +296,17 @@ Tensor unpack_int4_packed_tensor_to_int8(Tensor weight)
         int8_tensor_size[i] = weight.size(i);
     }
     int8_tensor_size[weight.dim() - 1] *= 2;
+
+    if (weight.is_cuda())
+    {
+        at::cuda::CUDAGuard const device_guard(weight.device());
+        Tensor unpacked_weight
+            = torch::empty(int8_tensor_size, torch::dtype(torch::kInt8).device(weight.device()).requires_grad(false));
+        auto stream = at::cuda::getCurrentCUDAStream(weight.device().index());
+        tensorrt_llm::kernels::invokeUnpackInt4PackedTensorToInt8(
+            get_ptr<int8_t>(unpacked_weight), get_ptr<int8_t>(weight), weight.numel(), stream);
+        return unpacked_weight;
+    }
 
     Tensor unpacked_weight
         = torch::zeros(int8_tensor_size, torch::dtype(torch::kInt8).device(torch::kCPU).requires_grad(false));
@@ -357,8 +370,6 @@ Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_si
     // weight (n, k / 2)
     // scale (n, k / group_size)
 
-    CHECK_CPU(weight);
-    CHECK_CPU(scale);
     CHECK_CONTIGUOUS(weight);
     CHECK_CONTIGUOUS(scale);
     TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
@@ -368,11 +379,26 @@ Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_si
     TORCH_CHECK(weight.size(0) == scale.size(0))
     TORCH_CHECK(weight.size(1) * 2 == scale.size(1) * group_size)
 
-    uint8_t* weight_packed_ptr = get_ptr<uint8_t>(weight);
-    __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(get_ptr<uint8_t>(scale));
-
     int const n = weight.size(0);
     int const k = weight.size(1) * 2;
+
+    if (weight.is_cuda())
+    {
+        TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor when weight is on CUDA");
+        TORCH_CHECK(weight.device() == scale.device(), "weight and scale must be on the same device");
+        at::cuda::CUDAGuard const device_guard(weight.device());
+        Tensor dequant_weight
+            = torch::empty({n, k}, torch::dtype(torch::kFloat).device(weight.device()).requires_grad(false));
+        auto stream = at::cuda::getCurrentCUDAStream(weight.device().index());
+        tensorrt_llm::kernels::invokeMxfp4DequantizeUnswizzled(get_ptr<float>(dequant_weight), get_ptr<uint8_t>(weight),
+            get_ptr<uint8_t>(scale), weight.numel(), k, scale.size(1), group_size, stream);
+        return dequant_weight;
+    }
+
+    TORCH_CHECK(scale.is_cpu(), "scale must be a CPU tensor when weight is on CPU");
+
+    uint8_t* weight_packed_ptr = get_ptr<uint8_t>(weight);
+    __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(get_ptr<uint8_t>(scale));
 
     Tensor dequant_weight = torch::empty({n, k}, torch::dtype(torch::kFloat).device(torch::kCPU).requires_grad(false));
     float* dequant_weight_ptr = get_ptr<float>(dequant_weight);

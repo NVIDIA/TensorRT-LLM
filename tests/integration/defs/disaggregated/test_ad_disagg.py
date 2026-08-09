@@ -25,7 +25,7 @@ from dataclasses import replace
 import cloudpickle
 import pytest
 import torch
-from defs.conftest import get_sm_version, skip_pre_hopper
+from defs.conftest import check_device_contain, get_sm_version, skip_pre_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -40,6 +40,16 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+@pytest.fixture(autouse=True)
+def skip_b300():
+    if check_device_contain(["B300"]):
+        pytest.skip(
+            "AutoDeploy disagg tests are disabled on B300/GB300 until capacity is available: "
+            "https://nvbugs/6301621"
+        )
+
 
 WORKER_READY = "ready"
 REQUEST_MODE_AGGREGATE = "aggregate"
@@ -143,6 +153,12 @@ def seed_disagg():
         torch.cuda.manual_seed_all(AUTODEPLOY_DISAGG_SEED)
 
 
+def disable_piecewise_cuda_graph_for_speculation(config: dict) -> dict:
+    """Disable piecewise CUDA graph capture for speculative AutoDeploy tests."""
+    config.setdefault("transforms", {}).setdefault("compile_model", {})["piecewise_enabled"] = False
+    return config
+
+
 def base_config(extra_config=None):
     common_config = dict(
         runtime="trtllm",
@@ -157,6 +173,8 @@ def base_config(extra_config=None):
     )
     if extra_config:
         common_config.update(extra_config)
+    if common_config.get("speculative_config") is not None:
+        disable_piecewise_cuda_graph_for_speculation(common_config)
 
     return common_config
 

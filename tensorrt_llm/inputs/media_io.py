@@ -4,16 +4,31 @@
 
 import asyncio
 import base64
+import functools
 import ipaddress
 import math
 import os
 import socket
 import tempfile
 from abc import ABC, abstractmethod
+from concurrent.futures import Executor
 from io import BytesIO
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Generic, List, Literal, Mapping, Optional, Tuple, Type, TypeVar, Union
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Generic,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
@@ -21,6 +36,8 @@ import numpy as np
 import requests
 import soundfile
 import torch
+from blake3 import blake3
+from packaging.version import Version
 from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
@@ -56,9 +73,14 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
 # Canonical set of supported media modalities for Pydantic field validation.
 MediaModality = Literal["image", "video", "audio"]
 
-# Output representations supported by `ImageMediaIO` and `VideoMediaIO`:
-# `"pt"` → `torch.Tensor`, `"pil"` → `PIL.Image.Image` (per frame for video).
-_SUPPORTED_IMAGE_FORMATS = ("pt", "pil")
+# Output representations supported by `ImageMediaIO`:
+# `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
+# `"pil"` -> `PIL.Image.Image`.
+_SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
+
+# Output representations supported by `VideoMediaIO`. See
+# `_load_video_by_cv2` for the per-format contract.
+_SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 
 # Module-level aiohttp session shared across all media fetch calls.
 # Created lazily on first use inside the async event loop, then reused so that
@@ -312,25 +334,263 @@ def extract_audio_from_video(
     return audio, target_sr
 
 
+def _get_cv2():
+    """Import OpenCV on demand for the optional cv2-backed video decode path."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV (cv2) is required for video decoding but is not installed. "
+            "Install it with `pip install opencv-python-headless`."
+        ) from exc
+    return cv2
+
+
+# --- Reference-payload classification ----------------------------------------
+# The serve boundary routes a metadata-free reference payload (JSON base64
+# carries no filename or MIME type; multipart metadata is client-typed) to the
+# image or video slot by its container signature. Routing only, never
+# acceptance: for both modalities the worker's decoder is what accepts, and
+# its failure is reported as a client error. So the signature can never
+# disagree with what actually decodes, and the boundary never spends a full
+# decode — on an async request path — to answer a routing question.
+
+
+# ISO-BMFF brands that mark a still image or image sequence (HEIF/AVIF/AVC
+# image). `ftyp` identifies the ISO-BMFF *family*, not video — HEIC photos
+# (the iOS camera default) share it with MP4 — so these are split out and
+# rejected at the boundary instead of being sent to a video decoder that
+# cannot use them.
+#
+# Deliberately NOT an exhaustive image registry: an unfamiliar ISO-BMFF
+# still-image brand simply stays a video candidate and gets a 400 from the
+# worker's decoder, which is safe. Registered names per MP4RA
+# (https://mp4ra.org/registered-types/brands).
+_ISOBMFF_IMAGE_BRANDS = frozenset(
+    {
+        b"mif1",
+        b"mif2",
+        b"msf1",  # MIAF image / image sequence
+        b"heic",
+        b"heix",
+        b"heim",
+        b"heis",  # HEVC image
+        b"hevc",
+        b"hevx",
+        b"hevm",
+        b"hevs",  # HEVC image sequence
+        b"avif",
+        b"avis",  # AVIF image / sequence
+        b"avci",
+        b"avcs",  # AVC image / sequence
+    }
+)
+
+# Work bound, not a format rule. The declared box size is client-controlled,
+# so without a ceiling the scan below costs O(payload): 1.6 s of interpreter
+# time for a 64 MB buffer, on the serving event loop. This admits 1020
+# compatible brands against a registry holding a few hundred in total, so no
+# encoder output comes near it; real boxes are tens of bytes.
+_MAX_FTYP_BOX_BYTES = 4096
+
+
+def _isobmff_brands(data) -> Optional[frozenset]:
+    """Brands declared by a leading ``ftyp`` box, or ``None`` if undeterminable.
+
+    Layout per ISO/IEC 14496-12 — ``size`` [0:4], ``'ftyp'`` [4:8], then::
+
+        normal    major [8:12]   minor [12:16]  compatible from 16
+        size == 1 largesize [8:16], major [16:20], minor [20:24], compat from 24
+
+    ``None`` means "do not classify" and callers must treat the payload as
+    unrecognized rather than assuming video: the box is malformed, extends
+    past the payload, or exceeds the scan bound, and a partial scan could
+    miss an image brand late in the compatible-brand list.
+    """
+    buf = bytes(data[:_MAX_FTYP_BOX_BYTES])
+    if len(buf) < 16:
+        return None
+
+    size = int.from_bytes(buf[0:4], "big")
+    if size == 1:
+        # Extended size: the 64-bit largesize occupies 8:16, shifting the
+        # brands. Reading 8:12 as the major brand here is what makes naive
+        # parsers misclassify.
+        box_end, brands_at = int.from_bytes(buf[8:16], "big"), 16
+    elif size == 0:
+        box_end, brands_at = len(data), 8  # box runs to EOF
+    else:
+        box_end, brands_at = size, 8
+
+    if box_end > len(data) or box_end > _MAX_FTYP_BOX_BYTES:
+        return None  # truncated, or past the work bound — refuse to guess
+    # `FileTypeBox` is a major brand plus a mandatory `minor_version`,
+    # followed by whole compatible brands. A short or misaligned box is
+    # malformed; reject it rather than rounding down to what parses.
+    if box_end < brands_at + 8 or (box_end - brands_at) % 4:
+        return None
+
+    brands = {buf[brands_at : brands_at + 4]}
+    # Skip the 4-byte minor_version between the major and compatible brands.
+    for off in range(brands_at + 8, box_end - 3, 4):
+        brands.add(buf[off : off + 4])
+    return frozenset(brands)
+
+
+def is_isobmff_image_bytes(data) -> bool:
+    """True when the payload is an ISO-BMFF still image (HEIF/AVIF/AVC image).
+
+    Lets the boundary say "this format is unsupported, convert it" instead of
+    "this file is corrupt" — the payload is perfectly valid, we just do not
+    decode it.
+    """
+    if bytes(data[4:8]) != b"ftyp":
+        return False
+    brands = _isobmff_brands(data)
+    return bool(brands and brands & _ISOBMFF_IMAGE_BRANDS)
+
+
+def sniff_media_kind(data) -> Optional[str]:
+    """Classify a reference payload by container signature.
+
+    Returns ``"image"`` (PNG/JPEG, or an ISO-BMFF still-image brand such as
+    HEIF/AVIF), ``"video"`` (other ISO-BMFF/MP4 family, or AVI), or ``None``
+    for anything unrecognized.
+    """
+    header = bytes(data[:12])
+    if header.startswith(b"\x89PNG\r\n\x1a\n") or header.startswith(b"\xff\xd8\xff"):
+        return "image"
+    if header[4:8] == b"ftyp":
+        brands = _isobmff_brands(data)
+        if not brands:
+            # Box unreadable (truncated / malformed / past the work bound):
+            # classify nothing rather than defaulting to video on a partial scan.
+            return None
+        # AVIF requires `avif`/`avis` among the *compatible* brands, so the
+        # major brand alone is not sufficient to identify still images.
+        if brands & _ISOBMFF_IMAGE_BRANDS:
+            return "image"
+        return "video"
+    if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
+        return "video"
+    return None
+
+
+def _select_cv2_stream_buffered_backend() -> Optional[int]:
+    """Return a VideoCapture backend that can read from a Python `BytesIO`.
+
+    Returns `None` if no such backend is available in this OpenCV build —
+    the caller falls back to the tempfile path. The `videoio_registry`
+    stream-buffered API was introduced in OpenCV 4.13.0, so older builds
+    are gated out by a version check.
+
+    Plugin-provided backends must implement the stream-buffered API at
+    version 1.2+; older plugins exist that load fine but crash on stream
+    open. Built-in backends (the FFMPEG path in the PyPI wheels) are always
+    safe to use.
+    """
+    cv2 = _get_cv2()
+
+    # The stream-buffered API was introduced in OpenCV 4.13.0. Older builds
+    # don't have `cv2.videoio_registry.getStreamBufferedBackends`, so signal
+    # "no usable backend" and let the caller fall back to the tempfile path.
+    if Version(cv2.__version__) < Version("4.13.0"):
+        return None
+
+    vr = cv2.videoio_registry
+
+    # `getStreamBufferedBackends()` enumerates every backend in this OpenCV
+    # build that *claims* to support stream-buffered reads. We filter that
+    # list down to one that's safe to use:
+    #   1. `hasBackend(backend)` — the backend's shared library is actually
+    #      loadable in this process (a backend can be enumerated by the
+    #      registry but missing at link time on a stripped build).
+    #   2. For plugin (non-built-in) backends, check the plugin's announced
+    #      stream-buffered API/ABI version. Plugins reporting ABI<1 or
+    #      (ABI==1, API<2) load fine but segfault on stream open in the
+    #      wild — skip them. Built-in backends (FFMPEG in the PyPI wheels)
+    #      have no plugin-version concept and are always safe.
+    # The first surviving backend is returned. Order is OpenCV's preference.
+    for backend in vr.getStreamBufferedBackends():
+        if not vr.hasBackend(backend):
+            continue
+        if not vr.isBackendBuiltIn(backend):
+            _, abi, api = vr.getStreamBufferedBackendPluginVersion(backend)
+            if abi < 1 or (abi == 1 and api < 2):
+                continue
+        return backend
+    return None
+
+
+# Prefer /dev/shm (tmpfs, RAM-backed) over the system tempdir to avoid a disk
+# round-trip; falls back to `None` (system default) when unavailable. Only
+# consumed as the `dir=` argument to `tempfile.NamedTemporaryFile`, so the
+# B108 predictable-path concern does not apply.
+_VIDEO_TEMPFILE_DIR: Optional[str] = (  # nosec B108
+    "/dev/shm"  # nosec B108
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)  # nosec B108
+    else None
+)
+
+
 def _load_video_by_cv2(
-    video: str,
+    video: Union[str, bytes],
     num_frames: int = 10,
     fps: int = 30,
     format: str = "pt",
     device: str = "cpu",
     extract_audio: bool = False,
+    cv2_backend: Optional[int] = None,
+    raw_bytes_hash: Optional[str] = None,
 ) -> VideoData:
-    # Keep this import local to avoid importing cv2 if not needed
-    import cv2
+    """Decode a video and return sampled frames as a list.
 
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+    `video` is either a file path / URL (`str`) or raw mp4 bytes. When
+    bytes are passed the caller must also pass `cv2_backend` (a
+    stream-buffered backend id from `_select_cv2_stream_buffered_backend`);
+    cv2.VideoCapture is then opened over a `BytesIO` via that backend, no
+    tempfile required. Callers that have no stream-buffered backend
+    available should spill to a tempfile themselves and pass a path.
 
-    vidcap = cv2.VideoCapture(video)
+    `format` controls the return type:
+      `"pt"`  - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
+                [0, 1]; rescaled and permuted to CHW here.
+      `"np"`  - np.ndarray of shape (N, H, W, 3), dtype=uint8; a single
+                contiguous 4D buffer that HF video processors pass through
+                without an extra frame-by-frame copy.
+      `"pil"` - list[PIL.Image], one per sampled frame.
+    """
+    assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
+
+    cv2 = _get_cv2()
+
+    # Open the source. Two cases:
+    #   (a) `video` is a file path / URL str -> hand it straight to cv2.
+    #   (b) `video` is mp4 bytes -> feed cv2 from an in-memory BytesIO via
+    #       the caller-supplied stream-buffered backend. The buffer is held
+    #       alive in `video_buf` because cv2 keeps a non-owning view into it.
+    video_buf: Optional[BytesIO] = None
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        if cv2_backend is None:
+            raise ValueError(
+                "cv2_backend must be provided when `video` is bytes; "
+                "callers without a stream-buffered backend should spill "
+                "the bytes to a tempfile and pass the path instead."
+            )
+        video_buf = BytesIO(bytes(video))
+        vidcap = cv2.VideoCapture(video_buf, cv2_backend, [])
+    else:
+        vidcap = cv2.VideoCapture(video)
 
     try:
         if not vidcap.isOpened():
+            src_repr = (
+                f"<{len(video)} bytes>"
+                if isinstance(video, (bytes, bytearray, memoryview))
+                else f"'{video}'"
+            )
             raise ValueError(
-                f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
+                f"Video {src_repr} could not be opened. Make sure opencv is installed with video support."
             )
 
         frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -349,39 +609,66 @@ def _load_video_by_cv2(
 
         indices = np.linspace(0, frame_count - 1, num_frames_to_sample, dtype=int).tolist()
 
-        # Sequential forward scan — grab() without per-frame seek
+        # Defer allocating the stacked buffer until the first frame is actually
+        # decoded: container metadata (CAP_PROP_FRAME_WIDTH/HEIGHT) can be 0
+        # or stale before the first decode for some codecs.
+        stacked_rgb: Optional[np.ndarray] = None
+        H = W = None
+
         target_set = set(indices)
         max_idx = indices[-1]
-        raw_frames: dict[int, np.ndarray] = {}
+        bgr_scratch: Optional[np.ndarray] = None
+        valid_indices: list[int] = []
+        # Log at most once per decode to avoid spamming when a whole stream is
+        # affected (e.g. every frame retrieves with a drifted shape).
+        skip_warned = False
         frame_idx = 0
-        while frame_idx <= max_idx:
-            grab_succeeded = vidcap.grab()
-            if not grab_succeeded:
-                break
+        while frame_idx <= max_idx and vidcap.grab():
             if frame_idx in target_set:
-                # cv2 decodes frames in BGR order; convert to RGB for downstream use
-                retrieve_succeeded, bgr_frame = vidcap.retrieve()
-                if retrieve_succeeded:
-                    raw_frames[frame_idx] = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                # Reuse a single BGR buffer across retrieves; cv2 replaces its
+                # contents in place when the argument is shape-compatible.
+                ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                if ok:
+                    fh, fw = bgr_scratch.shape[:2]
+                    if stacked_rgb is None:
+                        H, W = fh, fw
+                        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
+                    if (fh, fw) == (H, W):
+                        cv2.cvtColor(
+                            bgr_scratch,
+                            cv2.COLOR_BGR2RGB,
+                            dst=stacked_rgb[len(valid_indices)],
+                        )
+                        valid_indices.append(frame_idx)
+                    elif not skip_warned:
+                        logger.warning(
+                            f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
+                            f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                        )
+                        skip_warned = True
+                elif not skip_warned:
+                    logger.warning(
+                        f"Skipping frame {frame_idx} and subsequent retrieve failures: retrieve returned ok=False."
+                    )
+                    skip_warned = True
             frame_idx += 1
         vidcap.release()
 
-        if not raw_frames:
+        if stacked_rgb is None or not valid_indices:
             raise ValueError("Video has no readable frames.")
+        stacked_rgb = stacked_rgb[: len(valid_indices)]
 
-        valid_indices = [i for i in indices if i in raw_frames]
         if format == "pt":
-            # Bypass PIL: direct numpy HWC uint8 -> torch CHW float32
-            loaded_frames = [
-                torch.from_numpy(raw_frames[i])
-                .permute(2, 0, 1)
-                .float()
-                .div_(255.0)
-                .to(device=device)
-                for i in valid_indices
-            ]
-        else:
-            loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
+            stacked_f32 = stacked_rgb.astype(np.float32)
+            stacked_f32 *= 1.0 / 255.0
+            tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
+            if device != "cpu":
+                tensor_nchw = tensor_nchw.to(device)
+            loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
+        elif format == "np":
+            loaded_frames = stacked_rgb
+        else:  # "pil"
+            loaded_frames = [Image.fromarray(frame) for frame in stacked_rgb]
 
         metadata = {
             "total_num_frames": frame_count,
@@ -396,8 +683,16 @@ def _load_video_by_cv2(
 
     audio = None
     if extract_audio:
+        # extract_audio_from_video accepts Union[str, BytesIO]. When the
+        # in-memory cv2 path was taken, `video` is still the original
+        # bytes parameter — wrap in a fresh BytesIO (the one consumed by
+        # cv2 is at end-of-stream). When the tempfile fallback was used,
+        # `video` is the file path string and is passed through as-is.
+        audio_source = (
+            BytesIO(bytes(video)) if isinstance(video, (bytes, bytearray, memoryview)) else video
+        )
         try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(video)
+            audio_samples, audio_sample_rate = extract_audio_from_video(audio_source)
             audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
         except ValueError as e:
             if "No audio stream found" in str(e):
@@ -405,7 +700,12 @@ def _load_video_by_cv2(
             else:
                 raise
 
-    return VideoData(frames=loaded_frames, metadata=metadata, audio=audio)
+    return VideoData(
+        frames=loaded_frames,
+        metadata=metadata,
+        audio=audio,
+        raw_bytes_hash=raw_bytes_hash,
+    )
 
 
 def _normalize_file_uri(uri: str) -> str:
@@ -427,6 +727,21 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     and async coordination live here on the base class and are shared by all
     modalities.
     """
+
+    # Executor used by `async_load` to run blocking decode work off the
+    # event loop. `None` selects the asyncio loop's default executor.
+    # Servers can publish a dedicated pool via `set_executor` so
+    # media decoding does not contend with unrelated `to_thread` callers.
+    _executor: ClassVar[Optional[Executor]] = None
+
+    @classmethod
+    def set_executor(cls, executor: Executor) -> None:
+        """Publish a shared executor for blocking decode work.
+
+        Affects every existing and future subclass instance. Calling more
+        than once replaces the previously configured executor.
+        """
+        BaseMediaIO._executor = executor
 
     @classmethod
     def create(
@@ -476,13 +791,15 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """Fetch and decode media from a URL.
 
         Dispatches on scheme: http/https (remote fetch), data: (inline
-        base64), or file:// / bare path (local file).
+        base64), or file:// / bare path (local file). Blocking decode work
+        runs on the executor published via `set_executor`, falling
+        back to the asyncio loop's default executor when none is set.
         """
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https"):
             session = await _get_aiohttp_session()
             data = await _safe_aiohttp_get(url, session=session)
-            return await asyncio.to_thread(self.load_bytes, data)
+            return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
             data_spec, b64_data = parsed.path.split(",", 1)
             parts = data_spec.split(";", 1)
@@ -490,14 +807,22 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             encoding = parts[1] if len(parts) > 1 else ""
             if encoding != "base64":
                 raise NotImplementedError("Only base64 data URLs are supported for now.")
-            return await asyncio.to_thread(self.load_base64, media_type, b64_data)
+            return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
-            return await asyncio.to_thread(self.load_file, url)
+            return await self._run_in_executor(self.load_file, url)
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
+    @staticmethod
+    async def _run_in_executor(fn, *args, **kwargs):
+        """Run a blocking decode callable on the configured executor."""
+        if kwargs:
+            fn = functools.partial(fn, **kwargs)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
 
-class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
+
+class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
@@ -506,20 +831,25 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
         self._format = format
         self._device = device
 
-    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor]:
+    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         if self._format == "pt":
             from torchvision.transforms import ToTensor
 
             return ToTensor()(image).to(device=self._device)
+        if self._format == "np":
+            # uint8 HWC array; the downstream HF processor rescales/permutes.
+            return np.asarray(image)
         return image
 
-    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor]:
+    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
-    def load_base64(self, media_type: str, data: str) -> Union[Image.Image, torch.Tensor]:
+    def load_base64(
+        self, media_type: str, data: str
+    ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
 
-    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor]:
+    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
 
 
@@ -562,8 +892,11 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         device: str = "cpu",
         extract_audio: bool = False,
     ) -> None:
-        if format not in _SUPPORTED_IMAGE_FORMATS:
-            raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
+        # `"pt"` is the safe default every video model handles; models tuned
+        # for the uint8-HWC path opt into `"np"` via
+        # InputProcessor.get_preferred_media_io_kwargs().
+        if format not in _SUPPORTED_VIDEO_FORMATS:
+            raise ValueError(f"format must be one of {_SUPPORTED_VIDEO_FORMATS}, got {format!r}")
         self._num_frames = num_frames
         self._fps = fps
         self._format = format
@@ -590,30 +923,42 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return merged
 
     def load_bytes(self, data: bytes) -> VideoData:
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as f:
-            f.write(data)
-            f.flush()
+        # In-memory fast path when cv2 has a stream-buffered backend; spill
+        # to a tempfile otherwise so cv2 can open it by path. The tempfile
+        # is unlinked on context exit; the inode survives until cv2 closes
+        # its own fd (Linux semantics), so the decode inside the `with`
+        # block reads safely.
+        raw_bytes_hash = blake3(data).hexdigest()
+        cv2_backend = _select_cv2_stream_buffered_backend()
+        if cv2_backend is not None:
             return _load_video_by_cv2(
-                f.name,
+                data,
                 self._num_frames,
                 self._fps,
                 self._format,
                 self._device,
                 extract_audio=self._extract_audio,
+                cv2_backend=cv2_backend,
+                raw_bytes_hash=raw_bytes_hash,
+            )
+        with tempfile.NamedTemporaryFile(suffix=".mp4", dir=_VIDEO_TEMPFILE_DIR) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            return _load_video_by_cv2(
+                tmp.name,
+                self._num_frames,
+                self._fps,
+                self._format,
+                self._device,
+                extract_audio=self._extract_audio,
+                raw_bytes_hash=raw_bytes_hash,
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        return _load_video_by_cv2(
-            _normalize_file_uri(url),
-            self._num_frames,
-            self._fps,
-            self._format,
-            self._device,
-            extract_audio=self._extract_audio,
-        )
+        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(

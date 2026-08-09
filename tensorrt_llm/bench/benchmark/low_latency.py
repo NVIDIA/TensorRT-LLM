@@ -129,6 +129,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     "length of dataset.",
 )
 @optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requests dropped at the deadline are excluded from the report, so the statistics cover the requests that "
+    "completed rather than the whole dataset.",
+)
+@optgroup.option(
     "--warmup",
     type=int,
     default=2,
@@ -221,6 +230,14 @@ def latency_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
 
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")
@@ -315,6 +332,11 @@ def latency_command(
     if bench_env.telemetry_config is not None:
         kwargs["telemetry_config"] = bench_env.telemetry_config
 
+    runtime_config.settings_config.max_batch_size = kwargs.get(
+        "max_batch_size", runtime_config.settings_config.max_batch_size)
+    runtime_config.settings_config.max_num_tokens = kwargs.get(
+        "max_num_tokens", runtime_config.settings_config.max_num_tokens)
+
     # Set environment variables for setting runtime options.
     default_env_overrides = {
         "TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG": "1",
@@ -377,7 +399,8 @@ def latency_command(
                                 True,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
 

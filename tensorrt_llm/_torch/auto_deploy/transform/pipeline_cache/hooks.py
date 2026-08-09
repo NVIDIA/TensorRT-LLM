@@ -166,7 +166,7 @@ def collect_hook_specs(model: nn.Module) -> tuple[list[dict[str, Any]], bool]:
 
 
 def _rebuild_shard_tp_hook(spec: dict[str, Any]) -> Callable:
-    from ..library.sharding import _load_hook, _split_tensor_for_tp
+    from ..library.sharding_ir import _load_hook, _split_tensor_for_tp
 
     dim = spec["dim"]
     rank = spec["rank"]
@@ -203,8 +203,7 @@ def _rebuild_shard_tp_hook(spec: dict[str, Any]) -> Callable:
 
 
 def _rebuild_shard_fp8_block_scale_hook(spec: dict[str, Any]) -> Callable:
-    from ..library.sharding import _load_hook
-    from ..library.sharding_ir import _split_fp8_block_scale
+    from ..library.sharding_ir import _load_hook, _split_fp8_block_scale
 
     f_split = partial(
         _split_fp8_block_scale,
@@ -221,7 +220,7 @@ def _rebuild_shard_fp8_block_scale_hook(spec: dict[str, Any]) -> Callable:
 
 
 def _rebuild_shard_fp4_weight_scale_hook(spec: dict[str, Any]) -> Callable:
-    from ..library.sharding import _load_hook, _shard_fp4_weight_scale
+    from ..library.sharding_ir import _load_hook, _shard_fp4_weight_scale
 
     f_split = partial(
         _shard_fp4_weight_scale,

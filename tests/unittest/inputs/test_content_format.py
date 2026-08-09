@@ -2,7 +2,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for content format detection via Jinja AST analysis."""
 
+import pytest
+
 from tensorrt_llm.inputs.content_format import ContentFormat, detect_content_format
+
+pytestmark = pytest.mark.cpu_only
+
 
 # A template that iterates over message['content'] and checks content['type']
 # (OpenAI-style multimodal template)

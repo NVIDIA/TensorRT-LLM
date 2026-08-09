@@ -29,21 +29,21 @@ Before running these examples, ensure you have:
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash
-   trtllm-serve <path to your model> --extra_visual_gen_options <path to config yaml>
+   trtllm-serve <path to your model> --visual_gen_args <path to config yaml>
    ```
 
    e.g.
 
    ```bash
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml
-   trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --extra_visual_gen_options ./configs/wan22.yml
-   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
-   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
-   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
-   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --extra_visual_gen_options ./configs/qwen_image.yml
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml
+   trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --visual_gen_args ./configs/wan22.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --visual_gen_args ./configs/flux1.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --visual_gen_args ./configs/flux2.yml
+   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --visual_gen_args ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --visual_gen_args ./configs/qwen_image.yml
 
    # Run server on background:
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml > /tmp/serve.log 2>&1 &
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml > /tmp/serve.log 2>&1 &
 
    ## Check if the server is setup
    tail -f /tmp/serve.log
@@ -286,7 +286,8 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `input_reference`: Reference image (TI2V mode); accepted as base64-encoded string in JSON or as a file in multipart form-data
+- `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
+  - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"b64_json"` or `"url"`
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
@@ -315,6 +316,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, ...
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
@@ -355,6 +357,18 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "fps=24" \
   -F "size=256x256" \
   -F "guidance_scale=5.0"
+```
+
+### Video-to-Video (Multipart with File Upload, Cosmos3)
+```bash
+# The reference is classified by content: image -> I2V, video -> V2V.
+# V2V conditioning knobs ride in extra_params (values below are the defaults).
+curl -X POST "http://localhost:8000/v1/videos" \
+  -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
+  -F "input_reference=@./media/reference.mp4" \
+  -F "num_frames=189" \
+  -F "fps=24" \
+  -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'
 ```
 
 ### Check Video Status

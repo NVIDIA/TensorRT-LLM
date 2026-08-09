@@ -178,11 +178,18 @@ def get_torch_constraint_file(constraint_dir="."):
         torch_version = torch_version_result.stdout.strip()
         if torch_version:
             print(f"Found installed torch version: {torch_version}")
+            # Strip the local version label (e.g. +5aff3928d8.nv26.05) so the
+            # constraint satisfies PEP 440 ordered-comparison specifiers like
+            # ">=2.11.0,<=2.13.0a0" — local versions are excluded from such
+            # comparisons and would cause a pip conflict.
+            from packaging.version import Version
+            torch_version_public = Version(torch_version).public
             constraint_file = os.path.join(constraint_dir,
                                            "torch-constraint.txt")
             with open(constraint_file, "w") as f:
-                f.write(f"torch=={torch_version}\n")
-            print(f"Created {constraint_file} to constrain torch version.")
+                f.write(f"torch=={torch_version_public}\n")
+            print(f"Created {constraint_file} to constrain torch version "
+                  f"(public: {torch_version_public}, full: {torch_version}).")
             return constraint_file
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Torch is not installed. Proceeding without constraint.")

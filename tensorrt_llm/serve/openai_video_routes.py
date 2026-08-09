@@ -124,6 +124,15 @@ class _VideoRoutesMixin:
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
+            except MemoryError as exc:
+                # Valid request that does not fit this deployment (decode /
+                # allocation capacity) — a server condition, not client error.
+                logger.error(f"Video request capacity error: {exc}")
+                return self.create_error_response(
+                    str(exc),
+                    err_type="ServiceUnavailableError",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
 
             if output.video is None:
                 return self.create_error_response(
@@ -160,11 +169,20 @@ class _VideoRoutesMixin:
             resolved_fmt = resolved_encoder_fmt
             batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
             paths_in = [self.media_storage_path / f"{video_id}_{i}" for i in range(batch_size)]
-            saved_paths = output.save(
-                paths_in,
+            _save_kwargs = dict(
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
             )
+            if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
+                # Offload the blocking ffmpeg encode to a thread-pool executor so
+                # the event loop can start the next request's diffusion while this
+                # video encodes. Only overlaps when >=2 requests are in flight per
+                # server (i.e. client num_workers > server count).
+                saved_paths = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: output.save(paths_in, **_save_kwargs)
+                )
+            else:
+                saved_paths = output.save(paths_in, **_save_kwargs)
             latency = time.perf_counter() - sync_video_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0

@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 import time
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
 
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
+from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
@@ -28,28 +29,67 @@ from transformers import Qwen2Tokenizer
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import (
+    classify_worker_error,
+    postprocess_video_tensor,
+    synchronize_media_prepare_status,
+)
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media.decoding import decode_video_reference_window
 
-from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
+from .defaults import (
+    COSMOS3_720P_PARAMS,
+    COSMOS3_EXTRA_SPECS,
+    COSMOS3_PIPELINE_DEFAULTS,
+    COSMOS3_T2I_PARAMS,
+    _normalize_condition_video_keep,
+    _normalize_condition_video_latent_indexes,
+)
 from .guardrails import check_video_safety, download_guardrail_checkpoint
+from .sampling import Cosmos3SamplingPolicy, load_scheduler
+from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
-COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
-    "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
-    "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
-    "underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, "
-    "low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, "
-    "unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of "
-    "poor quality."
-)
+COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
+# NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant who will generate videos from a given prompt."
+    "You are a helpful assistant who will generate videos from a give prompt."
+)
+COSMOS3_T2I_SYSTEM_PROMPT = (
+    "You are a helpful assistant who will generate images from a give prompt."
 )
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
+
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+
+
+def _condition_pixel_frame_count(
+    condition_video_latent_indexes: Iterable[int],
+    temporal_compression: int,
+) -> int:
+    return max(condition_video_latent_indexes) * int(temporal_compression) + 1
+
+
+def _load_reference_image(path: str):
+    """Load an I2V reference, reporting unreadable content as a client error.
+
+    The worker's load is the acceptance check — the serve boundary only
+    routes on the container signature — so PIL's ``OSError``
+    (``UnidentifiedImageError`` for a bad header, plain ``OSError`` partway
+    through a truncated file) has to become a ``ValueError`` here, or a bad
+    upload would be reported as a server fault.
+    """
+    try:
+        return load_image(path, format="pil")
+    except OSError as exc:
+        raise ValueError(
+            f"Image reference could not be decoded; it may be truncated, "
+            f"corrupt, or in an unsupported format: {exc}"
+        ) from exc
 
 
 @register_pipeline(
@@ -58,17 +98,42 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Super",
         "nvidia/Cosmos3-Super-Image2Video",
+        "nvidia/Cosmos3-Super-Image2Video-4Step",
         "nvidia/Cosmos3-Super-Text2Image",
+        "nvidia/Cosmos3-Super-Text2Image-4Step",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):
+        primary_pretrained_config = pipeline_config.primary_pretrained_config
+        self.audio_gen = False
+        self.action_gen = False
+        # Pre-load placeholder; load_standard_components derives the real
+        # policy from the checkpoint's scheduler via from_scheduler().
+        self.sampling = Cosmos3SamplingPolicy()
+        # Independent of the extra-param spec, whose default stays None so an
+        # omitted value survives the executor's default merge and reaches
+        # forward() as "unset".
+        self.default_use_system_prompt = False
+        if getattr(
+            primary_pretrained_config,
+            "audio_gen",
+            getattr(primary_pretrained_config, "sound_gen", False),
+        ):
+            logger.info("Initializing Cosmos3OmniMoTPipeline with audio generation.")
+            self.audio_gen = True
+
+        if getattr(primary_pretrained_config, "action_gen", False):
+            logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
+            self.action_gen = True
+
         super().__init__(pipeline_config)
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
-        self.transformer = Cosmos3VFMTransformer(self.pipeline_config.model_configs["transformer"])
+        model_config = self.pipeline_config.model_configs["transformer"]
+        self.transformer = Cosmos3VFMTransformer(model_config)
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
@@ -80,6 +145,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         skip_components = skip_components or []
+
+        # Prompting defaults are checkpoint-declared: distilled conversions
+        # carry ``default_use_system_prompt`` in model_index.json (diffusers'
+        # distilled blocks default it to True); older checkpoints omit it and
+        # keep the historical False.
+        model_index_path = os.path.join(checkpoint_dir, "model_index.json")
+        if os.path.exists(model_index_path):
+            with open(model_index_path) as f:
+                model_index = json.load(f)
+            self.default_use_system_prompt = bool(
+                model_index.get("default_use_system_prompt", self.default_use_system_prompt)
+            )
+
+        if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
+            logger.info("Loading audio tokenizer...")
+            self.audio_tokenizer = (
+                LatentAutoEncoderV2.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.SOUND_TOKENIZER,
+                )
+                .to(device)
+                .to(self.dtype)
+                .eval()
+            )
 
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
@@ -110,10 +199,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
-            self.scheduler = UniPCMultistepScheduler.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.SCHEDULER,
-            )
+            # The scheduler class comes from the checkpoint: UniPC for base
+            # checkpoints, FlowMatchEuler (fixed stochastic schedule) for
+            # distilled ones. The policy holds the derived immutable facts.
+            self.scheduler = load_scheduler(checkpoint_dir)
+            self.sampling = Cosmos3SamplingPolicy.from_scheduler(self.scheduler)
+            if self.audio_gen:
+                # Separate instance so video and audio scheduler states don't
+                # collide (schedulers mutate internal state on every .step()).
+                self.audio_scheduler = type(self.scheduler).from_config(self.scheduler.config)
 
         # Re-check the env var in case it was changed after initialization like in unit tests.
         guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
@@ -153,14 +247,36 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return [189]
 
     @property
+    def default_warmup_steps(self):
+        # Distilled checkpoints only run their fixed schedule length.
+        return self.sampling.num_steps(super().default_warmup_steps)
+
+    @property
     def default_generation_params(self):
-        return dict(COSMOS3_720P_PARAMS)
+        return {**COSMOS3_PIPELINE_DEFAULTS, **self.sampling.generation_default_overrides()}
+
+    def classify_request_failure(self, exc: BaseException) -> Optional[str]:
+        """Cosmos3 rejects unusable request content with ``ValueError`` and
+        reports capacity exhaustion as ``MemoryError``, so those map onto the
+        response channel's client / capacity classes."""
+        return classify_worker_error(exc)
 
     @property
     def extra_param_specs(self):
+        # ``use_system_prompt`` keeps its None default here on purpose: the
+        # executor materializes these into every request, so publishing the
+        # checkpoint's boolean would destroy "unset" before forward() can
+        # resolve it by mode. The checkpoint value is exposed separately as
+        # ``default_use_system_prompt``.
         return dict(COSMOS3_EXTRA_SPECS)
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
+        # base defaults leave it None ("by mode") — warmup runs the video mode.
+        defaults = self.default_generation_params
+        guidance_scale = defaults["guidance_scale"]
+        if guidance_scale is None:
+            guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
@@ -169,33 +285,80 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 width=width,
                 num_frames=num_frames,
                 num_inference_steps=steps,
-                guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
+                guidance_scale=guidance_scale,
                 seed=42,
-                max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
+                max_sequence_length=defaults["max_sequence_length"],
                 use_guardrails=False,
                 image=None,
+                enable_audio=False,
+            )
+
+    def _apply_flow_shift(
+        self, target_shift: Optional[float], *, use_karras_sigmas: Optional[bool] = None
+    ) -> None:
+        """Rebuild both stream schedulers for the requested sampling knobs.
+
+        Video and audio denoise in lockstep in one loop, so a mode that
+        rebuilds only the video scheduler leaves audio on the checkpoint's
+        sigmas and the two streams step on different schedules.
+        """
+        self.scheduler = self.sampling.set_flow_shift(
+            self.scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
+        )
+        if getattr(self, "audio_scheduler", None) is not None:
+            self.audio_scheduler = self.sampling.set_flow_shift(
+                self.audio_scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
             )
 
     def infer(self, req):
+        extra_params = req.params.extra_params or {}
+        output_type = extra_params.get("output_type", "video")
+        is_t2i = str(output_type).lower() == "image"
+
+        # None = unset; resolve by mode exactly once. Non-None values pass through.
+        mode_params = COSMOS3_T2I_PARAMS if is_t2i else COSMOS3_720P_PARAMS
+
+        def resolved(value, field_name):
+            return value if value is not None else mode_params[field_name]
+
+        height = resolved(req.params.height, "height")
+        width = resolved(req.params.width, "width")
+        num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
+        guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
+        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
             image=req.params.image,
-            height=req.params.height,
-            width=req.params.width,
+            height=height,
+            width=width,
             num_frames=req.params.num_frames,
-            num_inference_steps=req.params.num_inference_steps,
-            guidance_scale=req.params.guidance_scale,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
-            use_duration_template=req.params.extra_params.get("use_duration_template", True),
-            use_resolution_template=req.params.extra_params.get("use_resolution_template", True),
-            use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
-            use_guardrails=req.params.extra_params.get("use_guardrails", True),
+            use_duration_template=extra_params.get(
+                "use_duration_template",
+                COSMOS3_EXTRA_SPECS["use_duration_template"].default,
+            ),
+            use_resolution_template=extra_params.get(
+                "use_resolution_template",
+                COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
+            ),
+            # None = unset; forward() resolves it by mode / checkpoint.
+            use_system_prompt=extra_params.get("use_system_prompt"),
+            use_guardrails=extra_params.get("use_guardrails", True),
+            enable_audio=extra_params.get("enable_audio", False),
+            output_type=output_type,
+            video=video,
+            condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
+            condition_video_keep=extra_params.get("condition_video_keep"),
+            flow_shift=extra_params.get("flow_shift"),
         )
 
-    def _format_prompt_with_template(
+    def _apply_metadata_templates(
         self,
         prompt: str,
         *,
@@ -203,22 +366,73 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         width: int,
         num_frames: int,
         frame_rate: float,
-        use_duration_template: bool = True,
-        use_resolution_template: bool = True,
+        duration_template: Optional[str] = COSMOS3_DURATION_TEMPLATE,
+        resolution_template: Optional[str] = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+        force_duration_template: bool = False,
     ) -> str:
-        prompt = prompt.strip()
+        """Append duration and resolution metadata to a plain-text prompt.
 
-        if use_duration_template and num_frames > 1:
+        ``duration_template`` / ``resolution_template`` of ``None`` disables that
+        template.  JSON prompts are handled by ``_format_prompt_with_metadata``.
+        """
+        parts: List[str] = []
+        head = prompt.rstrip(".").strip()
+        if head:
+            parts.append(head)
+        if duration_template is not None and (num_frames > 1 or force_duration_template):
             duration = num_frames / frame_rate
-            dur_text = COSMOS3_DURATION_TEMPLATE.format(duration=duration, fps=frame_rate)
-            prompt = prompt.rstrip(".") + ". " + dur_text
+            parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
+        if resolution_template is not None:
+            parts.append(resolution_template.format(height=height, width=width).rstrip("."))
+        if not parts:
+            return ""
+        return ". ".join(parts) + "."
 
-        prompt = prompt.strip()
-        if use_resolution_template:
-            res_text = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE.format(height=height, width=width)
-            prompt = prompt.rstrip(".") + ". " + res_text
+    def _format_prompt_with_metadata(
+        self,
+        prompt: str,
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        duration_template: Optional[str],
+        resolution_template: Optional[str],
+        force_duration_template: bool = False,
+    ) -> str:
+        """Apply cosmos-framework-style metadata to plain text or JSON prompts."""
+        stripped = prompt.strip()
+        if stripped.startswith("{"):
+            try:
+                data = json.loads(stripped)
+            except json.JSONDecodeError:
+                data = None
+            else:
+                if isinstance(data, dict):
+                    if duration_template is not None and (
+                        num_frames > 1 or force_duration_template
+                    ):
+                        duration = num_frames / frame_rate
+                        data["duration"] = f"{duration:.1f}s"
+                        data["fps"] = (
+                            int(frame_rate) if frame_rate == int(frame_rate) else frame_rate
+                        )
+                    if resolution_template is not None:
+                        data["resolution"] = {"W": width, "H": height}
+                        divisor = math.gcd(height, width)
+                        data["aspect_ratio"] = f"{height // divisor},{width // divisor}"
+                    return json.dumps(data, ensure_ascii=False)
 
-        return prompt
+        return self._apply_metadata_templates(
+            prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            duration_template=duration_template,
+            resolution_template=resolution_template,
+            force_duration_template=force_duration_template,
+        )
 
     def _resize_and_center_crop_image(
         self, image: PIL.Image.Image, height: int, width: int
@@ -237,14 +451,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @nvtx_range("_tokenize_prompt", color="blue")
     def _tokenize_prompt(
-        self, text: str, max_sequence_length: int, use_system_prompt: bool = False
+        self,
+        text: str,
+        max_sequence_length: int,
+        use_system_prompt: bool = False,
+        system_prompt: Optional[str] = None,
     ):
         """Tokenize a prompt using the Qwen2 chat template.
 
         Returns (input_ids, attention_mask) as [1, S] tensors on device.
         """
         conversations = (
-            [{"role": "system", "content": COSMOS3_DEFAULT_SYSTEM_PROMPT}]
+            [{"role": "system", "content": system_prompt or COSMOS3_DEFAULT_SYSTEM_PROMPT}]
             if use_system_prompt
             else []
         )
@@ -293,14 +511,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
-    # -- I2V latent preparation -----------------------------------------------
+    # =========================================================================
+    # I2V latent preparation
+    # =========================================================================
 
     def _encode_conditioning_video(
         self,
         image_tensor: torch.Tensor,
         num_frames: int,
-        height: int,
-        width: int,
     ) -> torch.Tensor:
         """VAE-encode a conditioning image as a full-length video.
 
@@ -315,8 +533,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         Args:
             image_tensor: [1, 3, H, W] in [-1, 1]
             num_frames: total pixel frames for the video
-            height: pixel height
-            width: pixel width
 
         Returns:
             [1, C, T_latent, H_latent, W_latent] normalized latent of the
@@ -325,28 +541,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Build pixel-space video: repeat the conditioning image across all frames
         # image_tensor: [1, 3, H, W] -> [1, 3, 1, H, W] -> [1, 3, num_frames, H, W]
         video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
-        video = video.to(device=self.device, dtype=self.vae.dtype)
-
-        latent = self.vae.encode(video).latent_dist.mode()
-
-        # Normalize (inverse of _decode_latents denormalization)
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, -1, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std)
-                .view(1, -1, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latent = (latent - latents_mean) / latents_std
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latent = latent * scaling_factor
-
-        return latent.to(self.dtype)
+        return self._encode_video_tensor(video)
 
     def _prepare_latents_i2v(
         self,
@@ -390,8 +585,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         cond_latent = self._encode_conditioning_video(
             image_tensor,
             num_frames,
-            height,
-            width,
         )  # [1, C, T_lat, H_lat, W_lat]
 
         # Keep only frame 0 for conditioning; replace rest with noise
@@ -404,6 +597,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         velocity_mask = 1.0 - condition_mask
         return latents, velocity_mask, image_latent
+
+    def _conditioning_anchor_post_step(self, image_latent: Optional[torch.Tensor]):
+        """Per-step re-anchor of the conditioned frame for distilled sampling.
+
+        The distilled FlowMatchEuler step is stochastic: it re-noises every
+        position, including the frame the velocity mask holds still, so the
+        conditioning frame the model reads as clean context degrades from step
+        2 on. Writing the clean latent back after every scheduler step keeps
+        it clean (diffusers' distilled loop re-anchors the same way).
+        Deterministic UniPC steps never move a zero-velocity frame, so base
+        checkpoints need no per-step anchor and keep their exact behavior.
+
+        Returns a ``post_step_fn`` for ``BasePipeline.denoise``, or ``None``
+        when no anchoring is needed.
+        """
+        if not self.sampling.is_distilled or image_latent is None:
+            return None
+
+        def post_step_fn(latents: torch.Tensor) -> torch.Tensor:
+            # In-place: writes one latent frame, no full-tensor copies.
+            latents[:, :, 0:1] = image_latent
+            return latents
+
+        return post_step_fn
 
     # =========================================================================
     # VAE decode
@@ -435,6 +652,138 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return video
 
     # =========================================================================
+    # Audio generation
+    # =========================================================================
+
+    def decode_audio(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode audio latent tokens back to waveform.
+
+        Args:
+            latent: Audio latent tensor of shape (B, C, T).
+
+        Returns:
+            Waveform tensor of shape (B, audio_channels, N_samples).
+        """
+        return self.audio_tokenizer.decode(latent).float()  # [B, audio_channels, N_samples]
+
+    def _condition_frames_to_video_tensor(self, frames: torch.Tensor) -> torch.Tensor:
+        """Normalize uint8 ``[T, H, W, C]`` device frames to ``[1, 3, T, H, W]``.
+
+        Same value mapping as ``VideoProcessor.preprocess`` (``[0, 255]`` →
+        ``[-1, 1]``), applied to the target-resolution frames the worker
+        decode (``decode_video_reference_window``) retains.
+        """
+        if frames.shape[0] < 1:
+            raise ValueError("Cosmos3 condition video must contain at least one frame.")
+        x = frames.to(torch.float32).div_(255.0).mul_(2.0).sub_(1.0)
+        return x.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
+
+    def _encode_video_tensor(self, video_tensor: torch.Tensor) -> torch.Tensor:
+        """VAE-encode a preprocessed pixel video [1, 3, T, H, W]."""
+        if video_tensor.ndim == 4:
+            video_tensor = video_tensor.unsqueeze(0)
+        if video_tensor.ndim != 5 or video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
+            raise ValueError(
+                f"Cosmos3 video tensor must have shape [1, 3, T, H, W], got {tuple(video_tensor.shape)}."
+            )
+
+        video = video_tensor.to(device=self.device, dtype=self.vae.dtype)
+        latent = self.vae.encode(video).latent_dist.mode()
+
+        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, -1, 1, 1, 1)
+                .to(latent.device, latent.dtype)
+            )
+            latents_std = (
+                torch.tensor(self.vae.config.latents_std)
+                .view(1, -1, 1, 1, 1)
+                .to(latent.device, latent.dtype)
+            )
+            latent = (latent - latents_mean) / latents_std
+        else:
+            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+            latent = latent * scaling_factor
+
+        return latent.to(self.dtype)
+
+    # =========================================================================
+    # Video to video
+    # =========================================================================
+
+    def _prepare_latents_v2v(
+        self,
+        video_tensor: torch.Tensor,
+        num_frames: int,
+        generator: torch.Generator,
+        condition_video_latent_indexes: Iterable[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare V2V latents with explicit clean conditioned latent frames."""
+        if video_tensor.ndim == 4:
+            video_tensor = video_tensor.unsqueeze(0)
+        if video_tensor.ndim != 5 or video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
+            raise ValueError(
+                "Cosmos3 video tensor must have shape [1, 3, T, H, W], "
+                f"got {tuple(video_tensor.shape)}."
+            )
+        if video_tensor.shape[2] < 1:
+            raise ValueError("Cosmos3 V2V video tensor must contain at least one frame.")
+
+        C = self.transformer.latent_channel_size
+        T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
+        W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
+        indexes = _normalize_condition_video_latent_indexes(condition_video_latent_indexes)
+        out_of_range = [index for index in indexes if index >= T_lat]
+        if out_of_range:
+            # Mode-aware bound (num_frames may be a mode-deferred default, so
+            # this cannot run at coordinator preflight); client error class.
+            raise ValueError(
+                "Cosmos3 condition_video_latent_indexes contains indexes outside the latent video: "
+                f"indexes={indexes}, latent_frames={T_lat}."
+            )
+
+        noise = randn_tensor(
+            (1, C, T_lat, H_lat, W_lat),
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        condition_pixel_frames = _condition_pixel_frame_count(
+            indexes, self.vae_scale_factor_temporal
+        )
+        condition_video = video_tensor[:, :, :condition_pixel_frames]
+        if condition_video.shape[2] < condition_pixel_frames:
+            pad = condition_video[:, :, -1:].repeat(
+                1, 1, condition_pixel_frames - condition_video.shape[2], 1, 1
+            )
+            condition_video = torch.cat([condition_video, pad], dim=2)
+
+        cond_latent = self._encode_video_tensor(condition_video)
+        expected_prefix = (1, C, max(indexes) + 1, H_lat, W_lat)
+        if (
+            cond_latent.shape[0] != expected_prefix[0]
+            or cond_latent.shape[1] != expected_prefix[1]
+            or cond_latent.shape[2] < expected_prefix[2]
+            or cond_latent.shape[3:] != expected_prefix[3:]
+        ):
+            raise ValueError(
+                "Cosmos3 V2V condition latent shape mismatch: "
+                f"encoded={tuple(cond_latent.shape)}, expected at least {expected_prefix}."
+            )
+
+        condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        condition_latents = torch.zeros_like(noise)
+        for index in indexes:
+            condition_mask[:, :, index, :, :] = 1.0
+            condition_latents[:, :, index : index + 1] = cond_latent[:, :, index : index + 1]
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
+        velocity_mask = 1.0 - condition_mask
+        return latents, velocity_mask, condition_latents
+
+    # =========================================================================
     # Forward (main generation entry point)
     # =========================================================================
 
@@ -443,26 +792,144 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
-        seed: int,
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
-        height: int = COSMOS3_720P_PARAMS["height"],
-        width: int = COSMOS3_720P_PARAMS["width"],
-        num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
-        num_inference_steps: int = COSMOS3_720P_PARAMS["num_inference_steps"],
-        guidance_scale: float = COSMOS3_720P_PARAMS["guidance_scale"],
-        max_sequence_length: int = COSMOS3_720P_PARAMS["max_sequence_length"],
-        frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        seed: int = 42,
+        max_sequence_length: Optional[int] = None,
+        frame_rate: Optional[float] = None,
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
-        use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
+        use_system_prompt: Optional[bool] = None,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
+        enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
+        output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
+        video: bytes | None = None,  # encoded MP4/AVI reference (V2V)
+        condition_video_latent_indexes: Iterable[int] | None = None,
+        condition_video_keep: str | None = None,
+        flow_shift: Optional[float] = None,
     ):
+        """Run one generation. ``infer()`` is the resolved entry point.
+
+        Production requests arrive through ``infer()`` with fully resolved
+        values; the signature defaults are the base-checkpoint *video* table
+        values for direct internal callers. ``forward()`` cannot tell a
+        signature default from an explicit argument, so on distilled
+        checkpoints (which fix steps/guidance and reject anything else) direct
+        callers must pass checkpoint-valid sampling values.
+
+        ``use_system_prompt=None`` means "unset": V2V always uses the system
+        prompt, and every other mode takes the checkpoint-declared default, so
+        warmup and other direct callers build the same prompt as served
+        requests.
+        """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
 
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
+
+        # Text-to-image mode: same checkpoint/forward path as T2V, but a single
+        # latent frame, image-flavored prompt templates, flow_shift=3.0, a CFG
+        # guidance interval, and an image (rather than video) output.
+        output_type = str(output_type).lower()
+        if output_type not in ("video", "image"):
+            raise ValueError(f"output_type must be 'video' or 'image', got {output_type!r}.")
+        is_t2i = output_type == "image"
+
+        self.sampling.validate_request(num_inference_steps, guidance_scale)
+
+        # A distilled checkpoint's step count and guidance are checkpoint facts,
+        # not mode defaults, so they resolve before the mode tables below.
+        # Requests through infer() already carry them via
+        # default_generation_params; a direct forward() call would otherwise
+        # fall through to the base tables and run CFG at 6.0 against weights
+        # with guidance baked in.
+        checkpoint_defaults = self.sampling.generation_default_overrides()
+        if num_inference_steps is None:
+            num_inference_steps = checkpoint_defaults.get("num_inference_steps")
+        if guidance_scale is None:
+            guidance_scale = checkpoint_defaults.get("guidance_scale")
+
+        if image is not None and video is not None:
+            raise ValueError(
+                "Cosmos3 generation supports text-only, text + image, "
+                "or text + video input, but not both image and video."
+            )
+        if is_t2i and video is not None:
+            raise ValueError(
+                "Cosmos3 video-to-video generation is supported only for video outputs."
+            )
+        is_v2v = video is not None and not is_t2i
+        if use_system_prompt is None:
+            # V2V always wants it; otherwise the checkpoint declares the default.
+            use_system_prompt = is_v2v or self.default_use_system_prompt
+        else:
+            use_system_prompt = bool(use_system_prompt)
+        guidance_interval = None
+        if is_t2i:
+            if image is not None:
+                raise ValueError(
+                    "Cosmos3 text-to-image (output_type='image') does not accept an image input."
+                )
+            num_frames = 1
+            # T2I force-disables audio instead of rejecting it, so an image
+            # request never trips the audio-weight presence check below.
+            enable_audio = False
+            height = height or COSMOS3_T2I_PARAMS["height"]
+            width = width or COSMOS3_T2I_PARAMS["width"]
+            num_inference_steps = num_inference_steps or COSMOS3_T2I_PARAMS["num_inference_steps"]
+            if guidance_scale is None:
+                guidance_scale = COSMOS3_T2I_PARAMS["guidance_scale"]
+            guidance_interval = COSMOS3_T2I_PARAMS["guidance_interval"]
+            self._apply_flow_shift(
+                flow_shift if flow_shift is not None else COSMOS3_T2I_PARAMS["flow_shift"],
+            )
+        else:
+            height = height or COSMOS3_720P_PARAMS["height"]
+            width = width or COSMOS3_720P_PARAMS["width"]
+            num_frames = num_frames or COSMOS3_720P_PARAMS["num_frames"]
+            num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
+            if guidance_scale is None:
+                guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
+            if is_v2v:
+                # V2V wants a stronger shift and the uniform sigma schedule.
+                self._apply_flow_shift(
+                    flow_shift if flow_shift is not None else 10.0,
+                    use_karras_sigmas=False,
+                )
+            else:
+                # Restore the checkpoint sampling knobs in case a prior T2I or
+                # V2V request rebuilt the scheduler with mode-specific values.
+                self._apply_flow_shift(
+                    flow_shift if flow_shift is not None else self.sampling.checkpoint_flow_shift,
+                    use_karras_sigmas=None,
+                )
+
+        max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
+        if frame_rate is None:
+            frame_rate = COSMOS3_720P_PARAMS["frame_rate"]
+
+        if self.rank == 0:
+            logger.info(
+                f"Cosmos3 generation dims: {width}x{height} (WxH), num_frames={num_frames}, "
+                f"num_inference_steps={num_inference_steps}, guidance_scale={guidance_scale:.2f}, "
+                f"frame_rate={frame_rate:.1f}"
+            )
+
+        # Weight-presence guard, not workflow policy: the request explicitly
+        # asks for audio, but the checkpoint ships no audio tower. Silently
+        # returning a silent video would hide the capability limit.
+        if enable_audio and not self.audio_gen:
+            raise ValueError(
+                "enable_audio=True, but this checkpoint has no audio tower "
+                "(transformer config declares sound_gen=false). Drop enable_audio "
+                "or use an audio-capable Cosmos3 checkpoint."
+            )
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -481,7 +948,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
         # Text guardrail — check both positive and user-supplied negative prompts.
-        # None negative_prompt means the hardcoded default will be used (safe); skip it.
+        # None negative_prompt means the empty default will be used (safe); skip it.
         text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
         if self.rank == 0 and use_guardrails and self.safety_checker is not None:
             prompts_to_check = list(prompt)
@@ -506,25 +973,40 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
 
-        negative_prompt = self._format_prompt_with_template(
+        # Positive prompt: forward duration/resolution templates.  T2I has no
+        # duration concept (single image) and uses the image-flavored
+        # resolution template.
+        use_duration_template = use_duration_template and not is_t2i
+        dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
+        if use_resolution_template:
+            res_tmpl = (
+                COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_DEFAULT_RESOLUTION_TEMPLATE
+            )
+        else:
+            res_tmpl = None
+
+        # Negative prompt: mirror positive metadata (cosmos-framework CLI default
+        # when ``negative_prompt_keep_metadata`` promotes mode to ``same``).
+        negative_prompt = self._format_prompt_with_metadata(
             negative_prompt,
             height=height,
             width=width,
             num_frames=num_frames,
             frame_rate=frame_rate,
-            use_duration_template=use_duration_template,
-            use_resolution_template=use_resolution_template,
+            duration_template=dur_tmpl,
+            resolution_template=res_tmpl,
+            force_duration_template=False,
         )
 
         prompt = [
-            self._format_prompt_with_template(
+            self._format_prompt_with_metadata(
                 p,
                 height=height,
                 width=width,
                 num_frames=num_frames,
                 frame_rate=frame_rate,
-                use_duration_template=use_duration_template,
-                use_resolution_template=use_resolution_template,
+                duration_template=dur_tmpl,
+                resolution_template=res_tmpl,
             )
             for p in prompt
         ]
@@ -534,32 +1016,114 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 1. Tokenize prompts (no separate text encoder — transformer embeds internally)
         logger.info("Tokenizing prompts...")
-        cond_ids, cond_mask = self._tokenize_prompt(prompt, max_sequence_length, use_system_prompt)
+        system_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_DEFAULT_SYSTEM_PROMPT
+        cond_ids, cond_mask = self._tokenize_prompt(
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
+        )
         uncond_ids, uncond_mask = self._tokenize_prompt(
-            negative_prompt, max_sequence_length, use_system_prompt
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
 
         # 2. Prepare latents
+        condition_latents = None
+        image_latent = None
+        velocity_mask = None
+
         if image is not None:
-            if isinstance(image, str):
-                image = PIL.Image.open(image).convert("RGB")
+            prepare_error: Optional[Exception] = None
+            try:
+                if isinstance(image, str):
+                    image = _load_reference_image(image)
 
-            if isinstance(image, PIL.Image.Image):
-                image = image.convert("RGB")
-                image = self._resize_and_center_crop_image(image, height=height, width=width)
-                image = self.video_processor.preprocess(
-                    image,
-                    height=height,
-                    width=width,
+                if isinstance(image, PIL.Image.Image):
+                    image = image.convert("RGB")
+                    image = self._resize_and_center_crop_image(image, height=height, width=width)
+                    image = self.video_processor.preprocess(
+                        image,
+                        height=height,
+                        width=width,
+                    )
+
+                latents, velocity_mask, image_latent = self._prepare_latents_i2v(
+                    image, height=height, width=width, num_frames=num_frames, generator=generator
                 )
+            except Exception as exc:
+                prepare_error = exc
+            # Same convergence as the V2V branch: every rank loads the image
+            # independently, so a rank that failed while others entered the
+            # transformer's collectives would hang the job.
+            synchronize_media_prepare_status(prepare_error)
+        elif video is not None:
+            prepare_error: Optional[Exception] = None
+            try:
+                condition_video_latent_indexes = _normalize_condition_video_latent_indexes(
+                    condition_video_latent_indexes
+                )
+                # Bound-check the indexes against the OUTPUT latent length
+                # before any window math: an out-of-range index would
+                # otherwise size the decode ring (keep="last" decodes to EOF
+                # through it) from a request that is deterministically
+                # invalid.
+                num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+                out_of_range = [i for i in condition_video_latent_indexes if i >= num_latent_frames]
+                if out_of_range:
+                    raise ValueError(
+                        f"Cosmos3 condition_video_latent_indexes {out_of_range} are out "
+                        f"of range for a {num_frames}-frame output "
+                        f"({num_latent_frames} latent frames)."
+                    )
+                if isinstance(video, bytes):
+                    window = _condition_pixel_frame_count(
+                        condition_video_latent_indexes, self.vae_scale_factor_temporal
+                    )
+                    # The conditioning window is a Cosmos3 constraint: it is
+                    # derived from indexes into the *output* latent timeline,
+                    # already bound-checked above. The decoder just returns
+                    # the frames asked for. "last" is a negative range, which
+                    # costs a decode to EOS -- the caller's choice to make.
+                    if _normalize_condition_video_keep(condition_video_keep) == "first":
+                        first_frame, last_frame = 0, window - 1
+                    else:
+                        first_frame, last_frame = -window, -1
+                    frames_u8 = decode_video_reference_window(
+                        video,
+                        first_frame=first_frame,
+                        last_frame=last_frame,
+                        target_h=height,
+                        target_w=width,
+                        device=self.device,
+                    )
+                else:
+                    raise ValueError(
+                        "Cosmos3 V2V reference must be encoded MP4/AVI bytes "
+                        f"(the 'video' extra-param contract), got "
+                        f"{type(video).__name__}."
+                    )
+                condition_pixels = self._condition_frames_to_video_tensor(frames_u8)
+                del frames_u8
 
-            latents, velocity_mask, image_latent = self._prepare_latents_i2v(
-                image, height=height, width=width, num_frames=num_frames, generator=generator
-            )
+                if self.rank == 0:
+                    logger.info(
+                        f"Cosmos3 V2V conditioning: frames={condition_pixels.shape[2]}, "
+                        f"latent_indexes={condition_video_latent_indexes}"
+                    )
+                latents, velocity_mask, condition_latents = self._prepare_latents_v2v(
+                    condition_pixels,
+                    num_frames=num_frames,
+                    generator=generator,
+                    condition_video_latent_indexes=condition_video_latent_indexes,
+                )
+                # The VAE-encoded condition latents are all the denoise loop
+                # needs; drop the decoded pixels before the long generation.
+                del condition_pixels
+            except Exception as exc:
+                prepare_error = exc
+            # Per-rank decode/prepare can fail non-uniformly (NVDEC init,
+            # corrupt stream, allocation); converge all ranks on one outcome
+            # before any model collective so healthy ranks cannot hang.
+            synchronize_media_prepare_status(prepare_error)
         else:
             latents = self._prepare_latents(height, width, num_frames, generator)
-            velocity_mask = None
-            image_latent = None
 
         # Compute video shape in latent space
         T_latent = latents.shape[2]
@@ -568,29 +1132,72 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         video_shape = (T_latent, H_latent, W_latent)
 
         # 3. Set up scheduler
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self.sampling.set_timesteps(self.scheduler, num_inference_steps, device=self.device)
+
+        # 3b. Audio noise init — latent length matches diffusers Cosmos3OmniPipeline.prepare_latents.
+        do_audio = enable_audio and self.audio_gen and hasattr(self, "audio_tokenizer")
+        audio_latents = None
+        if do_audio:
+            audio_cfg = self.audio_tokenizer.model_config
+            n_audio_samples = int(num_frames / frame_rate * audio_cfg["sampling_rate"])
+            hop_size = math.prod(audio_cfg["dec_strides"])
+            T_audio = (n_audio_samples + hop_size - 1) // hop_size
+            audio_latents = randn_tensor(
+                (1, self.transformer.audio_dim, T_audio),
+                generator=generator,
+                device=self.device,
+                dtype=latents.dtype,
+            )
+            # Audio uses the same scheduler type/config as video.
+            self.sampling.set_timesteps(
+                self.audio_scheduler, num_inference_steps, device=self.device
+            )
 
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
-            latent_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latent_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Cosmos3 forward function for BasePipeline.denoise().
 
             Since Cosmos3 embeds text internally, we pass token IDs via extra_tensors
             rather than through encoder_hidden_states.
             """
-            noise_pred = self.transformer(
+            current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
+
+            result = self.transformer(
                 hidden_states=latent_input,
-                timestep=timestep,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
+                raw_timestep=timestep,
                 text_ids=extra_tensors["text_ids"],
                 text_mask=extra_tensors["text_mask"],
                 video_shape=video_shape,
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
+                audio_latents=current_audio,
             )
+
+            video_noise_pred = result.video
+            audio_noise_pred = result.audio
+
             if velocity_mask is not None:
-                noise_pred = noise_pred * velocity_mask
-            return noise_pred
+                video_noise_pred = video_noise_pred * velocity_mask
+
+            if audio_noise_pred is not None:
+                return video_noise_pred, {"audio": audio_noise_pred}
+            return video_noise_pred
+
+        def post_step_fn(step_latents):
+            # V2V only: re-impose the clean condition latents after every
+            # scheduler step. I2V deliberately keeps its pre-existing behavior
+            # (velocity mask during the loop, one write-back after it) so this
+            # PR does not alter I2V denoising; per-step anchoring for
+            # stochastic distilled schedulers belongs to the distilled work.
+            return velocity_mask * step_latents + (1.0 - velocity_mask) * condition_latents
 
         # 5. Build CFG tensors — text_ids and text_mask need to be split for CFG
         #    BasePipeline.denoise batches [uncond, cond] when guidance_scale > 1
@@ -604,7 +1211,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 6. Denoise
         timer.mark_denoise_start()
-        latents = self.denoise(
+        extra_streams = None
+        if do_audio:
+            extra_streams = {"audio": (audio_latents, self.audio_scheduler)}
+        should_pin_condition_latents = condition_latents is not None and velocity_mask is not None
+        denoise_result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
             prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
@@ -612,20 +1223,45 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             guidance_scale=guidance_scale,
             forward_fn=forward_fn,
             extra_cfg_tensors=extra_cfg_tensors,
+            extra_streams=extra_streams,
+            guidance_interval=guidance_interval,
+            # V2V pins the conditioning latents; distilled I2V re-anchors the
+            # conditioning frame. A request carries an image or a video, never
+            # both, so at most one of these applies.
+            post_step_fn=(
+                post_step_fn
+                if should_pin_condition_latents
+                else self._conditioning_anchor_post_step(image_latent)
+            ),
+            scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
         )
+
+        if extra_streams is not None:
+            latents, extra_latents = denoise_result
+            audio_latents = extra_latents.get("audio")
+        else:
+            latents = denoise_result
+            audio_latents = None
+
         timer.mark_post_start()
 
-        # 7. Decode
+        # 7. Decode video
         logger.info("Decoding video...")
         decode_start = time.time()
 
         if image_latent is not None:
-            latents = latents.clone()
-            latents[:, :, 0:1, :, :] = image_latent.to(device=latents.device, dtype=latents.dtype)
+            # In-place: the loop output is consumed only by the decode below.
+            latents[:, :, 0:1] = image_latent
 
         video = self.decode_latents(latents, self._decode_latents)
 
-        # Video guardrails
+        # 7b. Decode audio
+        waveform = None
+        if do_audio and audio_latents is not None:
+            logger.info("Decoding audio...")
+            waveform = self.decode_audio(audio_latents)  # [B, audio_channels, N_samples]
+
+        # Video guardrail
         if self.rank == 0:
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
@@ -634,4 +1270,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video = check_video_safety(video, self.safety_checker)
 
         timer.mark_end()
-        return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
+
+        if is_t2i:
+            # Collapse the single decoded frame [B, T=1, H, W, C] -> [B, H, W, C].
+            image = video[:, 0] if video is not None else None
+            return timer.fill(PipelineOutput(image=image))
+
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                frame_rate=frame_rate,
+                audio=waveform,
+                audio_sample_rate=self.audio_tokenizer.model_config["sampling_rate"]
+                if waveform is not None
+                else None,
+            )
+        )

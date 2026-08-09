@@ -4,11 +4,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-# isort: off
-# needed before trying to import bindings to load tensorrt_libs
-import tensorrt as trt  # noqa
-# isort: on
-
 from tensorrt_llm.bindings import executor as tllme
 
 
@@ -55,6 +50,10 @@ class DisaggregatedParams:
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[Dict[str, Any]] = None
+    # Multi-turn conversation id (from session headers such as X-Session-ID),
+    # carried through so worker-side consumers (e.g. the ADP router) can see
+    # the same id the disagg orchestrator routed on.
+    conversation_id: Optional[str] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (

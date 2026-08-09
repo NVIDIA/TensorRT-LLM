@@ -3,6 +3,7 @@
 
 """Tests for VisualGen warmup configuration, plan resolution, and shape validation."""
 
+import contextlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -104,6 +105,8 @@ class _BaseStubPipeline(BasePipeline):
         self._warmed_up_shapes = set()
         self.pipeline_config = MagicMock()
         self.pipeline_config.compilation = warmup_cfg or CompilationConfig()
+        # warmup() branches on this; keep the stub on the plain (no-autotune) path.
+        self.pipeline_config.torch_compile.enable_autotune = False
 
     def forward(self, *args, **kwargs):
         pass
@@ -285,6 +288,66 @@ class TestWarmupExecution:
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
         assert pipe._warmed_up_shapes == {(480, 832, 33)}
+
+
+class TestWarmupPhasing:
+    """warmup() tune/merge/capture phasing: number of warmup passes per config.
+
+    Fully mocked (autotune, communicator, dist, the pass itself) so it exercises
+    the branch logic without a GPU or a real process group.
+    """
+
+    def _count_passes(self, monkeypatch, *, enable_autotune, world_size, cuda_graph_enable):
+        import tensorrt_llm._torch.visual_gen.pipeline as pmod
+
+        pipe = _make_stub_pipeline(CompilationConfig(resolutions=[(480, 832)], num_frames=[33]))
+        pipe.pipeline_config.torch_compile.enable_autotune = enable_autotune
+        pipe.pipeline_config.cuda_graph.enable = cuda_graph_enable
+
+        passes = {"n": 0}
+        monkeypatch.setattr(
+            pipe, "_run_warmup_pass", lambda shapes, steps: passes.__setitem__("n", passes["n"] + 1)
+        )
+        monkeypatch.setattr(pipe, "disallow_cuda_graph_capture", lambda: contextlib.nullcontext())
+        monkeypatch.setattr(pmod, "autotune", lambda **kw: contextlib.nullcontext())
+        monkeypatch.setattr(pmod, "_VisualGenAutotuneDist", lambda amap: object())
+        monkeypatch.setattr(pmod.dist, "is_initialized", lambda: world_size > 1)
+        monkeypatch.setattr(pmod.dist, "get_world_size", lambda: world_size)
+
+        pipe.warmup()
+        return passes["n"]
+
+    def test_no_autotune_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=False, world_size=1, cuda_graph_enable=True
+            )
+            == 1
+        )
+
+    def test_single_rank_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=1, cuda_graph_enable=True
+            )
+            == 1
+        )
+
+    def test_multi_rank_two_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=2, cuda_graph_enable=True
+            )
+            == 2
+        )
+
+    def test_multi_rank_graph_off_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=2, cuda_graph_enable=False
+            )
+            == 1
+        )
 
 
 class TestRequestValidation:

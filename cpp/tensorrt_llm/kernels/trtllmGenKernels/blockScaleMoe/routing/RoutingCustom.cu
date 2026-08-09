@@ -28,6 +28,8 @@
 
 #include "RoutingCustomPolicy.cuh"
 
+#include <cstdlib>
+
 namespace moe::dev::routing
 {
 namespace routingCustom
@@ -389,6 +391,405 @@ void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
+// 1a. Cooperative block kernel — single-block fused kernel for ≤4 tokens and ≤1024 experts,
+//     raw-scores input, ELEMENTWISE preprocess policies only (None / Sigmoid / SigmoidBias).
+//
+//     Motivation: routingIndicesBlockKernel runs TopK with one warp per token over
+//     VecSize = MaxNumExperts/32 register-resident candidates. For the large-expert tiers
+//     (e.g. 1024 experts / MaxNumTopExperts 32) that needs ~200 registers per thread
+//     (score[V] + idx[V] + the 64-bit sort network + out arrays) while
+//     __launch_bounds__(1024) caps the kernel at 64 — everything spills to local memory
+//     and a single decode token costs ~33 us on GB300 (896 experts, topK 16).
+//
+//     This kernel instead assigns ONE THREAD PER EXPERT (ExpertsPerThread for >1024-thread
+//     tiers) so per-thread state is a couple of registers:
+//       Phase A: every thread computes its expert's selection score (elementwise preprocess),
+//                packs it with TopKRedType (identical encoding/tie-break as the classic path),
+//                and each warp extracts its own top-`topK` by iterated redux.sync max into a
+//                shared-memory candidate list (no register arrays, no sort network).
+//       Phase B: one warp per token merges the NumWarps sorted candidate lists with a
+//                lane-per-list cursor loop — the k-th extracted winner is the k-th largest
+//                packed value overall, i.e. bit-identical selection (packed values are unique
+//                since the expert index is embedded in the low bits).
+//                Lane k keeps the k-th (score, expertIdx) — the same lane layout the classic
+//                kernels use — then applies the postprocess policy and writes the weights.
+//       Phase C: histogram / prefix-scan / CTA configs / permutation, identical math to
+//                routingIndicesBlockKernel but with the fused dual warp-scan (2 barriers)
+//                instead of two cub::BlockScans.
+//
+//     Bit-exactness vs routingIndicesBlockKernel (required — expert selection must not
+//     change under the small-batch fast path):
+//       * per-element preprocess math is the same ops in the same per-element order;
+//       * selection order is the same total order on the same packed 64/32-bit values;
+//       * postprocess warp reductions see the same values in the same lanes.
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelParams::MaxNumExperts : 1024)
+    routingIndicesCoopBlockKernel(KernelParams params)
+{
+    using OutputT = typename KernelParams::OutputT;
+    using InputT = typename KernelParams::InputT;
+    using ExpertSelect = typename KernelParams::ExpertSelectPolicy;
+    using PreProc = typename ExpertSelect::PreprocessPolicy;
+    using PostProc = typename ExpertSelect::PostprocessPolicy;
+    using BaseType = typename ExpertSelect::template BaseType<InputT>;
+    using RedType = topk::TopKRedType<BaseType>;
+    using TypeCmp = typename RedType::TypeCmp;
+
+    static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
+    static constexpr int MaxTopK = KernelParams::MaxNumTopExperts;
+    static constexpr int NumThreadsBlock = MaxNumExperts <= 1024 ? MaxNumExperts : 1024;
+    static constexpr int ExpertsPerThread = MaxNumExperts / NumThreadsBlock;
+    static constexpr int NumWarpsBlock = NumThreadsBlock / WarpSize;
+    static_assert(MaxNumExperts % NumThreadsBlock == 0, "MaxNumExperts must be a multiple of NumThreadsBlock");
+    static_assert(NumWarpsBlock <= WarpSize, "the merge phase holds one candidate list per lane");
+
+    // The host dispatch (run()) only selects this kernel for tiers within these limits and for
+    // elementwise preprocess policies; other instantiations exist only to satisfy the generic
+    // policy dispatch macros and must stay compilable (and small).
+    static constexpr bool Supported = MaxNumExperts <= CoopBlockKernelMaxNumExperts && PreProc::IsElementwise;
+
+    if constexpr (Supported)
+    {
+        static constexpr int MaxNumTokens = BlockKernelMaxNumTokens;
+
+        int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+        int32_t const laneIdx = cutlass::arch::LaneId();
+
+        __shared__ int8_t __attribute((aligned(128))) smemKIdx[MaxNumTokens * MaxNumExperts];
+        __shared__ int8_t __attribute((aligned(128))) smemOffset[MaxNumTokens * MaxNumExperts];
+        // Per-warp sorted candidate lists (descending packed values), per token.
+        __shared__ TypeCmp __attribute((aligned(128))) smemCand[MaxNumTokens][NumWarpsBlock * MaxTopK];
+        __shared__ int32_t __attribute((aligned(128))) warpTotals1[NumWarpsBlock];
+        __shared__ int32_t __attribute((aligned(128))) warpTotals2[NumWarpsBlock];
+
+        auto block = cg::this_thread_block();
+        auto warp = cg::tiled_partition<WarpSize>(block);
+
+        int const numSlots = params.mNumTokens * MaxNumExperts;
+        for (int i = threadIdx.x; i < numSlots; i += blockDim.x)
+        {
+            smemKIdx[i] = int8_t{-1};
+        }
+        __syncthreads();
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        // Wait on the primary grid: the scores are produced by the preceding kernel.
+        if (params.mUsePdl)
+        {
+            cudaGridDependencySynchronize();
+        }
+#endif
+
+        BaseType const minScore = BaseType{-INFINITY};
+        bool const expertThread = threadIdx.x < NumThreadsBlock;
+
+        // ----- Phase A: per-warp topK extraction, one token at a time (≤4) -----
+        for (int tokenIdx = 0; tokenIdx < params.mNumTokens; ++tokenIdx)
+        {
+            InputT const* scorePtr = params.mPtrScores + tokenIdx * params.mNumExperts;
+
+            BaseType score[ExpertsPerThread];
+            int32_t idx[ExpertsPerThread];
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                // Contiguous per-thread expert assignment — same as the histogram phase below.
+                int32_t const expertIdx = threadIdx.x * ExpertsPerThread + e;
+                score[e] = expertThread && expertIdx < params.mNumExperts ? static_cast<BaseType>(scorePtr[expertIdx])
+                                                                          : minScore;
+                idx[e] = expertIdx;
+            }
+            // Elementwise preprocess: identical per-element math to the classic kernels.
+            PreProc::apply(warp, score, idx, params.mNumExperts, params.mExpertSelectParams.mPreprocessParams);
+
+            RedType cand[ExpertsPerThread];
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                cand[e] = RedType{score[e], idx[e]};
+            }
+
+            // Iteratively extract this warp's top `topK` packed candidates (descending).
+            for (int kk = 0; kk < params.mTopK; ++kk)
+            {
+                RedType localMax = cand[0];
+#pragma unroll
+                for (int e = 1; e < ExpertsPerThread; ++e)
+                {
+                    localMax.compVal = max(localMax.compVal, cand[e].compVal);
+                }
+                TypeCmp const warpMax = localMax.reduce(warp);
+#pragma unroll
+                for (int e = 0; e < ExpertsPerThread; ++e)
+                {
+                    // Invalidate the winner (packed values are unique — idx is embedded).
+                    cand[e] = warpMax == cand[e].compVal ? RedType{minScore, idx[e]} : cand[e];
+                }
+                if (laneIdx == 0 && warpIdx < NumWarpsBlock)
+                {
+                    smemCand[tokenIdx][warpIdx * MaxTopK + kk] = warpMax;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ----- Phase B: merge the per-warp lists — warp t handles token t -----
+        if (warpIdx < params.mNumTokens)
+        {
+            int32_t const tokenIdx = warpIdx;
+            // Lane l walks warp-list l. Empty-lane sentinel 0 is strictly below any candidate:
+            // every candidate has (65535 - idx) > 0 in its low bits.
+            int cursor = 0;
+            TypeCmp head = laneIdx < NumWarpsBlock ? smemCand[tokenIdx][laneIdx * MaxTopK] : TypeCmp{0};
+
+            BaseType myScore = BaseType{0};
+            int32_t myIdx = int32_t{-1};
+            for (int kk = 0; kk < params.mTopK; ++kk)
+            {
+                RedType redCand;
+                redCand.compVal = head;
+                TypeCmp const winner = redCand.reduce(warp);
+                if (head == winner && laneIdx < NumWarpsBlock)
+                {
+                    ++cursor;
+                    head = cursor < params.mTopK ? smemCand[tokenIdx][laneIdx * MaxTopK + cursor] : TypeCmp{0};
+                }
+                if (laneIdx == kk)
+                {
+                    RedType::unpack(myScore, myIdx, winner);
+                }
+            }
+
+            // Postprocess with the canonical lane layout (lane k holds the k-th top entry).
+            // The policies only access element [laneIdx] of these arrays.
+            BaseType warpTopKScore[MaxTopK];
+            int32_t warpTopKExpertIdx[MaxTopK];
+            if (laneIdx < params.mTopK)
+            {
+                warpTopKScore[laneIdx] = myScore;
+                warpTopKExpertIdx[laneIdx] = myIdx;
+            }
+            PostProc::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mTopK,
+                params.mExpertSelectParams.mPostprocessParams);
+
+            if (laneIdx < params.mTopK)
+            {
+                smemKIdx[tokenIdx * MaxNumExperts + myIdx] = static_cast<int8_t>(laneIdx);
+                if (params.mPtrTopKWeights != nullptr)
+                {
+                    params.mPtrTopKWeights[tokenIdx * params.mTopK + laneIdx] = OutputT{warpTopKScore[laneIdx]};
+                }
+            }
+        }
+        __syncthreads();
+
+        // ----- Phase C: histogram / scan / CTA configs / permutation -----
+        // Identical math to routingIndicesBlockKernel; fused dual warp-scan like the dyn-block kernel.
+        int accExpertCount[ExpertsPerThread];
+#pragma unroll
+        for (int e = 0; e < ExpertsPerThread; ++e)
+        {
+            accExpertCount[e] = 0;
+        }
+        if (expertThread)
+        {
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                int const expert = threadIdx.x * ExpertsPerThread + e;
+                auto const localExpIdx = expert - params.mLocalExpertsStartIdx;
+                auto const isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts
+                    && (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+                if (isLocal)
+                {
+                    int offset = expert;
+                    for (int j = 0; j < params.mNumTokens; ++j)
+                    {
+                        if (smemKIdx[offset] >= 0)
+                        {
+                            smemOffset[offset] = static_cast<int8_t>(accExpertCount[e]);
+                            accExpertCount[e]++;
+                        }
+                        offset += MaxNumExperts;
+                    }
+                }
+            }
+        }
+
+        int32_t numCtaPerExpert[ExpertsPerThread];
+        int32_t tmpCountPerExpert[ExpertsPerThread];
+        int32_t ctaOffsetPerExpert[ExpertsPerThread];
+        int32_t expertScanCountsPerExpert[ExpertsPerThread];
+        int32_t numNonExitingCtas;
+        {
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                if (expertThread)
+                {
+                    if (params.mIsPow2)
+                    {
+                        numCtaPerExpert[e] = divUpLog2<int32_t>(accExpertCount[e], params.mPaddingLog2);
+                        tmpCountPerExpert[e] = divUpMulLog2<int32_t>(accExpertCount[e], params.mPaddingLog2);
+                    }
+                    else
+                    {
+                        numCtaPerExpert[e] = divUpTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
+                        tmpCountPerExpert[e] = divUpMulTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
+                    }
+                }
+                else
+                {
+                    numCtaPerExpert[e] = 0;
+                    tmpCountPerExpert[e] = 0;
+                }
+            }
+
+            int32_t localPrefix1[ExpertsPerThread], localPrefix2[ExpertsPerThread];
+            int32_t threadTotal1 = 0, threadTotal2 = 0;
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                localPrefix1[e] = threadTotal1;
+                localPrefix2[e] = threadTotal2;
+                threadTotal1 += numCtaPerExpert[e];
+                threadTotal2 += tmpCountPerExpert[e];
+            }
+
+            int32_t threadPrefix1, threadPrefix2;
+            warpExclusiveScan<NumWarpsBlock>(threadTotal1, threadTotal2, laneIdx, warpIdx, warpTotals1, warpTotals2,
+                threadPrefix1, threadPrefix2, numNonExitingCtas);
+
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                ctaOffsetPerExpert[e] = threadPrefix1 + localPrefix1[e];
+                expertScanCountsPerExpert[e] = threadPrefix2 + localPrefix2[e];
+            }
+        }
+
+        if (expertThread)
+        {
+#pragma unroll
+            for (int e = 0; e < ExpertsPerThread; ++e)
+            {
+                int const expert = threadIdx.x * ExpertsPerThread + e;
+                auto const localExpIdx = expert - params.mLocalExpertsStartIdx;
+                auto const isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts
+                    && (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+                if (isLocal)
+                {
+                    for (int cta = 0; cta < numCtaPerExpert[e]; ++cta)
+                    {
+                        int32_t const mappedLocalIdx
+                            = (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+                        params.mPtrCtaIdxXyToBatchIdx[ctaOffsetPerExpert[e] + cta] = mappedLocalIdx;
+                        int32_t mnLimit1;
+                        int32_t mnLimit2;
+                        if (params.mIsPow2)
+                        {
+                            mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mPaddingLog2);
+                            mnLimit2 = mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2) + accExpertCount[e];
+                        }
+                        else
+                        {
+                            mnLimit1 = mulTileN<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mTileTokensDim);
+                            mnLimit2
+                                = mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
+                        }
+                        params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
+                    }
+                }
+            }
+        }
+
+        if (threadIdx.x == 0)
+        {
+            int32_t permutedIdxSize;
+            if (params.mIsPow2)
+            {
+                permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+            }
+            else
+            {
+                permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+            }
+            params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+            params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+        }
+
+        if (expertThread)
+        {
+            for (int tokenIdx = 0; tokenIdx < params.mNumTokens; ++tokenIdx)
+            {
+#pragma unroll
+                for (int e = 0; e < ExpertsPerThread; ++e)
+                {
+                    int const expert = threadIdx.x * ExpertsPerThread + e;
+                    int const offset = tokenIdx * MaxNumExperts + expert;
+                    if (smemKIdx[offset] >= 0)
+                    {
+                        auto const localExpIdx = expert - params.mLocalExpertsStartIdx;
+                        auto const isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts
+                            && (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+
+                        int const expandedIdx = tokenIdx * params.mTopK + smemKIdx[offset];
+                        int const offsetWithinExpert = static_cast<int>(smemOffset[offset]);
+                        int const offsetForExpert = expertScanCountsPerExpert[e];
+                        int const permutedIdx = isLocal ? offsetForExpert + offsetWithinExpert : int32_t{-1};
+
+                        if (params.mPtrExpandedIdxToPermutedIdx != nullptr)
+                        {
+                            params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+                        }
+                        if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocal)
+                        {
+                            params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+                        }
+                        if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocal)
+                        {
+                            params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
+                        }
+                    }
+                }
+            }
+        }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        // Trigger the secondary kernel AFTER all global memory writes (including permutation
+        // indices) — downstream kernels depend on all routing outputs being visible.
+        if (params.mUsePdl)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+#endif
+    }
+    else
+    {
+        // Unsupported instantiation — never launched (see run()).
+        (void) params;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        if (params.mUsePdl)
+        {
+            cudaGridDependencySynchronize();
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+#endif
+    }
+}
+
+void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
+{
+    LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesCoopBlockKernel, 1, numThreadsHist,
+        /*smemSize=*/0, // No dynamic smem
+        stream);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
 // 1b. Dynamic-block kernel — single-block with dynamic thread count and dynamic shared memory.
 //
 //     Compared to routingIndicesBlockKernel (which fixes blockDim = MaxExperts):
@@ -709,23 +1110,78 @@ void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename KernelParams>
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
-    routingIndicesClusterKernel(KernelParams params)
+static constexpr int ClusterBlockDim256 = NumExperts256Experts;
+static constexpr int ClusterBlockDim512 = NumExperts512Experts;
+static constexpr int ClusterBlockDim1024 = NumThreads;
+static constexpr int MaxNumTokensClusterScores256 = NumBlocksPerCluster * (ClusterBlockDim256 / WarpSize);
+static constexpr int MaxNumTokensClusterScores512 = NumBlocksPerCluster * (ClusterBlockDim512 / WarpSize);
+
+template <typename TierT, typename TierListT>
+struct PrependTier;
+
+template <typename TierT, typename... Tiers>
+struct PrependTier<TierT, TierList<Tiers...>>
+{
+    using type = TierList<TierT, Tiers...>;
+};
+
+template <int ClusterBlockDim, typename TierListT>
+struct FilterClusterTiers;
+
+template <int ClusterBlockDim>
+struct FilterClusterTiers<ClusterBlockDim, TierList<>>
+{
+    using type = TierList<>;
+};
+
+template <int ClusterBlockDim, typename First, typename... Rest>
+struct FilterClusterTiers<ClusterBlockDim, TierList<First, Rest...>>
+{
+    using Tail = typename FilterClusterTiers<ClusterBlockDim, TierList<Rest...>>::type;
+    static constexpr bool IsValid = First::kExperts <= ClusterBlockDim || First::kExperts % ClusterBlockDim == 0;
+    using type = std::conditional_t<IsValid, typename PrependTier<First, Tail>::type, Tail>;
+};
+
+template <int ClusterBlockDim, typename PreProc, typename PostProc>
+struct ClusterPolicyTraits
+{
+    using Pairs = typename FilterClusterTiers<ClusterBlockDim, typename PolicyTraits<PreProc, PostProc>::Pairs>::type;
+};
+
+template <>
+struct ClusterPolicyTraits<ClusterBlockDim1024, NoOpPreprocess, SoftmaxPostprocess>
+{
+    using Pairs = TierList<Tier<128, 4>, Tier<128, 8>, Tier<160, 8>, Tier<256, 8>, Tier<256, 16>, Tier<512, 8>,
+        Tier<512, 16>, Tier<512, 22>, Tier<512, 32>, Tier<576, 8>, Tier<768, 32>, Tier<1024, 32>, Tier<2048, 32>>;
+};
+
+template <>
+struct ClusterPolicyTraits<ClusterBlockDim512, NoOpPreprocess, SoftmaxPostprocess>
+{
+    using Pairs = TierList<Tier<128, 4>, Tier<128, 8>, Tier<160, 8>, Tier<256, 8>, Tier<256, 16>, Tier<512, 8>,
+        Tier<512, 16>, Tier<512, 22>, Tier<512, 32>, Tier<1024, 32>, Tier<1536, 32>, Tier<2048, 32>>;
+};
+
+template <>
+struct ClusterPolicyTraits<ClusterBlockDim256, NoOpPreprocess, SoftmaxPostprocess>
+{
+    using Pairs = TierList<Tier<128, 4>, Tier<128, 8>, Tier<160, 8>, Tier<256, 8>, Tier<256, 16>, Tier<512, 8>,
+        Tier<512, 16>, Tier<512, 22>, Tier<512, 32>, Tier<768, 32>, Tier<1024, 32>, Tier<1536, 32>, Tier<2048, 32>>;
+};
+
+template <typename KernelParams, typename BaseType, int ClusterBlockDim, int ClusterNumWarps>
+__device__ __forceinline__ void routingIndicesClusterKernelBody(
+    KernelParams params, PackedScoreIdx<BaseType>* smemPackedScoreIdx)
 {
     using OutputT = typename KernelParams::OutputT;
     using InputT = typename KernelParams::InputT;
-    using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
     using TypePacked = PackedScoreIdx<BaseType>;
     static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
-
-    __shared__ TypePacked __attribute((aligned(128))) smemPackedScoreIdx[NumWarps * KernelParams::MaxNumTopExperts];
 
     uint32_t const clusterBlockRank = blockIdx.x;
     int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
     int32_t const laneIdx = cutlass::arch::LaneId();
-    auto warpTokenIdx = clusterBlockRank * NumWarps + warpIdx;
+    auto warpTokenIdx = clusterBlockRank * ClusterNumWarps + warpIdx;
     auto scoreOffset = warpTokenIdx * params.mNumExperts;
     bool validToken = warpTokenIdx < params.mNumTokens;
     auto block = cg::this_thread_block();
@@ -758,24 +1214,136 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
 
     if (params.mPtrScores != nullptr)
     {
-        routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, KernelParams::MaxNumTopExperts,
+        routingPermutation<KernelParams, BaseType, ClusterBlockDim, ClusterNumWarps, KernelParams::MaxNumTopExperts,
             /*LoadExpertIdxFromGlobal=*/false>(params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
     }
     else
     {
-        routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, KernelParams::MaxNumTopExperts,
+        routingPermutation<KernelParams, BaseType, ClusterBlockDim, ClusterNumWarps, KernelParams::MaxNumTopExperts,
             /*LoadExpertIdxFromGlobal=*/true>(params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
     }
 }
+
+template <typename KernelParams, int ClusterBlockDim = NumThreads>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(ClusterBlockDim)
+    routingIndicesClusterKernel(KernelParams params)
+{
+    using InputT = typename KernelParams::InputT;
+    using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+    using TypePacked = PackedScoreIdx<BaseType>;
+    static constexpr int NumWarpsBlock = ClusterBlockDim / WarpSize;
+    static_assert(ClusterBlockDim % WarpSize == 0);
+    static_assert(ClusterBlockDim <= NumThreads);
+    __shared__ TypePacked __attribute((aligned(128)))
+    smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
+    routingIndicesClusterKernelBody<KernelParams, BaseType, ClusterBlockDim, NumWarpsBlock>(params, smemPackedScoreIdx);
+}
 #else
-__global__ void __launch_bounds__(NumThreads) routingIndicesClusterKernel(KernelParams /* params */)
+__global__ void __launch_bounds__(ClusterBlockDim) routingIndicesClusterKernel(KernelParams /* params */)
 {
     assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
+template <typename KernelParams, int ClusterBlockDim>
+void launchClusterKernelInstance(Data const& data, void* stream)
+{
+    static_assert(ClusterBlockDim % WarpSize == 0);
+    static_assert(ClusterBlockDim <= NumThreads);
+
+    cudaLaunchConfig_t config{};
+    config.gridDim = NumBlocksPerCluster;
+    config.blockDim = ClusterBlockDim;
+    config.dynamicSmemBytes = 0;
+    config.stream = (cudaStream_t) stream;
+
+    cudaLaunchAttribute attributes[2] = {};
+    attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);
+    attributes[1].id = cudaLaunchAttributeCooperative;
+    attributes[1].val.cooperative = 0;
+    config.attrs = attributes;
+    config.numAttrs = 2;
+
+    auto params = KernelParams::setKernelParams(data);
+    auto kernelTyped = routingIndicesClusterKernel<KernelParams, ClusterBlockDim>;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernelTyped, params));
+}
+
+template <int ClusterBlockDim, typename PreProc, typename PostProc, int MaxNumExperts, int MaxNumTopExperts>
+void launchClusterKernelForTier(Data const& data, void* stream)
+{
+    using ExpertSelect = TopKExpertSelect<PreProc, PostProc>;
+    if (data.mDtypeOutput == tg::Dtype::Fp32)
+    {
+        using ParamsT = KernelParams<float, float, MaxNumExperts, MaxNumTopExperts, ExpertSelect>;
+        launchClusterKernelInstance<ParamsT, ClusterBlockDim>(data, stream);
+    }
+    else if (data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mDtypeInput == tg::Dtype::Fp32)
+    {
+        using ParamsT = KernelParams<float, __nv_bfloat16, MaxNumExperts, MaxNumTopExperts, ExpertSelect>;
+        launchClusterKernelInstance<ParamsT, ClusterBlockDim>(data, stream);
+    }
+    else if (data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mDtypeInput == tg::Dtype::Bfloat16)
+    {
+        using ParamsT = KernelParams<__nv_bfloat16, __nv_bfloat16, MaxNumExperts, MaxNumTopExperts, ExpertSelect>;
+        launchClusterKernelInstance<ParamsT, ClusterBlockDim>(data, stream);
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",
+            static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));
+    }
+}
+
+template <int ClusterBlockDim, typename PreProc, typename PostProc>
+void launchClusterKernelForPolicy(Data const& data, void* stream)
+{
+    using Pairs = typename ClusterPolicyTraits<ClusterBlockDim, PreProc, PostProc>::Pairs;
+    bool dispatched = dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
+        [&](auto eTag, auto kTag)
+        {
+            launchClusterKernelForTier<ClusterBlockDim, PreProc, PostProc, decltype(eTag)::value,
+                decltype(kTag)::value>(data, stream);
+        });
+    if (!dispatched)
+    {
+        TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+    }
+}
+
+template <int ClusterBlockDim>
+void launchClusterKernelForBlockDim(Data const& data, void* stream)
+{
+    dispatchRoutingPolicy(data,
+        [&](auto preProc, auto postProc)
+        { launchClusterKernelForPolicy<ClusterBlockDim, decltype(preProc), decltype(postProc)>(data, stream); });
+}
+
 void launchClusterKernel(Data const& data, void* stream)
 {
+    // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
+    // Use them only where the requested token count fits; otherwise keep the original 1024-thread launch.
+    if (data.mNumTokens <= MaxNumTokensClusterScores256)
+    {
+        launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
+        return;
+    }
+    if (data.mNumTokens <= MaxNumTokensClusterScores512)
+    {
+        launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+        return;
+    }
+
+    bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr && data.mPreprocessType == RoutingPreprocessType::None
+        && data.mPostprocessType == RoutingPostprocessType::Softmax;
+    if (useNoOpSoftmaxScores)
+    {
+        launchClusterKernelForPolicy<ClusterBlockDim1024, NoOpPreprocess, SoftmaxPostprocess>(data, stream);
+        return;
+    }
+
     LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
         /*smemSize=*/0, // No dynamic smem
         stream);
@@ -788,15 +1356,74 @@ void launchClusterKernel(Data const& data, void* stream)
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <int MaxNumExperts, int MaxNumTopExperts>
+struct HistogramScoresLaunchConfig : DefaultRoutingLaunchConfig<MaxNumExperts, MaxNumTopExperts>
+{
+    static constexpr int DefaultBlockDim = DefaultRoutingLaunchConfig<MaxNumExperts, MaxNumTopExperts>::BlockDim;
+    static constexpr int HistogramScoresBlockDim = NumExperts256Experts;
+
+    // This kernel uses one warp per token and keeps per-warp arrays sized by both the expert tier and
+    // the topK tier. The 256-expert tier already launches with 256 threads; for larger tiers, fewer
+    // warps per CTA gives each thread more register headroom while preserving total warp-level
+    // parallelism by scaling the grid cap below.
+    static constexpr bool UseHistogramScoresBlockDim = DefaultBlockDim > HistogramScoresBlockDim;
+    static constexpr int BlockDim = UseHistogramScoresBlockDim ? HistogramScoresBlockDim : DefaultBlockDim;
+
+    static_assert(BlockDim % WarpSize == 0);
+    static_assert(BlockDim <= NumThreads);
+
+    static int blockDim(Data const& /*data*/, int /*numThreads*/)
+    {
+        return BlockDim;
+    }
+
+    static int gridDim(Data const& data, int numBlocks, int /*blockDim*/)
+    {
+        if constexpr (UseHistogramScoresBlockDim)
+        {
+            static constexpr int NumWarpsBlock = BlockDim / WarpSize;
+            static constexpr int MaxBlockScale = (DefaultBlockDim + BlockDim - 1) / BlockDim;
+            int const tokenBlocks = (static_cast<int>(data.mNumTokens) + NumWarpsBlock - 1) / NumWarpsBlock;
+            int const scaledMaxBlocks = numBlocks * MaxBlockScale;
+            int const selectedBlocks = tokenBlocks < scaledMaxBlocks ? tokenBlocks : scaledMaxBlocks;
+            return selectedBlocks > 0 ? selectedBlocks : 1;
+        }
+        else
+        {
+            return DefaultRoutingLaunchConfig<MaxNumExperts, MaxNumTopExperts>::gridDim(
+                data, numBlocks, DefaultBlockDim);
+        }
+    }
+};
+
+template <typename ExpertSelect, int MaxNumExperts, int MaxNumTopExperts>
+struct HistogramScoresKernelConfig : HistogramScoresLaunchConfig<MaxNumExperts, MaxNumTopExperts>
+{
+};
+
+template <typename PreProc, typename PostProc>
+struct HistogramScoresPolicyTraits : PolicyTraits<PreProc, PostProc>
+{
+};
+
+template <>
+struct HistogramScoresPolicyTraits<NoOpPreprocess, SoftmaxPostprocess>
+{
+    using Pairs
+        = TierList<Tier<128, 4>, Tier<128, 8>, Tier<160, 8>, Tier<256, 8>, Tier<256, 16>, Tier<512, 8>, Tier<512, 16>,
+            Tier<512, 22>, Tier<512, 32>, Tier<576, 8>, Tier<768, 32>, Tier<1024, 32>, Tier<1536, 32>, Tier<2048, 32>>;
+};
+
 template <typename KernelParams>
-__global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelParams::MaxNumExperts : 1024)
+__global__ void __launch_bounds__(HistogramScoresKernelConfig<typename KernelParams::ExpertSelectPolicy,
+    KernelParams::MaxNumExperts, KernelParams::MaxNumTopExperts>::BlockDim)
     routingIndicesHistogramScoresKernel(KernelParams params)
 {
     using OutputT = typename KernelParams::OutputT;
     using InputT = typename KernelParams::InputT;
     using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
-    // Cap actual thread count at 1024 when MaxNumExperts > 1024.
-    static constexpr int NumThreadsBlock = KernelParams::MaxNumExperts <= 1024 ? KernelParams::MaxNumExperts : 1024;
+    static constexpr int NumThreadsBlock = HistogramScoresKernelConfig<typename KernelParams::ExpertSelectPolicy,
+        KernelParams::MaxNumExperts, KernelParams::MaxNumTopExperts>::BlockDim;
 
     // VecSize stays based on MaxNumExperts — each warp still processes all experts for one token.
     static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
@@ -855,9 +1482,30 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
 static void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist, void* stream)
 {
-    LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesHistogramScoresKernel, maxNumBlocks, numThreadsHist,
-        /*smemSize=*/0, // No dynamic smem
-        stream);
+    dispatchRoutingPolicy(data,
+        [&](auto preProc, auto postProc)
+        {
+            using PreProc = decltype(preProc);
+            using PostProc = decltype(postProc);
+            using Pairs = typename HistogramScoresPolicyTraits<PreProc, PostProc>::Pairs;
+            bool dispatched = dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
+                [&](auto eTag, auto kTag)
+                {
+                    using ExpertSelect = TopKExpertSelect<PreProc, PostProc>;
+                    using LaunchConfig
+                        = HistogramScoresKernelConfig<ExpertSelect, decltype(eTag)::value, decltype(kTag)::value>;
+                    int const effectiveThreads = LaunchConfig::blockDim(data, static_cast<int>(numThreadsHist));
+                    int const effectiveBlocks
+                        = LaunchConfig::gridDim(data, static_cast<int>(maxNumBlocks), effectiveThreads);
+                    LAUNCH_ROUTING_WITH_POLICIES(data, false, routingIndicesHistogramScoresKernel, effectiveBlocks,
+                        effectiveThreads,
+                        /*smemSize=*/0, stream, PreProc, PostProc, decltype(eTag)::value, decltype(kTag)::value);
+                });
+            if (!dispatched)
+            {
+                TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);
+            }
+        });
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -981,6 +1629,21 @@ void run(Data const& data, void* stream)
 
     bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
     int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
+    // Cooperative block kernel: fastest path for tiny batches. Requires an elementwise
+    // preprocess (any but softmax-over-experts) and one CUDA block's worth of experts.
+    // Critical for large expert counts, where the classic one-warp-per-token TopK spills
+    // registers under the 1024-thread launch bounds (e.g. 896 experts / topK 16 at decode).
+    bool const preprocessIsElementwise = data.mPreprocessType == RoutingPreprocessType::None
+        || data.mPreprocessType == RoutingPreprocessType::Sigmoid
+        || data.mPreprocessType == RoutingPreprocessType::SigmoidBias;
+    // Escape hatch for A/B validation and emergency fallback to the classic block kernel.
+    static bool const disableCoopBlock = []
+    {
+        char const* env = std::getenv("TLLM_ROUTING_DISABLE_COOP_BLOCK");
+        return env != nullptr && env[0] == '1';
+    }();
+    bool const useCoopBlock = !disableCoopBlock && useStaticBlock && preprocessIsElementwise
+        && dispatchedMaxExperts <= CoopBlockKernelMaxNumExperts;
     bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens
         && dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
     bool const useSingleBlock = useStaticBlock || useDynBlock;
@@ -998,7 +1661,11 @@ void run(Data const& data, void* stream)
 
     Data lastKernelData = data;
 
-    if (useDynBlock)
+    if (useCoopBlock)
+    {
+        launchCoopBlockKernel(lastKernelData, numThreadsHist, stream);
+    }
+    else if (useDynBlock)
     {
         launchDynBlockKernel(lastKernelData, numThreadsHist, stream);
     }

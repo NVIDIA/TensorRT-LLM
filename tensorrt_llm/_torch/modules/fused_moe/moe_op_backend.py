@@ -25,6 +25,8 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
+from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -105,6 +107,7 @@ class MoEOpBackend:
         gemm2_weights_scale: torch.Tensor,
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -115,6 +118,7 @@ class MoEOpBackend:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         gated_act_type: int = 0,
+        gemm1_clamp_limit: Optional[float] = None,
         output: Optional[torch.Tensor] = None,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
@@ -203,11 +207,9 @@ class TRTLLMOpBackend(MoEOpBackend):
 
     def __init__(self):
         from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
-        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 
         self._MnnvlMemory = MnnvlMemory
         self._MnnvlMoe = MnnvlMoe
-        self._MoeAlltoAll = MoeAlltoAll
 
     # Quantization
     def fp4_quantize(
@@ -246,6 +248,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         gemm2_weights_scale,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -256,6 +259,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=0,
+        gemm1_clamp_limit=None,
         output=None,
         use_shuffled_weight=False,
         weight_layout=0,
@@ -274,6 +278,7 @@ class TRTLLMOpBackend(MoEOpBackend):
             gemm2_weights_scale,
             num_experts,
             top_k,
+            num_fused_shared_experts,
             n_group,
             topk_group,
             intermediate_size,
@@ -284,6 +289,7 @@ class TRTLLMOpBackend(MoEOpBackend):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             act_type=gated_act_type,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             output=output,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp,
@@ -328,6 +334,37 @@ class TRTLLMOpBackend(MoEOpBackend):
         use_dp=False,
     ):
         hidden_size = gemm1_weights.shape[-1] * 2
+        if gated_act_type == int(ActType_TrtllmGen.SiTu):
+            if hidden_states.dtype != torch.float8_e4m3fn or hidden_states_scale is None:
+                raise ValueError(
+                    "TRTLLM-Gen SiTu expects dynamically quantized MXFP8 "
+                    "activations with block scales, got "
+                    f"dtype={hidden_states.dtype}, "
+                    f"has_scale={hidden_states_scale is not None}."
+                )
+            if gemm1_weights_scale is None or gemm1_weights_scale.shape[-1] != hidden_size // 32:
+                raise ValueError("TRTLLM-Gen SiTu requires MXFP4 weights with group-32 scales.")
+            if gemm1_alpha is None or gemm1_beta is None:
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires per-local-expert alpha and beta tensors."
+                )
+            for name, value in (("gemm1_alpha", gemm1_alpha), ("gemm1_beta", gemm1_beta)):
+                if (
+                    value.dtype != torch.float32
+                    or not value.is_contiguous()
+                    or value.numel() != local_num_experts
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous float32 with {local_num_experts} elements."
+                    )
+            if gemm1_clamp_limit is not None:
+                raise ValueError("TRTLLM-Gen SiTu does not use gemm1_clamp_limit.")
+            if valid_hidden_size is None or valid_intermediate_size is None:
+                raise ValueError(
+                    "TRTLLM-Gen SiTu requires valid hidden and intermediate "
+                    "sizes for padded MXFP4 weights."
+                )
+
         if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
             if (
                 gemm1_weights_scale is not None
@@ -589,6 +626,7 @@ class FlashinferOpBackend(MoEOpBackend):
         gemm2_weights_scale,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -599,6 +637,7 @@ class FlashinferOpBackend(MoEOpBackend):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=0,
+        gemm1_clamp_limit=None,
         output=None,
         use_shuffled_weight=False,
         weight_layout=0,
@@ -606,6 +645,14 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        assert not num_fused_shared_experts, (
+            "Flashinfer backend does not support fusing shared experts"
+        )
+        if gemm1_clamp_limit is not None:
+            raise NotImplementedError(
+                "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
+                "forward gemm1_clamp_limit; use the trtllm op backend."
+            )
         if router_logits is not None:
             return self._fused_moe.trtllm_fp8_block_scale_moe(
                 router_logits,

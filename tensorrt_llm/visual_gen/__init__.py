@@ -32,10 +32,11 @@ from .args import (
     CudaGraphConfig,
     ParallelConfig,
     QuantAttentionConfig,
-    SkipSoftmaxConfig,
+    SkipSoftmaxAttentionConfig,
     SparseAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
 from .output import VisualGenMetrics, VisualGenOutput
@@ -59,7 +60,8 @@ __all__ = [
     "AttentionConfig",
     "QuantAttentionConfig",
     "SparseAttentionConfig",
-    "SkipSoftmaxConfig",
+    "SkipSoftmaxAttentionConfig",
+    "VideoSparseAttentionConfig",
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",

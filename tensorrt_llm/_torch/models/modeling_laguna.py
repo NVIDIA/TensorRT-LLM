@@ -14,6 +14,7 @@
 # limitations under the License.
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
+import math
 from typing import Dict, List, Optional, Type
 
 import torch
@@ -304,7 +305,14 @@ class LagunaAttention(QKNormRoPEAttention):
             rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
             attention_factor = rp_dict.get("attention_factor")
             if attention_factor is not None:
-                rp.mscale = float(attention_factor)
+                attention_factor = float(attention_factor)
+                # attention_factor is the FINAL YaRN scaling (HF semantics).
+                # create_sinusoidal_positions_yarn applies get_mscale(factor, rp.mscale)
+                # = 0.1*rp.mscale*ln(factor)+1 (mscale_all_dim=0), so setting mscale to the
+                # final value routes it through the log twice. Invert to reproduce it exactly.
+                rp.mscale = (
+                    ((attention_factor - 1.0) / (0.1 * math.log(rp.scale))) if rp.scale > 1 else 1.0
+                )
             rp.original_max_positions = int(
                 rp_dict.get("original_max_position_embeddings", config.max_position_embeddings)
             )
@@ -680,3 +688,8 @@ class LagunaHfWeightMapper(HfWeightMapper):
                 updated[new_wn] = wv
             del module_weights
             module.load_weights(weights=[updated], allow_partial_loading=allow_partial_loading)
+
+
+@register_mapper("HF", "DFlashLagunaForCausalLM")
+class DFlashLagunaHfWeightMapper(LagunaHfWeightMapper):
+    """The DFlash drafter is a Laguna model; reuse Laguna's weight mapper."""

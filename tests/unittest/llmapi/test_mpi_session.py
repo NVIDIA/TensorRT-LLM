@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess  # nosec B404
 import sys
@@ -10,13 +13,14 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
+from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
+                                             MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
+                                             _identity_barrier_timeout,
                                              split_mpi_env)
 
 # isort: off
 sys.path.append(os.path.join(cur_dir, '..'))
-from utils.util import skip_single_gpu
 # isort: on
 
 
@@ -27,6 +31,12 @@ def task0():
     return MPINodeState.state
 
 
+@pytest.fixture(autouse=True)
+def _enable_mpi(monkeypatch):
+    monkeypatch.delenv("TLLM_DISABLE_MPI", raising=False)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 def test_mpi_session_basic():
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
@@ -61,6 +71,7 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
         return f"Error in client: {str(e)}"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
@@ -112,12 +123,13 @@ def task1():
     assert mpi_env
 
 
+@pytest.mark.cpu_only
 def test_split_mpi_env():
     session = MpiPoolSession(n_workers=4)
     session.submit_sync(task1)
 
 
-@skip_single_gpu
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "task_script", ["_run_mpi_comm_task.py", "_run_multi_mpi_comm_tasks.py"])
 def test_llmapi_launch_multiple_tasks(task_script: str):
@@ -166,3 +178,163 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
+
+
+# ---- wait_shutdown: shutdown blocks until worker processes actually exit ----
+
+
+def _wait_workers_exit(identities, timeout: float) -> None:
+    """Call the unbound method on an inert stand-in (no MPI spawn).
+
+    ``_wait_workers_exit`` only reads ``self._worker_identities``; a real
+    ``MpiPoolSession`` shell would trigger the base class's abort machinery
+    at garbage collection.
+    """
+    import types
+
+    stand_in = types.SimpleNamespace(_worker_identities=identities)
+    MpiPoolSession._wait_workers_exit(stand_in, timeout=timeout)
+
+
+def test_process_start_time_live_and_gone():
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    assert _process_start_time(os.getpid()) is not None
+    child = Popen(["true"])  # nosec B603, B607
+    child.wait()
+    assert _process_start_time(child.pid) is None  # reaped: /proc entry gone
+
+
+def test_wait_workers_exit_returns_once_workers_are_gone():
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    child = Popen(["true"])  # nosec B603, B607
+    identity = (child.pid, _process_start_time(child.pid))
+    child.wait()
+    # Dead worker -> returns immediately; a None start_time is skipped
+    # (identity collection failed for that worker: nothing to wait on).
+    _wait_workers_exit((identity, (os.getpid(), None)), timeout=5.0)
+
+
+def test_wait_workers_exit_bounded_by_timeout_on_live_worker():
+    import time as _time
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    t0 = _time.monotonic()
+    _wait_workers_exit((me, ), timeout=0.2)  # this process will not exit
+    waited = _time.monotonic() - t0
+    assert 0.2 <= waited < 2.0  # bounded: a wedged worker cannot hang teardown
+
+
+def _collect_identities(monkeypatch,
+                        results,
+                        pending=0,
+                        n_workers=2,
+                        observed_timeouts=None):
+    """Drive _collect_worker_identities on an inert stand-in (no MPI spawn)."""
+    import types
+    from concurrent.futures import Future
+
+    futs = []
+    for r in results:
+        f = Future()
+        f.set_result(r)
+        futs.append(f)
+    never = [Future() for _ in range(pending)]  # never resolve
+
+    from tensorrt_llm.llmapi import mpi_session as m
+
+    def _fake_wait(fs, timeout):
+        if observed_timeouts is not None:
+            observed_timeouts.append(timeout)
+        return futs, never
+
+    monkeypatch.setattr(m, "futures_wait", _fake_wait)
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+    it = iter(futs + never)
+    stand_in = types.SimpleNamespace(
+        n_workers=n_workers,
+        mpi_pool=types.SimpleNamespace(submit=lambda fn: next(it),
+                                       shutdown=lambda wait=True: None),
+        _teardown_unidentified_pool=lambda ids: MpiPoolSession.
+        _teardown_unidentified_pool(stand_in, ids),
+    )
+    result = MpiPoolSession._collect_worker_identities(stand_in)
+    return result, killed
+
+
+def test_identity_collection_complete_returns_identities(monkeypatch):
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    other = (1, b"1")  # pid 1: exists but start_time won't match -> unique pid
+    ids, killed = _collect_identities(monkeypatch, [me, other])
+    assert set(ids) == {me, other} and not killed
+
+
+def test_identity_collection_fails_closed_on_timeout(monkeypatch):
+    # A pending barrier task means the pool cannot honor wait_shutdown:
+    # the session must be torn down and rejected, NOT handed out with the
+    # contract silently downgraded (review requirement).
+    import pytest as _pytest
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    with _pytest.raises(RuntimeError, match="incomplete"):
+        _collect_identities(monkeypatch, [me], pending=1)
+
+
+def test_identity_collection_fails_closed_on_duplicate_pids(monkeypatch):
+    import pytest as _pytest
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    with _pytest.raises(RuntimeError, match="incomplete"):
+        _collect_identities(monkeypatch, [me, me])  # one worker answered twice
+
+
+def test_identity_collection_uses_configured_timeout(monkeypatch):
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "123.5")
+    observed_timeouts = []
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    _collect_identities(monkeypatch, [me],
+                        n_workers=1,
+                        observed_timeouts=observed_timeouts)
+    assert observed_timeouts == [123.5]
+
+
+def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
+    # The deadline bounds spawn + `import tensorrt_llm`, not barrier latency:
+    # it must exceed the slowest bootstrap the repo measures (~117s busy node).
+    monkeypatch.delenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raising=False)
+    assert _identity_barrier_timeout() > 117.0
+
+
+# Invalid values (unparsable, non-positive) fall back to the default rather
+# than turning the barrier into a busy-wait or an unbounded block.
+@pytest.mark.parametrize("raw, expected",
+                         [("90", 90.0), ("0.5", 0.5),
+                          ("", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("0", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("-1", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("abc", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("nan", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("inf", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("-inf", _DEFAULT_IDENTITY_TIMEOUT),
+                          ("1e309", _DEFAULT_IDENTITY_TIMEOUT)])
+def test_identity_timeout_env_override(monkeypatch, raw, expected):
+    monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raw)
+    assert _identity_barrier_timeout() == expected
+
+
+def test_prefetch_fallback_identity_timeout_matches_mpi_default():
+    from test_common.session_prefetcher import _FALLBACK_IDENTITY_TIMEOUT
+
+    assert _FALLBACK_IDENTITY_TIMEOUT == _DEFAULT_IDENTITY_TIMEOUT

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import os
 from typing import Dict, List, Optional, Tuple, Union
@@ -62,6 +77,8 @@ class WideEPMoE(MoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
@@ -75,6 +92,8 @@ class WideEPMoE(MoE):
             model_config=model_config,
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
@@ -385,6 +404,7 @@ class WideEPMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         use_all_to_all: bool,
+        input_ids: Optional[torch.IntTensor] = None,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -407,7 +427,7 @@ class WideEPMoE(MoE):
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
 
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
@@ -699,6 +719,7 @@ class WideEPMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
@@ -728,7 +749,8 @@ class WideEPMoE(MoE):
                 x,
                 router_logits,
                 use_all_to_all,
-                output_dtype,
+                input_ids=input_ids,
+                output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call),
@@ -768,6 +790,9 @@ class WideEPMoE(MoE):
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
+            input_ids_list = input_ids.split(
+                chunk_size_list) if input_ids is not None else [None
+                                                                ] * num_chunks
 
             if not use_all_to_all:
                 self.event_dict[EventType.Main].record()
@@ -776,8 +801,8 @@ class WideEPMoE(MoE):
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits) in enumerate(
-                    zip(x_list, router_logits_list)):
+            for idx_chunk, (x, router_logits, input_ids_chunk) in enumerate(
+                    zip(x_list, router_logits_list, input_ids_list)):
                 is_first_call = idx_chunk == 0 and self.repeat_idx == 0
                 is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
                 if not use_all_to_all:
@@ -787,6 +812,7 @@ class WideEPMoE(MoE):
                                 x,
                                 router_logits,
                                 use_all_to_all,
+                                input_ids=input_ids_chunk,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk],
                                 use_dp_padding=use_dp_padding,
@@ -804,6 +830,7 @@ class WideEPMoE(MoE):
                             x,
                             router_logits,
                             use_all_to_all,
+                            input_ids=input_ids_chunk,
                             all_rank_num_tokens=all_rank_num_tokens_list[
                                 idx_chunk],
                             use_dp_padding=use_dp_padding,
@@ -821,6 +848,7 @@ class WideEPMoE(MoE):
                         x,
                         router_logits,
                         use_all_to_all,
+                        input_ids=input_ids_chunk,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk],
                         repeating_info=(is_first_call, is_last_call),
                         alltoall_result_do_sum=alltoall_result_do_sum)
@@ -948,9 +976,6 @@ class WideEPMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
 
     def forward_fake(
         self,

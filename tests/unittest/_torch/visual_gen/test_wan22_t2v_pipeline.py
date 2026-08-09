@@ -273,7 +273,7 @@ class TestWan22_A14B_PipelineCorrectness:
 
 
 # ============================================================================
-# Two-stage feature fixtures (loaded once per module)
+# Two-stage feature fixtures (class-scoped: each A14B pipeline pins tens of GB)
 # ============================================================================
 
 
@@ -299,7 +299,7 @@ def _make_wan22_t2v(quant_config=None, attention_config=None):
     return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True, skip_components=_SKIP_AUX)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def wan22_t2v_fp8():
     pipeline = _make_wan22_t2v(quant_config={"quant_algo": "FP8", "dynamic": True})
     yield pipeline
@@ -308,7 +308,7 @@ def wan22_t2v_fp8():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def wan22_t2v_trtllm():
     pipeline = _make_wan22_t2v(attention_config=AttentionConfig(backend="TRTLLM"))
     yield pipeline
@@ -464,6 +464,9 @@ class TestWan22T2VCombinedOptimizations:
             assert pipeline.cache_accelerator is not None
             assert pipeline.cache_accelerator.is_enabled()
         finally:
+            acc = getattr(pipeline, "cache_accelerator", None)
+            if acc is not None:
+                acc.unwrap()
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()

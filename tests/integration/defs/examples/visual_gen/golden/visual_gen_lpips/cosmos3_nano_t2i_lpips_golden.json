@@ -1,0 +1,21 @@
+{
+  "image": "cosmos3_nano_t2i_lpips_golden.png",
+  "model": "Cosmos3-Nano",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "A serene mountain landscape with snow-capped peaks and a flowing river",
+  "height": 720,
+  "width": 1280,
+  "num_frames": 1,
+  "num_inference_steps": 35,
+  "guidance_scale": 6.0,
+  "seed": 42,
+  "attention_backend": "VANILLA",
+  "torch_compile": false,
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.38.0",
+  "tensorrt_llm_version": "1.3.0rc20",
+  "tensorrt_llm_commit": "85665f5fd331d0154a78172954846d843085e83f",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release@sha256:3308a2dc0192a8329ea02eca7b5c44f290f5e894cd8c5921099308d84c3e5691"
+}

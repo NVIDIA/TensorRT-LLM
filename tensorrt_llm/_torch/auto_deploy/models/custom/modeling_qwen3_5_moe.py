@@ -635,25 +635,31 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Intentionally left untagged: with no ``layer_type`` it defaults to "unknown",
-        # which the ``shard_layers`` inclusion whitelist excludes -> kept replicated.
+        # Tagged ``layer_type="mlp"`` so the shared expert is TP-sharded like the
+        # routed experts (colwise gate/up + rowwise down). Its rowwise down_proj
+        # therefore emits a per-rank partial that is summed with the routed
+        # partial and lifted to full by the single merge-point all_reduce in
+        # ``Qwen3_5MoeSparseMoeBlock.forward``.
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
             tp_mode="colwise",
+            layer_type="mlp",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise",
+            layer_type="mlp",
         )
         return torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise",
+            layer_type="mlp",
         )
 
 
@@ -774,11 +780,13 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             layer_type="moe",
         )
 
-        # The shared expert is replicated (excluded from TP sharding), so all-reduce
-        # the sharded routed-expert output first, then add the replicated shared
-        # output; adding before would scale it by the TP world size.
-        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
+        # Single merge-point all_reduce for routed + shared partial sums.
+        # Both branches produce per-rank partial outputs under TP/EP sharding
+        # (routed: MoEShardableNode; shared: rowwise down_proj inside the MLP).
+        # One reduction on the sum lifts both to full; reducing before the add
+        # would mix a full routed contribution with an unreduced shared one.
         expert_output = expert_output + shared_expert_output
+        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output

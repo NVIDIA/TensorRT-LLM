@@ -19,7 +19,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cassert>
 #include <vector>
@@ -37,9 +37,10 @@ class LoraImpl
 {
 public:
     LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool transA, bool transB, int num_lora_modules,
-        nvinfer1::DataType type, int max_low_rank, std::shared_ptr<CublasGemmWrapper> cublasWrapper);
+        tensorrt_llm::DataType type, int max_low_rank, std::shared_ptr<CublasGemmWrapper> cublasWrapper);
 
-    [[nodiscard]] size_t getWorkspaceSize(int64_t numTokens, int64_t numReqs, nvinfer1::DataType type) const noexcept;
+    [[nodiscard]] size_t getWorkspaceSize(
+        int64_t numTokens, int64_t numReqs, tensorrt_llm::DataType type) const noexcept;
     void setBestTactic(std::optional<Config> config);
     int run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
         void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
@@ -54,7 +55,7 @@ public:
 private:
     bool mTransA;
     bool mTransB;
-    nvinfer1::DataType mType;
+    tensorrt_llm::DataType mType;
     int mNumLoraModules;
 
     // @fixme: seems this is shared across multiple clones.

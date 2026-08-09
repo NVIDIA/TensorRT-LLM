@@ -72,8 +72,25 @@ class ReasoningParserFactory:
     def keys(cls):
         return cls._parsers.keys()
 
+    @classmethod
+    def needs_raw_special_tokens(cls, reasoning_parser: str) -> bool:
+        """Whether the registered parser must see special tokens.
+
+        See ``BaseReasoningParser.needs_raw_special_tokens``.
+        """
+        entry = cls._parsers.get(reasoning_parser.lower())
+        return bool(entry
+                    and getattr(entry[0], "needs_raw_special_tokens", False))
+
 
 class BaseReasoningParser(ABC):
+
+    # Parsers whose delimiters are registered special tokens must see the
+    # raw decoded stream; the serving layer checks this flag and disables
+    # ``skip_special_tokens`` for the request (mirrors
+    # ``BaseToolParser.needs_raw_special_tokens``, which only takes effect
+    # when the request carries tools).
+    needs_raw_special_tokens: bool = False
 
     def __init__(self,
                  *,
@@ -93,6 +110,19 @@ class BaseReasoningParser(ABC):
         buffered state or reclassify accumulated content. The default
         implementation returns an empty result."""
         return ReasoningParserResult()
+
+
+class IdentityReasoningParser(BaseReasoningParser):
+    """Reasoning parser that treats all model output as visible content."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return ReasoningParserResult(content=text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return ReasoningParserResult(content=delta_text)
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
@@ -197,6 +227,114 @@ class DeepSeekR1Parser(BaseReasoningParser):
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
+    def finish(self) -> ReasoningParserResult:
+        """Flush text withheld by `parse_delta` when the stream ends.
+
+        `parse_delta` holds back a trailing fragment that could still grow
+        into a `<think>` / `</think>` tag. If the stream ends while such a
+        fragment is buffered - because the response was truncated mid-tag, or
+        simply ends with a literal `<` - the fragment is ordinary model output
+        and must still be emitted, otherwise it is silently dropped. The
+        buffered text is attributed to the block it was withheld in: inside a
+        reasoning block it is reasoning content, otherwise it is visible
+        content.
+
+        A buffer holding exactly a complete tag is a delimiter rather than
+        model output, so it is discarded as it would have been had more text
+        followed.
+        """
+        remaining = self._buffer
+        self._buffer = ""
+        if not remaining or remaining in (self.reasoning_start,
+                                          self.reasoning_end):
+            return ReasoningParserResult()
+        if self.in_reasoning:
+            return ReasoningParserResult(reasoning_content=remaining)
+        return ReasoningParserResult(content=remaining)
+
+
+@register_reasoning_parser("deepseek_v4")
+class DeepSeekV4ReasoningParser(BaseReasoningParser):
+    """DeepSeek-V4 parser selected by thinking-mode chat template kwargs."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        chat_template_kwargs = chat_template_kwargs or {}
+        thinking = bool(
+            chat_template_kwargs.get("thinking", False)
+            or chat_template_kwargs.get("enable_thinking", False))
+        if thinking:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        else:
+            self._parser = IdentityReasoningParser(
+                chat_template_kwargs=chat_template_kwargs)
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._parser.parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        return self._parser.finish()
+
+
+@register_reasoning_parser("minimax_m3")
+class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
+    """Reasoning parser for MiniMax-M3.
+
+    The M3 chat template (``]<]minimax[>[`` family) renders the assistant
+    turn in one of two shapes:
+
+    * With reasoning::
+
+          <mm:think>{reasoning}</mm:think>{content}
+
+    * Without reasoning (the template still emits a bare ``</mm:think>``
+      as a sentinel so the model knows where the visible content starts)::
+
+          </mm:think>{content}
+
+    M3 is therefore not strictly ``reasoning_at_start`` — the leading
+    ``<mm:think>`` may or may not be present — so we partition on the
+    closing tag first and then strip an optional leading opening tag
+    from the reasoning portion. This keeps streaming behavior identical
+    to :class:`DeepSeekR1Parser` for the common (``<mm:think>...``) case
+    while also handling the bare-sentinel form.
+    """
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(reasoning_at_start=False,
+                         chat_template_kwargs=chat_template_kwargs)
+        self.reasoning_start = "<mm:think>"
+        self.reasoning_end = "</mm:think>"
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        end_idx = text.find(self.reasoning_end)
+        if end_idx == -1:
+            # No closing tag → no reasoning block in this response.
+            return ReasoningParserResult(content=text)
+        reasoning_content = text[:end_idx]
+        content = text[end_idx + len(self.reasoning_end):]
+        # Strip an optional leading <mm:think> from the reasoning portion
+        # so the sentinel-only shape (no opening tag) reduces to
+        # reasoning_content="".
+        if reasoning_content.startswith(self.reasoning_start):
+            reasoning_content = reasoning_content[len(self.reasoning_start):]
+        return self._create_reasoning_end_result(content, reasoning_content)
+
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3": "qwen3",
@@ -207,11 +345,15 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
     "laguna": "laguna",
+    "deepseek_v4": "deepseek_v4",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",
     "gemma4": "gemma4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
+    "kimi_k3": "kimi_k3",
+    "minimax_m3": "minimax_m3",
+    "minimax_m3_vl": "minimax_m3",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -708,3 +850,189 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
 
         raise RuntimeError(
             "Unreachable code reached in `KimiK2ReasoningParser.parse_delta`")
+
+
+@register_reasoning_parser("kimi_k3")
+class KimiK3ReasoningParser(BaseReasoningParser):
+    """Reasoning parser for Kimi-K3 XTML output.
+
+    K3 renders assistant messages as an XTML tag stream built from the
+    special tokens ``<|open|>`` / ``<|close|>`` / ``<|sep|>`` /
+    ``<|end_of_msg|>`` with plain-text tag headers (see the checkpoint's
+    ``encoding_k3.py``)::
+
+        <|open|>think<|sep|>REASONING<|close|>think<|sep|>
+        <|open|>response<|sep|>CONTENT<|close|>response<|sep|>
+        [<|open|>tools<|sep|>...calls...<|close|>tools<|sep|>]
+        <|close|>message<|sep|><|end_of_msg|>
+
+    The generation prompt already ends inside ``<|open|>think<|sep|>``
+    (thinking mode, the default) or ``<|open|>response<|sep|>``
+    (``chat_template_kwargs={"thinking": False}``), so the model output
+    begins mid-channel with no opening tag.
+
+    This parser emits the think body as ``reasoning_content`` and the
+    response body as ``content``. A ``tools`` section is passed through
+    into ``content`` verbatim (special tokens included) so the ``kimi_k3``
+    tool parser can consume it; all other structural markup is dropped.
+    """
+
+    needs_raw_special_tokens = True
+
+    OPEN = "<|open|>"
+    CLOSE = "<|close|>"
+    SEP = "<|sep|>"
+    EOM = "<|end_of_msg|>"
+    TOOLS_END = CLOSE + "tools" + SEP
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        thinking = True
+        if chat_template_kwargs is not None:
+            thinking = chat_template_kwargs.get("thinking", True) is not False
+        # Channel the model starts generating in (its opening tag is part
+        # of the prompt).
+        self._initial_channel = "think" if thinking else "response"
+        self._reset()
+
+    def _reset(self) -> None:
+        self._buffer = ""
+        # 'body' | 'open_header' | 'close_header' | 'tools_pass' | 'done'
+        self._state = "body"
+        self._channel: Optional[str] = self._initial_channel
+
+    @staticmethod
+    def _partial_suffix_len(text: str, markers: tuple[str, ...]) -> int:
+        """Length of the longest text suffix that is a proper prefix of any marker.
+
+        Markers may contain internal ``<`` (e.g. ``<|close|>tools<|sep|>``),
+        so every suffix length up to ``len(marker) - 1`` must be checked, not
+        just the one starting at the last ``<``.
+        """
+        best = 0
+        for marker in markers:
+            for length in range(min(len(text), len(marker) - 1), best, -1):
+                if marker.startswith(text[-length:]):
+                    best = length
+                    break
+        return best
+
+    def _emit(self, text: str, content: list, reasoning: list) -> None:
+        if not text:
+            return
+        if self._channel == "think":
+            reasoning.append(text)
+        elif self._channel == "response":
+            content.append(text)
+        # channel None: structural gap – dropped
+
+    def _step(self, content: list, reasoning: list) -> bool:
+        """Consume as much of the buffer as possible.
+
+        Returns False when more input is needed.
+        """
+        buf = self._buffer
+        if self._state == "done":
+            self._buffer = ""
+            return False
+        if self._state == "body":
+            markers = (self.OPEN, self.CLOSE, self.EOM)
+            indices = [(buf.find(m), m) for m in markers]
+            indices = [(i, m) for i, m in indices if i != -1]
+            if not indices:
+                hold = self._partial_suffix_len(buf, markers)
+                emit_len = len(buf) - hold
+                self._emit(buf[:emit_len], content, reasoning)
+                self._buffer = buf[emit_len:]
+                return False
+            idx, marker = min(indices)
+            self._emit(buf[:idx], content, reasoning)
+            self._buffer = buf[idx + len(marker):]
+            if marker == self.OPEN:
+                self._state = "open_header"
+            elif marker == self.CLOSE:
+                self._state = "close_header"
+            else:
+                self._state = "done"
+                self._buffer = ""
+            return True
+        if self._state in ("open_header", "close_header"):
+            idx = buf.find(self.SEP)
+            if idx == -1:
+                return False
+            header = buf[:idx]
+            self._buffer = buf[idx + len(self.SEP):]
+            tag = header.split(None, 1)[0] if header.split() else ""
+            if self._state == "open_header":
+                if tag == "think":
+                    self._channel = "think"
+                elif tag == "response":
+                    self._channel = "response"
+                elif tag == "tools":
+                    # Replay the section opener for the tool parser.
+                    self._channel = "response"
+                    self._emit(self.OPEN + header + self.SEP, content,
+                               reasoning)
+                    self._state = "tools_pass"
+                    return True
+                else:
+                    self._channel = None
+            else:
+                if tag == "message":
+                    self._state = "done"
+                    self._buffer = ""
+                    return False
+                self._channel = None
+            self._state = "body"
+            return True
+        if self._state == "tools_pass":
+            idx = buf.find(self.TOOLS_END)
+            if idx == -1:
+                hold = self._partial_suffix_len(buf, (self.TOOLS_END, ))
+                emit_len = len(buf) - hold
+                self._emit(buf[:emit_len], content, reasoning)
+                self._buffer = buf[emit_len:]
+                return False
+            end = idx + len(self.TOOLS_END)
+            self._emit(buf[:end], content, reasoning)
+            self._buffer = buf[end:]
+            self._channel = None
+            self._state = "body"
+            return True
+        raise RuntimeError("Unreachable state in `KimiK3ReasoningParser._step`")
+
+    def _feed(self, text: str) -> ReasoningParserResult:
+        self._buffer += text
+        content: list = []
+        reasoning: list = []
+        while self._step(content, reasoning):
+            pass
+        return ReasoningParserResult(content="".join(content),
+                                     reasoning_content="".join(reasoning))
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        self._reset()
+        result = self._feed(text)
+        tail = self.finish()
+        return ReasoningParserResult(
+            content=result.content + tail.content,
+            reasoning_content=result.reasoning_content + tail.reasoning_content,
+        )
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._feed(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        remaining = self._buffer
+        self._buffer = ""
+        if not remaining or self._state == "done":
+            return ReasoningParserResult()
+        if self._state in ("body", "tools_pass"):
+            if self._channel == "think":
+                return ReasoningParserResult(reasoning_content=remaining)
+            if self._channel == "response":
+                return ReasoningParserResult(content=remaining)
+        # Header fragments and structural-gap text are dropped.
+        return ReasoningParserResult()

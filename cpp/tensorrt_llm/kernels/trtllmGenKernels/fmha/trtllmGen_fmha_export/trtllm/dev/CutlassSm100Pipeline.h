@@ -22,6 +22,7 @@
 #include "CutlassSm90Pipeline.h"
 #include <cutlass/pipeline/sm100_pipeline.hpp>
 
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace trtllm::dev {
@@ -407,16 +408,12 @@ public:
   }
 
   CUTLASS_DEVICE
-  void producer_commit(PipelineState state, uint32_t bytes) {
-    impl_.producer_commit(state, bytes);
-  }
+  void producer_commit(PipelineState state, uint32_t bytes) { impl_.producer_commit(state, bytes); }
 
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) {
-    impl_.producer_tail(state);
-  }
+  void producer_tail(PipelineState state) { impl_.producer_tail(state); }
 
   CUTLASS_DEVICE
   ProducerBarrierType* producer_get_barrier(PipelineState state) {
@@ -437,9 +434,7 @@ public:
   }
 
   CUTLASS_DEVICE
-  void consumer_wait(PipelineState state) {
-    impl_.consumer_wait(state);
-  }
+  void consumer_wait(PipelineState state) { impl_.consumer_wait(state); }
 
   CUTLASS_DEVICE
   void consumer_wait(PipelineState state, cutlass::ConsumerToken barrier_token) {

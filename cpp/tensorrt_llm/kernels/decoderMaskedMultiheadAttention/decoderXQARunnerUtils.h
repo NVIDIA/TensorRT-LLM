@@ -442,7 +442,7 @@ inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multipro
     return 1; // disable multi-block for MLA kernel for now.
 }
 
-inline int computeMultiBlockCountSpecDecGMMA(
+inline int computeMultiBlockCountSpecDec(
     XQAParams const& xqaParams, int batchSize, int multiprocessorCount, int specDecBlocks)
 {
     auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();

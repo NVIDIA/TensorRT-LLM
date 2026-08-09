@@ -2,11 +2,12 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
-    DataRole,
     IndexRange,
     KVRegionSpec,
     RegionSpec,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_index_range_valid():
@@ -39,14 +40,6 @@ def test_index_range_invalid_end_before_start():
         IndexRange(start=10, end=5)
 
 
-def test_data_role_flags():
-    assert DataRole.KEY == 1
-    assert DataRole.VALUE == 2
-    combined = DataRole.KEY | DataRole.VALUE
-    assert DataRole.KEY in combined
-    assert DataRole.VALUE in combined
-
-
 def test_data_layout_flags():
     assert DataLayout.HND == 1
     assert DataLayout.NHD == 2
@@ -65,7 +58,6 @@ def test_region_spec_construction():
 def test_kv_region_spec_defaults():
     spec = KVRegionSpec()
     assert spec.layers is None
-    assert spec.role == DataRole.KEY | DataRole.VALUE
     assert spec.heads is None
     assert spec.tokens is None
 
@@ -73,11 +65,9 @@ def test_kv_region_spec_defaults():
 def test_kv_region_spec_with_all_axes():
     spec = KVRegionSpec(
         layers=IndexRange(0, 15),
-        role=DataRole.KEY,
         heads=IndexRange(0, 7),
         tokens=IndexRange(0, 127),
     )
     assert spec.layers == IndexRange(0, 15)
-    assert spec.role == DataRole.KEY
     assert spec.heads == IndexRange(0, 7)
     assert spec.tokens == IndexRange(0, 127)

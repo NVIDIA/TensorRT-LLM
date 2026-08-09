@@ -13,6 +13,7 @@ import pandas as pd
 from parser_utils import (
     kernel_short_name,
     lazy_convert_sqlite,
+    require_cuda_kernel_events,
     shortest_common_supersequence,
     warned_names,
 )
@@ -101,6 +102,7 @@ json_file_path = nsys_rep_file_path.parent / (
 lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path)
 
 conn = sqlite3.connect(f"file:{sqlite_file_path}?mode=ro", uri=True)
+require_cuda_kernel_events(conn, sqlite_file_path)
 
 query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
 df = pd.read_sql_query(query, conn)

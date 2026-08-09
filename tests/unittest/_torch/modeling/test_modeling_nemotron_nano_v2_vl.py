@@ -22,6 +22,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLMultimodalEncoder,
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
+    _get_vision_encoder_cuda_graph_config,
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
@@ -35,7 +36,11 @@ from tensorrt_llm.inputs import (
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    MultimodalConfig,
+    MultimodalEncoderCudaGraphConfig,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
@@ -59,6 +64,7 @@ def _make_minimal_nano_model_config():
     )
 
 
+@pytest.mark.cpu_only
 def test_nemotron_nano_registers_native_multimodal_epd_components():
     """Native Nano VL/Omni classes advertise MM EPD support."""
     for arch in ("NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"):
@@ -91,6 +97,7 @@ def _assert_nano_video_handoff(handoff):
     ],
     ids=["prompt", "prompt_token_ids"],
 )
+@pytest.mark.cpu_only
 def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     input_field, input_value, asserts_encode_not_called
 ):
@@ -144,6 +151,7 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     ],
     ids=["normal_worker", "mm_epd_worker"],
 )
+@pytest.mark.cpu_only
 def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects_encoder):
     """Encoder load depends on whether the worker runs raw MM prefill or consumes embeddings."""
     fake_encoder = MagicMock()
@@ -181,6 +189,7 @@ def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects
         vision_encoder_cls.assert_not_called()
 
 
+@pytest.mark.cpu_only
 def test_nemotron_nano_rejects_evs_attached_video_embeddings():
     """EVS needs retained-token metadata that E/P attached embeddings do not carry."""
     model = SimpleNamespace(
@@ -202,6 +211,22 @@ def test_nemotron_nano_rejects_evs_attached_video_embeddings():
             input_ids=torch.tensor([[20]], dtype=torch.long),
             multimodal_params=[param],
         )
+
+
+def test_get_vision_encoder_cuda_graph_config():
+    config = MultimodalEncoderCudaGraphConfig(buckets=[(1280, 1)])
+    mm_config = MultimodalConfig(encoder_cuda_graph={"vision": config})
+
+    assert _get_vision_encoder_cuda_graph_config(mm_config) is config
+
+
+def test_get_vision_encoder_cuda_graph_config_rejects_unknown_modalities():
+    mm_config = MultimodalConfig(
+        encoder_cuda_graph={"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+    )
+
+    with pytest.raises(ValueError, match="Unsupported multimodal encoder CUDA graph modalities"):
+        _get_vision_encoder_cuda_graph_config(mm_config)
 
 
 @pytest.fixture(scope="function")
@@ -256,6 +281,7 @@ def nano_llm_model():
         torch.cuda.empty_cache()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("condition", ["single", "multiple"])
 @pytest.mark.parametrize("modality", ["image", "video"])
 def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modality):
@@ -537,6 +563,7 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
         )
 
 
+@pytest.mark.cpu_only
 class TestEncodeMultimodalDispatch:
     def _make_mock_model(self):
         """Create a minimal mock with the attributes `_encode_multimodal` needs."""
@@ -598,6 +625,7 @@ class TestEncodeMultimodalDispatch:
             NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
 
 
+@pytest.mark.cpu_only
 class TestSoundPlaceholderInjection:
     """Test the sound placeholder token's injection points.
 
@@ -667,6 +695,7 @@ class TestSoundPlaceholderInjection:
         )
 
 
+@pytest.mark.cpu_only
 class TestEncodeMultimodalAudioOrder:
     """Test video / audio embedding order in multi-item scenarios."""
 
@@ -786,6 +815,7 @@ class TestEncodeMultimodalAudioOrder:
         model._encode_audio.assert_not_called()
 
 
+@pytest.mark.cpu_only
 class TestInterleaveVideoAudioEmbeddings:
     """Directly test `_interleave_video_audio_embeddings` with synthetic data."""
 
@@ -899,6 +929,7 @@ class TestInterleaveVideoAudioEmbeddings:
         assert torch.equal(result, expected)
 
 
+@pytest.mark.cpu_only
 class TestEncodeAudio:
     """Numerical equivalence: batched audio vs per-input encoding.
 
@@ -990,6 +1021,7 @@ class TestEncodeAudio:
         assert NemotronH_Nano_VL_V2._encode_audio(model, []) == []
 
 
+@pytest.mark.cpu_only
 class TestEncodeMultimodalContract:
     """Verify `_encode_multimodal` conforms to the contract expected by `get_multimodal_embeddings`.
 
@@ -1077,6 +1109,7 @@ class TestEncodeMultimodalContract:
         assert result == []
 
 
+@pytest.mark.cpu_only
 class TestChunkedPrefillCaching:
     """Verify that `_encode_multimodal` output is compatible with `get_multimodal_embeddings`.
 

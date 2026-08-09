@@ -312,8 +312,7 @@ def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
 
     2. [DEPRECATED] **TRT-LLM PretrainedConfig** (from ``tensorrt_llm.models.modeling_utils``):
        Has ``.architecture`` — a *singular string*, e.g. ``"LlamaForCausalLM"``.
-       This is the format used in TRT-LLM checkpoint ``config.json`` files
-       (``_ModelFormatKind.TLLM_CKPT``).
+       This is the format used in TRT-LLM checkpoint ``config.json`` files.
 
     3. [DEPRECATED] **Engine config loaded by HF** (``transformers.PretrainedConfig.from_pretrained``
        reading a TRT-LLM engine dir):
@@ -330,7 +329,7 @@ def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
         if architectures and isinstance(architectures, (list, tuple)) and len(architectures) > 0:
             return str(architectures[0])
 
-        # Case 2: TRT-LLM PretrainedConfig / TLLM_CKPT — .architecture (singular str)
+        # Case 2: TRT-LLM PretrainedConfig — .architecture (singular str)
         architecture = getattr(pretrained_config, "architecture", None)
         if architecture and isinstance(architecture, str):
             return architecture

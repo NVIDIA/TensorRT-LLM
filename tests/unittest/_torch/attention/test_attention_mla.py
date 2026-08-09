@@ -342,7 +342,7 @@ random.seed(0)
 min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
-max_num_contexts = 10
+max_num_contexts = 64
 random_context_sequence_lengths = [
     random.randint(min_context_sequence_length, max_context_sequence_length)
     for _ in range(random.randint(min_num_contexts, max_num_contexts))
@@ -354,6 +354,7 @@ context_sequence_lengths = [
     [100, 300, 20, 10],
     [253, 253, 253, 253],
     [100, 1110, 1000, 1000],
+    [10] * 64,
     random_context_sequence_lengths,
 ]
 # Use MTP by default if seqlen_q > 1.
@@ -389,7 +390,7 @@ accuracy_dict = {
 )
 def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
                                             monkeypatch):
-    import tensorrt_llm._torch.modules.attention as attention_module
+    import tensorrt_llm._torch.modules.mla as mla_module
 
     class FakeTrtllmAttention:
 
@@ -425,11 +426,9 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
         def forward_context_default(*_args, **_kwargs):
             return "default"
 
-    monkeypatch.setattr(attention_module, "TrtllmAttention",
-                        FakeTrtllmAttention)
-    monkeypatch.setattr(attention_module, "TrtllmAttentionMetadata",
-                        FakeMetadata)
-    monkeypatch.setattr(attention_module, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(mla_module, "TrtllmAttention", FakeTrtllmAttention)
+    monkeypatch.setattr(mla_module, "TrtllmAttentionMetadata", FakeMetadata)
+    monkeypatch.setattr(mla_module, "get_sm_version", lambda: sm_version)
 
     q = torch.empty((1, 8), dtype=torch.float16)
     compressed_kv = torch.empty((1, 4), dtype=torch.float16)
@@ -438,7 +437,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     output = torch.empty((1, 8), dtype=torch.float16)
     latent_cache = torch.empty((1, 1, 8), dtype=torch.float16)
 
-    result = attention_module.MLA.forward_context(
+    result = mla_module.MLA.forward_context(
         FakeAttention(),
         q,
         compressed_kv,

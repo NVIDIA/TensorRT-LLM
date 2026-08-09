@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 from flashinfer.mamba import selective_state_update as _flashinfer_ssm_update
@@ -31,11 +31,13 @@ from ..attention_interface import (
     IntermediateSSMStateHandler,
     MHACallable,
     ReplayCacheBufIdxHandler,
+    ReplayNWritesHandler,
     ReplayOldBHandler,
     ReplayOldDAcumsumHandler,
     ReplayOldDtHandler,
     ReplayOldXHandler,
     ReplayPrevNumAcceptedHandler,
+    ReplayWorkItemsHandler,
     ResourceHandlerDict,
 )
 from .mamba_backend_common import (
@@ -64,7 +66,7 @@ def _fi_align(t: torch.Tensor) -> torch.Tensor:
         "ssm_state_cache",
         "intermediate_ssm_state_cache",
         # replay buffers: written in-place by the precompute and main kernels
-        # (double-buffered B/dt/dA_cumsum, single-buffered x); None in non-replay mode
+        # (double-buffered x/B/dt/dA_cumsum); None in non-replay mode
         "replay_old_x",
         "replay_old_b",
         "replay_old_dt",
@@ -95,14 +97,22 @@ def _flashinfer_cached_ssm(
     intermediate_ssm_state_cache: Optional[
         torch.Tensor
     ],  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]; None in replay mode
-    replay_old_x: Optional[torch.Tensor],  # [max_batch, T, nheads, head_dim]; None in non-replay
-    replay_old_b: Optional[torch.Tensor],  # [max_batch, 2, T, ngroups, dstate]; None in non-replay
-    replay_old_dt: Optional[torch.Tensor],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    replay_old_x: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, history, nheads, head_dim]; None in non-replay
+    replay_old_b: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, history, ngroups, dstate]; None in non-replay
+    replay_old_dt: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, nheads, history] fp32; None in non-replay
     replay_old_da_cumsum: Optional[
         torch.Tensor
-    ],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    ],  # [max_batch, 2, nheads, history] fp32; None in non-replay
     replay_cache_buf_idx: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
     replay_prev_num_accepted: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    replay_work_items: Optional[torch.Tensor],  # [max_batch, 4] int32; None in non-replay
+    replay_n_writes: Optional[torch.Tensor],  # [1] int32; None in non-replay
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -198,6 +208,34 @@ def _flashinfer_cached_ssm(
 
         use_replay = batch_info.is_use_replay()
         if use_replay:
+            missing_replay_tensors = [
+                name
+                for name, tensor in (
+                    ("replay_old_x", replay_old_x),
+                    ("replay_old_b", replay_old_b),
+                    ("replay_old_dt", replay_old_dt),
+                    ("replay_old_da_cumsum", replay_old_da_cumsum),
+                    ("replay_cache_buf_idx", replay_cache_buf_idx),
+                    ("replay_prev_num_accepted", replay_prev_num_accepted),
+                    ("replay_work_items", replay_work_items),
+                    ("replay_n_writes", replay_n_writes),
+                )
+                if tensor is None
+            ]
+            if missing_replay_tensors:
+                raise RuntimeError(
+                    "flashinfer_cached_ssm replay path missing required tensors: "
+                    f"{', '.join(missing_replay_tensors)}"
+                )
+            replay_old_x = cast(torch.Tensor, replay_old_x)
+            replay_old_b = cast(torch.Tensor, replay_old_b)
+            replay_old_dt = cast(torch.Tensor, replay_old_dt)
+            replay_old_da_cumsum = cast(torch.Tensor, replay_old_da_cumsum)
+            replay_cache_buf_idx = cast(torch.Tensor, replay_cache_buf_idx)
+            replay_prev_num_accepted = cast(torch.Tensor, replay_prev_num_accepted)
+            replay_work_items = cast(torch.Tensor, replay_work_items)
+            replay_n_writes = cast(torch.Tensor, replay_n_writes)
+
             # Replay path: fast-forward SSM state via tl.dot on cached values.
             # State is updated in-place; no disable_state_update needed.
             # x_extend/B_extend/C_extend are non-contiguous views from the CUDA graph's
@@ -218,6 +256,8 @@ def _flashinfer_cached_ssm(
                 B_extend,
                 C_extend,
                 out=preallocated_ssm_out_e,
+                n_writes=replay_n_writes,
+                replay_work_items=replay_work_items[:num_extend],
                 D=D_full,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
@@ -225,6 +265,11 @@ def _flashinfer_cached_ssm(
                 launch_with_pdl=True,  # PDL chain: triton_causal_conv extend → precompute → main
             )
         else:
+            if intermediate_ssm_state_cache is None:
+                raise RuntimeError(
+                    "flashinfer_cached_ssm non-replay extend branch requires "
+                    "intermediate_ssm_state_cache"
+                )
             if intermediate_ssm_state_cache.size(1) < tokens_per_extend:
                 raise RuntimeError(
                     "flashinfer_cached_ssm: intermediate_ssm_state_cache is too small "
@@ -342,14 +387,22 @@ def _flashinfer_cached_ssm_fake(
     intermediate_ssm_state_cache: Optional[
         torch.Tensor
     ],  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]; None in replay mode
-    replay_old_x: Optional[torch.Tensor],  # [max_batch, T, nheads, head_dim]; None in non-replay
-    replay_old_b: Optional[torch.Tensor],  # [max_batch, 2, T, ngroups, dstate]; None in non-replay
-    replay_old_dt: Optional[torch.Tensor],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    replay_old_x: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, history, nheads, head_dim]; None in non-replay
+    replay_old_b: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, history, ngroups, dstate]; None in non-replay
+    replay_old_dt: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, nheads, history] fp32; None in non-replay
     replay_old_da_cumsum: Optional[
         torch.Tensor
-    ],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    ],  # [max_batch, 2, nheads, history] fp32; None in non-replay
     replay_cache_buf_idx: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
     replay_prev_num_accepted: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    replay_work_items: Optional[torch.Tensor],  # [max_batch, 4] int32; None in non-replay
+    replay_n_writes: Optional[torch.Tensor],  # [1] int32; None in non-replay
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -400,7 +453,7 @@ class FlashinferBackendSSM(BaseBackendSSM):
 
         ssm_h = ret["ssm_state_cache"]
 
-        # All 7 optional caches are always registered positionally (None = unused in this mode).
+        # Optional replay/spec caches are registered positionally (None = unused in this mode).
         # intermediate_ssm_state_cache: real in non-replay, None in replay.
         # replay_old_*: real in replay mode (SM80+), None otherwise.
         if use_replay:
@@ -418,6 +471,8 @@ class FlashinferBackendSSM(BaseBackendSSM):
             ret["replay_old_da_cumsum"] = ReplayOldDAcumsumHandler(num_heads=ssm_h.num_heads)
             ret["replay_cache_buf_idx"] = ReplayCacheBufIdxHandler()
             ret["replay_prev_num_accepted"] = ReplayPrevNumAcceptedHandler()
+            ret["replay_work_items"] = ReplayWorkItemsHandler()
+            ret["replay_n_writes"] = ReplayNWritesHandler()
         else:
             ret["intermediate_ssm_state_cache"] = IntermediateSSMStateHandler.from_base(ssm_h)
             ret["replay_old_x"] = None
@@ -426,4 +481,6 @@ class FlashinferBackendSSM(BaseBackendSSM):
             ret["replay_old_da_cumsum"] = None
             ret["replay_cache_buf_idx"] = None
             ret["replay_prev_num_accepted"] = None
+            ret["replay_work_items"] = None
+            ret["replay_n_writes"] = None
         return ret

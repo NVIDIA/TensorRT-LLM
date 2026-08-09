@@ -138,6 +138,25 @@ class LoraModuleType(IntEnum):
         return self in {self.MAMBA_IN_PROJ, self.MAMBA_OUT_PROJ}
 
 
+# Canonical routed-expert MoE LoRA module set and module->kernel-slot mapping,
+# shared by the MoE factory/validator (create_moe.py, validation.py), the
+# adapter-layout helpers (moe_layout.py), and the CUTLASS MoE backend
+# (fused_moe_cutlass.py). Keep this the single source of truth.
+#
+# Slot convention (see loraFC1 / doActivationKernel in moe_kernels.cu): the
+# kernel applies the "fc1" LoRA to the gate (SiLU) half of the packed FC1
+# output and the "gated" LoRA to the up (linear) half. With the canonical
+# convention (moe_h_to_4h = w1 gate/SiLU, moe_gate = w3 up/linear,
+# moe_4h_to_h = w2 down), this maps moe_h_to_4h->fc1, moe_gate->gated,
+# moe_4h_to_h->fc2.
+MOE_LORA_MODULE_NAMES = ("moe_h_to_4h", "moe_4h_to_h", "moe_gate")
+MOE_LORA_MODULE_TO_KERNEL_SLOT = {
+    LoraModuleType.MOE_H_TO_4H: "fc1",
+    LoraModuleType.MOE_GATE: "gated",
+    LoraModuleType.MOE_4H_TO_H: "fc2",
+}
+
+
 class LoraLayer(torch.nn.Module):
 
     def __init__(self, lora_module_types: List[LoraModuleType],

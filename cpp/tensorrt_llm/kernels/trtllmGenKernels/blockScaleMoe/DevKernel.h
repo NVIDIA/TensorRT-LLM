@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -259,7 +259,25 @@ struct Data
     int32_t topK;
     int32_t* expandedIdxToPermutedIdx;
 
+    // Used only to pick between the two activation kernels; see the dispatch
+    // note in DevKernel.cu. The permuted-space kernel sweeps
+    // totalNumPaddedTokens, which carries up to one partial tile of padding per
+    // local expert, so it only pays off when there is enough real work per
+    // expert to amortise that sweep. Both are host-side values.
+    int32_t numExperts{0};
+    int32_t tileTokensDim{0};
+
     int32_t const* totalNumPaddedTokens;
+
+    // Optional swiglu clamp limit (fp32, uniform across experts on the FP8
+    // separate-activation path). When `hasSwigluLimit` is true, the kernel
+    // applies gate.clamp(max=swigluLimit) and up.clamp(-swigluLimit,
+    // swigluLimit) before silu/mul, matching the swiglu_torch reference.
+    // NVFP4 still consumes a per-expert tensor via fused-activation GEMM
+    // cubins (see MoERunnerArgs::gemm1_clamp_limit); this scalar is only
+    // for the FP8 separate-activation kernel.
+    float swigluLimit = 0.0f;
+    bool hasSwigluLimit = false;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -282,6 +300,9 @@ struct KernelParams
 
     int32_t const* totalNumPaddedTokens;
 
+    float swigluLimit = 0.0f;
+    bool hasSwigluLimit = false;
+
     static KernelParams setKernelParams(Data const& data)
     {
         KernelParams params;
@@ -297,6 +318,9 @@ struct KernelParams
         params.numTokens = data.numTokens;
         params.topK = data.topK;
         params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+
+        params.swigluLimit = data.swigluLimit;
+        params.hasSwigluLimit = data.hasSwigluLimit;
 
         return params;
     }
