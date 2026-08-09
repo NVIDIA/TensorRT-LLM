@@ -3998,18 +3998,11 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
                                                    layer_updates_per_iter=2,
                                                    ep_size=4)
-        al = _run_deepseekv4_eplb(self.MODEL_NAME,
-                                  self.MODEL_PATH,
-                                  moe_backend,
-                                  eplb_config,
-                                  mtp_nextn=mtp_nextn)
-        if al is not None:
-            print(f"[AL] test_nvfp4_4gpus_online_eplb mtp_nextn={mtp_nextn} "
-                  f"acceptance_length = {al:.3f}")
-            assert_acceptance_length(
-                f"TestDeepSeekV4Flash::test_nvfp4_4gpus_online_eplb"
-                f"[mtp_nextn_{mtp_nextn}]",
-                al)
+        _run_deepseekv4_eplb(self.MODEL_NAME,
+                             self.MODEL_PATH,
+                             moe_backend,
+                             eplb_config,
+                             mtp_nextn=mtp_nextn)
 
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (

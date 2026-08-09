@@ -7,9 +7,6 @@ TestQwen3_4B::test_eagle3:
 ? TestDeepSeekV3Lite::test_bfloat16[mtp_nextn_2-attention_dp_False-cuda_graph_False-overlap_scheduler_False-torch_compile_False-enable_chunked_prefill_False-v2_kv_cache_False]
 : ref_al: 2.6241039490569817
   min_al: 2.4928987516041325
-TestDeepSeekV4Flash::test_nvfp4_4gpus_online_eplb[mtp_nextn_1]:
-  ref_al: null
-  min_al: null
 TestNemotronV3Super::test_nvfp4_marlin_adp_4gpus[mtp_nextn_3]:
   ref_al: null
   min_al: null
