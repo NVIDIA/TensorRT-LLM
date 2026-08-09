@@ -683,10 +683,8 @@ class Indexer(nn.Module):
         self.use_cute_dsl_paged_mqa_logits = (
             sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
         )
-        # GVR emission-assisted decode (opt-in, experimental): the FP4
-        # indexer epilogue emits seed counts / the bucketed candidate
-        # list and the top-k consumes them (see gvr_ext / gvr_routing).
-        # Env-gated so the default path stays byte-identical.
+        # GVR emission-assisted decode (opt-in, experimental): the FP4 indexer
+        # epilogue emits candidates for the top-k (see gvr_ext / gvr_routing).
         self.use_gvr_ext = (
             os.environ.get("TRTLLM_GVR_EXT", "0") == "1"
             and self.use_cute_dsl_topk
@@ -1716,31 +1714,32 @@ class Indexer(nn.Module):
 
                     gvr_emit_kwargs = {}
                     if self.use_gvr_ext and next_n == 1 and not dsl_atom_split:
-                        from ..gvr_ext import GvrExtState
+                        from ..gvr_ext import LIST_EMIT_MIN_N, GvrExtState
 
+                        # indexer_max_seq_len is already the compressed length
+                        # (get_indexer_max_seq_len divides); do not divide again.
+                        n_comp = indexer_max_seq_len
                         if self._gvr_ext is None:
                             self._gvr_ext = GvrExtState(
                                 max_rows=metadata.max_num_sequences,
                                 top_k=self.index_topk,
                                 device=q_fp8.device,
+                                # the list tier is only reachable at
+                                # n_comp >= LIST_EMIT_MIN_N; skip its large
+                                # candidate buffers when the engine's static
+                                # length cannot get there
+                                enable_list_tier=n_comp >= LIST_EMIT_MIN_N,
                             )
                         st = self._gvr_ext
-                        # indexer_max_seq_len is ALREADY the compressed
-                        # length - get_indexer_max_seq_len divides by the
-                        # compress ratio, and it is what goes to the top-k
-                        # as max_seq_len below. Dividing again shifted every
-                        # routing threshold by two doublings: the list tier
-                        # became unreachable and 30 of the 154 grid shapes
-                        # fell back to the stock kernel instead of 4.
-                        n_comp = indexer_max_seq_len
                         emit_tier, self._gvr_route = st.plan(
                             batch_size,
                             n_comp,
                             torch.cuda.get_device_properties(q_fp8.device).multi_processor_count,
                             compress_ratio=max(self.compress_ratio, 1),
                         )
-                        st.update_seed_rows(batch_size, emit_tier)
-                        gvr_emit_kwargs = st.indexer_emit_kwargs(emit_tier, batch_size)
+                        if emit_tier in ("counts", "list"):
+                            st.update_seed_rows(batch_size, emit_tier)
+                            gvr_emit_kwargs = st.indexer_emit_kwargs(emit_tier, batch_size)
                         if self._gvr_route.attach_block_max or emit_tier in (
                             "counts",
                             "list",
@@ -1827,11 +1826,8 @@ class Indexer(nn.Module):
                     if not metadata.use_cute_dsl_topk:
                         heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                # tier "none": too short for any assist to pay, or inside
-                # the mid-row band where the stock kernel's split grid wins
-                # (see gvr_routing) - fall through to the stock branch. The
-                # untouched ext state reads as cold start, which its closed
-                # loop already handles.
+                # tier "none" (see gvr_routing) falls through to the stock
+                # branch; the untouched ext state reads as a cold start there.
                 if (
                     self.use_gvr_ext
                     and self._gvr_ext is not None
@@ -1840,16 +1836,13 @@ class Indexer(nn.Module):
                     and next_n == 1
                     and num_gen_tokens <= 256
                 ):
-                    # emission-assisted GVR: consume what the indexer
-                    # epilogue emitted this step (packed seed row /
-                    # bucketed list / block_max per the picked route)
+                    # emission-assisted GVR: consume what the indexer epilogue
+                    # emitted this step (seed row / list / block_max per route)
                     st = self._gvr_ext
                     out_slice = topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :]
-                    # the GVR op takes RAW-domain seq_lens (its kernel
-                    # ceil-divides by compress_ratio internally). On the
-                    # DSL indexer path the live compressed lengths are in
-                    # gen_indexer_kv_lens_cuda_runtime (kv_lens_cuda_2d
-                    # stays zero there - same trap as the indexer call).
+                    # GVR op takes RAW-domain seq_lens (kernel ceil-divides by
+                    # compress_ratio); on the DSL path the live compressed lens
+                    # are gen_indexer_kv_lens_cuda_runtime, kv_lens_cuda_2d is 0.
                     if self.compress_ratio > 1:
                         gvr_lens = metadata.gen_indexer_kv_lens_cuda_runtime
                         assert gvr_lens is not None
@@ -1872,34 +1865,6 @@ class Indexer(nn.Module):
                         max_seq_len=indexer_max_seq_len,
                         **ext_kw,
                     )
-                    # diagnostic dump (NO_GRAPH runs only): capture the
-                    # inputs AND the in-run selection so an offline pass
-                    # can check score-multiset equality vs torch.topk on
-                    # the exact production path. prev_topk still holds
-                    # the pre-op value here (copy-back is below). The
-                    # min-seq guard skips warmup/dummy rows (n < K).
-                    # TRTLLM_GVR_DUMP holds the target directory.
-                    gvr_dump_dir = os.environ.get("TRTLLM_GVR_DUMP")
-                    if (
-                        gvr_dump_dir
-                        and getattr(self, "_gvr_dumped", 0) < 6
-                        and int(seq_1d.min()) >= self.index_topk * self.compress_ratio
-                    ):
-                        os.makedirs(gvr_dump_dir, exist_ok=True)
-                        self._gvr_dumped = getattr(self, "_gvr_dumped", 0) + 1
-                        torch.save(
-                            {
-                                "logits": logits_decode.clone().cpu(),
-                                "seq_raw": seq_1d.clone().cpu(),
-                                "pre": st.prev_topk[:num_gen_tokens].clone().cpu(),
-                                "sel": out_slice.clone().cpu(),
-                                "layer": self.layer_idx,
-                            },
-                            os.path.join(
-                                gvr_dump_dir,
-                                f"dump_l{self.layer_idx}_{self._gvr_dumped}.pt",
-                            ),
-                        )
                     st.prev_topk[:num_gen_tokens].copy_(out_slice)
                 elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
@@ -1914,10 +1879,8 @@ class Indexer(nn.Module):
                         order_row=metadata.kv_lens_row_reorder,
                     )
                 elif self.use_cute_dsl_topk and (self.compress_ratio == 1 or next_n == 1):
-                    # request-level seq_lens must be 1-D; on the DSL
-                    # indexer path the live compressed lengths are in
-                    # gen_indexer_kv_lens_cuda_runtime (kv_lens_cuda_2d
-                    # stays zero there)
+                    # seq_lens must be 1-D; on the DSL path the live compressed
+                    # lens are gen_indexer_kv_lens_cuda_runtime (2d buf is zero)
                     if self.compress_ratio > 1:
                         radix_lens = (
                             metadata.gen_indexer_kv_lens_cuda_runtime

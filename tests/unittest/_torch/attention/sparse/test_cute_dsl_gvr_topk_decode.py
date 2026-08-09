@@ -1278,3 +1278,226 @@ def test_cute_dsl_gvr_topk_decode_tie_flood_beyond_capacity():
     )
     torch.cuda.synchronize()
     _tie_aware_check(out_indices, logits, seq_lens, top_k, 1, compress_ratio=1)
+
+
+# ---------------------------------------------------------------------------
+# Emission-assisted (ext) tiers: packed seed row / candidate list / block max.
+# Inputs emulate the indexer epilogue host-side against the layout contracts
+# in ``gvr_ext`` (segments at bases 0 / LIST_SEG_A / 2*LIST_SEG_A, packed row
+# = lines at [0..2] + exact counts at [3..5] + skip pass count at [6]).
+# ---------------------------------------------------------------------------
+
+_FLT_MAX = 3.4028234663852886e38
+
+
+def _lines_at_counts(logits_f32, n_eff, targets):
+    """Per-row threshold lines placed at exact counts (descending targets
+    -> ascending line values). count(logits >= line[j]) == targets[j]."""
+    num_rows = logits_f32.shape[0]
+    lines = torch.empty((num_rows, len(targets)), dtype=torch.float32, device=logits_f32.device)
+    for r in range(num_rows):
+        ne = int(n_eff[r])
+        row = logits_f32[r, :ne]
+        for j, c in enumerate(targets):
+            c = min(int(c), ne)
+            lines[r, j] = torch.kthvalue(row, ne - c + 1).values
+    return lines
+
+
+def _pack_seed_row(logits_f32, n_eff, lines, block_max=None):
+    """[rows, 8] fp32 packed seed row: lines + exact counts (+ skip count)."""
+    num_rows, N = logits_f32.shape
+    pos = torch.arange(N, device=logits_f32.device)[None, :]
+    valid = pos < n_eff[:, None]
+    counts = torch.stack(
+        [((logits_f32 >= lines[:, j : j + 1]) & valid).sum(-1) for j in range(3)], 1
+    ).int()
+    pack = torch.zeros((num_rows, 8), dtype=torch.float32, device=logits_f32.device)
+    pack[:, 0:3] = lines
+    pack[:, 3:6] = counts.float()
+    if block_max is not None:
+        pack[:, 6] = (block_max >= lines[:, 0:1]).sum(dim=1).float()
+    return pack.contiguous()
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("mode", ["band", "fat", "miss", "inf"])
+def test_cute_dsl_gvr_topk_decode_ext_counts(top_k, mode):
+    """Packed seed row ([rows, 8]: lines + exact counts) consumption.
+
+    band: one line's count sits inside the admission band (direct path).
+    fat:  every count overshoots the candidate capacity -> full fallback.
+    miss: lines above the row max (count 0) -> seed rejected.
+    inf:  non-finite lines (production cold start) -> validity guard.
+    """
+    N, batch = 131072, 4
+    logits, pre_idx, seq_lens = _make_inputs(batch, N, top_k, torch.float32, 1, seed=7, varlen=True)
+    n_eff = seq_lens.to(device=logits.device, dtype=torch.long)
+    if mode == "band":
+        lines = _lines_at_counts(logits, n_eff, (4 * top_k, 2 * top_k, top_k + top_k // 4))
+    elif mode == "fat":
+        lines = _lines_at_counts(logits, n_eff, (32768, 24576, 16384))
+    elif mode == "miss":
+        pos = torch.arange(N, device=logits.device)[None, :]
+        rowmax = torch.where(pos < n_eff[:, None], logits, float("-inf")).amax(-1)
+        lines = rowmax[:, None] + torch.tensor([1.0, 2.0, 3.0], device=logits.device)
+    else:
+        lines = torch.full((batch, 3), float("inf"), device=logits.device)
+    seed_row = _pack_seed_row(logits, n_eff, lines)
+    xstate = torch.zeros((batch, 8), dtype=torch.float32, device=logits.device)
+    out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        cluster_size=1,
+        seed_thr=seed_row,
+        xstate=xstate,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, 1)
+    if mode == "band":
+        # the closed loop must republish valid state for the next step
+        assert bool((xstate[:, 0] > 0).all().item())
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("mode", ["hit", "pads", "hist", "void", "bucketed"])
+def test_cute_dsl_gvr_topk_decode_ext_list(mode):
+    """Candidate-list tier at the production geometry (accept_cap =
+    LIST_SEG_A, width = LIST_WIDTH).
+
+    hit:      parked lines (production shape), claimed inside [K+64, B*]
+              -> line cut, single mapped load.
+    pads:     same + interleaved idx=-1 window sentinels (claimed counts
+              them; the K+64 slack absorbs them).
+    hist:     claimed past B* but list complete -> clamped-histogram
+              fallback over segment C.
+    void:     collection overflows LIST_CAP_C -> void=1 -> full scan.
+    bucketed: three live lines spread across segments A/B/C, cut at the
+              tightest line inside the band.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_ext import (
+        LIST_CAP_C,
+        LIST_PARK_LINE,
+        LIST_SEG_A,
+        LIST_WIDTH,
+    )
+
+    top_k, N, batch = 512, 131072, 2
+    logits, pre_idx, seq_lens = _make_inputs(
+        batch, N, top_k, torch.float32, 1, seed=11, varlen=True
+    )
+    dev = logits.device
+    n_eff = seq_lens.to(device=dev, dtype=torch.long)
+    if mode == "bucketed":
+        lines = _lines_at_counts(logits, n_eff, (20000, 4000, 600))
+    else:
+        n0 = {"hit": 4096, "pads": 4096, "hist": 12000, "void": 30000}[mode]
+        l0 = _lines_at_counts(logits, n_eff, (n0,))
+        lines = torch.cat(
+            [l0, torch.full_like(l0, LIST_PARK_LINE), torch.full_like(l0, 2 * LIST_PARK_LINE)], 1
+        )
+    seed_row = _pack_seed_row(logits, n_eff, lines)
+    cand_vals = torch.full((batch, LIST_WIDTH), float("-inf"), dtype=torch.float32, device=dev)
+    cand_idx = torch.full((batch, LIST_WIDTH), -1, dtype=torch.int32, device=dev)
+    cand_ctl = torch.zeros((batch, 4), dtype=torch.int32, device=dev)
+    pads = 64 if mode == "pads" else 0
+    for r in range(batch):
+        ne = int(n_eff[r])
+        row = logits[r, :ne]
+        hits = torch.nonzero(row >= lines[r, 0], as_tuple=False).flatten()
+        cand_ctl[r, 2] = int((row >= lines[r, 1]).sum())
+        cand_ctl[r, 3] = int((row >= lines[r, 2]).sum())
+        # emission order is value-blind: shuffle, then classify by the
+        # tightest line passed; a full segment spills to the looser one
+        perm = hits[torch.randperm(hits.numel(), device=dev)]
+        v = row[perm]
+        seg = torch.where(v >= lines[r, 2], 0, torch.where(v >= lines[r, 1], 1, 2))
+        in_a = seg == 0
+        ord_a = torch.cumsum(in_a.int(), 0)
+        stay_a = in_a & (ord_a <= LIST_SEG_A)
+        in_b = (seg == 1) | (in_a & ~stay_a)
+        ord_b = torch.cumsum(in_b.int(), 0)
+        stay_b = in_b & (ord_b <= LIST_SEG_A)
+        in_c = (seg == 2) | (in_b & ~stay_b)
+        ord_c = torch.cumsum(in_c.int(), 0)
+        stay_c = in_c & (ord_c <= LIST_CAP_C - pads)
+        slot = torch.full_like(seg, -1)
+        slot[stay_a] = ord_a[stay_a] - 1
+        slot[stay_b] = LIST_SEG_A + (ord_b[stay_b] - 1)
+        slot[stay_c] = 2 * LIST_SEG_A + (ord_c[stay_c] - 1)
+        if pads:
+            # sentinels displace C entries later in emission order: the
+            # kept ordinals shift by how many sentinels landed before them
+            pad_slots = torch.randperm(int(stay_c.sum()) + pads, device=dev)[:pads]
+            keep = slot[stay_c] - 2 * LIST_SEG_A
+            shift = (pad_slots[None, :] <= keep[:, None]).sum(-1)
+            slot[stay_c] = 2 * LIST_SEG_A + keep + shift
+        live = slot >= 0
+        cand_vals[r, slot[live].long()] = v[live]
+        cand_idx[r, slot[live].long()] = perm[live].int()
+        cand_ctl[r, 0] = int(hits.numel()) + pads
+        cand_ctl[r, 1] = 1 if int(in_c.sum()) > LIST_CAP_C - pads else 0
+    out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        cluster_size=1,
+        seed_thr=seed_row,
+        cand_vals=cand_vals,
+        cand_idx=cand_idx,
+        cand_ctl=cand_ctl,
+        accept_cap=LIST_SEG_A,
+        num_threads=512,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, 1)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("tail_mode", ["exact", "pad_inf"])
+def test_cute_dsl_gvr_topk_decode_ext_block_max(tail_mode):
+    """32-grain positional upper-bound records + packed seed row.
+
+    The skip walk may only skip units whose bound clears no line, so it
+    must be exact under both legal tail bounds: the tight max over valid
+    positions and the worst legal inflation (+FLT_MAX on a partially
+    valid record).
+    """
+    top_k, N, batch = 1024, 262144, 2
+    seq_lens = torch.tensor([N, N - 37], dtype=torch.int32, device="cuda")
+    logits, pre_idx, seq_lens = _make_inputs(
+        batch, N, top_k, torch.float32, 1, seed=13, seq_lens=seq_lens
+    )
+    dev = logits.device
+    n_eff = seq_lens.to(device=dev, dtype=torch.long)
+    pos = torch.arange(N, device=dev)[None, :]
+    masked = torch.where(pos < n_eff[:, None], logits, float("-inf"))
+    records = masked.view(batch, N // 32, 32).amax(-1)
+    if tail_mode == "pad_inf":
+        rec_start = torch.arange(N // 32, device=dev)[None, :] * 32
+        partial = (rec_start < n_eff[:, None]) & (rec_start + 32 > n_eff[:, None])
+        records = torch.where(partial, torch.full_like(records, _FLT_MAX), records)
+    records = records.contiguous()
+    lines = _lines_at_counts(logits, n_eff, (4 * top_k, 2 * top_k, top_k + top_k // 4))
+    seed_row = _pack_seed_row(logits, n_eff, lines, block_max=records)
+    out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        cluster_size=1,
+        seed_thr=seed_row,
+        block_max=records,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, 1)

@@ -52,13 +52,13 @@ def _env_flag(name: str) -> bool:
 # Diagnostic knob: compile per-phase clock64 stamps of the list path
 # into the spare xstate slots (harness-side analysis). Off by default;
 # NEVER set in production.
-_P4_TAIL_DBG = _env_flag("GVR_P4_TAIL_DBG")
+_P4_TAIL_DBG = _env_flag("TRTLLM_GVR_P4_TAIL_DBG")
 # P4 sub-phase clock64 breakdown -> xstate[1,2,4,5,6,7] (debug: clobbers
 # the closed-loop thr/anch publish; single-shot cells only, not chains)
-_P4_SUB_DBG = _env_flag("GVR_P4_SUB_DBG")
-# GVR_P4_SUB_DBG=2: publish the P4 HEAD triple (minmax / histogram build /
+_P4_SUB_DBG = _env_flag("TRTLLM_GVR_P4_SUB_DBG")
+# TRTLLM_GVR_P4_SUB_DBG=2: publish the P4 HEAD triple (minmax / histogram build /
 # coarse search) instead of the tail triple, so the phase budget adds up.
-_P4_SUB_HEAD = os.environ.get("GVR_P4_SUB_DBG", "0").strip() == "2"
+_P4_SUB_HEAD = os.environ.get("TRTLLM_GVR_P4_SUB_DBG", "0").strip() == "2"
 # Exact-tail small-class pair buffer. The scatter parks each member of the
 # straddling tie class as (value bits, index) here, above the 256 digit bins
 # the large-class radix zeroes and above its [256..258] scalars, so the repair
@@ -81,7 +81,7 @@ def _pair_cap_for(n_bins: int) -> int:
     return min(_PAIR_MAX, 1 << (room.bit_length() - 1))
 
 
-_SKIP_DBG = _env_flag("GVR_SKIP_DBG")
+_SKIP_DBG = _env_flag("TRTLLM_GVR_SKIP_DBG")
 
 
 # ---------------------------------------------------------------------------
@@ -635,8 +635,7 @@ class GvrTopKKernel:
             # physical candidate-buffer capacity override (B* search)
             self.kC = int(kc_override)
         # acceptance band top B*: a cut whose count fits [K, B*] goes
-        # straight to Phase 4. Cost-bounded (refine ~1.9us/1k cands vs
-        # ~21-30us fallback), physically bounded by kC.
+        # straight to Phase 4. Physically bounded by kC.
         self.accept_cap = int(accept_cap) if accept_cap is not None else self.kC
         self.cand_cap = int(cand_cap)
         # list path: the score column is staged into a DEDICATED smem
@@ -757,28 +756,13 @@ class GvrTopKKernel:
             p4_exact_tail = self.enable_p4_rank_scatter_exact and dtype == cutlass.Float32
         self.p4_exact_tail = bool(p4_exact_tail) and self.enable_p4_rank_scatter_exact
         # p4_tail_fast: tiny-tie COLLECT+SELECT fast path inside the
-        # exact-tail fire branch. When the (b*, sb*) tie class holds <= 128
-        # entries (the real firing cells have 2), ONE candidate pass collects
-        # (value_bits, cand_idx) pairs into SMEM and thread0 selects the
-        # top-need exactly, replacing the 4 unconditional radix passes
-        # (~5.3us -> ~1 pass on pro/512k). Larger tie classes fall through to
-        # the existing radix select. Pure optimization (the radix backstop
-        # keeps exactness identical either way); False compiles the original
-        # text (byte-identical PTX modulo kernel name) for A/B.
-        # Default gate = p4_exact_tail AND top_k >= 1024: the non-firing
-        # codegen tax concentrates at K512 cs=1 mid-N (flash 64k/128k
-        # -6.6/-9.1%, cross-GPU reproducible, 2026-07-20 b200-035) while the
-        # fire census (pro/512k bench + 9 per-layer fixture cells) contains
-        # NO K512 cell — so K512 keeps the original byte-identical kernel.
+        # exact-tail fire branch: when the boundary tie class holds few
+        # enough entries to buffer, one candidate pass replaces the radix
+        # passes; larger classes fall through to the radix backstop, so
+        # exactness is identical either way.
         if p4_tail_fast is None:  # [p4tt]
-            # Was gated on top_k >= 1024, which left K=512 on the original
-            # full-candidate 4-level radix: every level re-zeroes 256 bins
-            # and re-walks the WHOLE candidate array, so a step whose
-            # boundary class is large costs ~5us against ~0.2us for its
-            # neighbours. The compacted path pays for the class only.
-            # Measured on the captured flash rows that trigger it
-            # (256k layer 20 step 4, K=512): 5.04us -> 2.17us, with the
-            # neighbouring steps unchanged at ~0.2us.
+            # default follows p4_exact_tail for every K (the compacted
+            # path pays for the boundary class only)
             p4_tail_fast = self.p4_exact_tail
         self.p4_tail_fast = bool(p4_tail_fast) and self.p4_exact_tail  # [p4tt]
         # p4_tail_v3: compacted-class repair (block-parallel radix +
@@ -790,27 +774,30 @@ class GvrTopKKernel:
                 use_ext_counts or use_ext_cand or ext_rungs or self_scan or enable_block_skip
             )
         self.p4_tail_v3 = bool(p4_tail_v3)
-        # p4_no_fine: drop the 256-bin fine level from phase 4 outright and
-        # let the tail repair rank the whole straddling COARSE bin instead.
-        # Phase 4's cost is a chain of sequential stages, not work: its total
-        # barely moves when the candidate count triples, so the only way to
-        # cut it is to remove a stage. The coarse bin holds 11 candidates at
-        # the median and 49 at the max over 520 captured steps - inside the
-        # tail's pair buffer - and the tail now ranks with the whole block,
-        # so it absorbs the class cheaply. A class past the buffer falls into
-        # the tail's radix, which handles any size. Gated to the same
-        # configuration as that small-class route; the stock kernel keeps the
-        # fine level so its codegen is untouched.
+        # p4_no_fine: drop the 256-bin fine level from phase 4 and let the
+        # tail repair rank the whole straddling COARSE bin instead. A class
+        # past the tail's pair buffer falls into its radix, which handles
+        # any size. Gated to the same configuration as that small-class
+        # route; the stock kernel keeps the fine level so its codegen is
+        # untouched.
         if p4_no_fine is None:
             p4_no_fine = bool(
                 self.p4_exact_tail and self.p4_tail_fast and self.p4_tail_v3
             ) and not (self.p4_fine_rangetest or self.p4_scat_rangetest)
         self.p4_no_fine = bool(p4_no_fine)
+        if self.p4_no_fine:
+            if not (self.p4_exact_tail and self.p4_tail_fast and self.p4_tail_v3):
+                raise ValueError("p4_no_fine requires the exact-tail repair chain")
+            if self.p4_fine_rangetest or self.p4_scat_rangetest:
+                raise ValueError("p4_no_fine is incompatible with the range-test arms")
+        if self.p4_exact_tail and self.p4_tail_fast and self.p4_tail_v3:
+            if _pair_cap_for(self.kNumBins) < 1:
+                raise ValueError(
+                    f"kNumBins={self.kNumBins} leaves no room for the tail pair buffer"
+                )
         # p1r_rescue: rebuild the refine bracket from the row when the
-        # seed bracket is degenerate. ON by default - upstream's identity
-        # shortcut is wrong on real data (every request's first decode
-        # step feeds a zero-init prev_topk). The knob exists to measure
-        # its cost, not to ship it off.
+        # seed bracket is degenerate (e.g. the zero-init prev_topk every
+        # request's first decode step feeds). ON by default.
         self.p1r_rescue = bool(p1r_rescue)
 
     # ------------------------------------------------------------------
@@ -1440,16 +1427,13 @@ class GvrTopKKernel:
         uncapped), so {n0, void, n1, n2} fall out for free — the same
         contract the v5 emitter produced externally.
 
-        Perf shape (v13): the dense scan is a cp.async pipeline — each
-        thread streams one 16B vector per step into its private
-        slot-major smem staging slot (LDGSTS: no data registers, no
-        scoreboard stall until the wait), keeping ``stage_slots`` steps
-        in flight; classification reads the staged values and claims
-        passers with per-element direct smem atomics (they don't
-        synchronize the warp and hide under the async copy stream).
-        Segment overflow is resolved in-claim by spilling to the next
-        looser segment (a segment overflows at most once per row, and
-        divergent scalar atomics need no warp coordination)."""
+        The dense scan is a cp.async pipeline: each thread streams one
+        16B vector per step into its private slot-major smem staging
+        slot, keeping ``stage_slots`` steps in flight; classification
+        reads the staged values and claims passers with per-element
+        direct smem atomics (they don't synchronize the warp). Segment
+        overflow is resolved in-claim by spilling to the next looser
+        segment (a segment overflows at most once per row)."""
         num_threads = cutlass.const_expr(self.num_threads)
         segA = cutlass.const_expr(self.accept_cap)
         capC = cutlass.const_expr(self.cap_c)
@@ -1475,13 +1459,10 @@ class GvrTopKKernel:
         # are the same non-synchronizing per-element atomics as the
         # dense loop - so the block loop needs no uniform trip counts.
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
-            # v8.2: 8 blocks per warp iteration. Every lane vector-loads
-            # the SAME 8 bmax values (L1 broadcast - the pass decisions
-            # are warp-uniform registers), then the passing blocks are
-            # loaded back-to-back (independent 128B coalesced loads, so
-            # the memory level parallelism the naive one-block loop
-            # lacked is restored; at high skip rates an iteration is
-            # just the one 32B bmax vector).
+            # 8 blocks per warp iteration: every lane vector-loads the
+            # SAME 8 bmax values (L1 broadcast - the pass decisions are
+            # warp-uniform registers), then the passing blocks are
+            # loaded back-to-back as independent 128B coalesced loads.
             bm_addr = block_max_row.iterator.toint()
             nb0 = (N + cutlass.Int32(31)) >> cutlass.Int32(5)
             # Two-pass skip: (1) DENSE-scan the bmax array itself (it
@@ -1489,10 +1470,8 @@ class GvrTopKKernel:
             # PASSING BLOCK IDS into the idle C segment (single-band mode
             # never fills C; ids < 2^23 store exactly as floats);
             # (2) walk the compact list, 8 blocks per warp round issued
-            # unguarded back-to-back - every element read is useful and
-            # the loads pipeline. If the list overflows capC the row
-            # falls back to the dense full scan (routing should have
-            # sent it there anyway).
+            # unguarded back-to-back. If the list overflows capC the row
+            # falls back to the dense full scan.
             # pass-1 vectors: 128-bit (the bmax row base is only 16B
             # aligned: nb_pad %% 4)
             pass1_atom = cute.make_copy_atom(
@@ -1661,17 +1640,13 @@ class GvrTopKKernel:
         cpw = cutlass.const_expr(4)  # cp.async caps at 16B per copy
         step1 = cutlass.const_expr(num_threads * cpw)
         st2log = cutlass.const_expr((2 * step1).bit_length() - 1)
-        # Pair-step cp.async pipeline: the scan is instruction-issue
-        # bound (pcsamp: no_instructions + wait dominate; long_scoreboard
-        # is 6%), so each step processes TWO 16B vectors per thread —
-        # loop/wait/commit/address overhead amortizes over 8 elements
-        # instead of 4 while the in-flight byte count stays put (2 pairs
-        # x 32B across the 4 staging slots). One commit group per pair;
-        # wait_group(1) pops the oldest pair. The staging buffer aliases
-        # smem_vals (only written after phase 0); every non-empty group
-        # is drained inside the loop, so nothing is in flight once the
-        # alias is read. FULL-pair steps only in the hot loop; the
-        # remainder takes the scalar tail below.
+        # Pair-step cp.async pipeline: each step processes TWO 16B
+        # vectors per thread (2 pairs x 32B across the 4 staging slots).
+        # One commit group per pair; wait_group(1) pops the oldest pair.
+        # The staging buffer aliases smem_vals (only written after phase
+        # 0); every non-empty group is drained inside the loop, so
+        # nothing is in flight once the alias is read. FULL-pair steps
+        # only in the hot loop; the remainder takes the scalar tail below.
         nfull = N >> st2log
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             nfull = cutlass.Int32(0)
@@ -2110,9 +2085,8 @@ class GvrTopKKernel:
     # columns (the accepted rung's column seeds Phase 3 per CTA).
     # ------------------------------------------------------------------
 
-    # ---- block-skip machinery (enable_block_skip; ported from the
-    # skip-finegrain development chain, measured-optimal configuration
-    # only: grain 32, int16 list, grouped strided build, UN=2 scan) ----
+    # ---- block-skip machinery (enable_block_skip): grain 32, int16
+    # list, grouped strided build, UN=2 scan ----
 
     @cute.jit
     def _list_ld(self, smem_active, idx):
@@ -3541,15 +3515,12 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # _p4_coarse_rw - redundant-warp coarse bin search for the fused
-    # rank-and-scatter path. Same result as the high->low walk it
-    # replaces (the straddling bin and the count strictly above it),
-    # but staged once and then resolved lane-parallel on every warp:
-    # an idx-shuffle scan + ballot locate the target slice, a second
-    # scan + the unique crossing test locate the bin inside it. Two
-    # publish barriers and a bins_per_warp-deep serial LDS+IADD chain in
-    # a single lane disappear; integer sums are associative so every
-    # warp lands on the same answer bit-for-bit. Mirrors
-    # _kth_bin_search_rw, which does the same for the snap path.
+    # rank-and-scatter path: returns the straddling bin and the count
+    # strictly above it, resolved lane-parallel on every warp (an
+    # idx-shuffle scan + ballot locate the target slice, a second scan
+    # + the unique crossing test locate the bin inside it). Integer
+    # sums are associative, so every warp lands on the same answer
+    # bit-for-bit. Mirrors _kth_bin_search_rw (snap path).
     # ------------------------------------------------------------------
     @cute.jit
     def _p4_coarse_rw(self, smem_hist, smem_wcnt, warp_id, lane):
@@ -3653,13 +3624,10 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # _p4_fine_rw - redundant-warp variant of the fine sub-bin search,
-    # the same transformation _p4_coarse_rw applies one level up. The
-    # serial form stages per-warp slice sums, has thread 0 walk the warp
-    # totals, then has one lane of the target warp walk that slice bin by
-    # bin, with three publish barriers. Here every warp resolves it from
-    # the staged sums with an idx-shuffle scan and a ballot, so two
-    # barriers and the fbins/num_warps-deep serial LDS chain disappear.
-    # Integer sums are associative: every warp lands on the same answer.
+    # the same transformation _p4_coarse_rw applies one level up: every
+    # warp resolves it from the staged per-warp sums with an idx-shuffle
+    # scan and a ballot. Integer sums are associative: every warp lands
+    # on the same answer.
     # ------------------------------------------------------------------
     @cute.jit
     def _p4_fine_rw(self, smem_hist, smem_wcnt, fbins, rank_above, warp_id, lane):
@@ -3751,8 +3719,7 @@ class GvrTopKKernel:
         return sb_out, ra_out
 
     # ------------------------------------------------------------------
-    # Phase 4 (alt): op#7 fused rank-and-scatter (enable_p4_rank_scatter).
-    # Ported verbatim from p4_recursive_digit/gvr_topk_decode_p4.py.
+    # Phase 4 (alt): fused rank-and-scatter (enable_p4_rank_scatter).
     # ------------------------------------------------------------------
     @cute.jit
     def phase4_rank_scatter(
@@ -3807,8 +3774,7 @@ class GvrTopKKernel:
                 if use_ext_r == cutlass.Int32(1):
                     # list rows: the take walk pre-zeroed the hist and staged
                     # per-warp maxima in smem_wcnt (its end barrier orders
-                    # them); min := cut line by construction. The minmax
-                    # scan, the zero pass and their three barriers vanish.
+                    # them); min := cut line by construction.
                     if cutlass.const_expr(ext_min is not None):
                         bmin_r = ext_min
                     for w in cutlass.range_constexpr(self.num_warps):
@@ -3820,14 +3786,9 @@ class GvrTopKKernel:
                         bmax_r = bmin_r + cutlass.Float32(1e-6)
             if run_stock_range:
                 # ---- block min/max over candidates ----
-                # The accepted threshold is an EXACT lower bound: every
-                # candidate got here by comparing >= against it. So the min
-                # side of this scan buys nothing but a slightly tighter
-                # window - and the window only has to be tight where the
-                # k-th lives, which is the TOP of it. Taking the threshold
-                # instead drops half the scan, one warp reduce and one arm
-                # of the cross-warp fold. Only the assist tiers have a
-                # published threshold, hence the gate.
+                # The accepted threshold is an EXACT lower bound on every
+                # candidate, so it can stand in for the min. Only the
+                # assist tiers have a published threshold, hence the gate.
                 use_thr_min = cutlass.const_expr(self.p4_no_fine)
                 local_cmin = cutlass.Float32(self.FLT_MAX)
                 local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
@@ -3848,10 +3809,8 @@ class GvrTopKKernel:
                     smem_hist[warp_id] = float_as_uint32(cmax)
                 cute.arch.barrier()
                 # lane-parallel cross-warp fold: lane w holds slot w and one
-                # warp reduce settles it, instead of every thread walking all
-                # num_warps slots of two arrays with dependent SMEM reads.
-                # min/max reassociate freely, so the result is bit-identical
-                # and every warp still lands on it without a leader.
+                # warp reduce settles it. min/max reassociate freely, so the
+                # result is bit-identical on every warp without a leader.
                 pmn = cutlass.Float32(self.FLT_MAX)
                 pmx = cutlass.Float32(self.NEG_FLT_MAX)
                 if lane < cutlass.Int32(self.num_warps):
@@ -3960,8 +3919,7 @@ class GvrTopKKernel:
 
             # ---- EXACT: one fine-histogram recursion on the straddling bin b* ----
             if cutlass.const_expr(self.enable_p4_rank_scatter_exact):
-                # FIXED small fine-bin count (independent of kNumBins) — cuts the
-                # re-zero + 3-step cost (esp. K=2048 where kNumBins=2048); 256
+                # FIXED small fine-bin count (independent of kNumBins): 256
                 # sub-bins over bin b* gives kNumBins×256 effective resolution,
                 # enough to resolve the straddling bin to ≤1 distinct value.
                 fbins = cutlass.const_expr(256)
@@ -3975,11 +3933,8 @@ class GvrTopKKernel:
                     # Sub-binning collapsed: finv 0 sends every member of the
                     # straddling coarse bin to sub-bin 0 == sb*, so the
                     # scatter parks the whole coarse class and the tail ranks
-                    # it. The re-zero, the build and the search below are not
-                    # traced at all - this is a compile-time removal, not a
-                    # runtime branch, because a runtime branch still costs the
-                    # stage (measured: 0.64us for a fine window whose work was
-                    # gated off).
+                    # it. MUST stay a compile-time removal (the re-zero, build
+                    # and search below untraced), not a runtime branch.
                     finv = cutlass.Float32(0.0)
                     sb_star = cutlass.Int32(0)
                     rank_above_fine = rank_above
@@ -4000,12 +3955,10 @@ class GvrTopKKernel:
                     cute.arch.barrier()
                     if cutlass.const_expr(self.p4_fine_rangetest):
                         # A candidate belongs to bin b* exactly when its value
-                        # lies in [f_lo, f_hi), so the filter is two compares -
-                        # the bin recompute (subtract + multiply + two clamps)
-                        # per candidate is redundant work. The clamped ends of
-                        # the binning fold out-of-range values INTO bin 0 and
-                        # bin kBins-1, so those two bins drop the matching side
-                        # of the range test to stay bit-identical.
+                        # lies in [f_lo, f_hi). The clamped ends of the binning
+                        # fold out-of-range values INTO bin 0 and bin kBins-1,
+                        # so those two bins must drop the matching side of the
+                        # range test to stay bit-identical.
                         ifb = tidx
                         while ifb < cand_count:
                             vf = smem_keys[ifb]
@@ -4041,9 +3994,8 @@ class GvrTopKKernel:
                             ifb = ifb + cutlass.Int32(num_threads)
                     cute.arch.barrier()
                     # fine sub-bin search, resolved lane-parallel on every
-                    # warp (see _p4_fine_rw): the two publish barriers and the
-                    # fbins/num_warps-deep single-lane walk that used to sit
-                    # here are gone, and the answer comes back in registers.
+                    # warp (see _p4_fine_rw); the answer comes back in
+                    # registers.
                     sb_star, rank_above_fine = self._p4_fine_rw(
                         smem_hist, smem_wcnt, fbins, rank_above, warp_id, lane
                     )
@@ -4115,20 +4067,13 @@ class GvrTopKKernel:
                             if cutlass.const_expr(
                                 self.p4_exact_tail and self.p4_tail_fast and self.p4_tail_v3
                             ):
-                                # The tie class is exactly what the exact-tail
-                                # repair needs, and this pass has already
-                                # classified every candidate AND handed out the
-                                # intra-class ordinal. Park (value bits, index)
-                                # here so the repair does not have to walk the
-                                # candidates again: measured 0.61us of its
-                                # remaining cost was that second walk. Pairs
+                                # Park (value bits, index) so the exact-tail
+                                # repair never re-walks the candidates. Pairs
                                 # live above the digit bins the radix route
                                 # zeroes; small classes are the only consumer.
                                 # Unconditional, index wrapped: the buffer is
                                 # only ever READ when the class fits it, and
-                                # then the wrap is a no-op. Dropping the bound
-                                # branch keeps this off the scatter's critical
-                                # path, which every step pays.
+                                # then the wrap is a no-op.
                                 ow = (o & cutlass.Int32(pair_cap - 1)) * cutlass.Int32(2)
                                 smem_hist[cutlass.Int32(_PAIR_BASE) + ow] = float_as_int32(v)
                                 smem_hist[cutlass.Int32(_PAIR_BASE) + ow + cutlass.Int32(1)] = (
@@ -4166,16 +4111,10 @@ class GvrTopKKernel:
                 # slot range [rank_above_fine, kK). Unambiguous rows (the
                 # overwhelming majority) pay two scalar compares; the counters
                 # and the fine histogram are reused, so SMEM does not grow.
-                # boundary-class repair: collect the (b*, sb*) tie
-                # class compactly (ONE candidate pass), then select inside
-                # it. Tiny jobs (need x class <= 512) keep the thread0
-                # serial select (cheapest at that size). Bigger classes up
-                # to capc get a 4-level MSB radix over the COLLECTED class
-                # (each level scans <= capc pairs with all threads instead
-                # of re-scanning every candidate) — the old serial select
-                # was O(need x class) and measured 8.5us on real chain rows
-                # (need ~100 x class ~100). Classes beyond capc take the
-                # UNMODIFIED full-candidate radix below (verbatim copy).
+                # boundary-class repair: pure-tie classes (one key value)
+                # exit on a warp-reduce precheck; classes parked in the
+                # pair buffer rank block-parallel over the parked pairs;
+                # anything larger takes the full-candidate radix below.
                 if cutlass.const_expr(self.p4_exact_tail and self.p4_tail_fast):  # [p4tt]
                     if cutlass.const_expr(self.p4_tail_v3):
                         need0 = cutlass.Int32(kK) - rank_above_fine
@@ -4197,19 +4136,9 @@ class GvrTopKKernel:
                                 # Small mixed class: the scatter already parked
                                 # every member as a (value bits, index) pair,
                                 # so there is nothing to collect - go straight
-                                # to the rank. No extra candidate walk, no
-                                # staging barrier, nothing riding in registers.
-                                # Rank the class with the WHOLE BLOCK, not
-                                # one warp. Each warp owns a stride of the
-                                # class and its 32 lanes split the
-                                # comparisons, so the cost is
-                                # ceil(n/num_warps) * ceil(n/32) trips per
-                                # lane plus one warp reduce - 1 trip for the
-                                # class of two that fires today, 8 for a class
-                                # of fifty. The old form had a single warp walk
-                                # n^2/32 steps while the other fifteen waited
-                                # at the barrier below, which is what made a
-                                # larger class unaffordable.
+                                # to the rank. Rank with the WHOLE BLOCK: each
+                                # warp owns a stride of the class and its 32
+                                # lanes split the comparisons.
                                 e9 = warp_id
                                 while e9 < cnt_strad:
                                     be9 = smem_hist[_PAIR_BASE + e9 + e9]
@@ -4253,20 +4182,12 @@ class GvrTopKKernel:
                                     e9 = e9 + cutlass.Int32(num_warps)
                                 cute.arch.barrier()
                             else:
-                                # Large class only. Everything below -
-                                # the pure-tie pre-check walk, its
-                                # cross-warp fold and the publish
-                                # barrier that fold needs - exists to
-                                # decide whether the radix can be
-                                # skipped. The small route above needs
-                                # none of it, and used to run it anyway
-                                # for a class of two.
-                                # block-wide pure-tie check, ANY class
-                                # size: min/max order key over the (b*, sb*) class.
+                                # Large class only: block-wide pure-tie check
+                                # (min/max order key over the (b*, sb*) class)
+                                # decides whether the radix can be skipped.
                                 # A pure-tie class needs NO repair — the scatter's
                                 # arrival fill of bit-equal values is already
-                                # value-set exact. Real fp8-lineage logits tie in
-                                # the thousands, which used to take the full radix.
+                                # value-set exact.
                                 # Staging mirrors the head min/max (wcnt + hist
                                 # slots [0..31], both dead here; pairs live at
                                 # 260+).
@@ -4276,14 +4197,10 @@ class GvrTopKKernel:
                                 kmn6 = cutlass.Int32(2147483647)
                                 kmx6 = cutlass.Int32(-2147483648)
                                 it6 = tidx
-                                # The pure-tie pre-check only exists to SKIP the
-                                # repair when the class is bit-uniform. The small
-                                # route below ranks by (key, arrival) and rewrites
-                                # exactly the need0 winner slots, which is already
-                                # value-exact on a pure tie - so for a small class
-                                # the check is a whole candidate walk bought for
-                                # nothing. Only the large-class route, whose radix
-                                # really is worth avoiding, still pays for it.
+                                # The pure-tie pre-check SKIPs the repair when
+                                # the class is bit-uniform; only the large-class
+                                # route runs it (the small route is already
+                                # value-exact on a pure tie).
                                 while it6 < cand_count:
                                     v6 = smem_keys[it6]
                                     b6 = cutlass.Int32((v6 - bmin_r) * inv1)
@@ -4292,11 +4209,15 @@ class GvrTopKKernel:
                                     if b6 > cutlass.Int32(kBins - 1):
                                         b6 = cutlass.Int32(kBins - 1)
                                     if b6 == b_star:
-                                        s6 = cutlass.Int32((v6 - f_lo) * finv)
-                                        if s6 < cutlass.Int32(0):
-                                            s6 = cutlass.Int32(0)
-                                        if s6 > cutlass.Int32(fbins - 1):
-                                            s6 = cutlass.Int32(fbins - 1)
+                                        # with the fine level compiled out the
+                                        # whole coarse bin IS the class
+                                        s6 = cutlass.Int32(0)
+                                        if cutlass.const_expr(not self.p4_no_fine):
+                                            s6 = cutlass.Int32((v6 - f_lo) * finv)
+                                            if s6 < cutlass.Int32(0):
+                                                s6 = cutlass.Int32(0)
+                                            if s6 > cutlass.Int32(fbins - 1):
+                                                s6 = cutlass.Int32(fbins - 1)
                                         if s6 == sb_star:
                                             k6 = f32_order_key(v6) ^ cutlass.Int32(-2147483648)
                                             if k6 < kmn6:
@@ -4304,13 +4225,9 @@ class GvrTopKKernel:
                                             if k6 > kmx6:
                                                 kmx6 = k6
                                             # Buffer the member so the compaction
-                                            # below needs no walk of its own. The
+                                            # below needs no walk of its own; the
                                             # array is nbuf7 = kC/num_threads
-                                            # deep and every store is an unrolled
-                                            # dynamic-index search over it, which
-                                            # is why only the large class - whose
-                                            # alternative is a 4-level radix -
-                                            # pays for it.
+                                            # deep (unrolled dynamic-index store).
                                             for sl7 in cutlass.range_constexpr(nbuf7):
                                                 if cutlass.Int32(sl7) == nh7:
                                                     rv7[sl7] = v6
@@ -4341,17 +4258,12 @@ class GvrTopKKernel:
                                 if fast_done == cutlass.Int32(0):
                                     # mixed class: compact the members buffered by
                                     # the pure-tie pass above into
-                                    # smem_keys/vals[0..cnt_strad). The buffering
-                                    # pass already read every candidate it needs,
-                                    # and the staging barrier above orders those
-                                    # reads before these writes, so the second
-                                    # full-candidate walk (and its barrier) is
-                                    # gone. Repair cost is a function of the CLASS
-                                    # size only, for any class size.
+                                    # smem_keys/vals[0..cnt_strad). The staging
+                                    # barrier above orders the buffered reads
+                                    # before these writes.
                                     # warp-aggregated claim: intra-warp exclusive
                                     # prefix via shfl scan + ONE atomic per warp
-                                    # (a thousand same-address claims serialize
-                                    # and scale with the class size)
+                                    # (same-address claims would serialize)
                                     pf7 = nh7
                                     for so3 in cutlass.range_constexpr(5):
                                         oth3 = cute.arch.shuffle_sync_up(
@@ -4373,13 +4285,11 @@ class GvrTopKKernel:
                                             smem_keys[bs7 + cutlass.Int32(sl8)] = rv7[sl8]
                                             smem_vals[bs7 + cutlass.Int32(sl8)] = ri7[sl8]
                                     cute.arch.barrier()
-                                    # Large class only (the small one is handled
-                                    # above, ahead of the pure-tie pass, so it
-                                    # never reaches here): block-parallel 4-level
+                                    # Large class only (the small one never
+                                    # reaches here): block-parallel 4-level
                                     # MSB radix over the compacted class (scans
                                     # touch class pairs only; warp0 shuffle-scan
-                                    # digit search - 3 block barriers per level
-                                    # instead of 5).
+                                    # digit search).
                                     if tidx == cutlass.Int32(0):
                                         smem_hist[256] = cutlass.Int32(0)
                                         smem_hist[257] = need0
@@ -4627,8 +4537,7 @@ class GvrTopKKernel:
                                     # Two-stage descending digit scan (mirrors the
                                     # fine 3-step search): per-warp partial sums,
                                     # thread0 picks the target warp, its lane0 walks
-                                    # the warp's digit range — 2*num_warps serial
-                                    # steps instead of 256.
+                                    # the warp's digit range.
                                     fdw = cutlass.const_expr(256 // self.num_warps)
                                     wsum2 = cutlass.Int32(0)
                                     for jd in cutlass.range_constexpr(fdw):
@@ -5629,8 +5538,7 @@ class GvrTopKKernel:
             block_max_row = None
         if cutlass.const_expr(self.use_ext_counts and seed_thr is not None):
             # packed seed row [>=6] fp32: [0..2] lines, [3..5] counts as
-            # floats (exact to 2^24) - ONE 32B sector serves both, halving
-            # the serial cold loads of the admission preview
+            # floats (exact to 2^24) - ONE 32B sector serves both
             seed_thr_row = seed_thr[row_idx, None]
             seed_counts_row = None
         elif cutlass.const_expr(self.ext_rungs and seed_thr is not None):
@@ -5900,16 +5808,11 @@ class GvrTopKKernel:
             s_cluster_partial_m = None
             smem_gath = None
 
-        # PDL wait placed as late as possible: everything above (row
-        # resolution, SMEM allocation, config folding - and, on a cold
-        # call, the instruction fetch for all of it) overlaps with the
-        # producer indexer's tail, because dependent CTAs stage onto SMs
-        # as producer CTAs retire. Nothing above reads producer-written
-        # data: seq_lens/pre_idx come from the host-side metadata and the
-        # feedback buffer, while logits / block_max / seed_thr / cand are
-        # first touched below. Instruction-fetch starvation is 37-44% of
-        # this kernel's stall cycles on the small-N cells, so warming it
-        # under the producer's shadow is the point.
+        # PDL wait placed as late as possible so the prologue overlaps
+        # the producer indexer's tail. INVARIANT: nothing above may read
+        # producer-written data - seq_lens/pre_idx come from host-side
+        # metadata and the feedback buffer; logits / block_max /
+        # seed_thr / cand are first touched below.
         if cutlass.const_expr(self.pdl_wait_late):
             griddepcontrol_wait()
 
@@ -6183,10 +6086,8 @@ class GvrTopKKernel:
         # Use the epilogue rungs ONLY when the row is valid (finite t_0,
         # xstate contract) AND some rung count already lies in [K, kC].
         # A miss/invalid row runs the full stock path (P1 + P1b + vseed +
-        # count): real data shows stock beats ext-bracket refine on
-        # misses (pro-1M cold: stock-skip 21us vs ext-miss 51us). All
-        # threads read the same control words, so the predicate is
-        # CTA-uniform and the dynamic branches below stay convergent.
+        # count). All threads read the same control words, so the
+        # predicate is CTA-uniform and the branches below stay convergent.
         if cutlass.const_expr(_P4_TAIL_DBG):
             ck0 = cutlass.Int64(0)
             ck1 = cutlass.Int64(0)
@@ -6194,12 +6095,11 @@ class GvrTopKKernel:
             ckE = cute.arch.clock64()  # row-phase entry (device-residency ref)
         ext_row = cutlass.Int32(0)
         if cutlass.const_expr(self.use_ext_counts):
-            # line validity mirrors ext_rungs: ALL THREE lines finite and
-            # strictly ascending. The old t0-only guard let a NaN in
-            # t1/t2 get parked into the refine brackets (the same failure
-            # mode that broke ext_rungs exactness on-chain); invalid rows
-            # fall to the stock path, exactness never rides on the host
-            # loop's line quality.
+            # line validity mirrors ext_rungs: ALL THREE lines must be
+            # finite and strictly ascending (a NaN in t1/t2 must not
+            # reach the refine brackets); invalid rows fall to the stock
+            # path, so exactness never rides on the host loop's line
+            # quality.
             if (
                 seed_thr_row[0] < cutlass.Float32(1e37)
                 and seed_thr_row[0] > cutlass.Float32(-1e37)
@@ -6222,6 +6122,10 @@ class GvrTopKKernel:
             ):
                 claimed_p = cutlass.Int32(cand_ctl_row[0])
                 void_p = cutlass.Int32(cand_ctl_row[1])
+                # real (non-parked) lines only: the skip stages the raw
+                # lines into the threshold scratch, and a parked line
+                # (1e30) would poison every later bracket. Parked rows
+                # keep Phase 1; the list take below is independent.
                 if (
                     void_p == cutlass.Int32(0)
                     and claimed_p >= cutlass.Int32(self.top_k + 64)
@@ -6230,6 +6134,7 @@ class GvrTopKKernel:
                     and seed_thr_row[0] > cutlass.Float32(-1e37)
                     and seed_thr_row[1] > seed_thr_row[0]
                     and seed_thr_row[2] > seed_thr_row[1]
+                    and seed_thr_row[2] < cutlass.Float32(1e29)
                 ):
                     ext_row = cutlass.Int32(1)
             # ---- self_scan phase 0: fused scan-bucket ----
@@ -6400,13 +6305,11 @@ class GvrTopKKernel:
         # A duplicate/invalid preIdx gather (cold-start zero-init slots, stale
         # slots pointing past N, an all-tied gather) produces an unusable
         # bracket. When N > K real selection work remains, so rebuild the
-        # bracket from the data itself (P1r) and run the normal pipeline —
-        # the old identity shortcut here returned indices [0, K), which is
-        # NOT the top-K on real data (production hit: the first decode step
-        # of every request feeds the zero-init prev_topk feedback buffer).
-        # If the bracket is STILL degenerate after the rescue, every
-        # in-range value is identical (or N <= K), and identity output is
-        # then exact — keep the shortcut for exactly those rows.
+        # bracket from the data itself (P1r) and run the normal pipeline;
+        # an identity shortcut here would NOT be the top-K. If the bracket
+        # is STILL degenerate after the rescue, every in-range value is
+        # identical (or N <= K), and identity output is then exact — keep
+        # the shortcut for exactly those rows.
         if cutlass.const_expr(self.p1r_rescue):
             v_lo = s_thr[1]
             v_hi = s_thr[2]
@@ -6496,8 +6399,11 @@ class GvrTopKKernel:
                 void_c = cutlass.Int32(cand_ctl_row[1])
                 n1_c = cutlass.Int32(cand_ctl_row[2])
                 n2_c = cutlass.Int32(cand_ctl_row[3])
-                segA = cutlass.const_expr(min(self.accept_cap, self.kC))
-                bstar = segA
+                # segment bases/extents follow the EMITTER geometry
+                # (accept_cap); the admission bound is additionally
+                # clamped by the physical candidate capacity kC.
+                segA = cutlass.const_expr(self.accept_cap)
+                bstar = cutlass.const_expr(min(self.accept_cap, self.kC))
                 if cutlass.const_expr(_P4_TAIL_DBG):
                     ck0 = cute.arch.clock64()
                     ck1 = ck0
@@ -6585,6 +6491,9 @@ class GvrTopKKernel:
                             hs_len = lenA
                             hs_band = n2_c
                             need_max = cutlass.Int32(1)
+                        if b_hi >= cutlass.Float32(1e29):
+                            # parked upper line: bracket by the segment max
+                            need_max = cutlass.Int32(1)
                         if hs_band < cutlass.Int32(1):
                             hs_band = cutlass.Int32(1)
                         samp_f = (cutlass.Float32(1.0) * hs_len) / hs_band
@@ -6623,9 +6532,8 @@ class GvrTopKKernel:
                         # by segment/band); the descend base stays in
                         # sample units too - the post-load exact-count
                         # net absorbs the sampling error.
-                        # fire target = 1.25x the K-need: the sampled
-                        # estimate carries ~1-2% noise and firing at the
-                        # band's bottom edge would demote half the time
+                        # fire target = 1.25x the K-need (headroom over
+                        # the sampling noise)
                         kneedS = cutlass.Int32(
                             (cutlass.Float32(1.25) * (kK_l - base_c)) * samp_f
                             + cutlass.Float32(0.5)
@@ -6733,10 +6641,8 @@ class GvrTopKKernel:
                     lane_c = tidx & cutlass.Int32(self.WARP_SIZE - 1)
                     # fused P4 prologue: zero the coarse hist here and
                     # accumulate the candidate max INSIDE the cut walk
-                    # (per-fragment fmax is free ILP; min := cut line by
-                    # construction). P4's minmax scan + zero pass and
-                    # their three barriers disappear for list rows - the
-                    # staging rides this walk's own end barrier.
+                    # (min := cut line by construction); the staging
+                    # rides this walk's own end barrier.
                     izh_c = tidx
                     while izh_c < cutlass.Int32(self.kNumBins):
                         smem_hist[izh_c] = cutlass.Int32(0)
@@ -6897,12 +6803,8 @@ class GvrTopKKernel:
                 and self.dtype == cutlass.Float32
             ):
                 if ext_row == cutlass.Int32(1) and N < cutlass.Int32(16384):
-                    # short rows only: the fused walk wins ~1us below
-                    # ~16k (pass fixed costs dominate there); at 16k+
-                    # the claim-dense cells (pro 9.4% band) lose to
-                    # count-then-place and the rest sit at parity, so
-                    # the two-pass path keeps them (measured both ways,
-                    # loncheng cells; captures all sit above the gate)
+                    # short rows only (< 16k): fused claim-collect;
+                    # longer rows keep the two-pass count-then-place path
                     cut_p = s_thr[0]  # parked line (staged at P1-init)
                     rbase = input_row.iterator.toint()
                     vw_p = cutlass.const_expr(self.vec_bits // self.dtype.width)
@@ -7083,10 +6985,8 @@ class GvrTopKKernel:
 
                 # ---- Phase 2: R0 histogram-ladder admission (single-CTA fast
                 # path) or the secant threshold search ----
-                # enable_r0 gates to cluster_size==1 for now: op#26's R0 scans the
-                # full row in one CTA. The slice-parallel + cluster count-merge
-                # variant that lets R0 cover the cs>1 long-row branch lands in a
-                # later commit; until then cs>1 keeps the secant path.
+                # enable_r0 gates to cluster_size==1: R0 scans the full row in
+                # one CTA; cs>1 keeps the secant path.
                 if cutlass.const_expr(self.enable_r0):
                     # P1b rung placement -> ONE M-ary R0 count pass -> accept the
                     # tightest rung with count in [K, kC]. On a miss, fall back to
@@ -7109,12 +7009,10 @@ class GvrTopKKernel:
                             # Parking and staging happen in the P1-init thread0
                             # block, one barrier for the whole prologue.
                             if cutlass.const_expr(not self.enable_block_skip):
-                                # v3: the parked M-ary pass counted the SAME
-                                # threshold in all three columns (3x compare
-                                # + 3 ptcnt columns for identical values).
-                                # Count it ONCE with the refine primitive -
-                                # same per-thread ptcnt cache and cluster
-                                # merge P3 consumes - and accept in place.
+                                # parked admission: count the parked threshold
+                                # ONCE with the refine primitive - same
+                                # per-thread ptcnt cache and cluster merge P3
+                                # consumes - and accept in place.
                                 if s_r0col[0] == cutlass.Int32(self.M_qf):
                                     self.block_count_ge(
                                         input_row,
@@ -7265,12 +7163,10 @@ class GvrTopKKernel:
                         )
                     cute.arch.barrier()
                     if run_mary and tidx == 0:
-                        # tightest admissible rung = SMALLEST count in [K, kC].
-                        # (Explicit argmin: with r0_vseed the pmean column is not
-                        # sorted into the rung order; for sorted rungs this is
-                        # equivalent to the old "last m in window" rule.)
-                        # Dropped rungs (block-skip rung tightening) hold PARTIAL
-                        # counts — never admissible.
+                        # tightest admissible rung = SMALLEST count in [K, kC]
+                        # (explicit argmin: with r0_vseed the pmean column is not
+                        # sorted into the rung order). Dropped rungs (block-skip
+                        # rung tightening) hold PARTIAL counts — never admissible.
                         dmask_c = cutlass.Int32(0)
                         if cutlass.const_expr(self.enable_block_skip):
                             dmask_c = s_active_cnt[2]
@@ -7314,13 +7210,11 @@ class GvrTopKKernel:
                         smem_ptcnt[tidx] = smem_ptcnt_multi[bc * cutlass.Int32(num_threads) + tidx]
                     cute.arch.barrier()
                     # ---- R0 miss: SEEDED bounded log-falsi refine ----
-                    # At large N the M2D rungs straddle [K, kC]; the refine must
-                    # find a threshold with count in [K, kC] between the measured
-                    # rungs. SEED the loop with the rung bracket AND its known
-                    # counts (clo/chi) so it does log-count regula-falsi from
-                    # iter 0 with no re-measure and no separate R1 shot -> ~2-3
-                    # count passes (op#26 efficiency) instead of ~6. done=1 on
-                    # accept so Phase 3 skips its retry-shrink.
+                    # The refine must find a threshold with count in [K, kC]
+                    # between the measured rungs. SEED the loop with the rung
+                    # bracket AND its known counts (clo/chi) so it does
+                    # log-count regula-falsi from iter 0 with no re-measure.
+                    # done=1 on accept so Phase 3 skips its retry-shrink.
                     if bc < cutlass.Int32(0):
                         if cutlass.const_expr(self.enable_block_skip):
                             if tidx == cutlass.Int32(0):
@@ -7957,14 +7851,11 @@ class GvrTopKKernel:
         if n_row < 65536:
             cluster_size = 1
         elif has_block_max and n_row >= 200_000:
-            # Block-skip sweet spot is cs == 1 with a large per-CTA slice:
-            # the compact list + rung tightening (cs1-only) beat the
-            # row-split configs outright once the bounds prune the scan
-            # (cold protocol, real data: BS1 1.18x, BS64 2.14x, BS1024
-            # 4.16x vs this policy's stock picks; splitting shrinks each
-            # CTA's slice below the skip break-even and disables
-            # tightening). Below 200k the wrapper drops block_max anyway
-            # (skip_min_n gate) and the stock picks apply.
+            # Block-skip requires cs == 1 with a large per-CTA slice
+            # (splitting shrinks each CTA's slice below the skip
+            # break-even and disables rung tightening). Below 200k the
+            # wrapper drops block_max anyway (skip_min_n gate) and the
+            # stock picks apply.
             cluster_size = 1
         elif num_rows <= 4 and n_row >= 131072:
             cluster_size = 8

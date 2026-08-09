@@ -16,47 +16,45 @@
 """Emission-assisted GVR top-k state for the DSA decode path.
 
 Owns the persistent (graph-address-stable) buffers the emission tiers
-ride on, the device-side closed-loop seed-row update (pure tensor ops:
-CUDA-graph capturable, validated 11/11-step replay-exact against eager)
-and the per-step routing decision. All of it is opt-in: without the
-flag the DSA decode path is byte-identical to before.
+ride on, the device-side closed-loop seed-row update (pure tensor ops,
+CUDA-graph capturable) and the per-step routing decision. Opt-in:
+without the flag the DSA decode path is unchanged.
 
 Tier semantics (see gvr_routing):
   * this step's TOP-K consumes what the PREVIOUS step's indexer
     epilogue emitted;
   * this step's INDEXER emits what the routing planned for the NEXT
-    step. N changes by at most one slot per step, so tier flapping is
-    a non-issue.
+    step.
 """
 
 from typing import Optional
 
 import torch
 
-from ...cute_dsl_kernels.blackwell.top_k.gvr_routing import TopkRoute, pick_config, plan_emission
+from ...cute_dsl_kernels.blackwell.top_k.gvr_routing import (
+    LIST_EMIT_MIN_N,
+    TopkRoute,
+    pick_config,
+    plan_emission,
+)
 
-# Bucketed list geometry (validated defaults: B* = 8192 segment cap,
-# 24576-entry C segment; see the f15/f17 sweeps).
+# Bucketed candidate-list geometry: two tight segments of LIST_SEG_A
+# entries plus a LIST_CAP_C-entry loose segment.
 LIST_SEG_A = 8192
 LIST_CAP_C = 24576
 LIST_WIDTH = 2 * LIST_SEG_A + LIST_CAP_C
 
-# Closed-loop line derivation around the published k-th anchor: t1
-# hugs the k-th value from below, t0/t2 guard by the (anchor - kth)
-# span. Matches the graph_test.py-validated update.
+# Closed-loop lines around the published k-th anchor: t1 hugs the k-th
+# value from below; t0/t2 guard by the (anchor - kth) span.
+__all__ = ["GvrExtState", "LIST_EMIT_MIN_N", "LIST_PARK_LINE"]
+
 GUARD_LO = 2.0
 GUARD_HI = 0.5
 
 # List tier only: park the two tight lines above any score so every
-# admitted entry lands in the loosest segment, which is the one that
-# already claims its slots through a per-warp window instead of an
-# exact ballot. Measured on the indexer kernel (nsys kernel-only): the
-# emission cost drops 2.7-5x (e.g. batch 16 / ctx 512k, +88.7us ->
-# +15.0us) and the top-k side stays at parity, because the consumer
-# reads the segment counts from the control row and finds the two tight
-# segments empty. Any finite value above the score range works; the
-# kernel's eligibility check only needs the three lines to be
-# increasing and the loosest one finite.
+# admitted entry lands in the loosest segment. Any finite value above
+# the score range works; the kernel's eligibility check only needs the
+# three lines increasing and the loosest one finite.
 LIST_PARK_LINE = 1.0e30
 
 
@@ -81,27 +79,20 @@ class GvrExtState:
             self.cand_idx = torch.zeros((max_rows, LIST_WIDTH), dtype=torch.int32, device=device)
             self.cand_ctl = torch.zeros((max_rows, 4), dtype=torch.int32, device=device)
             self.cand_cur = torch.zeros((max_rows, 4), dtype=torch.int32, device=device)
-        # GVR warm-start feedback: this layer's previous-step top-k
-        # (same stable-address feedback-loop shape as
-        # heuristic_prev_topk; zero-init -> first step's pre_idx points
-        # at index 0, a valid benign candidate)
+        # previous-step top-k feedback (address-stable; zero-init ->
+        # first step's pre_idx points at index 0, a benign candidate)
         self.prev_topk = torch.zeros((max_rows, top_k), dtype=torch.int32, device=device)
         # block_max prefix ([rows, nb_pad*4] fp32 warp-partials),
         # allocated lazily once max_seq_len is known
         self.block_max: Optional[torch.Tensor] = None
-        # tier the PREVIOUS indexer call emitted (what this step's
-        # top-k may consume); "rungs" until the first emission lands
-        self.emitted_tier = "rungs"
 
     def ensure_block_max(self, max_seq_len: int) -> torch.Tensor:
         nb4 = ((max_seq_len + 255) // 256 * 256) // 128 * 4
         # exact width: the runner asserts shape == (rows, nrec), so a
         # wider reused buffer would trip it
         if self.block_max is None or self.block_max.shape[1] != nb4:
-            # max_seq_len is engine-static, so this allocates once on the
-            # first (eager warmup) step; allocating inside CUDA graph
-            # capture would bake a dangling address into the graph, so
-            # fail loudly instead of corrupting the capture.
+            # allocating during CUDA graph capture would bake a dangling
+            # address into the graph, so fail loudly instead
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "GvrExtState.ensure_block_max: (re)allocation requested "
@@ -116,8 +107,8 @@ class GvrExtState:
     def plan(
         self, batch: int, n_comp: int, num_sms: int, compress_ratio: int = 4
     ) -> tuple[str, TopkRoute]:
-        """Route this step: (tier to EMIT next, launch knobs to CONSUME
-        what was emitted last step)."""
+        """Route this step: (tier the epilogue emits, launch knobs the
+        top-k consumes it with)."""
         emit_tier = plan_emission(
             batch, n_comp, self.top_k, have_epilogue=True, compress_ratio=compress_ratio
         )
@@ -125,16 +116,17 @@ class GvrExtState:
             # constructed with enable_list_tier=False: no candidate
             # buffers to emit into, demote to the counts tier
             emit_tier = "counts"
-        route = pick_config(self.emitted_tier, batch, n_comp, self.top_k, num_sms)
+        # emission and consumption happen inside the SAME forward (zero,
+        # emit, consume), so the consumer routes on this step's tier
+        route = pick_config(emit_tier, batch, n_comp, self.top_k, num_sms)
         return emit_tier, route
 
     def update_seed_rows(self, num_rows: int, emit_tier: str = "counts") -> None:
         """Device-side closed-loop line update from the last publish.
 
-        Pure tensor ops (graph-capturable). Rows whose xstate is not
-        valid (col 0 == 0, e.g. cold start) get non-finite lines, which
-        the kernel's validity guard routes to the stock path - the
-        closed loop never rides on host data quality.
+        Pure tensor ops (graph-capturable). Rows with invalid xstate
+        (col 0 == 0, e.g. cold start) get non-finite lines, which the
+        kernel's validity guard routes to the stock path.
         """
         s = self.seed_row[:num_rows]
         x = self.xstate[:num_rows]
@@ -170,14 +162,13 @@ class GvrExtState:
                 cand_ctl_out=self.cand_ctl[:num_rows],
                 cand_cur_out=self.cand_cur[:num_rows],
             )
-        self.emitted_tier = emit_tier
         return kw
 
     def topk_ext_kwargs(
         self, route: TopkRoute, num_rows: int, block_max: Optional[torch.Tensor]
     ) -> dict:
-        """kwargs for trtllm::cute_dsl_gvr_topk_decode consuming the
-        PREVIOUS step's emission per the picked route."""
+        """kwargs for trtllm::cute_dsl_gvr_topk_decode consuming this
+        step's emission per the picked route."""
         kw: dict = {
             "xstate": self.xstate[:num_rows],
             "cluster_size": route.cluster_size,
@@ -186,16 +177,18 @@ class GvrExtState:
             kw["num_threads"] = route.num_threads
         if route.tier in ("counts", "list"):
             kw["seed_thr"] = self.seed_row[:num_rows]
-        # rungs tier (first step / no emission yet): pass no seed at
-        # all - cold-start xstate is invalid so the lines would be
-        # non-finite anyway; the plain stock path is the right fallback
-        # (a [rows, 3] column view of the packed row is non-contiguous
-        # and would trip the runner's contract assert)
+        # rungs tier: pass no seed at all (a [rows, 3] column view of the
+        # packed row is non-contiguous and would trip the runner's assert)
         if route.tier == "list":
+            # accept_cap must match the emitter's segment geometry: the
+            # buffers are laid out at bases 0 / LIST_SEG_A / 2*LIST_SEG_A,
+            # and the consumer derives the C capacity from the tensor
+            # width minus 2*accept_cap.
             kw.update(
                 cand_vals=self.cand_vals[:num_rows],
                 cand_idx=self.cand_idx[:num_rows],
                 cand_ctl=self.cand_ctl[:num_rows],
+                accept_cap=LIST_SEG_A,
             )
         if route.attach_block_max and block_max is not None:
             kw["block_max"] = block_max
