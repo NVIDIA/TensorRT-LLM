@@ -9,6 +9,9 @@ This guide is a deployment checklist for running TensorRT LLM disaggregated
 serving on AWS EFA with NIXL using the LIBFABRIC backend. It complements the
 main [Disaggregated Serving](disagg-serving.md) guide; start there for the
 context/generation server topology and then apply the AWS-specific checks here.
+The Kubernetes examples in this page are scoped to EKS-managed deployments;
+SLURM or bare-metal deployments can reuse the container, LIBFABRIC plugin, and
+runtime verification checks but should map device allocation to their scheduler.
 
 For managed Dynamo deployments, also follow the Dynamo AWS EFA guide:
 <https://docs.nvidia.com/dynamo/latest/kubernetes-deployment/cloud-provider-guides/aws/efa-rdma-over-aws-fabric>.
