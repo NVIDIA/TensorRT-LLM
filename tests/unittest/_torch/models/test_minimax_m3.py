@@ -1419,11 +1419,15 @@ def _boundary_layer(**overrides):
             setattr(layer.next_layer_qkv_proj, key[len("proj_"):], value)
         else:
             setattr(layer, key, value)
+    # The boundary norm consults the predicate through self, which a namespace
+    # does not resolve to the class the way an instance would.
+    layer._boundary_folds_qkv_mxfp8 = (
+        MiniMaxM3DecoderLayer._boundary_folds_qkv_mxfp8.__get__(layer))
     return layer
 
 
 def _folds(**overrides):
-    return MiniMaxM3DecoderLayer._boundary_folds_qkv_mxfp8(_boundary_layer(**overrides))
+    return _boundary_layer(**overrides)._boundary_folds_qkv_mxfp8()
 
 
 def test_boundary_folds_qkv_mxfp8_when_the_next_projection_wants_it():
@@ -1441,6 +1445,9 @@ def test_boundary_folds_qkv_mxfp8_when_the_next_projection_wants_it():
         ({"proj_quant_method": None}, "projection is not MXFP8"),
         ({"proj_quant_method": _mxfp8_quant_method(use_cutlass=False)}, "dequant path"),
         ({"proj_in_features": 6144 - 16}, "hidden not a multiple of 32"),
+        # 6112/32 = 191 scale columns, so the swizzled layout would pad columns
+        # the epilogue never writes.
+        ({"proj_in_features": 6144 - 32}, "hidden pads scale columns"),
         ({"proj_lora": object()}, "LoRA reads the unquantized activation"),
         ({"proj_use_fused_gemm_allreduce": True}, "fused GEMM+AllReduce"),
     ],

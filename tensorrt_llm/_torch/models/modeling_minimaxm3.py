@@ -2639,7 +2639,10 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             isinstance(quant_method, MXFP8LinearMethod)
             # The dequant reference path needs the high-precision input.
             and quant_method.use_cutlass
-            and proj.in_features % MXFP8_BLOCK_SIZE == 0
+            # One block scale per 32 elements, and four scale columns per
+            # swizzled tile: anything else leaves scale columns the epilogue
+            # cannot reach, which the op rejects outright.
+            and proj.in_features % (MXFP8_BLOCK_SIZE * 4) == 0
             # LoRA reads the un-quantized activation alongside the GEMM.
             and getattr(proj, "lora", None) is None
             # The fused GEMM+AllReduce takes its own path into the quant method,
