@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
+import sys
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
@@ -22,7 +26,7 @@ from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
-from ..utils import make_weak_ref, piecewise_cuda_graph
+from ..utils import make_weak_ref, piecewise_cuda_graph, safe_reset_cuda_graph
 from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
@@ -642,7 +646,7 @@ class CUDAGraphRunner:
         saved_kv_lens_cuda = _save_spec_decode_capture_state(
             attn_metadata, enable_spec_decode)
 
-        self.graph_metadata[key] = {
+        graph_metadata = {
             "attn_metadata": attn_metadata,
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
@@ -656,47 +660,61 @@ class CUDAGraphRunner:
                 capture_inputs['attn_metadata'].use_spec_decoding = True
             return forward_fn(capture_inputs)
 
-        output = None
-        with with_multi_stream(True), piecewise_cuda_graph(False):
-            # We have to do a warmup run to initialize PyTorch's internal
-            # states according to the docs:
-            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
-            # This also lets us initialize states in the attn_metadata and
-            # resize the shared attention workspace before any graph is captured.
-            for _ in range(self.WARMUP_STEPS):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
-                if postprocess_fn is not None:
-                    postprocess_fn(capture_inputs)
-                _restore_spec_decode_capture_state(attn_metadata,
-                                                   saved_kv_lens_cuda)
-
-            if self.is_warmup_only:
-                return output
-
-            graph = torch.cuda.CUDAGraph()
+        @contextlib.contextmanager
+        def _restore_state_after_forward() -> Iterator[None]:
             try:
-                with torch.cuda.graph(graph, pool=self.memory_pool):
-                    output = _setup_spec_decoding_and_forward(
-                        key, forward_fn, capture_inputs)
-                if postprocess_fn is not None:
-                    postprocess_fn(capture_inputs)
-                _restore_spec_decode_capture_state(attn_metadata,
-                                                   saved_kv_lens_cuda)
-            except Exception:
-                # Reset the partially-captured graph now, while the CUDA generator
-                # state is still valid. Otherwise this orphaned graph (it was never
-                # stored in self.graphs) is destroyed later during GC, when the
-                # generator state may already be gone, and ~CUDAGraph()'s
-                # unregister_graph can abort the process via terminate(), masking
-                # the real capture-time error.
-                self._safe_reset_graph(graph, "after a capture failure")
-                raise
+                yield
+            finally:
+                active_error = sys.exc_info()[1]
+                try:
+                    _restore_spec_decode_capture_state(attn_metadata,
+                                                       saved_kv_lens_cuda)
+                except RuntimeError as restore_error:
+                    if active_error is None:
+                        raise
+                    logger.warning(
+                        "Failed to restore speculative-decoding state after "
+                        f"CUDA graph forward failure: {restore_error}")
+
+        output = None
+        graph = None
+        try:
+            with with_multi_stream(True), piecewise_cuda_graph(False):
+                # We have to do a warmup run to initialize PyTorch's internal
+                # states according to the docs:
+                # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+                # This also lets us initialize states in the attn_metadata and
+                # resize the shared attention workspace before any graph is captured.
+                for _ in range(self.WARMUP_STEPS):
+                    with _restore_state_after_forward():
+                        output = _setup_spec_decoding_and_forward(
+                            key, forward_fn, capture_inputs)
+                        if postprocess_fn is not None:
+                            postprocess_fn(capture_inputs)
+
+                if self.is_warmup_only:
+                    self.graph_metadata[key] = graph_metadata
+                    return output
+
+                graph = torch.cuda.CUDAGraph()
+                with _restore_state_after_forward():
+                    with torch.cuda.graph(graph, pool=self.memory_pool):
+                        output = _setup_spec_decoding_and_forward(
+                            key, forward_fn, capture_inputs)
+                    if postprocess_fn is not None:
+                        postprocess_fn(capture_inputs)
+
+            graph_output = make_weak_ref(output)
+            memory_pool = graph.pool()
+        except Exception:
+            if graph is not None:
+                safe_reset_cuda_graph(graph, "before graph commit")
+            raise
 
         self.graphs[key] = graph
-        graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph.pool()
+        self.graph_metadata[key] = graph_metadata
+        self.memory_pool = memory_pool
         return graph_output
 
     def replay(self, key: KeyType,
@@ -1023,22 +1041,10 @@ class CUDAGraphRunner:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
 
-    @staticmethod
-    def _safe_reset_graph(graph: torch.cuda.CUDAGraph, context: str):
-        # graph.reset() can raise (e.g. a stale CUDA generator state inside
-        # ~CUDAGraph()); swallow it so one failing reset cannot abort the rest
-        # of the teardown or mask an earlier, more relevant error.
-        try:
-            graph.reset()
-        except Exception:
-            logger.warning("Failed to reset CUDA graph %s.", context)
-
-    def clear(self):
+    def clear(self) -> None:
         """Releases all captured graphs and the associated memory pool."""
-        # Reset each graph independently so a failure tearing down one graph
-        # does not abort cleanup of the remaining graphs.
         for graph in self.graphs.values():
-            self._safe_reset_graph(graph, "during cleanup")
+            safe_reset_cuda_graph(graph, "during decoder cleanup")
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
@@ -1758,7 +1764,7 @@ class EncoderCUDAGraphRunner:
 
         attn_md = capture_inputs["attn_metadata"]
 
-        self.graph_metadata[key] = {"attn_metadata": attn_md}
+        graph_metadata = {"attn_metadata": attn_md}
 
         # Warmup must see the same runtime data as capture. In particular,
         # graph metadata initializes _seq_lens_cuda to ones, while
@@ -1775,43 +1781,54 @@ class EncoderCUDAGraphRunner:
         torch.cuda.current_stream().synchronize()
 
         output = None
-        with with_multi_stream(True), piecewise_cuda_graph(False):
-            # Warmup runs required by CUDA graph semantics. See
-            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
-            # Warmups initialize PyTorch and attention metadata state, and
-            # resize the shared attention workspace before any graph is captured.
-            for _ in range(self.WARMUP_STEPS):
-                output = forward_fn(capture_inputs)
+        graph = None
+        try:
+            with with_multi_stream(True), piecewise_cuda_graph(False):
+                # Warmup runs required by CUDA graph semantics. See
+                # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+                # Warmups initialize PyTorch and attention metadata state, and
+                # resize the shared attention workspace before any graph is captured.
+                for _ in range(self.WARMUP_STEPS):
+                    output = forward_fn(capture_inputs)
 
-            if self.is_warmup_only:
-                return output
+                if self.is_warmup_only:
+                    self.graph_metadata[key] = graph_metadata
+                    return output
 
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph,
-                                  pool=self.memory_pool,
-                                  capture_error_mode="thread_local"):
-                if self._capture_h2d_copy:
-                    # H2D copies for captured inside the graph: at replay
-                    # time it re-issues from the pinned static buffer without
-                    # an eager driver call.
-                    capture_inputs["input_ids"].copy_(
-                        sliced_static_tensors_cpu["input_ids"],
-                        non_blocking=True)
-                    capture_inputs["position_ids"].copy_(
-                        sliced_static_tensors_cpu["position_ids"],
-                        non_blocking=True)
-                    attn_md._seq_lens_cuda.copy_(attn_md._seq_lens,
-                                                 non_blocking=True)
-                output = forward_fn(capture_inputs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph,
+                                      pool=self.memory_pool,
+                                      capture_error_mode="thread_local"):
+                    if self._capture_h2d_copy:
+                        # H2D copies for captured inside the graph: at replay
+                        # time it re-issues from the pinned static buffer without
+                        # an eager driver call.
+                        capture_inputs["input_ids"].copy_(
+                            sliced_static_tensors_cpu["input_ids"],
+                            non_blocking=True)
+                        capture_inputs["position_ids"].copy_(
+                            sliced_static_tensors_cpu["position_ids"],
+                            non_blocking=True)
+                        attn_md._seq_lens_cuda.copy_(attn_md._seq_lens,
+                                                     non_blocking=True)
+                    output = forward_fn(capture_inputs)
 
-        if self._contains_nested_tensor(output):
-            raise TypeError(
-                "Encoder CUDA graph does not support nested tensor outputs. "
-                "Disable encoder CUDA graphs for models with ragged outputs.")
+            if self._contains_nested_tensor(output):
+                raise TypeError(
+                    "Encoder CUDA graph does not support nested tensor outputs. "
+                    "Disable encoder CUDA graphs for models with ragged outputs."
+                )
+            graph_output = make_weak_ref(output)
+            memory_pool = graph.pool()
+        except Exception:
+            if graph is not None:
+                safe_reset_cuda_graph(graph, "before encoder graph commit")
+            raise
+
         self.graphs[key] = graph
-        graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph.pool()
+        self.graph_metadata[key] = graph_metadata
+        self.memory_pool = memory_pool
         return graph_output
 
     def retire_staging(self) -> None:
@@ -1846,9 +1863,10 @@ class EncoderCUDAGraphRunner:
     def get_graph_pool(self):
         return self.memory_pool
 
-    def clear(self):
+    def clear(self) -> None:
+        """Release all captured encoder graphs and their shared memory pool."""
         for graph in self.graphs.values():
-            graph.reset()
+            safe_reset_cuda_graph(graph, "during encoder cleanup")
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()

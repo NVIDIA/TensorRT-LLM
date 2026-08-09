@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
@@ -14,7 +17,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..utils import (get_model_extra_attrs,
                      get_per_request_piecewise_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
-                     set_piecewise_running)
+                     safe_reset_cuda_graph, set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import (get_capture_piecewise_cuda_graph_flag,
                     get_optional_trtllm_op, is_call_function)
@@ -179,11 +182,12 @@ class PiecewiseRunner(object):
                 callable=default_callable,
             )
 
-    def clear_cuda_graphs(self):
+    def clear_cuda_graphs(self) -> None:
         """Release captures while retaining buckets for a later warmup."""
         for entry in self.entries.values():
             if entry.cuda_graph is not None:
-                entry.cuda_graph.reset()
+                safe_reset_cuda_graph(entry.cuda_graph,
+                                      "during piecewise cleanup")
             entry.cuda_graph = None
             entry.warmup_count = 0
             entry.input_addresses = None
@@ -191,6 +195,7 @@ class PiecewiseRunner(object):
             entry.output = None
 
     def __call__(self, *args):
+        """Run eagerly, capture a bucket, or replay its captured graph."""
         runtime_num_of_token = None
         if self.runtime_num_tokens_idx != None:
             runtime_num_of_token = int(
@@ -232,25 +237,37 @@ class PiecewiseRunner(object):
 
             graph = torch.cuda.CUDAGraph()
 
-            # Torch's cuda graph will call gc.collect() internally. This will slow down the performance.
-            # We patch it to do nothing.
-            with patch("gc.collect", lambda: None):
-                # TODO: consider to use `make_graphed_callables()` when
-                # it's ready rather than capture it ourselves
-                # Graph Capture would override the stream. We need to setup the stream correctly.
-                extra_attrs = get_model_extra_attrs()
-                with torch.cuda.graph(graph, pool=self.graph_pool_handle):
-                    extra_attrs["global_stream"] = torch.cuda.current_stream()
-                    output = entry.callable(*args)
-                extra_attrs["global_stream"] = torch.cuda.current_stream()
+            try:
+                # Torch's cuda graph will call gc.collect() internally. This will slow down the performance.
+                # We patch it to do nothing.
+                with patch("gc.collect", lambda: None):
+                    # TODO: consider to use `make_graphed_callables()` when
+                    # it's ready rather than capture it ourselves
+                    # Graph Capture would override the stream. We need to setup the stream correctly.
+                    extra_attrs = get_model_extra_attrs()
+                    try:
+                        with torch.cuda.graph(graph,
+                                              pool=self.graph_pool_handle):
+                            extra_attrs[
+                                "global_stream"] = torch.cuda.current_stream()
+                            output = entry.callable(*args)
+                    finally:
+                        extra_attrs[
+                            "global_stream"] = torch.cuda.current_stream()
+
+                # Mark weak ref here. The intermediate activation tensor should be freed properly.
+                # Here we don't use python native weakref since we still need the object to be alive when the graph is replayed.
+                graph_output = make_weak_ref(output)
+                output_addresses = [
+                    i.data_ptr() for i in output if isinstance(i, torch.Tensor)
+                ]
+            except Exception:
+                safe_reset_cuda_graph(graph, "before piecewise graph commit")
+                raise
 
             entry.cuda_graph = graph
-            # Mark weak ref here. The intermediate activation tensor should be freed properly.
-            # Here we don't use python native weakref since we still need the object to be alive when the graph is replayed.
-            entry.output = make_weak_ref(output)
-            entry.output_addresses = [
-                i.data_ptr() for i in output if isinstance(i, torch.Tensor)
-            ]
+            entry.output = graph_output
+            entry.output_addresses = output_addresses
 
             entry.cuda_graph.replay()
 

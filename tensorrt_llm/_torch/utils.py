@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_sm_version, torch_dtype_to_str)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -385,6 +386,14 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+def safe_reset_cuda_graph(graph: torch.cuda.CUDAGraph, context: str) -> None:
+    """Reset a CUDA graph without letting teardown failure mask an error."""
+    try:
+        graph.reset()
+    except RuntimeError as error:
+        logger.warning(f"Failed to reset CUDA graph {context}: {error}")
 
 
 @contextlib.contextmanager
