@@ -73,6 +73,9 @@ inline std::unordered_map<AllReduceFusionOp, int> mapFusionOpToIndex = {
     // norm out quant fusion ops share the same index with norm quant fusion ops
     {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8, 2},
     {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, 3},
+    {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF, 3},
+    // MXFP8 was not swept; it writes one byte per element like FP8, so it borrows that row.
+    {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8, 2},
 };
 
 // AllReduce lookup: [tp][fusion][hidden][tokens] = strategy
@@ -91,7 +94,14 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
 {
     auto sm_version = tensorrt_llm::common::getSMVersion();
     auto tp_index = static_cast<size_t>(std::log2(tp_size) - 1);
-    auto fusion_op_index = static_cast<size_t>(mapFusionOpToIndex.find(fusionOp)->second);
+    auto const fusion_op_entry = mapFusionOpToIndex.find(fusionOp);
+    if (fusion_op_entry == mapFusionOpToIndex.end())
+    {
+        // A fusion op the sweep never covered. NCCL runs every op via the
+        // decomposed fallback, so it is the safe answer.
+        return AllReduceStrategyType::NCCL;
+    }
+    auto fusion_op_index = static_cast<size_t>(fusion_op_entry->second);
     auto num_token_index = static_cast<size_t>(std::log2(num_tokens));
     auto hidden_size_index = static_cast<size_t>(std::log2(hidden_size) - 7);
 

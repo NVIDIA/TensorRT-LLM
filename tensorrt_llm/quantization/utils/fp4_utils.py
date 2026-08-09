@@ -46,6 +46,23 @@ def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
     return output_shape, scale_shape
 
 
+def get_mxfp8_sf_size(input_shape, sf_vec_size=32, is_swizzled_layout=True):
+    """Elements in the MXFP8 scale-factor buffer for an input of ``input_shape``.
+
+    MXFP8 keeps one byte per element, so only the scale factors need a shape;
+    the quantized tensor has the same shape as the input. Mirrors
+    computeSwizzledLayoutSFSize / computeLinearLayoutSFSize.
+    """
+    m = 1
+    for i in range(len(input_shape) - 1):
+        m *= input_shape[i]
+
+    num_sf_cols = input_shape[-1] // sf_vec_size
+    if is_swizzled_layout:
+        return pad_up(m, 128) * pad_up(num_sf_cols, 4)
+    return m * num_sf_cols
+
+
 def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
     """
     Reorders rows in the gemm/MOE_gemm weight matrix for min-latency

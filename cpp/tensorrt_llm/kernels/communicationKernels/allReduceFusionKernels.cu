@@ -267,6 +267,21 @@ public:
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
         }
+        else if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8)
+        {
+            // 32 elements share one E8M0 scale and each thread holds 8, so the
+            // four lanes that reduce to one scale are 4k..4k+3. They are within
+            // a token because hidden_dim is a multiple of 32.
+            constexpr int SF_VEC_SIZE = 32;
+            using PackedVec = PackedVec<DType>;
+            PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, SF_VEC_SIZE / kMathCount>(std::nullopt, token_id,
+                m_access_id_in_token, std::nullopt, m_params.hidden_dim / SF_VEC_SIZE,
+                reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+            // No global scale: MXFP8's scale is per block and derived here.
+            reinterpret_cast<uint64_t*>(m_params.quant_out)[m_access_id]
+                = cvt_warp_fp16_to_mxfp8<DType, SF_VEC_SIZE>(pack_val, sf_out);
+        }
         else if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
         {
             using PackedQuantizedType = std::conditional_t<std::is_same_v<DType, float>, float, float2>;
@@ -341,6 +356,36 @@ private:
     float4 m_residual_val;
     float4 m_gamma_val;
 };
+
+// Zero the scale-factor rows the swizzled layout invents past the last real
+// token. The block-scaled GEMM reads a whole 128-row tile, and the epilogue
+// above only writes the rows that carry data, so without this the tail of the
+// tile is whatever the allocation held. The standalone quantizer covers the
+// same rows by running a row-padded grid; here the grid is the AllReduce's, so
+// the rows are spread over it instead. A no-op once tokens reach a multiple of
+// 128, which is where this would otherwise start to cost something.
+template <AllReduceFusionPattern Pattern>
+__device__ __forceinline__ void zero_mxfp8_sf_padding(AllReduceFusionParams const& params)
+{
+    if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8)
+    {
+        constexpr int kSfVecSize = 32;
+        constexpr int kSfTileRows = 128;
+        int const num_tokens = params.size / params.hidden_dim;
+        int const padded_tokens = (num_tokens + kSfTileRows - 1) / kSfTileRows * kSfTileRows;
+        int const num_col_vecs = params.hidden_dim / kSfVecSize;
+        int64_t const tot_pad = static_cast<int64_t>(padded_tokens - num_tokens) * num_col_vecs;
+        int const tid = blockIdx.x * blockDim.x + threadIdx.x;
+        int const stride = gridDim.x * blockDim.x;
+        auto* sf_out = reinterpret_cast<uint8_t*>(params.scale_out);
+        for (int64_t i = tid; i < tot_pad; i += stride)
+        {
+            int const row = num_tokens + static_cast<int>(i / num_col_vecs);
+            int const col = static_cast<int>(i % num_col_vecs);
+            sf_out[get_sf_out_offset_128x4(std::nullopt, row, col, std::nullopt, num_col_vecs)] = 0;
+        }
+    }
+}
 
 __device__ __forceinline__ bool is_neg_zero(float v)
 {
@@ -514,6 +559,8 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
         fused_op(sum_val, tidx);
     }
 
+    zero_mxfp8_sf_padding<Pattern>(params);
+
     comm.update(params.size * NRanks);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -586,6 +633,8 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
             fused_op(sum_val, tidx);
         }
     }
+    zero_mxfp8_sf_padding<Pattern>(params);
+
     comm.update(barrier.m_flag_value);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -683,6 +732,14 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
     int block_size = threads_per_block;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
+    if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8)
+    {
+        // Four consecutive lanes butterfly-reduce to one E8M0 scale and the
+        // lowest of them stores it, so a block has to begin on a group of four.
+        TLLM_CHECK_WITH_INFO(block_size % (32 / kElemsPerAccess<DType>) == 0,
+            "MXFP8 AllReduce fusion needs a block size that is a multiple of the %d threads per scale factor, got %d",
+            32 / kElemsPerAccess<DType>, block_size);
+    }
 
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
@@ -789,6 +846,19 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     else if (params.pattern == AllReduceFusionPattern::kARRMSNorm)                                                     \
     {                                                                                                                  \
         DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARRMSNorm, NRanks);                                          \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)                                \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<DType, float>)                                                                   \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, NRanks);                 \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false,                                                                                \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormOutMXFP8Quant can not work with "   \
+                "DType=float!");                                                                                       \
+        }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \

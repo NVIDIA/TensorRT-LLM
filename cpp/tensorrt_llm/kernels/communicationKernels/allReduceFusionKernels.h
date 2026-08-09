@@ -68,6 +68,7 @@ enum class AllReduceFusionPattern : int
     // AllReduce + RMSNorm without residual addition. Useful when there is no
     // external residual to add (e.g. models where residual is handled externally).
     kARRMSNorm = 6,
+    kARResidualRMSNormOutMXFP8Quant = 7,
 };
 
 enum class QuantType : int
@@ -75,6 +76,7 @@ enum class QuantType : int
     kNone = 0,
     kFP8 = 1,
     kFP4 = 2,
+    kMXFP8 = 3,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -105,6 +107,8 @@ DEFINE_FUSION_PATTERN_TRAITS(
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true, true, true, true, QuantType::kFP4);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNorm, false, false, false, true, true, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, false, true, true, true, true, QuantType::kMXFP8);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>

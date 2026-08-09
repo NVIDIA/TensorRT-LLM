@@ -132,6 +132,10 @@ class AllReduceFusionOp(IntEnum):
     # As RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, but the block scale factors are emitted in LINEAR
     # (row-major) rather than SWIZZLED layout, which is what the trtllm-gen MoE kernels consume.
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF = 10
+    # Residual + RMSNorm emitting both the norm result and its MXFP8 form: E4M3 values
+    # with one E8M0 block scale per 32 elements, in the SWIZZLED layout the CUTLASS
+    # block-scaled GEMM reads. MXFP8 needs no global scale, so `scale` is unused.
+    RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 11
 
 
 class AllReduceParams:
