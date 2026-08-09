@@ -360,13 +360,21 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        # Start with the established pool size. Once the model is loaded we
-        # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
+        # Disaggregated attention-DP can backfill a batch before the overlap
+        # scheduler releases the previous batch's terminal sequence slots.
         from ._util import (compute_max_num_sequences,
-                            should_enable_dsv4_adp_dummy_fixes,
-                            should_enable_dsv4_overlap_headroom)
+                            should_enable_disagg_adp_overlap_headroom,
+                            should_enable_dsv4_adp_dummy_fixes)
+        self._enable_disagg_adp_overlap_headroom = (
+            should_enable_disagg_adp_overlap_headroom(
+                mapping, llm_args.cache_transceiver_config,
+                llm_args.disable_overlap_scheduler))
         self.max_num_seq_slots = compute_max_num_sequences(
-            mapping, self.batch_size, llm_args.disable_overlap_scheduler)
+            mapping,
+            self.batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
+        )
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -450,21 +458,8 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        # Keep the scheduler/dummy fix model-scoped, while the larger slot pool
-        # is restricted to the validated MTP overlap configuration. PP remains
-        # on its established path for follow-up changes.
-        self._enable_dsv4_adp_dummy_fixes = (should_enable_dsv4_adp_dummy_fixes(
-            model_type, mapping))
-        self._enable_dsv4_overlap_headroom = (
-            should_enable_dsv4_overlap_headroom(
-                model_type, spec_config, mapping,
-                llm_args.disable_overlap_scheduler))
-        self.max_num_seq_slots = compute_max_num_sequences(
-            mapping,
-            self.batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self._enable_dsv4_overlap_headroom,
-        )
+        self._enable_dsv4_adp_dummy_fixes = should_enable_dsv4_adp_dummy_fixes(
+            model_type, mapping)
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -2685,11 +2680,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
         spec_config = self.spec_config if self.enable_spec_decode else None
-        # Only the scoped DeepSeek-V4 overlap path opts into larger metadata
+        # The disaggregated attention-DP overlap path opts into larger metadata
         # buffers. Passing None preserves the established max_num_requests
-        # fallback for every other model, including MTP-Eagle with PP.
+        # fallback for other configurations, including PP.
         num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_dsv4_overlap_headroom else None)
+                         if self._enable_disagg_adp_overlap_headroom else None)
         if no_cache:
             return get_spec_metadata(
                 spec_config,

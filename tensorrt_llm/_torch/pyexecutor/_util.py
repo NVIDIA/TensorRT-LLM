@@ -2393,12 +2393,11 @@ def compute_max_num_sequences(mapping: Mapping,
                               enable_overlap_headroom: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    ``enable_overlap_headroom`` is intentionally opt-in. DeepSeek-V4 needs a
-    second non-PP slot set because the V2 scheduler can backfill seats before
-    the overlap scheduler releases the previous iteration's terminal slots.
-    Other models retain their established sizing until that behavior is
-    validated independently. Pipeline parallelism already sizes the pool by
-    ``pp_size``.
+    ``enable_overlap_headroom`` is intentionally opt-in. Disaggregated
+    attention-DP needs a second non-PP slot set because the V2 scheduler can
+    backfill seats before the overlap scheduler releases the previous
+    iteration's terminal slots. Pipeline parallelism already sizes the pool
+    by ``pp_size``.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
@@ -2414,13 +2413,14 @@ def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
     return model_type == "deepseek_v4" and not mapping.has_pp()
 
 
-def should_enable_dsv4_overlap_headroom(
-        model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
-        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
-    return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
-            and spec_config is not None
-            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+def should_enable_disagg_adp_overlap_headroom(
+        mapping: Mapping,
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to non-PP disaggregated attention-DP."""
+    is_disagg = (cache_transceiver_config is not None
+                 and cache_transceiver_config.backend is not None)
+    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
             and not disable_overlap_scheduler)
 
 
