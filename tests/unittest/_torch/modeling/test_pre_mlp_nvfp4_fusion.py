@@ -19,6 +19,11 @@ from pathlib import Path
 
 import pytest
 
+import tensorrt_llm._torch.models as _models
+
+
+_MODELS_DIR = Path(_models.__file__).parent
+
 
 def _attribute_path(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
@@ -104,15 +109,8 @@ def _scan_statement_list_for_nvfp4_branch(statements: list[ast.stmt], aliases: s
     return None
 
 
-def _find_repo_root(start: Path) -> Path:
-    for candidate in (start, *start.parents):
-        if (candidate / "tensorrt_llm" / "_torch" / "models").exists():
-            return candidate
-    raise AssertionError(f"Could not locate repo root from {start}")
-
-
-def _forward_mlp_has_nvfp4_branch(model_file: str, repo_root: Path) -> ast.If:
-    source = (repo_root / "tensorrt_llm" / "_torch" / "models" / model_file).read_text()
+def _forward_mlp_has_nvfp4_branch(model_file: str, models_dir: Path = _MODELS_DIR) -> ast.If:
+    source = (models_dir / model_file).read_text()
     module = ast.parse(source)
 
     for node in ast.walk(module):
@@ -120,7 +118,13 @@ def _forward_mlp_has_nvfp4_branch(model_file: str, repo_root: Path) -> ast.If:
             nvfp4_branch = _scan_statement_list_for_nvfp4_branch(node.body, set())
             if nvfp4_branch is not None:
                 return nvfp4_branch
-    raise AssertionError(f"{model_file} does not guard PRE_MLP NVFP4 fusion")
+    raise AssertionError(
+        f"{model_file} does not guard PRE_MLP NVFP4 fusion. "
+        "Expected a branch that gates RESIDUAL_RMS_NORM_QUANT_NVFP4 on has_nvfp4, "
+        "uses self.mlp.gate_up_proj.input_scale in that branch, and falls back to "
+        "RESIDUAL_RMS_NORM otherwise; the has_nvfp4 check supports direct attributes, "
+        "getattr(..., \"has_nvfp4\", ...), or an alias assigned before the branch."
+    )
 
 
 
@@ -132,9 +136,8 @@ def _forward_mlp_has_nvfp4_branch(model_file: str, repo_root: Path) -> ast.If:
         "modeling_exaone_moe.py",
     ],
 )
-def test_pre_mlp_nvfp4_fusion_guards_unquantized_dense_mlp(pytestconfig, model_file: str) -> None:
-    repo_root = _find_repo_root(pytestconfig.rootpath)
-    nvfp4_branch = _forward_mlp_has_nvfp4_branch(model_file, repo_root)
+def test_pre_mlp_nvfp4_fusion_guards_unquantized_dense_mlp(model_file: str) -> None:
+    nvfp4_branch = _forward_mlp_has_nvfp4_branch(model_file)
 
     assert _contains_attribute(nvfp4_branch, "self.mlp.gate_up_proj.input_scale")
     assert _contains_attribute(nvfp4_branch, "AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4")
@@ -186,7 +189,7 @@ def test_forward_mlp_has_nvfp4_branch_supports_alias_and_getattr(tmp_path) -> No
         )
     )
 
-    nvfp4_branch = _forward_mlp_has_nvfp4_branch("modeling_alias.py", repo_root)
+    nvfp4_branch = _forward_mlp_has_nvfp4_branch("modeling_alias.py", model_dir)
 
     assert _contains_attribute(nvfp4_branch, "self.mlp.gate_up_proj.input_scale")
     assert _contains_attribute(nvfp4_branch, "AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4")
@@ -227,8 +230,9 @@ def test_forward_mlp_alias_must_be_defined_before_candidate_branch(tmp_path) -> 
         ''',
     )
 
+    model_dir = repo_root / "tensorrt_llm" / "_torch" / "models"
     with pytest.raises(AssertionError, match="does not guard PRE_MLP NVFP4 fusion"):
-        _forward_mlp_has_nvfp4_branch("modeling_alias_use_before_assignment.py", repo_root)
+        _forward_mlp_has_nvfp4_branch("modeling_alias_use_before_assignment.py", model_dir)
 
 
 def test_forward_mlp_alias_must_not_leak_from_sibling_branch(tmp_path) -> None:
@@ -256,5 +260,6 @@ def test_forward_mlp_alias_must_not_leak_from_sibling_branch(tmp_path) -> None:
         ''',
     )
 
+    model_dir = repo_root / "tensorrt_llm" / "_torch" / "models"
     with pytest.raises(AssertionError, match="does not guard PRE_MLP NVFP4 fusion"):
-        _forward_mlp_has_nvfp4_branch("modeling_alias_sibling_branch.py", repo_root)
+        _forward_mlp_has_nvfp4_branch("modeling_alias_sibling_branch.py", model_dir)
