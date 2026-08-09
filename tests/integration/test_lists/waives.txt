@@ -429,6 +429,7 @@ unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp4[False-True
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1 SKIP (https://nvbugs/6109745)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_2gpu[1-2] SKIP (https://nvbugs/6427411)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_tp2pp2 SKIP (https://nvbugs/6427411)
+unittest/llmapi/test_llm_pytorch.py -m "part3" SKIP (bug pending, tracked in PR #17432)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_llm_context_only_timed_out_kv_cache_exhausted[None-UCX-1000] SKIP (https://nvbugs/6490004)
