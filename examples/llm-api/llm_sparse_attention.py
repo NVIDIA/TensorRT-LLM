@@ -1,7 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 ### :title Sparse Attention
 ### :order 5
 ### :section Customization
-"""
+r"""
 This example demonstrates how to use sparse attention with TensorRT-LLM.
 
 Supported sparse attention algorithms:
@@ -10,8 +24,18 @@ Supported sparse attention algorithms:
 
 Usage:
 ```bash
-python llm_sparse_attention.py --algo ROCKETKV --attention_backend TRTLLM --window_size 32 --kernel_size 63 --prompt_budget 2048
+python llm_sparse_attention.py \
+    --model_path nvidia/Llama-3.1-8B-Instruct-FP8 \
+    --algo ROCKETKV \
+    --attention_backend TRTLLM \
+    --window_size 32 \
+    --kernel_size 63 \
+    --prompt_budget 2048
 ```
+
+When ``--input_file`` is omitted, the example uses a built-in
+needle-in-a-haystack prompt that exceeds the default ``prompt_budget`` and
+exercises the sparse attention path.
 """
 import argparse
 import json
@@ -20,6 +44,54 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
                                  KvCacheConfig, MoeConfig,
                                  RocketSparseAttentionConfig)
+
+# The built-in prompt follows a self-contained needle-in-a-haystack layout:
+# 1. Cycle routine expedition log templates to form a deterministic haystack.
+# 2. Replace one numbered log entry with a unique access-code needle.
+# 3. Append a question that asks the model to retrieve the needle.
+# With the default model, 128 entries produce about 2.8K tokens, exceeding the
+# default 2,048-token prompt budget so that sparse attention is exercised.
+_DEFAULT_LOG_TEMPLATES = (
+    "The survey team checked the northern weather station and recorded normal "
+    "temperature and pressure readings.",
+    "Technicians inspected backup batteries, radio transmitters, and emergency "
+    "lighting; all systems passed routine checks.",
+    "Researchers cataloged soil samples, labeled storage containers, and "
+    "updated the expedition inventory.",
+    "The navigation group reviewed trail maps, satellite images, and the next "
+    "day's travel schedule.",
+    "At sunset, the field crew secured scientific instruments and uploaded the "
+    "day's measurements.",
+    "The medical officer reviewed first-aid supplies and confirmed the "
+    "evacuation plan with base camp.",
+    "Engineers calibrated wind sensors and verified timestamps against the "
+    "observatory master clock.",
+    "The logistics team counted food, water, fuel, and spare parts before "
+    "closing the storage area.",
+)
+_DEFAULT_NUM_LOG_ENTRIES = 128
+_DEFAULT_NEEDLE_INDEX = 87
+_DEFAULT_ACCESS_CODE = "314159"
+
+
+def _build_default_prompt():
+    log_entries = []
+    for index in range(_DEFAULT_NUM_LOG_ENTRIES):
+        if index == _DEFAULT_NEEDLE_INDEX:
+            message = (f"The expedition access code is {_DEFAULT_ACCESS_CODE}. "
+                       "Remember this code for the final question.")
+        else:
+            message = _DEFAULT_LOG_TEMPLATES[index %
+                                             len(_DEFAULT_LOG_TEMPLATES)]
+        log_entries.append(f"Log entry {index}: {message}")
+
+    return (
+        "Read the following expedition field log carefully. One entry contains "
+        "an access code that you will need to recall.\n\n" +
+        "\n".join(log_entries) + "\n\nWhat is the expedition access code?")
+
+
+DEFAULT_PROMPTS = [_build_default_prompt()]
 
 
 def read_input(input_file):
@@ -33,16 +105,16 @@ def read_input(input_file):
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--model_path',
-        type=str,
-        default=
-        "/home/scratch.trt_llm_data_ci/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct"
-    )
+    parser.add_argument('--model_path',
+                        type=str,
+                        default="nvidia/Llama-3.1-8B-Instruct-FP8",
+                        help="The local path or Hugging Face ID of the model.")
     parser.add_argument(
         '--input_file',
         type=str,
-        default="tests/unittest/_torch/multi_gpu/NIAH_simple_data.jsonl")
+        default=None,
+        help="Optional path to a JSONL input file. The built-in "
+        "long prompt is used when omitted.")
 
     # Build config
     parser.add_argument('--algo',
@@ -104,8 +176,8 @@ def parse_arguments():
                         type=str,
                         default='CUTLASS',
                         choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM',
+                            'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
@@ -141,10 +213,18 @@ def parse_arguments():
 
 
 def run_llm(args, sparse_attention_config):
-    data = read_input(args.input_file)
-    num_samples = args.num_samples if args.num_samples is not None else len(
-        data)
-    data = data[:num_samples]
+    if args.input_file is None:
+        prompts = DEFAULT_PROMPTS
+        reference = [None] * len(prompts)
+    else:
+        data = read_input(args.input_file)
+        num_samples = args.num_samples if args.num_samples is not None else len(
+            data)
+        data = data[:num_samples]
+        prompts = [{
+            'prompt': sample['input_context'] + sample['input_query']
+        } for sample in data]
+        reference = [sample['outputs'] for sample in data]
 
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=
@@ -178,13 +258,6 @@ def run_llm(args, sparse_attention_config):
         enable_chunked_prefill=args.enable_chunked_prefill,
     )
 
-    prompts = []
-    reference = []
-    for sample in data:
-        prompts.append(
-            {'prompt': sample['input_context'] + sample['input_query']})
-        reference.append(sample['outputs'])
-
     sampling_params = SamplingParams(add_special_tokens=False,
                                      max_tokens=args.max_new_tokens,
                                      temperature=0.8,
@@ -192,9 +265,10 @@ def run_llm(args, sparse_attention_config):
 
     outputs = llm.generate(prompts, sampling_params)
     for idx, output in enumerate(outputs):
-        print(
-            f'Generated text: {output.outputs[0].text!r}, ref: {reference[idx]}'
-        )
+        result = f'Generated text: {output.outputs[0].text!r}'
+        if reference[idx] is not None:
+            result += f', ref: {reference[idx]}'
+        print(result)
 
 
 def run_RocketKV(args):

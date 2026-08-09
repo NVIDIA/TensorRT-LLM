@@ -1,7 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, cast
 
@@ -80,7 +94,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
+        # Setup interleaves MPI collectives (broadcast/allgather below) with
+        # per-rank native NIXL/UCX initialization inside TransferWorker. A rank
+        # that blocks or dies in the native phase leaves its peers stuck in the
+        # next collective, so log each phase per rank to make the blocking
+        # rank/phase identifiable from the logs (see the 'setup:' lines).
+        rank = self._dist.rank
+        logger.info(f"KvCacheTransceiverV2 setup: rank={rank} broadcast instance name (collective)")
         self._instance_name = self._broadcast_instance_name()
+        logger.info(
+            f"KvCacheTransceiverV2 setup: rank={rank} creating TransferWorker "
+            "(native NIXL agent init + KV memory registration)"
+        )
         self._transfer_worker = TransferWorker(
             TransferWorkerConfig(
                 kv_cache_manager=kv_cache_manager,
@@ -92,14 +117,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
-                # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
+                # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
+                # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
             )
+        )
+        logger.info(
+            f"KvCacheTransceiverV2 setup: rank={rank} TransferWorker ready; "
+            "broadcast context endpoint (collective)"
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
         self._context_info_endpoint = self._broadcast_context_endpoint()
         self._init_sync_policy()
+        logger.info(f"KvCacheTransceiverV2 setup: rank={rank} exchange rank info (collective)")
         self._exchange_rank_info()
+        logger.info(f"KvCacheTransceiverV2 setup: rank={rank} complete")
 
         self._send_sessions: Dict[int, TxSessionBase] = {}
         self._recv_sessions: Dict[int, RxSessionBase] = {}
@@ -154,6 +187,48 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
+
+    def get_status_dump(self) -> str:
+        """Return a one-line summary of transceiver state for debugging hangs."""
+
+        def summarize(
+            sessions: Dict[int, Any],
+            include_receiver_ready: bool,
+        ) -> str:
+            sessions_snapshot = list(sessions.values())
+            status_counts = Counter()
+            receiver_ready = 0
+            for session in sessions_snapshot:
+                status = session.status
+                if isinstance(status, SessionStatus):
+                    status_counts[status] += 1
+                else:
+                    status_counts["unknown"] += 1
+
+                if include_receiver_ready:
+                    receiver_ready += int(bool(session.receiver_ready))
+
+            fields = [
+                f"sessions={len(sessions_snapshot)}",
+                f"init={status_counts[SessionStatus.INIT]}",
+                f"ready_to_transfer={status_counts[SessionStatus.READY]}",
+                f"transferring={status_counts[SessionStatus.TRANSFERRING]}",
+                f"kv_transferred={status_counts[SessionStatus.KV_TRANSFERRED]}",
+                f"fully_transferred={status_counts[SessionStatus.FULLY_TRANSFERRED]}",
+                f"error={status_counts[SessionStatus.ERROR]}",
+                f"cancelled={status_counts[SessionStatus.CANCELLED]}",
+                f"unknown={status_counts['unknown']}",
+            ]
+            if include_receiver_ready:
+                fields.append(f"peer_ready={receiver_ready}/{len(sessions_snapshot)}")
+            return ", ".join(fields)
+
+        tx_status = summarize(self._send_sessions, include_receiver_ready=True)
+        rx_status = summarize(self._recv_sessions, include_receiver_ready=False)
+        return (
+            f"KV cache transceiver | backend=NIXL | TX({tx_status}) | RX({rx_status}) | "
+            f"waiting_for_peer_info={len(self._wait_reqs)}"
+        )
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):
@@ -261,10 +336,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return 0
         total = 0
         for lg_id, block_ids in enumerate(slice.block_ids_per_layer_groups):
-            if block_ids is None or block_ids.size == 0:
-                continue
             lg = pt.layer_groups[lg_id]
             if isinstance(lg, MambaLayerGroup):
+                # Fixed-size recurrent state (mamba/KDA): one slot per layer in
+                # each of the conv and ssm pools, independent of token count.
+                # For hybrid models (e.g. Kimi K3) this blob can dominate
+                # short-prompt transfers, so it must be counted. The caller's
+                # tp_size scaling then yields total bytes moved across ranks
+                # (exact for sharded state; for replicated state every rank
+                # pair moves a full copy, so it matches bytes on the wire).
+                if slice.mamba_state_index is not None:
+                    total += len(lg.mamba_layer_offsets) * (
+                        lg.conv_states.slot_bytes + lg.ssm_states.slot_bytes
+                    )
+                continue
+            if block_ids is None or block_ids.size == 0:
                 continue
             n = int((block_ids >= 0).sum())
             if n == 0:

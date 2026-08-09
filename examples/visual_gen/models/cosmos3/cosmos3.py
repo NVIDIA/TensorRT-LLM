@@ -13,6 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Cosmos3 Text(+Image/Video)-to-Video(+Audio) generation.
+
+One checkpoint serves T2V, T2I, I2V/TI2V, V2V and T2AV; ``prompts/`` holds a
+prompt file per mode and ``--help`` lists the flags. See ``README.md`` in this
+directory for the checkpoints, guardrail setup, deployment configs, and a
+worked command line per mode.
+"""
 
 import argparse
 import json
@@ -136,9 +143,22 @@ def main():
         help="Disable resolution metadata template (enabled by default, matching cosmos-framework CLI)",
     )
     parser.add_argument(
-        "--use_system_prompt", action="store_true", help="Use system prompt in prompt"
+        "--use_system_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Prepend the Cosmos3 system prompt (--no-use_system_prompt to disable). "
+            "When omitted, V2V uses it and every other mode takes the checkpoint's "
+            "declared default."
+        ),
     )
     parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="Reference video for V2V: a local MP4/AVI file (decoded on worker NVDEC)",
+    )
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
     )
@@ -181,10 +201,14 @@ def main():
         params.extra_params["use_duration_template"] = False
     if args.disable_resolution_template:
         params.extra_params["use_resolution_template"] = False
-    params.extra_params["use_system_prompt"] = args.use_system_prompt
+    if args.use_system_prompt is not None:
+        params.extra_params["use_system_prompt"] = args.use_system_prompt
     params.extra_params["enable_audio"] = enable_audio
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = output_type
+
+    if args.video_path is not None:
+        params.extra_params["video"] = Path(args.video_path).read_bytes()
 
     if negative_prompt is None:
         params.negative_prompt = None
@@ -200,6 +224,7 @@ def main():
 
     output.save(args.output_path)
     print(f"Saved: {args.output_path}")
+
     print(output.metrics)
 
 

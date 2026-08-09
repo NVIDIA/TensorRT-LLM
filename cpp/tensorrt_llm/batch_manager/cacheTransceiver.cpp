@@ -65,6 +65,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -102,6 +103,20 @@ namespace
 using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
+
+char const* cacheTransceiverBackendName(executor::CacheTransceiverConfig::BackendType backendType)
+{
+    using BackendType = executor::CacheTransceiverConfig::BackendType;
+    switch (backendType)
+    {
+    case BackendType::DEFAULT: return "DEFAULT";
+    case BackendType::MPI: return "MPI";
+    case BackendType::UCX: return "UCX";
+    case BackendType::NIXL: return "NIXL";
+    case BackendType::MOONCAKE: return "MOONCAKE";
+    }
+    return "UNKNOWN";
+}
 
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
@@ -378,7 +393,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
-    std::vector<SizeType32> const& rnnLayerNumPerPP)
+    std::vector<SizeType32> const& rnnLayerNumPerPP, std::vector<SizeType32> const& indexerLayerNumPerPP)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
@@ -515,11 +530,11 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         kvFactor = 1;
     }
-    mCacheState
-        = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig, attentionLayerNumPerPP,
-            dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(), cacheManager->isEnablePartialReuse(),
-            cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
-            cacheManager->getIndexerKCacheQuantBlockSize(), cacheManager->getIndexerKCacheUseFp4());
+    mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
+        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
+        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
+        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize(),
+        cacheManager->getIndexerKCacheUseFp4(), indexerLayerNumPerPP);
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -545,6 +560,21 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
     if (isMLA && cacheManager->isEnableIndexerKCache())
     {
+        // The advertised per-PP indexer layer counts must match the local pool. A rank
+        // without any indexer rows is not supported by the transfer machinery, so reject
+        // it up front.
+        auto const indexerPool = cacheManager->getIndexerKCachePool();
+        TLLM_CHECK_WITH_INFO(indexerPool != nullptr,
+            "The KV cache transceiver does not support a rank without indexer K cache rows (every local layer "
+            "uses cross-layer indexer sharing).");
+        auto const selfPPRank = worldConfig.getPipelineParallelRank();
+        auto const advertisedIndexerLayerNum = indexerLayerNumPerPP.empty() ? attentionLayerNumPerPP.at(selfPPRank)
+                                                                            : indexerLayerNumPerPP.at(selfPPRank);
+        auto const numIndexerLayers = indexerPool->getShape().d[1];
+        TLLM_CHECK_WITH_INFO(numIndexerLayers == static_cast<int64_t>(advertisedIndexerLayerNum),
+            "The indexer K cache pool holds %ld layer rows but indexerLayerNumPerPP advertises %d for PP rank "
+            "%d. Pass the per-PP indexer layer counts matching the (masked) indexer pool layout.",
+            static_cast<long>(numIndexerLayers), advertisedIndexerLayerNum, selfPPRank);
         mCacheTransBufferManagers.push_back(
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }
@@ -731,6 +761,73 @@ CacheTransceiver::~CacheTransceiver()
     }
 }
 
+std::string CacheTransceiver::getStatusDump() const
+{
+    auto const backendType = mCacheTransceiverConfig->getBackendType().value();
+    auto const requesterSyncActive = mSyncRequesterActive.load(std::memory_order_relaxed);
+    StatusSnapshot snapshot;
+    {
+        std::unique_lock<std::mutex> lock(mStatusSnapshotMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+        {
+            std::ostringstream oss;
+            oss << "KV cache transceiver | backend=" << cacheTransceiverBackendName(backendType)
+                << " | snapshot=unavailable | RX(sync_active=" << requesterSyncActive
+                << ") | poisoned=" << (hasPoisonedTransferBuffer() ? "yes" : "no");
+            return oss.str();
+        }
+        snapshot = mStatusSnapshot;
+    }
+    std::ostringstream oss;
+    oss << "KV cache transceiver | backend=" << cacheTransceiverBackendName(backendType)
+        << " | TX(async_active=" << snapshot.senderAsyncActive << ", timed_out=" << snapshot.timedOutSenders
+        << ", cancel_requested=" << snapshot.cancelingSenders << ", local_completed=" << snapshot.completedSenders
+        << ", local_failed=" << snapshot.failedSenders << ", awaiting_consensus=" << snapshot.sendersAwaitingConsensus
+        << ") | RX(async_active=" << snapshot.requesterAsyncActive << ", sync_active=" << requesterSyncActive
+        << ", timed_out=" << snapshot.timedOutRequesters << ", cancel_requested=" << snapshot.cancelingRequesters
+        << ", local_completed=" << snapshot.completedRequesters << ", local_failed=" << snapshot.failedRequesters
+        << ", awaiting_consensus=" << snapshot.requestersAwaitingConsensus
+        << ") | poisoned=" << (hasPoisonedTransferBuffer() ? "yes" : "no");
+    return oss.str();
+}
+
+void CacheTransceiver::publishStatusSnapshot() noexcept
+{
+    StatusSnapshot snapshot;
+    snapshot.senderAsyncActive = mSenderFutures.size();
+    snapshot.requesterAsyncActive = mRequesterFutures.size();
+    snapshot.timedOutSenders = mTimedOutSenderIds.size();
+    snapshot.timedOutRequesters = mTimedOutRequesterIds.size();
+    snapshot.cancelingSenders = mCancelRequestedSenderIds.size();
+    snapshot.cancelingRequesters = mCancelRequestedRequesterIds.size();
+    snapshot.completedSenders = mCompletedSenderRequestIds.size();
+    snapshot.completedRequesters = mCompletedRequesterRequestIds.size();
+    snapshot.failedSenders = mFailedSenderRequestIds.size();
+    snapshot.failedRequesters = mFailedRequesterRequestIds.size();
+    snapshot.sendersAwaitingConsensus = mSenderRequestsAwaitingConsensus.size();
+    snapshot.requestersAwaitingConsensus = mRequesterRequestsAwaitingConsensus.size();
+    try
+    {
+        std::lock_guard<std::mutex> lock(mStatusSnapshotMutex);
+        mStatusSnapshot = snapshot;
+    }
+    catch (std::system_error const&)
+    {
+        // Status publication is best-effort and must never fail a transfer path.
+    }
+}
+
+CacheTransceiver::SyncRequesterStatusGuard::SyncRequesterStatusGuard(CacheTransceiver& transceiver)
+    : mTransceiver{transceiver}
+{
+    mTransceiver.mSyncRequesterActive.fetch_add(1, std::memory_order_relaxed);
+}
+
+CacheTransceiver::SyncRequesterStatusGuard::~SyncRequesterStatusGuard() noexcept
+{
+    mTransceiver.mSyncRequesterActive.fetch_sub(1, std::memory_order_relaxed);
+}
+
 void CacheTransceiver::initializeCommState()
 {
     mCommState = std::addressof(mCacheSender->getCommState());
@@ -782,6 +879,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
+    publishStatusSnapshot();
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -799,6 +897,7 @@ void CacheTransceiver::respondAndSendLayerWise(
         auto future = mCacheSender->sendAsync(llmRequest);
         mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
+    publishStatusSnapshot();
 }
 
 void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
@@ -808,6 +907,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
     auto const contextRequestId = llmRequest->getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG("Synchronous KV cache receive request %zu, context request %zu waiting for native completion.",
         requestId, contextRequestId);
+    SyncRequesterStatusGuard statusGuard{*this};
     try
     {
         auto future = mCacheReceiver->receiveAsync(llmRequest);
@@ -856,6 +956,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     auto* requestPtr = llmRequest.get();
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
     requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    publishStatusSnapshot();
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -1026,7 +1127,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             contextCompleteRequestIds.push_back(request->mRequestId);
         }
     }
-
+    publishStatusSnapshot();
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
     if ((syncComm) && syncComm->getSize() > 1)
     {
@@ -1176,6 +1277,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         }
     }
 
+    // Publish after local polling and before consensus, which may be the point at which a rank hangs.
+    publishStatusSnapshot();
     RequestStatuses requestsStatus{};
     TransferConsensusOutcome consensusOutcome;
     if (mContextTransferCoordinator)
@@ -1273,6 +1376,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
 
+    publishStatusSnapshot();
     return requestsStatus;
 }
 
@@ -1315,6 +1419,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             collectReadyRequestIds();
         }
     }
+    publishStatusSnapshot();
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
 
     std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
@@ -1468,6 +1573,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         }
     }
 
+    // Publish after local polling and before collectives, which may be the point at which a rank hangs.
+    publishStatusSnapshot();
     auto const consensusOutcome
         = reduceTransferStates(syncComm, mCompletedRequesterRequestIds, mFailedRequesterRequestIds,
             inflightCancelEnabled ? mTimedOutRequesterIds : std::unordered_set<RequestIdType>{});
@@ -1526,6 +1633,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         eraseLocalTransferOutcome(
             requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
     }
+    publishStatusSnapshot();
 
     // Batch-sync timing across ranks in one allgather (instead of per-request), then write
     // the gen-side transfer summary CSV.

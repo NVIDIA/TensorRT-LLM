@@ -65,6 +65,16 @@ def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
 
+def _pop_optional_str_config_option(config: dict[str, Any],
+                                    key: str) -> Optional[str]:
+    value = config.pop(key, None)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"{key} must be a non-empty string")
+
+
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -187,6 +197,7 @@ def get_llm_args(
         custom_tokenizer: Optional[str] = None,
         post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
+        generation_config: str = _LLM_ARGS_FIELDS["generation_config"].default,
         max_beam_width: int = _LLM_ARGS_FIELDS["max_beam_width"].default,
         max_batch_size: int = _LLM_ARGS_FIELDS["max_batch_size"].default,
         max_num_tokens: int = _LLM_ARGS_FIELDS["max_num_tokens"].default,
@@ -237,6 +248,8 @@ def get_llm_args(
         model,
         "backend":
         backend,
+        "generation_config":
+        generation_config,
         "tokenizer":
         tokenizer,
         "custom_tokenizer":
@@ -529,7 +542,8 @@ def launch_server(
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
         num_media_load_workers: int = 8,
-        multi_frontend_enabled: bool = True):
+        multi_frontend_enabled: bool = True,
+        internal_disagg_auth_key: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -605,7 +619,8 @@ def launch_server(
                 chat_template=chat_template,
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers)
+                media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
@@ -977,6 +992,13 @@ def launch_visual_gen_server(
     default="pytorch",
     help="The backend to use to serve the model. Default is pytorch backend.",
     status="beta")
+@stability_option(
+    "--generation-config",
+    type=click.Choice(["auto", "trtllm"]),
+    default=_LLM_ARGS_FIELDS["generation_config"].default,
+    help="Sampling defaults source. 'auto' loads supported values from the "
+    "model's generation_config.json; 'trtllm' uses TRT-LLM defaults.",
+    status="prototype")
 @stability_option("--custom_module_dirs",
                   type=click.Path(exists=True,
                                   readable=True,
@@ -1265,10 +1287,11 @@ def launch_visual_gen_server(
     status="prototype")
 def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tensor_parallel_size: int, pipeline_parallel_size: int,
-          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          log_level: str, backend: str, generation_config: str,
+          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+          max_seq_len: int, tensor_parallel_size: int,
+          pipeline_parallel_size: int, context_parallel_size: int,
+          moe_expert_parallel_size: Optional[int],
           moe_cluster_parallel_size: Optional[int],
           gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
           kv_cache_dtype: str, num_postprocess_workers: int,
@@ -1355,6 +1378,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             custom_tokenizer=custom_tokenizer,
             post_processor_hook=post_processor_hook,
             backend=backend,
+            generation_config=generation_config,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1395,6 +1419,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
+        internal_disagg_auth_key = _pop_optional_str_config_option(
+            llm_args_extra_dict, "internal_request_auth_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1449,6 +1475,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
+                "internal_request_auth_key":
+                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1482,7 +1510,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
-                num_media_load_workers=num_media_load_workers)
+                num_media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -2078,7 +2107,12 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     #    ZMQ ingest server, started once here).
     def _client_factory(router, role, max_retries=1):
         from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+        return OpenAIHttpClient(
+            router,
+            role,
+            request_timeout,
+            max_retries,
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,
@@ -2090,9 +2124,11 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
-            CoordinatorServer(coordinator)(public_host,
-                                           coord_port,
-                                           uds=coord_uds))
+            CoordinatorServer(coordinator)(
+                public_host,
+                coord_port,
+                uds=coord_uds,
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
 
         async def _monitor_fleet():
             while True:
@@ -2350,13 +2386,21 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
-    launch_server(
-        host=server_cfg.hostname,
-        port=server_cfg.port,
-        llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template,
+    launch_kwargs = {
+        "allow_request_chat_template":
+        disagg_config.allow_request_chat_template,
         # Disagg ctx/gen MPI workers must not enter multi-frontend mode.
-        multi_frontend_enabled=False)
+        "multi_frontend_enabled": False,
+    }
+    internal_disagg_auth_key = getattr(disagg_config,
+                                       "internal_request_auth_key", None)
+    if internal_disagg_auth_key is not None:
+        launch_kwargs["internal_disagg_auth_key"] = internal_disagg_auth_key
+
+    launch_server(host=server_cfg.hostname,
+                  port=server_cfg.port,
+                  llm_args=llm_args,
+                  **launch_kwargs)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

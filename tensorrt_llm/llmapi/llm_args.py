@@ -561,7 +561,7 @@ class MultimodalConfig(StrictBaseModel):
         ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
          "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
          "Incompatible with encoder_cuda_graph because graph replay uses static buffers. "
-         "For the time being, this is also incompatible with encoder_cache_max_bytes > 0."
+         "Can be combined with encoder_cache_max_bytes; the two memory limits are additive."
          ),
         status="prototype",
     )
@@ -574,7 +574,7 @@ class MultimodalConfig(StrictBaseModel):
          "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
          "every item in the request must hit the cache before cached embeddings are reused. "
          "Only single-modality requests are cacheable for the time being. "
-         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+         "Can be combined with encoder_side_stream_max_ahead. "
          "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",
@@ -605,14 +605,6 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
-        # TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.
-        if (self.encoder_cache_max_bytes > 0
-                and self.encoder_side_stream_max_ahead > 0):
-            raise ValueError(
-                "multimodal_config.encoder_cache_max_bytes > 0 and "
-                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
-                "mutually exclusive. Disable side-stream MM prefetch or set "
-                "the MM encoder cache capacity to 0.")
         return self
 
 
@@ -918,6 +910,12 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "`fp4` requires Blackwell+ (SM>=100) at runtime and "
         "index_head_dim=128.",
     )
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
+        "it each step. Defaults to the model's HF config value.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1046,6 +1044,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1062,6 +1062,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 return getattr(pretrained_config, name, default)
             return default
 
+        num_layers = getattr(pretrained_config, "num_hidden_layers", None)
+        has_shared_indexer_layers = (num_layers is not None and any(
+            not self._is_full_indexer_layer(pretrained_config, layer_idx)
+            for layer_idx in range(num_layers)))
+
         return DSAMetadataParams(
             indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
             max_sparse_topk=_value("index_topk"),
@@ -1071,6 +1076,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
+            has_shared_indexer_layers=has_shared_indexer_layers,
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
 
@@ -1687,6 +1695,32 @@ class CalibConfig(StrictBaseModel):
         "The maximum sequence length to initialize tokenizer for calibration.")
 
 
+class AdvancedSamplingMode(StrEnum):
+    """Deploy-time specialization of the one-model advanced sampler.
+
+    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
+    NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
+    NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
+    """
+    FULL = "full"
+    NO_TOPK = "no_topk"
+    NO_TOPP = "no_topp"
+    NO_TOPK_NO_TOPP = "no_topk_no_topp"
+
+    @property
+    def skips_top_k(self) -> bool:
+        """Single source of truth: does this mode disable the top_k filter?"""
+        return self in (AdvancedSamplingMode.NO_TOPK,
+                        AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+    @property
+    def skips_top_p(self) -> bool:
+        """Single source of truth: does this mode disable the top_p filter?"""
+        return self in (AdvancedSamplingMode.NO_TOPP,
+                        AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -1768,6 +1802,13 @@ class DecodingBaseConfig(StrictBaseModel):
         "in a future release. Non-greedy sampling is now auto-detected per "
         "request; this flag no longer has any effect.")
 
+    advanced_sampling_mode: AdvancedSamplingMode = Field(
+        default=AdvancedSamplingMode.FULL,
+        description=
+        "Deploy-time specialization of the one-model advanced sampler that skips disabled "
+        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
+        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -1776,6 +1817,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # If set, the draft model attends directly over the target model KV cache.
+    _use_shared_kv_cache: bool = PrivateAttr(False)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -3529,19 +3572,83 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
+
+    changes_physical_kv_length: ClassVar[bool] = False
+    """Whether physical and logical KV lengths can diverge."""
+
     algorithm: str = Field(
         description=
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
-    @property
-    def kv_cache_compression_mode(self):
-        # The mode carries algorithm-level traits (``is_*`` predicates) the
-        # raw algorithm string does not.
-        from tensorrt_llm._torch.kv_cache_compression.interface import \
-            KvCacheCompressionMode
-        return KvCacheCompressionMode.from_string(self.algorithm)
+    def supports_block_reuse(self) -> bool:
+        return False
+
+    def supports_speculative_decoding(self) -> bool:
+        return False
+
+
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """TriAttention KV-cache compression: periodic decode-time eviction.
+
+    Scored by offline calibration (github.com/WeianMao/triattention; supply
+    the official .pt via ``calibration_path``). Pure compression — decode
+    runs the model's standard attention over the compacted cache.
+    """
+
+    changes_physical_kv_length: ClassVar[bool] = True
+
+    algorithm: Literal["triattention"] = "triattention"
+    eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
+        default="union",
+        description=
+        "Which token set each eviction round keeps. `union` (default) takes "
+        "the union of each KV head's top-B and re-ranks it by the per-token max "
+        "score; it matches the official base setting (per-head and "
+        "per-layer-per-head pruning both off). `per_head` keeps a per-KV-head "
+        "set shared across layers (mean of per-layer max); `per_layer_perhead` "
+        "keeps a fully independent set per (layer, KV head).")
+    normalize_scores: bool = Field(
+        default=True,
+        description="Z-normalize each head's scores over the decode region "
+        "before selection (upstream default). `union` eviction requires True: "
+        "its fused score+stats+union pipeline always normalizes.")
+    budget: int = Field(
+        default=2048,
+        gt=0,
+        description="Tokens kept at each periodic eviction; prompt tokens are "
+        "always preserved on top.")
+    beta: int = Field(
+        default=128,
+        gt=0,
+        description="Eviction period in confirmed generation tokens (upstream "
+        "`divide_length`): one speculative iteration may advance the counter "
+        "by multiple accepted tokens; at most one eviction is coalesced per update."
+    )
+    model_path: str = Field(
+        min_length=1,
+        description="Checkpoint path used to derive RoPE tables when converting "
+        "the official calibration and to classify kernel-masked sliding-attention "
+        "layers.")
+    calibration_path: str = Field(
+        min_length=1,
+        description="Path to the official TriAttention calibration `.pt` "
+        "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
+        "compute calibration; it converts this file to the runtime schema at "
+        "load.")
+
+    def supports_block_reuse(self) -> bool:
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        return self.eviction_mode == "union"
+
+
+KvCacheCompressionConfigType: TypeAlias = Annotated[
+    Union[TriAttentionKvCacheCompressionConfig],
+    Field(discriminator="algorithm"),
+]
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3616,6 +3723,43 @@ class MambaStateConfig(StrictBaseModel):
         "the end of each prompt. An offset of 0 selects the prompt end. "
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
+
+
+class BlockReuseConfig(StrictBaseModel):
+    """Configuration for KV cache block reuse policies."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_renamed_block_reuse_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "block_reuse_policy" in data:
+            raise ValueError(
+                "'kv_cache_config.block_reuse_config.block_reuse_policy' was "
+                "renamed to 'kv_cache_config.block_reuse_config.policy'.")
+        return data
+
+    policy: Literal["all_reusable", "per_request", "per_conversation"] = Field(
+        default="all_reusable",
+        status="prototype",
+        description="KV cache manager v2 block reuse policy. "
+        "'all_reusable' commits reusable blocks after every context chunk; "
+        "'per_request' commits them only after the final context chunk; "
+        "'per_conversation' uses 'per_request' commits and retains committed "
+        "SWA-window blocks and Mamba stable-boundary state for up to "
+        "`max_num_turns` completed turns. Periodic Mamba state snapshots "
+        "are disabled with 'per_conversation'. All reusable blocks remain "
+        "subject to normal cache eviction. "
+        "Requests without conversation params use 'per_request' behavior. When "
+        "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+        "blocks are committed for reuse.")
+
+    max_num_turns: PositiveInt = Field(
+        default=1,
+        status="prototype",
+        description=
+        "Maximum number of completed conversation turns whose committed SWA-window "
+        "blocks and Mamba stable-boundary state are retained by KV cache manager v2. "
+        "Only used when "
+        "`policy` is 'per_conversation'.")
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -3820,6 +3964,20 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    fp8_context_mla_kv_len_cap: Optional[int] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that "
+        "the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 "
+        "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
+        "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
+        "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
+        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
+        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     pool_ratio: Optional[List[float]] = Field(
         default=None,
         min_length=1,
@@ -3840,21 +3998,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "unset. This does not take effect when pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    block_reuse_policy: Literal[
-        "all_reusable", "per_request", "per_conversation"] = Field(
-            default="all_reusable",
-            status="prototype",
-            description="KV cache manager v2 block reuse policy. "
-            "'all_reusable' commits reusable blocks after every context chunk; "
-            "'per_request' commits them only after the final context chunk; "
-            "'per_conversation' uses 'per_request' commits and drops the previous "
-            "turn's committed SWA-window blocks and Mamba stable-boundary state "
-            "after the current turn's final context chunk. Periodic Mamba state "
-            "snapshots are disabled with 'per_conversation'. All reusable blocks "
-            "remain subject to normal cache eviction. "
-            "Requests without conversation params use 'per_request' behavior. When "
-            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
-            "blocks are committed for reuse.")
+    block_reuse_config: BlockReuseConfig = Field(
+        default_factory=BlockReuseConfig,
+        status="prototype",
+        description="KV cache manager v2 configuration for block reuse policies."
+    )
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3940,13 +4088,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     def disable_periodic_mamba_snapshots_for_conversations(
             self) -> 'KvCacheConfig':
         """Use only explicit stable boundaries for conversation reuse."""
-        if (self.block_reuse_policy == "per_conversation"
+        if (self.block_reuse_config.policy == "per_conversation"
                 and self.mamba_state_config.periodic_snapshot_interval != 0):
             interval = self.mamba_state_config.periodic_snapshot_interval
             logger.warning(
                 f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
                 "is ignored because "
-                "'kv_cache_config.block_reuse_policy=per_conversation' disables "
+                "'kv_cache_config.block_reuse_config.policy=per_conversation' disables "
                 "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})
@@ -4255,8 +4403,7 @@ class BaseLlmArgs(StrictBaseModel):
         "(default), it is read from the HF config.json ('dtype', or the "
         "deprecated 'torch_dtype'); for composite/VLM configs it falls "
         "back to the nested text_config.dtype. Defaults to bfloat16 if "
-        "none is found, and is overridden to float16 on GPUs with compute "
-        "capability < 8.0 (pre-Ampere).",
+        "none is found.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32"))
 
@@ -4388,8 +4535,8 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # KV cache compression config (separate from sparse attention: changes which
-    # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+    # KV is stored, not the attention computation).
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")
@@ -4486,15 +4633,27 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
         telemetry=TelemetryField.categorical('pytorch', '_autodeploy'))
 
-    return_perf_metrics: bool = Field(default=False,
-                                      description="Return perf metrics.",
-                                      status="prototype")
+    return_perf_metrics: bool = Field(
+        default=False,
+        description=
+        "Allow serving responses to include per-request performance metrics when "
+        "the request sets X-TRTLLM-return-metrics: 1.",
+        status="prototype")
+
+    perf_metrics_output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory for per-process performance metrics JSONL "
+        "files. Setting this enables collection even when "
+        "return_perf_metrics is false.",
+        status="prototype",
+        telemetry=False)
 
     perf_metrics_max_requests: NonNegativeInt = Field(
         default=0,
         description=
-        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
-        status="prototype")
+        "Deprecated compatibility field. Completed per-request metrics are no "
+        "longer retained in memory.",
+        status="deprecated")
 
     prometheus_metrics_config: Optional[PrometheusMetricsConfig] = Field(
         default=None,
@@ -4553,16 +4712,6 @@ class BaseLlmArgs(StrictBaseModel):
         elif not isinstance(config_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
         return cls(**config_dict)
-
-    @field_validator("dtype")
-    @classmethod
-    def validate_dtype(cls, v, info):
-        if torch.cuda.get_device_properties(0).major < 8:
-            if v == 'auto':
-                v = 'float16'
-            if v == 'bfloat16':
-                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-        return v
 
     @field_validator("gpus_per_node", mode='before')
     @classmethod
@@ -4906,6 +5055,17 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    generation_config: Literal["auto", "trtllm"] = Field(
+        default="trtllm",
+        description=
+        "Controls whether sampling defaults are loaded from the model's "
+        "generation_config.json. 'auto' applies supported values when the "
+        "request does not specify them; 'trtllm' preserves TRT-LLM defaults. "
+        "Precedence is request values, generation_config.json values, then "
+        "TRT-LLM defaults.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'trtllm']"})
+
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
@@ -4922,6 +5082,25 @@ class TorchLlmArgs(BaseLlmArgs):
         since the input shapes are a function of the sequence lengths).\
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
+
+    encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig] = Field(
+        default=None,
+        description=(
+            "CUDA graph configuration for the encoder forward pass of an "
+            "encoder-decoder model. Use `cuda_graph_config` for the decoder "
+            "and this field for the encoder. Encoder CUDA graphs require "
+            "`encoder_max_batch_size` to be set."),
+        status="prototype")
+
+    enable_encoder_decoder_mixed_cuda_graph: bool = Field(
+        default=True,
+        description=(
+            "Enable the mixed-batch CUDA graph performance optimization for "
+            "encoder-decoder models. The graph handles decoder iterations "
+            "containing both context and generation requests. It is enabled "
+            "by default when both `cuda_graph_config` and "
+            "`encoder_cuda_graph_config` produce usable graph shapes."),
+        status="prototype")
 
     @field_validator('cuda_graph_config', mode='before')
     @classmethod
@@ -4976,21 +5155,21 @@ class TorchLlmArgs(BaseLlmArgs):
 
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
-            "Falls back to `max_batch_size` when unset. This budget is shared "
-            "proportionately across all modalities the model encodes, not set "
-            "per modality; per-modality knobs may be added later."),
+        description=
+        ("Maximum encoder batch size. For encoder-decoder models, this also "
+         "controls encoder microbatch admission and limits encoder CUDA graph "
+         "batch sizes. For multimodal models, this is the shared "
+         "AttentionMetadata budget across all encoded modalities. Falls back "
+         "to `max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
         description=(
-            "Maximum number of tokens for the multimodal encoder's "
-            "AttentionMetadata. Falls back to `max_num_tokens` when unset. This "
-            "budget is shared proportionately across all modalities the model "
-            "encodes, not set per modality; per-modality knobs may be added "
-            "later."),
+            "Maximum number of encoder tokens. For encoder-decoder models, this "
+            "limits encoder CUDA graph total-token buckets. For multimodal "
+            "models, this is the shared AttentionMetadata budget across all "
+            "encoded modalities. Falls back to `max_num_tokens` when unset."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
@@ -4999,6 +5178,28 @@ class TorchLlmArgs(BaseLlmArgs):
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer when set")
         return v
+
+    @model_validator(mode="after")
+    def validate_encoder_cuda_graph_config(self) -> 'TorchLlmArgs':
+        if self.encoder_cuda_graph_config is None:
+            return self
+        if self.encode_only:
+            raise ValueError(
+                "Use cuda_graph_config=EncodeCudaGraphConfig(...) when "
+                "encode_only=True; encoder_cuda_graph_config is for "
+                "encoder-decoder models.")
+        if self.encoder_max_batch_size is None:
+            raise ValueError(
+                "encoder_cuda_graph_config requires encoder_max_batch_size.")
+        missing = []
+        if not self.encoder_cuda_graph_config.num_tokens:
+            missing.append("num_tokens/max_num_token")
+        if not self.encoder_cuda_graph_config.seq_lens:
+            missing.append("seq_lens/max_seq_len")
+        if missing:
+            raise ValueError("encoder_cuda_graph_config requires "
+                             f"{' and '.join(missing)}.")
+        return self
 
     attn_backend: str = Field(
         default='TRTLLM',

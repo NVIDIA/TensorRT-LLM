@@ -244,12 +244,12 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
-        constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
+        # Constraints stay feasibility floors even under an explicit initial pool
+        # ratio (a share below what a declared batch needs is clamped up), and the
+        # floors are scaled by 1/max_util_for_resume because _KVCache.resume rejects
+        # any pool group above that utilization. Mirrors PR #16269.
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints_for_min_slots,
-            tokens_per_block,
-            swa_scratch_reuse,
-            max_util_for_resume,
+            constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
 
         # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
@@ -918,6 +918,8 @@ class StorageManager:
         All returned elements are positive. Constraint-derived floors include
         headroom for the utilization gate checked by ``_KVCache.resume``.
         """
+        if not 0 < max_util_for_resume <= 1:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
         max_slots = filled_list(0, self.num_pool_groups)
 
         def swa_floor_blocks(lc: AttnLifeCycle) -> int:

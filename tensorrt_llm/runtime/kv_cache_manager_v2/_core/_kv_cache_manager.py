@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
@@ -37,6 +38,7 @@ from .._common import (
     TokenIdExt,
 )
 from .._config import DataRole, KVCacheManagerConfig
+from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
@@ -292,13 +294,31 @@ class KVCacheManager:
         self._stats_excluded_kv_cache_ids = set()
 
     def __del__(self) -> None:
-        self.shutdown()
+        try:
+            self.shutdown()
+        except LogicError as e:
+            warnings.warn(str(e))
+
+    def _check_no_living_kv_caches(self, api: str) -> None:
+        """Raise unless every KV cache has been closed.
+
+        `api` names the caller so the message points at the mistake rather than at
+        whatever breaks later. Entries are dropped by `_KVCache.close()`, so this counts
+        sequences that are still open, not merely un-collected objects.
+        """
+        if self._living_kv_caches:
+            raise LogicError(
+                f"{api} with {len(self._living_kv_caches)} KV cache(s) still open; "
+                "close them (or drain the engine) first"
+            )
 
     def shutdown(self) -> None:
+        self._check_no_living_kv_caches("shutdown()")
         self.clear_reusable_blocks()
         self._storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
+        self._check_no_living_kv_caches("clear_reusable_blocks()")
         self._radix_tree.clear()
 
     def get_mem_pool_base_address(
@@ -671,6 +691,11 @@ class KVCacheManager:
         """
         Layers are divided into multiple groups.
         Buffers in the same layer group for the same token block are always allocated/deallocated together.
+
+        NOTE: the iteration order of the layer lists (and of the groups) is NOT part of
+        the API contract and may differ across backends/runs. Do not rely on it for
+        buffer/pool memory order -- query ``pool_group_descs`` (PoolGroupDesc.pools[i]
+        .base_address + coalesced_buffers) for that.
         """
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
         num_life_cycles = self._life_cycles.size

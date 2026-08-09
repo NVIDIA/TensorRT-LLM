@@ -97,6 +97,9 @@ kv_cache_config:
   enable_block_reuse: true
   use_kv_cache_manager_v2: true
   avg_seq_len: 2048
+  block_reuse_config:
+    policy: per_conversation
+    max_num_turns: 2
   mamba_state_config:
     periodic_snapshot_interval: 0
     additional_snapshot_offsets_from_start: [128]
@@ -122,6 +125,8 @@ snapshots only.
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
 
 To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+
+This isolation is enforced entirely by the block-key hash: the salt is mixed into the hashed input and prefix matching is decided by digest equality alone (blocks are not re-compared token-by-token). The block-key hash is therefore required to be a cryptographic hash with strong collision resistance and a 256-bit digest (SHA-256 provides ~128-bit collision resistance, which is ample here); substituting a non-cryptographic hash would allow crafted collisions to bypass salt isolation and must not be done.
 
 ### Multimodal UUID Support for Cache Identification
 
