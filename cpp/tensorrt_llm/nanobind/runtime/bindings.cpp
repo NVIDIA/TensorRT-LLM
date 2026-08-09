@@ -334,7 +334,9 @@ void initBindings(nb::module_& m)
         .value("RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4",
             tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
         .value("RESIDUAL_RMS_NORM_OUT_QUANT_FP8",
-            tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8);
+            tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8)
+        .value("RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF",
+            tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceStrategyType>(m, "AllReduceStrategy")
         .value("NCCL", tensorrt_llm::kernels::AllReduceStrategyType::NCCL)

@@ -129,6 +129,9 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
+    # As RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, but the block scale factors are emitted in LINEAR
+    # (row-major) rather than SWIZZLED layout, which is what the trtllm-gen MoE kernels consume.
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF = 10
 
 
 class AllReduceParams:

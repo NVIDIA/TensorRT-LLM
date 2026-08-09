@@ -964,7 +964,9 @@ class TRTLLMGenFusedMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
-        assert x.dtype == torch.bfloat16
+        # A pre-quantized activation carries no dtype of its own; quantize_input
+        # passes it straight through to the expert GEMMs.
+        assert isinstance(x, Fp4QuantizedTensor) or x.dtype == torch.bfloat16
 
         top_k = self._extract_routing_params().top_k
 
