@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import atexit
 import enum
+import functools
 import json
 import os
 import threading
@@ -87,9 +88,35 @@ def _configured_backend() -> LowMGemmBackend:
     return _normalize_backend(os.environ.get(_BACKEND_ENV, "off"))
 
 
-def _current_sm(device: torch.device) -> int:
-    major, minor = torch.cuda.get_device_capability(device)
+@functools.cache
+def _device_sm(device_index: int) -> int:
+    major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + minor
+
+
+def _current_sm(device: torch.device) -> int:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _device_sm(device_index)
+
+
+def _prefer_cublas_for_auto(m: int, n: int, k: int, sm: int) -> bool:
+    """Return whether cuBLAS wins for a measured low-M Blackwell shape.
+
+    FlashInfer selects its direct versus split-K tactic internally.  This
+    narrow crossover handles shapes where the packaged CuTe DSL kernels are
+    slower than the normal cuBLAS Linear path in the 2026-08-06 nightly.
+    Explicit ``flashinfer`` selection remains an unconditional override.
+    """
+
+    if sm != 103:
+        return False
+    if (n, k) == (8192, 128):
+        return m >= 8
+    if (n, k) == (15520, 8192):
+        return m >= 15
+    return (m, n, k) == (16, 2304, 8192)
 
 
 class _ShapeCollector:
@@ -368,13 +395,17 @@ class LowMGemmDispatcher:
         if not self._is_candidate_shape(input_tensor, weight, bias):
             return None
 
-        if not self._is_flashinfer_supported(input_tensor.device):
-            return None
-
         input_2d = input_tensor.detach().view(-1, input_tensor.shape[-1])
         m = int(input_2d.shape[0])
         n = int(weight.shape[0])
         k = int(weight.shape[1])
+        sm = _current_sm(input_tensor.device)
+        if self.backend == LowMGemmBackend.AUTO and _prefer_cublas_for_auto(m, n, k, sm):
+            return None
+
+        if not self._is_flashinfer_supported(input_tensor.device):
+            return None
+
         engaged_key = (m, n, k, bias is not None)
         if engaged_key not in self._engaged:
             self._engaged.add(engaged_key)
