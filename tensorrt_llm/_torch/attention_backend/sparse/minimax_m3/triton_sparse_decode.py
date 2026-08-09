@@ -35,6 +35,12 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+from tensorrt_llm._torch.modules.triton_mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    mxfp8_quantize_tile,
+    swizzled_sf_numel,
+    swizzled_sf_offset,
+)
 
 # One sparse block is exactly one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -213,6 +219,8 @@ def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
     lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
     out_ptr,  # merged out: [total_q, num_heads, head_dim]
+    out_fp8_ptr,  # MXFP8 out: [total_q, num_heads * head_dim], or unused
+    out_sf_ptr,  # swizzled UE8M0 scales for out_fp8_ptr, or unused
     head_dim,
     stride_o_c,
     stride_o_b,
@@ -224,8 +232,13 @@ def _merge_topk_attn_out_kernel(
     stride_out_n,
     stride_out_h,
     stride_out_d,
+    stride_qout_n,
+    num_sf_k_tiles,
+    sf_padded_rows,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    QUANT_MXFP8: tl.constexpr,
+    NUM_SF_BLOCKS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
@@ -255,8 +268,36 @@ def _merge_topk_attn_out_kernel(
     denom = tl.sum(weights, axis=0)
     weights = weights / tl.where(denom > 0, denom, 1.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
+    o_out = o_merged.to(out_ptr.dtype.element_ty)
     out_ptrs = out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
-    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
+    tl.store(out_ptrs, o_out, mask=off_d < head_dim)
+
+    if QUANT_MXFP8:
+        # Quantize the narrowed value, not the fp32 accumulator: a standalone
+        # mxfp8_quantize would read what the store above leaves in memory, and
+        # this has to be indistinguishable from that.
+        #
+        # One program owns one head, so with head_dim a multiple of 32 its
+        # columns are whole scale-factor blocks and no amax crosses programs.
+        # The masked-out lanes of o_out are zero, so they cannot raise an amax.
+        xq, sf = mxfp8_quantize_tile(
+            o_out.to(tl.float32), NUM_SF_BLOCKS, BLOCK_SIZE_D // NUM_SF_BLOCKS
+        )
+        tl.store(
+            out_fp8_ptr + pid_b * stride_qout_n + pid_h * head_dim + off_d,
+            xq,
+            mask=off_d < head_dim,
+        )
+        k_idx = pid_h * NUM_SF_BLOCKS + tl.arange(0, NUM_SF_BLOCKS)
+        tl.store(out_sf_ptr + swizzled_sf_offset(pid_b, k_idx, num_sf_k_tiles), sf)
+
+        # The swizzled layout rounds rows up to 128 and the reference quantizer
+        # zeroes the rows it invents. Spreading those over the live programs
+        # keeps the buffer self-contained for a few bytes each, rather than
+        # making the caller hold a persistently zeroed one.
+        zero = tl.zeros((NUM_SF_BLOCKS,), tl.uint8)
+        for pad_row in range(pid_b + tl.num_programs(0), sf_padded_rows, tl.num_programs(0)):
+            tl.store(out_sf_ptr + swizzled_sf_offset(pad_row, k_idx, num_sf_k_tiles), zero)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -286,6 +327,8 @@ def minimax_m3_sparse_attn_decode(
     decode_query_len: int,
     kv_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
+    output_mxfp8: Optional[torch.Tensor] = None,
+    output_mxfp8_sf: Optional[torch.Tensor] = None,
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
@@ -293,6 +336,17 @@ def minimax_m3_sparse_attn_decode(
     MiniMax-M3 stores unscaled E4M3, so it is normally None. num_topk_chunks
     overrides the split-K factor and exists for tests: the merged result must
     not depend on it.
+
+    output_mxfp8 / output_mxfp8_sf, when given, additionally receive the MXFP8
+    form of output, saving the o_proj a standalone mxfp8_quantize over a tensor
+    the merge kernel just wrote. output is still written in full, so the two
+    are redundant by construction and the caller may use either.
+
+    Both describe rows ``[0, total_q)`` of the o_proj input, laid out as
+    ``[total_q, num_heads * head_dim]``. A caller running only the generation
+    suffix of a mixed batch must therefore not pass them: the rows this kernel
+    skips would reach the GEMM unquantized. The scale buffer is written in
+    full, padding rows included, so plain uninitialized memory will do.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -316,6 +370,36 @@ def minimax_m3_sparse_attn_decode(
         num_topk_chunks = resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
     elif num_topk_chunks & (num_topk_chunks - 1):
         raise ValueError(f"num_topk_chunks must be a power of two; got {num_topk_chunks}.")
+
+    quant_mxfp8 = output_mxfp8 is not None
+    if quant_mxfp8 != (output_mxfp8_sf is not None):
+        raise ValueError("output_mxfp8 and output_mxfp8_sf must be given together.")
+    if quant_mxfp8:
+        if head_dim % MXFP8_BLOCK_SIZE:
+            # A program owns one head; anything else would split a scale-factor
+            # block across programs, which cannot agree on its amax.
+            raise ValueError(
+                f"MiniMax-M3 sparse decode cannot emit MXFP8 for head_dim={head_dim}; "
+                f"it must be a multiple of {MXFP8_BLOCK_SIZE}."
+            )
+        if output_mxfp8.shape != (total_q, num_heads * head_dim):
+            raise ValueError(
+                f"output_mxfp8 must be [{total_q}, {num_heads * head_dim}] covering "
+                f"the whole o_proj input; got {tuple(output_mxfp8.shape)}."
+            )
+        expect_sf = swizzled_sf_numel(total_q, num_heads * head_dim // MXFP8_BLOCK_SIZE)
+        if output_mxfp8_sf.numel() != expect_sf:
+            raise ValueError(
+                f"output_mxfp8_sf must hold {expect_sf} swizzled scale factors; "
+                f"got {output_mxfp8_sf.numel()}."
+            )
+    # Unused pointers still have to be real ones.
+    fp8_arg = output_mxfp8 if quant_mxfp8 else output
+    sf_arg = output_mxfp8_sf if quant_mxfp8 else output
+    num_sf_blocks = head_dim // MXFP8_BLOCK_SIZE if quant_mxfp8 else 1
+    num_sf_k_tiles = triton.cdiv(num_heads * num_sf_blocks, 4)
+    stride_qout_n = output_mxfp8.stride(0) if quant_mxfp8 else 0
+    sf_padded_rows = triton.cdiv(total_q, 128) * 128 if quant_mxfp8 else 0
 
     # Persistent arena rather than torch.empty, so the partials keep one address
     # across CUDA graph replays.
@@ -386,6 +470,8 @@ def minimax_m3_sparse_attn_decode(
         o_partial,
         lse_partial,
         output,
+        fp8_arg,
+        sf_arg,
         head_dim,
         o_partial.stride(0),
         o_partial.stride(1),
@@ -397,7 +483,12 @@ def minimax_m3_sparse_attn_decode(
         output.stride(0),
         output.stride(1),
         output.stride(2),
+        stride_qout_n,
+        num_sf_k_tiles,
+        sf_padded_rows,
         NUM_TOPK_CHUNKS=num_topk_chunks,
+        QUANT_MXFP8=quant_mxfp8,
+        NUM_SF_BLOCKS=num_sf_blocks,
         USE_PDL=use_pdl,
         **pdl_launch,
     )

@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decod
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
 )
+from tensorrt_llm._torch.modules.triton_mxfp8_quantize import MXFP8_BLOCK_SIZE, swizzled_sf_numel
 from tensorrt_llm._utils import get_sm_version
 
 PAGE_SIZE = SPARSE_BLOCK_SIZE
@@ -246,6 +247,90 @@ def test_sparse_decode_zero_length_rows_are_zero_not_nan():
     assert torch.equal(out[1], torch.zeros_like(out[1]))
     assert torch.equal(out[3], torch.zeros_like(out[3]))
     assert out[0].abs().sum() > 0
+
+
+def _mxfp8_out_buffers(total_q, hidden):
+    fp8 = torch.empty(total_q, hidden, dtype=torch.float8_e4m3fn, device="cuda")
+    # Deliberately poisoned rather than zeroed: the kernel owns the padding
+    # rows too, so anything left behind here has to be overwritten.
+    sf = torch.full(
+        (swizzled_sf_numel(total_q, hidden // MXFP8_BLOCK_SIZE),),
+        0xCD,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    return fp8, sf
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("decode_query_len", [1, 3])
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+def test_sparse_decode_mxfp8_epilogue_matches_the_standalone_quantize(
+    decode_query_len, num_kv_heads
+):
+    """Folding the o_proj quantize in must be indistinguishable from not doing it.
+
+    The o_proj consumes whichever of the two forms is available, layer by
+    layer, so a difference here is a silent accuracy change rather than a
+    failure anyone would notice.
+    """
+    seq_lens = [37, 512, 129]
+    inputs = _make_inputs(
+        seq_lens,
+        kv_dtype=torch.bfloat16,
+        num_kv_heads=num_kv_heads,
+        group=8,
+        decode_query_len=decode_query_len,
+        seed=41,
+    )
+    total_q, num_heads, head_dim = inputs[0].shape
+    hidden = num_heads * head_dim
+
+    baseline = _run(*inputs, decode_query_len)
+    out_fp8, out_sf = _mxfp8_out_buffers(total_q, hidden)
+    fused = _run(
+        *inputs,
+        decode_query_len,
+        output_mxfp8=out_fp8,
+        output_mxfp8_sf=out_sf,
+    )
+
+    # The high-precision output is still written, and the epilogue must not
+    # perturb it.
+    assert torch.equal(fused, baseline)
+    ref_fp8, ref_sf = torch.ops.trtllm.mxfp8_quantize(fused.reshape(total_q, hidden), True)
+    assert torch.equal(out_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert torch.equal(out_sf, ref_sf.view(torch.uint8))
+
+
+@skip_not_sm100
+def test_sparse_decode_mxfp8_epilogue_zeroes_rows_that_attend_nothing():
+    """A CUDA-graph padding row quantizes to zero, not to a stale scale."""
+    seq_lens = [1024, 0, 512, 0]
+    inputs = _make_inputs(seq_lens, kv_dtype=torch.bfloat16, seed=43)
+    total_q, num_heads, head_dim = inputs[0].shape
+    hidden = num_heads * head_dim
+
+    out_fp8, out_sf = _mxfp8_out_buffers(total_q, hidden)
+    fused = _run(*inputs, 1, output_mxfp8=out_fp8, output_mxfp8_sf=out_sf)
+
+    assert torch.equal(fused[1], torch.zeros_like(fused[1]))
+    assert torch.equal(out_fp8[1].view(torch.uint8), torch.zeros_like(out_fp8[1].view(torch.uint8)))
+    ref_fp8, ref_sf = torch.ops.trtllm.mxfp8_quantize(fused.reshape(total_q, hidden), True)
+    assert torch.equal(out_fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert torch.equal(out_sf, ref_sf.view(torch.uint8))
+
+
+def test_sparse_decode_mxfp8_epilogue_rejects_a_partial_batch():
+    """The scale buffer is row-indexed, so a suffix-only slice cannot use it."""
+    seq_lens = [128, 128]
+    inputs = _make_inputs(seq_lens, kv_dtype=torch.bfloat16, seed=47)
+    total_q, num_heads, head_dim = inputs[0].shape
+    hidden = num_heads * head_dim
+    out_fp8, out_sf = _mxfp8_out_buffers(total_q + 1, hidden)
+
+    with pytest.raises(ValueError, match="whole o_proj input"):
+        _run(*inputs, 1, output_mxfp8=out_fp8, output_mxfp8_sf=out_sf)
 
 
 def test_sparse_decode_accepts_token_major_topk_table():
