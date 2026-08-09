@@ -427,11 +427,12 @@ class _KVCache:
         else:
             self.manager.clear_stats_dirty(self.id)
 
+    def _is_attention_life_cycle(self, life_cycle: LifeCycleId) -> bool:
+        return isinstance(self.manager._life_cycles.get_life_cycle(life_cycle), AttnLifeCycle)
+
     def _stats_life_cycle_key(self, life_cycle: LifeCycleId) -> LifeCycleId | None:
-        life_cycle_obj = self.manager._life_cycles.get_life_cycle(life_cycle)
-        if isinstance(life_cycle_obj, AttnLifeCycle):
-            return life_cycle
-        return None
+        """Key for the attention-only block-reuse (hit/miss range) accounting."""
+        return life_cycle if self._is_attention_life_cycle(life_cycle) else None
 
     def _refresh_generation_alloc_ready(self) -> None:
         expected_prompt_length = self._expected_prompt_length
@@ -498,10 +499,12 @@ class _KVCache:
     def _record_direct_iteration_stats(
         self, life_cycle: LifeCycleId, iteration_stats: KVCacheIterationStatsDelta
     ) -> None:
-        life_cycle_key = self._stats_life_cycle_key(life_cycle)
-        if life_cycle_key is None or iteration_stats.empty or not self._should_record_stats():
+        # Every life cycle is reported, including SSM / recurrent ones: iteration
+        # statistics are keyed by life cycle, so recurrent page movement stays
+        # distinguishable from attention movement downstream.
+        if iteration_stats.empty or not self._should_record_stats():
             return
-        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle: iteration_stats})
 
     def _record_migrated_slots(
         self,
@@ -514,9 +517,7 @@ class _KVCache:
             return
         assert len(pages) == len(slots)
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
+            is_attention = self._is_attention_life_cycle(page.life_cycle)
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
             stats = KVCacheStatsDelta()
@@ -525,8 +526,11 @@ class _KVCache:
                 iteration_stats.iter_offload_blocks = 1
                 iteration_stats.iter_offload_bytes = page_size
             elif dst_level == GPU_LEVEL:
-                stats.alloc_total_blocks = 1
-                stats.alloc_new_blocks = 1
+                # Global cache-hit accounting is attention-only. SSM movement is
+                # reported by life-cycle/pool-group iteration statistics instead.
+                if is_attention:
+                    stats.alloc_total_blocks = 1
+                    stats.alloc_new_blocks = 1
                 iteration_stats.iter_alloc_total_blocks = 1
                 iteration_stats.iter_alloc_new_blocks = 1
                 if src_level > GPU_LEVEL:
@@ -536,7 +540,7 @@ class _KVCache:
                     iteration_stats.iter_intra_device_copy_blocks = 1
                     iteration_stats.iter_intra_device_copy_bytes = page_size
             if not stats.empty or not iteration_stats.empty:
-                self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
+                self.manager.commit_stats(stats, {page.life_cycle: iteration_stats})
 
     def _record_dropped_pages(
         self,
@@ -554,15 +558,12 @@ class _KVCache:
         if not self._should_record_stats() or not pages:
             return
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
             iteration_stats = KVCacheIterationStatsDelta()
             iteration_stats.iter_host_dropped_blocks = 1
             iteration_stats.iter_host_dropped_bytes = page_size
-            self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+            self.manager.commit_stats(KVCacheStatsDelta(), {page.life_cycle: iteration_stats})
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.

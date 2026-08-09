@@ -615,8 +615,10 @@ void KvCache::_refreshStatsDirtyState()
 
 void KvCache::_recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIterationStatsDelta const& iterationStats)
 {
-    if (!_shouldRecordStats() || iterationStats.empty()
-        || !std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle)))
+    // Every lifecycle is reported, including SSM / recurrent ones: iteration
+    // statistics are keyed by lifecycle, so recurrent page movement stays
+    // distinguishable from attention movement downstream.
+    if (!_shouldRecordStats() || iterationStats.empty())
     {
         return;
     }
@@ -636,10 +638,7 @@ void KvCache::_recordMigratedSlots(
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        if (!std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle)))
-        {
-            continue;
-        }
+        bool const isAttention = std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle));
 
         PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
         int64_t pageSize = 0;
@@ -657,8 +656,13 @@ void KvCache::_recordMigratedSlots(
         }
         else if (dstLevel == kGpuLevel)
         {
-            stats.allocTotalBlocks = 1;
-            stats.allocNewBlocks = 1;
+            // Global cache-hit accounting is attention-only. SSM movement is
+            // reported by lifecycle/pool-group iteration statistics instead.
+            if (isAttention)
+            {
+                stats.allocTotalBlocks = 1;
+                stats.allocNewBlocks = 1;
+            }
             iterationStats.iterAllocTotalBlocks = 1;
             iterationStats.iterAllocNewBlocks = 1;
             if (srcLevel > kGpuLevel)
@@ -692,10 +696,6 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        if (!std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle)))
-        {
-            continue;
-        }
         PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
         int64_t pageSize = 0;
         for (size_t const size : mManager->storage().slotSize(poolGroup))
