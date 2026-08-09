@@ -7848,7 +7848,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            implementation="msa" if use_msa else "triton")
+            implementation="msa" if use_msa else "triton",
+            indexer_kv_dtype="fp8" if use_msa else "bf16",
+            fuse_qkv_index_projection=use_msa)
         moe_config = MoeConfig(backend="CUTLASS")
         # InferenceMAX evaluates a serving endpoint with client concurrency
         # capped at 64 (EVAL_CONCURRENT_REQUESTS); match that batching regime.
