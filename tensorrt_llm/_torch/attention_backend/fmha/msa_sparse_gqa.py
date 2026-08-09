@@ -146,6 +146,7 @@ def run_msa_paged_gqa(
         msa_decode_span_bounds,
         msa_paged_kv,
         msa_ported_decode_active,
+        msa_ported_decode_owns_batch,
         write_msa_main_kv,
     )
 
@@ -153,6 +154,19 @@ def run_msa_paged_gqa(
     head_dim = attn.head_dim
     kv_cache_manager = metadata.kv_cache_manager
     num_tokens = int(q.shape[0])
+
+    # Ahead of the cache write, so a caller that got this wrong is told before
+    # anything about the step has moved.
+    if output_mxfp8 is not None and not (
+        kv_block_indexes is not None and msa_ported_decode_owns_batch(metadata, num_tokens)
+    ):
+        raise RuntimeError(
+            "MiniMax-M3 paged GQA was asked for an MXFP8 output on a step the "
+            "ported sparse decode kernel does not own end to end, which would "
+            "leave part of the o_proj input unquantized; see "
+            "msa_ported_decode_owns_batch."
+        )
+
     # The fused per-layer scatter (msa_write_layer_caches) may have written
     # this layer's K/V already; consume the marker so it never goes stale.
     prewritten = getattr(metadata, "_msa_prewritten_layer", None) == layer_idx
@@ -182,14 +196,6 @@ def run_msa_paged_gqa(
     # ported kernel takes the generation slice, then the context prefix alone.
     fmha_tokens = num_tokens
     ported = msa_ported_decode_active(metadata)
-
-    if output_mxfp8 is not None and not (ported and kv_block_indexes is not None and gen_tok0 == 0):
-        raise RuntimeError(
-            "MiniMax-M3 paged GQA was asked for an MXFP8 output on a step the "
-            "ported sparse decode kernel does not own end to end, which would "
-            "leave part of the o_proj input unquantized; see "
-            "msa_ported_decode_owns_batch."
-        )
 
     if kv_block_indexes is not None and ported:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
