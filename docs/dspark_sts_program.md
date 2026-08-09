@@ -410,6 +410,11 @@ device 臂指纹(各轮一致):completion 恰好=bs×768(零 EOS)、trim ≈49.8
 - Caveats:模型不同(Flash accept 2.79 vs Pro 1.45 于 poetry;Pro 在其栈不可跑),per-rank 并发不同(128/256 vs 我们 64/128);+2.6~+2.9% 的两格在 ±3% 噪声边缘,+7.7% 超出噪声带。
 - 后续实验队列:① 我们的栈 DEP4×128/rank 复测;② #19 连续预算(去 tier 量化)原型;③ 均匀 cap 模式(替代 ragged)可行性评估——若三者叠加能兑现 SGLang 级别收益,#25/#30 产品线复活。
 
+**【08-09 00:25 追记】regime 判别的结论(实验 ① 改为解析判定)**:
+- DEP4-Pro 实测尝试三次均 OOM(Pro 832GB 权重 tp4 = 208GB/卡,图捕获期差 1-2GB;KV 0.32 + 捕获集裁到 5 尺寸仍不够)——Pro 在 4 卡上不可行,与 SGLang 侧 Pro 崩溃互为印证:**跨栈同模型比较做不到,模型差异是本对照的固有 caveat**。
+- 但 regime 问题不需要 DEP4:**per-GPU 负载对齐的格子已经存在**。他们 poetry512(tp4/dp4:每 GPU 128 请求、~128k token MoE 负载)↔ 我们 poetry1024(DEP8:每 GPU 同样 128 请求、~128k token)。同等每 GPU 压力:**他们 +7.7% vs 我们 −1.6%**。→ **差距主体是实现侧**(图形状经济学 + 机制税),不是负载 regime;残余混杂仅剩 EP 宽度(EP8 vs EP4 的 a2a)与模型(Flash vs Pro 的 accept 分布)。
+- 优先级更新:#19 连续预算原型 + 均匀 cap 模式评估升为首位修复路线;DEP4 复测取消。
+
 ### 备选修复方案评估(供评审;当前实施的是 A,标记为暂定)
 
 - **A(已实施,Python-only)**:捕获拷贝换 D2D 源(`_seq_lens_cuda`)+ NEXT_N 抬全局上界。最小爆炸半径,当场可在活挂载容器里验证;把双胞胎缓冲降级为 canonical 缓冲的衍生物。host 路径装填时刻数值逐位等价,uniform/eager 分支未触碰。
