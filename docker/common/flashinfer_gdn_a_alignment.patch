@@ -1,0 +1,20 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+--- a/flashinfer/gdn_kernels/gdn_decode_bf16_state.py
++++ b/flashinfer/gdn_kernels/gdn_decode_bf16_state.py
+@@ -50,0 +51,5 @@
++# The scalar gate view can begin halfway through a 32-byte-aligned packed row.
++# The generated kernel only requires 16-byte alignment for this input.
++GDN_A_ALIGNMENT_BYTES = 16
++
++
+@@ -3183 +3188 @@
+-        a_ = _mark_batch_dynamic(a)
++        a_ = _mark_batch_dynamic(a, assumed_align=GDN_A_ALIGNMENT_BYTES)
+@@ -3454 +3459 @@
+-        a_ = _mark_batch_dynamic(a)
++        a_ = _mark_batch_dynamic(a, assumed_align=GDN_A_ALIGNMENT_BYTES)
+@@ -3827 +3832 @@
+-        a_ = _mark_batch_dynamic(a)
++        a_ = _mark_batch_dynamic(a, assumed_align=GDN_A_ALIGNMENT_BYTES)

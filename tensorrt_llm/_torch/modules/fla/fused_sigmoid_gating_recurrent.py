@@ -24,14 +24,28 @@ try:
         gated_delta_rule as _fi_gdn_decode_bf16_state_t1
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
         gated_delta_rule_mtp as _fi_gdn_decode_bf16_state_mtp
+    try:
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+            GDN_A_ALIGNMENT_BYTES as _FI_GDN_A_ALIGNMENT_BYTES
+    except ImportError:
+        # FlashInfer builds predating the relaxed gate descriptor retain the
+        # original 32-byte alignment contract and realignment copy.
+        _FI_GDN_A_ALIGNMENT_BYTES = 32
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = True
 except (ImportError, RuntimeError):
+    _FI_GDN_A_ALIGNMENT_BYTES = 32
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = False
 
 # Max per-sequence token count served by the FlashInfer MTP verify kernel; the
 # parity test (test_flashinfer_gdn_verify.py) covers T=1..8 against the Triton
 # reference. Longer drafts fall back to the Triton recurrent kernel.
 _FI_GDN_MAX_MTP_T = 8
+
+# Realigning the gate view is beneficial for small verify batches, while the
+# copy cost dominates larger throughput batches. FlashInfer builds that expose
+# a relaxed gate alignment contract can therefore consume the view directly at
+# and above this batch size.
+_FI_GDN_VERIFY_ZERO_COPY_A_MIN_BATCH = 8
 
 
 @triton.heuristics({
@@ -389,12 +403,13 @@ def _flashinfer_gdn_verify(
     HV, V = v.shape[2], v.shape[3]
     output = (output.view(N, T, HV, V) if output is not None else q.new_empty(
         N, T, HV, V))
-    # The FI CuTe-DSL kernel asserts 32-byte data alignment on every tensor
-    # argument. ``a`` starts ``num_v_heads_per_tp`` bf16 elements into the fused
-    # ``in_proj_ba`` output, so it is misaligned when that count is not a
-    # multiple of 16 (e.g. Qwen3.5 TEP16: 128 / 16 = 8) -- see the note in
-    # _flashinfer_gdn_decode for why this clones instead of .contiguous().
-    if a.data_ptr() % 32 != 0:
+    # ``a`` starts ``num_v_heads_per_tp`` bf16 elements into the fused
+    # ``in_proj_ba`` output. Older FlashInfer builds require 32-byte alignment.
+    # Newer builds may advertise a relaxed contract that avoids the copy for
+    # throughput batches; keep the aligned small-batch path for low latency.
+    a_alignment_bytes = (32 if N < _FI_GDN_VERIFY_ZERO_COPY_A_MIN_BATCH else
+                         _FI_GDN_A_ALIGNMENT_BYTES)
+    if a.data_ptr() % a_alignment_bytes != 0:
         a = a.clone(memory_format=torch.contiguous_format)
     if b.data_ptr() % 32 != 0:
         b = b.clone(memory_format=torch.contiguous_format)
