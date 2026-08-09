@@ -321,7 +321,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
     """Mirror serving's model-preference resolution (PR #15823 semantics).
 
     - use_kv_cache_manager_v2 == "auto" (yaml absent): adopt the model
-      class's get_model_defaults() value, default False
+      class's get_preferred_kv_cache_manager_version() value, default V1
       (llm_utils._resolve_kv_cache_manager_v2_auto).
     - cache_cfg.transceiver_runtime == "auto": adopt
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
@@ -349,25 +349,16 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto":
-        defaults = {}
-        if model_cls is not None:
-            try:
-                defaults = model_cls.get_model_defaults(None) or {}
-            except Exception as e:  # noqa: BLE001 - model hooks may need llm_args
-                print(
-                    f"[precheck] WARNING: get_model_defaults failed ({e!r}); assuming V1",
-                    flush=True,
-                )
         try:
             # The REAL serving resolver, via the same shim pattern as the
             # runtime resolution below -- one owner for the 'auto' semantics.
             # cache_transceiver_config feeds the resolver's disagg gating
-            # (a V2 model default requires the NIXL Python transceiver).
+            # (a V2 model preference requires the NIXL Python transceiver).
             shim = types.SimpleNamespace(
                 kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto"),
                 cache_transceiver_config=cache_cfg,
             )
-            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, defaults))
+            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, model_cls, hf_view))
         except Exception as e:  # noqa: BLE001 - fall back like a missing model
             print(
                 f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); assuming V1", flush=True
@@ -820,7 +811,7 @@ class PrecheckRunner:
         self.kvm = None
         self.xcvr = None
         self.runtime = "CPP"
-        # Resolved in setup(): "auto" needs the model class (get_model_defaults).
+        # Resolved in setup(): "auto" needs the model preference hook.
         self.use_v2 = False
         self.mapping = None
         self.llm_request_state = None

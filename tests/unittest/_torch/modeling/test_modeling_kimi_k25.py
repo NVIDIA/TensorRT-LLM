@@ -611,6 +611,13 @@ class TestKimiK25AutoModelRegistration(unittest.TestCase):
             KimiK25ForConditionalGeneration.get_preferred_transceiver_runtime(), "PYTHON"
         )
 
+    def test_prefers_kv_cache_manager_v2(self):
+        """Kimi-K2.5 prefers KV cache manager V2."""
+        self.assertEqual(
+            KimiK25ForConditionalGeneration.get_preferred_kv_cache_manager_version(),
+            "V2",
+        )
+
 
 # ---------------------------------------------------------------------------
 # E2E Smoke Test — requires GPU + model checkpoint

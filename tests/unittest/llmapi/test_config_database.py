@@ -15,6 +15,7 @@
 """L0 tests for validating curated and database YAML configs against TorchLlmArgs."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -28,7 +29,11 @@ from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.llm_utils import (
+    _apply_kv_cache_config_preferences,
+    _resolve_kv_cache_manager_v2_auto,
+    apply_model_defaults_to_llm_args,
+)
 
 from .yaml_validation_harness import (
     assert_no_default_valued_leaves,
@@ -106,12 +111,17 @@ def _get_default_values_for_config(config_path: Path) -> dict:
     model = entry["model"]
     arch = entry["arch"]
     model_cls = get_registered_model_class(arch)
-    if not model_cls or not hasattr(model_cls, "get_model_defaults"):
+    if not model_cls:
         return global_default
 
     base_args = llm_args_module.TorchLlmArgs(model=model, skip_tokenizer_init=True)
-    model_defaults = model_cls.get_model_defaults(base_args)
-    apply_model_defaults_to_llm_args(base_args, model_defaults)
+    pretrained_config = SimpleNamespace(architectures=[arch])
+    _apply_kv_cache_config_preferences(base_args, model_cls, pretrained_config)
+    get_model_defaults = getattr(model_cls, "get_model_defaults", None)
+    model_defaults = get_model_defaults(base_args) if get_model_defaults else {}
+    if model_defaults:
+        apply_model_defaults_to_llm_args(base_args, model_defaults)
+    _resolve_kv_cache_manager_v2_auto(base_args, model_cls, pretrained_config)
     return base_args.model_dump(mode="json")
 
 
@@ -126,14 +136,18 @@ def get_config_id(config_path: Path) -> str:
     return str(config_path.relative_to(CONFIG_ROOT))
 
 
-def test_model_nested_defaults_preserve_global_nested_defaults(monkeypatch):
-    config_key = "test-only/deepseek-v3.yaml"
+@pytest.mark.parametrize(
+    "arch",
+    ["DeepseekV3ForCausalLM", "KimiK25ForConditionalGeneration"],
+)
+def test_model_preferences_preserve_global_nested_defaults(monkeypatch, arch):
+    config_key = f"test-only/{arch}.yaml"
     monkeypatch.setitem(
         _CONFIG_PATH_TO_ENTRY,
         config_key,
         {
             "model": "dummy/model",
-            "arch": "DeepseekV3ForCausalLM",
+            "arch": arch,
         },
     )
 

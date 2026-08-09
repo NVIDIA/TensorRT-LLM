@@ -389,11 +389,11 @@ class TestInternalApiContract:
     def test_serving_resolvers(self, api):
         import inspect
 
-        # The driver calls resolve_kv_cache_manager_v2_auto(shim, defaults):
-        # the first two params are fixed, anything added later must default.
+        # The driver calls the serving resolver with a shim, model class, and
+        # pretrained config. Only the shim is required.
         v2 = inspect.signature(api.resolve_kv_cache_manager_v2_auto).parameters
-        assert list(v2)[:2] == ["llm_args", "model_defaults_dict"]
-        assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[2:])
+        assert list(v2)[:3] == ["llm_args", "model_cls", "pretrained_config"]
+        assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[1:])
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
 

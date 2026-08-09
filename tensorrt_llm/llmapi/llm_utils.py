@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import transformers
-from pydantic import BaseModel
 
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
@@ -530,52 +529,6 @@ def _deep_merge(base: Dict[str, Any], *overlays: Dict[str,
     return result
 
 
-def _capture_pydantic_fields_set(value: Any) -> Any:
-    """Capture explicit-field state for nested Pydantic configurations."""
-    if isinstance(value, BaseModel):
-        return (
-            "model",
-            set(value.model_fields_set),
-            {
-                field_name:
-                _capture_pydantic_fields_set(getattr(value, field_name))
-                for field_name in type(value).model_fields
-            },
-        )
-    if isinstance(value, (list, tuple)):
-        return ("sequence",
-                [_capture_pydantic_fields_set(item) for item in value])
-    if isinstance(value, dict):
-        return (
-            "mapping",
-            {
-                key: _capture_pydantic_fields_set(item)
-                for key, item in value.items()
-            },
-        )
-    return None
-
-
-def _restore_pydantic_fields_set(value: Any, state: Any) -> None:
-    """Restore explicit-field state after validating reconstructed configs."""
-    if state is None:
-        return
-
-    kind = state[0]
-    if kind == "model" and isinstance(value, BaseModel):
-        object.__setattr__(value, "__pydantic_fields_set__", set(state[1]))
-        for field_name, child_state in state[2].items():
-            _restore_pydantic_fields_set(getattr(value, field_name),
-                                         child_state)
-    elif kind == "sequence" and isinstance(value, (list, tuple)):
-        for item, child_state in zip(value, state[1]):
-            _restore_pydantic_fields_set(item, child_state)
-    elif kind == "mapping" and isinstance(value, dict):
-        for key, child_state in state[1].items():
-            if key in value:
-                _restore_pydantic_fields_set(value[key], child_state)
-
-
 def apply_model_defaults_to_llm_args(
         llm_args: 'TorchLlmArgs',
         model_defaults_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -596,20 +549,28 @@ def apply_model_defaults_to_llm_args(
             "config the user did not turn on. Declare a runtime preference "
             "via get_preferred_transceiver_runtime() instead.")
 
-    explicit_fields_state = _capture_pydantic_fields_set(llm_args)
+    kv_cache_defaults = model_defaults_dict.get("kv_cache_config")
+    if (kv_cache_defaults is not None
+            and not isinstance(kv_cache_defaults, dict)):
+        raise ValueError(
+            "Model default 'kv_cache_config' must be a dict. Runtime "
+            "preferences must use the corresponding get_preferred_* hook.")
+    if (kv_cache_defaults is not None
+            and "use_kv_cache_manager_v2" in kv_cache_defaults):
+        raise ValueError(
+            "Model defaults must not contain "
+            "'kv_cache_config.use_kv_cache_manager_v2'. Declare a runtime "
+            "preference via get_preferred_kv_cache_manager_version() "
+            "instead.")
+
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
 
     new_args = llm_args.__class__(**merged_state)
 
-    for field_name in llm_args.model_fields:
+    for field_name in type(llm_args).model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
-    # Reconstructing from a complete model_dump marks every nested default as
-    # explicit. Preserve the original user-intent metadata after validation so
-    # later checkpoint resolution can still distinguish omitted values from
-    # overrides (for example DeepSeek index_topk).
-    _restore_pydantic_fields_set(llm_args, explicit_fields_state)
 
     def _compute_applied(defaults: Dict[str, Any],
                          overrides: Dict[str, Any]) -> Dict[str, Any]:
@@ -650,11 +611,60 @@ def _two_model_spec_dec_decoding_type(
     return getattr(spec_config, "decoding_type", "speculative decoding")
 
 
-def _resolve_kv_cache_manager_v2_auto(
+def _apply_kv_cache_config_preferences(
         llm_args: 'TorchLlmArgs',
-        model_defaults_dict: Dict[str, Any],
-        original_setting: Optional[Union[bool, str]] = None) -> bool:
-    """Resolve the KV cache manager auto setting after model defaults are applied.
+        model_cls: Optional[type] = None,
+        pretrained_config: Any = None) -> Dict[str, Any]:
+    """Apply scalar KV-cache preferences that the user left unspecified."""
+    if model_cls is None:
+        return {}
+
+    kv_cache_config = llm_args.kv_cache_config
+    user_overrides = kv_cache_config.model_dump(exclude_unset=True)
+    applied = {}
+
+    get_tokens_per_block = getattr(model_cls,
+                                   'get_preferred_kv_cache_tokens_per_block',
+                                   None)
+    if ("tokens_per_block" not in user_overrides
+            and get_tokens_per_block is not None):
+        preferred_tokens_per_block = get_tokens_per_block(pretrained_config)
+        if preferred_tokens_per_block is not None:
+            if (type(preferred_tokens_per_block) is not int
+                    or preferred_tokens_per_block <= 0):
+                raise ValueError(
+                    f"{model_cls.__name__}."
+                    "get_preferred_kv_cache_tokens_per_block() must return a "
+                    f"positive int or None, got {preferred_tokens_per_block!r}."
+                )
+            kv_cache_config.tokens_per_block = preferred_tokens_per_block
+            applied["tokens_per_block"] = preferred_tokens_per_block
+
+    get_swa_scratch_reuse = getattr(model_cls,
+                                    'get_preferred_kv_cache_swa_scratch_reuse',
+                                    None)
+    if ("enable_swa_scratch_reuse" not in user_overrides
+            and get_swa_scratch_reuse is not None):
+        preferred_swa_scratch_reuse = get_swa_scratch_reuse(pretrained_config)
+        if preferred_swa_scratch_reuse is not None:
+            if type(preferred_swa_scratch_reuse) is not bool:
+                raise ValueError(
+                    f"{model_cls.__name__}."
+                    "get_preferred_kv_cache_swa_scratch_reuse() must return "
+                    f"bool or None, got {preferred_swa_scratch_reuse!r}.")
+            kv_cache_config.enable_swa_scratch_reuse = (
+                preferred_swa_scratch_reuse)
+            applied["enable_swa_scratch_reuse"] = preferred_swa_scratch_reuse
+
+    if "tokens_per_block" in applied:
+        llm_args.validate_helix_tokens_per_block()
+    return applied
+
+
+def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
+                                      model_cls: Optional[type] = None,
+                                      pretrained_config: Any = None) -> bool:
+    """Resolve the KV cache manager auto setting from the model preference.
 
     A model default of V2 is demoted to V1 for routes V2 cannot serve; an
     explicit user value otherwise wins. The compatibility arms are:
@@ -674,8 +684,7 @@ def _resolve_kv_cache_manager_v2_auto(
     -- sparse attention picks its class from the algorithm alone -- keep a V2
     manager after the demotion, so the arm does not protect them.
     """
-    setting = (llm_args.kv_cache_config.use_kv_cache_manager_v2
-               if original_setting is None else original_setting)
+    setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     if setting != "auto":
         if setting is True:
             decoding_type = _two_model_spec_dec_decoding_type(llm_args)
@@ -690,40 +699,43 @@ def _resolve_kv_cache_manager_v2_auto(
                     "one-model variant of this decoding mode.")
         return setting
 
-    kv_cache_defaults = model_defaults_dict.get("kv_cache_config", {})
-    model_default = (kv_cache_defaults.get("use_kv_cache_manager_v2", False)
-                     if isinstance(kv_cache_defaults, dict) else False)
-    if model_default == "auto":
-        model_default = False
-    if not isinstance(model_default, bool):
+    preferred_version = None
+    if model_cls is not None:
+        get_preferred = getattr(model_cls,
+                                'get_preferred_kv_cache_manager_version', None)
+        if get_preferred is not None:
+            preferred_version = get_preferred(pretrained_config)
+    if preferred_version not in (None, "V1", "V2"):
         raise ValueError(
-            "Model default kv_cache_config.use_kv_cache_manager_v2 must be "
-            f"True, False, or 'auto', got {model_default!r}.")
+            f"{model_cls.__name__}.get_preferred_kv_cache_manager_version() "
+            f"must return 'V1', 'V2', or None, got {preferred_version!r}.")
+
+    use_v2 = preferred_version == "V2"
 
     transceiver_config = llm_args.cache_transceiver_config
-    if (model_default and transceiver_config is not None
+    if (use_v2 and transceiver_config is not None
             and transceiver_config.backend is not None):
         effective_backend, _ = transceiver_config._resolve_default_backend()
         runtime = transceiver_config.transceiver_runtime
         if effective_backend != "NIXL" or runtime != "PYTHON":
             logger.info(
-                "KV cache manager V2 is the model default, but disaggregated "
+                "KV cache manager V2 is the model preference, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "
                 "falling back to V1.", runtime, effective_backend)
-            model_default = False
+            use_v2 = False
 
-    if model_default:
+    if use_v2:
         decoding_type = _two_model_spec_dec_decoding_type(llm_args)
         if decoding_type is not None:
             logger.info(
-                "KV cache manager V2 is the model default, but %s runs the "
+                "KV cache manager V2 is the model preference, but %s runs the "
                 "draft model in a separate engine and V2 sizes both KV cache "
                 "managers from the full max_gpu_total_bytes budget; falling "
                 "back to V1.", decoding_type)
-            model_default = False
+            use_v2 = False
 
-    llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
-    return model_default
+    llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
+    return use_v2
 
 
 def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',

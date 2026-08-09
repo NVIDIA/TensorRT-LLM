@@ -658,12 +658,54 @@ class DecoderModelForCausalLM(nn.Module,
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.
 
-        Note: ``cache_transceiver_config`` is rejected here (enforced at
-        load time) — the deep-merge could materialize or silently enable a
-        transceiver config the user did not turn on. Use
-        :meth:`get_preferred_transceiver_runtime` instead.
+        Note: ``cache_transceiver_config`` and
+        ``kv_cache_config.use_kv_cache_manager_v2`` are rejected here
+        (enforced at load time). Use
+        :meth:`get_preferred_transceiver_runtime` and
+        :meth:`get_preferred_kv_cache_manager_version` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+            cls,
+            pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
+        """Return the model's preferred KV cache manager version.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
+        ``None`` to defer to the global default (V1).
+
+        Args:
+            pretrained_config: The loaded Hugging Face config. Shared model
+                implementations can inspect it to select a preference for the
+                original checkpoint architecture.
+        """
+        return None
+
+    @classmethod
+    def get_preferred_kv_cache_tokens_per_block(cls,
+                                                pretrained_config: Any = None
+                                                ) -> Optional[int]:
+        """Return the model's preferred KV-cache block size.
+
+        The preference is adopted only when the user does not explicitly set
+        ``kv_cache_config.tokens_per_block``. Return ``None`` to keep the
+        global default.
+        """
+        return None
+
+    @classmethod
+    def get_preferred_kv_cache_swa_scratch_reuse(cls,
+                                                 pretrained_config: Any = None
+                                                 ) -> Optional[bool]:
+        """Return the model's preferred SWA scratch-reuse setting.
+
+        The preference is adopted only when the user does not explicitly set
+        ``kv_cache_config.enable_swa_scratch_reuse``. Return ``None`` to keep
+        the global default.
+        """
+        return None
 
     @classmethod
     def get_preferred_transceiver_runtime(

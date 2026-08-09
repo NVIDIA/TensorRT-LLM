@@ -58,7 +58,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           update_llm_args_with_extra_dict,
                                           update_llm_args_with_extra_options)
 # fmt: on
-from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+from tensorrt_llm.llmapi.llm_utils import (_apply_kv_cache_config_preferences,
+                                           _resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
@@ -513,34 +514,49 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
 
 
 @pytest.mark.cpu_only
-class TestModelDefaults:
-    """Test suite for model-specific default overrides functionality."""
+class TestKvCacheManagerV2AutoResolution:
+    """Test model preferences for the KV cache manager version."""
 
-    def test_compute_applied_llm_defaults_simple_field(self):
-        model_defaults = {"enable_chunked_prefill": False}
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
-        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        assert applied == model_defaults
+    class _PreferV2:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V2"
+
+    class _PreferV1:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V1"
+
+    class _InvalidPreference:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V3"
+
+    class _ArchitectureSensitive:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            architectures = getattr(pretrained_config, "architectures", [])
+            return "V2" if architectures == ["PreferV2ForCausalLM"] else "V1"
 
     @pytest.mark.parametrize("explicit_auto", [False, True])
-    def test_kv_cache_manager_v2_auto_uses_model_default(self, explicit_auto):
+    def test_auto_uses_model_preference(self, explicit_auto):
         kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
                            if explicit_auto else KvCacheConfig())
         llm_args = TorchLlmArgs(model="/tmp/dummy_model",
                                 kv_cache_config=kv_cache_config)
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
 
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
-    def test_kv_cache_manager_v2_auto_falls_back_to_false(self):
+    def test_auto_without_preference_falls_back_to_v1(self):
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
-        _resolve_kv_cache_manager_v2_auto(llm_args, {})
+        _resolve_kv_cache_manager_v2_auto(llm_args)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
 
@@ -552,53 +568,157 @@ class TestModelDefaults:
             ("MPI", None),
         ],
     )
-    def test_kv_cache_manager_v2_auto_falls_back_for_incompatible_disagg(
-            self, backend, runtime):
+    def test_auto_v2_falls_back_for_incompatible_disagg(self, backend, runtime):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(
                 backend=backend, transceiver_runtime=runtime),
         )
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
 
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
 
-    def test_kv_cache_manager_v2_auto_keeps_python_nixl_model_default(self):
+    def test_auto_v2_keeps_python_nixl_preference(self):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(
                 backend="NIXL", transceiver_runtime="PYTHON"),
         )
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
 
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
-    @pytest.mark.parametrize("user_setting", [False, True])
-    def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
-            self, user_setting):
+    @pytest.mark.parametrize(("user_setting", "model_cls"), [
+        pytest.param(False, _PreferV2, id="explicit-v1"),
+        pytest.param(True, _PreferV1, id="explicit-v2"),
+    ])
+    def test_explicit_value_overrides_model_preference(self, user_setting,
+                                                       model_cls):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
-        model_defaults = {
-            "kv_cache_config": {
-                "use_kv_cache_manager_v2": not user_setting
-            }
-        }
 
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
+
+    def test_pretrained_config_is_forwarded_to_preference(self):
+        from types import SimpleNamespace
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        pretrained_config = SimpleNamespace(
+            architectures=["PreferV2ForCausalLM"])
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._ArchitectureSensitive,
+                                          pretrained_config)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_invalid_model_preference_raises(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        with pytest.raises(ValueError, match="must return 'V1', 'V2', or None"):
+            _resolve_kv_cache_manager_v2_auto(llm_args, self._InvalidPreference)
+
+    @pytest.mark.parametrize("architecture", [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "KimiK25ForConditionalGeneration",
+        "MiniMaxM2ForCausalLM",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    ])
+    def test_registered_models_prefer_v2(self, architecture):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+
+        model_cls = MODEL_CLASS_MAPPING[architecture]
+        assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+
+@pytest.mark.cpu_only
+class TestKvCacheConfigPreferences:
+    """Test scalar KV-cache preferences outside generic model defaults."""
+
+    def test_deepseek_v4_preferences_preserve_unrelated_nested_config(self):
+        from tensorrt_llm._torch.models.modeling_deepseekv4 import \
+            DeepseekV4ForCausalLM
+
+        sparse_config = DeepSeekV4SparseAttentionConfig(index_head_dim=128)
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                sparse_attention_config=sparse_config)
+
+        applied = _apply_kv_cache_config_preferences(llm_args,
+                                                     DeepseekV4ForCausalLM)
+
+        assert applied == {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
+        }
+        assert llm_args.kv_cache_config.tokens_per_block == 128
+        assert llm_args.kv_cache_config.enable_swa_scratch_reuse is True
+        assert llm_args.sparse_attention_config is sparse_config
+        assert sparse_config.model_dump(exclude_unset=True) == {
+            "index_head_dim": 128
+        }
+
+    def test_explicit_values_override_deepseek_v4_preferences(self):
+        from tensorrt_llm._torch.models.modeling_deepseekv4 import \
+            DeepseekV4ForCausalLM
+
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(tokens_per_block=32,
+                                          enable_swa_scratch_reuse=False),
+        )
+
+        applied = _apply_kv_cache_config_preferences(llm_args,
+                                                     DeepseekV4ForCausalLM)
+
+        assert applied == {}
+        assert llm_args.kv_cache_config.tokens_per_block == 32
+        assert llm_args.kv_cache_config.enable_swa_scratch_reuse is False
+
+
+@pytest.mark.cpu_only
+class TestModelDefaults:
+    """Test suite for model-specific default overrides functionality."""
+
+    def test_compute_applied_llm_defaults_simple_field(self):
+        model_defaults = {"enable_chunked_prefill": False}
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        assert applied == model_defaults
+
+    def test_kv_cache_manager_version_preference_is_rejected(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        with pytest.raises(ValueError,
+                           match="get_preferred_kv_cache_manager_version"):
+            apply_model_defaults_to_llm_args(
+                llm_args,
+                {"kv_cache_config": {
+                    "use_kv_cache_manager_v2": True
+                }})
+
+    def test_kv_cache_config_object_cannot_bypass_preference_guard(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        with pytest.raises(ValueError, match="get_preferred_"):
+            apply_model_defaults_to_llm_args(llm_args, {
+                "kv_cache_config":
+                KvCacheConfig(use_kv_cache_manager_v2=True)
+            })
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -3572,11 +3692,15 @@ class TestEnableLowLatencyHostDispatch:
 
 
 class _PreferPythonTransceiverModel:
-    """Fake model class opting into the Python transceiver."""
+    """Fake model class preferring Python transceiver and KV manager V2."""
 
     @classmethod
     def get_model_defaults(cls, llm_args):
         return {}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None):
@@ -3694,6 +3818,11 @@ class TestMambaSnapshotConfigResolution:
             assert "no Mamba state snapshot policy" in warnings[0]
 
     def test_hybrid_fixed_snapshot_rejects_auto_resolved_v1(self, monkeypatch):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+
+        monkeypatch.setitem(MODEL_CLASS_MAPPING, "Qwen3NextForCausalLM",
+                            _NoModelDefaults)
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(
@@ -3793,13 +3922,9 @@ class TestTransceiverRuntimeAutoResolution:
             monkeypatch.delenv(env_var, raising=False)
         monkeypatch.setenv(backend_env, "1")
         args = self._disagg_args(backend="DEFAULT")
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-        apply_model_defaults_to_llm_args(args, model_defaults)
 
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
-        _resolve_kv_cache_manager_v2_auto(args,
-                                          model_defaults,
-                                          original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(args, _PreferPythonTransceiverModel)
 
         assert args.cache_transceiver_config.transceiver_runtime is None
         assert args.kv_cache_config.use_kv_cache_manager_v2 is False
@@ -3880,6 +4005,7 @@ class TestTransceiverRuntimeAutoResolution:
         ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", args,
                                                    None)
         assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     @staticmethod
     def _fake_checkpoint_loader(architectures):
@@ -3904,6 +4030,7 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     @pytest.mark.parametrize("arch,expected", [
         ("ModelAForCausalLM", "PYTHON"),
@@ -3963,6 +4090,7 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     def test_model_loader_full_chain_aggregated_stays_none(self, monkeypatch):
         """Full chain in aggregated mode: no transceiver config appears."""
@@ -3978,6 +4106,7 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config is None
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     def test_resolve_default_backend_env_priority(self, monkeypatch):
         env_vars = ("TRTLLM_USE_NIXL_KVCACHE", "TRTLLM_USE_UCX_KVCACHE",
@@ -4004,8 +4133,8 @@ class TestTransceiverRuntimeAutoResolution:
             backend="UCX")._resolve_default_backend() == ("UCX", None)
 
 
-class TestDeepseekTransceiverPreference:
-    """Per-architecture preferred KV-cache transceiver runtime.
+class TestDeepseekRuntimePreferences:
+    """DeepSeek KV-cache manager and transceiver preferences.
 
     DeepseekV3ForCausalLM and DeepseekV32ForCausalLM prefer the Python KV-cache
     transceiver, while GlmMoeDsaForCausalLM (GLM 5.2) requires the C++ transceiver
@@ -4040,6 +4169,12 @@ class TestDeepseekTransceiverPreference:
             DeepseekV3ForCausalLM
         assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
         ) == "PYTHON"
+
+    def test_prefers_kv_cache_manager_v2(self) -> None:
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        assert DeepseekV3ForCausalLM.get_preferred_kv_cache_manager_version(
+        ) == "V2"
 
     def test_deepseek_resolves_auto_to_python_on_nixl(self) -> None:
         """DeepseekV3ForCausalLM on NIXL adopts the Python transceiver from 'auto'."""

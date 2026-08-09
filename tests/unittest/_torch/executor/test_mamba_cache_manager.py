@@ -515,7 +515,7 @@ def test_hybrid_cache_manager_factory_requires_v2_for_explicit_snapshots(
         kv_cache_config=kv_cache_config,
     )
 
-    assert _resolve_kv_cache_manager_v2_auto(llm_args, {}) is False
+    assert _resolve_kv_cache_manager_v2_auto(llm_args) is False
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
     with pytest.raises(ValueError, match="use_kv_cache_manager_v2=True"):
         get_kv_cache_manager_cls(
@@ -696,7 +696,7 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         model_defaults = model_cls.get_model_defaults(llm_args)
         apply_model_defaults_to_llm_args(llm_args, model_defaults)
         _resolve_transceiver_runtime_auto(llm_args, model_cls)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults, original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
         assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
@@ -736,8 +736,7 @@ def test_qwen3_gdn_replay_defaults_to_v2_cache_manager(
     apply_model_defaults_to_llm_args(llm_args, model_defaults)
     _resolve_kv_cache_manager_v2_auto(
         llm_args,
-        model_defaults,
-        original_setting=manager_setting,
+        Qwen3NextForCausalLM,
     )
 
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
@@ -763,7 +762,7 @@ def test_kimi_defaults_to_mixed_manager(monkeypatch: pytest.MonkeyPatch) -> None
     llm_args = TorchLlmArgs(model="/tmp/dummy_model")
     model_defaults = KimiLinearForCausalLM.get_model_defaults(llm_args)
     apply_model_defaults_to_llm_args(llm_args, model_defaults)
-    resolved = _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults, original_setting="auto")
+    resolved = _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
 
     assert resolved is False
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False

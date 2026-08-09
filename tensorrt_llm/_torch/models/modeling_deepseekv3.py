@@ -31,10 +31,7 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
-
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -1911,10 +1908,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     @classmethod
-    def get_model_defaults(
-            cls, llm_args: "TorchLlmArgs") -> dict[str, dict[str, bool]]:
-        """Use KV cache manager V2 for models backed by this implementation."""
-        return {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for this model implementation."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(

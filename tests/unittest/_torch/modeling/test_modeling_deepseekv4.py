@@ -156,13 +156,10 @@ def test_deepseek_v4_model_defaults():
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
-    assert defaults == {
-        "kv_cache_config": {
-            "tokens_per_block": 128,
-            "use_kv_cache_manager_v2": True,
-            "enable_swa_scratch_reuse": True,
-        }
-    }
+    assert defaults == {}
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_tokens_per_block() == 128
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_swa_scratch_reuse() is True
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
