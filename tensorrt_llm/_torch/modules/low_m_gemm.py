@@ -27,6 +27,7 @@ _FLASHINFER_BACKEND = "cute-dsl"
 _MIN_FLASHINFER_VERSION = Version("0.6.17.dev20260806")
 _SUPPORTED_SMS = {100, 103}
 _MAX_FLASHINFER_M = 32
+_CUBLAS_8192X2048_M = frozenset({5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 21, 24})
 
 
 class LowMGemmBackend(str, enum.Enum):
@@ -114,6 +115,8 @@ def _prefer_cublas_for_auto(m: int, n: int, k: int, sm: int) -> bool:
         return False
     if (n, k) == (8192, 128):
         return m >= 8
+    if (n, k) == (8192, 2048):
+        return m in _CUBLAS_8192X2048_M
     if (n, k) == (15520, 8192):
         return m >= 15
     return (m, n, k) == (16, 2304, 8192)
