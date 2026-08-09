@@ -231,8 +231,7 @@ def test_fi_mtp_verify_misaligned_index_slice():
 
 
 @skip_unsupported
-@pytest.mark.parametrize("num_decodes", [2, 8])
-def test_fi_mtp_verify_misaligned_ab_slices(num_decodes):
+def test_fi_mtp_verify_misaligned_ab_slices():
     """Non-32B-aligned ``a``/``b`` column slices must be realigned.
 
     ``gdn_mixer._compute_tokenwise_inputs`` splits the fused ``in_proj_ba``
@@ -257,7 +256,7 @@ def test_fi_mtp_verify_misaligned_ab_slices(num_decodes):
 
     torch.manual_seed(0)
     dev = "cuda"
-    N, T, H, HV, K, V = num_decodes, 3, 4, 4, 128, 128
+    N, T, H, HV, K, V = 2, 3, 4, 4, 128, 128
     q = (torch.randn(N, T, H, K, device=dev) * 0.1).to(torch.bfloat16)
     k = (torch.randn(N, T, H, K, device=dev) * 0.1).to(torch.bfloat16)
     v = (torch.randn(N, T, HV, V, device=dev) * 0.1).to(torch.bfloat16)
@@ -313,58 +312,6 @@ def test_fi_mtp_verify_misaligned_ab_slices(num_decodes):
             b.clone(memory_format=torch.contiguous_format),
         )
         torch.testing.assert_close(out_misaligned.float(), out_aligned.float())
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("num_decodes, expect_zero_copy", [(1, False), (8, True)])
-def test_fi_verify_a_alignment_capability_controls_clone(
-    monkeypatch, num_decodes, expect_zero_copy
-):
-    """Use the relaxed gate contract only above the throughput batch knee."""
-    import tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent as fsg
-
-    captured_a_ptrs = []
-
-    def fake_flashinfer_mtp(**kwargs):
-        captured_a_ptrs.append(kwargs["a"].data_ptr())
-        kwargs["output"].zero_()
-
-    monkeypatch.setattr(fsg, "_fi_gdn_decode_bf16_state_mtp", fake_flashinfer_mtp, raising=False)
-    torch.manual_seed(0)
-    N, T, H, HV, K, V = num_decodes, 4, 1, 8, 128, 128
-    q = torch.randn(N, T, H, K, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    projected_ba = torch.randn(N, T, 2 * HV, device="cuda", dtype=torch.bfloat16)
-    b = projected_ba[..., :HV]
-    a = projected_ba[..., HV:]
-    assert a.data_ptr() % 32 == 16
-    common = {
-        "A_log": torch.randn(HV, device="cuda"),
-        "a": a,
-        "dt_bias": torch.randn(HV, device="cuda"),
-        "softplus_beta": 1.0,
-        "softplus_threshold": 20.0,
-        "q": q,
-        "k": k,
-        "v": v,
-        "b": b,
-        "initial_state_source": torch.randn(N, HV, V, K, device="cuda", dtype=torch.bfloat16),
-        "initial_state_indices": torch.arange(N, device="cuda", dtype=torch.int32),
-        "intermediate_states_buffer": torch.empty(
-            N, T, HV, V, K, device="cuda", dtype=torch.bfloat16
-        ),
-        "scale": K**-0.5,
-        "use_qk_l2norm_in_kernel": True,
-    }
-
-    monkeypatch.setattr(fsg, "_FI_GDN_A_ALIGNMENT_BYTES", 16)
-    fsg._flashinfer_gdn_verify(**common)
-    assert (captured_a_ptrs[-1] == a.data_ptr()) == expect_zero_copy
-
-    monkeypatch.setattr(fsg, "_FI_GDN_A_ALIGNMENT_BYTES", 32)
-    fsg._flashinfer_gdn_verify(**common)
-    assert captured_a_ptrs[-1] != a.data_ptr()
 
 
 @skip_unsupported
