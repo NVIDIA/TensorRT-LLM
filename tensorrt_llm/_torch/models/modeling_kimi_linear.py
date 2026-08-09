@@ -188,7 +188,10 @@ def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
     The KDA and KDA-glue switches only narrow an already-enabled master, so
     they stay default-on and are inert while the master is off.
     """
-    fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "0") != "0"
+    fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "0") not in (
+        "",
+        "0",
+    )
     kda_fp8 = fp8_weight_read and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
     kda_glue_fp8 = kda_fp8 and os.environ.get(_KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
     return fp8_weight_read, kda_fp8, kda_glue_fp8
