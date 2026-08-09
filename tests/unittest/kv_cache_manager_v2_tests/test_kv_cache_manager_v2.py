@@ -2483,6 +2483,9 @@ class TestSSMSupport(unittest.TestCase):
 
         kv3 = self.manager.create_kv_cache(input_tokens=prompt[:48])
         self.assertEqual(kv3.num_committed_tokens, 32)
+        # Attention pages cover all 48 tokens; the latest reusable SSM snapshot
+        # is at 32, so recurrent pruning is what cut the reuse (TRTLLM-15218).
+        self.assertEqual(kv3._get_num_tokens_before_hybrid_pruning(), 48)
         kv3.resume(stream)
         kv3.close()
 
