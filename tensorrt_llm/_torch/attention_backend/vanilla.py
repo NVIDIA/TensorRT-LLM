@@ -18,7 +18,6 @@ except ImportError:
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask, merge_attention_forward_args)
-from .sparse.kernel import triton_index_gather
 from .sparse.params import SparseParams
 
 
@@ -195,6 +194,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         """Append new K/V tokens and gather the logical paged-cache sequence."""
         # select tokens using the sparse kv indices
         if sparse_kv_indices is not None:
+            from .sparse.rocket.kernels import triton_index_gather
+
             k_selected = triton_index_gather(k, sparse_kv_indices)
             v_selected = triton_index_gather(v, sparse_kv_indices)
         else:
@@ -323,6 +324,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         """
         # select the key and value states using the sparse indices
         if sparse_indices is not None:
+            from .sparse.rocket.kernels import triton_index_gather
+
             key_states = triton_index_gather(key_states, sparse_indices)
             value_states = triton_index_gather(value_states, sparse_indices)
 

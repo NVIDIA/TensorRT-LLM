@@ -1825,6 +1825,73 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.seq_lens == [8, 32]
         assert args.cuda_graph_config.max_seq_len == 32
 
+    def test_encoder_decoder_cuda_graph_user_interface(self):
+        encoder_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[16, 64],
+            seq_lens=[8, 32],
+            enable_padding=True,
+        )
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            cuda_graph_config=DecodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
+            ),
+            encoder_cuda_graph_config=encoder_config,
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert isinstance(args.encoder_cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.encoder_cuda_graph_config.batch_sizes == [1, 4]
+        assert args.enable_encoder_decoder_mixed_cuda_graph
+
+        disabled_args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=encoder_config,
+            enable_encoder_decoder_mixed_cuda_graph=False,
+        )
+
+        assert not disabled_args.enable_encoder_decoder_mixed_cuda_graph
+
+    def test_encoder_cuda_graph_config_validation(self):
+        invalid_cases = [
+            (
+                {
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        num_tokens=[16, 64],
+                        seq_lens=[8, 32],
+                        enable_padding=True,
+                    ),
+                },
+                "encoder_cuda_graph_config requires encoder_max_batch_size",
+            ),
+            (
+                {
+                    "encoder_max_batch_size":
+                    4,
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        enable_padding=True,
+                    ),
+                },
+                ("encoder_cuda_graph_config requires "
+                 "num_tokens/max_num_token and seq_lens/max_seq_len"),
+            ),
+        ]
+
+        for kwargs, error_match in invalid_cases:
+            with pytest.raises(ValidationError, match=error_match):
+                TorchLlmArgs(
+                    model=llama_model_path,
+                    **kwargs,
+                )
+
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -3159,7 +3226,7 @@ class TestSkipSoftmaxAttentionConfig:
     @staticmethod
     def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
         sparse_params = config.to_sparse_params(**kwargs)
-        return sparse_params.scheduler.get_kernel_params()
+        return sparse_params.scheduler.get_runtime_params()
 
     def test_python_api_parses_skip_softmax_config(self):
         args = TorchLlmArgs(

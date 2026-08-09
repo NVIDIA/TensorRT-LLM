@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
@@ -380,6 +381,20 @@ class BatchState:
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
+
+
+@dataclasses.dataclass
+class EncoderStepResult:
+    hidden_states: torch.Tensor
+    sequence_lengths: List[int]
+    ready_event: torch.cuda.Event
+
+
+@dataclasses.dataclass
+class PendingEncoderStep:
+    requests: List[LlmRequest]
+    future: Future[EncoderStepResult]
+    result: Optional[EncoderStepResult] = None
 
 
 class AsyncTransferManager:
@@ -783,10 +798,10 @@ class PyExecutor:
         # models, so encoder PP send/recv support is not implemented in the
         # PyTorch path for now. Reject pp_size > 1.
         # TODO: Add support for pp + encoder models
-        is_encoder_decoder = bool(
+        self.is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
-        if is_encoder_decoder:
+        if self.is_encoder_decoder:
             if self.dist.pp_size > 1:
                 raise NotImplementedError(
                     "pp_size > 1 is not supported for encoder-decoder models "
@@ -826,6 +841,17 @@ class PyExecutor:
         # Ensure the default stream waits for execution_stream to complete
         # before subsequent operations.
         torch.cuda.current_stream().wait_stream(self.execution_stream)
+        self.encoder_launch_executor = (ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="encoder-launch")
+                                        if self.is_encoder_decoder else None)
+        self.pending_encoder_steps: List[PendingEncoderStep] = []
+        if self.encoder_launch_executor is not None:
+            # CUDA graph capture inherits per-thread CUDA library state. Capture
+            # on the same single worker that owns every runtime encoder replay.
+            self.encoder_stream.wait_stream(self.execution_stream)
+            self.encoder_launch_executor.submit(
+                self._warmup_encoder_cuda_graphs_enc_dec).result()
+
         self.is_warmup = False
 
         # Snapshot some cumulative KV cache counters so that stats reported to
@@ -843,6 +869,7 @@ class PyExecutor:
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
         self.batch_wait_iters_count = 0
+        self.encoder_batch_wait_iters_count = 0
 
         def on_detected():
             # The graceful shutdown path can itself deadlock on collectives
@@ -1477,6 +1504,11 @@ class PyExecutor:
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()
+        encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
+        if encoder_launch_executor is not None:
+            encoder_launch_executor.shutdown(wait=True)
+            self.encoder_launch_executor = None
+
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
@@ -3617,6 +3649,7 @@ class PyExecutor:
 
     def _prepare_and_schedule_batch(self):
         self._sync_disagg_transfer_made_progress = False
+        self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
@@ -4056,15 +4089,6 @@ class PyExecutor:
                 gpu_forward_end = None
                 gpu_forward_events_from_perf_pool = False
 
-                # Run the encoder iteration first.  After scatter the
-                # encoder requests transition to ``CONTEXT_INIT`` and are
-                # picked up by the next scheduler iteration as decoder
-                # context. The encoder pass is independent of the decoder
-                # ``can_queue`` gate, so an iteration with only encoder-init
-                # requests still makes forward progress.
-                if scheduled_batch.encoder_requests:
-                    self._run_encoder_step(scheduled_batch.encoder_requests)
-
                 can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
@@ -4093,6 +4117,9 @@ class PyExecutor:
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
                 self._finalize_adp_dummy_allocation(can_queue)
+
+                if not can_queue and scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
@@ -4137,6 +4164,10 @@ class PyExecutor:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
+
+                    if scheduled_batch.encoder_requests:
+                        self._submit_encoder_step(
+                            scheduled_batch.encoder_requests)
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
@@ -4524,9 +4555,6 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
-                if scheduled_batch.encoder_requests:
-                    self._run_encoder_step(scheduled_batch.encoder_requests)
-
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -4571,6 +4599,9 @@ class PyExecutor:
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
                 self._finalize_adp_dummy_allocation(can_queue)
+
+                if not can_queue and scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
@@ -4637,6 +4668,9 @@ class PyExecutor:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
+                    if scheduled_batch.encoder_requests:
+                        self._submit_encoder_step(
+                            scheduled_batch.encoder_requests)
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
@@ -5316,6 +5350,95 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _waiting_encoder_requests(
+            self, encoder_requests: list[LlmRequest],
+            context_requests: list[LlmRequest],
+            generation_requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Accumulate encoder work while an admitted decode batch progresses.
+
+        Encoder-decoder serving can otherwise launch one eager encoder forward
+        for each replacement request. Use the existing iteration deadline and
+        token threshold to form a larger encoder microbatch without blocking
+        the executor thread. Decoder generation continues while the encoder
+        requests wait. The encoder has its own counter because the resulting
+        decoder-context requests are already coalesced and must not wait for a
+        second window. CUDA-graph microbatch admission returns at most one
+        supported graph batch so scheduler overfill cannot turn a target-eight
+        batch into an eager batch of nine or more requests.
+        """
+        if not encoder_requests:
+            self.encoder_batch_wait_iters_count = 0
+            return encoder_requests
+
+        encoder_max_batch_size = self.llm_args.encoder_max_batch_size
+        encoder_cuda_graph_config = self.llm_args.encoder_cuda_graph_config
+        if (encoder_max_batch_size is not None
+                and encoder_cuda_graph_config is not None
+                and bool(encoder_cuda_graph_config.num_tokens)
+                and bool(encoder_cuda_graph_config.seq_lens)):
+            encoder_batch_size_limit = min(encoder_max_batch_size,
+                                           self.max_batch_size)
+            configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
+                                      or [])
+            supported_batch_sizes = [
+                batch_size for batch_size in configured_batch_sizes
+                if batch_size <= encoder_batch_size_limit
+            ]
+            if (encoder_cuda_graph_config.enable_padding
+                    and any(batch_size > encoder_batch_size_limit
+                            for batch_size in configured_batch_sizes) and
+                (not supported_batch_sizes
+                 or supported_batch_sizes[-1] != encoder_batch_size_limit)):
+                supported_batch_sizes.append(encoder_batch_size_limit)
+
+            if supported_batch_sizes:
+                microbatch_target = supported_batch_sizes[-1]
+                decoder_occupancy = (len(context_requests) +
+                                     len(generation_requests))
+                decoder_low_watermark = (self.max_batch_size -
+                                         microbatch_target)
+                deadline_reached = (self.encoder_batch_wait_iters_count
+                                    >= self.batch_wait_timeout_iters)
+
+                if decoder_occupancy <= decoder_low_watermark:
+                    if len(encoder_requests) >= microbatch_target:
+                        self.encoder_batch_wait_iters_count = 0
+                        return encoder_requests[:microbatch_target]
+
+                    if deadline_reached:
+                        releasable_batch_sizes = [
+                            batch_size for batch_size in supported_batch_sizes
+                            if batch_size <= len(encoder_requests)
+                        ]
+                        fallback_batch_size = (
+                            releasable_batch_sizes[-1] if releasable_batch_sizes
+                            else min(len(encoder_requests), microbatch_target))
+                        self.encoder_batch_wait_iters_count = 0
+                        return encoder_requests[:fallback_batch_size]
+
+                self.encoder_batch_wait_iters_count += 1
+                return []
+
+        num_scheduled_tokens = sum(request.encoder_output_len
+                                   for request in encoder_requests)
+        num_scheduled_tokens += sum(1 + request.num_draft_tokens
+                                    for request in generation_requests)
+        has_decoder_work = bool(context_requests or generation_requests)
+        if not has_decoder_work:
+            has_decoder_work = any(
+                request.request_id in self.inflight_req_ids
+                and request.state != LlmRequestState.ENCODER_INIT
+                for request in self.active_requests)
+        should_wait = (has_decoder_work and self.encoder_batch_wait_iters_count
+                       < self.batch_wait_timeout_iters and num_scheduled_tokens
+                       < self.batch_wait_max_tokens_ratio * self.max_num_tokens)
+        if should_wait:
+            self.encoder_batch_wait_iters_count += 1
+            return []
+
+        self.encoder_batch_wait_iters_count = 0
+        return encoder_requests
+
     def _get_ctx_mla_kv_len_cap(self):
         """Cap on the summed context attended-KV length (total_kv_len) per forward step, cached.
 
@@ -5382,6 +5505,16 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
+        scheduled_encoder_requests = scheduler_output.encoder_requests
+        should_batch_encoder_requests = (self.is_encoder_decoder
+                                         and not self.enable_attention_dp
+                                         and self.enable_batch_waiting)
+        if should_batch_encoder_requests:
+            scheduled_encoder_requests = self._waiting_encoder_requests(
+                scheduler_output.encoder_requests,
+                scheduler_output.context_requests,
+                scheduler_output.generation_requests)
+
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
@@ -5389,9 +5522,12 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         # If no generation requests, no need to wait, to avoid dead waiting
-        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
-            scheduler_output.context_requests) > 0 and len(
-                scheduler_output.generation_requests) > 0
+        should_check_waiting = (not self.is_encoder_decoder
+                                and not self.enable_attention_dp
+                                and self.enable_batch_waiting
+                                and len(scheduler_output.context_requests) > 0
+                                and len(
+                                    scheduler_output.generation_requests) > 0)
         if should_check_waiting:
             # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
             # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
@@ -5415,7 +5551,7 @@ class PyExecutor:
             scheduled_context_requests)
 
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.encoder_requests = scheduler_output.encoder_requests
+        scheduled_requests.encoder_requests = scheduled_encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
@@ -5442,44 +5578,172 @@ class PyExecutor:
     # micro-batch; this preserves the cross-KV lifecycle and the
     # dual-pool budget.
     # ---------------------------------------------------------------
-    @nvtx_range("_run_encoder_step")
-    def _run_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
-        """Drive one encoder iteration for ``encoder_requests``.
-
-        Runs the encoder stack on the dedicated encoder stream, then
-        scatters the packed hidden states back onto the per-request
-        ``py_encoder_output`` field and transitions request state to
-        ``CONTEXT_INIT`` so the next scheduler pass picks them up as
-        decoder-context requests. A separate CUDA event is recorded for
-        each request on the encoder stream; the scheduler queries that
-        event before admitting the request to a decoder context step.
-        """
-        if not encoder_requests:
+    def _warmup_encoder_cuda_graphs_enc_dec(self) -> None:
+        """Capture encoder graphs on the worker used for runtime replay."""
+        warmup = getattr(
+            self.model_engine,
+            "_warmup_encoder_cuda_graphs_enc_dec",
+            None,
+        )
+        if not callable(warmup):
             return
+
+        torch.cuda.set_device(self.device_id)
+        with torch.cuda.stream(self.encoder_stream):
+            warmup(self.resource_manager)
+
+    def _submit_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
+        """Queue encoder work, serializing it with decoder work under TP."""
+        executor = self.encoder_launch_executor
+        if executor is None:
+            raise RuntimeError("Encoder launch executor is unavailable.")
+
+        requests = list(encoder_requests)
+        for request in requests:
+            self.inflight_req_ids.insert(request.request_id)
+
+        serialize_tp = self.dist.tp_size > 1
+        if serialize_tp:
+            self.encoder_stream.wait_stream(self.execution_stream)
 
         try:
-            self.encoder_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.encoder_stream):
-                encoder_hidden_states, encoder_seq_lens = (
-                    self.model_engine.forward_encoder(
-                        encoder_requests,
-                        resource_manager=self.resource_manager,
-                    ))
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(
-                f"Encountered an error in encoder forward: {error_msg}")
-            self._handle_errors(error_msg, requests=encoder_requests)
+            future = executor.submit(self._run_encoder_step_unchecked, requests)
+        except Exception:
+            for request in requests:
+                self.inflight_req_ids.erase(request.request_id)
+            raise
+
+        if serialize_tp:
+            # Encoder and decoder forwards share TP communicators and
+            # workspaces. Complete encoder GPU work before the caller launches
+            # decoder work, while retaining the worker thread affinity needed
+            # by encoder CUDA graph replay.
+            try:
+                result = future.result()
+                result.ready_event.synchronize()
+                self._publish_encoder_step(requests, result)
+            except Exception as e:
+                self._finish_failed_encoder_step(requests, e)
+                return
+            for request in requests:
+                self.inflight_req_ids.erase(request.request_id)
             return
 
-        self._scatter_encoder_output(encoder_requests, encoder_hidden_states,
-                                     encoder_seq_lens)
-        for req in encoder_requests:
-            req.py_encoder_output_ready_event = torch.cuda.Event()
-            req.py_encoder_output_ready_event.record(self.encoder_stream)
-            # TODO(TRTLLM-12339): Honor return_encoder_output once the public
-            # LLM API shape for returned encoder hidden states is finalized.
+        self.pending_encoder_steps.append(
+            PendingEncoderStep(requests=requests, future=future))
+
+    @nvtx_range("_poll_encoder_steps")
+    def _poll_encoder_steps(self) -> None:
+        """Publish ready encoder batches without waiting for their futures.
+
+        Encoder request IDs stay in ``inflight_req_ids`` from submission
+        until both the launch worker and its CUDA completion event finish.
+        Consequently the scheduler cannot submit an encoder request twice or
+        admit its decoder-context step before the encoder output is ready.
+        """
+        pending_steps = getattr(self, "pending_encoder_steps", None)
+        if not pending_steps:
+            return
+
+        while pending_steps:
+            pending = pending_steps[0]
+            if pending.result is None:
+                if not pending.future.done():
+                    break
+                try:
+                    pending.result = pending.future.result()
+                except Exception as e:
+                    pending_steps.pop(0)
+                    self._finish_failed_encoder_step(pending.requests, e)
+                    continue
+
+            if not pending.result.ready_event.query():
+                break
+
+            pending_steps.pop(0)
+            try:
+                self._publish_encoder_step(pending.requests, pending.result)
+            except Exception as e:
+                self._finish_failed_encoder_step(pending.requests, e)
+                continue
+
+            for request in pending.requests:
+                self.inflight_req_ids.erase(request.request_id)
+
+    def _finish_failed_encoder_step(self, encoder_requests: List[LlmRequest],
+                                    error: Exception) -> None:
+        for request in encoder_requests:
+            self.inflight_req_ids.erase(request.request_id)
+        traceback.print_exception(error)
+        error_msg = str(error)
+        logger.error(f"Encountered an error in encoder forward: {error_msg}")
+        failed_requests = [
+            request for request in encoder_requests
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        if failed_requests:
+            self._handle_errors(error_msg, requests=failed_requests)
+
+    def _run_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
+        try:
+            executor = self.encoder_launch_executor
+            if executor is None:
+                raise RuntimeError("Encoder launch executor is unavailable.")
+            future = executor.submit(self._run_encoder_step_unchecked,
+                                     encoder_requests)
+            result = future.result()
+            if self.dist.tp_size > 1:
+                result.ready_event.synchronize()
+            self._publish_encoder_step(encoder_requests, result)
+        except Exception as e:
+            self._finish_failed_encoder_step(encoder_requests, e)
+
+    @nvtx_range("_run_encoder_step")
+    def _run_encoder_step_unchecked(
+            self, encoder_requests: List[LlmRequest]) -> EncoderStepResult:
+        """Drive one encoder iteration for ``encoder_requests``.
+
+        Runs the encoder stack on its independent stream and returns packed
+        output plus a completion event. Request state remains owned by the
+        main executor thread and is updated by ``_poll_encoder_steps`` only
+        after this event reports ready.
+
+        The caller submits encoder work immediately before decoder forward so
+        their independent CPU launch and GPU execution can overlap. Encoder
+        inputs are staged inside this stream, and request-level completion
+        events guard the only downstream dependency. Successive encoder
+        batches remain ordered by the stream itself.
+        """
+        if not encoder_requests:
+            raise ValueError("Encoder step requires at least one request.")
+
+        torch.cuda.set_device(self.device_id)
+        with torch.cuda.stream(self.encoder_stream):
+            encoder_hidden_states, encoder_seq_lens = (
+                self.model_engine.forward_encoder(
+                    encoder_requests,
+                    resource_manager=self.resource_manager,
+                ))
+
+        ready_event = torch.cuda.Event()
+        ready_event.record(self.encoder_stream)
+        return EncoderStepResult(
+            hidden_states=encoder_hidden_states,
+            sequence_lengths=encoder_seq_lens,
+            ready_event=ready_event,
+        )
+
+    def _publish_encoder_step(self, encoder_requests: List[LlmRequest],
+                              result: EncoderStepResult) -> None:
+        """Make a completed encoder batch visible to decoder scheduling."""
+        self._scatter_encoder_output(
+            encoder_requests,
+            result.hidden_states,
+            result.sequence_lengths,
+            result.ready_event,
+        )
+        # TODO(TRTLLM-12339): Honor return_encoder_output once the public
+        # LLM API shape for returned encoder hidden states is finalized.
 
     @nvtx_range("_scatter_encoder_output")
     def _scatter_encoder_output(
@@ -5487,6 +5751,7 @@ class PyExecutor:
         encoder_requests: List[LlmRequest],
         encoder_hidden_states: torch.Tensor,
         encoder_seq_lens: List[int],
+        ready_event: torch.cuda.Event,
     ) -> None:
         """Slice packed encoder hidden states into per-request tensors.
 
@@ -5515,10 +5780,12 @@ class PyExecutor:
 
         offset = 0
         for req, seq_len in zip(encoder_requests, encoder_seq_lens):
-            req.py_encoder_output = encoder_hidden_states[offset:offset +
-                                                          seq_len]
-            req.py_skip_cross_kv_projection = False
-            req.state = LlmRequestState.CONTEXT_INIT
+            if req.state == LlmRequestState.ENCODER_INIT:
+                req.py_encoder_output = encoder_hidden_states[offset:offset +
+                                                              seq_len]
+                req.py_skip_cross_kv_projection = False
+                req.py_encoder_output_ready_event = ready_event
+                req.state = LlmRequestState.CONTEXT_INIT
             offset += seq_len
 
     @nvtx_range("_attach_encoder_output_to_execution_stream")
@@ -6025,6 +6292,24 @@ class PyExecutor:
                 ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
                     requests)
             self._setup_sampler_step(requests)
+            # KDA fused-verify replay caches: the ctx->gen state transfer
+            # populates only the base mamba conv/ssm pools; with one-model
+            # spec decoding (e.g. SA) the first forward for these requests
+            # takes the fused verify path, which reads the per-slot
+            # kda_conv_* replay caches instead of the conv pool. Seed them
+            # from the transferred conv states before the first step
+            # (otherwise the recurrent state is permanently contaminated by
+            # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
+            if self.model_engine.enable_spec_decode:
+                kv_mgr = self.resource_manager.resource_managers.get(
+                    ResourceManagerType.KV_CACHE_MANAGER)
+                seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
+                               None)
+                if seed is not None:
+                    seed([
+                        req.py_request_id
+                        for req in cache_trans_complete_requests
+                    ])
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -6598,11 +6883,49 @@ class PyExecutor:
                          resource_manager: Optional[ResourceManager] = None):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+
+    def _accumulate_spec_dec_stats(self, sample_state: SampleState) -> None:
+        """Accumulate per-request spec-decode acceptance stats for one step.
+
+        Runs right after Sampler.update_requests, which writes the paired
+        (py_num_accepted_draft_tokens, py_num_draft_tokens_verified) counters
+        for exactly the requests in sample_state. Consuming (and resetting)
+        py_num_draft_tokens_verified here counts each verified step exactly
+        once, immune to scheduling gaps, response-emission skips, and the
+        samplers/drafters replacing py_draft_tokens with the next step's
+        (padded) buffer before responses are handled.
+        """
+        requests = getattr(sample_state, 'requests', None)
+        if not requests:
+            return
+        for request in requests:
+            drafted_step = getattr(request, 'py_num_draft_tokens_verified', 0)
+            if drafted_step <= 0:
+                continue
+            request.py_num_draft_tokens_verified = 0
+            py_num_accepted = request.py_num_accepted_draft_tokens
+            # Mirror C++ LlmRequest::updateNumTokensPerIteration, which
+            # clamps the drafted count to getMaxDraftPathLen(): with
+            # tree-based drafting the request carries up to
+            # max_total_draft_tokens draft tokens, but at most
+            # max_draft_len (the max path length) of them can be accepted
+            # in one step, so the acceptance-rate denominator counts paths,
+            # not trees. No-op for linear chains (drafted_step <=
+            # max_draft_len there).
+            drafted = (min(drafted_step, self.max_draft_len)
+                       if self.max_draft_len > 0 else drafted_step)
+            request.py_total_draft_tokens += drafted
+            request.py_total_accepted_draft_tokens += py_num_accepted
+            for pos in range(min(drafted_step, MAX_SPEC_DECODE_POSITIONS)):
+                request.py_per_pos_drafted[pos] += 1
+            for pos in range(min(py_num_accepted, MAX_SPEC_DECODE_POSITIONS)):
+                request.py_per_pos_accepted[pos] += 1
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
@@ -6995,16 +7318,6 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
-            py_num_accepted = getattr(request, 'py_num_accepted_draft_tokens',
-                                      0)
-            draft_len = get_draft_token_length(request)
-            if draft_len > 0:
-                for pos in range(min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
-                    request.py_per_pos_drafted[pos] += 1
-                for pos in range(min(py_num_accepted,
-                                     MAX_SPEC_DECODE_POSITIONS)):
-                    request.py_per_pos_accepted[pos] += 1
-
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
@@ -7034,6 +7347,14 @@ class PyExecutor:
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
+                    if request.py_total_draft_tokens > 0:
+                        # Backfills RequestPerfMetrics.speculative_decoding on
+                        # the client side; the C++ section is only populated
+                        # by updateNumTokensPerIteration, which the PyTorch
+                        # flow never calls.
+                        response.result.spec_dec_totals = (
+                            request.py_total_accepted_draft_tokens,
+                            request.py_total_draft_tokens)
                     new_responses.append((req_id, response))
 
             if request_done:
