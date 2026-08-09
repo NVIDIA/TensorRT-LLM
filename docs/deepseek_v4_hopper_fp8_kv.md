@@ -28,21 +28,20 @@ decode API and the source layout used by this integration.
 
 ## Runtime dispatch
 
-`MLA.forward_context_sparse_mla` and
-`MLA.forward_generation_sparse_mla` dispatch by GPU architecture:
+The DeepSeek-V4 sparse module hooks dispatch by GPU architecture:
 
 ```text
 SM100+:
     existing DeepSeek-V4 absorption FMHA path
 
 SM90 context:
-    forward_sparse_mla_deepseek_v4_bf16
+    DeepseekV4TrtllmAttention.forward_hopper_bf16
 
 SM90 generation, ratio 4:
-    forward_sparse_decode_deepseek_v4_fp8
+    DeepseekV4TrtllmAttention.forward_hopper_fp8
 
 SM90 generation, other ratios:
-    forward_sparse_mla_deepseek_v4_bf16
+    DeepseekV4TrtllmAttention.forward_hopper_bf16
 ```
 
 The Hopper metadata path prepares the context and generation indirection
@@ -52,7 +51,7 @@ standard TRT-LLM paged cache before FlashMLA reads it.
 
 ## BF16 dual-pool path
 
-`forward_sparse_mla_deepseek_v4_bf16` performs the following steps:
+`DeepseekV4TrtllmAttention.forward_hopper_bf16` performs the following steps:
 
 1. Apply RoPE and update the paged cache.
 2. Convert SWA and compressed local positions into pool-relative
@@ -107,8 +106,9 @@ graph capture.
 | `3rdparty/fetch_content.json` | FlashMLA revision |
 | `cpp/tensorrt_llm/flash_mla/CMakeLists.txt` | FlashMLA SM90/SM100 sources |
 | generated `tensorrt_llm/flash_mla/` package | sparse prefill wrapper from the pinned dependency |
-| `tensorrt_llm/_torch/modules/mla.py` | Hopper dispatch and shadow conversion |
-| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/deepseek_v4.py` | Hopper metadata preparation |
+| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/module.py` | DeepSeek-V4 module hooks and Hopper dispatch |
+| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/backend.py` | FlashMLA execution, pool conversion, and MODEL1 shadow cache |
+| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/metadata.py` | Hopper metadata preparation |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | fused MLA argument normalization |
 | `tensorrt_llm/_torch/models/modeling_deepseekv4.py` | Hopper CUTLASS MXFP4 scale loading |
 
