@@ -94,6 +94,9 @@ _FUSED_MAIN_KV_WRITE_ENV = "TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE"
 # Kill switch for folding the o_proj activation quantize into the sparse decode
 # kernel. Read once, so the decision cannot change under a traced graph.
 _FUSE_O_PROJ_MXFP8 = os.environ.get("TRTLLM_M3_FUSE_O_PROJ_MXFP8", "1") == "1"
+# The same, for folding the next layer's qkv activation quantize into the
+# boundary AllReduce+RMSNorm epilogue.
+_FUSE_QKV_MXFP8 = os.environ.get("TRTLLM_M3_FUSE_QKV_MXFP8", "1") == "1"
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -1564,6 +1567,7 @@ class MiniMaxM3Attention(Attention):
         hidden_states: Optional[torch.Tensor] = None,
         attn_metadata: Optional[AttentionMetadata] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
+        hidden_states_mxfp8: Optional[MXFP8QuantizedTensor] = None,
         **kwargs,
     ):
         """Dispatch sparse layers to the MiniMax-M3 sparse algorithm.
@@ -1581,6 +1585,12 @@ class MiniMaxM3Attention(Attention):
         ``algorithm='minimax_m3'``). The cache manager owns both the
         standard paged main K/V buffer and a per-sparse-layer paged
         side index-K buffer.
+
+        ``hidden_states_mxfp8`` is the same activation as ``hidden_states``,
+        already quantized by the previous layer's boundary AllReduce, and is
+        passed to ``qkv_proj`` in its place. None means no fold happened and
+        the projection quantizes for itself. Everything else here reads the
+        bf16, which is always present.
         """
         if not self.is_sparse_attention_layer:
             return self._dense_forward(
@@ -1588,6 +1598,7 @@ class MiniMaxM3Attention(Attention):
                 hidden_states,
                 attn_metadata,
                 all_reduce_params=all_reduce_params,
+                hidden_states_mxfp8=hidden_states_mxfp8,
                 **kwargs,
             )
         return self._sparse_forward(
@@ -1595,6 +1606,7 @@ class MiniMaxM3Attention(Attention):
             hidden_states,
             attn_metadata,
             all_reduce_params=all_reduce_params,
+            hidden_states_mxfp8=hidden_states_mxfp8,
             **kwargs,
         )
 
@@ -1604,6 +1616,7 @@ class MiniMaxM3Attention(Attention):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        hidden_states_mxfp8: Optional[MXFP8QuantizedTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Dense MiniMax-M3 attention for layers 0-2.
@@ -1648,7 +1661,9 @@ class MiniMaxM3Attention(Attention):
             )
 
         # Projections (no index branch).
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(
+            hidden_states if hidden_states_mxfp8 is None else hidden_states_mxfp8
+        )
 
         # Per-head Gemma RMSNorm and partial RoPE on Q/K. The bf16 fast
         # path fuses both into one kernel over the fused qkv; otherwise fall
@@ -2126,6 +2141,7 @@ class MiniMaxM3Attention(Attention):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        hidden_states_mxfp8: Optional[MXFP8QuantizedTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run a MiniMax-M3 sparse attention forward end-to-end.
@@ -2175,10 +2191,14 @@ class MiniMaxM3Attention(Attention):
         # only hidden_states and write disjoint outputs, so each runs its
         # projection, norm, and RoPE concurrently on the aux stream when
         # multi-stream is enabled, joining before the attention core.
+        # The boundary AllReduce may have already quantized what qkv_proj wants;
+        # everything else in this forward reads the bf16.
+        qkv_input = hidden_states if hidden_states_mxfp8 is None else hidden_states_mxfp8
+
         packed_qkv = None
         packed_idx_qk = None
         if self.enable_fused_qkv_index_projection:
-            packed = self.qkv_proj(hidden_states)
+            packed = self.qkv_proj(qkv_input)
             horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
                 packed, position_ids, attn_metadata
             )
@@ -2192,7 +2212,7 @@ class MiniMaxM3Attention(Attention):
             )
 
         def _main_norm_rope():
-            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(hidden_states)
+            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(qkv_input)
             fused_q = self._fused_fp8_main_qk_norm_rope_kv_insert(qkv, position_ids, attn_metadata)
             if fused_q is not None:
                 return fused_q, None, None
@@ -2475,6 +2495,11 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         # next layer's input_layernorm (or the final model norm for the last
         # layer). None disables POST fusion and boundary-norm folding.
         self.next_layer_layernorm: Optional[RMSNorm] = None
+        # Also wired by setup_aliases: the qkv projection that consumes what
+        # next_layer_layernorm produces, or None for the last layer (whose
+        # boundary norm feeds the LM head instead). Lets the boundary AllReduce
+        # emit that projection's MXFP8 activation; see _boundary_folds_qkv_mxfp8.
+        self.next_layer_qkv_proj: Optional[Linear] = None
 
     def forward(
         self,
@@ -2483,8 +2508,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        hidden_states_mxfp8: Optional[MXFP8QuantizedTensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[MXFP8QuantizedTensor], torch.Tensor]:
         # NVTX markers below are emitted only when TLLM_NVTX_DEBUG=1 (or
         # TLLM_LLMAPI_ENABLE_NVTX=1) is set; otherwise they are no-ops.
         attn_kind = "sparse_attn" if self.self_attn.is_sparse_attention_layer else "dense_attn"
@@ -2511,20 +2537,23 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 all_reduce_params=attn_all_reduce_params,
+                hidden_states_mxfp8=hidden_states_mxfp8,
                 **kwargs,
             )
 
         if self.block_sparse_moe is not None:
-            hidden_states, residual = self.forward_MoE(hidden_states, attn_metadata, residual)
+            hidden_states, next_mxfp8, residual = self.forward_MoE(
+                hidden_states, attn_metadata, residual
+            )
         else:
-            hidden_states, residual = self.forward_mlp(hidden_states, residual)
+            hidden_states, next_mxfp8, residual = self.forward_mlp(hidden_states, residual)
 
         # hidden_states is fully TP-reduced at layer exit (no cross-layer
         # allreduce+norm fusion).
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
 
-        return hidden_states, residual
+        return hidden_states, next_mxfp8, residual
 
     def _apply_pre_feed_forward_norm(
         self,
@@ -2588,11 +2617,41 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         act = Fp4QuantizedTensor(act_fp4, act_sf, is_sf_swizzled=False)
         return norm_out, act, residual
 
+    def _boundary_folds_qkv_mxfp8(self) -> bool:
+        """Whether the boundary AllReduce should also emit the next qkv's MXFP8.
+
+        The next layer's qkv projection quantizes its activation to MXFP8 in a
+        kernel of its own, on the serial chain between this AllReduce and the
+        first GEMM of that layer. The fused epilogue can emit it from the same
+        bf16 norm result it already computes, bitwise what the standalone
+        kernel would read.
+
+        Everything consulted here is fixed at load time, so the answer does not
+        vary across steps and cannot bake one step's shape into a traced graph.
+        """
+        if not self.post_feed_forward_fusion or self.next_layer_qkv_proj is None:
+            return False
+        if not _FUSE_QKV_MXFP8:
+            return False
+        proj = self.next_layer_qkv_proj
+        quant_method = getattr(proj, "quant_method", None)
+        return (
+            isinstance(quant_method, MXFP8LinearMethod)
+            # The dequant reference path needs the high-precision input.
+            and quant_method.use_cutlass
+            and proj.in_features % MXFP8_BLOCK_SIZE == 0
+            # LoRA reads the un-quantized activation alongside the GEMM.
+            and getattr(proj, "lora", None) is None
+            # The fused GEMM+AllReduce takes its own path into the quant method,
+            # which has no pre-quantized entry.
+            and not getattr(proj, "use_fused_gemm_allreduce", False)
+        )
+
     def _apply_next_layer_layernorm(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[MXFP8QuantizedTensor], torch.Tensor]:
         """Apply the next layer's input_layernorm at the layer boundary.
 
         On the POST-fusion path the deferred feed-forward output AllReduce is
@@ -2602,11 +2661,29 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         standalone unit test that never ran setup_aliases) the
         (hidden_states, residual) pair is returned unchanged so the model can
         apply the final norm itself.
+
+        The middle return is the next layer's qkv activation in MXFP8 when the
+        epilogue produced it, and None otherwise, leaving that projection to
+        quantize for itself. The bf16 norm is returned either way: the index
+        projection on the compatibility path, the spec-decoding capture and the
+        final norm all still read it.
         """
         if self.next_layer_layernorm is None:
-            return hidden_states, residual
+            return hidden_states, None, residual
         if self.post_feed_forward_fusion:
-            return self.allreduce(
+            if self._boundary_folds_qkv_mxfp8():
+                norm_out, act_fp8, act_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+                return norm_out, MXFP8QuantizedTensor(act_fp8, act_sf), residual
+            hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -2616,7 +2693,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                     trigger_completion_at_end=False,
                 ),
             )
-        return self.next_layer_layernorm(hidden_states, residual)
+            return hidden_states, None, residual
+        hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
+        return hidden_states, None, residual
 
     def _feed_forward_all_reduce_params(self) -> Optional[AllReduceParams]:
         """AllReduce params handed to the MoE or dense-MLP output projection.
@@ -2634,7 +2713,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[MXFP8QuantizedTensor], torch.Tensor]:
         with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
             hidden_states, hidden_states_fp4, residual = self._apply_pre_moe_norm(
                 hidden_states, residual
@@ -2649,14 +2728,13 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             )
 
         with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):
-            hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
-        return hidden_states, residual
+            return self._apply_next_layer_layernorm(hidden_states, residual)
 
     def forward_mlp(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[MXFP8QuantizedTensor], torch.Tensor]:
         with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
             hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
@@ -2667,8 +2745,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             )
 
         with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):
-            hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
-        return hidden_states, residual
+            return self._apply_next_layer_layernorm(hidden_states, residual)
 
 
 class MiniMaxM3Model(DecoderModel):
@@ -2741,16 +2818,20 @@ class MiniMaxM3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
+        # Carries the next layer's qkv activation when that layer's boundary
+        # AllReduce quantized it; None leaves the projection to do its own.
+        hidden_states_mxfp8 = None
         for layer_idx, decoder_layer in enumerate(self.layers):
             # Per-layer NVTX range (layer0, layer1, ...). Emitted only when
             # TLLM_NVTX_DEBUG=1 (or TLLM_LLMAPI_ENABLE_NVTX=1) is set.
             with nvtx_range_debug(f"MiniMaxM3.layer{layer_idx}"):
-                hidden_states, residual = decoder_layer(
+                hidden_states, hidden_states_mxfp8, residual = decoder_layer(
                     position_ids=position_ids,
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     residual=residual,
                     spec_metadata=spec_metadata,
+                    hidden_states_mxfp8=hidden_states_mxfp8,
                 )
 
         # When setup_aliases has chained the final norm into the last decoder
@@ -2907,6 +2988,9 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         aliases). Each layer's MoE/MLP output AllReduce is fused into the next
         layer's input_layernorm; the last layer chains the final model norm so
         its output AllReduce folds the final normalization too.
+
+        The next layer's qkv projection is chained alongside, as the consumer
+        of whatever that norm produces.
         """
         layers = self.model.layers
         num_layers = len(layers)
@@ -2915,6 +2999,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = layers[idx + 1].input_layernorm
+                layer.next_layer_qkv_proj = layers[idx + 1].self_attn.qkv_proj
 
 
 def _strip_language_model_prefix(
