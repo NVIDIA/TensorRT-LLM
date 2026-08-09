@@ -321,7 +321,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
     """Mirror serving's model-preference resolution (PR #15823 semantics).
 
     - use_kv_cache_manager_v2 == "auto" (yaml absent): adopt the model
-      class's get_preferred_kv_cache_manager_version() value, default V1
+      class's get_preferred_kv_cache_manager_version() value, falling back to V1
       (llm_utils._resolve_kv_cache_manager_v2_auto).
     - cache_cfg.transceiver_runtime == "auto": adopt
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
@@ -357,6 +357,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
             shim = types.SimpleNamespace(
                 kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto"),
                 cache_transceiver_config=cache_cfg,
+                speculative_config=None,
             )
             use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, model_cls, hf_view))
         except Exception as e:  # noqa: BLE001 - fall back like a missing model

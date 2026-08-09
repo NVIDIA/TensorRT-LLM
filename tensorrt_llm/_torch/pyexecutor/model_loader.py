@@ -23,8 +23,7 @@ from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
-from tensorrt_llm.llmapi.llm_utils import (_apply_kv_cache_config_preferences,
-                                           _resolve_kv_cache_manager_v2_auto,
+from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
@@ -442,12 +441,6 @@ class ModelLoader:
         if architectures:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
-
-        applied_kv_preferences = _apply_kv_cache_config_preferences(
-            llm_args, preference_cls, config.pretrained_config)
-        if applied_kv_preferences:
-            logger.info("Applied KV-cache preferences for %s: %s",
-                        preference_cls.__name__, applied_kv_preferences)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}

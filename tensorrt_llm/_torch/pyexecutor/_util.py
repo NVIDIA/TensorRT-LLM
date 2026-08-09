@@ -651,7 +651,7 @@ class KvCacheCreator:
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
                         "provide a compatible fallback. Use max_beam_width=1 "
                         "and disable the KV connector.")
-                # Plain V2 (explicitly enabled or selected by a model default):
+                # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
                 logger.warning(

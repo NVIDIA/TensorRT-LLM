@@ -397,6 +397,26 @@ class TestInternalApiContract:
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
 
+    def test_model_preference_resolver_shim_supports_v2(self, api, monkeypatch):
+        class _PreferV2:
+            @classmethod
+            def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+                return "V2"
+
+        monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+        monkeypatch.setattr(
+            rp,
+            "_lookup_model_cls",
+            lambda model_dir: (_PreferV2, types.SimpleNamespace()),
+        )
+        cache_cfg = api.CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+
+        assert rp.resolve_model_prefs(
+            "/tmp/dummy_model",
+            {"use_kv_cache_manager_v2": "auto"},
+            cache_cfg,
+        )
+
     def test_enum_members(self, api):
         for enum, members in (
             (api.DataType, ("FP8", "HALF", "BF16")),

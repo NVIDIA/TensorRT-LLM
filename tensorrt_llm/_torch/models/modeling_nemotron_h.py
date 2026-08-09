@@ -985,8 +985,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Model-specific defaults for NemotronH.
 
-        Uses KV cache manager V2 for the hybrid state layout. Block reuse
-        remains opt-in because it also requires a Mamba snapshot policy.
+        Block reuse remains opt-in because it also requires a Mamba snapshot
+        policy.
         """
         return {
             "kv_cache_config": {

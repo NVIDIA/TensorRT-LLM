@@ -549,20 +549,6 @@ def apply_model_defaults_to_llm_args(
             "config the user did not turn on. Declare a runtime preference "
             "via get_preferred_transceiver_runtime() instead.")
 
-    kv_cache_defaults = model_defaults_dict.get("kv_cache_config")
-    if (kv_cache_defaults is not None
-            and not isinstance(kv_cache_defaults, dict)):
-        raise ValueError(
-            "Model default 'kv_cache_config' must be a dict. Runtime "
-            "preferences must use the corresponding get_preferred_* hook.")
-    if (kv_cache_defaults is not None
-            and "use_kv_cache_manager_v2" in kv_cache_defaults):
-        raise ValueError(
-            "Model defaults must not contain "
-            "'kv_cache_config.use_kv_cache_manager_v2'. Declare a runtime "
-            "preference via get_preferred_kv_cache_manager_version() "
-            "instead.")
-
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
@@ -611,62 +597,12 @@ def _two_model_spec_dec_decoding_type(
     return getattr(spec_config, "decoding_type", "speculative decoding")
 
 
-def _apply_kv_cache_config_preferences(
-        llm_args: 'TorchLlmArgs',
-        model_cls: Optional[type] = None,
-        pretrained_config: Any = None) -> Dict[str, Any]:
-    """Apply scalar KV-cache preferences that the user left unspecified."""
-    if model_cls is None:
-        return {}
-
-    kv_cache_config = llm_args.kv_cache_config
-    user_overrides = kv_cache_config.model_dump(exclude_unset=True)
-    applied = {}
-
-    get_tokens_per_block = getattr(model_cls,
-                                   'get_preferred_kv_cache_tokens_per_block',
-                                   None)
-    if ("tokens_per_block" not in user_overrides
-            and get_tokens_per_block is not None):
-        preferred_tokens_per_block = get_tokens_per_block(pretrained_config)
-        if preferred_tokens_per_block is not None:
-            if (type(preferred_tokens_per_block) is not int
-                    or preferred_tokens_per_block <= 0):
-                raise ValueError(
-                    f"{model_cls.__name__}."
-                    "get_preferred_kv_cache_tokens_per_block() must return a "
-                    f"positive int or None, got {preferred_tokens_per_block!r}."
-                )
-            kv_cache_config.tokens_per_block = preferred_tokens_per_block
-            applied["tokens_per_block"] = preferred_tokens_per_block
-
-    get_swa_scratch_reuse = getattr(model_cls,
-                                    'get_preferred_kv_cache_swa_scratch_reuse',
-                                    None)
-    if ("enable_swa_scratch_reuse" not in user_overrides
-            and get_swa_scratch_reuse is not None):
-        preferred_swa_scratch_reuse = get_swa_scratch_reuse(pretrained_config)
-        if preferred_swa_scratch_reuse is not None:
-            if type(preferred_swa_scratch_reuse) is not bool:
-                raise ValueError(
-                    f"{model_cls.__name__}."
-                    "get_preferred_kv_cache_swa_scratch_reuse() must return "
-                    f"bool or None, got {preferred_swa_scratch_reuse!r}.")
-            kv_cache_config.enable_swa_scratch_reuse = (
-                preferred_swa_scratch_reuse)
-            applied["enable_swa_scratch_reuse"] = preferred_swa_scratch_reuse
-
-    if "tokens_per_block" in applied:
-        llm_args.validate_helix_tokens_per_block()
-    return applied
-
-
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                                       model_cls: Optional[type] = None,
                                       pretrained_config: Any = None) -> bool:
     """Resolve the KV cache manager auto setting from the model preference.
 
-    A model default of V2 is demoted to V1 for routes V2 cannot serve; an
+    A model preference for V2 is demoted to V1 for routes V2 cannot serve; an
     explicit user value otherwise wins. The compatibility arms are:
 
     - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
@@ -676,8 +612,8 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
       with its own KV cache manager. ``build_managers`` hands that manager the
       target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
       by ``max_gpu_total_bytes``, so both managers size their pools from the
-      full budget. The model default falls back to V1, and an explicit ``True``
-      is rejected rather than deferred to that allocation.
+      full budget. The model preference falls back to V1, and an explicit
+      ``True`` is rejected rather than deferred to that allocation.
 
     The fallback only reaches models whose manager class is selected by
     ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally

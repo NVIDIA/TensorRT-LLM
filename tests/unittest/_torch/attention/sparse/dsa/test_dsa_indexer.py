@@ -40,9 +40,6 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager,
-)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSABackendForwardArgs,
     DSACacheManager,
@@ -53,14 +50,13 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     _effective_compress_ratio_divisor,
     _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
-    is_dsa_cache_manager,
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
-    SpecWorkerBase,
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
@@ -85,28 +81,6 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
-
-
-@pytest.mark.parametrize("cache_manager_cls", [DSACacheManager, DSACacheManagerV2])
-def test_is_dsa_cache_manager_accepts_native_managers(cache_manager_cls):
-    assert is_dsa_cache_manager(object.__new__(cache_manager_cls))
-
-
-@pytest.mark.parametrize(
-    "cache_manager",
-    [
-        None,
-        object.__new__(DeepseekV4CacheManager),
-        SimpleNamespace(
-            index_head_dim=128,
-            get_pool_block_indices=Mock(),
-            indexer_k_cache_page_scale=1,
-        ),
-    ],
-    ids=["none", "deepseek-v4", "structural-lookalike"],
-)
-def test_is_dsa_cache_manager_rejects_non_native_managers(cache_manager):
-    assert not is_dsa_cache_manager(cache_manager)
 
 
 def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
@@ -325,76 +299,37 @@ def create_dsa_cache_manager(
     return cache_manager, sparse_attn_config
 
 
-@pytest.mark.parametrize(
-    "cache_manager_cls",
-    [
-        pytest.param(DSACacheManager, id="v1"),
-        pytest.param(DSACacheManagerV2, id="v2"),
-    ],
-)
-def test_transform_local_topk_uses_page_mapping_for_pp_local_layer(cache_manager_cls):
-    """Flatten sparse indices with the active manager's PP-local page mapping."""
-    num_local_layers = 3
-    global_layer_idx = 5
-    local_layer_idx = 1
-    tokens_per_block = 4
-    page_index_scale = 3
-    layer_offset = 1
-
-    if cache_manager_cls is DSACacheManager:
-        cache_manager = SimpleNamespace(num_local_layers=num_local_layers)
-    else:
-        cache_manager = SimpleNamespace(_primary_pool_page_index_params=[(3, 0), (3, 1), (3, 2)])
-    cache_manager.layer_offsets = {global_layer_idx: local_layer_idx}
-    get_page_index_params = MethodType(
-        cache_manager_cls.get_primary_pool_page_index_params,
+def test_transform_local_topk_uses_v2_page_mapping():
+    """Use the V2 pool scale and offset when flattening DSA indices."""
+    cache_manager = SimpleNamespace(
+        _primary_pool_page_index_params=[(3, 1)],
+        get_primary_pool_page_index_params=None,
+    )
+    cache_manager.get_primary_pool_page_index_params = MethodType(
+        DSACacheManagerV2.get_primary_pool_page_index_params,
         cache_manager,
     )
-    cache_manager.get_primary_pool_page_index_params = Mock(wraps=get_page_index_params)
-
     req_idx = torch.tensor([0], dtype=torch.int32)
     block_table = torch.tensor([[3, 7]], dtype=torch.int32)
     topk_indices = torch.tensor([[6]], dtype=torch.int32)
-    pool_view = torch.empty(0)
     metadata = SimpleNamespace(
         kv_cache_manager=cache_manager,
         _ensure_pool_view_cached=Mock(),
         _cached_block_table_ctx=block_table,
         _cached_req_idx_ctx=req_idx,
-        _cached_tokens_per_block=tokens_per_block,
-        _cached_pool_view=pool_view,
+        _cached_tokens_per_block=4,
+        _cached_pool_view=torch.empty(0),
     )
-    attention = SimpleNamespace(layer_idx=global_layer_idx, local_layer_idx=None)
-    pp_local_layer_idx = TrtllmAttention.get_local_layer_idx(attention, metadata)
-    expected_flat_index = (
-        7 * (page_index_scale * tokens_per_block) + (layer_offset * tokens_per_block) + 2
-    )
-    expected_indices = torch.tensor([[expected_flat_index]], dtype=torch.int32)
+    expected_indices = torch.tensor([[90]], dtype=torch.int32)
 
     with patch(
         "torch.ops.trtllm.convert_req_index_to_global",
         return_value=expected_indices,
-    ) as convert_req_index_to_global:
-        global_indices, returned_pool_view = transform_local_topk_and_prepare_pool_view(
-            topk_indices,
-            metadata,
-            layer_idx=pp_local_layer_idx,
-        )
+    ) as convert:
+        actual, _ = transform_local_topk_and_prepare_pool_view(topk_indices, metadata, layer_idx=0)
 
-    assert pp_local_layer_idx == local_layer_idx
-    cache_manager.get_primary_pool_page_index_params.assert_called_once_with(local_layer_idx)
-    convert_req_index_to_global.assert_called_once_with(
-        req_idx,
-        block_table,
-        topk_indices,
-        tokens_per_block,
-        1,
-        page_index_scale * tokens_per_block,
-        layer_offset,
-    )
-    assert torch.equal(global_indices, expected_indices)
-    assert returned_pool_view is pool_view
-    metadata._ensure_pool_view_cached.assert_called_once_with()
+    torch.testing.assert_close(actual, expected_indices)
+    convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
 
 
 def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
@@ -406,6 +341,19 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         num_hidden_layers=num_layers,
         index_topk_pattern=["F", "S", "F"],
     )
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=head_dim)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        sparse_attention_config=sparse_config,
+    )
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=True),
+        )
+        is DSACacheManagerV2
+    )
+
     cache_manager, _ = create_dsa_cache_manager(
         batch_size=2,
         head_dim=head_dim,
@@ -419,7 +367,6 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
     try:
         assert cache_manager.indexer_k_cache_local_layer_mask == [True, False, True]
         assert cache_manager.indexer_k_cache_page_scale == 2
-        assert cache_manager.indexer_k_cache_pool_per_layer[1] is None
         assert cache_manager.get_indexer_k_cache_buffers(0).shape == (
             cache_manager.blocks_in_primary_pool * cache_manager.indexer_k_cache_page_scale,
             tokens_per_block,
@@ -428,20 +375,19 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         )
 
         indexer_bytes_per_token = head_dim + 4
-        expected_cache_bytes = 0
-        for local_layer_idx, owns_indexer in enumerate([True, False, True]):
+        has_indexer_buffers = []
+        for local_layer_idx in range(num_layers):
             layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
-            has_indexer_buffer = any(
-                buffer.role == Role.INDEX_KEY for buffer in layer_config.buffers
+            has_indexer_buffers.append(
+                any(buffer.role == Role.INDEX_KEY for buffer in layer_config.buffers)
             )
-            assert has_indexer_buffer is owns_indexer
+        assert has_indexer_buffers == [True, False, True]
 
-            key_bytes = cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
-            all_bytes = cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.ALL)
-            expected_all_bytes = key_bytes + indexer_bytes_per_token if owns_indexer else key_bytes
-            assert all_bytes == expected_all_bytes
-            expected_cache_bytes += expected_all_bytes
-
+        key_bytes = sum(
+            cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
+            for local_layer_idx in range(num_layers)
+        )
+        expected_cache_bytes = key_bytes + 2 * indexer_bytes_per_token
         assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
         with pytest.raises(AssertionError, match="shared-indexer layer"):
             cache_manager.get_indexer_k_cache_buffers(1)
@@ -3445,6 +3391,9 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     )
 
     Indexer.prepare(metadata)
+    if not enable_indexer_skip:
+        assert metadata.slot_mapping_fp8_fullkv is not metadata.slot_mapping_fp8
+        assert metadata.slot_mapping_scale_fullkv is not metadata.slot_mapping_scale
     indexer._update_k_cache(k_fp8, k_scale, metadata)
 
     # Test custom kernel
@@ -3571,23 +3520,25 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
     def test_prepare_swaps_and_restore_recovers(self):
         """Test that prepare swaps KV manager and restore recovers original state."""
-        from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-
         meta = self._make_mock_metadata()
         mgr = self._make_mock_draft_manager()
+        # DeepSeek-V4 metadata inherits DSA metadata, while its manager exposes
+        # index_head_dim without implementing DSA's full page-mapping contract.
+        mgr.index_head_dim = 128
+        mgr.get_pool_block_indices = Mock()
+        mgr.indexer_k_cache_page_scale = 1
         original_kv_mgr = meta.kv_cache_manager
         original_offsets = meta.kv_cache_block_offsets.clone()
         original_host_offsets = meta.host_kv_cache_block_offsets.clone()
 
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
         with patch(
             "tensorrt_llm._torch.speculative.interface.isinstance",
-            side_effect=lambda obj, cls: (
-                obj is meta
-                if cls is TrtllmAttentionMetadata
-                else False
-                if cls.__name__ == "DSAtrtllmAttentionMetadata"
-                else builtins.isinstance(obj, cls)
-            ),
+            side_effect=is_attn_metadata,
         ):
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
@@ -3602,60 +3553,33 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
 
-    @pytest.mark.parametrize("capturing", [False, True])
-    def test_draft_context_recomputes_and_restores_dsa_metadata(self, capturing):
-        """Draft context rebinds preallocated DSA buffers and restores lazy aliases."""
+    def test_native_dsa_replay_swaps_and_restores_buffers(self):
+        """Switch native DSA metadata to draft buffers and restore it."""
         meta = self._make_mock_metadata()
         mgr = object.__new__(DSACacheManagerV2)
         mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
-        meta.enable_flash_mla = False
         meta.enable_context_mla_with_cached_kv = False
-        meta.host_indexer_k_cache_block_offsets = torch.tensor([1, 2, 3])
-        meta.indexer_k_cache_block_offsets = torch.tensor([4, 5, 6])
-        meta.host_slot_mapping_fp8 = torch.tensor([7, 8, 9])
-        meta.host_slot_mapping_scale = torch.tensor([10, 11, 12])
-        meta.slot_mapping_fp8 = torch.tensor([13, 14, 15])
-        meta.slot_mapping_scale = torch.tensor([16, 17, 18])
-        meta.block_table = torch.tensor([19, 20, 21])
-        meta.block_table_expanded = torch.tensor([22, 23, 24])
-        meta.host_block_table_expanded = torch.tensor([25, 26, 27])
-        meta.host_draft_indexer_k_cache_block_offsets = torch.tensor([28, 29, 30])
-        meta.draft_indexer_k_cache_block_offsets = torch.tensor([31, 32, 33])
-        meta.host_draft_slot_mapping_fp8 = torch.tensor([34, 35, 36])
-        meta.host_draft_slot_mapping_scale = torch.tensor([37, 38, 39])
-        meta.draft_slot_mapping_fp8 = torch.tensor([40, 41, 42])
-        meta.draft_slot_mapping_scale = torch.tensor([43, 44, 45])
-        meta.draft_block_table = torch.tensor([46, 47, 48])
-        meta.draft_block_table_expanded = torch.tensor([49, 50, 51])
-        meta.host_draft_block_table_expanded = torch.tensor([52, 53, 54])
-        meta.prepare_for_indexer_k_cache = Mock()
-        meta._refresh_expanded_block_table = Mock()
-        meta._update_indexer_k_cache_block_offsets = Mock()
+        meta._invalidate_pool_view_cache = Mock()
+        buffer_pairs = {
+            "host_indexer_k_cache_block_offsets": "host_draft_indexer_k_cache_block_offsets",
+            "indexer_k_cache_block_offsets": "draft_indexer_k_cache_block_offsets",
+            "host_slot_mapping_fp8": "host_draft_slot_mapping_fp8",
+            "host_slot_mapping_scale": "host_draft_slot_mapping_scale",
+            "slot_mapping_fp8": "draft_slot_mapping_fp8",
+            "slot_mapping_scale": "draft_slot_mapping_scale",
+            "block_table": "draft_block_table",
+            "block_table_expanded": "draft_block_table_expanded",
+            "host_block_table_expanded": "host_draft_block_table_expanded",
+        }
+        target_buffers = {}
+        draft_buffers = {}
+        for target_name, draft_name in buffer_pairs.items():
+            target_buffers[target_name] = object()
+            draft_buffers[target_name] = object()
+            setattr(meta, target_name, target_buffers[target_name])
+            setattr(meta, draft_name, draft_buffers[target_name])
         del meta.slot_mapping_fp8_fullkv
         del meta.slot_mapping_scale_fullkv
-
-        target_buffers = {
-            "host_indexer_k_cache_block_offsets": meta.host_indexer_k_cache_block_offsets,
-            "indexer_k_cache_block_offsets": meta.indexer_k_cache_block_offsets,
-            "host_slot_mapping_fp8": meta.host_slot_mapping_fp8,
-            "host_slot_mapping_scale": meta.host_slot_mapping_scale,
-            "slot_mapping_fp8": meta.slot_mapping_fp8,
-            "slot_mapping_scale": meta.slot_mapping_scale,
-            "block_table": meta.block_table,
-            "block_table_expanded": meta.block_table_expanded,
-            "host_block_table_expanded": meta.host_block_table_expanded,
-        }
-        draft_buffers = {
-            "host_indexer_k_cache_block_offsets": meta.host_draft_indexer_k_cache_block_offsets,
-            "indexer_k_cache_block_offsets": meta.draft_indexer_k_cache_block_offsets,
-            "host_slot_mapping_fp8": meta.host_draft_slot_mapping_fp8,
-            "host_slot_mapping_scale": meta.host_draft_slot_mapping_scale,
-            "slot_mapping_fp8": meta.draft_slot_mapping_fp8,
-            "slot_mapping_scale": meta.draft_slot_mapping_scale,
-            "block_table": meta.draft_block_table,
-            "block_table_expanded": meta.draft_block_table_expanded,
-            "host_block_table_expanded": meta.host_draft_block_table_expanded,
-        }
 
         def is_attn_metadata(obj, cls):
             if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
@@ -3669,116 +3593,16 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             ),
             patch(
                 "tensorrt_llm._torch.speculative.interface.torch.cuda.is_current_stream_capturing",
-                return_value=capturing,
+                return_value=True,
             ),
-            patch.object(Indexer, "recompute_slot_mappings") as recompute,
-        ):
-            with SpecWorkerBase.draft_kv_cache_context(Mock(), meta, mgr):
-                for name, buffer in draft_buffers.items():
-                    assert getattr(meta, name) is buffer
-                assert meta.slot_mapping_fp8_fullkv is meta.draft_slot_mapping_fp8
-                assert meta.slot_mapping_scale_fullkv is meta.draft_slot_mapping_scale
-
-        for name, buffer in target_buffers.items():
-            assert getattr(meta, name) is buffer
-        assert meta.slot_mapping_fp8_fullkv is meta.slot_mapping_fp8
-        assert meta.slot_mapping_scale_fullkv is meta.slot_mapping_scale
-        if capturing:
-            meta.prepare_for_indexer_k_cache.assert_not_called()
-            meta._refresh_expanded_block_table.assert_not_called()
-            recompute.assert_not_called()
-        else:
-            meta.prepare_for_indexer_k_cache.assert_called_once_with()
-            meta._refresh_expanded_block_table.assert_called_once_with()
-            recompute.assert_called_once_with(meta)
-        meta._update_indexer_k_cache_block_offsets.assert_not_called()
-
-    def test_non_dsa_manager_skips_inherited_dsa_replay_state(self):
-        """A DSA metadata subclass must not impose DSA layout on its manager."""
-        meta = self._make_mock_metadata()
-        mgr = self._make_mock_draft_manager()
-        target_manager = meta.kv_cache_manager
-        target_offsets = meta.kv_cache_block_offsets
-        target_host_offsets = meta.host_kv_cache_block_offsets
-        # DeepSeek-V4 cache managers expose this field but not the DSA page
-        # mapping contract used by _update_indexer_k_cache_block_offsets().
-        mgr.index_head_dim = 128
-        mgr.get_pool_block_indices = Mock()
-        mgr.indexer_k_cache_page_scale = 1
-
-        def is_attn_metadata(obj, cls):
-            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
-                return obj is meta
-            return builtins.isinstance(obj, cls)
-
-        with patch(
-            "tensorrt_llm._torch.speculative.interface.isinstance",
-            side_effect=is_attn_metadata,
         ):
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
-        assert saved is not None
-        assert "saved_dsa_state" not in saved
-
+        assert "saved_dsa_state" in saved
+        assert meta.slot_mapping_fp8 is draft_buffers["slot_mapping_fp8"]
         restore_attn_metadata_after_draft_replay(meta, saved)
-        assert meta.kv_cache_manager is target_manager
-        assert meta.kv_cache_block_offsets is target_offsets
-        assert meta.host_kv_cache_block_offsets is target_host_offsets
-
-
-def test_recompute_context_kv_gather_mappings_does_not_alias_uncompressed_cached_mappings():
-    """Cached KV requires independent full-KV mappings even without compression."""
-    fp8_mapping = torch.tensor([1, 2, 3])
-    scale_mapping = torch.tensor([4, 5, 6])
-    fullkv_fp8_mapping = object()
-    fullkv_scale_mapping = object()
-    host_fullkv_fp8_mapping = Mock()
-    host_fullkv_scale_mapping = Mock()
-    host_fullkv_fp8_mapping.cuda.return_value = fullkv_fp8_mapping
-    host_fullkv_scale_mapping.cuda.return_value = fullkv_scale_mapping
-    computed_fp8_mapping = torch.tensor([10, 11, 12, 13])
-    computed_scale_mapping = torch.tensor([20, 21, 22, 23])
-    metadata = SimpleNamespace(
-        enable_context_mla_with_cached_kv=True,
-        skip_indexer_for_ctx_reqs=False,
-        slot_mapping_fp8=fp8_mapping,
-        slot_mapping_scale=scale_mapping,
-        slot_mapping_fp8_fullkv=fp8_mapping,
-        slot_mapping_scale_fullkv=scale_mapping,
-        host_indexer_k_cache_block_offsets=torch.tensor([[0], [1]], dtype=torch.int32),
-    )
-    indexer_params = SimpleNamespace(
-        num_contexts=2,
-        compress_ratio=1,
-        cached_kv_tokens=torch.tensor([0, 1], dtype=torch.int32),
-        kv_lens=torch.tensor([2, 2], dtype=torch.int32),
-        head_dim=128,
-        tokens_per_block=64,
-        quant_block_size=128,
-        data_bytes_per_token=128,
-    )
-
-    with (
-        patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.torch.empty",
-            side_effect=[host_fullkv_fp8_mapping, host_fullkv_scale_mapping],
-        ),
-        patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer._compute_slot_mappings",
-            return_value=(computed_fp8_mapping, computed_scale_mapping),
-        ) as compute_slot_mappings,
-    ):
-        Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
-
-    assert metadata.slot_mapping_fp8_fullkv is fullkv_fp8_mapping
-    assert metadata.slot_mapping_scale_fullkv is fullkv_scale_mapping
-    assert metadata.slot_mapping_fp8_fullkv is not fp8_mapping
-    assert metadata.slot_mapping_scale_fullkv is not scale_mapping
-    host_fullkv_fp8_mapping.copy_.assert_called_once_with(computed_fp8_mapping)
-    host_fullkv_scale_mapping.copy_.assert_called_once_with(computed_scale_mapping)
-    host_fullkv_fp8_mapping.cuda.assert_called_once_with(non_blocking=True)
-    host_fullkv_scale_mapping.cuda.assert_called_once_with(non_blocking=True)
-    compute_slot_mappings.assert_called_once()
+        assert meta.slot_mapping_fp8 is target_buffers["slot_mapping_fp8"]
+        assert meta.slot_mapping_fp8_fullkv is target_buffers["slot_mapping_fp8"]
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")

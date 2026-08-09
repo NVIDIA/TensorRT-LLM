@@ -150,15 +150,15 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_model_defaults():
-    class LlmArgs:
-        pass
+def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
 
-    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
-
-    assert defaults == {}
-    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_tokens_per_block() == 128
-    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_swa_scratch_reuse() is True
+    assert defaults == {
+        "kv_cache_config": {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
+        }
+    }
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 

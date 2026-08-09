@@ -31,7 +31,10 @@
 import copy
 import math
 import os
-from typing import Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 import torch
 import triton
@@ -2530,18 +2533,13 @@ class DeepseekV4Model(DecoderModel):
 @register_auto_model("DeepseekV4ForCausalLM")
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
-    def get_preferred_kv_cache_tokens_per_block(
-        cls, pretrained_config: object | None = None
-    ) -> int:
-        """Prefer 128-token KV-cache blocks for DeepSeek-V4."""
-        return 128
-
-    @classmethod
-    def get_preferred_kv_cache_swa_scratch_reuse(
-        cls, pretrained_config: object | None = None
-    ) -> bool:
-        """Prefer SWA scratch reuse for DeepSeek-V4."""
-        return True
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return {
+            "kv_cache_config": {
+                "tokens_per_block": 128,
+                "enable_swa_scratch_reuse": True,
+            }
+        }
 
     @classmethod
     def get_preferred_kv_cache_manager_version(
