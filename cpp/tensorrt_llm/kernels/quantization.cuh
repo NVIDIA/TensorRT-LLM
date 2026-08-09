@@ -846,9 +846,19 @@ quantize_with_block_size(
             // Fast path: This row is entirely padding, only zero out scale factors.
             // Note: Padding rows do NOT exist in the output tensor (which is sized [numRows, K]),
             // they only exist in the swizzled scale factor layout. Do NOT write to output buffer here.
+            //
+            // A padding row writes one scale factor byte per column and nothing
+            // else, which is far too little work to spread over the column
+            // blocks: that multiplies the block count by gridDim.y and costs
+            // more than the stores themselves. Leave the row to the first
+            // column block, which walks it exactly as it would with no split.
+            if (blockIdx.y != 0)
+            {
+                continue;
+            }
             for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
             {
-                for (int colIdx = colStart; colIdx < numColThreadsForSf; colIdx += colStride)
+                for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
                 {
                     std::optional<int> optionalBatchIdx = batchIdx;
                     std::optional<int> optionalNumRows = numRows;
