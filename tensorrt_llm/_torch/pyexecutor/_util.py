@@ -2221,6 +2221,16 @@ def _create_kv_cache_manager(
             if is_kda_mtp_verify_available():
                 kimi_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+        # KDA's conv state is a [Q | K | V] concatenation whose three sections
+        # have identical width, i.e. the qwen3_next section layout. The V1
+        # managers select that layout by `model_type`; MambaHybridCacheManagerV2
+        # takes an explicit `conv_state_layout` and silently defaults to
+        # "x_b_c" (and absorbs `model_type` into **kwargs), so V2 must be given
+        # the layout by name. Mirrors the qwen3_hybrid branch below.
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            kimi_extra_kwargs["conv_state_layout"] = "q_k_v"
+        else:
+            kimi_extra_kwargs["model_type"] = "qwen3_next"
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -2248,9 +2258,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
-            # all three KDA sections have identical width.
-            model_type="qwen3_next",
             **kimi_extra_kwargs,
             **manager_extra_kwargs,
         )
