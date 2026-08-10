@@ -132,12 +132,13 @@ class GatedMLP(nn.Module):
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
-            override_tp_sharding=override_tp_sharding,
         )
 
         if self.split_gate_up:
             # Each Linear owns one checkpoint tensor and its own scale, so no
-            # fused weight mode and no shard-index mapping.
+            # fused weight mode, no shard-index mapping, and no gate/up-keyed
+            # override_tp_sharding -- Linear asserts that a dict tp_sharding
+            # only ever reaches a fused weight mode.
             self.gate_proj = Linear(self.hidden_size, self.intermediate_size,
                                     **_common_proj_kwargs)
             self.up_proj = Linear(self.hidden_size, self.intermediate_size,
@@ -150,6 +151,7 @@ class GatedMLP(nn.Module):
                 weights_loading_config=WeightsLoadingConfig(
                     weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
                 fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
+                override_tp_sharding=override_tp_sharding,
                 **_common_proj_kwargs,
             )
 
@@ -254,8 +256,14 @@ class GatedMLP(nn.Module):
                               up,
                               quant_scale=self.down_proj.input_scale,
                               quant_type=torch.float8_e4m3fn,
-                              swiglu_limit=self.swiglu_limit)
-        return swiglu_2in(gate, up, swiglu_limit=self.swiglu_limit)
+                              swiglu_limit=self.swiglu_limit,
+                              swiglu_alpha=self.swiglu_alpha,
+                              swiglu_beta=self.swiglu_beta)
+        return swiglu_2in(gate,
+                          up,
+                          swiglu_limit=self.swiglu_limit,
+                          swiglu_alpha=self.swiglu_alpha,
+                          swiglu_beta=self.swiglu_beta)
 
     def _shares_gate_up_quantization(self) -> bool:
         """Config-only half of the condition, so post_load_weights() can reuse it.

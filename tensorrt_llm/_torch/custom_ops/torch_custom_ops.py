@@ -2093,7 +2093,9 @@ def silu_and_mul_2in(gate: torch.Tensor,
                      up: torch.Tensor,
                      scale: Optional[torch.Tensor] = None,
                      dtype: Optional[torch.dtype] = None,
-                     swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                     swiglu_limit: Optional[float] = None,
+                     swiglu_alpha: Optional[float] = None,
+                     swiglu_beta: Optional[float] = None) -> torch.Tensor:
     """silu_and_mul for gate and up held in separate tensors.
 
     Equivalent to silu_and_mul(cat([gate, up], -1), ...) with no concatenation.
@@ -2132,6 +2134,8 @@ def silu_and_mul_2in(gate: torch.Tensor,
         up_ptr=up,
         n_elements=n_elements,
         swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
         BLOCK_SIZE=block_elements,
         HAS_O_SCALE=scale is not None,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
@@ -2148,6 +2152,8 @@ def _(
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ) -> torch.Tensor:
     o_dtype = dtype or gate.dtype
     return gate.new_empty(gate.shape, dtype=o_dtype)

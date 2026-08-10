@@ -64,7 +64,9 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
 @triton.jit
 def silu_and_mul_2in_kernel(o_ptr, o_scale_ptr, gate_ptr, up_ptr, n_elements,
                             swiglu_limit: tl.constexpr,
-                            BLOCK_SIZE: tl.constexpr, HAS_O_SCALE: tl.constexpr,
+                            swiglu_alpha: tl.constexpr,
+                            swiglu_beta: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                            HAS_O_SCALE: tl.constexpr,
                             HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
     """As silu_and_mul_kernel, but gate and up come from separate tensors.
 
@@ -85,7 +87,7 @@ def silu_and_mul_2in_kernel(o_ptr, o_scale_ptr, gate_ptr, up_ptr, n_elements,
         a = tl.minimum(a, swiglu_limit)
         b = tl.clamp(b, -swiglu_limit, swiglu_limit)
 
-    result = tl.sigmoid(a) * a * b
+    result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
 
     if HAS_O_SCALE:
         o_scale = tl.load(o_scale_ptr)
@@ -148,7 +150,9 @@ def swiglu_2in(gate,
                up,
                quant_scale: Optional[torch.Tensor] = None,
                quant_type=None,
-               swiglu_limit: Optional[float] = None):
+               swiglu_limit: Optional[float] = None,
+               swiglu_alpha: Optional[float] = None,
+               swiglu_beta: Optional[float] = None):
     """SiLU(gate) * up for separately projected gate and up tensors.
 
     Equivalent to ``swiglu(torch.cat([gate, up], dim=-1), ...)`` without
@@ -162,8 +166,12 @@ def swiglu_2in(gate,
             scale=quant_scale,
             dtype=quant_type,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
     return torch.ops.trtllm.silu_and_mul_2in(gate,
                                              up,
-                                             swiglu_limit=swiglu_limit)
+                                             swiglu_limit=swiglu_limit,
+                                             swiglu_alpha=swiglu_alpha,
+                                             swiglu_beta=swiglu_beta)
