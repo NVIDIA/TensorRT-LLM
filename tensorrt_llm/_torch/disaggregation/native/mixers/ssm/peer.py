@@ -363,12 +363,15 @@ class MambaPolicy:
         The core invariant checked is *global* (TP-aggregated) state size:
         for a TP-sharded state, ``per_rank_bytes * mamba_tp`` is
         TP-invariant, so it must match between peers even when their TP
-        sizes differ. Models with *replicated* recurrent state (e.g. Kimi K3
-        KDA, whose per-rank state is pre-scaled to full size when
-        attention-DP is off) violate this invariant under heterogeneous TP —
-        exactly the configuration where the TP-mismatch mappers would
-        compute shard offsets past the end of the slot, silently corrupting
-        the replicated state — and are therefore rejected here.
+        sizes differ. Kimi K3 KDA satisfies it: with attention-DP off the
+        cache manager head-shards the state across tp_size (matching the
+        model's head-sharded KDA compute), so heterogeneous ctx/gen TP
+        passes; under attention-DP the state is replicated and ``_mamba_tp``
+        is 1 on that side. A model that kept a replicated full-size per-rank
+        state while reporting ``mamba_tp > 1`` would violate the invariant
+        under heterogeneous TP — exactly the configuration where the
+        TP-mismatch mappers would compute shard offsets past the end of the
+        slot, silently corrupting the state — and is rejected here.
         """
         self_mlg = MambaPolicy._find_mamba_layer_group(self_page_table)
         peer_mlg = MambaPolicy._find_mamba_layer_group(peer_page_table)
@@ -411,9 +414,9 @@ class MambaPolicy:
                     f"peer {peer_bytes} bytes/rank x mamba_tp={peer_tp}. Per-rank state "
                     "sizes are inconsistent with a TP-sharded layout across the two "
                     "sides; either the state shape/dtype differs, or the model keeps a "
-                    "replicated (non-TP-sharded) recurrent state (e.g. Kimi K3 KDA), "
-                    "which supports heterogeneous ctx/gen TP only with attention-DP "
-                    "enabled on both sides."
+                    "replicated (non-TP-sharded) per-rank recurrent state while "
+                    "reporting mamba_tp > 1, which supports heterogeneous ctx/gen TP "
+                    "only with attention-DP enabled on both sides."
                 )
 
         _check_global(
