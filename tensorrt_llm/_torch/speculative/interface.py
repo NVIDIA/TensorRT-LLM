@@ -2109,23 +2109,13 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def get_draft_kv_cache_manager(self, resource_manager):
         """
-        Get the draft KV cache manager if using separate KV cache layouts,
-        or the target manager's draft sub-page view when shared draft layers
-        run at a smaller kernel page size (e.g. MiniMax-M3 unified KV cache).
+        Get the draft-side KV manager (separate manager or the target
+        manager's draft sub-page view); see resolve_draft_kv_cache_manager.
         """
         if resource_manager is None:
             return None
-        # The registered separate manager is the ground truth; the
-        # use_separate_draft_kv_cache flag is derived from the raw spec
-        # config and disagrees with the manager-level decision when the
-        # attention-DP branch chooses shared layers.
-        draft_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        if draft_manager is not None:
-            return draft_manager
-        target_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
-        return getattr(target_manager, "draft_subpage_view", None)
+        from .utils import resolve_draft_kv_cache_manager
+        return resolve_draft_kv_cache_manager(resource_manager)
 
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):

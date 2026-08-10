@@ -1980,6 +1980,15 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        # One-model speculative decoding with shared draft layers appends the
+        # drafter's layers to this manager; tell the manager explicitly which
+        # tail of the layer range is draft (consumed by managers that expose a
+        # draft sub-page view, e.g. MiniMax-M3; the base __init__ ignores it).
+        num_appended_draft_layers = (len(per_layer_num_kv_heads) -
+                                     num_hidden_layers if isinstance(
+                                         per_layer_num_kv_heads, list) else 0)
+        manager_extra_kwargs["num_one_model_draft_layers"] = max(
+            0, num_appended_draft_layers)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

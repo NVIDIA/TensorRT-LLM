@@ -198,21 +198,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
         # One-model speculative decoding with shared draft layers appends the
         # drafter's layers after the target's. They are dense (no MSA index
-        # cache) and identifiable by a kv-head count differing from the
-        # target's uniform value in the per-layer heads list.
+        # cache); the creation site passes the appended count explicitly
+        # (``num_one_model_draft_layers`` in ``_create_kv_cache_manager``).
+        num_draft = int(kwargs.pop("num_one_model_draft_layers", 0) or 0)
         self._shared_draft_layer_ids: list[int] = []
-        heads = kwargs.get("num_kv_heads")
-        if isinstance(heads, (list, tuple)) and len(heads) > 1:
-            n = len(heads)
-            while n > 1 and heads[n - 1] != heads[0]:
-                n -= 1
-            self._shared_draft_layer_ids = list(range(n, len(heads)))
+        if num_draft > 0 and num_layers is not None:
+            self._shared_draft_layer_ids = list(range(int(num_layers) - num_draft, int(num_layers)))
         if sparse_layer_ids is None:
             if num_layers is not None:
-                num_target_layers = int(num_layers)
-                if self._shared_draft_layer_ids:
-                    num_target_layers = min(num_target_layers, self._shared_draft_layer_ids[0])
-                sparse_layer_ids = list(range(3, num_target_layers))
+                sparse_layer_ids = list(range(3, int(num_layers) - num_draft))
             else:
                 sparse_layer_ids = []
         if disable_index_value_layer_ids is None:
@@ -652,7 +646,7 @@ class MiniMaxM3DraftSubpageView:
         self.host_kv_cache_block_offsets = torch.zeros(
             (manager.num_pools, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        self._scratch: Optional[torch.Tensor] = None
+        self._slots_host: Optional[torch.Tensor] = None
         self._arange: Optional[torch.Tensor] = None
 
     def __getattr__(self, name):
@@ -678,19 +672,31 @@ class MiniMaxM3DraftSubpageView:
         max_blocks: Optional[int] = None,
     ) -> None:
         sub = self._subdiv
+        max_units = dst_tensor.shape[-1]
+        max_slots = max_units // sub
         # Raw mega-pool slot ids per request (M3's bypass semantics).
         slot_rows = self._manager._get_batch_cache_indices_by_pool_id(request_ids, pool_id=0)
-        max_units = dst_tensor.shape[-1]
-        host = torch.zeros((num_seqs, 2, max_units), dtype=dst_tensor.dtype)
-        for i, slots in enumerate(slot_rows[:num_seqs]):
-            n = min(len(slots), max_units // sub)
-            if n <= 0:
-                continue
-            base = torch.tensor(slots[:n], dtype=dst_tensor.dtype)
-            base = torch.where(base < 0, torch.zeros_like(base), base)
-            k = (base * self._slot_units).unsqueeze(-1) + torch.arange(sub, dtype=dst_tensor.dtype)
-            host[i, 0, : n * sub] = k.reshape(-1)
-            host[i, 1, : n * sub] = (k + sub).reshape(-1)
+        if (
+            self._slots_host is None
+            or self._slots_host.shape[0] < num_seqs
+            or self._slots_host.shape[1] != max_slots
+        ):
+            self._slots_host = torch.zeros(
+                (max(num_seqs, dst_tensor.shape[1]), max_slots), dtype=dst_tensor.dtype
+            )
+            self._arange = torch.arange(sub, dtype=dst_tensor.dtype)
+        slots = self._slots_host[:num_seqs]
+        slots.zero_()
+        # Ragged fill is the only per-row work; all arithmetic below is one
+        # fused expansion across the batch. Pad/BAD_PAGE_INDEX entries clamp
+        # to slot 0 (safe pages: kernels never read past kv_lens).
+        for i, row in enumerate(slot_rows[:num_seqs]):
+            n = min(len(row), max_slots)
+            if n > 0:
+                slots[i, :n] = torch.as_tensor(row[:n], dtype=dst_tensor.dtype)
+        slots.clamp_(min=0)
+        k = (slots * self._slot_units).unsqueeze(-1) + self._arange
+        host = torch.stack((k, k + sub), dim=1).reshape(num_seqs, 2, max_slots * sub)
         dst_tensor[0, :num_seqs].copy_(host, non_blocking=True)
 
 

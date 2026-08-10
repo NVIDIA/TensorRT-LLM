@@ -523,22 +523,15 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
-def get_draft_kv_cache_manager(spec_config, resource_manager):
-    """
-    Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache, or — when
-    the draft layers share the target manager — the target manager's draft
-    sub-page view, if it exposes one (e.g. MiniMax-M3, whose shared drafter
-    pool runs at a smaller kernel page size than the target's
-    tokens_per_block). The view is draft-manager-shaped for the attention
-    metadata (offsets/pointers/tokens_per_block) but owns no block lifecycle.
+def resolve_draft_kv_cache_manager(resource_manager):
+    """Resolve the draft-side KV manager for one-model speculative decoding.
+
+    The registered separate manager is the ground truth when present;
+    otherwise fall back to the target manager's ``draft_subpage_view`` (None
+    for managers that do not expose one, e.g. same-geometry shared drafters).
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
-    if spec_config is None:
-        return None
-    if not spec_config.spec_dec_mode.use_one_engine():
-        return None
     draft_manager = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
     if draft_manager is not None:
@@ -546,6 +539,20 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
     target_manager = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
     return getattr(target_manager, "draft_subpage_view", None)
+
+
+def get_draft_kv_cache_manager(spec_config, resource_manager):
+    """
+    Returns the draft KV cache manager only in one-model speculative decoding
+    mode: the separate manager when the target manages one, or the target
+    manager's draft sub-page view when shared draft layers run at a smaller
+    kernel page size (e.g. MiniMax-M3). See resolve_draft_kv_cache_manager.
+    """
+    if spec_config is None:
+        return None
+    if not spec_config.spec_dec_mode.use_one_engine():
+        return None
+    return resolve_draft_kv_cache_manager(resource_manager)
 
 
 def update_spec_config_from_model_config(spec_config, model_config):
