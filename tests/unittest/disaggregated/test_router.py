@@ -2334,14 +2334,11 @@ def _grow_conversation():
 
 
 class _BoundaryMergingTokenizer:
-    """Greedy tokenizer whose longest token can cross a changed boundary."""
+    """Greedy tokenizer with a merge across the AgentX rewrite boundary."""
 
     _TOKENS = {
-        "abc": 1,
-        "ab": 2,
-        "zz": 3,
-        "X": 4,
-        "Y": 5,
+        "\nactual": 1,
+        "\n": 2,
     }
 
     def __init__(self):
@@ -2385,14 +2382,24 @@ class _BoundaryMergingTokenizer:
 
 
 def test_prefix_cache_rolls_back_boundary_token(servers):
+    """AgentX replaces the previous synthetic ``<think>`` generation prefix.
+
+    The old rendered prompt ends in ``assistant\n<think>\n``. On the next
+    turn, the actual assistant response replaces that final ``<think>\n``,
+    followed by the next user turn and a fresh assistant generation prefix.
+    """
     with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
         router = KvCacheAwareRouter(server_role=None,
                                     servers=servers,
                                     tokens_per_block=4)
         tokenizer = _BoundaryMergingTokenizer()
         key = 42
-        previous = "stable-prefix-zzabX"
-        current = "stable-prefix-zzabcY"
+        common = "stable-prefix<|im_end|>\n<|im_start|>assistant"
+        previous = common + "\n<think>\n"
+        current_suffix = ("\nactual response<|im_end|>\n"
+                          "<|im_start|>user\nnext request<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\n")
+        current = common + current_suffix
         assert not current.startswith(previous)
         assert router._encode_with_prefix_cache(
             previous, key, tokenizer) == tokenizer.encode(previous)
@@ -2400,7 +2407,7 @@ def test_prefix_cache_rolls_back_boundary_token(servers):
         result = router._encode_with_prefix_cache(current, key, tokenizer)
 
     assert result == tokenizer.encode(current)
-    assert tokenizer.calls == ["abcY"]
+    assert tokenizer.calls == [current_suffix]
 
 
 def test_prefix_cache_tokenize_matches_full_encode(servers):
