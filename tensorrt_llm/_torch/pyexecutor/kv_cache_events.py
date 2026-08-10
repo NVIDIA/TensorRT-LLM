@@ -351,13 +351,6 @@ def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
 
-class _NativeStoredBlockState:
-    __slots__ = ("block_hash",)
-
-    def __init__(self, block_hash: int) -> None:
-        self.block_hash = block_hash
-
-
 class NativeKVCacheEventManager:
     """Scheduler-local fast path that produces vLLM wire events directly.
 
@@ -383,7 +376,7 @@ class NativeKVCacheEventManager:
         self._max_window_size = max_window_size
         self._max_entries = max_entries
         self._target_life_cycle_id: int | None = None
-        self._stored_blocks: dict[bytes, _NativeStoredBlockState] = {}
+        self._stored_blocks: dict[bytes, int] = {}
         self._pending_events: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
         self._pending_entries = 0
         self._closed = False
@@ -458,7 +451,7 @@ class NativeKVCacheEventManager:
             return
         try:
             token_ids = self._token_ids(block.tokens)
-            block_hash, parent_hash, state = self._block_hashes(block)
+            block_hash, parent_hash = self._block_hashes(block)
         except ValueError:
             self.dropped_events += 1
             self._pending_entries -= 1
@@ -467,7 +460,7 @@ class NativeKVCacheEventManager:
                 f"{traceback.format_exc()}"
             )
             return
-        self._stored_blocks[key] = state
+        self._stored_blocks[key] = block_hash
         if self._pending_events and isinstance(self._pending_events[-1], BlockStored):
             previous = self._pending_events[-1]
             if previous.block_hashes and previous.block_hashes[-1] == parent_hash:
@@ -500,12 +493,12 @@ class NativeKVCacheEventManager:
     def _block_hashes(
         self,
         block: Any,
-    ) -> tuple[int, int | None, _NativeStoredBlockState]:
+    ) -> tuple[int, int | None]:
         parent = block.prev
         is_root_child = getattr(parent, "ordinal", -1) == -1
         block_hash = _vllm_wire_hash_from_radix_key(bytes(block.key))
         parent_hash = None if is_root_child else _vllm_wire_hash_from_radix_key(bytes(parent.key))
-        return block_hash, parent_hash, _NativeStoredBlockState(block_hash)
+        return block_hash, parent_hash
 
     def add_removed_event(self, block_hashes: Any) -> None:
         if self._closed:
@@ -516,9 +509,9 @@ class NativeKVCacheEventManager:
         for block_key in block_hashes:
             if not isinstance(block_key, bytes):
                 continue
-            state = self._stored_blocks.pop(block_key, None)
-            if state is not None:
-                removed_hashes.append(state.block_hash)
+            stored_hash = self._stored_blocks.pop(block_key, None)
+            if stored_hash is not None:
+                removed_hashes.append(stored_hash)
         self._add_removed_hashes(removed_hashes)
 
     def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None:
@@ -527,9 +520,9 @@ class NativeKVCacheEventManager:
         if int(life_cycle_id) != self._target_life_cycle_id:
             self.non_target_life_cycles_ignored += 1
             return
-        state = self._stored_blocks.pop(block_hash, None)
-        if state is not None:
-            self._add_removed_hashes([state.block_hash])
+        stored_hash = self._stored_blocks.pop(block_hash, None)
+        if stored_hash is not None:
+            self._add_removed_hashes([stored_hash])
 
     def _add_removed_hashes(self, block_hashes: list[ExternalBlockHash]) -> None:
         if not block_hashes:

@@ -18,9 +18,14 @@ import time
 from types import SimpleNamespace
 
 import msgspec
+import pytest
 import zmq
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_events import BlockRemoved, NativeKVCacheEventManager
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
+    BlockRemoved,
+    NativeKVCacheEventManager,
+    ZmqEventPublisher,
+)
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
 
@@ -184,3 +189,37 @@ def test_native_removals_are_never_dropped_by_the_entry_cap():
     assert sum(len(event.block_hashes) for event in removed) == 2
 
     manager.shutdown()
+
+
+def test_kv_events_config_publisher_default():
+    """model_post_init resolves the publisher default (the common user path)."""
+    assert KVEventsConfig(enable_kv_cache_events=True).publisher == "zmq"
+    assert KVEventsConfig().publisher == "null"
+    assert KVEventsConfig(enable_kv_cache_events=False).publisher == "null"
+    # An explicitly set publisher is always respected.
+    assert KVEventsConfig(enable_kv_cache_events=True, publisher="null").publisher == "null"
+    assert KVEventsConfig(enable_kv_cache_events=False, publisher="zmq").publisher == "zmq"
+
+
+@pytest.mark.parametrize(
+    "endpoint,rank,expected",
+    [
+        ("tcp://*:5557", 0, "tcp://*:5557"),  # rank 0 is identity
+        ("tcp://*:5557", 3, "tcp://*:5560"),  # tcp base_port + rank
+        ("tcp://127.0.0.1:5557", 1, "tcp://127.0.0.1:5558"),
+        ("ipc:///tmp/kv-events", 2, "ipc:///tmp/kv-events_dp2"),  # no port -> suffix
+        ("inproc://kv-events", 2, "inproc://kv-events_dp2"),
+        (None, 5, None),
+    ],
+)
+def test_offset_endpoint_port(endpoint, rank, expected):
+    assert ZmqEventPublisher.offset_endpoint_port(endpoint, rank) == expected
+
+
+def test_offset_endpoint_port_rejects_bad_input():
+    # base_port + rank must stay within the u16 range.
+    with pytest.raises(ValueError):
+        ZmqEventPublisher.offset_endpoint_port("tcp://*:65535", 1)
+    # Unknown scheme is rejected for a non-zero rank.
+    with pytest.raises(ValueError):
+        ZmqEventPublisher.offset_endpoint_port("http://host:5557", 1)
