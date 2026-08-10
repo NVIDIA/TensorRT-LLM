@@ -37,6 +37,8 @@ MARKER_LIST_IN_TEST = [" TIMEOUT"]
 # AST validation defaults
 _DEFAULT_TEST_LISTS_DIR = "tests/integration/test_lists"
 _DEFAULT_TEST_BASE_DIR = "tests/integration/defs"
+# Preserve pytest's defaults while collecting the intentionally nonstandard dry-run module.
+_L0_PYTEST_FILE_PATTERNS = "test_*.py *_test.py infra_dry_run_benchmark.py"
 # Paths whose tests are generated dynamically — skip AST validation
 _EXCLUDED_PATH_PREFIXES = ("perf/", )
 
@@ -593,7 +595,8 @@ def verify_l0_test_lists(llm_src):
 
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --test-list={test_list} --output-dir={llm_src} -s --co -q",
+        f"pytest -o \"python_files={_L0_PYTEST_FILE_PATTERNS}\" "
+        f"--test-list={test_list} --output-dir={llm_src} -s --co -q",
         shell=True,
         check=True)
 
@@ -659,7 +662,7 @@ def check_waive_duplicates(llm_src):
                     f.write(
                         f"  Occurrence {i} at line {line_no}: '{original_line}'\n"
                     )
-                f.write(f"\n")
+                f.write("\n")
 
 
 def verify_waive_list(llm_src, args):

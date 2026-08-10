@@ -154,6 +154,12 @@ class InfraDryRunPytestTest(unittest.TestCase):
             )
             test_list = root / "infra_dry_run.txt"
             test_list.write_text("infra_dry_run_benchmark.py::test_infra_dry_run_benchmark\n")
+            (root / "test_normal.py").write_text("def test_normal(): pass\n")
+            validation_list = root / "all_l0.txt"
+            validation_list.write_text(
+                "infra_dry_run_benchmark.py::test_infra_dry_run_benchmark\n"
+                "test_normal.py::test_normal\n"
+            )
             env = {**os.environ, "stageName": "CPU-Validation"}
             explicit = subprocess.run(
                 [
@@ -164,6 +170,24 @@ class InfraDryRunPytestTest(unittest.TestCase):
                     f"--test-list={test_list}",
                     "--test-prefix=CPU-Validation",
                     str(benchmark),
+                ],
+                cwd=root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            validation = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--collect-only",
+                    "-o",
+                    "python_files=test_*.py *_test.py infra_dry_run_benchmark.py",
+                    f"--test-list={validation_list}",
                 ],
                 cwd=root,
                 env=env,
@@ -184,7 +208,12 @@ class InfraDryRunPytestTest(unittest.TestCase):
 
         self.assertEqual(explicit.returncode, 0, explicit.stdout)
         self.assertIn("1 passed", explicit.stdout)
-        self.assertEqual(normal.returncode, 5, normal.stdout)
+        self.assertEqual(validation.returncode, 0, validation.stdout)
+        self.assertIn("infra_dry_run_benchmark.py::test_infra_dry_run_benchmark", validation.stdout)
+        self.assertIn("test_normal.py::test_normal", validation.stdout)
+        self.assertIn("2 tests collected", validation.stdout)
+        self.assertEqual(normal.returncode, 0, normal.stdout)
+        self.assertIn("test_normal.py::test_normal", normal.stdout)
         self.assertNotIn(BENCHMARK_PATH.name, normal.stdout)
 
     def test_bounded_wait_interrupts_and_restores_the_signal_handler(self):

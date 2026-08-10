@@ -33,6 +33,7 @@ BENCHMARK = BENCHMARK_PATH.read_text()
 DRY_RUN_DB_PATH = (
     REPO_ROOT / "tests" / "integration" / "test_lists" / "test-db" / "infra_dry_run.yml"
 )
+CHECK_TEST_LIST = (REPO_ROOT / "scripts" / "check_test_list.py").read_text()
 
 
 def _function_body(source, name, next_name):
@@ -62,6 +63,10 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             "infra_dry_run_benchmark.py::test_infra_dry_run_benchmark",
             DRY_RUN_DB_PATH.read_text(),
         )
+        l0_validation = _function_body(
+            CHECK_TEST_LIST, "verify_l0_test_lists", "verify_qa_test_lists"
+        )
+        self.assertIn('pytest -o \\"python_files={_L0_PYTEST_FILE_PATTERNS}\\"', l0_validation)
         self.assertIn('positionalTest=""', process)
         self.assertIn("if (positionalTest)", process)
         self.assertIn("testListCmd += [positionalTest]", process)
