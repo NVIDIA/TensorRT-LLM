@@ -76,11 +76,14 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
             ],
         )
 
-    first_hash = b"\x11" * 24 + b"\x80\x00\x00\x00\x00\x00\x00\x01"
+    # Wire hashes come from truncate_sha256_hash_to_int64 = the FIRST 8 bytes of
+    # the radix key, so put the distinguishing bytes -- including the high bit
+    # that exercises the signed-wraparound branch of the wire hash -- at the front.
+    first_hash = b"\x80\x00\x00\x00\x00\x00\x00\x01" + b"\x11" * 24
     partial_hash = b"\x22" * 32
-    second_hash = b"\x33" * 24 + b"\x00\x00\x00\x00\x00\x00\x00\x02"
-    first_wire_hash = int.from_bytes(first_hash[-8:], "big")
-    second_wire_hash = int.from_bytes(second_hash[-8:], "big")
+    second_hash = b"\x00\x00\x00\x00\x00\x00\x00\x02" + b"\x33" * 24
+    first_wire_hash = int.from_bytes(first_hash[:8], "big")
+    second_wire_hash = int.from_bytes(second_hash[:8], "big")
     first_wire_hash = first_wire_hash - 2**64 if first_wire_hash >= 2**63 else first_wire_hash
     second_wire_hash = second_wire_hash - 2**64 if second_wire_hash >= 2**63 else second_wire_hash
     first = block(first_hash, [1, 2, 3, 4], root)
