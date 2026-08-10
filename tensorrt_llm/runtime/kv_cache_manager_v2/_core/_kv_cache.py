@@ -1293,13 +1293,13 @@ class _KVCache:
                         )
                         if changed:
                             self.manager.mark_stats_dirty(self.id)
-                    self._record_direct_iteration_stats(
-                        lc_idx,
-                        KVCacheIterationStatsDelta(
-                            iter_intra_device_copy_blocks=1,
-                            iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
-                        ),
-                    )
+                self._record_direct_iteration_stats(
+                    lc_idx,
+                    KVCacheIterationStatsDelta(
+                        iter_intra_device_copy_blocks=1,
+                        iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
+                    ),
+                )
             # Unlock source pages — _record_event captures all prior cuda work
             # so the original pages know when we're done reading from them.
             if src_locks:
