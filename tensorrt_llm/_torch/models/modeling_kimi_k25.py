@@ -1559,6 +1559,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     """
 
     _LANG_PREFIX = "language_model."
+    # Vision tower class. Subclasses (Kimi K3) override this so the shared
+    # __init__/load_weights MetaInitMode deferral-and-recreation logic
+    # constructs their tower without re-implementing either method.
+    _VISION_MODEL_CLS = KimiK25VisionModel
 
     @classmethod
     def get_preferred_kv_cache_manager_version(
@@ -1610,7 +1614,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         self.mm_encoder = None
         if not DISAGG:
             try:
-                mm_encoder = KimiK25VisionModel(model_config)
+                mm_encoder = self._VISION_MODEL_CLS(model_config)
                 if _has_meta_tensors(mm_encoder):
                     logger.info("Vision encoder deferred to load_weights() (MetaInitMode active)")
                 else:
@@ -1722,7 +1726,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             vision_model_config._frozen = False
             vision_model_config.pretrained_config = self._vlm_pretrained_config
             vision_model_config._frozen = True
-            self.mm_encoder = KimiK25VisionModel(vision_model_config)
+            self.mm_encoder = self._VISION_MODEL_CLS(vision_model_config)
         if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 

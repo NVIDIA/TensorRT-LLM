@@ -75,6 +75,13 @@
 
 set -euo pipefail
 
+# Per-job runtime config copies (the --dflash and --parallel tep rewrites) are
+# removed when this batch script exits. Every branch that writes one appends
+# it here; a single trap covers them all because a second bare `trap ... EXIT`
+# would *replace* the first, not add to it.
+CLEANUP_FILES=()
+trap '[ ${#CLEANUP_FILES[@]} -eq 0 ] || rm -f "${CLEANUP_FILES[@]}"' EXIT
+
 usage() {
     echo "Usage: sbatch $0 --model PATH --image PATH [--task gsm8k|mmmu] [--parallel dep|tep] [--sa | --reuse | --dflash DRAFTER_PATH]"
 }
@@ -199,6 +206,7 @@ case "$MODE" in
         EVAL_CONFIG=$REPO/examples/kimi_k3/.eval_dflash_runtime.$SLURM_JOB_ID.yaml
         sed "s|speculative_model: .*|speculative_model: $DFLASH_DRAFTER|" \
             "$REPO/examples/kimi_k3/eval_extra_llm_options_dflash.yaml" > "$EVAL_CONFIG"
+        CLEANUP_FILES+=("$EVAL_CONFIG")
         MAX_BATCH_SIZE=8
         MAX_NUM_TOKENS=4096
         KV_FRAC=0.20
@@ -231,11 +239,11 @@ if [[ "$PARALLEL" == tep ]]; then
     # The per-job copy must live under $REPO: that is the only path guaranteed
     # to be container-mounted at the same location on every rank
     # ($SLURM_SUBMIT_DIR only coincides with it by default, and a node-local
-    # mktemp file would be invisible to the other nodes). Removed when this
-    # batch script exits; also gitignored in case the job dies before the
-    # trap fires.
+    # mktemp file would be invisible to the other nodes). Removed by the
+    # CLEANUP_FILES exit trap; also gitignored in case the job dies before
+    # the trap fires.
     TEP_CONFIG=$REPO/examples/kimi_k3/.eval_tep_runtime.$SLURM_JOB_ID.yaml
-    trap 'rm -f "$TEP_CONFIG"' EXIT
+    CLEANUP_FILES+=("$TEP_CONFIG")
     if [[ "$MODE" == default ]]; then
         MAX_BATCH_SIZE=128
         sed -e 's/^enable_attention_dp: true$/enable_attention_dp: false/' \

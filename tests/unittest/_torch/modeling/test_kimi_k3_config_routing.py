@@ -11,7 +11,9 @@ the checkpoint.
 """
 
 import unittest
+from types import SimpleNamespace
 
+from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
 from tensorrt_llm._torch.pyexecutor.config_utils import is_kimi_k3_multimodal_config
 
 
@@ -71,6 +73,31 @@ class TestIsKimiK3MultimodalConfig(unittest.TestCase):
         cfg = _composite_config()
         cfg["model_type"] = "qwen3_5"
         self.assertFalse(is_kimi_k3_multimodal_config(cfg))
+
+
+def _vision_model_config(tp_size, enable_attention_dp):
+    """Minimal stand-in exposing the mapping fields the predicate reads."""
+    return SimpleNamespace(
+        mapping=SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+    )
+
+
+class TestVisionRequiresReplication(unittest.TestCase):
+    """Pin the (mapping, num_heads) contract of _vision_requires_replication.
+
+    The predicate gates whether the MoonViT tower TP-shards or runs replicated
+    (tp=1); a silent change to the divisibility rule or the attention-DP
+    short-circuit would otherwise only fail at multi-GPU runtime.
+    """
+
+    def test_k3_12_heads_under_tp16_requires_replication(self):
+        self.assertTrue(_vision_requires_replication(_vision_model_config(16, False), num_heads=12))
+
+    def test_k25_16_heads_under_tp8_shards(self):
+        self.assertFalse(_vision_requires_replication(_vision_model_config(8, False), num_heads=16))
+
+    def test_attention_dp_always_replicates(self):
+        self.assertTrue(_vision_requires_replication(_vision_model_config(16, True), num_heads=16))
 
 
 if __name__ == "__main__":

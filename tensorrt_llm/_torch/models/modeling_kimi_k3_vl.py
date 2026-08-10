@@ -55,7 +55,6 @@ from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from ..pyexecutor.config_utils import resolve_hf_torch_dtype
-from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_kimi_k25 import (
     _MEDIA_PLACEHOLDER_TOKEN_ID,
     DISAGG,
@@ -74,7 +73,6 @@ from .modeling_kimi_linear import KimiLinearForCausalLM
 from .modeling_utils import (
     MetaInitException,
     QuantConfig,
-    filter_weights,
     register_auto_model,
     register_vision_encoder,
 )
@@ -430,10 +428,13 @@ class KimiK3InputProcessor(KimiK25InputProcessor):
 class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     """Kimi K3 vision-language model: MoonViT3d + KimiLinear text backbone.
 
-    Reuses the K2.5 wrapper's spec-dec / weight-loading property forwarding and
-    :meth:`forward`; only ``__init__`` (vision encoder + text backbone classes)
-    and the deferred vision-encoder recreation in :meth:`load_weights` differ.
+    Reuses the K2.5 wrapper's spec-dec / weight-loading property forwarding,
+    :meth:`forward`, and :meth:`load_weights` (which builds the tower through
+    ``_VISION_MODEL_CLS``); only ``__init__`` differs (vision encoder + text
+    backbone classes).
     """
+
+    _VISION_MODEL_CLS = KimiK3VisionModel
 
     def __init__(
         self,
@@ -468,7 +469,7 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
         self.mm_encoder = None
         if not DISAGG:
             try:
-                mm_encoder = KimiK3VisionModel(model_config)
+                mm_encoder = self._VISION_MODEL_CLS(model_config)
                 if _has_meta_tensors(mm_encoder):
                     logger.info("Vision encoder deferred to load_weights() (MetaInitMode active)")
                 else:
@@ -514,24 +515,6 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
         model_config.pretrained_config = self.llm.config
         model_config._frozen = True
 
-    def load_weights(self, weights) -> None:
-        """Load vision + projector + KimiLinear text weights from checkpoint."""
-        if self.mm_encoder is not None and _has_meta_tensors(self.mm_encoder):
-            logger.info("Recreating deferred vision encoder after MetaInitMode")
-            self.mm_encoder = None
-
-        if self.mm_encoder is None and not DISAGG:
-            vision_model_config = copy.copy(self.model_config)
-            vision_model_config._frozen = False
-            vision_model_config.pretrained_config = self._vlm_pretrained_config
-            vision_model_config._frozen = True
-            self.mm_encoder = KimiK3VisionModel(vision_model_config)
-        if self.mm_encoder is not None:
-            self.mm_encoder.load_weights(weights)
-
-        if any(k.startswith(self._LANG_PREFIX) for k in weights):
-            lm_weights = filter_weights("language_model", weights)
-            lm_weights = ConsumableWeightsDict(lm_weights)
-        else:
-            lm_weights = weights
-        self.llm.load_weights(lm_weights)
+    # load_weights is inherited from KimiK25ForConditionalGeneration: the
+    # MetaInitMode deferral/recreation logic is identical and constructs the
+    # tower via _VISION_MODEL_CLS, which this class overrides above.

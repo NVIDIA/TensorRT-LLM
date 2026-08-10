@@ -1636,15 +1636,19 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
 # path is unchanged.
 
 from tensorrt_llm.evaluate.post_processing import (  # noqa: E402
-    extract_kimi_k3_mmmu_answer, strip_thinking,
-    strip_thinking_and_extract_mmmu_answer)
+    extract_kimi_k3_mmmu_answer,
+    strip_thinking,
+    strip_thinking_and_extract_mmmu_answer,
+)
 
 
 def _k3_output(thinking: str, answer: str) -> str:
     """Build a well-formed Kimi K3 channel-structured output string."""
-    return (f"{thinking}<|close|>think<|sep|>"
-            f"<|open|>response<|sep|>{answer}<|close|>response<|sep|>"
-            f"<|close|>message<|sep|>")
+    return (
+        f"{thinking}<|close|>think<|sep|>"
+        f"<|open|>response<|sep|>{answer}<|close|>response<|sep|>"
+        f"<|close|>message<|sep|>"
+    )
 
 
 def test_k3_channel_bare_letter():
@@ -1654,14 +1658,26 @@ def test_k3_channel_bare_letter():
 
 
 def test_k3_channel_real_samples_recovered():
-    """Real committed mmmu_val samples the old parser scored wrong (channel has
-    the correct letter): accounting doc_id 7->C, 12->D, 21->A."""
-    assert extract_kimi_k3_mmmu_answer(
-        _k3_output("...Total debits adjusted = 126,925. Final: C.", "C")) == "C"
-    assert extract_kimi_k3_mmmu_answer(
-        _k3_output("...Ending = 0. Option D. Final just D.", "D")) == "D"
-    assert extract_kimi_k3_mmmu_answer(
-        _k3_output("...commonly known by that name, so True. (A).", "A")) == "A"
+    """Real committed mmmu_val samples the old parser scored wrong.
+
+    The channel holds the correct letter: accounting doc_id 7->C, 12->D, 21->A.
+    """
+    assert (
+        extract_kimi_k3_mmmu_answer(
+            _k3_output("...Total debits adjusted = 126,925. Final: C.", "C")
+        )
+        == "C"
+    )
+    assert (
+        extract_kimi_k3_mmmu_answer(_k3_output("...Ending = 0. Option D. Final just D.", "D"))
+        == "D"
+    )
+    assert (
+        extract_kimi_k3_mmmu_answer(
+            _k3_output("...commonly known by that name, so True. (A).", "A")
+        )
+        == "A"
+    )
 
 
 def test_k3_channel_parenthesized_answer():
@@ -1677,10 +1693,14 @@ def test_k3_channel_answer_is_phrase():
 
 
 def test_k3_truncated_after_channel_open():
-    """Output truncated right after the response channel opened still yields the
-    letter (regex boundary falls back to end-of-text)."""
-    out = ("Some reasoning.<|close|>think<|sep|>"
-           "<|open|>response<|sep|>B")  # cut off before <|close|>response
+    """Truncation right after the channel opened still yields the letter.
+
+    The regex boundary falls back to end-of-text for the unterminated span.
+    """
+    out = (
+        "Some reasoning.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>B"
+    )  # cut off before <|close|>response
     assert extract_kimi_k3_mmmu_answer(out) == "B"
 
 
@@ -1688,7 +1708,8 @@ def test_k3_last_channel_wins():
     """When multiple response channels are present, the final one is the answer."""
     out = (
         "r1<|close|>think<|sep|><|open|>response<|sep|>A<|close|>response<|sep|>"
-        "<|open|>response<|sep|>E<|close|>response<|sep|><|close|>message<|sep|>")
+        "<|open|>response<|sep|>E<|close|>response<|sep|><|close|>message<|sep|>"
+    )
     assert extract_kimi_k3_mmmu_answer(out) == "E"
 
 
@@ -1699,10 +1720,14 @@ def test_k3_no_channel_bare_letter_falls_back():
 
 
 def test_k3_no_channel_truncated_thinking_does_not_crash():
-    """A thinking trace truncated before the channel opened (finish=length):
-    no channel to parse -> fall back; must not raise and must not fabricate."""
-    truncated = ("Let me reason step by step about this very long problem "
-                 "that never reaches a final answer channel " * 20)
+    """Thinking truncated before the channel opened (finish=length).
+
+    No channel to parse -> fall back; must not raise and must not fabricate.
+    """
+    truncated = (
+        "Let me reason step by step about this very long problem "
+        "that never reaches a final answer channel " * 20
+    )
     # Should not raise; returns whatever the fallback cascade yields (the model
     # genuinely did not emit an answer, so the exact value is not asserted).
     out = extract_kimi_k3_mmmu_answer(truncated)
@@ -1714,10 +1739,14 @@ def test_k3_empty_input():
 
 
 def test_k3_scrubs_residual_special_tokens():
-    """Residual ``<|...|>`` tokens inside a channel span are scrubbed, not
-    returned as part of the answer."""
-    out = ("t<|close|>think<|sep|><|open|>response<|sep|>"
-           "<|reserved|>D<|close|>response<|sep|><|close|>message<|sep|>")
+    """Residual ``<|...|>`` tokens inside a channel span are scrubbed.
+
+    They must not be returned as part of the answer.
+    """
+    out = (
+        "t<|close|>think<|sep|><|open|>response<|sep|>"
+        "<|reserved|>D<|close|>response<|sep|><|close|>message<|sep|>"
+    )
     assert extract_kimi_k3_mmmu_answer(out) == "D"
 
 
@@ -1731,3 +1760,15 @@ def test_k2_5_strip_thinking_path_unchanged():
     # And the K3 extractor, given a </think> blob with no K3 response channel,
     # defers to the K2.5 cascade and returns the same answer.
     assert extract_kimi_k3_mmmu_answer(k25) == "C"
+
+
+def test_k3_channel_extracting_to_nothing_falls_back_to_cascade():
+    """A channel whose content extracts to nothing must not mask the fallback.
+
+    "** **" survives the special-token scrub as non-empty text, but the
+    cascade's markdown-bold stripping reduces it to "" — the extractor must
+    keep scanning and recover the letter from the reasoning text instead of
+    returning the empty string.
+    """
+    out = _k3_output("Elimination shows the answer is (B).", "** **")
+    assert extract_kimi_k3_mmmu_answer(out) == "B"
