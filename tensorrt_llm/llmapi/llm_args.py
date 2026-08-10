@@ -3619,11 +3619,11 @@ class MambaStateConfig(StrictBaseModel):
 
 
 class KVEventsConfig(StrictBaseModel):
-    """Configuration for native KV cache event publishing."""
+    """Configuration for streaming (push-based) KV cache event publishing."""
 
     enable_kv_cache_events: bool = Field(
         default=False,
-        description="Whether to produce and publish native KV cache events.")
+        description="Whether to produce and publish KV cache events over the streaming (push) path.")
     publisher: Optional[Literal["null", "zmq"]] = Field(
         default=None,
         description=
@@ -3736,9 +3736,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         status="prototype",
         description=
-        "Native KV cache event publishing (KV cache manager V2 only). When set, "
+        "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, "
         "each rank publishes its own events directly (e.g. over ZeroMQ) instead "
-        "of the legacy event_buffer_max_size gather/poll path.")
+        "of the buffered event_buffer_max_size gather/poll path.")
     enable_partial_reuse: bool = Field(
         default=True,
         description=

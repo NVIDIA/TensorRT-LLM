@@ -82,7 +82,7 @@ from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .kv_cache_events import NativeKVCacheEventManager
+from .kv_cache_events import StreamingKVCacheEventManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -868,32 +868,32 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len if window_size is None else int(window_size)
             for window_size in self.max_attention_window_vec
         )
-        self.event_manager: Optional[KVCacheEventManager | NativeKVCacheEventManager] = None
-        native_events_enabled = (
+        self.event_manager: Optional[KVCacheEventManager | StreamingKVCacheEventManager] = None
+        streaming_events_enabled = (
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
-        if native_events_enabled:
+        if streaming_events_enabled:
             if self.event_buffer_max_size > 0:
                 logger.warning(
-                    "Both kv_cache_config.event_buffer_max_size and native "
-                    "kv_events_config are enabled; native publishing takes "
-                    "precedence and the legacy get_kv_cache_events() poll path "
+                    "Both kv_cache_config.event_buffer_max_size and streaming "
+                    "kv_events_config are enabled; streaming publishing takes "
+                    "precedence and the buffered get_kv_cache_events() poll path "
                     "will return no events."
                 )
             if mapping.pp_size > 1:
-                raise ValueError("Native KV events do not support pipeline parallelism")
+                raise ValueError("Streaming KV events do not support pipeline parallelism")
             if mapping.cp_size > 1:
-                raise ValueError("Native KV events do not support context parallelism")
+                raise ValueError("Streaming KV events do not support context parallelism")
             assert kv_events_config is not None
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 event_rank = mapping.rank if mapping.enable_attention_dp else 0
-                self.event_manager = NativeKVCacheEventManager(
+                self.event_manager = StreamingKVCacheEventManager(
                     kv_events_config,
                     data_parallel_rank=event_rank,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
                 )
-                logger.info("Native KV event fast path reuses V2 radix block hashes")
+                logger.info("Streaming KV event fast path reuses V2 radix block hashes")
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
@@ -1073,7 +1073,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        # The native event manager has already bound its ZMQ socket and started
+        # The streaming event manager has already bound its ZMQ socket and started
         # its background thread, so tear it down if impl construction or
         # event-manager setup fails here -- otherwise the socket and daemon
         # thread leak and an in-process retry cannot rebind the same endpoint.
@@ -1105,7 +1105,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     self._get_event_layer_group_ids(),
                 )
         except Exception:
-            if isinstance(self.event_manager, NativeKVCacheEventManager):
+            if isinstance(self.event_manager, StreamingKVCacheEventManager):
                 self.event_manager.shutdown()
             raise
 
@@ -1507,7 +1507,7 @@ class KVCacheManagerV2(BaseResourceManager):
         window_sizes: Dict[int, int] = {}
         for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
             life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
-            # Native KV events track attention prefix reuse only. Excluding SSM
+            # Streaming KV events track attention prefix reuse only. Excluding SSM
             # and other non-attention life cycles prevents a state life cycle
             # (which reports max_seq_len as its window) from tying with the
             # attention life cycle and being selected as the event target.
@@ -2943,8 +2943,8 @@ class KVCacheManagerV2(BaseResourceManager):
             event_manager.flush_iteration_events()
 
     def get_latest_events(self, timeout_ms: Optional[float] = None):
-        # Native publishing pushes events out-of-band; in that mode the event
-        # manager's get_latest_events returns [], so the legacy pull path
+        # Streaming publishing pushes events out-of-band; in that mode the event
+        # manager's get_latest_events returns [], so the buffered pull path
         # degrades cleanly instead of raising. Snapshot event_manager once so a
         # concurrent shutdown cannot turn it into None between the check and use.
         event_manager = self.event_manager
@@ -2953,8 +2953,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return event_manager.get_latest_events(timeout_ms)
 
     @property
-    def native_kv_events_enabled(self) -> bool:
-        return isinstance(self.event_manager, NativeKVCacheEventManager)
+    def streaming_kv_events_enabled(self) -> bool:
+        return isinstance(self.event_manager, StreamingKVCacheEventManager)
 
     def get_iteration_stats(self):
         if not self.enable_stats:
@@ -3482,12 +3482,12 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self.impl.shutdown()
-        # Shut the native event manager down last so removals emitted during
+        # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
         # event_manager: get_latest_events/flush snapshot it and operate safely
         # on a closed manager, so there is no teardown-time None race.
-        if isinstance(self.event_manager, NativeKVCacheEventManager):
+        if isinstance(self.event_manager, StreamingKVCacheEventManager):
             self.event_manager.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()

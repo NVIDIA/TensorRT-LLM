@@ -1996,7 +1996,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["kv_events_config"] = kv_events_config
     elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
         logger.warning(
-            "kv_cache_config.kv_events_config is set but native KV event "
+            "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):

@@ -164,7 +164,7 @@ class ZmqEventPublisher(EventPublisher):
         )
         self._thread.start()
         logger.info(
-            f"Started native KV event publisher rank={self._rank} "
+            f"Started streaming KV event publisher rank={self._rank} "
             f"endpoint={self._endpoint} topic={topic!r}"
         )
 
@@ -189,7 +189,7 @@ class ZmqEventPublisher(EventPublisher):
             drops = self._queue_full_drops
             if drops == 1 or (drops & (drops - 1) == 0):
                 logger.warning(
-                    f"Dropping native KV event batch on rank={self._rank} because "
+                    f"Dropping streaming KV event batch on rank={self._rank} because "
                     "the publisher queue is full; "
                     f"dropped_batches={self.dropped_batches}"
                 )
@@ -208,11 +208,11 @@ class ZmqEventPublisher(EventPublisher):
         self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
         if self._thread.is_alive():
             logger.warning(
-                f"Native KV event publisher rank={self._rank} did not stop "
+                f"Streaming KV event publisher rank={self._rank} did not stop "
                 f"within {self.SHUTDOWN_TIMEOUT:.1f}s"
             )
         logger.info(
-            f"Stopped native KV event publisher rank={self._rank} "
+            f"Stopped streaming KV event publisher rank={self._rank} "
             f"enqueued_batches={self.enqueued_batches} "
             f"published_batches={self.published_batches} "
             f"dropped_batches={self.dropped_batches}"
@@ -245,7 +245,7 @@ class ZmqEventPublisher(EventPublisher):
                         self._service_replay()
                     except Exception:
                         logger.error(
-                            "Failed to service native KV event replay request\n"
+                            "Failed to service streaming KV event replay request\n"
                             f"{traceback.format_exc()}"
                         )
                 try:
@@ -270,7 +270,7 @@ class ZmqEventPublisher(EventPublisher):
                 except Exception:
                     self._send_error_drops += 1
                     logger.error(
-                        f"Failed to publish native KV event batch rank={self._rank} "
+                        f"Failed to publish streaming KV event batch rank={self._rank} "
                         f"seq={seq}\n{traceback.format_exc()}"
                     )
                     time.sleep(0.1)
@@ -285,7 +285,7 @@ class ZmqEventPublisher(EventPublisher):
         assert self._replay is not None
         frame = self._replay.recv_multipart()
         if len(frame) != 3:
-            logger.warning(f"Invalid native KV event replay request: {frame}")
+            logger.warning(f"Invalid streaming KV event replay request: {frame}")
             return
         client_id, _, start_seq_bytes = frame
         start_seq = int.from_bytes(start_seq_bytes, "big")
@@ -351,7 +351,7 @@ def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
 
-class NativeKVCacheEventManager:
+class StreamingKVCacheEventManager:
     """Scheduler-local fast path that produces vLLM wire events directly.
 
     Implements the V2 KV-cache-manager event-sink hook interface by duck
@@ -403,10 +403,10 @@ class NativeKVCacheEventManager:
                 if window_size == largest_window
             ]
         if not target_ids:
-            raise ValueError("Native KV events require an attention KV cache life cycle")
+            raise ValueError("Streaming KV events require an attention KV cache life cycle")
         self._target_life_cycle_id = min(target_ids)
         logger.info(
-            "Native KV event fast path selected "
+            "Streaming KV event fast path selected "
             f"lifecycle_id={self._target_life_cycle_id} "
             f"window_size={self._max_window_size}"
         )
@@ -419,7 +419,7 @@ class NativeKVCacheEventManager:
         return
 
     def add_stored_event(self, *args: Any, **kwargs: Any) -> None:
-        # Native publishing derives stored events from the per-block hooks
+        # Streaming publishing derives stored events from the per-block hooks
         # below; the aggregate stored-event hook is intentionally unused.
         return
 
@@ -456,7 +456,7 @@ class NativeKVCacheEventManager:
             self.dropped_events += 1
             self._pending_entries -= 1
             logger.error(
-                "Dropping native KV store event with unsupported token data\n"
+                "Dropping streaming KV store event with unsupported token data\n"
                 f"{traceback.format_exc()}"
             )
             return
@@ -557,7 +557,7 @@ class NativeKVCacheEventManager:
             self.dropped_events & (self.dropped_events - 1) == 0
         ):
             logger.warning(
-                "Dropping native KV events because the per-iteration safety "
+                "Dropping streaming KV events because the per-iteration safety "
                 f"cap was exceeded; dropped_events={self.dropped_events}"
             )
         return False
@@ -582,14 +582,14 @@ class NativeKVCacheEventManager:
         except Exception:
             self.dropped_batches += 1
             logger.error(
-                f"Dropping native KV event iteration batch on rank={self._rank}\n"
+                f"Dropping streaming KV event iteration batch on rank={self._rank}\n"
                 f"{traceback.format_exc()}"
             )
 
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
-        # Native publishing pushes events out-of-band, so the pull API has
+        # Streaming publishing pushes events out-of-band, so the pull API has
         # nothing to return. Return empty instead of raising so callers of the
-        # legacy polling path degrade cleanly rather than erroring.
+        # buffered polling path degrade cleanly rather than erroring.
         return []
 
     def shutdown(self) -> None:
@@ -599,7 +599,7 @@ class NativeKVCacheEventManager:
         self._closed = True
         self._publisher.shutdown()
         logger.info(
-            "Native KV event fast path "
+            "Streaming KV event fast path "
             f"rank={self._rank} "
             f"stored_blocks={self.stored_blocks} "
             f"removed_blocks={self.removed_blocks} "
