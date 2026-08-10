@@ -31,7 +31,7 @@ from utils.llm_data import llm_models_root
 
 @pytest.fixture(scope="module")
 def trtllm_model_path():
-    return llm_models_root() / "gpt_oss/gpt-oss-20b"
+    return llm_models_root() / "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
