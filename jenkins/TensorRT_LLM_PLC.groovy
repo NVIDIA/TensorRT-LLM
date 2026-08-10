@@ -52,7 +52,7 @@ def createKubernetesPodConfig()
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: pulse-container-scanner
-                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:stable
+                    image: urm.nvidia.com/sw-tensorrt-docker/pulse-container-scanner:stable
                     command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
@@ -69,7 +69,7 @@ def createKubernetesPodConfig()
                       runAsUser: 0
                       runAsGroup: 0
                   - name: pulse-oss-scanner
-                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable
+                    image: urm.nvidia.com/sw-tensorrt-docker/pulse-oss-cli:stable
                     command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
