@@ -103,6 +103,10 @@ def _make_runtime(seed):
                         * 0.03
                     ).to(p.dtype)
                 )
+    # The fused-verify conv constants are prebuilt at weight-load finalize
+    # time in production; the runtime never computes them lazily. Mirror
+    # that here (after the random init above, which they snapshot).
+    rt._build_mtp_conv_weights()
     return rt
 
 

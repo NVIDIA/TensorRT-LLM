@@ -336,6 +336,106 @@ class MambaPolicy:
     """
 
     @staticmethod
+    def _find_mamba_layer_group(
+        page_table: Optional[KVCachePageTable],
+    ) -> Optional[MambaLayerGroup]:
+        if page_table is None:
+            return None
+        return next(
+            (lg for lg in page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+
+    @staticmethod
+    def validate_peer_compatible(
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+        self_page_table: Optional[KVCachePageTable],
+        peer_page_table: Optional[KVCachePageTable],
+    ) -> None:
+        """Validate recurrent-state (Mamba/KDA) layout compatibility with a peer.
+
+        Analogue of the C++ ``rnnCacheFormatter inquireSupport`` gate for the
+        V2 path: reject at peer-registration time instead of corrupting
+        memory at transfer time. Raises ``ValueError`` naming the mismatched
+        field.
+
+        The core invariant checked is *global* (TP-aggregated) state size:
+        for a TP-sharded state, ``per_rank_bytes * mamba_tp`` is
+        TP-invariant, so it must match between peers even when their TP
+        sizes differ. Models with *replicated* recurrent state (e.g. Kimi K3
+        KDA, whose per-rank state is pre-scaled to full size when
+        attention-DP is off) violate this invariant under heterogeneous TP —
+        exactly the configuration where the TP-mismatch mappers would
+        compute shard offsets past the end of the slot, silently corrupting
+        the replicated state — and are therefore rejected here.
+        """
+        self_mlg = MambaPolicy._find_mamba_layer_group(self_page_table)
+        peer_mlg = MambaPolicy._find_mamba_layer_group(peer_page_table)
+        if self_mlg is None or peer_mlg is None:
+            # Under pipeline parallelism each rank publishes only its own
+            # stage's layers, so a hybrid model can pair a rank holding
+            # recurrent layers with a peer stage holding none. The transfer
+            # path (build_mamba_frags) intersects the two layer sets and
+            # moves nothing when either side has no recurrent layers, so
+            # there is nothing to validate for this pair.
+            return
+
+        # Layer sets are NOT required to match: with pipeline parallelism the
+        # two sides may partition layers differently, and the transfer covers
+        # exactly the intersection (empty intersection moves no state). The
+        # invariants below are per-layer-slot quantities, uniform across a
+        # model's recurrent layers, so they apply regardless of which layers
+        # overlap.
+        if (
+            self_mlg.ssm_bytes_per_head is not None
+            and peer_mlg.ssm_bytes_per_head is not None
+            and self_mlg.ssm_bytes_per_head != peer_mlg.ssm_bytes_per_head
+        ):
+            # TP-invariant: head_dim * d_state * element_size. A mismatch
+            # means different state shape or SSM cache dtype.
+            raise ValueError(
+                "MambaPolicy.validate_peer_compatible: ssm_bytes_per_head differs "
+                f"(local={self_mlg.ssm_bytes_per_head}, peer={peer_mlg.ssm_bytes_per_head}); "
+                "check head_dim / d_state / mamba_ssm_cache_dtype"
+            )
+
+        self_tp, _ = MambaPolicy._mamba_tp(self_ri)
+        peer_tp, _ = MambaPolicy._mamba_tp(peer_ri)
+
+        def _check_global(field: str, self_bytes: int, peer_bytes: int) -> None:
+            if self_bytes * self_tp != peer_bytes * peer_tp:
+                raise ValueError(
+                    f"MambaPolicy.validate_peer_compatible: global (TP-aggregated) {field} "
+                    f"differs: local {self_bytes} bytes/rank x mamba_tp={self_tp} vs "
+                    f"peer {peer_bytes} bytes/rank x mamba_tp={peer_tp}. Per-rank state "
+                    "sizes are inconsistent with a TP-sharded layout across the two "
+                    "sides; either the state shape/dtype differs, or the model keeps a "
+                    "replicated (non-TP-sharded) recurrent state (e.g. Kimi K3 KDA), "
+                    "which supports heterogeneous ctx/gen TP only with attention-DP "
+                    "enabled on both sides."
+                )
+
+        _check_global(
+            "ssm slot_bytes", self_mlg.ssm_states.slot_bytes, peer_mlg.ssm_states.slot_bytes
+        )
+        _check_global(
+            "conv slot_bytes", self_mlg.conv_states.slot_bytes, peer_mlg.conv_states.slot_bytes
+        )
+
+        if self_mlg.conv_section_bytes is not None and peer_mlg.conv_section_bytes is not None:
+            if len(self_mlg.conv_section_bytes) != len(peer_mlg.conv_section_bytes):
+                raise ValueError(
+                    "MambaPolicy.validate_peer_compatible: conv section count differs "
+                    f"(local={len(self_mlg.conv_section_bytes)}, "
+                    f"peer={len(peer_mlg.conv_section_bytes)})"
+                )
+            for i, (s, p) in enumerate(
+                zip(self_mlg.conv_section_bytes, peer_mlg.conv_section_bytes)
+            ):
+                _check_global(f"conv_section_bytes[{i}]", s, p)
+
+    @staticmethod
     def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
         """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
 
@@ -491,6 +591,35 @@ class MambaPolicy:
                 kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
 
         return src_frags, dst_frags, kv_sizes
+
+    @staticmethod
+    def payload_bytes(
+        sender_page_table: KVCachePageTable,
+        receiver_page_table: KVCachePageTable,
+        dst_slot: Optional[int],
+        sender_ri: RankInfo,
+        receiver_ri: RankInfo,
+    ) -> int:
+        """Total recurrent-state bytes one sender appends to the KV write for a request.
+
+        Mirrors the sender's ``collect_frags`` call in ``_build_kv_write_meta`` with the same
+        argument roles (sender as self/src), so the receiver can size a bounce region for the
+        exact bytes the coalesced write will carry. Slot indices only shift pointers, never
+        fragment sizes, so a dummy ``src_slot`` stands in for the sender's state index (which
+        the receiver does not know at reserve time). Returns 0 when either side has no mamba
+        layer group or the receiver has no state slot for the request.
+        """
+        if dst_slot is None:
+            return 0
+        _, _, sizes = MambaPolicy.collect_frags(
+            self_page_table=sender_page_table,
+            peer_page_table=receiver_page_table,
+            src_slot=0,
+            dst_slot=dst_slot,
+            self_ri=sender_ri,
+            peer_ri=receiver_ri,
+        )
+        return int(sum(sizes))
 
     @staticmethod
     def collect_frags(
