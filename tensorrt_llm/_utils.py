@@ -63,7 +63,7 @@ except ImportError:
     has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import DataType, LayerType
+from tensorrt_llm.bindings import DataType, LayerType, steady_clock_now
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -107,6 +107,15 @@ def numpy_to_torch(x):
         return torch.from_numpy(x.view(np.int8)).view(torch.float8_e4m3fn)
     else:
         return torch.from_numpy(x)
+
+
+def get_steady_clock_now_in_seconds() -> float:
+    """Time from the C++ runtime's steady clock, in seconds.
+
+    Shared by the executor and the serving frontends so their perf-metric
+    timestamps are directly comparable.
+    """
+    return steady_clock_now().total_seconds()
 
 
 def CUASSERT(cuda_ret):
@@ -683,7 +692,7 @@ else:
 def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version == 100 or sm_version == 103
+    return sm_version >= 100 and sm_version < 110
 
 
 @lru_cache(maxsize=1)

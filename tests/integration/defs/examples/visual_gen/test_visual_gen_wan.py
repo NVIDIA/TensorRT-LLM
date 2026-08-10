@@ -23,6 +23,15 @@ import torch
 from defs import conftest
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
+    FASTWAN_LPIPS_FRAME_RATE,
+    FASTWAN_LPIPS_GUIDANCE_SCALE,
+    FASTWAN_LPIPS_HEIGHT,
+    FASTWAN_LPIPS_NEGATIVE_PROMPT,
+    FASTWAN_LPIPS_NUM_FRAMES,
+    FASTWAN_LPIPS_NUM_INFERENCE_STEPS,
+    FASTWAN_LPIPS_PROMPT,
+    FASTWAN_LPIPS_SEED,
+    FASTWAN_LPIPS_WIDTH,
     VISUAL_GEN_OUTPUT_VIDEO,
     WAN21_LPIPS_GUIDANCE_SCALE,
     WAN21_LPIPS_HEIGHT,
@@ -72,6 +81,7 @@ WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
+FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
 WAN_FEATURE_LPIPS_THRESHOLD = 0.05
 WAN_STANDARD_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
@@ -273,6 +283,29 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     return output_path
 
 
+@pytest.fixture(scope="session")
+def fastwan_video_path(_visual_gen_deps, llm_venv):
+    output_path = _visual_gen_output_path(llm_venv, "fastwan")
+    if os.path.isfile(output_path):
+        return output_path
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    with torch.compiler.set_stance("force_eager"):
+        _generate_wan_lpips_video(
+            _lpips_model_path(FASTWAN_MODEL_SUBPATH),
+            output_path,
+            FASTWAN_LPIPS_PROMPT,
+            FASTWAN_LPIPS_NEGATIVE_PROMPT,
+            FASTWAN_LPIPS_HEIGHT,
+            FASTWAN_LPIPS_WIDTH,
+            FASTWAN_LPIPS_NUM_FRAMES,
+            FASTWAN_LPIPS_NUM_INFERENCE_STEPS,
+            FASTWAN_LPIPS_GUIDANCE_SCALE,
+            FASTWAN_LPIPS_SEED,
+            FASTWAN_LPIPS_FRAME_RATE,
+        )
+    return output_path
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_wan21_t2v_lpips_against_golden(request, tmp_path, wan21_bf16_video_path):
     golden_path = _golden_media_path(
@@ -315,6 +348,29 @@ def test_wan22_t2v_lpips_against_golden(request, tmp_path, wan22_bf16_video_path
         WAN_LPIPS_THRESHOLD,
         wan22_bf16_video_path,
         "wan22_t2v_lpips_golden_video.mp4",
+    )
+    _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_fastwan_lpips_against_golden(request, tmp_path, fastwan_video_path):
+    golden_path = _golden_media_path(
+        tmp_path, "fastwan_lpips_golden_video.mp4", "FastWan LPIPS golden video"
+    )
+    score = _run_lpips_eval(
+        tmp_path,
+        "fastwan",
+        "video",
+        FASTWAN_LPIPS_PROMPT,
+        golden_path,
+        fastwan_video_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        WAN_LPIPS_THRESHOLD,
+        fastwan_video_path,
+        "fastwan_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 

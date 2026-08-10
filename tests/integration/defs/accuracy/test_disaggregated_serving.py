@@ -2484,7 +2484,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
-        # TRTLLM backend required (WIDEEP lacks MXFP4 support for V4-Flash).
+        # TRTLLM backend required: it is the backend supporting V4-Flash MXFP4.
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
@@ -2603,7 +2603,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # FP8 weights ~71 GB/rank at TP=4 → ~142 GB/rank at TP=2; requires
         # ≥140 GB per GPU (fits on B300 288 GB, tight on B200 178 GB).
-        # TRTLLM backend: WIDEEP's FP8 block-scale path is Hopper-only.
+        # TRTLLM backend: the CUTLASS FP8 block-scale path is Hopper-only.
         # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.

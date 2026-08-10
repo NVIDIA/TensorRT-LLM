@@ -31,10 +31,10 @@ from ..llm_request import LlmRequest
 from .ops.vanilla import Fusions
 from .sampler_common import _get_max_beam_width, _unwrap_singleton
 
-__all__ = ["PenaltyHandler", "PenaltyStore"]
+__all__ = ["PenaltyHandler", "PenaltyStore", "has_occurrence_penalty"]
 
 
-def _has_occurrence_penalty(request: LlmRequest) -> bool:
+def has_occurrence_penalty(request: LlmRequest) -> bool:
     sampling_config = request.sampling_config
     repetition = _unwrap_singleton(sampling_config.repetition_penalty)
     presence = _unwrap_singleton(sampling_config.presence_penalty)
@@ -219,7 +219,7 @@ class PenaltyHandler:
         Called from ``TorchSampler.validate_request`` (request admission), so a
         violating request is failed individually instead of aborting the whole batch.
         """
-        if _get_max_beam_width(request) > 1 and _has_occurrence_penalty(request):
+        if _get_max_beam_width(request) > 1 and has_occurrence_penalty(request):
             raise ValueError(
                 "TorchSampler does not support repetition, presence, or frequency "
                 "penalties with beam search."
@@ -240,7 +240,7 @@ class PenaltyHandler:
         gathered, so their stale parameters/counts are left untouched.
         """
         was_active = self._slots[slot] is not None
-        if not (_get_max_beam_width(request) == 1 and _has_occurrence_penalty(request)):
+        if not (_get_max_beam_width(request) == 1 and has_occurrence_penalty(request)):
             self._slots[slot] = None
             if was_active:
                 self._num_active_slots -= 1
