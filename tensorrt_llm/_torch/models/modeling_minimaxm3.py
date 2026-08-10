@@ -68,6 +68,7 @@ from ..utils import (
     ActivationType,
     AuxStreamType,
     EventType,
+    Fp4QuantizedTensor,
     get_model_extra_attrs,
     is_torch_compiling,
 )
@@ -705,18 +706,56 @@ class MiniMaxM3MoE(nn.Module):
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
 
+        # Resolved on first use, once the expert weights and their scales
+        # exist. The answer cannot change after weight load.
+        self._routed_expert_input_scale: Optional[torch.Tensor] = None
+        self._routed_expert_input_scale_resolved = False
+
+    @property
+    def routed_expert_input_scale(self) -> Optional[torch.Tensor]:
+        """NVFP4 global activation scale for the routed experts, or None.
+
+        Non-None only when the experts quantize their input to NVFP4 with a
+        static per-layer scale and no reshaping, which is what lets an
+        upstream kernel produce that quantized input in its epilogue.
+        """
+        if self._routed_expert_input_scale_resolved:
+            return self._routed_expert_input_scale
+        self._routed_expert_input_scale = self._resolve_routed_expert_input_scale()
+        self._routed_expert_input_scale_resolved = True
+        return self._routed_expert_input_scale
+
+    def _resolve_routed_expert_input_scale(self) -> Optional[torch.Tensor]:
+        experts = self.experts
+        if not experts.has_nvfp4:
+            return None
+        if getattr(experts, "fc31_act_scale", None) is not None:
+            # NVFP4_AWQ applies a per-channel pre-quant scale before
+            # quantizing, which an RMSNorm epilogue cannot reproduce.
+            return None
+        w3_w1_weight = getattr(experts, "w3_w1_weight", None)
+        if w3_w1_weight is None or w3_w1_weight.shape[-1] * 2 != self.hidden_dim:
+            # The MoE pads the activation to the weight's hidden extent before
+            # quantizing, which an epilogue emitting exactly hidden_dim
+            # columns cannot do.
+            return None
+        return getattr(experts, "fc31_input_scale", None)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
+            # The experts take the pre-quantized activation when the caller
+            # supplies one.
             return self.experts(
-                hidden_states,
+                hidden_states if hidden_states_fp4 is None else hidden_states_fp4,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
@@ -2432,6 +2471,42 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             )
         return self.post_attention_layernorm(hidden_states, residual)
 
+    def _apply_pre_moe_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor], torch.Tensor]:
+        """As _apply_pre_feed_forward_norm, but also quantizes the MoE input.
+
+        The routed experts consume NVFP4, and the AllReduce epilogue emits it
+        from the same bf16 norm result it already computes, saving the
+        standalone quantize between the AllReduce and the first expert GEMM.
+        The OUT_ variant is required because the router gate and the shared
+        expert still consume the bf16 norm.
+
+        Returns a None fp4 tensor when the fold does not apply, leaving the
+        MoE to quantize for itself.
+        """
+        scale = self.block_sparse_moe.routed_expert_input_scale
+        if not self.pre_feed_forward_fusion or scale is None:
+            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+            return hidden_states, None, residual
+
+        norm_out, act_fp4, act_sf, residual = self.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF,
+                residual=residual,
+                norm_weight=self.post_attention_layernorm.weight,
+                scale=scale,
+                eps=self.post_attention_layernorm.variance_epsilon,
+                trigger_completion_at_end=False,
+            ),
+        )
+        # The op emits LINEAR scale factors.
+        act = Fp4QuantizedTensor(act_fp4, act_sf, is_sf_swizzled=False)
+        return norm_out, act, residual
+
     def _apply_next_layer_layernorm(
         self,
         hidden_states: torch.Tensor,
@@ -2480,13 +2555,16 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
-            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+            hidden_states, hidden_states_fp4, residual = self._apply_pre_moe_norm(
+                hidden_states, residual
+            )
 
         with nvtx_range_debug(f"layer{self.layer_idx}.moe"):
             hidden_states = self.block_sparse_moe(
                 hidden_states,
                 attn_metadata,
                 final_all_reduce_params=self._feed_forward_all_reduce_params(),
+                hidden_states_fp4=hidden_states_fp4,
             )
 
         with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):

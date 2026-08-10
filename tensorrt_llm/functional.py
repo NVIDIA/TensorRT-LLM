@@ -129,6 +129,8 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
+    # NVFP4 with the block scale factors in LINEAR (row-major) layout.
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF = 10
 
 
 class AllReduceParams:

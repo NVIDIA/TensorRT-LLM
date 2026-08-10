@@ -49,8 +49,13 @@ def _register_fake():
             scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
             residual_out = torch.empty_like(input)
             return [quant_fp4, scale_fp4, residual_out]
-        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4):
-            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+        elif op in (int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4),
+                    int(AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)):
+            swizzled = op == int(
+                AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(
+                input.shape, 16, swizzled)
             quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
             scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
             norm_out = torch.empty_like(input)

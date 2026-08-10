@@ -318,6 +318,124 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
 
 
 @torch.inference_mode()
+def run_nvfp4_linear_sf_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    weights: torch.Tensor,
+    fusion_op: AllReduceFusionOp,
+):
+    """The linear-SF epilogue must match the standalone quantize bitwise.
+
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF lets a consumer of the
+    row-major scale factor layout have its activation quantized inside the
+    AllReduce, which is only a valid substitution if the result is exactly
+    what the standalone quantize would produce. Compare against the swizzled
+    epilogue for the parts that do not depend on layout, and against
+    fp4_quantize on the epilogue's own bf16 norm output for the part that
+    does.
+    """
+    del fusion_op
+
+    def fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0,
+                     is_sf_swizzled_layout):
+        # Nested so that "ops" stays out of the worker's own co_names. Workers
+        # are shipped to the ranks by value, and cloudpickle then pulls in
+        # sys.modules["torch.ops"], whose type only subclasses ModuleType and
+        # so misses the module reducer, leaving an unpicklable object.
+        return torch.ops.trtllm.fp4_quantize(x, global_scale, sf_vec_size,
+                                             sf_use_ue8m0,
+                                             is_sf_swizzled_layout)
+
+    x = x.cuda()
+    residual = residual.cuda()
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+    eps = 1e-5
+    scale = torch.tensor(6.0, dtype=torch.float32).cuda()
+
+    mapping = Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    )
+    AutoTuner.get().setup_distributed_state(mapping)
+    allreduce = AllReduce(mapping=mapping).cuda()
+
+    def fused(op):
+        return allreduce(
+            x,
+            all_reduce_params=AllReduceParams(
+                fusion_op=op,
+                residual=residual,
+                norm_weight=norm_weight,
+                scale=scale,
+                bias=None,
+                eps=eps,
+            ),
+        )
+
+    swz_norm, swz_fp4, swz_sf, swz_res = fused(
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+    lin_norm, lin_fp4, lin_sf, lin_res = fused(
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)
+
+    del swz_sf  # The scale factor layout is what is meant to differ.
+
+    def assert_same_bytes(actual, expected, what):
+        # Byte-wise rather than assert_close: these are FP4 values and FP8
+        # scale factors, and the comparison wanted here is identity.
+        a = actual.reshape(-1).view(torch.uint8)
+        b = expected.reshape(-1).view(torch.uint8)
+        assert a.shape == b.shape, f"{what}: {a.shape} vs {b.shape}"
+        assert torch.equal(
+            a,
+            b), (f"{what}: {(a != b).sum().item()} of {a.numel()} bytes differ")
+
+    # Everything but the scale factors must be equal.
+    assert_same_bytes(lin_norm, swz_norm, "norm_out vs swizzled")
+    assert_same_bytes(lin_res, swz_res, "residual_out vs swizzled")
+    assert_same_bytes(lin_fp4, swz_fp4, "quant_fp4 vs swizzled")
+
+    # Linear layout is unpadded, unlike the swizzled layout's 128x4 blocks.
+    assert lin_sf.numel() == x.shape[0] * (hidden_size // 16)
+
+    # Quantizing the epilogue's own norm output must reproduce its fp4 output
+    # and scale factors.
+    ref_fp4, ref_sf = fp4_quantize(lin_norm, scale, 16, False, False)
+    assert_same_bytes(lin_fp4, ref_fp4, "quant_fp4 vs standalone quantize")
+    assert_same_bytes(lin_sf, ref_sf, "scale_out vs standalone quantize")
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("seq_len", [4, 16, 256], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [128, 6144],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_allreduce_fusion_nvfp4_linear_sf(seq_len, hidden_size,
+                                          mpi_pool_executor):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    x = torch.randn((seq_len, hidden_size), dtype=dtype)
+    residual = torch.randn_like(x)
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(
+            *[(tensor_parallel_size, run_nvfp4_linear_sf_op, x, residual, [],
+               hidden_size, dtype,
+               AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)] *
+            tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
 def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
                          active_experts_token_input: torch.Tensor,
                          scale: torch.Tensor, tensor_parallel_size: int,

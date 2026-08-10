@@ -750,7 +750,8 @@ private:
             }
         }
         else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)
         {
             // TODO: Better check for each pattern
             int64_t sf_vec_size = 16;
@@ -767,19 +768,24 @@ private:
             std::vector<int64_t> output_shape(input_shape.begin(), input_shape.end());
             output_shape[r - 1] = k / 2;
 
+            bool const linear_sf = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF;
+            auto const sf_size = linear_sf ? tensorrt_llm::computeLinearLayoutSFSize(m, k / sf_vec_size)
+                                           : tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size);
+
             quant_out = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            scale_out = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
-                SF_DTYPE, input.device(), std::nullopt);
+            scale_out = at::detail::empty_cuda({sf_size}, SF_DTYPE, input.device(), std::nullopt);
             residual_out = torch::empty_like(residual.value());
 
             allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
             allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
             allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            allreduce_fusion_params.layout
+                = linear_sf ? tensorrt_llm::QuantizationSFLayout::LINEAR : tensorrt_llm::QuantizationSFLayout::SWIZZLED;
             allreduce_fusion_params.pattern
                 = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant;
 
             // norm out is required
-            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+            if (mOp != AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
             {
                 norm_out = torch::empty_like(input);
                 allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
@@ -816,7 +822,8 @@ private:
         bool const is_scale_factor_required = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF;
 
         allreduce_fusion_params.scale_factor
             = is_scale_factor_required ? static_cast<float*>(scale.value().data_ptr()) : nullptr;
@@ -833,6 +840,7 @@ private:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return {quant_out, scale_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF:
             return {norm_out, quant_out, scale_out, residual_out};
         default: TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         }
@@ -909,6 +917,12 @@ private:
         {
             auto [quant_out, scale_out]
                 = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
+            return {norm_out, quant_out, scale_out, reduce_output};
+        }
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF:
+        {
+            auto [quant_out, scale_out]
+                = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, /*swizzled=*/false);
             return {norm_out, quant_out, scale_out, reduce_output};
         }
         default: break;
