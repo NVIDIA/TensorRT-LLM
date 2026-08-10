@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Import a repo module without running the ``tensorrt_llm`` package __init__.
+"""Import a repo module without running the `tensorrt_llm` package __init__.
 
-``import tensorrt_llm`` pulls in the whole runtime -- ``transformers``, the
-compiled C++ extension, the LLM API -- none of which a kernel microbenchmark
-needs, and any one of which can be missing from a bare container. The CuTe DSL
-kernels themselves only import ``cutlass`` and their siblings.
+`import tensorrt_llm` pulls in the whole runtime: `transformers`, the compiled
+C++ extension, the LLM API. A kernel microbenchmark needs none of it, and a bare
+container may be missing any of it, while the CuTe DSL kernels themselves import
+only `cutlass` and their siblings.
 
-So stand in fake parent packages that carry nothing but a ``__path__`` and let
-the normal import machinery resolve the leaf module through them. Relative
-imports inside the kernel modules keep working, because the parents exist as
-far as the import system is concerned.
+So stand in fake parent packages carrying nothing but a `__path__` and let the
+normal import machinery resolve the leaf module through them. Relative imports
+inside the kernel modules keep working, because the parents exist as far as the
+import system is concerned.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def import_bare(dotted: str) -> ModuleType:
-    """Import ``dotted`` from the repo, stubbing out its parent packages."""
+    """Import `dotted` from the repo, stubbing out its parent packages."""
     parts = dotted.split(".")
     for depth in range(1, len(parts)):
         name = ".".join(parts[:depth])

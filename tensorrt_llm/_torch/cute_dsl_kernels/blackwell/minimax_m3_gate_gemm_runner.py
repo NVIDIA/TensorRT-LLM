@@ -2,38 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch-facing entry point for the MiniMax-M3 MoE gate projection.
 
-The gate multiplies BF16 hidden states by an FP32 router weight. cuBLAS cannot
-take those two dtypes together, so the model casts the activation to FP32
-first -- at 16k tokens that materialises a 400MB temporary and then feeds a
-CUDA-core SGEMM, which between them run at about 4% of what the memory system
-can deliver.
-
-This path hands the BF16 activation straight to the tensor cores and puts the
-precision back on the weight side, where it is cheap: the FP32 weight is
-rewritten as a sum of ``terms`` BF16 tensors, each one holding what the previous
-rounding threw away. The GEMM accumulates all of them into a single FP32
-accumulator, so the activation is never widened and never copied.
+The precision sits on the weight rather than the activation. The FP32 router
+weight is rewritten as a sum of `terms` BF16 tensors, each one holding what the
+previous rounding threw away, and the GEMM accumulates all of them into a single
+FP32 accumulator. The BF16 activation reaches the tensor cores unwidened and
+uncopied.
 
 Each extra term costs one more tensor-core pass over a 3MB weight and buys about
 eight mantissa bits:
 
-===== ================== ==============================================
-terms weight mantissa    max rel error at 32 tokens
-===== ================== ==============================================
-1     8 bits             6.1e-3; worse than the TF32 path, so not an option
-2     ~16 bits           1.1e-5; 67x better than TF32, 12x short of FP32
-3     ~24 bits           7.3e-6; only 1.5x better than two, for 0.5us more
-===== ================== ==============================================
+===== ================= ==========================================
+terms weight mantissa   max rel error at 32 tokens
+===== ================= ==========================================
+1     8 bits            6.1e-3, worse than TF32, so not an option
+2     ~16 bits          1.1e-5, 67x better than TF32
+3     ~24 bits          7.3e-6, only 1.5x better than two
+===== ================= ==========================================
 
-Two is the pick. That the third term barely moves the error is the useful
-result: past ~16 weight bits the accumulation order dominates, so more terms
-buy tensor-core passes and nothing else. The reference is FP64 over the same
-BF16 activation, so the activation's own width is not an error term here --
-it is the input, which is why weight bits keep paying up to that point.
+Two is the pick. Past roughly 16 weight bits the accumulation order dominates,
+so a third term buys a tensor-core pass and little else. The reference is FP64
+over the same BF16 activation, so the activation's own width is not an error
+term in that column.
 
-Two BF16 passes cost about 24us of tensor-core time at 16k tokens against a
-33us floor for reading the activation once, so the accurate configuration is
-still bandwidth-bound and effectively free next to the one-term version.
+At 16k tokens the two passes cost about 24us of tensor-core time against a 33us
+floor for reading the activation once, so the accurate configuration is still
+bandwidth-bound.
 """
 
 from __future__ import annotations
@@ -48,7 +41,7 @@ import torch
 from .minimax_m3_gate_gemm import MiniMaxM3GateGemmKernel
 from .utils import make_ptr
 
-#: ``(use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)``.
+#: (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
 Tactic = Tuple[bool, Tuple[int, int], Tuple[int, int]]
 
 DEFAULT_TERMS = 2
@@ -60,15 +53,14 @@ _TORCH_TO_CUTLASS = {
 
 
 def split_weight(weight: torch.Tensor, terms: int = DEFAULT_TERMS) -> torch.Tensor:
-    """Rewrite an FP32 ``[N, K]`` weight as ``terms`` stacked BF16 terms.
+    """Rewrite an FP32 [N, K] weight as `terms` stacked BF16 terms.
 
-    Term ``i`` is the BF16 rounding of everything the first ``i`` terms failed
-    to represent, so the terms sum back to the original weight to within the
-    last one's rounding. Stacking them along N lets a single GEMM sweep all of
-    them against one activation tile.
+    Term i is the BF16 rounding of everything the first i terms failed to
+    represent, so the terms sum back to the original weight to within the last
+    one's rounding. Stacking them along N lets a single GEMM sweep all of them
+    against one activation tile.
 
-    The router weight is a frozen parameter, so in production this runs once at
-    load rather than per call.
+    The router weight is frozen, so this runs once at load rather than per call.
     """
     if weight.dtype != torch.float32:
         raise ValueError(f"router weight must be fp32, got {weight.dtype}")
@@ -91,11 +83,10 @@ _K_TILE_ELEMS = {torch.bfloat16: 64, torch.float32: 32}
 
 
 def split_k_is_supported(k: int, split_k: int, ab_dtype: torch.dtype) -> bool:
-    """Whether K divides evenly into ``split_k`` runs of whole MMA tiles.
+    """Whether K divides evenly into `split_k` runs of whole MMA tiles.
 
-    The kernel gives every partition the same number of K tiles and does no
-    predication at the seams, so an uneven split would quietly drop the
-    remainder rather than run slowly.
+    Every partition gets the same number of K tiles and there is no predication
+    at the seams, so an uneven split would quietly drop the remainder.
     """
     if split_k < 1:
         return False
@@ -110,20 +101,9 @@ def split_k_is_supported(k: int, split_k: int, ab_dtype: torch.dtype) -> bool:
 def default_split_k(num_tokens: int) -> int:
     """How many CTAs to put on the K dimension, from the microbenchmark sweep.
 
-    Below a thousand tokens the output is one or two tiles wide, so the whole
-    grid is one or two CTAs and the mainloop walks all 96 K tiles serially in
-    each of them. That, not bandwidth, is the small-M floor: a narrower N tile
-    spreads the same weight over more CTAs and changes nothing, and a deeper K
-    tile shortens the loop and changes nothing, but partitioning K takes the
-    kernel from 8.9us to 2.8us at 32 tokens.
-
-    Four is well short of what the kernel alone would like -- it keeps falling
-    to 32 partitions -- because the partials go back through memory and Torch
-    cannot reduce them for less than about 1.8us however the sum is phrased.
-    Past four the reduction grows faster than the mainloop shrinks. Reducing
-    inside the kernel does not lift this: both a last-CTA fixup and a barrier
-    between the partitions were measured and neither beat the Torch pass, for
-    the reasons in the kernel's module docstring.
+    The mainloop alone keeps wanting 32 partitions, but the partials go back
+    through memory and Torch will not reduce them for less than about 1.8us, so
+    past four the reduction grows faster than the mainloop shrinks.
     """
     if num_tokens >= 4096:
         return 1
@@ -135,13 +115,13 @@ def default_split_k(num_tokens: int) -> int:
 def fold_is_supported(tactic: Tactic, stacked_n: int) -> bool:
     """Whether the epilogue can sum the weight terms for this tile shape.
 
-    The epilogue folds by pairing accumulator subtiles a fixed distance apart,
-    which holds only if one MMA tile covers every term -- otherwise a tile
-    holds a single term and there is nothing in it to fold against. On top of
-    that, a 2-CTA instruction whose M tile is 128 leaves each CTA with 64
-    accumulator rows, and the subtile ordering that pairing relies on no longer
-    holds; the same 64-row tile is fine as a 1-CTA instruction. Verified
-    against an FP64 reference by ``test_minimax_m3_gate_gemm.py``.
+    The fold pairs accumulator subtiles a fixed distance apart, which holds only
+    if one MMA tile covers every term; otherwise a tile holds a single term and
+    has nothing to fold against. A 2-CTA instruction with an M tile of 128 also
+    fails, because 64 accumulator rows per CTA break the subtile ordering the
+    pairing relies on, though the same 64-row tile is fine as a 1-CTA
+    instruction. Both sides of this are checked against an FP64 reference by
+    test_minimax_m3_gate_gemm.py.
     """
     use_2cta, (tiler_m, _), _ = tactic
     if tactic[1][1] != stacked_n:
@@ -150,26 +130,21 @@ def fold_is_supported(tactic: Tactic, stacked_n: int) -> bool:
 
 
 def default_tactic(num_tokens: int) -> Tactic:
-    """Tile and cluster shape, from the sweep in the microbenchmark's ``--tune``.
+    """Tile and cluster shape, from the microbenchmark's tuning sweep.
 
     N is at most 256 even with both weight terms, so the grid is essentially
-    ``M / tile_m`` CTAs and the tile shape is really a choice about how few
-    CTAs the work is allowed to land on.
+    M / tile_m CTAs and the tile shape decides how few CTAs the work lands on.
 
-    A tile spanning all of N lets the epilogue fold the terms in registers,
-    which saves a second pass over the output, but it also forces the whole 3MB
-    weight through however many CTAs the token count affords. Below 8192 tokens
-    that is too few and the narrow tile wins outright despite the extra pass:
-    at 32 tokens the wide tile takes 28.5us against 12.1us, because one CTA
-    cannot stream 3MB any faster. Above it the ordering flips and folding is
-    worth 5us at 16384. So the threshold is not about occupancy in the usual
-    sense; it is the point where there are finally enough rows to spread the
-    weight load across.
+    A tile spanning all of N lets the epilogue fold the terms in registers and
+    save a pass over the output, but it also forces the whole 3MB weight through
+    however many CTAs the token count affords. Below 8192 tokens those are too
+    few and the narrow tile wins despite the extra pass: at 32 tokens the wide
+    tile takes 28.5us against 12.1us. Above 8192 the ordering flips and folding
+    is worth 5us at 16384. The threshold is where there are finally enough rows
+    to spread the weight load across.
 
     Clustering along M multicasts the weight to the CTAs sharing it and helps
-    everywhere. Below ~1024 tokens none of these shapes is the right tool: the
-    kernel sits at a flat ~12us floor that has nothing to do with the work it
-    is doing -- see the microbenchmark's notes on split-K.
+    everywhere.
     """
     if num_tokens >= 16384:
         return (True, (256, 256), (2, 1))  # folds in the epilogue
@@ -181,8 +156,8 @@ def default_tactic(num_tokens: int) -> Tactic:
 class GateGemmRunner:
     """Compiles and caches the gate GEMM, one compilation per tactic.
 
-    ``wrapper`` takes M, N and K as runtime values, so a single compiled kernel
-    serves the whole token sweep and only the tile shape forces a recompile.
+    `wrapper` takes M, N and K as runtime values, so a single compiled kernel
+    serves the whole token range and only the tile shape forces a recompile.
     """
 
     _cache: dict = {}
@@ -244,19 +219,19 @@ class GateGemmRunner:
         fold: int = 1,
         split_k: int = 1,
     ) -> None:
-        """``out = x @ w_split.T``, with ``out`` holding one column block per term.
+        """Computes `out = x @ w_split.T`, one column block per weight term.
 
-        ``out`` is ``[num_tokens, n]`` when ``split_k`` is 1 and ``[split_k,
-        num_tokens, n]`` otherwise, one slice per K partition for the caller to
-        sum. Either way it is handed to the kernel as an ``(m, n, l)`` tensor,
-        which is what makes split-K cheap to express: the partition index rides
-        in as the batch coordinate, the TMA store lands each partial in its own
-        slice, and the epilogue needs no notion of splitting at all.
+        `out` is [num_tokens, n] when `split_k` is 1 and [split_k, num_tokens, n]
+        otherwise, one slice per K partition for the caller to sum. Either way
+        the kernel receives it as an (m, n, l) tensor, which is what makes
+        split-K cheap to express: the partition index rides in as the batch
+        coordinate, the TMA store lands each partial in its own slice, and the
+        epilogue needs no notion of splitting.
 
-        Passing FP32 operands instead of BF16 selects the TF32 tensor cores, via
-        the TMA descriptor's ``internal_type``. That is the comparison point for
-        the multi-term BF16 path rather than a usable configuration, since an
-        FP32 activation is exactly the copy this kernel exists to avoid.
+        FP32 operands select the TF32 tensor cores instead of BF16, through the
+        TMA descriptor's `internal_type`. That is a comparison point rather than
+        a usable configuration, since an FP32 activation is the copy this kernel
+        exists to avoid.
         """
         m, k = x.shape
         n = w_split.shape[0]
@@ -291,16 +266,14 @@ def gate_gemm(
 ) -> torch.Tensor:
     """Router logits from BF16 hidden states and a pre-split BF16 weight.
 
-    ``w_split`` comes from :func:`split_weight`. Returns ``[num_tokens,
-    num_experts]`` FP32.
+    `w_split` comes from `split_weight`. Returns [num_tokens, num_experts] FP32.
 
-    Two ways of getting the terms back together, picked by shape. When the tile
+    The terms come back together one of two ways, picked by shape. When the tile
     spans all of N the epilogue folds them in registers and only the leading
-    ``num_experts`` columns are ever stored -- the buffer is still allocated
-    full width because the TMA store descriptor is derived from it, but the
-    rest is untouched address space rather than traffic. Otherwise the terms
-    are stored side by side and summed in a second pass, which is also where
-    the K partitions are summed when K is split.
+    `num_experts` columns are stored; the buffer is still allocated full width
+    because the TMA store descriptor derives from it, but the rest is untouched
+    address space rather than traffic. Otherwise the terms are stored side by
+    side and summed in a second pass, which also sums the K partitions.
     """
     num_tokens = hidden_states.shape[0]
     stacked_n = w_split.shape[0]

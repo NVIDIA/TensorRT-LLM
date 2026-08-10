@@ -502,17 +502,13 @@ class MiniMaxM3Gate(nn.Module):
             requires_grad=False,
         )
         # The fp32 weight rewritten as stacked bf16 terms for the CuTe DSL gate
-        # GEMM, filled by load_weights. Stays None where that kernel is
-        # unavailable, which leaves the wide band on the F.linear fallback. It
-        # is a second copy of a 3MB weight, which buys the tensor cores an
-        # operand they can take without widening the activation first.
+        # GEMM, filled by load_weights and None where that kernel cannot run.
+        # Costs a second copy of a 3MB weight per layer.
         self.register_buffer("weight_split", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang, which cuBLAS answers with a TF32
-        # split-K, a splitKreduce, and a separate cast of the activation. A
-        # GEMV covers decode and the CuTe DSL gate GEMM the wider batches; both
-        # keep more of the fp32 mantissa than the path they replace.
+        # The router runs in fp32 to match SGLang. router_gemm picks the kernel
+        # that suits the token count.
         return router_gemm(hidden_states, self.weight, self.weight_split)
 
     def load_weights(self, weights: List[Dict]):
@@ -531,8 +527,7 @@ class MiniMaxM3Gate(nn.Module):
         w = weights[0]
         if "weight" in w:
             self.weight.copy_(w["weight"][:].to(self.weight.dtype))
-            # The router weight is frozen, so the split is done once here
-            # rather than on every wide call.
+            # The weight is frozen, so it is split here rather than per call.
             self.weight_split = split_router_weight(self.weight)
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(

@@ -7882,14 +7882,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         minimax_m3_gate_gemm_runner as _m3_gate
 
     _m3_gate_gemm = _m3_gate.gate_gemm
-    # Re-exported so callers reach the gate GEMM's load-time weight split and
-    # its term count without importing the runner, which pulls in cutlass.
+    # Re-exported so callers reach the load-time weight split and its term count
+    # without importing the runner, which pulls in cutlass.
     minimax_m3_gate_split_weight = _m3_gate.split_weight
     MINIMAX_M3_GATE_GEMM_TERMS = _m3_gate.DEFAULT_TERMS
-    # The architecture gate, kept apart from the shape checks below so it can
-    # be answered once when the weight is split. It is lru_cached, and Dynamo
-    # traces through an lru_cache rather than honouring it, so calling it from
-    # the forward would cost a warning on every graph.
+    # The architecture gate, kept apart from the shape checks below so callers
+    # can answer it once when the weight is split. It is lru_cached, and Dynamo
+    # traces through an lru_cache instead of honouring it, so asking from a
+    # traced forward costs a warning per graph.
     minimax_m3_gate_arch_is_supported = is_sm_100f
 
     # One MMA tile of K for a BF16 operand. The kernel gives every split-K
@@ -7903,15 +7903,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> bool:
         """Whether the CuTe DSL gate GEMM can serve this call.
 
-        Callers use this to choose between the CuTe path and the fallback
-        rather than catching an exception on the hot path. Everything here is
-        a property of the shapes and the loaded weight, so a traced graph sees
-        the same answer it saw when it was captured.
-
-        The architecture is not among them. It is settled when the weight is
-        split, which leaves ``w_split`` None where the kernel cannot run, so
-        this stays free of the lru_cached arch query that Dynamo would trace
-        through and warn about once per graph.
+        Callers use this to choose between the CuTe path and the fallback rather
+        than catching an exception on the hot path. Every condition is a property
+        of the shapes and the loaded weight, so a traced graph sees the answer it
+        saw when it was captured. The architecture is settled earlier, when the
+        weight is split, and shows up here as `w_split` being None.
         """
         return (w_split is not None and hidden_states.dim() == 2
                 and hidden_states.dtype == torch.bfloat16
@@ -7934,10 +7930,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Args:
             hidden_states: [num_tokens, hidden_size] BF16, contiguous.
             w_split: [terms * num_experts, hidden_size] BF16, the FP32 router
-                weight rewritten by ``split_weight`` as a sum of ``terms``
-                BF16 tensors so the tensor cores can take it without the
-                activation being widened first.
-            terms: how many BF16 terms ``w_split`` stacks.
+                weight as rewritten by `split_weight`.
+            terms: how many BF16 terms `w_split` stacks.
 
         Returns:
             [num_tokens, num_experts] FP32 logits.

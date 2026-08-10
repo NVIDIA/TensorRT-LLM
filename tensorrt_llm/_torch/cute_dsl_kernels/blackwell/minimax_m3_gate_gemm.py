@@ -47,42 +47,40 @@
 
 """Persistent SM100 GEMM specialised for the MiniMax-M3 MoE gate projection.
 
-The gate is ``[num_tokens, 6144] BF16 x [128, 6144] FP32``, once per sparse
-layer. It is a hard shape for a general GEMM: N is 128, so there is almost no
-work per column, and the operands disagree on dtype, which is what pushes the
-model into casting the activation to FP32 before calling cuBLAS.
+The gate is [num_tokens, 6144] BF16 by [128, 6144] FP32, once per sparse layer.
+N of 128 leaves almost no work per column, and the operands disagree on dtype,
+which is a hard shape for a general GEMM.
 
-The specialisation is on the weight rather than the activation. Callers pass a
-weight that :func:`minimax_m3_gate_gemm_runner.split_weight` has rewritten as
-``terms`` BF16 tensors stacked along N, and the kernel treats it as one N=256
-(or N=384) BF16 GEMM. The activation stays BF16 from HBM to the tensor cores,
-which is the whole point -- there is no FP32 copy of it anywhere.
+The specialisation is on the weight. Callers pass a weight that
+`minimax_m3_gate_gemm_runner.split_weight` has rewritten as BF16 terms stacked
+along N, and the kernel treats it as one N=256 or N=384 BF16 GEMM. The
+activation stays BF16 from HBM to the tensor cores.
 
 Three things differ from the general kernel this came from:
 
-* ``cute.make_fragment`` became ``cute.make_rmem_tensor`` in CuTe DSL 4.6.
+* `cute.make_fragment` became `cute.make_rmem_tensor` in CuTe DSL 4.6.
 * The epilogue can fold the weight terms out of the accumulator, so only the
   summed column block reaches global memory.
 * K can be partitioned across CTAs, one partial per partition.
 
 Splitting K is what makes the decode shapes work. With N at 256 and M under one
 tile the grid is one or two CTAs, each walking all 96 K tiles in series, and the
-kernel sits at a flat 12us no matter how few tokens there are. Partitioning K
-takes the mainloop to 2.8us at 32 tokens. Neither of the obvious alternatives
-does anything: a 32-wide N tile spreads the same weight over eight CTAs, and a
-deeper MMA K tile shortens the loop to a quarter of the iterations, and both
-stay at 12us. It is the serial dependency, not the traffic.
+kernel sits at a flat 12us however few tokens there are. Partitioning K takes
+the mainloop to 2.8us at 32 tokens. Neither obvious alternative moves it: a
+32-wide N tile spreads the same weight over eight CTAs and a deeper MMA K tile
+cuts the loop to a quarter of the iterations, and both stay at 12us. The limit
+is the serial dependency, not the traffic.
 
 The partials land in separate slices of C's batch dimension and the caller sums
-them, so the result does not depend on how the CTAs happened to be scheduled.
-Reducing them inside the kernel was tried both ways and neither paid: handing a
-row of tiles to its last-arriving CTA puts the entire read on that one CTA, and
-letting the partitions meet at a barrier and divide the read between them buys
-back about what the barrier costs. Both finish within a few percent of reducing
-outside, and both need every partition co-resident or they hang. An atomic
-epilogue would beat all of it, and is what the MoE kernels here use, but a
-router whose logits move with CTA scheduling can route a request differently on
-a rerun, which is not worth a microsecond.
+them, so the result does not depend on how the CTAs were scheduled. Reducing
+inside the kernel was tried two ways and neither paid. Handing a row of tiles to
+its last-arriving CTA puts the entire read on that CTA, and letting the
+partitions meet at a barrier to divide the read costs about what the barrier
+saves; both land within a few percent of reducing outside, and both need every
+partition co-resident or they hang. An atomic epilogue would beat all of it, and
+is what the MoE kernels here use, but a router whose logits move with CTA
+scheduling can route a request differently on a rerun, which is not worth a
+microsecond.
 """
 
 from typing import Literal, Optional, Tuple, Type, Union
@@ -298,7 +296,7 @@ class MiniMaxM3GateGemmKernel:
     ):
         """Execute the GEMM operation.
 
-        When K is split, ``c`` holds one partial per partition in its batch
+        When K is split, `c` holds one partial per partition in its batch
         dimension and the caller sums them.
         """
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -529,9 +527,9 @@ class MiniMaxM3GateGemmKernel:
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
         # Each K partition sweeps an equal, contiguous run of K tiles. The
         # scheduler hands out one work tile per partition because C's batch
-        # dimension was widened by ``split_k`` on the host, so the partition
-        # index arrives as the L coordinate and A and B have to divide it back
-        # out to find the real batch.
+        # dimension was widened by `split_k` on the host, so the partition index
+        # arrives as the L coordinate and A and B divide it back out to find the
+        # real batch.
         k_tile_cnt_local = k_tile_cnt // self.split_k
 
         # Partition global tensor for TiledMMA_A/B/C
@@ -695,7 +693,7 @@ class MiniMaxM3GateGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
 
-            # -- Epilogue partition setup (TMA store path) --
+            # Epilogue partition setup (TMA store path).
             assert cutlass.const_expr(self.use_tma_store)
             assert tma_atom_c is not None and sC is not None
 
@@ -747,7 +745,7 @@ class MiniMaxM3GateGemmKernel:
                 num_stages=self.num_c_stage, producer_group=c_producer_group
             )
 
-            # -- Epilogue tile scheduling loop --
+            # Epilogue tile scheduling loop.
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -777,9 +775,9 @@ class MiniMaxM3GateGemmKernel:
                 # block per term and only their sum is wanted, so the epilogue
                 # walks the first block and folds the rest onto it out of TMEM.
                 # Subtiles run M-fastest within a column block, which puts a
-                # block's worth exactly ``subtile_cnt // terms`` apart. Folding
+                # block's worth exactly `subtile_cnt // terms` apart. Folding
                 # here rather than in a second pass keeps the extra terms off
-                # global memory entirely: only the first block is ever stored.
+                # global memory: only the first block is ever stored.
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 stored_cnt = subtile_cnt // self.fold_terms
                 num_prev_subtiles = (num_tiles_executed - 1) * stored_cnt
@@ -1093,9 +1091,9 @@ class MiniMaxM3GateGemmKernel:
     ):
         """Executes the GEMM kernel with explicit A tensor strides.
 
-        Like ``wrapper`` but allows non-contiguous A tensors by accepting
-        the M and batch strides directly.  The K stride is assumed to be 1
-        (row-major in K).  B is always contiguous.
+        Like `wrapper` but allows non-contiguous A tensors by accepting the M
+        and batch strides directly. The K stride is assumed to be 1 (row-major
+        in K). B is always contiguous.
 
         Args:
             m: The M dimension of the GEMM problem.

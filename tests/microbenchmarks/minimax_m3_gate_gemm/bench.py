@@ -4,40 +4,27 @@
 
     python3 tests/microbenchmarks/minimax_m3_gate_gemm/bench.py
 
-The gate is ``[num_tokens, 6144] bf16 @ [128, 6144] fp32``, once per sparse
-layer. At 32 tokens it is latency-bound and the activation fits in L2; at 16384
-it is a 200MB stream and the only thing that matters is reading that stream
-once. A single sweep over both ends is the point -- the interesting question is
-where each candidate stops being the right answer.
+The gate is [num_tokens, 6144] bf16 by [128, 6144] fp32, once per sparse layer.
+At 32 tokens it is latency-bound and the activation fits in L2; at 16384 it is a
+200MB stream where only reading that stream once matters. One sweep over both
+ends shows where each candidate stops being the right answer.
 
-Add ``--cute`` to include the CuTe DSL kernel, ``--only`` to filter candidates
-by substring, and ``--tokens`` to change the sweep.
+Add --cute to include the CuTe DSL kernel, --only to filter candidates by
+substring, and --tokens to change the sweep.
 
 Where the crossovers land, on a B200
 ------------------------------------
 
-From 8 tokens up the CuTe kernel is ahead of the TF32 path the model runs
-today, by 1.14x at the bottom and 7.6x at 16384, and it is some 25x to 70x
-closer to the FP64 reference the whole way. At 1 token it is still behind.
+From 8 tokens up the CuTe kernel is ahead of the TF32 path the model runs today,
+by 1.14x at the bottom and 7.6x at 16384, and it is 25x to 70x closer to the FP64
+reference the whole way. At 1 token it is still behind, so the 1 to 16 token band
+stays with the Triton GEMV, which answers a 1-token router in 1.97us against
+7.07us here.
 
-The small-M story took two rounds to get right. Without splitting K the kernel
-sat at a flat ~12us for every token count under a thousand, which looks like a
-bandwidth problem and is not: N is 256 and M fits in one tile, so the grid
-collapses to one or two CTAs and each walks all 96 K tiles in series. Two
-plausible fixes do nothing at all -- a 32-wide N tile spreads the same weight
-over eight CTAs and stays at 12us, and a deeper MMA K tile shortens the loop to
-24 iterations and stays at 12us. Partitioning K is what works, and it works
-hard: at 32 tokens the mainloop drops from 8.9us to 2.8us at 32 partitions.
-
-What stops it there is the reduction. The partials come back through memory and
-Torch will not sum them for less than about 1.8us however the sum is phrased,
-which is why the default settles at 4 partitions rather than 32 -- past that
-the reduction grows faster than the mainloop shrinks. Reducing inside the
-kernel was the obvious way to get that 1.8us back and it does not: both a
-last-CTA fixup and a barrier between the partitions land within a few percent
-of the Torch pass, for the reasons in the kernel's module docstring. So the
-1-16 token band stays with the Triton GEMV, which answers a 1-token router in
-1.97us against 7.07us here.
+Two settings carry that result. Splitting K is what lifts the small-M end, from
+8.9us to 2.8us at 32 tokens, and the default stops at 4 partitions because
+reducing the partials costs about 1.8us. The tile shape switches at 8192 tokens,
+above which a tile spanning all of N lets the epilogue fold the weight terms.
 """
 
 from __future__ import annotations
@@ -101,8 +88,7 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=M3_EXPERTS)
     parser.add_argument("--layers", type=int, default=M3_SPARSE_LAYERS)
     # The gate's GEMM runs on the TF32 tensor cores in production, so that is
-    # what a replacement has to beat -- on accuracy as much as on time, since
-    # TF32 has already given up most of the FP32 weight's mantissa.
+    # what a replacement has to beat, on accuracy as much as on time.
     parser.add_argument("--baseline", default="cast + cublas tf32")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
@@ -165,7 +151,7 @@ def main() -> None:
 
 
 def _run_tune(args) -> None:
-    """Best tile/cluster shape per token count, for filling in ``default_tactic``."""
+    """Best tile and cluster shape per token count, for `default_tactic`."""
     from .cute_candidates import tune
     from .harness import time_us
 

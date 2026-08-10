@@ -2,34 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP32 MoE router projection.
 
-A router that keeps its weight in FP32 has no good path through cuBLAS at any
-shape. For ``[4, 6144] x [6144, 128]`` cuBLAS picks a 32-way split-K TF32 kernel
-plus a ``splitKreduce``, and the FP32 activation it wants costs a separate cast
-of the BF16 hidden states first. Three kernels, and the TF32 tensor cores round
-both operands to a 10-bit mantissa on the way in.
+An FP32 router weight has no good path through cuBLAS. Both operands must share
+a dtype, so the BF16 hidden states are cast first, and the kernel cuBLAS then
+picks rounds the weight to a 10-bit TF32 mantissa anyway. The existing
+small-router kernels do not apply: `dsv3_router_gemm_op` and `tinygemm2` both
+want a BF16 weight, which is the one thing an FP32 router cannot give up.
 
-The existing small-router kernels do not apply: ``dsv3_router_gemm_op`` and
-``tinygemm2`` both take a BF16 weight, which is the one thing an FP32 router
-cannot give up.
+Two kernels cover the token range and `router_gemm` picks between them:
 
-Two kernels cover the range, and :func:`router_gemm` picks between them:
+* Up to `MAX_GEMV_TOKENS`, the GEMV below. One CTA per expert reduces over the
+  hidden dimension in FP32, widening the BF16 activation in registers, so no
+  cast is materialized and the multiply keeps the full FP32 mantissa.
+* Above it, the CuTe DSL gate GEMM, which leaves the activation BF16 and
+  carries the precision on the weight: the FP32 weight is split at load into a
+  sum of BF16 terms the tensor cores accept. That kernel needs Blackwell and
+  the nvidia-cutlass-dsl package, so it stays a soft dependency.
 
-* Up to ``MAX_GEMV_TOKENS``, the GEMV in this module. One CTA per expert
-  reduces over the hidden dimension with plain FP32 FMA, widening the BF16
-  activation in-register, so the cast disappears, there are no partials to
-  reduce, and the multiply keeps the full FP32 mantissa. It is deliberately
-  shaped for a handful of tokens, which is where decode lives.
-* Above it, the CuTe DSL gate GEMM, which keeps the activation BF16 and moves
-  the precision onto the weight instead -- the FP32 weight is pre-split at load
-  into a sum of BF16 terms the tensor cores can take. It needs Blackwell and
-  the ``nvidia-cutlass-dsl`` package, so it stays a soft dependency.
+Shapes neither kernel claims fall back to `F.linear` on a widened activation.
 
-Anything neither can serve falls back to ``F.linear`` on a widened activation,
-which is what the model did before either existed.
-
-Numerics move, and in the direction of the reference: both kernels are closer
-to a true FP32 router than the TF32 split-K they replace, so this wants an eval
-rather than a bitwise comparison.
+Both kernels keep more of the FP32 mantissa than the cuBLAS path, so their logits
+differ from it. The tests hold them to an FP64 reference rather than to cuBLAS.
 """
 
 from __future__ import annotations
@@ -40,20 +32,17 @@ import torch
 import triton
 import triton.language as tl
 
-# Measured on B200 at 128 experts / 6144 hidden, against the cuBLAS sequence:
-# 3.4x at 4 tokens, 1.6x at 12, 1.5x at 16, and 0.85x by 32. The turn comes from
-# the register tile: the activation block is BLOCK_M x BLOCK_K, so past 16
-# tokens BLOCK_K has to shrink faster than the extra rows pay for, and cuBLAS'
-# tiling wins. Streaming K per token the way dsv3RouterGemm does would push this
-# out, at the cost of a C++ kernel with a separate instantiation per token count.
+# Where the GEMV stops paying. On B200 at 128 experts and 6144 hidden it is
+# 3.4x cuBLAS at 4 tokens, 1.5x at 16 and 0.85x by 32: the activation block is
+# BLOCK_M x BLOCK_K, so past 16 tokens BLOCK_K shrinks faster than the extra
+# rows earn back.
 MAX_GEMV_TOKENS = 16
 
 # Elements of the activation tile held in registers per CTA, which sets the K
-# block. Larger was monotonically better across the whole tuning sweep, all the
-# way to covering the hidden dimension in a single pass: at one CTA per expert
-# the kernel is latency-bound, occupancy is already capped by having fewer CTAs
-# than SMs, so the only lever is loads in flight per thread. This lets a 4-token
-# batch take the whole 6144 in one iteration, worth 4.26 -> 2.53 us.
+# block. One CTA per expert leaves fewer CTAs than SMs, so occupancy is already
+# capped and loads in flight per thread is the only lever; larger was better
+# throughout the sweep. A 4-token batch takes all 6144 in one iteration, worth
+# 4.26 to 2.53 us.
 _TILE_ELEMS = 32768
 
 
@@ -110,11 +99,11 @@ def _gemv_applies(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 def fp32_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Router logits in FP32: ``hidden_states.float() @ weight.T``.
+    """Router logits in FP32: `hidden_states.float() @ weight.T`.
 
-    ``weight`` is ``[num_experts, hidden_size]`` FP32, in the ``nn.Linear``
-    layout the HF checkpoint already uses. Falls back to ``F.linear`` for shapes
-    the GEMV is not built for.
+    `weight` is [num_experts, hidden_size] FP32, the `nn.Linear` layout the HF
+    checkpoint already uses. Shapes the GEMV is not built for fall back to
+    `F.linear`.
     """
     if not _gemv_applies(hidden_states, weight):
         return torch.nn.functional.linear(hidden_states.to(torch.float32), weight)
@@ -152,11 +141,11 @@ def fp32_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch
 
 
 def cute_gate_ops():
-    """The CuTe DSL gate-GEMM helpers, or None when unavailable.
+    """The CuTe DSL gate GEMM helpers, or None when unavailable.
 
-    The CuTe DSL ops are registered only when the nvidia-cutlass-dsl package is
-    importable, so this stays a soft dependency. Resolved through the module
-    rather than imported directly, since importing the runner pulls in cutlass.
+    The ops are registered only when nvidia-cutlass-dsl is importable. Resolved
+    through the module rather than imported directly, since importing the runner
+    pulls in cutlass.
     """
     try:
         from ..custom_ops import cute_dsl_custom_ops
@@ -170,15 +159,13 @@ def cute_gate_ops():
 def split_router_weight(weight: torch.Tensor) -> Optional[torch.Tensor]:
     """Pre-split an FP32 router weight for the CuTe DSL gate GEMM.
 
-    Returns None when that kernel is unavailable -- the package missing or the
-    GPU not Blackwell -- which leaves the caller with nothing to pass and
-    :func:`router_gemm` on its fallback above the GEMV band. Meant to run once
-    at load: the split is a few small elementwise passes, but the result is a
-    second copy of the weight.
+    Returns None when that kernel cannot run, either because the package is
+    missing or the GPU is not Blackwell, which leaves `router_gemm` on its
+    fallback above the GEMV band. Meant to run once at load: the split is a few
+    small elementwise passes, but the result is a second copy of the weight.
 
-    Deciding the architecture here rather than per call is what keeps
-    :func:`router_gemm` free of it, since the arch query is lru_cached and
-    Dynamo traces through an lru_cache instead of honouring it.
+    Settling the architecture here keeps it out of the traced forward, where
+    Dynamo would trace through the lru_cache behind the query and warn.
     """
     ops = cute_gate_ops()
     if ops is None or not ops.minimax_m3_gate_arch_is_supported():
@@ -191,16 +178,14 @@ def router_gemm(
     weight: torch.Tensor,
     weight_split: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Router logits in FP32: ``hidden_states.float() @ weight.T``.
+    """Router logits in FP32: `hidden_states.float() @ weight.T`.
 
-    ``weight`` is ``[num_experts, hidden_size]`` FP32, in the ``nn.Linear``
-    layout the HF checkpoint already uses. ``weight_split`` is what
-    :func:`split_router_weight` made of it, or None to leave the wide band on
-    the ``F.linear`` fallback.
+    `weight` is [num_experts, hidden_size] FP32, the `nn.Linear` layout the HF
+    checkpoint already uses. `weight_split` is what `split_router_weight` made
+    of it, or None to leave the wide band on the `F.linear` fallback.
 
-    The split at ``MAX_GEMV_TOKENS`` is where the GEMV's register tile stops
-    paying; see that constant. Both branches are decided by shape alone, so a
-    traced graph keeps whichever kernel it was captured with.
+    Both branches turn on shape alone, so a traced graph keeps whichever kernel
+    it was captured with.
     """
     if hidden_states.dim() == 2 and hidden_states.shape[0] > MAX_GEMV_TOKENS:
         ops = cute_gate_ops()

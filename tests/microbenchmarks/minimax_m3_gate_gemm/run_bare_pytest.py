@@ -4,13 +4,13 @@
 """Run the gate-GEMM unit tests in a container with no TensorRT-LLM install.
 
 The unit tests import the kernel the normal way, which is right for CI and
-useless in a bare PyTorch container: ``tensorrt_llm/__init__.py`` reaches for
-the compiled bindings and a long tail of runtime dependencies, none of which a
-CuTe DSL kernel needs. ``tests/unittest/conftest.py`` imports the package too.
+useless in a bare PyTorch container: `tensorrt_llm/__init__.py` reaches for the
+compiled bindings and a long tail of runtime dependencies, none of which a CuTe
+DSL kernel needs, and `tests/unittest/conftest.py` imports the package too.
 
-Pre-import the kernel through the stubbed parents from ``_repo_import`` so the
-test file's own import is already satisfied by the time pytest reads it, and
-skip the conftest that would drag the package back in.
+So pre-import the kernel through the stubbed parents from `_repo_import`, which
+satisfies the test file's own import by the time pytest reads it, and skip the
+conftest that would drag the package back in.
 
     python3 tests/microbenchmarks/minimax_m3_gate_gemm/run_bare_pytest.py -q
 """

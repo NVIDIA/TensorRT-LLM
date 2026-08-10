@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CuTe DSL candidates for the gate projection.
 
-One kernel, three precisions. The FP32 router weight is rewritten as a sum of
-BF16 terms and all of them ride in a single GEMM against a BF16 activation that
-is never cast, so the only knob is how many terms to carry. One term is
-BF16-grade and is here to show what precision costs; two is the drop-in; three
-is enough to check that two is not leaving accuracy on the table.
+One kernel, three precisions. The only knob is how many BF16 weight terms to
+carry: one is BF16-grade and shows what precision costs, two is the drop-in, and
+three checks that two leaves no accuracy on the table.
 """
 
 from __future__ import annotations
@@ -28,8 +26,8 @@ def _runner():
 def _build(terms: int, tactic=None) -> Callable:
     def build(x: torch.Tensor, w: torch.Tensor) -> Callable[[], torch.Tensor]:
         mod = _runner()
-        # The router weight is a frozen parameter, so the split belongs at load
-        # time and is hoisted out of the timed region here.
+        # The weight is frozen, so the split belongs at load time and is hoisted
+        # out of the timed region.
         w_split = mod.split_weight(w, terms)
         return lambda: mod.gate_gemm(x, w_split, terms, tactic)
 
@@ -37,13 +35,12 @@ def _build(terms: int, tactic=None) -> Callable:
 
 
 def _build_tf32(x: torch.Tensor, w: torch.Tensor) -> Callable[[], torch.Tensor]:
-    """The same kernel driven at TF32, for the precision-per-microsecond question.
+    """The same kernel driven at TF32, for the precision per microsecond question.
 
-    An FP32 activation reaches the TF32 tensor cores through the TMA
-    descriptor's ``internal_type``, so this is one tensor-core pass at ten
-    mantissa bits against the BF16 path's two passes at sixteen. The cast is
-    inside the timed region because TF32 cannot avoid it -- that is the
-    asymmetry the BF16 path exploits.
+    An FP32 activation reaches the TF32 tensor cores through the TMA descriptor's
+    `internal_type`, so this is one pass at ten mantissa bits against the BF16
+    path's two passes at sixteen. The cast is inside the timed region because TF32
+    cannot avoid it, which is the asymmetry the BF16 path exploits.
     """
     mod = _runner()
     out = torch.empty((x.shape[0], w.shape[0]), dtype=torch.float32, device=x.device)
@@ -64,12 +61,12 @@ def cute_candidates(terms: tuple[int, ...] = (1, 2, 3)) -> list[Candidate]:
 def tactics() -> list:
     """Tile and cluster shapes worth trying for an N=256, K=6144 GEMM.
 
-    Two axes matter here and both push the same way. A tile that covers all of
-    N in one go reads the activation once instead of once per column block, and
-    a tall tile means fewer CTAs re-reading the 3MB weight out of L2 -- with a
-    64-row tile at 16k tokens that re-read is 800MB, several times the
-    activation itself. Clustering along M multicasts the weight to the CTAs
-    that share it, which attacks the same traffic from the other side.
+    Two axes matter and both push the same way. A tile covering all of N reads the
+    activation once instead of once per column block, and a tall tile means fewer
+    CTAs re-reading the 3MB weight out of L2: with a 64-row tile at 16k tokens
+    that re-read is 800MB, several times the activation itself. Clustering along M
+    multicasts the weight to the CTAs sharing it, attacking the same traffic from
+    the other side.
     """
     return [
         (use_2cta, tiler, cluster)
@@ -93,17 +90,17 @@ SPLIT_K = (1, 2, 4, 8, 16, 32)
 
 
 def tune(x: torch.Tensor, w: torch.Tensor, terms: int, time_fn) -> list[tuple[float, object]]:
-    """Time every tactic at one token count. Returns ``(micros, tactic)`` sorted.
+    """Time every tactic at one token count. Returns sorted (micros, tactic).
 
-    Sweeps the tile shape and the K partition count together, because the two
-    interact: a tile that covers all of N lets the epilogue fold the weight
-    terms, but it also concentrates the weight into fewer CTAs, which is
-    exactly what splitting K is there to undo.
+    The tile shape and the K partition count are swept together because they
+    interact: a tile covering all of N lets the epilogue fold the weight terms,
+    but it also concentrates the weight into fewer CTAs, which is what splitting K
+    is there to undo.
 
-    Both the folding and the non-folding tile shapes are included. Folding is
-    the better deal wherever it is available, but below roughly a thousand
-    tokens the narrow tile wins even while paying an extra pass over the
-    output. Excluding either hides a crossover.
+    Folding and non-folding tile shapes are both included. Folding is the better
+    deal wherever it is available, but below roughly a thousand tokens the narrow
+    tile wins even while paying an extra pass over the output, and excluding
+    either one hides a crossover.
     """
     mod = _runner()
     w_split = mod.split_weight(w, terms)

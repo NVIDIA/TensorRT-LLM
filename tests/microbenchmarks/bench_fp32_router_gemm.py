@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP32 router projection: the GEMV against the cuBLAS path it replaces.
 
-MiniMax-M3's gate is ``[num_tokens, 6144] x [6144, 128]`` with an FP32 weight.
-cuBLAS answers that with a split-K TF32 GEMM plus a ``splitKreduce``, and wants
-the BF16 hidden states cast to FP32 first, so the baseline here is the whole
-three-kernel sequence rather than the GEMM alone.
+MiniMax-M3's gate is [num_tokens, 6144] by [6144, 128] with an FP32 weight. cuBLAS
+answers that with a split-K TF32 GEMM plus a `splitKreduce`, and wants the BF16
+hidden states cast to FP32 first, so the baseline is the whole three-kernel
+sequence rather than the GEMM alone.
 
-Many calls go into one CUDA graph: a single-call graph measures the ~6us host
-cost of ``graph.replay()`` instead of the kernel. The reported floor is the same
-harness timing a trivial kernel, so a result near it is not resolving anything.
+Many calls go into one CUDA graph, because a single-call graph measures the 6us
+host cost of `graph.replay()` instead of the kernel. The reported floor is the
+same harness timing a trivial kernel, so a result near it resolves nothing.
 
     python tests/microbenchmarks/bench_fp32_router_gemm.py
 
-``--tune`` sweeps the kernel's block size and warp count at one token count
+Pass --tune to sweep the kernel's block size and warp count at one token count
 instead, for picking the launch config.
 """
 

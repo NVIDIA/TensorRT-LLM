@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Accuracy and dispatch coverage for the FP32 router projection.
 
-The kernels replace a cuBLAS call rather than reproducing it, so the bar is not
-bitwise equality with today. It is that the result sits closer to an FP64
-reference than the TF32 split-K path it displaces, and that every shape neither
-kernel claims keeps the old path untouched, bitwise.
+Neither kernel reproduces the cuBLAS result it stands in for, so the bar is not
+bitwise equality. It is that both land closer to an FP64 reference than the TF32
+path does, and that any shape neither kernel claims reaches `F.linear` bitwise.
 """
 
 import pytest
@@ -107,7 +106,7 @@ def test_hidden_sizes_including_non_multiples(hidden_size):
 
 
 def test_prefill_shape_falls_back_bitwise():
-    """Above the window the old kernel must be untouched, numerics included."""
+    """Past the GEMV's window the call must land on `F.linear`, bitwise."""
     num_tokens = MAX_GEMV_TOKENS + 1
     x, w = _inputs(num_tokens, M3_HIDDEN, M3_EXPERTS)
 
@@ -151,8 +150,8 @@ def test_runs_under_cuda_graph():
 
 
 # The dispatcher over both kernels. The CuTe DSL half is a soft dependency and
-# wants Blackwell, so the cases that need it skip rather than fail elsewhere --
-# the same two conditions under which the weight is left unsplit.
+# wants Blackwell, so cases needing it skip elsewhere, under the same two
+# conditions that leave the weight unsplit.
 
 _gate_ops = cute_gate_ops()
 needs_cute_gate = pytest.mark.skipif(
@@ -172,7 +171,7 @@ def test_dispatch_keeps_the_gemv_in_the_decode_band(num_tokens):
 
 
 def test_dispatch_without_a_split_weight_falls_back_bitwise():
-    """No CuTe DSL, or a gate that never loaded: the old kernel, untouched."""
+    """No CuTe DSL, or a gate that never loaded weights: `F.linear`, bitwise."""
     x, w = _inputs(MAX_GEMV_TOKENS + 1, M3_HIDDEN, M3_EXPERTS)
 
     out = router_gemm(x, w, None)
@@ -199,7 +198,7 @@ def test_split_weight_reconstructs_the_fp32_weight():
 @needs_cute_gate
 @pytest.mark.parametrize("num_tokens", [MAX_GEMV_TOKENS + 1, 64, 1024])
 def test_dispatch_above_the_band_beats_tf32_cublas(num_tokens):
-    """The wide path exists to be more accurate than what it replaces."""
+    """The wide path exists to be more accurate than the TF32 cuBLAS pair."""
     x, w = _inputs(num_tokens, M3_HIDDEN, M3_EXPERTS)
     reference = x.double() @ w.double().t()
 

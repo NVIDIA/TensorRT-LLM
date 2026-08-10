@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Correctness of the CuTe DSL MiniMax-M3 gate GEMM.
 
-The kernel replaces ``F.linear(hidden_states.float(), weight)`` for the router
+The kernel stands in for `F.linear(hidden_states.float(), weight)` in the router
 projection, so what has to hold is an accuracy claim rather than a bitwise one:
-carrying the FP32 weight as two BF16 terms has to leave the logits close enough
-to an FP64 reference that top-k over 128 experts cannot tell the difference.
+carrying the FP32 weight as two BF16 terms must leave the logits close enough to
+an FP64 reference that a top-k over 128 experts cannot tell the difference.
 
 The epilogue fold is the delicate part. It sums the weight terms by pairing
-accumulator subtiles a fixed distance apart, which is only valid for some tile
-shapes, so :func:`fold_is_supported` is tested directly against every tactic
-rather than trusted -- a wrong answer there is silent.
+accumulator subtiles a fixed distance apart, which is valid only for some tile
+shapes, so `fold_is_supported` is tested against every tactic rather than
+trusted. A wrong answer there is silent.
 """
 
 import pytest
@@ -62,9 +62,8 @@ def _reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 def _rel_error(got: torch.Tensor, ref: torch.Tensor) -> float:
     """Max error against the RMS logit, not against each element.
 
-    Router logits cross zero, and a per-element relative error would be
-    dominated by the ones that land near it -- exactly the ones whose value the
-    routing does not depend on.
+    Router logits cross zero, and a per-element relative error would be dominated
+    by the ones near zero, whose value the routing does not depend on.
     """
     scale = ref.double().pow(2).mean().sqrt()
     return ((got.double() - ref.double()).abs().max() / scale).item()
@@ -100,9 +99,9 @@ def test_matches_reference_across_token_counts(num_tokens: int):
 def test_fused_fold_matches_unfused(num_tokens: int):
     """The epilogue fold must agree with summing the terms in a second pass.
 
-    Both sum the same FP32 accumulators, so this is an exact comparison, not an
-    approximate one. ``split_k=1`` is pinned because a K partition changes the
-    accumulation order, which is a different question from the fold's.
+    Both sum the same FP32 accumulators, so the comparison is exact. `split_k` is
+    pinned to 1 because a K partition changes the accumulation order, which is a
+    separate question from the fold's.
     """
     x, w = _inputs(num_tokens)
     w_split = split_weight(w, 2)
@@ -119,10 +118,10 @@ def test_fused_fold_matches_unfused(num_tokens: int):
 def test_split_k_matches_reference(num_tokens: int, split_k: int):
     """Every K partition count has to land on the same logits.
 
-    The partition boundaries are unpredicated -- each partition takes an equal
-    run of whole K tiles -- so an off-by-one in the offset silently drops a
-    slice of the hidden dimension and still returns plausible numbers. Only a
-    reference comparison catches that.
+    The partition boundaries are unpredicated, each partition taking an equal run
+    of whole K tiles, so an off-by-one in the offset silently drops a slice of the
+    hidden dimension and still returns plausible numbers. Only a reference
+    comparison catches that.
     """
     x, w = _inputs(num_tokens)
     got = gate_gemm(x, split_weight(w, 2), 2, split_k=split_k)
@@ -163,9 +162,9 @@ def test_split_k_falls_back_when_unsupported():
 
 @pytest.mark.parametrize("tactic", ALL_TACTICS, ids=str)
 def test_fold_guard_admits_only_correct_tile_shapes(tactic):
-    """``fold_is_supported`` must never green-light a tile shape that folds wrong.
+    """`fold_is_supported` must never admit a tile shape that folds wrong.
 
-    Tactics the kernel cannot build at all are skipped; the point is that among
+    Tactics the kernel cannot build at all are skipped. The point is that among
     the ones it can, the guard's answer matches what the hardware produces.
     """
     x, w = _inputs(4096)
