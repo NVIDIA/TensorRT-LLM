@@ -35,13 +35,13 @@ SM100+:
     existing DeepSeek-V4 absorption FMHA path
 
 SM90 context:
-    DeepseekV4TrtllmAttention.forward_hopper_bf16
+    DeepSeekV4FlashMLA.forward_context
 
 SM90 generation, ratio 4:
-    DeepseekV4TrtllmAttention.forward_hopper_fp8
+    DeepSeekV4FlashMLA native FP8 sparse decode
 
 SM90 generation, other ratios:
-    DeepseekV4TrtllmAttention.forward_hopper_bf16
+    DeepSeekV4FlashMLA BF16 fallback
 ```
 
 The Hopper metadata path prepares the context and generation indirection
@@ -51,7 +51,7 @@ standard TRT-LLM paged cache before FlashMLA reads it.
 
 ## BF16 dual-pool path
 
-`DeepseekV4TrtllmAttention.forward_hopper_bf16` performs the following steps:
+`DeepSeekV4FlashMLA` performs the following steps for the BF16 path:
 
 1. Apply RoPE and update the paged cache.
 2. Convert SWA and compressed local positions into pool-relative
@@ -88,19 +88,17 @@ regions first, followed by all 8-byte scale regions. The shadow state
 consists of:
 
 - `_fp8_shadows[attention_type]`: MODEL1 data plus one dummy block;
-- `_fp8_update_grids`: cached request/block/token grids; and
 - `_fp8_token_update_grids`: cached request/token grids for decode; and
 - `_fp8_offsets_cache`: cached byte offsets used by vectorized scatter.
 
-The first decode after a BF16 context or fallback call rebuilds only the
-valid tokens in the active cache pages, bounded by the batch's actual KV
-length instead of the configured block-table capacity. Steady-state
-decode converts the exact newly appended SWA positions and newly produced
-compressed positions. It does not infer freshness from a physical page's
-previous fill level, so a page reassigned to another request cannot retain
-stale MODEL1 data. Invalid incremental grid entries write to the extra
-dummy block, keeping the decode tensor shapes and scatter pattern stable
-for CUDA graph capture.
+When a shadow is first created, it synchronizes the currently valid cache
+entries once so that pre-populated and restored caches remain supported.
+After that, every cache append writes the new SWA positions and newly
+produced compressed positions through to the MODEL1 shadow. Context and
+decode share the same physical-slot mapping and do not track a separate
+bulk-update state. Invalid fixed-grid entries write to the extra dummy
+block, keeping the tensor shapes and scatter pattern stable for CUDA graph
+capture.
 
 ## Key files
 
@@ -109,8 +107,9 @@ for CUDA graph capture.
 | `3rdparty/fetch_content.json` | FlashMLA revision |
 | `cpp/tensorrt_llm/flash_mla/CMakeLists.txt` | FlashMLA SM90/SM100 sources |
 | generated `tensorrt_llm/flash_mla/` package | sparse prefill wrapper from the pinned dependency |
-| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/module.py` | DeepSeek-V4 module hooks and Hopper dispatch |
-| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/backend.py` | FlashMLA execution, pool conversion, and MODEL1 shadow cache |
+| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/module.py` | DeepSeek-V4 module hooks and architecture dispatch |
+| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/flash_mla.py` | Hopper FlashMLA execution, pool conversion, and MODEL1 shadow cache |
+| `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/backend.py` | TRTLLM sparse prediction, compressor, and indexer integration |
 | `tensorrt_llm/_torch/attention_backend/sparse/deepseek_v4/metadata.py` | Hopper metadata preparation |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | fused MLA argument normalization |
 | `tensorrt_llm/_torch/models/modeling_deepseekv4.py` | Hopper CUTLASS MXFP4 scale loading |

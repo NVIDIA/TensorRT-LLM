@@ -24,6 +24,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
 from .backend import DeepseekV4TrtllmAttention
+from .flash_mla import DeepSeekV4FlashMLA
 from .metadata import DeepseekV4TrtllmAttentionMetadata
 
 if TYPE_CHECKING:
@@ -121,6 +122,11 @@ def initialize_sparse_attn(self) -> None:
         is_neox=self.pos_embd_params.is_neox,
         inverse=True,
     )
+    self._dsv4_flash_mla = None
+    if get_sm_version() < 100:
+        if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
+            raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
+        self._dsv4_flash_mla = DeepSeekV4FlashMLA(self.mqa, self.mqa.compress_ratio)
     self._disable_dsv4_epilogue_fusion = os.environ.get(
         "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION", ""
     ).strip().lower() in ("1", "true", "on")
@@ -635,13 +641,13 @@ def forward_generation_sparse_attn(
     if get_sm_version() < 100:
         if latent_cache is None:
             raise ValueError("DeepSeek-V4 Hopper generation requires a latent cache")
-        if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
-            raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
         if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
             raise TypeError(
                 "DeepSeek-V4 Hopper generation requires DeepseekV4TrtllmAttentionMetadata"
             )
-        return self.mqa.forward_hopper_generation(
+        if self._dsv4_flash_mla is None:
+            raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
+        return self._dsv4_flash_mla.forward_generation(
             q,
             latent_cache,
             attn_metadata,
@@ -822,18 +828,17 @@ def forward_context_sparse_attn(
     if get_sm_version() < 100:
         if latent_cache is None:
             raise ValueError("DeepSeek-V4 Hopper context requires a latent cache")
-        if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
-            raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
         if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
             raise TypeError("DeepSeek-V4 Hopper context requires DeepseekV4TrtllmAttentionMetadata")
-        return self.mqa.forward_hopper_bf16(
+        if self._dsv4_flash_mla is None:
+            raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
+        return self._dsv4_flash_mla.forward_context(
             q,
             latent_cache,
             attn_metadata,
             output,
             topk_indices,
             self.softmax_scale,
-            is_generation=False,
             position_ids=position_ids,
             rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin,
             is_neox=self.inverse_rotary_emb.is_neox,
