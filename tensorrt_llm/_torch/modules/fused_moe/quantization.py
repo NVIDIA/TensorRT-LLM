@@ -190,8 +190,9 @@ def maybe_pad_for_mxfp4(weight: torch.Tensor,
     col_pad_size = (col_alignment - weight.shape[-1]) % col_alignment
     if row_alignment:
         row_pad_size = (row_alignment - weight.shape[-2]) % row_alignment
-        weight = F.pad(weight, (0, col_pad_size, 0, row_pad_size))
-    else:
+        if col_pad_size > 0 or row_pad_size > 0:
+            weight = F.pad(weight, (0, col_pad_size, 0, row_pad_size))
+    elif col_pad_size > 0:
         weight = F.pad(weight, (0, col_pad_size))
     return weight
 
@@ -5096,7 +5097,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
             # Divide bias by tp_size as we shard along the hidden dimension.
             # The bias is applied at each TP rank before the final accumulation.
-            w2_weight /= module.tp_size
+            w2_weight = w2_weight / module.tp_size
 
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,

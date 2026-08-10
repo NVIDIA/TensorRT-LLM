@@ -1606,7 +1606,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
-@register_auto_model("MistralForCausalLM")
+# NOTE: deliberately NOT decorated with @register_auto_model: the
+# "MistralForCausalLM" architecture is owned by modeling_mistral (which, under
+# the previous eager import order, always overwrote this legacy registration).
+# With the model zoo imported lazily, a duplicate registration here would make
+# the resolved class depend on import order.
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(
