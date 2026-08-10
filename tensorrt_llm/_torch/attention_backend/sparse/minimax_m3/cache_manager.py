@@ -38,6 +38,7 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -155,11 +156,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
-    # The AttentionOp-facing tensors this manager builds are synthetic
-    # placeholders over INDEX_KEY-coalesced pools, so one-model speculative
-    # draft layers must live in a separate manager even under attention DP
-    # (read by ``_should_create_separate_draft_kv_cache``).
-    supports_shared_draft_layers = False
+    # One-model speculative draft layers share this manager (unified KV
+    # cache): the drafter's buffers differ in per-block size from every M3
+    # buffer, so V2 storage places them in their own uniform pool, for which
+    # the base AttentionOp-facing tensors and block-id math are valid as-is.
+    # The drafter's attention runs at a smaller kernel page size through
+    # ``draft_subpage_view`` (see MiniMaxM3DraftSubpageView below), which
+    # sidesteps the tokens_per_block=128 Eagle kernel bugs the separate
+    # draft manager previously worked around.
+    supports_shared_draft_layers = True
 
     # Workaround: the Eagle3 drafter's trtllm-gen generation kernels hit an
     # illegal memory access at tokens_per_block=128 (base regression), while
@@ -191,9 +196,23 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
+        # One-model speculative decoding with shared draft layers appends the
+        # drafter's layers after the target's. They are dense (no MSA index
+        # cache) and identifiable by a kv-head count differing from the
+        # target's uniform value in the per-layer heads list.
+        self._shared_draft_layer_ids: list[int] = []
+        heads = kwargs.get("num_kv_heads")
+        if isinstance(heads, (list, tuple)) and len(heads) > 1:
+            n = len(heads)
+            while n > 1 and heads[n - 1] != heads[0]:
+                n -= 1
+            self._shared_draft_layer_ids = list(range(n, len(heads)))
         if sparse_layer_ids is None:
             if num_layers is not None:
-                sparse_layer_ids = list(range(3, int(num_layers)))
+                num_target_layers = int(num_layers)
+                if self._shared_draft_layer_ids:
+                    num_target_layers = min(num_target_layers, self._shared_draft_layer_ids[0])
+                sparse_layer_ids = list(range(3, num_target_layers))
             else:
                 sparse_layer_ids = []
         if disable_index_value_layer_ids is None:
@@ -221,6 +240,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         super().__init__(*args, **kwargs)
 
+        self._draft_subpage_view_obj: Optional["MiniMaxM3DraftSubpageView"] = None
+
         index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
         if self.is_disagg and index_v_layer_ids:
             raise ValueError(
@@ -246,6 +267,43 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+
+    @property
+    def draft_subpage_view(self) -> Optional["MiniMaxM3DraftSubpageView"]:
+        """Sub-page view over the shared drafter pool, or None.
+
+        Only meaningful on a target manager that carries appended one-model
+        draft layers; a separate draft manager (``is_draft``) never exposes
+        one. Built lazily so the manager's page-table tensors exist.
+        """
+        if self.is_draft or not self._shared_draft_layer_ids:
+            return None
+        if self._draft_subpage_view_obj is None:
+            self._draft_subpage_view_obj = MiniMaxM3DraftSubpageView(
+                self,
+                self._shared_draft_layer_ids,
+                self.draft_manager_tokens_per_block,
+            )
+            logger.info(
+                f"[unified-kv] draft subpage view active: "
+                f"draft_layers={self._shared_draft_layer_ids} "
+                f"subdiv={self._draft_subpage_view_obj._subdiv} "
+                f"draft_pools={self._draft_subpage_view_obj._draft_pool_ids}"
+            )
+        return self._draft_subpage_view_obj
+
+    def add_dummy_requests(self, *args, **kwargs):
+        """Drop the draft sub-page view before delegating.
+
+        The base method mirrors dummy KV caches into a *separate* draft
+        manager. With shared draft layers the dummy request's blocks in THIS
+        manager already span the drafter's pool (all pools allocate in
+        lockstep per logical block), so no mirror is needed — and the view
+        deliberately owns no block lifecycle.
+        """
+        if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftSubpageView):
+            kwargs["draft_kv_cache_manager"] = None
+        return super().add_dummy_requests(*args, **kwargs)
 
     def _extra_buffers_per_layer(self, *, tokens_per_block):
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
@@ -542,6 +600,98 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # BAD_PAGE_INDEX marks padding, which this tensor reports as 0.
         rows[rows == BAD_PAGE_INDEX] = 0
         return padded_tensor
+
+
+class MiniMaxM3DraftSubpageView:
+    """Present the shared manager's draft-layer pool at a smaller kernel page size.
+
+    With unified KV cache the drafter's blocks live in the shared manager
+    (128-token logical blocks), but the Eagle3 kernels are only healthy at
+    32-token pages on this architecture (context cubin missing and ForGen IMA
+    at 128). This view is handed out wherever a separate draft manager would
+    flow (``get_draft_kv_cache_manager`` and the attention-metadata draft
+    swap): it reuses the manager's pool pointers and layer→pool mapping
+    verbatim and re-expresses only the page granularity —
+    ``tokens_per_block=32`` plus a block-offset table where each standard
+    entry ``v`` fans out to sub-pages ``v*subdiv + j``. The attention op
+    derives the page stride from tokens_per_block, so slot ``s`` resolves to
+    K sub-pages ``2s*subdiv..`` and V sub-pages ``(2s+1)*subdiv..`` with no
+    pointer arithmetic changes. The view owns no blocks: lifecycle stays
+    entirely with the shared manager.
+    """
+
+    def __init__(self, manager, draft_layer_ids: Sequence[int], subpage_tokens: int):
+        self._manager = manager
+        self.tokens_per_block = int(subpage_tokens)
+        assert manager.tokens_per_block % self.tokens_per_block == 0, (
+            f"subpage size {subpage_tokens} must divide manager "
+            f"tokens_per_block {manager.tokens_per_block}"
+        )
+        self._subdiv = manager.tokens_per_block // self.tokens_per_block
+        # M3 packs every layer's buffers into one mega-slot pool; per-layer
+        # geometry (slot count, per-layer scale, this layer's K base) comes
+        # from the same API the dense-layer trtllm-gen adapter uses.
+        gid = draft_layer_ids[0]
+        addr_key, _dt, num_slots, scale, _shape = manager._kv_slot_geometry(gid, None)
+        self._slot_units = scale * self._subdiv  # slot stride in 32-tok units
+        self.num_pools = 1
+        self.num_attention_op_pools = 1
+        self.max_blocks_per_seq = manager.max_blocks_per_seq * self._subdiv
+        # Single-pool pointer rooted at the drafter's K; the op derives the
+        # page stride from tokens_per_block, so unit indices below address
+        # 32-token drafter pages directly.
+        self.kv_cache_pool_pointers = torch.tensor(
+            [[addr_key, 0]], dtype=torch.int64, pin_memory=prefer_pinned()
+        )
+        mapping = manager.kv_cache_pool_mapping.clone()
+        local = manager.layer_offsets[gid]
+        mapping[int(local)] = torch.tensor([0, 0], dtype=mapping.dtype)
+        self.kv_cache_pool_mapping = mapping
+        # Placeholder host mirror: the dense TRTLLM path plans from device
+        # offsets; nothing reads the host table during the draft window.
+        self.host_kv_cache_block_offsets = torch.zeros(
+            (manager.num_pools, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        self._scratch: Optional[torch.Tensor] = None
+        self._arange: Optional[torch.Tensor] = None
+
+    def __getattr__(self, name):
+        manager = self.__dict__.get("_manager")
+        if manager is None:
+            raise AttributeError(name)
+        return getattr(manager, name)
+
+    @property
+    def host_kv_cache_pool_pointers(self):
+        return self._manager.kv_cache_pool_pointers
+
+    def free_resources(self, request) -> None:
+        """No-op: block lifecycle belongs to the shared manager."""
+
+    def copy_batch_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+        max_blocks: Optional[int] = None,
+    ) -> None:
+        sub = self._subdiv
+        # Raw mega-pool slot ids per request (M3's bypass semantics).
+        slot_rows = self._manager._get_batch_cache_indices_by_pool_id(request_ids, pool_id=0)
+        max_units = dst_tensor.shape[-1]
+        host = torch.zeros((num_seqs, 2, max_units), dtype=dst_tensor.dtype)
+        for i, slots in enumerate(slot_rows[:num_seqs]):
+            n = min(len(slots), max_units // sub)
+            if n <= 0:
+                continue
+            base = torch.tensor(slots[:n], dtype=dst_tensor.dtype)
+            base = torch.where(base < 0, torch.zeros_like(base), base)
+            k = (base * self._slot_units).unsqueeze(-1) + torch.arange(sub, dtype=dst_tensor.dtype)
+            host[i, 0, : n * sub] = k.reshape(-1)
+            host[i, 1, : n * sub] = (k + sub).reshape(-1)
+        dst_tensor[0, :num_seqs].copy_(host, non_blocking=True)
 
 
 def get_minimax_m3_kv_cache_manager_cls():

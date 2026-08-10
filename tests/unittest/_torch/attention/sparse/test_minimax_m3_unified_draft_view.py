@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Pure-logic tests for MiniMaxM3DraftSubpageView.
+
+The view presents the shared manager's draft-layer pool to the attention ops
+at a smaller kernel page size (32-token pages inside 128-token logical
+blocks). These tests validate the addressing math against a fake manager, so
+they run without GPUs: slot ``s`` of the drafter's layer must resolve to K
+sub-pages ``s*scale*subdiv + j`` and V sub-pages offset by ``subdiv`` (V is
+laid out immediately after K within the slot).
+"""
+
+import torch
+
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3DraftSubpageView,
+)
+
+DRAFT_LAYER = 60
+SCALE = 178  # sub-pages per mega-slot, in units of the drafter's 128-tok page
+ADDR = 0x7000_0000
+
+
+class _FakeManager:
+    tokens_per_block = 128
+    max_blocks_per_seq = 16
+    num_pools = 1
+
+    def __init__(self):
+        self.layer_offsets = {DRAFT_LAYER: DRAFT_LAYER}
+        self.kv_cache_pool_mapping = torch.zeros((DRAFT_LAYER + 1, 2), dtype=torch.int32)
+        self.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([0, 7], dtype=torch.int32)
+        self.slot_rows = [[5, 7]]
+
+    def _kv_slot_geometry(self, layer_idx, kv_layout):
+        assert layer_idx == DRAFT_LAYER
+        page_shape = [self.tokens_per_block, 16, 128]
+        return ADDR, torch.int8, 1024, SCALE, page_shape
+
+    def _get_batch_cache_indices_by_pool_id(self, request_ids, *, pool_id):
+        assert pool_id == 0
+        return self.slot_rows[: len(request_ids)]
+
+
+def _make_view():
+    return MiniMaxM3DraftSubpageView(_FakeManager(), [DRAFT_LAYER], 32)
+
+
+def test_view_geometry():
+    view = _make_view()
+    assert view.tokens_per_block == 32
+    assert view._subdiv == 4
+    assert view._slot_units == SCALE * 4
+    assert view.max_blocks_per_seq == 16 * 4
+    assert view.num_pools == view.num_attention_op_pools == 1
+    assert view.kv_cache_pool_pointers.tolist() == [[ADDR, 0]]
+    # The draft layer's mapping row is rewritten to the view's single pool.
+    assert view.kv_cache_pool_mapping[DRAFT_LAYER].tolist() == [0, 0]
+
+
+def test_block_table_expansion():
+    view = _make_view()
+    max_units = view.max_blocks_per_seq
+    dst = torch.full((1, 1, 2, max_units), -7, dtype=torch.int32)
+    view.copy_batch_block_offsets(dst, request_ids=[123], beam_width=1, num_contexts=1, num_seqs=1)
+    unit = SCALE * 4
+    expect_k = [5 * unit + j for j in range(4)] + [7 * unit + j for j in range(4)]
+    expect_v = [v + 4 for v in expect_k]
+    assert dst[0, 0, 0, :8].tolist() == expect_k
+    assert dst[0, 0, 1, :8].tolist() == expect_v
+    # Unallocated tail stays at the safe pad written by the expansion (zeros).
+    assert dst[0, 0, 0, 8:].tolist() == [0] * (max_units - 8)
+
+
+def test_bad_page_index_padding_is_safe():
+    view = _make_view()
+    view._manager.slot_rows = [[5, -1]]
+    dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
+    view.copy_batch_block_offsets(dst, request_ids=[1], beam_width=1, num_contexts=1, num_seqs=1)
+    # BAD_PAGE_INDEX (-1) clamps to slot 0: pad entries index pages 0..subdiv,
+    # never negative offsets.
+    assert dst[0, 0, 0, 4:8].tolist() == [0, 1, 2, 3]
+    assert (dst >= 0).all()
+
+
+def test_free_resources_is_noop():
+    view = _make_view()
+    view.free_resources(object())  # must not raise nor touch the manager
