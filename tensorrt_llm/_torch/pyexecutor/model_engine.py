@@ -104,16 +104,11 @@ def _use_captured_context_model(attn_metadata) -> bool:
 class _ContextOnlyCompiledModel(torch.nn.Module):
     """Route captured context batches through compile and all others eager.
 
-    Piecewise context CUDA graphs require the compiled model. Generation-only
-    batches and context batches above the largest captured token bucket should
-    retain the pristine eager path rather than inherit compile-specific kernels
-    without receiving graph replay. This wrapper keeps both callables over the
-    same parameters and selects from host-visible request state before either
-    model starts execution.
-
-    This is initially guarded by ``TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1`` so the
-    mixed-context graph experiment can be evaluated without changing the default
-    compile contract.
+    Piecewise CUDA graphs cover context and mixed batches. Generation-only
+    batches and context batches above the capture ceiling do not replay those
+    graphs, so they retain the eager model path. This wrapper keeps both
+    callables over the same parameters and selects from host-visible request
+    state before either model starts execution.
     """
 
     def __init__(self, eager_model: torch.nn.Module,
@@ -536,17 +531,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.torch_compile_config = self.llm_args.torch_compile_config
         torch_compile_enabled = bool(self.torch_compile_config is not None)
-        context_only_compile_env = os.environ.get(
-            "TRTLLM_TORCH_COMPILE_CONTEXT_ONLY", "0")
-        if context_only_compile_env not in ("0", "1"):
-            raise ValueError(
-                "TRTLLM_TORCH_COMPILE_CONTEXT_ONLY must be 0 or 1, got "
-                f"{context_only_compile_env!r}")
-        self._torch_compile_context_only = context_only_compile_env == "1"
-        if self._torch_compile_context_only and not torch_compile_enabled:
-            raise ValueError(
-                "TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1 requires TorchCompileConfig"
-            )
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
@@ -562,6 +546,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
+        self._torch_compile_context_only = torch_compile_piecewise_cuda_graph
 
         piecewise_cuda_graph_num_tokens = (
             torch_compile_piecewise_cuda_graph_num_tokens
