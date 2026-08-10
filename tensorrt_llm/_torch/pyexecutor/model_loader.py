@@ -54,6 +54,31 @@ _KV_CACHE_MAP = {
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
+# Dense models do not consume moe_backend. Their mapping dimensions remain
+# constrained so unsupported parallel topologies still fail closed.
+_MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
+    dtypes=frozenset({"bfloat16"}),
+    quant_algorithms=frozenset({"none"}),
+    kv_cache_quant_algorithms=frozenset({"none"}),
+    layerwise_quantization=frozenset({False}),
+    force_dynamic_quantization=frozenset({False}),
+    lora_enabled=frozenset({False}),
+    sparse_attention_enabled=frozenset({False}),
+    attention_backends=frozenset({"TRTLLM"}),
+    tp_sizes=frozenset({1, 2}),
+    pp_sizes=frozenset({1}),
+    cp_sizes=frozenset({1}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1}),
+    attention_tp_sizes=frozenset({1, 2}),
+    attention_cp_sizes=frozenset({1}),
+    attention_dp=frozenset({False}),
+    multi_node=frozenset({False}),
+    tied_word_embeddings=frozenset({False}),
+    rope_types=frozenset({"default"}),
+    rope_fusion=frozenset({True}),
+)
+
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
                                                llm_args: TorchLlmArgs) -> None:
@@ -366,28 +391,7 @@ class ModelLoader:
                         _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
                         transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-                        runtime_constraints=PostTransformRuntimeConstraints(
-                            dtypes=frozenset({"bfloat16"}),
-                            quant_algorithms=frozenset({"none"}),
-                            kv_cache_quant_algorithms=frozenset({"none"}),
-                            layerwise_quantization=frozenset({False}),
-                            force_dynamic_quantization=frozenset({False}),
-                            lora_enabled=frozenset({False}),
-                            sparse_attention_enabled=frozenset({False}),
-                            attention_backends=frozenset({"TRTLLM"}),
-                            tp_sizes=frozenset({1, 2}),
-                            pp_sizes=frozenset({1}),
-                            cp_sizes=frozenset({1}),
-                            moe_tp_sizes=frozenset({1, 2}),
-                            moe_ep_sizes=frozenset({1}),
-                            attention_tp_sizes=frozenset({1, 2}),
-                            attention_cp_sizes=frozenset({1}),
-                            attention_dp=frozenset({False}),
-                            multi_node=frozenset({False}),
-                            tied_word_embeddings=frozenset({False}),
-                            rope_types=frozenset({"default"}),
-                            rope_fusion=frozenset({True}),
-                        ),
+                        runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
                     ),
                     PostTransformProfile(
                         profile_id="qwen2-for-causal-lm-bf16-target-v1",
@@ -400,28 +404,7 @@ class ModelLoader:
                         transform_abi_id=
                         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
                         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-                        runtime_constraints=PostTransformRuntimeConstraints(
-                            dtypes=frozenset({"bfloat16"}),
-                            quant_algorithms=frozenset({"none"}),
-                            kv_cache_quant_algorithms=frozenset({"none"}),
-                            layerwise_quantization=frozenset({False}),
-                            force_dynamic_quantization=frozenset({False}),
-                            lora_enabled=frozenset({False}),
-                            sparse_attention_enabled=frozenset({False}),
-                            attention_backends=frozenset({"TRTLLM"}),
-                            tp_sizes=frozenset({1, 2}),
-                            pp_sizes=frozenset({1}),
-                            cp_sizes=frozenset({1}),
-                            moe_tp_sizes=frozenset({1, 2}),
-                            moe_ep_sizes=frozenset({1}),
-                            attention_tp_sizes=frozenset({1, 2}),
-                            attention_cp_sizes=frozenset({1}),
-                            attention_dp=frozenset({False}),
-                            multi_node=frozenset({False}),
-                            tied_word_embeddings=frozenset({False}),
-                            rope_types=frozenset({"default"}),
-                            rope_fusion=frozenset({True}),
-                        ),
+                        runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
                     ),
                 ))
         return cls._POST_TRANSFORM_PROFILE_REGISTRY
@@ -1240,14 +1223,11 @@ class ModelLoader:
                 if not weights_preloaded:
                     unsupported_runtime_dimensions = ",".join(
                         sorted(qualification.unsupported_runtime_dimensions))
-                    logger.info(
-                        "Skipping MX post-transform publish for %s: "
-                        "qualification reason=%s, "
-                        "unsupported_runtime_dimensions=%s.",
-                        type(model).__name__,
-                        qualification.reason.value,
-                        unsupported_runtime_dimensions or "none",
-                    )
+                    logger.info("Skipping MX post-transform publish for "
+                                f"{type(model).__name__}: qualification "
+                                f"reason={qualification.reason.value}, "
+                                "unsupported_runtime_dimensions="
+                                f"{unsupported_runtime_dimensions or 'none'}.")
                 return
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)

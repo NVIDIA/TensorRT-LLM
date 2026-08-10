@@ -661,6 +661,7 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("rank", [0, 1])
 def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
     monkeypatch: pytest.MonkeyPatch,

@@ -353,7 +353,7 @@ def test_registry_selects_disjoint_runtime_profile() -> None:
 def test_registry_rejects_overlapping_runtime_profiles() -> None:
     with pytest.raises(
         ValueError,
-        match="Duplicate post-transform profile for .*runtime constraints overlap",
+        match=r"Duplicate post-transform profile for .*runtime constraints overlap",
     ):
         PostTransformProfileRegistry(
             (
