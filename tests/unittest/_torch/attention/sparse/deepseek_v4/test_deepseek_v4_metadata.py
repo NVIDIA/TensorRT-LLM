@@ -23,6 +23,8 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_prepare_computes_draft_sliding_block_tables_before_base_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
     """DeepSeek-V4 MTP draft KV managers need their sliding tables prepared.
