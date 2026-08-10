@@ -121,7 +121,23 @@ public:
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
+    /// Whether the bounce v2 transport is active on this agent (built + enabled + init succeeded).
+    /// Programmatic alternative to grepping logs (deployment checks and tests).
+    [[nodiscard]] bool isBounceEnabled() const noexcept
+    {
+        return mBounce != nullptr;
+    }
+
+    /// Number of transfer requests routed to the bounce fast path so far.
+    [[nodiscard]] std::uint64_t getBounceSubmitCount() const noexcept
+    {
+        return mBounceSubmitCount.load(std::memory_order_relaxed);
+    }
+
 private:
+    /// Counts requests admitted by shouldUseBounce (see getBounceSubmitCount).
+    std::atomic<std::uint64_t> mBounceSubmitCount{0};
+
     // shared_ptr so outstanding NixlTransferStatus (via weak_ptr) can detect agent reset.
     std::shared_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};

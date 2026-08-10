@@ -983,6 +983,7 @@ def run_transfer_test(
     request_lengths: Optional[List[int]] = None,
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
+    expect_cpp_bounce: bool = False,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
@@ -1161,6 +1162,17 @@ def run_transfer_test(
                 gen_request_ids=gen_request_ids,
                 num_layers=num_layers,
             )
+
+        # Programmatic bounce check (no log parsing): every agent must have the C++
+        # bounce v2 transport active, and at least one transfer must have been routed
+        # through it (only KV senders submit WRITEs, so we assert on the total).
+        if expect_cpp_bounce:
+            agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
+            assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
+                "C++ bounce v2 transport is not active on every NIXL agent"
+            )
+            total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
+            assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
 
         # 9. Cleanup
         if use_v2:
@@ -1596,6 +1608,7 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
             use_v2=use_v2,
             request_lengths=[30, 60],
             enable_indexer_k_cache=enable_indexer_k_cache,
+            expect_cpp_bounce=True,
         )
         return
 
@@ -1616,10 +1629,12 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
             # UCX_TLS can fail the transfer or oversubscribe CPUs).
             "UCX_TLS": "^ib,gdr_copy",
             "TRTLLM_NIXL_NUM_THREADS": "1",
-            "TLLM_LOG_LEVEL": "INFO",
-            "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
         }
     )
+    # Deliberately NOT setting TLLM_LOG_LEVEL_BY_MODULE: bounce engagement is verified
+    # programmatically inside the child (agent.bounce_enabled / bounce_submit_count),
+    # and a non-empty per-module level map can hang the child at exit (static-destruction
+    # order: CudaMemPool's deleter logs through an already-destroyed Logger module map).
     env.pop("UCX_NET_DEVICES", None)
     # Do not override TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY: the test must
     # exercise the production default, including automatic cudaMalloc fallback
@@ -1636,8 +1651,6 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     )
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    assert "bounce v2 enabled" in output, output
-    assert "bounce path engaged" in output, output
 
 
 if __name__ == "__main__":
