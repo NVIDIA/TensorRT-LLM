@@ -129,6 +129,138 @@ def test_block_reuse_default_departs_from_the_framework_default():
     assert defaults["kv_cache_config"]["enable_block_reuse"] is False
 
 
+# ---------------------------------------------------------------------------
+# The two features that must be refused, not defaulted off.
+#
+# Both leave a CONTEXT request with history it should attend to and convolve
+# against, and Inkling gets that wrong twice: _run_context attends only to the
+# tokens of its own call (inkling_prefill_attention has no paged-KV argument),
+# and InklingConvRuntime.build seeds every context request with
+# has_initial_state=False. Neither raises on its own -- both emit wrong logits.
+# ---------------------------------------------------------------------------
+def test_block_reuse_is_rejected_not_merely_defaulted_off():
+    """An explicit enable_block_reuse=True wins the deep-merge over the model
+    default, so the default alone cannot be the guarantee."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    with pytest.raises(NotImplementedError, match="block reuse"):
+        reject_unsupported_inkling_kv_cache_features(
+            InklingConfig(), enable_block_reuse=True, enable_chunked_prefill=False
+        )
+
+
+def test_chunked_prefill_is_rejected():
+    """slots_for keeps a request's pool row across chunks and causal_conv1d_fn
+    does write the trailing window into it, but a second chunk still declares
+    has_initial_state=False, so the carried window is never consumed."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    with pytest.raises(NotImplementedError, match="chunked prefill"):
+        reject_unsupported_inkling_kv_cache_features(
+            InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
+        )
+
+
+def test_both_messages_name_the_attention_path_not_just_the_conv():
+    """The conv window is the visible half; the load-bearing half is that
+    inkling_prefill_attention has no paged-KV argument, so a context request
+    with cached history loses it in ATTENTION too. A reader who sees only the
+    conv reason will "fix" has_initial_state, get a still-wrong result, and
+    conclude the guard was over-cautious. Both messages must say so."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    for reuse, chunked in ((True, False), (False, True)):
+        with pytest.raises(NotImplementedError) as exc:
+            reject_unsupported_inkling_kv_cache_features(
+                InklingConfig(), enable_block_reuse=reuse, enable_chunked_prefill=chunked
+            )
+        msg = str(exc.value)
+        assert "inkling_prefill_attention" in msg, msg
+        assert "paged-KV" in msg, msg
+
+
+def test_the_conv_seeding_site_warns_against_a_partial_fix():
+    """InklingConvRuntime.build is where someone would land with the
+    Mamba2Metadata pattern in hand. The comment there has to say that deriving
+    has_initial_state is necessary but not sufficient, or the next reader
+    reintroduces the bug in a form that no longer raises."""
+    import inspect
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingConvRuntime
+
+    src = inspect.getsource(InklingConvRuntime.build)
+    assert "not sufficient" in src.lower(), src
+    assert "_run_context" in src, src
+
+
+def test_the_supported_configuration_is_accepted():
+    """Both off -- what every Inkling accuracy run measured -- must stay silent,
+    including on the text sub-config the KV cache is sized from."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    for cfg in (InklingConfig(), InklingTextConfig()):
+        reject_unsupported_inkling_kv_cache_features(
+            cfg, enable_block_reuse=False, enable_chunked_prefill=False
+        )
+
+
+def test_the_rejection_is_scoped_to_inkling():
+    """The guard sits on a shared path (KvCacheCreator picks the manager class
+    for every model), so it must be inert for anything that is not Inkling."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    not_inkling = SimpleNamespace(model_type="llama")
+    reject_unsupported_inkling_kv_cache_features(
+        not_inkling, enable_block_reuse=True, enable_chunked_prefill=True
+    )
+
+
+def test_the_rejection_names_both_features_separately():
+    """Two independent causes; a user who hits both must not have to re-run to
+    discover the second. Block reuse is reported first because it is the one a
+    user can hit without asking for it (the framework default is True)."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    with pytest.raises(NotImplementedError) as first:
+        reject_unsupported_inkling_kv_cache_features(
+            InklingConfig(), enable_block_reuse=True, enable_chunked_prefill=True
+        )
+    assert "block reuse" in str(first.value)
+    assert "enable_block_reuse=False" in str(first.value)
+
+    with pytest.raises(NotImplementedError) as second:
+        reject_unsupported_inkling_kv_cache_features(
+            InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
+        )
+    assert "enable_chunked_prefill=False" in str(second.value)
+
+
+def test_the_kv_cache_creator_calls_the_guard():
+    """The guard is only worth anything if the one path that builds every KV
+    cache manager runs it, with the RESOLVED kv_cache_config (post deep-merge)
+    rather than the user's raw input."""
+    import inspect
+
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    src = inspect.getsource(_util.KvCacheCreator._get_model_kv_cache_manager_cls)
+    assert "reject_unsupported_inkling_kv_cache_features" in src
+    assert "kv_cache_config.enable_block_reuse" in src
+    assert "enable_chunked_prefill" in src
+
+
 def test_text_geometry():
     """The config defaults are the checkpoint's text-tower geometry."""
     tc = InklingTextConfig()

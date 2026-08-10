@@ -303,9 +303,17 @@ class InklingConvRuntime:
                 0
             )
             query_start_loc = cu
-            # Fresh prefill carries no prior conv window. Only correct because
-            # Inkling defaults ``enable_block_reuse`` off; supporting reuse would
-            # need this set per request plus the preceding activations restored.
+            # Fresh prefill carries no prior conv window. This is correct only
+            # because the two features that would leave a context request with a
+            # prior window -- KV block reuse and chunked prefill -- are refused
+            # up front by ``reject_unsupported_inkling_kv_cache_features``.
+            #
+            # Do NOT "fix" this line on its own. Deriving has_initial_state from
+            # ``num_cached_tokens_per_seq`` (the ``Mamba2Metadata`` pattern) is
+            # necessary but NOT sufficient: ``_run_context`` attends only to the
+            # tokens of its own call, so a request carrying cached history would
+            # still lose that history in attention and stay silently wrong. See
+            # ``reject_unsupported_inkling_kv_cache_features``.
             has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
         return cls(
             num_ctx_tokens=num_ctx_tokens,
@@ -858,6 +866,16 @@ class InklingAttention(QKNormRoPEAttention):
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
+        # NOTE: this attends only to the tokens of THIS call. The write above
+        # honours ``num_cached``, but ``inkling_prefill_attention`` takes no
+        # paged-KV argument, so a context request carrying cached history
+        # (chunked prefill, or a reused prefix) would silently drop all of it.
+        # Both are refused up front by
+        # ``reject_unsupported_inkling_kv_cache_features``; adding either one
+        # means giving Inkling a chunked-context prefill path that reads the
+        # pages back while carrying rel_logits and the sliding window across the
+        # boundary. ``num_cached`` is non-zero here only in that unsupported
+        # case, which is why the write path already accounts for it.
         return inkling_prefill_attention(
             q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
         )

@@ -50,7 +50,8 @@ from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            is_gemma4_hybrid, is_hybrid_linear, is_inkling,
                            is_kimi_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid)
+                           is_qwen3_hybrid,
+                           reject_unsupported_inkling_kv_cache_features)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -593,6 +594,16 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
+        # Inkling's short-conv window is per-request state outside the KV cache;
+        # block reuse and chunked prefill would both silently drop it. Checked
+        # here because this is the one place that sees the *resolved*
+        # kv_cache_config (model defaults already deep-merged with the user's
+        # settings) alongside llm_args.
+        reject_unsupported_inkling_kv_cache_features(
+            model_config.pretrained_config,
+            enable_block_reuse=kv_cache_config.enable_block_reuse,
+            enable_chunked_prefill=bool(
+                getattr(self._llm_args, "enable_chunked_prefill", False)))
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
