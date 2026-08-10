@@ -374,7 +374,10 @@ def _publish_bound_address(report_addr: Optional[str], host: str,
                                     suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(f"{host}:{port}\n")
+            # Bracket IPv6 literals so the value is a usable URL authority:
+            # readers build "http://<reported>/..." from it verbatim.
+            reported_host = f"[{host}]" if ":" in host else host
+            f.write(f"{reported_host}:{port}\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, report_addr)

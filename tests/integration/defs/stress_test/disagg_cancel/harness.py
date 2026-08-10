@@ -1909,6 +1909,15 @@ class DisaggCancellationStressHarness:
             logger.exception("[injector] failed to respawn %s_%d", spec.role, spec.index)
             return False
         tracked.wrapper = new_wrapper
+        # _teardown_cluster terminates the wrapper lists held in self._cluster,
+        # not self._tracked_workers, so the respawn has to replace its slot
+        # there or it survives teardown and keeps holding its GPUs. Done before
+        # the port wait below, so a respawn that never registers is cleaned up
+        # too. spec.index is per-role (see _make_worker_launch_spec callers).
+        if self._cluster is not None:
+            _, ctx_workers, gen_workers, *_ = self._cluster
+            workers = ctx_workers if spec.role == "ctx" else gen_workers
+            workers[spec.index] = new_wrapper
         if new_wrapper.log_path is not None:
             spec.log_path = new_wrapper.log_path
 

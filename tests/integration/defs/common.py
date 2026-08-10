@@ -726,6 +726,13 @@ def get_ephemeral_port_range():
         print_info(f"[get_free_port_in_ci] could not read the ephemeral port "
                    f"range ({e}); assuming none is reserved.")
         return None
+    # Nonsense bounds would make get_static_port_range() hand out ports outside
+    # 1-65535, and bind() raises OverflowError (not OSError) for those, so
+    # reserve_port_from_range would propagate it instead of trying another port.
+    if not 1 <= low <= high <= 65535:
+        print_warning(f"[get_free_port_in_ci] ignoring implausible ephemeral "
+                      f"port range ({low}, {high}).")
+        return None
     return low, high
 
 
