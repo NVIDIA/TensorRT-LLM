@@ -89,7 +89,23 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
+.. autoclass:: tensorrt_llm.llmapi.BlockReuseConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
 .. autoclass:: tensorrt_llm.llmapi.KvCacheConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.MambaStateConfig
     :members:
     :undoc-members:
     :show-inheritance:
@@ -360,7 +376,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_construct,model_copy,dict,copy,schema,json,model_post_init,model_computed_fields,model_rebuild,parse_obj,model_extra,model_json_schema,model_fields_set,model_validate_json,construct,model_validate,model_validate_strings,model_dump_json,parse_raw,validate,from_orm,model_parametrized_name,model_fields,parse_file,schema_json,model_config,model_dump,update_forward_refs
+    :exclude-members: update_forward_refs,model_json_schema,parse_obj,model_copy,model_validate_strings,model_construct,model_parametrized_name,copy,model_rebuild,model_post_init,parse_file,model_validate,validate,model_extra,model_fields,schema_json,model_computed_fields,model_dump,model_dump_json,parse_raw,construct,model_fields_set,model_validate_json,model_config,json,dict,from_orm,schema
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
@@ -450,6 +466,14 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
+.. autoclass:: tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
 .. autoclass:: tensorrt_llm.llmapi.PrometheusMetricsConfig
     :members:
     :undoc-members:
@@ -467,6 +491,14 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.add_thinking_budget_logits_processor
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.MultimodalConfig
     :members:
     :undoc-members:
     :show-inheritance:

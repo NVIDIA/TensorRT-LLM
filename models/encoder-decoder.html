@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,6 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -419,6 +420,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a></li>
@@ -600,8 +602,8 @@ with the PyTorch backend. You do not need to convert the checkpoint or build a
 TensorRT engine. The LLM API treats the supplied prompt as the encoder input and
 automatically starts the decoder with the checkpoint’s
 <code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> or <code class="docutils literal notranslate"><span class="pre">bos_token_id</span></code>.</p>
-<p>This guide covers text-to-text generation with the following Hugging Face
-architectures:</p>
+<p>This guide covers text-to-text generation and speech-to-text transcription with
+the following Hugging Face architectures:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Hugging Face architecture</p></th>
@@ -618,17 +620,22 @@ architectures:</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MBartForConditionalGeneration</span></code></p></td>
 <td><p>mBART checkpoints</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WhisperForConditionalGeneration</span></code></p></td>
+<td><p>Whisper automatic speech recognition (ASR), for example <code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
+</tr>
 </tbody>
 </table>
 </div>
-<p>Whisper is not currently supported by the PyTorch encoder-decoder path. Support
-is in progress.</p>
 <p>mBART architecture loading is available. When a BART or mBART checkpoint
 defines <code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, the PyTorch backend seeds that token in the
 decoder prefix. Source- and target-language selection remains
 checkpoint-specific, so validate the configured language tokens before
 deployment. Refer to <a class="reference internal" href="#understand-bart-and-mbart-decoder-tokens"><span class="xref myst">Understand BART and mBART decoder tokens</span></a>
 for BOS, EOS, and output-limit behavior.</p>
+<p>Whisper consumes audio rather than a text prompt. The sections up to
+<a class="reference internal" href="#transcribe-audio-with-whisper"><span class="xref myst">Transcribe audio with Whisper</span></a> describe the
+text-to-text models; the runtime configuration, KV cache manager, beam search,
+CUDA graph, and parallelism guidance in this guide applies to all architectures.</p>
 <section id="feature-support">
 <h2>Feature support<a class="headerlink" href="#feature-support" title="Link to this heading">#</a></h2>
 <p>The following table describes the supported and recommended configurations.</p>
@@ -661,12 +668,12 @@ for BOS, EOS, and output-limit behavior.</p>
 <td><p>Use this backend for encoder-decoder models. It is required when <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p>Decoder CUDA graphs</p></td>
-<td><p>Yes</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code> captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path.</p></td>
+<td><p>Yes, except in FP32</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code> captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. FP32 encoder-decoder models decline capture at engine init and log a warning instead of failing.</p></td>
 </tr>
 <tr class="row-even"><td><p>Encoder CUDA graphs</p></td>
-<td><p>No</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">EncodeCudaGraphConfig</span></code> is disabled for encoder-decoder models. The encoder runs eagerly.</p></td>
+<td><p>Yes</p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config=EncodeCudaGraphConfig(...)</span></code> and <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>. Usually set <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> lower than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend is required.</p></td>
 </tr>
 <tr class="row-odd"><td><p>Overlap scheduler</p></td>
 <td><p>Yes</p></td>
@@ -835,6 +842,75 @@ past EOS.</p>
 <code class="docutils literal notranslate"><span class="pre">finish_reason=&quot;length&quot;</span></code>.</p>
 </section>
 </section>
+<section id="transcribe-audio-with-whisper">
+<h2>Transcribe audio with Whisper<a class="headerlink" href="#transcribe-audio-with-whisper" title="Link to this heading">#</a></h2>
+<p>Whisper is an audio encoder-decoder model for speech transcription and
+translation. It differs from the text-to-text models in this guide in two ways:
+the encoder consumes audio instead of a text prompt, and the text prompt, when
+supplied, sets the decoder task prefix rather than the encoder input.</p>
+<p>Pass one audio clip per request through <code class="docutils literal notranslate"><span class="pre">multi_modal_data[&quot;audio&quot;]</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">SchedulerConfig</span>
+
+
+<span class="n">model</span> <span class="o">=</span> <span class="s2">&quot;openai/whisper-large-v3&quot;</span>
+<span class="n">wave</span><span class="p">,</span> <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="s2">&quot;utterance.wav&quot;</span><span class="p">)</span>
+
+<span class="k">with</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="c1"># Cross-KV pool capacity. The default (1024) is smaller than the 1500</span>
+    <span class="c1"># encoder positions that every Whisper request produces.</span>
+    <span class="n">max_input_len</span><span class="o">=</span><span class="mi">1500</span><span class="p">,</span>
+    <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">3000</span><span class="p">,</span>
+    <span class="n">enable_chunked_prefill</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+        <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">scheduler_config</span><span class="o">=</span><span class="n">SchedulerConfig</span><span class="p">(</span><span class="n">use_python_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">llm</span><span class="p">:</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+        <span class="p">{</span><span class="s2">&quot;prompt&quot;</span><span class="p">:</span> <span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="s2">&quot;multi_modal_data&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;audio&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">wave</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)]}},</span>
+        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">96</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">),</span>
+        <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Set <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> to at least 1500. Every Whisper request produces 1500 encoder
+positions regardless of clip length, and the cross-KV pool is sized from <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code>.</p>
+<p>The audio item accepts a file path or URL, an <code class="docutils literal notranslate"><span class="pre">(array,</span> <span class="pre">sample_rate)</span></code> tuple, or a
+<code class="docutils literal notranslate"><span class="pre">{&quot;array&quot;:</span> <span class="pre">...,</span> <span class="pre">&quot;sampling_rate&quot;:</span> <span class="pre">...}</span></code> mapping. Supply exactly one clip per
+request, at the checkpoint’s sampling rate, which is 16 kHz for the published
+Whisper checkpoints. Clips shorter than the 30-second window are zero-padded;
+longer clips and other sampling rates are rejected rather than silently
+truncated or resampled. Long-form chunked transcription is not part of this
+path.</p>
+<section id="select-the-language-and-task">
+<h3>Select the language and task<a class="headerlink" href="#select-the-language-and-task" title="Link to this heading">#</a></h3>
+<p>An empty text prompt selects the checkpoint default, which is English
+transcription (<code class="docutils literal notranslate"><span class="pre">&lt;|startoftranscript|&gt;[&lt;|en|&gt;][&lt;|transcribe|&gt;]&lt;|notimestamps|&gt;</span></code>).
+A non-empty text prompt replaces that decoder prefix verbatim and is how you
+override the language or switch to translation. It must begin with
+<code class="docutils literal notranslate"><span class="pre">&lt;|startoftranscript|&gt;</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|startoftranscript|&gt;&lt;|de|&gt;&lt;|transcribe|&gt;&lt;|notimestamps|&gt;&quot;</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+    <span class="p">{</span><span class="s2">&quot;prompt&quot;</span><span class="p">:</span> <span class="n">prompt</span><span class="p">,</span> <span class="s2">&quot;multi_modal_data&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;audio&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">wave</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)]}},</span>
+    <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">96</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The prefix counts against the decoder position table, so <code class="docutils literal notranslate"><span class="pre">SamplingParams.max_tokens</span></code>
+is capped to the space remaining in it. A request asking for more logs a warning
+and proceeds with the capped budget. Pre-tokenized <code class="docutils literal notranslate"><span class="pre">prompt_token_ids</span></code> are not
+consumed on this path.</p>
+</section>
+</section>
 <section id="run-a-batch">
 <h2>Run a batch<a class="headerlink" href="#run-a-batch" title="Link to this heading">#</a></h2>
 <p>Pass a list of strings to batch inputs. The strings can have different tokenized
@@ -942,10 +1018,10 @@ to return only the best hypothesis.</p>
 <p>Beam search expands decoder-side cache and compute requirements. Include this
 expansion when sizing the self-attention KV pool and CUDA graph batch sizes.</p>
 </section>
-<section id="enable-decoder-cuda-graphs">
-<h2>Enable decoder CUDA graphs<a class="headerlink" href="#enable-decoder-cuda-graphs" title="Link to this heading">#</a></h2>
-<p>Pass <code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code> to capture and replay decoder iterations:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphConfig</span>
+<section id="enable-encoder-and-decoder-cuda-graphs">
+<h2>Enable encoder and decoder CUDA graphs<a class="headerlink" href="#enable-encoder-and-decoder-cuda-graphs" title="Link to this heading">#</a></h2>
+<p>Configure the decoder and encoder graph grids separately:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphConfig</span><span class="p">,</span> <span class="n">EncodeCudaGraphConfig</span>
 
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
@@ -953,10 +1029,19 @@ expansion when sizing the self-attention KV pool and CUDA graph batch sizes.</p>
     <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span>
     <span class="n">attn_backend</span><span class="o">=</span><span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span>
     <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">encoder_max_batch_size</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+    <span class="n">encoder_max_num_tokens</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
     <span class="n">cuda_graph_config</span><span class="o">=</span><span class="n">CudaGraphConfig</span><span class="p">(</span>
         <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
         <span class="n">enable_padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
     <span class="p">),</span>
+    <span class="n">encoder_cuda_graph_config</span><span class="o">=</span><span class="n">EncodeCudaGraphConfig</span><span class="p">(</span>
+        <span class="n">batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+        <span class="n">num_tokens</span><span class="o">=</span><span class="p">[</span><span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">2048</span><span class="p">],</span>
+        <span class="n">seq_lens</span><span class="o">=</span><span class="p">[</span><span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">],</span>
+        <span class="n">enable_padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">),</span>
+    <span class="n">enable_encoder_decoder_mixed_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
     <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
         <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
         <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
@@ -964,13 +1049,28 @@ expansion when sizing the self-attention KV pool and CUDA graph batch sizes.</p>
 <span class="p">)</span>
 </pre></div>
 </div>
-<p>This configuration captures decoder work only; the encoder continues to run
-eagerly. With beam search, graph batch sizes must cover the active decoder
-sequences after beam expansion. Padding lets nearby runtime batch sizes reuse a
-captured graph.</p>
-<p>Do not use <code class="docutils literal notranslate"><span class="pre">EncodeCudaGraphConfig</span></code> for an encoder-decoder model. The runtime
-warns and disables it. Piecewise CUDA graphs through <code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code> are
-also unsupported for this model type.</p>
+<p><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> controls decoder and mixed decoder graphs.
+<code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code> controls encoder-forward graph buckets for batch
+size, total packed tokens, and maximum sequence length. The
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> value is the hard encoder capacity and admission
+limit. With beam search, decoder graph batch sizes must cover the active
+decoder sequences after beam expansion.</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> controls the total decoder concurrency, while
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> controls encoder microbatch admission. For better
+performance, tune <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code>, and the
+encoder CUDA graph buckets together for the production workload. Start with
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> smaller than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, such as 2 versus 8,
+then adjust the limits and capture buckets based on benchmark results.</p>
+<p><code class="docutils literal notranslate"><span class="pre">enable_encoder_decoder_mixed_cuda_graph</span></code> is primarily a performance option. It
+reduces CPU launch overhead for decoder iterations that mix newly admitted
+context requests with ongoing generation requests. The option defaults to
+<code class="docutils literal notranslate"><span class="pre">True</span></code>, but becomes effective only when the encoder and decoder graph
+configurations produce usable capture shapes. Set it to <code class="docutils literal notranslate"><span class="pre">False</span></code> to disable
+mixed graphs while retaining the separate encoder and decoder CUDA graphs.</p>
+<p>Passing <code class="docutils literal notranslate"><span class="pre">EncodeCudaGraphConfig</span></code> through <code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code> remains unsupported
+for encoder-decoder models; pass it through <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code>
+instead. Piecewise CUDA graphs through <code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code> are also
+unsupported for this model type.</p>
 </section>
 <section id="control-the-overlap-scheduler">
 <h2>Control the overlap scheduler<a class="headerlink" href="#control-the-overlap-scheduler" title="Link to this heading">#</a></h2>
@@ -1026,10 +1126,22 @@ backend. Save it as <code class="docutils literal notranslate"><span class="pre"
 <span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bfloat16</span>
 <span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 <span class="nt">enable_chunked_prefill</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="nt">encoder_max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="nt">encoder_max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
 <span class="nt">max_beam_width</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
 <span class="nt">max_input_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
 <span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
+<span class="nt">cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">encoder_cuda_graph_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">batch_sizes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">num_tokens</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">256</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">512</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1024</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">seq_lens</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">256</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">512</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">enable_encoder_decoder_mixed_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 <span class="nt">kv_cache_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 <span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.8</span>
@@ -1042,7 +1154,6 @@ backend. Save it as <code class="docutils literal notranslate"><span class="pre"
 <p>Start the server:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>google/flan-t5-small<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--config<span class="w"> </span>enc-dec-config.yaml
 </pre></div>
 </div>
@@ -1078,11 +1189,14 @@ attention backend set to <code class="docutils literal notranslate"><span class=
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> to at least the larger of the maximum encoder input length
 and maximum decoded sequence length. The current encoder-decoder runtime uses
 this value while sizing both phases.</p></li>
-<li><p>Set <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> high enough for all encoder tokens admitted together and
-for the active decoder tokens. This is especially important for mixed-length
-batches.</p></li>
-<li><p>Increase <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> for more concurrent requests. Beam width multiplies
-the number of active decoder sequences but not the number of source requests.</p></li>
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> high enough for the active decoder tokens.</p></li>
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code> high enough for all encoder tokens in one
+encoder microbatch. This is especially important for mixed-length batches.</p></li>
+<li><p>Increase <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> for more concurrent requests. Start with a smaller
+<code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>, such as 2 when <code class="docutils literal notranslate"><span class="pre">max_batch_size=8</span></code>, to bound encoder
+memory and admission cost without reducing decoder concurrency. Beam width
+multiplies the number of active decoder sequences but not the number of
+source requests.</p></li>
 <li><p>Tune <code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction</span></code> first, then tune
 <code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> based on whether the cross-attention or
 self-attention pool is exhausted.</p></li>
@@ -1090,115 +1204,22 @@ self-attention pool is exhausted.</p></li>
 </section>
 <section id="performance">
 <h2>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h2>
-<p>The following benchmarks compare the PyTorch backend with the legacy TensorRT
-encoder-decoder path for large-batch inference. The measurements use BF16 on
-one H100 80 GB GPU with greedy decoding, an output limit of 128 tokens, and
-mixed encoder input lengths from 260 to 440 tokens. The Flan-T5-XL results are
-the average of ten timed runs after three warmup runs. The BART results are the
-average of 20 timed runs after five warmup runs. Executed-token throughput
-includes the terminal EOS token when a sequence emits it.</p>
-<p>The PyTorch configuration uses the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend, the overlap
-scheduler, the Python scheduler, decoder CUDA graphs with padding, KV cache
-manager V1, <code class="docutils literal notranslate"><span class="pre">max_input_len=512</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len=1024</span></code>, and
-<code class="docutils literal notranslate"><span class="pre">max_num_tokens=65536</span></code>. Block reuse and chunked prefill are disabled. The KV
-cache uses <code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction=0.3</span></code> and
-<code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction=0.5</span></code>.</p>
-<p>The legacy TensorRT configuration uses separate BF16 encoder and decoder
-engines built for batch size 128 and beam width 1. The encoder supports 512
-input tokens and 65,536 tokens per iteration; the decoder supports a sequence
-length of 129. The benchmark runs these engines through <code class="docutils literal notranslate"><span class="pre">ModelRunnerCpp</span></code> with
-greedy <code class="docutils literal notranslate"><span class="pre">top_k=1</span></code> decoding and the same KV cache fractions. For BART, the legacy
-TensorRT benchmark starts the decoder with token IDs <code class="docutils literal notranslate"><span class="pre">[2,</span> <span class="pre">0]</span></code> and generates at
-most 127 more tokens. The PyTorch LLM API applies the same decoder prefix
-internally and counts token ID 0 as the first output token; customers do not
-need to provide the decoder prefix. Both paths use token ID 2 as EOS and stop
-when the model generates it naturally. If a sequence reaches the output limit,
-it retains the model-selected final token and reports a length stop instead of
-forcing EOS. This setup also lets beam search begin after the shared decoder
-prefix without a per-step Python logits processor.</p>
-<section id="flan-t5-xl">
-<h3>Flan-T5-XL<a class="headerlink" href="#flan-t5-xl" title="Link to this heading">#</a></h3>
-<p>For Flan-T5-XL, the PyTorch backend performs on par with the legacy TensorRT
-path, with slightly lower latency and higher executed-token throughput across
-the tested batch sizes.</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head text-right"><p>Batch size</p></th>
-<th class="head text-right"><p>Legacy TensorRT latency</p></th>
-<th class="head text-right"><p>PyTorch latency</p></th>
-<th class="head text-right"><p>PyTorch latency improvement over legacy TensorRT</p></th>
-<th class="head text-right"><p>Legacy TensorRT executed tokens/s</p></th>
-<th class="head text-right"><p>PyTorch executed tokens/s</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td class="text-right"><p>32</p></td>
-<td class="text-right"><p>727.6 ms</p></td>
-<td class="text-right"><p>706.1 ms</p></td>
-<td class="text-right"><p>3.0%</p></td>
-<td class="text-right"><p>3,153</p></td>
-<td class="text-right"><p>3,312</p></td>
-</tr>
-<tr class="row-odd"><td class="text-right"><p>64</p></td>
-<td class="text-right"><p>1,225.0 ms</p></td>
-<td class="text-right"><p>1,136.7 ms</p></td>
-<td class="text-right"><p>7.2%</p></td>
-<td class="text-right"><p>3,863</p></td>
-<td class="text-right"><p>4,184</p></td>
-</tr>
-<tr class="row-even"><td class="text-right"><p>128</p></td>
-<td class="text-right"><p>2,056.8 ms</p></td>
-<td class="text-right"><p>1,999.3 ms</p></td>
-<td class="text-right"><p>2.8%</p></td>
-<td class="text-right"><p>4,601</p></td>
-<td class="text-right"><p>4,768</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-</section>
-<section id="bart-large-cnn">
-<h3>BART-large-CNN<a class="headerlink" href="#bart-large-cnn" title="Link to this heading">#</a></h3>
-<p>For BART-large-CNN, the PyTorch backend has 21.9% to 36.0% higher latency than
-the legacy TensorRT path across the tested batch sizes.</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head text-right"><p>Batch size</p></th>
-<th class="head text-right"><p>Legacy TensorRT latency</p></th>
-<th class="head text-right"><p>PyTorch latency</p></th>
-<th class="head text-right"><p>PyTorch latency difference</p></th>
-<th class="head text-right"><p>Legacy TensorRT executed tokens/s</p></th>
-<th class="head text-right"><p>PyTorch executed tokens/s</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td class="text-right"><p>32</p></td>
-<td class="text-right"><p>229.9 ms</p></td>
-<td class="text-right"><p>280.2 ms</p></td>
-<td class="text-right"><p>21.9% slower</p></td>
-<td class="text-right"><p>12,611</p></td>
-<td class="text-right"><p>10,662</p></td>
-</tr>
-<tr class="row-odd"><td class="text-right"><p>64</p></td>
-<td class="text-right"><p>252.2 ms</p></td>
-<td class="text-right"><p>343.0 ms</p></td>
-<td class="text-right"><p>36.0% slower</p></td>
-<td class="text-right"><p>22,007</p></td>
-<td class="text-right"><p>16,209</p></td>
-</tr>
-<tr class="row-even"><td class="text-right"><p>128</p></td>
-<td class="text-right"><p>352.3 ms</p></td>
-<td class="text-right"><p>472.7 ms</p></td>
-<td class="text-right"><p>34.2% slower</p></td>
-<td class="text-right"><p>31,544</p></td>
-<td class="text-right"><p>23,518</p></td>
-</tr>
-</tbody>
-</table>
-</div>
+<p>Configure encoder, decoder, and mixed decoder CUDA graphs for the expected
+serving workload. With representative capture buckets, the PyTorch backend can
+outperform the legacy TensorRT encoder-decoder path while avoiding the engine
+build and checkpoint conversion steps.</p>
+<p>For example, a BF16 FLAN-T5 Large serving benchmark on one H100 80 GB GPU used
+encoder CUDA graphs, padded decoder CUDA graphs, and mixed encoder-decoder CUDA
+graphs. Compared with the legacy TensorRT path, the PyTorch backend delivered
+65.8%, 12.6%, and 11.8% higher request throughput at concurrencies 8, 32, and
+64, respectively. P99 latency was 51.6%, 31.0%, and 33.5% lower.</p>
+<p>Follow <a class="reference internal" href="#enable-encoder-and-decoder-cuda-graphs"><span class="xref myst">Enable encoder and decoder CUDA graphs</span></a>
+and choose capture buckets that cover the batch sizes, packed encoder token
+counts, and sequence lengths expected in production. Capture grids that omit
+common runtime shapes fall back to eager execution and can lose these
+performance benefits.</p>
 <p>Performance depends on the model, request distribution, decoding settings, and
 GPU configuration. Benchmark with a representative workload before deployment.</p>
-</section>
 </section>
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
@@ -1230,11 +1251,12 @@ size.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">enable_attention_dp=False</span></code>.</p></li>
 </ul>
 </section>
-<section id="cuda-graphs-do-not-capture-the-encoder">
-<h3>CUDA graphs do not capture the encoder<a class="headerlink" href="#cuda-graphs-do-not-capture-the-encoder" title="Link to this heading">#</a></h3>
-<p>This is expected. <code class="docutils literal notranslate"><span class="pre">CudaGraphConfig</span></code> accelerates decoder iterations only. The
-encoder path runs eagerly, and <code class="docutils literal notranslate"><span class="pre">EncodeCudaGraphConfig</span></code> is disabled for
-encoder-decoder models.</p>
+<section id="encoder-cuda-graphs-fall-back-to-eager-execution">
+<h3>Encoder CUDA graphs fall back to eager execution<a class="headerlink" href="#encoder-cuda-graphs-fall-back-to-eager-execution" title="Link to this heading">#</a></h3>
+<p>Check that <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code> and <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> are set,
+that the encoder graph buckets cover the request shape, and that
+<code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;TRTLLM&quot;</span></code>. Unsupported shapes and attention backends fall back to
+eager encoder execution.</p>
 </section>
 <section id="output-quality-differs-from-the-hugging-face-example">
 <h3>Output quality differs from the Hugging Face example<a class="headerlink" href="#output-quality-differs-from-the-hugging-face-example" title="Link to this heading">#</a></h3>
@@ -1284,25 +1306,25 @@ differences can change lower-ranked beam hypotheses when scores are close.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#understand-bart-and-mbart-decoder-tokens">Understand BART and mBART decoder tokens</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#transcribe-audio-with-whisper">Transcribe audio with Whisper</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#select-the-language-and-task">Select the language and task</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-a-batch">Run a batch</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#choose-kv-cache-manager-v1-or-v2">Choose KV cache manager V1 or V2</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-beam-search">Use beam search</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-decoder-cuda-graphs">Enable decoder CUDA graphs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-encoder-and-decoder-cuda-graphs">Enable encoder and decoder CUDA graphs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#control-the-overlap-scheduler">Control the overlap scheduler</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#use-tensor-parallelism">Use tensor parallelism</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serve-an-encoder-decoder-model">Serve an encoder-decoder model</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#size-the-runtime">Size the runtime</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flan-t5-xl">Flan-T5-XL</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#bart-large-cnn">BART-large-CNN</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-kv-cache-fraction-is-required"><code class="docutils literal notranslate"><span class="pre">cross_kv_cache_fraction</span></code> is required</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#decoder-start-token-id-is-required"><code class="docutils literal notranslate"><span class="pre">decoder_start_token_id</span></code> is required</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-manager-v2-fails-with-beam-search">KV cache manager V2 fails with beam search</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-initialization-is-rejected">Tensor parallel initialization is rejected</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graphs-do-not-capture-the-encoder">CUDA graphs do not capture the encoder</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#encoder-cuda-graphs-fall-back-to-eager-execution">Encoder CUDA graphs fall back to eager execution</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#output-quality-differs-from-the-hugging-face-example">Output quality differs from the Hugging Face example</a></li>
 </ul>
 </li>
@@ -1397,9 +1419,9 @@ differences can change lower-ranked beam hypotheses when scores are close.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

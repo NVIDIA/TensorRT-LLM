@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -752,7 +754,7 @@ limitations under the License.
 </div>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog26_deepseek_v4_hybrid_attention.png" width="100%" alt="DeepSeek-V4 hybrid attention architecture. Panel a shows SWA attending over the latest 128 raw tokens. Panel b shows CSA combining the sliding window with 4× compressed KV entries selected by an Indexer and Top-K stage. Panel c shows HCA combining the sliding window with all 128× compressed KV entries without an Indexer.">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog26_deepseek_v4_hybrid_attention.png" width="100%" alt="DeepSeek-V4 hybrid attention architecture. Panel a shows SWA attending over the latest 128 raw tokens. Panel b shows CSA combining the sliding window with 4× compressed KV entries selected by an Indexer and Top-K stage. Panel c shows HCA combining the sliding window with all 128× compressed KV entries without an Indexer.">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. DeepSeek-V4 hybrid attention. (a) SWA attends densely within the 128-token sliding window. (b) CSA augments that window with Top-K entries selected from the 4× compressed history. (c) HCA attends to the window and the complete 128× compressed history without an Indexer.</em></sub></p>
@@ -770,7 +772,7 @@ limitations under the License.
 <p><strong>MoE.</strong> Both model scales activate six routed experts and one shared expert per token, selecting from 256 routed experts in Flash and 384 in Pro. The first three layers use hash routing, where a checkpoint-provided token-ID-to-expert table maps each input token directly to its experts. Later layers use a learned gate with Sqrt-Softplus affinity scores and a score-correction bias. TensorRT LLM implements both routing modes through a shared interface that supplies the selected experts and routing weights to its configurable MoE backends. TRTLLM-Gen, DeepGEMM, and the standard CuTe DSL fused MoE backend cover the corresponding DeepSeek-V4 precision paths and preserve the checkpoint-defined <code class="docutils literal notranslate"><span class="pre">swiglu_limit</span></code> activation clamp, including the uniform clamp used by the NVFP4 CuTe DSL path. DeepSeek-V4 is also registered with TensorRT LLM’s expert parallel load balancer, allowing supported expert-parallel deployments to rebalance physical expert placement without changing the model’s routing semantics.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog26_deepseek_v4_mhc_moe.png" width="100%" alt="DeepSeek-V4 mHC architecture and MoE routing. Panel a shows the repeated transformer stack with mHC pre- and post-mappings around the attention and MoE blocks, followed by the HC head and language-model head. Panel b shows hash routing through a token-ID embedding table and learned routing through Sqrt-Softplus scores, correction bias, and Top-K expert selection.">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog26_deepseek_v4_mhc_moe.png" width="100%" alt="DeepSeek-V4 mHC architecture and MoE routing. Panel a shows the repeated transformer stack with mHC pre- and post-mappings around the attention and MoE blocks, followed by the HC head and language-model head. Panel b shows hash routing through a token-ID embedding table and learned routing through Sqrt-Softplus scores, correction bias, and Top-K expert selection.">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. DeepSeek-V4 components beyond attention. (a) mHC wraps the attention and MoE sublayers with pre- and post-mappings, then uses an HC head to collapse the expanded residual stream before the language-model head. (b) The MoE router supports checkpoint-defined hash routing in the first three layers (left) and learned Sqrt-Softplus scoring with correction bias and Top-6 selection in later layers (right).</em></sub></p>
@@ -955,7 +957,7 @@ limitations under the License.
 <p><strong>SWA scratch reuse.</strong> A long prefill step produces KV entries for every token in the input chunk, but sliding-window attention retains only the most recent window after the step. Among the new blocks allocated for the current chunk, blocks that will already be outside the final non-rewindable window are needed only by the currently executing layer. TensorRT LLM maps this scratch-eligible range through per-layer block tables to coalesced scratch subpages. Because these per-layer lifetimes do not overlap, the same physical scratch storage can be reused as execution advances across layers. Pre-existing history from earlier chunks remains in the normal KV cache and is never overwritten by scratch reuse. New blocks in the active window also remain in the normal cache, and the tail that MTP may rewind is excluded from scratch storage. As a result, the cache does not retain the full current prefill chunk independently for every compatible SWA layer, reducing long-context prefill memory consumption and leaving more capacity for larger chunks, longer prompts, or higher concurrency.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog26_dsv4_scratch_swa.png" width="100%" alt="SWA scratch reuse during long-context prefill. Scratch-eligible KV blocks produced by the current prefill chunk and falling outside the final retained window reuse the same physical storage across SWA layers, while blocks inside the sliding window remain in the normal KV cache.">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog26_dsv4_scratch_swa.png" width="100%" alt="SWA scratch reuse during long-context prefill. Scratch-eligible KV blocks produced by the current prefill chunk and falling outside the final retained window reuse the same physical storage across SWA layers, while blocks inside the sliding window remain in the normal KV cache.">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. SWA scratch reuse during long-context prefill. Scratch-eligible blocks from the current prefill chunk reuse the same physical storage across SWA layers, while the final sliding-window state remains in the normal KV cache.</em></sub></p>
@@ -1092,7 +1094,7 @@ limitations under the License.
 <p>The following figure summarizes the closed-loop request path for aggregated and disaggregated serving.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog26_agentperf_closed_loop_workflow.svg" width="100%" alt="AA-AgentPerf closed-loop workflow. A simulated agent sends the next recorded turn with its accumulated conversation. The inference deployment routes the request, reuses matching KV blocks, prefills the uncached suffix, and streams the generated response. In disaggregated serving, the generation side retrieves the KV cache using context metadata. The client drains the complete response, simulates tool time when needed, advances the trajectory, and sends the next turn only after the current cycle completes.">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog26_agentperf_closed_loop_workflow.svg" width="100%" alt="AA-AgentPerf closed-loop workflow. A simulated agent sends the next recorded turn with its accumulated conversation. The inference deployment routes the request, reuses matching KV blocks, prefills the uncached suffix, and streams the generated response. In disaggregated serving, the generation side retrieves the KV cache using context metadata. The client drains the complete response, simulates tool time when needed, advances the trajectory, and sends the next turn only after the current cycle completes.">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5. AA-AgentPerf closed-loop request workflow. Repeated conversation prefixes can be reused through the KV cache. Aggregated serving performs prefill and generation on the same worker. In disaggregated serving, context metadata allows the generation worker to retrieve the KV cache and continue decoding. Tool time is simulated by the client and consumes no LLM compute.</em></sub></p>
@@ -1119,7 +1121,7 @@ limitations under the License.
 <p>The DeepSeek-V3.2 study showed the central routing tradeoff: affinity without load control creates imbalance, while load balancing that overrides affinity destroys reuse. DeepSeek-V4 applies that lesson through two consecutive placement decisions. The front-end orchestrator first selects a context (CTX) server instance. The attention data-parallel (ADP) router then selects a rank within that instance. At either level, the router can use an explicit conversation identifier or infer locality from KV-cache contents. Reuse is preserved only when both decisions return a later turn to the server and rank that own its KV blocks. Instance-level affinity cannot compensate for a rank-level miss, and the correct rank is unreachable after the wrong server has been selected.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog26_two_level_routing.svg" width="100%" alt="Two-level routing for context locality in disaggregated serving. The front-end orchestrator first selects a context server, then the selected server's attention data-parallel router selects a rank. At each level, the router can use either conversation-aware affinity or KV-cache-aware scoring. Full conversation-prefix reuse requires both decisions to return to the context server and rank that own the corresponding KV blocks. The selected context rank transfers the KV cache to a generation server for decoding.">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog26_two_level_routing.svg" width="100%" alt="Two-level routing for context locality in disaggregated serving. The front-end orchestrator first selects a context server, then the selected server's attention data-parallel router selects a rank. At each level, the router can use either conversation-aware affinity or KV-cache-aware scoring. Full conversation-prefix reuse requires both decisions to return to the context server and rank that own the corresponding KV blocks. The selected context rank transfers the KV cache to a generation server for decoding.">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6. Two-level routing for context locality in disaggregated serving. The front-end orchestrator first selects a CTX server, and that server's ADP router then selects a rank. Conversation-aware routing uses explicit conversation affinity, while KV-cache-aware routing infers placement from reusable prefix blocks and load. Full conversation-prefix reuse requires both decisions to return the request to the CTX server and ADP rank that hold the corresponding KV blocks.</em></sub></p>
@@ -1435,9 +1437,9 @@ limitations under the License.
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

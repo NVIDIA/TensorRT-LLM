@@ -418,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -761,6 +761,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -770,6 +771,7 @@ window.runMermaid = runMermaid;</script>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -961,8 +963,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseModel</span>
@@ -971,7 +974,20 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllme</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 
-<span class="n">MAX_TOP_LOGPROBS</span> <span class="o">=</span> <span class="mi">20</span>
+<span class="n">MAX_TOP_LOGPROBS</span> <span class="o">=</span> <span class="mi">100</span>
+
+<span class="n">_GENERATION_CONFIG_SAMPLING_FIELDS</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span>
+    <span class="p">{</span>
+        <span class="s2">&quot;early_stopping&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;length_penalty&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;min_p&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;no_repeat_ngram_size&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;repetition_penalty&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;temperature&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;top_k&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;top_p&quot;</span><span class="p">,</span>
+    <span class="p">}</span>
+<span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">validate_thinking_token_budget</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
@@ -1178,7 +1194,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values &lt;= 0 have no effect. Values &gt; input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.</span>
 <span class="sd">        length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.</span>
 <span class="sd">        early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.</span>
-<span class="sd">        no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 &lt;&lt; 30. Defaults to None.</span>
+<span class="sd">        no_repeat_ngram_size (int, optional): Forbids repeating any n-gram of this size: a token is excluded from sampling if it would recreate an n-gram that already occurs in the sequence (prompt included). None or 0 disables the restriction. Defaults to None.</span>
 <span class="sd">        min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.</span>
 <span class="sd">        beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.</span>
 
@@ -1300,6 +1316,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.</span>
     <span class="c1"># TODO: make this a per-request parameter.</span>
     <span class="n">_stream_interval</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># None identifies direct LLM API SamplingParams, where non-None values are</span>
+    <span class="c1"># request-provided. Serving adapters set this to preserve which fields were</span>
+    <span class="c1"># explicitly present before they materialize their protocol defaults.</span>
+    <span class="n">_request_provided_fields</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1323,11 +1343,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        For instance, while the greedy decoding with n &gt; 1 is capable in the</span>
 <span class="sd">        Executor class of C++ runtime, the LLM API disallows such combination.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">):</span>
+        <span class="c1"># These bounds are written as negated range checks rather than as</span>
+        <span class="c1"># `value &lt; low or value &gt; high`, so that NaN is rejected too: every</span>
+        <span class="c1"># comparison against NaN is False, which lets it slip through the</span>
+        <span class="c1"># positive form. The top_p_decay / top_p_min checks below already use</span>
+        <span class="c1"># this form.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require 0 &lt;= top_p &lt;= 1, got top_p=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require top_k &gt;= 0, got top_k=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require 0 &lt;= min_p &lt;= 1, got min_p=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">min_p</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;require temperature &gt;= 0, got temperature=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">temperature</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="c1"># Top-p decay param ranges mirror the hard checks in the</span>
@@ -1392,8 +1419,45 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs_simple_format</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;logprobs_simple_format is not supported with beam search&quot;</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_set_request_provided_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_names</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Record sampler fields explicitly supplied by a serving request.&quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_request_provided_fields</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">field_names</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">_GENERATION_CONFIG_SAMPLING_FIELDS</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_generation_config_defaults</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">generation_config</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Apply compatible model defaults without overriding request values.&quot;&quot;&quot;</span>
+        <span class="k">for</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">_GENERATION_CONFIG_SAMPLING_FIELDS</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">generation_config</span><span class="p">:</span>
+                <span class="k">continue</span>
+
+            <span class="c1"># Direct LLM API calls preserve None as the unset sentinel. Serving</span>
+            <span class="c1"># adapters materialize protocol defaults, so they instead record</span>
+            <span class="c1"># which fields the request explicitly supplied.</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_request_provided_fields</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">request_provided</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">request_provided</span> <span class="o">=</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_request_provided_fields</span>
+            <span class="k">if</span> <span class="n">request_provided</span><span class="p">:</span>
+                <span class="k">continue</span>
+
+            <span class="c1"># A JSON null is also unset and must fall through to the existing</span>
+            <span class="c1"># TRT-LLM or serving default.</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="n">generation_config</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="c1"># Hugging Face also permits &quot;never&quot;, which the TRT-LLM integer</span>
+            <span class="c1"># early-stopping setting cannot represent.</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s2">&quot;early_stopping&quot;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">int</span><span class="p">)):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;Ignoring unsupported generation_config.json early_stopping value &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">; TRT-LLM supports only boolean or integer values.&quot;</span>
+                <span class="p">)</span>
+                <span class="k">continue</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
+
     <span class="c1"># NB: The predicates below are static because downstream code (e.g.</span>
-    <span class="c1">#     sampling_utils.resolve_sampling_strategy) only holds instances of</span>
+    <span class="c1">#     sampler_strategy.resolve_sampling_strategy) only holds instances of</span>
     <span class="c1">#     bindings.SamplingConfig (not SamplingParams). They are the single</span>
     <span class="c1">#     source of truth for the greedy / top-p-decay resolution shared by</span>
     <span class="c1">#     _greedy_decoding and the torch sampler.</span>
@@ -1420,13 +1484,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">temperature</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
         <span class="n">top_p</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
         <span class="n">top_k</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="n">min_p</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Whether the request carries an explicit greedy control.</span>
 
-<span class="sd">        Explicit means top_k == 1, top_p == 0.0, or temperature == 0, as opposed</span>
-<span class="sd">        to the implicit &quot;all params unset&quot; greedy default.</span>
+<span class="sd">        Explicit means top_k == 1, top_p == 0.0, min_p == 1.0, or temperature == 0,</span>
+<span class="sd">        as opposed to the implicit &quot;all params unset&quot; greedy default. min_p == 1.0</span>
+<span class="sd">        keeps only tokens whose probability equals the row maximum, so like</span>
+<span class="sd">        top_p == 0.0 it collapses sampling to a single token.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">return</span> <span class="n">top_k</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">top_p</span> <span class="o">==</span> <span class="mf">0.0</span> <span class="ow">or</span> <span class="n">temperature</span> <span class="o">==</span> <span class="mi">0</span></div>
+        <span class="k">return</span> <span class="n">top_k</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">top_p</span> <span class="o">==</span> <span class="mf">0.0</span> <span class="ow">or</span> <span class="n">min_p</span> <span class="o">==</span> <span class="mf">1.0</span> <span class="ow">or</span> <span class="n">temperature</span> <span class="o">==</span> <span class="mi">0</span></div>
 
 
 <div class="viewcode-block" id="SamplingParams.params_imply_greedy_decoding">
@@ -1438,23 +1505,28 @@ window.runMermaid = runMermaid;</script>
         <span class="n">top_p</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
         <span class="n">top_k</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">use_beam_search</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">min_p</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">top_p_decay</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Whether the parameters resolve to greedy decoding.</span>
 
 <span class="sd">        An explicit greedy control always wins. The implicit &quot;all params unset&quot;</span>
-<span class="sd">        greedy default is overridden by an active top-p decay (which implies</span>
-<span class="sd">        top-p sampling so the decayed runtime top-p can take effect); callers</span>
-<span class="sd">        that do not support decay may omit ``top_p_decay``.</span>
+<span class="sd">        greedy default is overridden by any active sampling knob: an active</span>
+<span class="sd">        top-p decay (which implies top-p sampling so the decayed runtime top-p</span>
+<span class="sd">        can take effect) or a ``min_p`` in ``(0, 1)`` (which still selects among</span>
+<span class="sd">        multiple tokens); callers that do not support decay may omit</span>
+<span class="sd">        ``top_p_decay``.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="n">use_beam_search</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
         <span class="k">if</span> <span class="n">SamplingParams</span><span class="o">.</span><span class="n">params_imply_explicit_greedy</span><span class="p">(</span>
-            <span class="n">temperature</span><span class="o">=</span><span class="n">temperature</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="n">top_p</span><span class="p">,</span> <span class="n">top_k</span><span class="o">=</span><span class="n">top_k</span>
+            <span class="n">temperature</span><span class="o">=</span><span class="n">temperature</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="n">top_p</span><span class="p">,</span> <span class="n">top_k</span><span class="o">=</span><span class="n">top_k</span><span class="p">,</span> <span class="n">min_p</span><span class="o">=</span><span class="n">min_p</span>
         <span class="p">):</span>
             <span class="k">return</span> <span class="kc">True</span>
         <span class="n">implicitly_greedy</span> <span class="o">=</span> <span class="n">temperature</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">top_p</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">top_k</span> <span class="ow">is</span> <span class="kc">None</span>
-        <span class="k">return</span> <span class="n">implicitly_greedy</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">SamplingParams</span><span class="o">.</span><span class="n">params_imply_top_p_decay_active</span><span class="p">(</span><span class="n">top_p_decay</span><span class="p">)</span></div>
+        <span class="n">min_p_active</span> <span class="o">=</span> <span class="n">min_p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">min_p</span> <span class="o">&gt;</span> <span class="mf">0.0</span>
+        <span class="n">decay_active</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="o">.</span><span class="n">params_imply_top_p_decay_active</span><span class="p">(</span><span class="n">top_p_decay</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">implicitly_greedy</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">min_p_active</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">decay_active</span></div>
 
 
     <span class="nd">@property</span>
@@ -1464,6 +1536,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">top_p</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p</span><span class="p">,</span>
             <span class="n">top_k</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span>
             <span class="n">use_beam_search</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">,</span>
+            <span class="n">min_p</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">min_p</span><span class="p">,</span>
             <span class="n">top_p_decay</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">top_p_decay</span><span class="p">,</span>
         <span class="p">)</span>
 
@@ -1767,9 +1840,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

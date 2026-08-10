@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -610,11 +612,47 @@ no compatible source is available, or if MX transfer fails, loading falls back
 to the provided Hugging Face checkpoint.</p>
 <section id="current-support-scope">
 <h2>Current Support Scope<a class="headerlink" href="#current-support-scope" title="Link to this heading">#</a></h2>
-<p>The post-transform MX receive path currently supports only
-<code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code> with transform protocol version 1. TensorRT LLM publishes
-post-transform weights together with source-identity and layout metadata. A
-receiver whose model family is not allow-listed does not consume those bytes;
-it falls back to the standard Hugging Face checkpoint path.</p>
+<p>The post-transform MX receive path currently supports one exact qualification
+profile:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Profile</p></th>
+<th class="head"><p>Root class</p></th>
+<th class="head"><p>Config identity</p></th>
+<th class="head"><p>Scope</p></th>
+<th class="head"><p>Protocol</p></th>
+<th class="head"><p>Transform-layout ABI</p></th>
+<th class="head"><p>Constraints</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">llama-for-causal-lm-target-v1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code> / <code class="docutils literal notranslate"><span class="pre">llama</span></code></p></td>
+<td><p>Target model</p></td>
+<td><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-llama-target-layout-v1</span></code></p></td>
+<td><p>No speculative mode or separately loaded draft model</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The registry matches the exact root class and the architecture/model type
+captured from the resolved config before model construction. An unregistered
+subclass or config alias does not inherit support. It falls back to the
+standard Hugging Face checkpoint path before any P2P transfer starts.</p>
+<p>TensorRT LLM applies two independent compatibility gates:</p>
+<ul class="simple">
+<li><p>The qualification profile records that a model/config/lifecycle combination
+has passed full-load versus staged-load equivalence testing.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> format version 3 binds two concrete runs to the same
+checkpoint artifact, runtime layout choices, local shard layout, and
+transform-layout ABI.</p></li>
+</ul>
+<p>The transfer protocol version identifies the staged receiver protocol. The
+transform-layout ABI identifies the meaning of the transferred tensor names,
+layouts, aliases, and receiver finalization. A pre-version-3 identity, a
+missing ABI, or a different ABI is rejected rather than treated as compatible.</p>
 <p>Loads that require a separately loaded draft model also fall back to the
 standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
@@ -630,15 +668,39 @@ structural wiring to <code class="docutils literal notranslate"><span class="pre
 <li><p>Verify that every one-time transform is guarded by <code class="docutils literal notranslate"><span class="pre">_weights_transformed</span></code>
 and that the staged receiver can skip <code class="docutils literal notranslate"><span class="pre">transform_weights()</span></code> without
 changing aliases, derived state, tensor layout, or outputs.</p></li>
-<li><p>Add the model class and transform protocol version to the MX staged-receiver
-allow-list only after full-load and staged-load equivalence tests pass.</p></li>
+<li><p>Add an exact qualification profile only after the reusable harness in
+<code class="docutils literal notranslate"><span class="pre">tests/unittest/utils/post_transform_qualification.py</span></code> proves tensor,
+alias, transform-guard, derived-state, and deterministic output
+equivalence. Include an unregistered-root negative control.</p></li>
 <li><p>Cover compatible transfer, source-identity mismatch, unsupported layout or
-protocol, and non-allow-listed fallback. Keep target-plus-draft loading
-disabled unless that combination has its own mixed-layout tests.</p></li>
+protocol/ABI, no-disk staged reception, and unqualified-profile fallback.
+Keep target-plus-draft loading disabled unless that combination has its own
+mixed-layout tests.</p></li>
 <li><p>Run a real ModelExpress donor/receiver test with the model configurations
 being claimed, including the supported quantization and TP/PP/EP layouts.
 Compare deterministic output token IDs with the standard Hugging Face load
 path before documenting the family as supported.</p></li>
+</ol>
+</section>
+<section id="transform-layout-abi-rules">
+<h3>Transform-Layout ABI Rules<a class="headerlink" href="#transform-layout-abi-rules" title="Link to this heading">#</a></h3>
+<p>An existing transform-layout ABI ID is immutable. Introduce a new ID when a
+change affects any transferred tensor name, shape, dtype, packing, sharding,
+alias relationship, one-shot transform result, or receiver-side
+<code class="docutils literal notranslate"><span class="pre">setup_aliases()</span></code>/<code class="docutils literal notranslate"><span class="pre">cache_derived_state()</span></code> interpretation. Keep the existing ID
+for implementation-only changes that preserve all of those observable
+semantics.</p>
+<p>When adding an ABI ID:</p>
+<ol class="arabic simple">
+<li><p>Give the qualified profile the new ID and propagate it through
+<code class="docutils literal notranslate"><span class="pre">SourceIdentity</span></code> and MX source metadata.</p></li>
+<li><p>Add matching, missing, and mismatched producer/receiver compatibility
+tests. ABI mismatches remain incompatible even under the <code class="docutils literal notranslate"><span class="pre">ENFORCE</span></code> identity
+policy.</p></li>
+<li><p>Re-run the qualification harness and the real donor/receiver GPU test for
+every profile that adopts the ID.</p></li>
+<li><p>Never reinterpret an already published ID. Supporting two ABIs requires an
+explicit compatibility decision and tests for each producer/receiver pair.</p></li>
 </ol>
 </section>
 </section>
@@ -736,7 +798,7 @@ path.</p>
 <ul class="simple">
 <li><p>Post-transform MX reception is currently limited to the Llama model family.
 Other model families safely fall back to Hugging Face loading until they are
-explicitly qualified and added to the staged-receiver allow-list.</p></li>
+explicitly qualified and added as exact capability profiles.</p></li>
 <li><p>The MX server and Redis lifecycle is external to TensorRT LLM. Every
 TensorRT LLM instance must be able to reach the configured MX server URL.</p></li>
 <li><p>The MX server coordinates source discovery but does not store model weights.
@@ -801,6 +863,7 @@ is already registered.</p></li>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-support-scope">Current Support Scope</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#adding-a-model-family">Adding a Model Family</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#transform-layout-abi-rules">Transform-Layout ABI Rules</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a></li>
@@ -899,9 +962,9 @@ is already registered.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       
