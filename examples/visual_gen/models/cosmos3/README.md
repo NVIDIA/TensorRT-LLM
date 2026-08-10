@@ -29,10 +29,15 @@ python cosmos3.py --model /path/to/Cosmos3-Nano-FP8 \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 ```
 
-There are no FP8 Hub IDs yet, so use a local path. Support is limited to T2V,
-T2I, I2V and V2V on a **single GPU**; audio (T2AV/TI2AV) and every multi-GPU
-configuration are untested and rejected, so use BF16 for those. FP8 output
-quality has not been benchmarked against BF16.
+There are no FP8 Hub IDs yet, so use a local path. T2V, T2I, I2V and V2V are
+validated on a **single GPU**; every multi-GPU configuration is refused with an
+explicit error, so use BF16 there.
+
+These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
+rather than being refused — audio is quantized and generated like any other
+supported task. It simply has not been exercised as thoroughly as the four
+video/image tasks above, and no FP8 audio quality claim is made. FP8 output
+quality in general has not been benchmarked against BF16.
 
 ## Guardrails
 

@@ -239,6 +239,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_fp8.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
@@ -277,6 +278,7 @@ l0_b200:
   - unittest/disaggregated/test_openai_server_info.py
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_fp8_decode_is_not_collapsed TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:
