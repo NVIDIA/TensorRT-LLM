@@ -1770,7 +1770,7 @@ INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
 //
 // FC1 and FC2 each consume fp8 activations + per-token 1x128 scales. Two fusions produce that input
 // in-place instead of a standalone scale_1x128 kernel: pre-FC1 in the row expansion, pre-FC2 in the
-// SwiGLU epilogue. Both pack fp8 in the low part of a buffer and the scales just above.
+// activation epilogue. Both pack fp8 in the low part of a buffer and the scales just above.
 // These helpers hold the shared layout and quant.
 
 // Byte offset from the buffer base to the 1x128 scale region that follows `rows` x `cols` fp8
@@ -2518,7 +2518,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
             }
             else if constexpr (WriteFp8BlockScale && ACTIVATION_ELEM_PER_THREAD == 8)
             {
-                // Fuse the pre-FC2 1x128 activation quant into the SwiGLU epilogue (see fp8BlockScaleQuantize).
+                // Fuse the pre-FC2 1x128 activation quant into the activation epilogue (see fp8BlockScaleQuantize).
                 // Only the bf16 activation (8 channels/thread == 16 lanes/block) is wired; other T never reach
                 // this at runtime, so their instantiations fall through to the plain store below.
                 // Round the activation through GemmOutputType (bf16) first, matching the standalone path that
@@ -2774,41 +2774,45 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 int64_t const*, int, int64_t, float const*, bool, TmaWarpSpecializedGroupedGemmInput::ElementSF*,
                 ActivationParams, GemmOutputType const*, float*, GemmOutputType*, Fp8BlockScaleActOutput);
 
-            auto fn = [&](auto block_scaling_type) -> KernelFnPtr
+            // write_fp8_block_scale toggles the fused pre-FC2 1x128 activation quant in the epilogue; it is
+            // orthogonal to the activation function, so every activation below can be fused (write_fp8_block_scale
+            // is only ever set together with the NONE block-scaling type).
+            auto fn = [&](auto block_scaling_type, auto write_fp8_block_scale) -> KernelFnPtr
             {
+                constexpr bool kWriteFp8 = decltype(write_fp8_block_scale)::value;
                 switch (activation_type.activation_type)
                 {
                 case ActivationType::Identity:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Identity>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Gelu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Relu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::ReLu>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Silu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Swiglu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         GLUAdaptor<cutlass::epilogue::thread::SiLu>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Geglu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         GLUAdaptor<cutlass::epilogue::thread::GELU>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::SwigluBias:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                        decltype(block_scaling_type)::value, num_rows_per_cta_v>;
+                        decltype(block_scaling_type)::value, num_rows_per_cta_v, false, kWriteFp8>;
                 case ActivationType::Relu2:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, decltype(block_scaling_type)::value,
-                        num_rows_per_cta_v>;
+                        num_rows_per_cta_v, false, kWriteFp8>;
                 default: TLLM_CHECK_WITH_INFO(false, "Invalid activation type"); return nullptr;
                 }
             };
@@ -2821,13 +2825,15 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             [[maybe_unused]] auto NONE
                 = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE>{};
+            [[maybe_unused]] auto WRITE_FP8 = tensorrt_llm::common::ConstExprWrapper<bool, true>{};
+            [[maybe_unused]] auto NO_WRITE_FP8 = tensorrt_llm::common::ConstExprWrapper<bool, false>{};
 #ifdef ENABLE_FP4
             if constexpr (std::is_same_v<T, __nv_fp4_e2m1>)
             {
                 num_padding_tokens = TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4 * num_experts_per_node;
                 TLLM_CHECK_WITH_INFO(
                     quant_params.fp4.fc2.weight_block_scale, "NVFP4 block scaling is expected for FP4xFP4");
-                return fn(NVFP4);
+                return fn(NVFP4, NO_WRITE_FP8);
             }
             else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
             {
@@ -2837,7 +2843,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 num_padding_tokens = mxfpx_fc2_sf
                     ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX * num_experts_per_node
                     : 0;
-                return mxfpx_fc2_sf ? fn(MXFPX) : fn(NONE);
+                return mxfpx_fc2_sf ? fn(MXFPX, NO_WRITE_FP8) : fn(NONE, NO_WRITE_FP8);
             }
             else
 #endif
@@ -2846,16 +2852,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 {
                     if (fp8_block_scale_out.fp8_out != nullptr)
                     {
-                        // Fuse pre-FC2 1x128 activation quantization.
-                        TLLM_CHECK_WITH_INFO(activation_type.activation_type == ActivationType::Swiglu,
-                            "Fused FP8 block-scale activation quant only supports Swiglu");
-                        return static_cast<KernelFnPtr>(&doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                                                        GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-                                                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE,
-                                                        num_rows_per_cta_v, false, true>);
+                        return fn(NONE, WRITE_FP8);
                     }
                 }
-                return fn(NONE);
+                return fn(NONE, NO_WRITE_FP8);
             }
         }();
 
@@ -3192,8 +3192,7 @@ void dequantFP8(OutputType* output, InputType const* input, int64_t const* num_v
 }
 
 // The DeepSeek FP8 block-scale MoE folds the pre-FC1 and pre-FC2 1x128 activation quant into the
-// row-expansion and SwiGLU-epilogue kernels, enabled automatically on supported hardware (Hopper / SM90) --
-// mirroring how the nvfp4 / mxfp8 formats fold their activation quant by capability rather than a flag.
+// row-expansion and activation-epilogue kernels, enabled automatically on supported hardware (Hopper / SM90).
 // Evaluated once at construction to pick the block-scale runner, so it is fixed for the runner's lifetime.
 static inline bool useFp8BlockScaleActFusion()
 {
@@ -3202,9 +3201,8 @@ static inline bool useFp8BlockScaleActFusion()
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::CutlassMoeFCRunner()
-    // Build only the runner the enabled path needs: fused consumes pre-quantized fp8 A (<fp8,fp8,bf16>, no
-    // internal scale_1x128 and no deepseek_fc_workspace); unfused quantizes bf16 A internally (<bf16,fp8,bf16>,
-    // also the only non-Hopper-capable variant).
+    // Build only the runner the enabled path needs: fused consumes pre-quantized fp8 A (<fp8,fp8,bf16>);
+    // unfused quantizes bf16 A internally (<bf16,fp8,bf16>).
     : blockscale_gemm_runner_{useFp8BlockScaleActFusion()
             ? std::unique_ptr<DeepSeekBlockScaleGemmRunner>(
                 std::make_unique<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3,
@@ -3535,8 +3533,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     {
         auto* blockscale_gemm_runner = getDeepSeekBlockScaleGemmRunner();
         TLLM_CHECK(blockscale_gemm_runner != nullptr);
-        // Fused runner reads pre-quantized A + external scales, so it needs no internal workspace; the unfused
-        // runner quantizes A into deepseek_fc_workspace (only allocated in that case).
         blockscale_gemm_runner->configureWorkspace(
             blockscale_gemm_runner->isActivationPrequantized() ? nullptr : getWsPtr(char{}, "deepseek_fc_workspace"));
     }
@@ -3591,7 +3587,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     }
     else
     {
-        // Fuse the pre-FC2 1x128 quant into the SwiGLU epilogue: write fp8 + scales into the FC2-input buffer
+        // Fuse the pre-FC2 1x128 quant into the activation epilogue: write fp8 + scales into the FC2-input buffer
         // (`output`, bf16-sized so the scales fit above the fp8), removing FC2's standalone scale_1x128.
         TLLM_CHECK_WITH_INFO(
             inter_size % 128 == 0, "Fused FC2 activation quant requires inter_size to be a multiple of 128.");
@@ -3623,7 +3619,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     int shape_n = hidden_size;
     int shape_k = inter_size;
 
-    // When the runner is prequantized, `input` (fc1_result_) already holds fp8 A + 1x128 scales from the SwiGLU
+    // When the runner is prequantized, `input` (fc1_result_) already holds fp8 A + 1x128 scales from the activation
     // epilogue; the caller routes `gemm_output` to glu_inter_result_ so it does not clobber that fp8 A
     // (fc1_result_ is aliased onto fc2_result_). Otherwise `input` is a bf16 activation moeGemm quantizes.
     runBlockScaleMoeGemm(gemm_runner, gemm_output, input, fc2_expert_weights, expert_first_token_offset,
@@ -4751,7 +4747,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             sync_check_cuda_error(stream);
         }
         // Fused FC2 writes glu_inter_result_ instead of fc2_result_: its input (fc1_result_) holds the fp8 A
-        // from the SwiGLU epilogue and fc2_result_ is aliased onto fc1_result_, so writing there would clobber it.
+        // from the activation epilogue and fc2_result_ is aliased onto fc1_result_, so writing there would clobber it.
         void* const fc2_gemm_output = use_fused_block_scale_quant ? glu_inter_result_ : fc2_result_;
         Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_gemm_output, final_output,
             gemm_expert_first_token_offset, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases, fc2_int_scales,
