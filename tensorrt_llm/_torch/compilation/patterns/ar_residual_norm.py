@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from inspect import signature
 from operator import getitem
 from typing import Callable, List, Optional
 
@@ -16,15 +15,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ...custom_ops.torch_custom_ops import BufferKind
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
-from . import MATCHER_SUBSYSTEM
+from . import MATCHER_SUBSYSTEM, _make_pattern_example_inputs
 
 aten = torch.ops.aten
-
-
-def _make_pattern_example_inputs(
-        search_fn: Callable[..., object]) -> List[torch.Tensor]:
-    """Create dummy inputs required for manual pattern registration."""
-    return [torch.empty(0) for _ in signature(search_fn).parameters]
 
 
 def _append_named_pass(custom_passes: List[PatternMatcherPass], pass_name: str):
