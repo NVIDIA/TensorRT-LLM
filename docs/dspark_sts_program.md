@@ -613,6 +613,18 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 - 新观测:步时 ~290ms @ 62 行(缺健康基线,eager 嫌疑未证);SWA 固定成本 8.1GiB = max_batch_size(128) × 63.6MB/请求,定容公式按满批预留(sizing 侧无恙)。
 - 进行中的二分:v1 KV 管理器(`use_kv_cache_manager_v2: false`)vs python 调度器(`use_python_scheduler: true`)各跑一轮——若 v1 恢复 128 → 病灶在 v2 管理器的调度集成;若 python 调度器恢复 → 病灶在 C++ 容量调度器与 v2 的适配。
 
+**二分收网(08-10 09:40)——上限 ≈ max_batch_size/2,ماxbs=256 即刻解锁**:
+| 判别 | 结果 | 结论 |
+|---|---|---|
+| v1 KV 管理器 | 仍 ~60-63 | v2 管理器免罪 |
+| python 调度器 | 仍 ~60-63 | C++/python 调度器共同层 |
+| 关 overlap | 仍 ~62-65 | overlap 免罪 |
+| **max_batch_size 128→256** | **调度 115-128(满份额),步时 290→108ms(2.7×)** | **上限 ≈ maxbs/2 坐实** |
+
+- **部署级解法(立即可用)**:Pro@DEP8 设 `max_batch_size=256`(或 2× 目标并发/rank)→ 128 行满批 + 步时 2.7× 改善;Pro 复测(trim 产品线最终判决)就此解锁。
+- **代码级根因(待定位)**:两个调度器共享的容量/槽记账把每个 DSpark 请求按 ~2 份计(嫌疑:spec 序列槽为 draft 复占、或 GNE 容量对 spec 请求的双倍预留);`get_max_num_sequences`=pp×bs=128 本身无恙。290ms 步时 = 减半批的伴生病(62 行时慢 2.7×,机理与槽争抢/eager 待nsys确认)。
+- 观测注记:cap 尾部到 67-75(非硬 64)——完成中请求可能释放半槽,支持"槽复占"方向。
+
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
