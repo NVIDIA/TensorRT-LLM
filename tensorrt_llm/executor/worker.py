@@ -227,7 +227,8 @@ def worker_main(
         set_global_tracer(tracer)
 
     if _torch_model_class_mapping is not None:
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
         MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
 
     set_mpi_session_cpp(mpi_comm())
