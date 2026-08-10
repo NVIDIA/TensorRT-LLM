@@ -7796,13 +7796,15 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("use_msa", [False, True])
-    def test_mxfp8_piecewise_cuda_graph(self, use_msa):
+    def test_mxfp8_piecewise_cuda_graph(self, use_msa, monkeypatch):
         tp_size = ep_size = 4
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
+        monkeypatch.setenv("TRTLLM_TORCH_COMPILE_CONTEXT_ONLY", "1")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto")
+                                        dtype="fp8" if use_msa else "auto",
+                                        use_kv_cache_manager_v2=use_msa)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton")
         cuda_graph_config = CudaGraphConfig(

@@ -1370,6 +1370,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"smaller than the step's per-request page count ({block_table_cols})."
             )
 
+        # Piecewise graphs pad token-shaped inputs to the capture bucket. The
+        # fused producer runs over that fixed extent; negative slots make the
+        # padded rows cache-write no-ops. Reset the tail because a prior larger
+        # step may have left valid slot ids there.
+        self.msa_out_cache_loc.fill_(-1)
         self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
         if kv_indices is not None:
             self.msa_kv_indices[: int(kv_indices.shape[0])].copy_(kv_indices, non_blocking=True)

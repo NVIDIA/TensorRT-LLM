@@ -153,6 +153,45 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
         )
 
 
+def test_msa_metadata_clears_padded_cache_slot_tail():
+    """A smaller piecewise replay must not reuse a prior step's cache slots."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+
+    class FakeCacheManager:
+        tokens_per_block = 4
+
+        @staticmethod
+        def get_buffers(_layer_idx):
+            return torch.empty(1)
+
+        @staticmethod
+        def get_block_ids_per_seq(_request_ids):
+            return torch.tensor([[3]], dtype=torch.int32)
+
+    metadata._msa_buffers_ready = True
+    metadata.request_ids = [0]
+    metadata.seq_lens = torch.tensor([2], dtype=torch.int32)
+    metadata.kv_lens = torch.tensor([2], dtype=torch.int32)
+    metadata.kv_cache_params = None
+    metadata.kv_cache_manager = FakeCacheManager()
+    metadata.msa_out_cache_loc = torch.full((4,), 99, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    metadata.msa_subpage_block_table = None
+    metadata.msa_req_to_token = torch.zeros((1, 4), dtype=torch.int32)
+    metadata.msa_q_batch_row = torch.zeros(4, dtype=torch.int32)
+    metadata.msa_q_intra = torch.zeros(4, dtype=torch.int32)
+    metadata.msa_qo_lens_dev = torch.zeros(1, dtype=torch.int32)
+    metadata.kv_lens_cuda = None
+    metadata._msa_runs_no_fmha = lambda: True
+
+    metadata._build_msa_fields()
+
+    assert metadata.msa_out_cache_loc.tolist() == [12, 13, -1, -1]
+    assert metadata._msa_fields_ready
+
+
 MAX_NUM_SEQUENCES = 8
 MAX_BLOCKS_PER_SEQ = 64
 

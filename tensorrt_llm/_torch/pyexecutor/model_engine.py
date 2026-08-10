@@ -70,6 +70,8 @@ from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
+                     get_per_request_piecewise_cuda_graph_flag,
+                     is_torch_compiling,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .config_utils import is_mla
@@ -90,6 +92,44 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+
+
+def _use_captured_context_model(attn_metadata) -> bool:
+    """Return whether this request can execute the compiled context path."""
+    return (attn_metadata is not None
+            and int(getattr(attn_metadata, "num_contexts", 0)) != 0
+            and get_per_request_piecewise_cuda_graph_flag())
+
+
+class _ContextOnlyCompiledModel(torch.nn.Module):
+    """Route captured context batches through compile and all others eager.
+
+    Piecewise context CUDA graphs require the compiled model. Generation-only
+    batches and context batches above the largest captured token bucket should
+    retain the pristine eager path rather than inherit compile-specific kernels
+    without receiving graph replay. This wrapper keeps both callables over the
+    same parameters and selects from host-visible request state before either
+    model starts execution.
+
+    This is initially guarded by ``TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1`` so the
+    mixed-context graph experiment can be evaluated without changing the default
+    compile contract.
+    """
+
+    def __init__(self, eager_model: torch.nn.Module,
+                 compiled_model: torch.nn.Module):
+        super().__init__()
+        self.eager_model = eager_model
+        self.compiled_model = compiled_model
+
+    def forward(self, *args, **kwargs):
+        attn_metadata = kwargs.get("attn_metadata")
+        if _use_captured_context_model(attn_metadata):
+            return self.compiled_model(*args, **kwargs)
+        # The engine owns the compile-mode scope. It must cover the whole
+        # top-level forward (including the speculative-decoding epilogue),
+        # rather than ending when this inner transformer returns.
+        return self.eager_model(*args, **kwargs)
 
 
 class ModelEngine(ABC):
@@ -496,6 +536,17 @@ class PyTorchModelEngine(ModelEngine):
 
         self.torch_compile_config = self.llm_args.torch_compile_config
         torch_compile_enabled = bool(self.torch_compile_config is not None)
+        context_only_compile_env = os.environ.get(
+            "TRTLLM_TORCH_COMPILE_CONTEXT_ONLY", "0")
+        if context_only_compile_env not in ("0", "1"):
+            raise ValueError(
+                "TRTLLM_TORCH_COMPILE_CONTEXT_ONLY must be 0 or 1, got "
+                f"{context_only_compile_env!r}")
+        self._torch_compile_context_only = context_only_compile_env == "1"
+        if self._torch_compile_context_only and not torch_compile_enabled:
+            raise ValueError(
+                "TRTLLM_TORCH_COMPILE_CONTEXT_ONLY=1 requires TorchCompileConfig"
+            )
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
@@ -559,10 +610,21 @@ class PyTorchModelEngine(ModelEngine):
                                                   "apply_llm_torch_compile",
                                                   None)
                 if isinstance(self.model, DecoderModelForCausalLM):
-                    self.model.model = torch.compile(
-                        self.model.model,
+                    eager_model = self.model.model
+                    compiled_model = torch.compile(
+                        eager_model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
+                    if self._torch_compile_context_only:
+                        logger.info(
+                            "Torch compile context-only routing enabled: "
+                            "capture-eligible context batches use the compiled "
+                            "model; generation-only and over-ceiling context "
+                            "batches use the eager model.")
+                        self.model.model = _ContextOnlyCompiledModel(
+                            eager_model, compiled_model)
+                    else:
+                        self.model.model = compiled_model
                 elif callable(apply_llm_torch_compile):
                     # TODO: Move this contract to MultimodalModelMixin once
                     # multimodal models consistently expose their LLM compile
@@ -1484,12 +1546,18 @@ class PyTorchModelEngine(ModelEngine):
             quant_method = getattr(module, "quant_method", None)
             if not isinstance(quant_method, MXFP8LinearMethod):
                 continue
-            if self._torch_compile_enabled:
+            if (self._torch_compile_enabled and
+                    not getattr(self, "_torch_compile_context_only", False)):
                 # Automatic dispatch keys off context state that Dynamo cannot
                 # trace. Settle auto on native so warmup tunes the path that
                 # execution will use; an explicitly pinned backend is retained.
                 quant_method.disable_flashinfer_auto()
             elif mxfp8_decode_graph_default_requested:
+                # Eager generation remains a separate runtime path when compile
+                # is context-only, so preserve the normal generation-graph
+                # backend selection instead of permanently settling the shared
+                # module on native. Compiled context calls still select native
+                # because they execute with is_torch_compiling() == True.
                 # Graph warmup has no pipeline-parallel cache handoff; retain
                 # the existing eager FlashInfer tuner when PP is enabled.
                 quant_method.configure_default_graph_dispatch(
@@ -6338,10 +6406,30 @@ class PyTorchModelEngine(ModelEngine):
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
+        def call_model():
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                return trace_func(self.model.forward)(**kwargs)
             return self.model.forward(**kwargs)
+
+        attn_metadata = kwargs['attn_metadata']
+        run_eager = (getattr(self, "_torch_compile_context_only", False)
+                     and not _use_captured_context_model(attn_metadata))
+        if not run_eager:
+            return call_model()
+
+        # ``is_torch_compiling`` is TRT-LLM's runtime construction/dispatch
+        # flag, not Dynamo's tracing predicate.  Keep it disabled for the
+        # entire top-level eager forward: target model, logits processor,
+        # speculative worker, and draft model. Restoring it inside the target
+        # transformer makes an uncompiled Eagle3 epilogue select compile-only
+        # paths and severely regresses generation iterations. The same scope
+        # keeps over-ceiling context batches identical to the eager baseline.
+        previous_mode = is_torch_compiling()
+        set_torch_compiling(False)
+        try:
+            return call_model()
+        finally:
+            set_torch_compiling(previous_mode)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,
