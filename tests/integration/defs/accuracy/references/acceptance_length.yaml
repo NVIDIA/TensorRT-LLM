@@ -8,8 +8,8 @@ TestQwen3_4B::test_eagle3:
 : ref_al: 2.6241039490569817
   min_al: 2.4928987516041325
 TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_ON]:
-  ref_al: null
-  min_al: null
+  ref_al: 3.6246252767465843
+  min_al: 3.443394012909255
 TestLlama3_1_8BInstruct::test_dflash:
   ref_al: 2.994515008800723
   min_al: 2.8447892583606866
