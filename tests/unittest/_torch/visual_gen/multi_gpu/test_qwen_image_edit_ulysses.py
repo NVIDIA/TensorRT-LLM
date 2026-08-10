@@ -25,7 +25,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.unittest._torch.visual_gen.conftest import spawn_with_retry
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _visual_gen_dist_utils import spawn_with_retry
 
 # The unit test creates its own torch.distributed NCCL process group. Disable the
 # TRT-LLM MPI bootstrap path so importing tensorrt_llm does not initialize MPI.
@@ -45,14 +46,6 @@ try:
     )
 except ImportError as e:  # pragma: no cover - import guard for direct collection
     pytest.skip(f"TensorRT-LLM modules unavailable: {e}", allow_module_level=True)
-
-
-def _get_free_port() -> int:
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
 
 
 @pytest.fixture(autouse=True)
@@ -96,15 +89,13 @@ def _distributed_worker(
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> None:
-    port = _get_free_port()
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
             args=(world_size, "nccl", test_fn, port, kwargs),
             nprocs=world_size,
             join=True,
-        ),
-        port,
+        )
     )
 
 
