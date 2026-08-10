@@ -5575,10 +5575,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
-        if v2_kv_cache and not one_model and overlap_scheduler:
+        if v2_kv_cache and not one_model:
             pytest.skip(
-                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
-            )
+                "KVCacheManagerV2 sizes the target and draft managers from the "
+                "same budget, so two-model Eagle3 is rejected")
 
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,

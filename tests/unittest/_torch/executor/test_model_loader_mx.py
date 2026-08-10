@@ -124,14 +124,14 @@ def _moe_context(config, mapping):
     yield None
 
 
-class _UnqualifiedLlamaForCausalLM(model_loader_mod.LlamaForCausalLM):
+class _UnqualifiedLlamaForCausalLM(modeling_llama_mod.LlamaForCausalLM):
     pass
 
 
 def _tiny_llama_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    model_class: type[nn.Module] = model_loader_mod.LlamaForCausalLM,
+    model_class: type[nn.Module] = modeling_llama_mod.LlamaForCausalLM,
 ) -> nn.Module:
     monkeypatch.setattr(modeling_llama_mod, "get_sm_version", lambda: 90)
     llama_config = LlamaConfig(
