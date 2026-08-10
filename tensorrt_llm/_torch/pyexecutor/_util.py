@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -500,6 +500,25 @@ def draft_config_defines_attention_layout(
         getattr(draft_pretrained_config, "use_sliding_window", None) is not None
         or getattr(draft_pretrained_config, "sliding_window", None) is not None
         or bool(getattr(draft_pretrained_config, "layer_types", None)))
+
+
+def _expand_attention_window_pattern_to_global_layers(
+    max_attention_window: Optional[Sequence[int]],
+    layer_mask: Sequence[bool],
+) -> Optional[List[int]]:
+    """Expand an enabled-layer pattern into physical global-layer order."""
+    if max_attention_window is None:
+        return None
+
+    pattern = list(max_attention_window)
+    global_windows = [pattern[0]] * len(layer_mask)
+    enabled_layer_offset = 0
+    for layer_idx, enabled in enumerate(layer_mask):
+        if enabled:
+            global_windows[layer_idx] = pattern[enabled_layer_offset %
+                                                len(pattern)]
+            enabled_layer_offset += 1
+    return global_windows
 
 
 def _derive_draft_max_attention_window(
@@ -1466,6 +1485,11 @@ class KvCacheCreator:
             kv_cache_config,
             max_seq_len,
             estimating_kv_cache=estimating_kv_cache)
+        draft_kv_config.max_attention_window = (
+            _expand_attention_window_pattern_to_global_layers(
+                draft_kv_config.max_attention_window,
+                spec_dec_layer_mask,
+            ))
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
