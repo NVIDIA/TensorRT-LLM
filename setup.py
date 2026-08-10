@@ -142,10 +142,12 @@ devel_deps, _ = parse_requirements(
          if on_windows else "requirements-dev.txt"))
 mx_deps = ["modelexpress==0.4.1"]
 # Gateway protocol adapters are opt-in extras: the default installation must
-# not carry any gateway protobuf package. The single source of truth for each
-# gateway pin lives here; the devel extra aggregates them so developers and CI
-# get the adapters without a separate install step.
-grpc_smg_deps = ["smg-grpc-proto>=0.4.2"]
+# not carry any gateway protobuf package. Each gateway owns a dedicated
+# requirements-<gateway>.txt as the single source of truth for its pins; CI
+# stages that exercise a gateway install that file explicitly, and the file
+# may carry gateway-specific options (such as an --extra-index-url) without
+# affecting the default dependency graph.
+grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
