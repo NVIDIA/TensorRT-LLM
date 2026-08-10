@@ -506,6 +506,10 @@ cap-accept 模式(同一 planner 决策,提交完整块全量验证、接受端�
 - **真凶(官方配方对照,perf-analysis.md)**:`trtllm-serve` 的 worker 进程是 **fork-before-exec** 派生的,nsys 缺 `--trace-fork-before-exec=true` 时不会向 fork 出的子进程注入 → worker 里的 `cudaProfilerStart` 对 nsys 不可见,capture 永远不开始,报告永远不落盘。nsys 退出时抱怨的 "re-parented processes" 即其指纹。
 - **v6 修正**:`--trace-fork-before-exec=true` + `--cuda-graph-trace node`(后者让 CUDA graph 内的 kernel 逐个展开——我们全部计算都在图里,做 pin5 vs pin3 kernel 对拍必须要 node 粒度)。两轮已重发(pin5@743961 / pin3@743962)。
 
+**v6 判决(08-09 22:10)**:fork 追踪使触发器**开火了**(两轮 serve log 均出现 `"Profiling started at iteration 2000."`,这是 TRT-LLM 侧打的,证明 env 到位、门条件满足),但 nsys 退出时自供 `Processing events... → No reports were generated`——**容器内 nsys 2026.2.1 仍未注入到 worker 进程**,cudaProfilerStart 调了但没人接。此前"没看到 Profiling stopped"是预期行为(该日志只在 torch trace 开启时打,L1666-1671)。另收获:stop-shutdown 关不掉 re-parented worker,`--wait=primary` 让 nsys 干等,需手动 TERM app(留 nsys)才收尾。
+
+**v7(执行中)——采用同事已验证配方**:peihengh 的 dsv4 nsys 战役(同集群同拓扑 B300 + trtllm-llmapi-launch + trtllm-serve)成功出过 `.nsys-rep`,其 start_worker.sh 注释直言 *"Lingjie's hang-avoidance: NSYS_BIN=extracted 2025.5.1"*——与用户"nsys 得用 2025.5.x"的提示互相印证:**容器自带 2026.2.1 有问题,须用 lustre 上提取版 2025.5.1.121**。v7 变更:① nsys 换 `peihengh/dsv4_pipe_clean_20260723/tools/nsys-2025.5.1.121`(容器内烟测可运行);② `--capture-range-end=stop`(cudaProfilerStop 时就地落盘,app 继续跑,绕开 shutdown 死结);③ 照抄其余旗标(`-t cuda,nvtx --cuda-graph-trace node --gpu-metrics-devices=none`);④ **窗口对准**:pin3 v6 的窗口正好砸进 burst 排水缝(iter 2000-2025 只有 1 个请求;pin5 幸运落在稳态 120 请求)——burst 跨度 ≈ max_tokens/accept 与批大小无关(pin5 ~470/pin3 ~515 iter,确定性强),v7 round 先放校准 burst 实测跨度,再用小 filler burst(64 req × 按缺口折算的 max_tokens)把 2000-2050 顶进整 burst 的稳态中段。
+
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
 1. **host 未复现**:初测 +8.3%(poetry 128/rank)在四轮中缩为 [0.0, +1.9, +1.3, +2.2]%;arena 侧 [−2.4, 0.0, −1.4, −5.6]%。host 整体 ≈ 0±3%,poetry 微正、arena 微负。host 调度行为本身跨节点完全可复现(trim 22.4-22.7%,accept 1.66-1.67,四轮逐位一致)——**是收益不存在,不是实验不稳**。
