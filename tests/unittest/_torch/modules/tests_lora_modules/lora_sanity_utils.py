@@ -29,6 +29,7 @@ from safetensors.torch import save_file
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.llmapi import RequestOutput
 from tensorrt_llm.lora_helper import LoraConfig
 
 # HF module name -> block path relative to layers.{idx}.
@@ -52,8 +53,12 @@ MLP_TRTLLM_MODULES = ["mlp_h_to_4h", "mlp_gate", "mlp_4h_to_h"]
 
 
 def create_lora_adapter(
-    output_dir, base_model_path, target_modules, lora_rank=8, dtype=torch.bfloat16
-):
+    output_dir: str,
+    base_model_path: str,
+    target_modules: dict[str, str],
+    lora_rank: int = 8,
+    dtype: torch.dtype = torch.bfloat16,
+) -> str:
     """Create a dummy LoRA adapter for any decoder model."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -109,7 +114,12 @@ def create_lora_adapter(
     return output_dir
 
 
-def run_with_and_without_lora(model_path, lora_config, lora_dir, prompts):
+def run_with_and_without_lora(
+    model_path: str,
+    lora_config: LoraConfig,
+    lora_dir: str,
+    prompts: list[str],
+) -> tuple[list[RequestOutput], list[RequestOutput]]:
     """Run inference with and without LoRA, return (lora_outputs, base_outputs)."""
     with LLM(
         model=model_path,
@@ -128,7 +138,9 @@ def run_with_and_without_lora(model_path, lora_config, lora_dir, prompts):
     return out_lora, out_base
 
 
-def assert_lora_changes_output(out_lora, out_base):
+def assert_lora_changes_output(
+    out_lora: list[RequestOutput], out_base: list[RequestOutput]
+) -> None:
     """Assert that LoRA produces at least one different output (tokens or logprobs)."""
     any_differ = False
     for lora_out, base_out in zip(out_lora, out_base, strict=True):
@@ -152,7 +164,12 @@ def assert_lora_changes_output(out_lora, out_base):
     assert any_differ, "LoRA outputs identical to base model (same tokens AND same logprobs)"
 
 
-def run_lora_test(model_path, target_modules, trtllm_modules, dtype=torch.bfloat16):
+def run_lora_test(
+    model_path: str,
+    target_modules: dict[str, str],
+    trtllm_modules: list[str],
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_dir = create_lora_adapter(
