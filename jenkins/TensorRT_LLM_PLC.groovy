@@ -52,7 +52,7 @@ def createKubernetesPodConfig()
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: pulse-container-scanner
-                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:6.2.1
+                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:stable
                     command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
