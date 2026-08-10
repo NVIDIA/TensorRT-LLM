@@ -37,7 +37,6 @@ from typing import (
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.llm_request import MultimodalEncoderRequestState
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
@@ -53,6 +52,35 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+
+
+def _assemble_multimodal_encoder_embeddings(
+    item_tensors: Dict[int, torch.Tensor], total_items: int
+) -> torch.Tensor:
+    """Copy prompt-ordered item embeddings into one contiguous tensor."""
+    ordered = [item_tensors[i] for i in range(total_items)]
+    first = ordered[0]
+    if any(
+        output.shape[1:] != first.shape[1:]
+        or output.dtype != first.dtype
+        or output.device != first.device
+        for output in ordered[1:]
+    ):
+        raise ValueError(
+            "MM encoder items for one request must have matching output shape, dtype, and device"
+        )
+
+    embeddings = torch.empty(
+        (sum(output.shape[0] for output in ordered), *first.shape[1:]),
+        dtype=first.dtype,
+        device=first.device,
+    )
+    start = 0
+    for output in ordered:
+        end = start + output.shape[0]
+        embeddings[start:end].copy_(output.detach())
+        start = end
+    return embeddings
 
 
 @dataclass(frozen=True)
@@ -321,12 +349,12 @@ class EncoderCachePartition:
     indices that still require encoder work; `keys` is aligned to item order so miss
     embeddings can be written back after they are computed.
 
-    `keys` always spans every item in the request -- `assemble_full_embedding` needs the
-    total item count, and misses are written back by item index. `hits` and `miss_indices`
-    instead cover only `looked_up`, the indices the caller asked about. The item scheduler
-    passes the subset it picked for this iteration, so items it has no budget for yet are
-    not touched: an LRU `get` refreshes recency, and probing an item the caller cannot
-    encode would reorder eviction against items that are actually in flight.
+    `keys` always spans every item in the request -- full embedding assembly needs the total
+    item count, and misses are written back by item index. `hits` and `miss_indices` instead
+    cover only `looked_up`, the indices the caller asked about. The item scheduler passes the
+    subset it picked for this iteration, so items it has no budget for yet are not touched: an
+    LRU `get` refreshes recency, and probing an item the caller cannot encode would reorder
+    eviction against items that are actually in flight.
     """
 
     hits: Dict[int, torch.Tensor]
@@ -1003,9 +1031,7 @@ class MultimodalModelMixin:
                     continue
                 if partition.is_full_hit:
                     param.multimodal_data["multimodal_embedding"] = (
-                        MultimodalEncoderRequestState.assemble_full_embedding(
-                            partition.hits, len(partition.keys)
-                        )
+                        _assemble_multimodal_encoder_embeddings(partition.hits, len(partition.keys))
                     )
                     continue
                 partial_hits.append((param, partition))
@@ -1357,8 +1383,8 @@ class MultimodalModelMixin:
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
             for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
                 by_item[miss_idx] = tensor
-            param.multimodal_data["multimodal_embedding"] = (
-                MultimodalEncoderRequestState.assemble_full_embedding(by_item, len(partition.keys))
+            param.multimodal_data["multimodal_embedding"] = _assemble_multimodal_encoder_embeddings(
+                by_item, len(partition.keys)
             )
 
             inserted = 0
@@ -1609,7 +1635,7 @@ def _dispatch_cross_iter_prefetch(
                         cache_misses.append(param)
                     elif partition.is_full_hit:
                         param.multimodal_data["multimodal_embedding"] = (
-                            MultimodalEncoderRequestState.assemble_full_embedding(
+                            _assemble_multimodal_encoder_embeddings(
                                 partition.hits, len(partition.keys)
                             )
                         )

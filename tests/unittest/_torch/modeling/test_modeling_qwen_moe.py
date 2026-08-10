@@ -1,7 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-import gc
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -70,10 +66,6 @@ class Scenario:
 
 
 class TestQwenMoe(unittest.TestCase):
-
-    def tearDown(self) -> None:
-        gc.collect()
-        torch.cuda.empty_cache()
 
     @parameterized.expand([None, "FP8", "NVFP4"])
     def test_qwen_moe_sanity(self, quant_algo):

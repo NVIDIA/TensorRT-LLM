@@ -3052,17 +3052,9 @@ def create_py_executor_instance(
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     if getattr(model_engine, "mm_encoder_item_scheduling_enabled", False):
-        # Wrap the LLM scheduler with atomic MM item budgeting. The
-        # side-stream conflict is checked here rather than in an args
-        # validator because item scheduling is a model capability
-        # (MultimodalModelMixin + processor opt-in) only known after model
-        # load; side-stream prefetch stays valid for other MM models.
+        # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
+        # already validated model-capability-dependent feature combinations.
         multimodal_config = llm_args.multimodal_config
-        if multimodal_config.encoder_side_stream_max_ahead > 0:
-            raise NotImplementedError(
-                "MM side-stream prefetch is not yet compatible with "
-                "item-level encoder scheduling; set "
-                "multimodal_config.encoder_side_stream_max_ahead to 0")
         # `mm_encoder_item_scheduling_enabled` already excludes the DISABLED
         # policy (a disabled model never reaches here and keeps the base LLM
         # scheduler), so only the EAGER vs DEFAULT variant is selected here.
