@@ -2453,6 +2453,43 @@ class _WideBoundaryMergingTokenizer(_BoundaryMergingTokenizer):
         return super().encode(text, add_special_tokens=add_special_tokens)
 
 
+@pytest.mark.asyncio
+async def test_ctx_frontend_uses_shared_incremental_tokenizer():
+    """CTX frontend tokenization must exercise the same cache as router tokenization."""
+    from tensorrt_llm.serve.chat_tokenization import IncrementalTokenizationCache
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    tokenizer = _BoundaryMergingTokenizer()
+    server = object.__new__(OpenAIServer)
+    server._incremental_tokenizer = IncrementalTokenizationCache(
+        name="ctx frontend", enabled=True)
+    server.tokenizer = SimpleNamespace(tokenizer=tokenizer)
+    server._input_proc_executor = None
+    request = ChatCompletionRequest(
+        model="mock",
+        messages=[{"role": "user", "content": "next request"}],
+        conversation_params=ConversationParams(conversation_id="agentx-session"),
+    )
+
+    common = "stable-prefix<|im_end|>\n<|im_start|>assistant"
+    previous = common + "\n<think>\n"
+    current_suffix = ("\nactual response<|im_end|>\n"
+                      "<|im_start|>user\nnext request<|im_end|>\n"
+                      "<|im_start|>assistant\n<think>\n")
+    current = common + current_suffix
+
+    first = await server._maybe_incremental_tokenize_chat_prompt(
+        previous, request, has_multimodal=False)
+    assert first == tokenizer.encode(previous)
+    tokenizer.calls.clear()
+    result = await server._maybe_incremental_tokenize_chat_prompt(
+        current, request, has_multimodal=False)
+
+    assert result == tokenizer.encode(current)
+    assert tokenizer.calls == [current_suffix]
+    assert server._incremental_tokenizer._incremental_hits == 1
+
+
 def test_prefix_cache_rolls_back_boundary_token(servers):
     r"""AgentX replaces the previous synthetic ``<think>`` generation prefix.
 

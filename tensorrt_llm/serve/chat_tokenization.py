@@ -15,17 +15,181 @@
 
 from __future__ import annotations
 
+import bisect
 import os
-from typing import TYPE_CHECKING, Callable, Optional, cast
+import threading
+from collections import OrderedDict
+from typing import TYPE_CHECKING, Callable, Hashable, Optional, Protocol, TypedDict, cast
 
 from transformers import PretrainedConfig
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.harmony_adapter import HarmonyAdapter
 
 ToolDict = dict[str, object]
+
+
+class _OffsetEncoding(TypedDict):
+    input_ids: list[int]
+    offset_mapping: list[tuple[int, int]]
+
+
+class OffsetTokenizer(Protocol):
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        """Encode text into canonical token IDs."""
+        ...
+
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ) -> _OffsetEncoding:
+        """Encode text and optionally return character offsets."""
+        ...
+
+
+class IncrementalTokenizationCache:
+    """Boundary-safe rendered-prompt token cache shared by frontends and routers."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        enabled: bool,
+        rollback_tokens: int = 1,
+        verify_every: int = 0,
+        max_entries: int = 1024,
+    ) -> None:
+        self.name = name
+        self.enabled = enabled
+        self.rollback_tokens = max(1, rollback_tokens)
+        self.verify_every = max(0, verify_every)
+        self.max_entries = max(1, max_entries)
+        self._cache: OrderedDict[
+            Hashable,
+            tuple[str, list[int], Optional[list[tuple[int, int]]]],
+        ] = OrderedDict()
+        self._lock = threading.Lock()
+        self._verify_count = 0
+        self._incremental_hits = 0
+
+    @classmethod
+    def from_environment(cls, name: str) -> "IncrementalTokenizationCache":
+        """Create a cache from the shared incremental-tokenization environment flags."""
+        return cls(
+            name=name,
+            enabled=os.environ.get("TRTLLM_INCREMENTAL_TOKENIZE", "0") == "1",
+            rollback_tokens=int(os.environ.get("TRTLLM_INCREMENTAL_TOKENIZE_ROLLBACK_TOKENS", "1")),
+            verify_every=int(os.environ.get("TRTLLM_INCREMENTAL_TOKENIZE_VERIFY_EVERY", "0")),
+        )
+
+    def encode(
+        self,
+        rendered: str,
+        key: Hashable,
+        tokenizer: OffsetTokenizer,
+    ) -> list[int]:
+        """Tokenize a rendered prompt while reusing a stable cached prefix."""
+        with self._lock:
+            entry = self._cache.get(key)
+
+        used_incremental = False
+        if entry is not None and rendered == entry[0]:
+            ids = entry[1]
+            offsets = entry[2]
+        elif self.enabled and entry is not None and entry[2]:
+            previous_text, previous_ids, previous_offsets = entry
+            prefix_limit = min(len(previous_text), len(rendered))
+            low, high = 0, prefix_limit
+            while low < high:
+                middle = (low + high + 1) // 2
+                if previous_text[:middle] == rendered[:middle]:
+                    low = middle
+                else:
+                    high = middle - 1
+            common_prefix_chars = low
+
+            stable_tokens = bisect.bisect_right(
+                previous_offsets,
+                common_prefix_chars,
+                key=lambda offset: offset[1],
+            )
+            # BPE merges may cross the character-level common-prefix boundary.
+            cut_token = max(0, stable_tokens - self.rollback_tokens)
+            cut_char = 0 if cut_token == 0 else previous_offsets[cut_token][0]
+            suffix_ids, suffix_offsets = self._encode_with_offsets(rendered[cut_char:], tokenizer)
+            if suffix_offsets is not None:
+                ids = previous_ids[:cut_token] + suffix_ids
+                offsets = previous_offsets[:cut_token] + [
+                    (start + cut_char, end + cut_char) for start, end in suffix_offsets
+                ]
+                used_incremental = True
+            else:
+                ids, offsets = self._encode_with_offsets(rendered, tokenizer)
+        elif self.enabled:
+            ids, offsets = self._encode_with_offsets(rendered, tokenizer)
+        else:
+            ids = tokenizer.encode(rendered, add_special_tokens=False)
+            offsets = None
+
+        with self._lock:
+            self._verify_count += 1
+            verify_count = self._verify_count
+
+        if used_incremental and self.verify_every > 0 and verify_count % self.verify_every == 0:
+            full_ids = tokenizer.encode(rendered, add_special_tokens=False)
+            if ids != full_ids:
+                logger.error(
+                    "Incremental tokenization mismatch in %s; "
+                    "falling back to full encode for cache key %r",
+                    self.name,
+                    key,
+                )
+                ids = full_ids
+                offsets = None
+
+        with self._lock:
+            self._cache[key] = (rendered, ids, offsets)
+            self._cache.move_to_end(key)
+            while len(self._cache) > self.max_entries:
+                self._cache.popitem(last=False)
+            if used_incremental:
+                self._incremental_hits += 1
+                incremental_hits = self._incremental_hits
+            else:
+                incremental_hits = 0
+
+        if incremental_hits == 1 or incremental_hits % 1000 == 0:
+            logger.info(
+                "Incremental tokenization exercised in %s: hits=%d",
+                self.name,
+                incremental_hits,
+            )
+        return ids
+
+    @staticmethod
+    def _encode_with_offsets(
+        rendered: str, tokenizer: OffsetTokenizer
+    ) -> tuple[list[int], Optional[list[tuple[int, int]]]]:
+        """Return canonical token IDs and validated offsets when supported."""
+        ids = tokenizer.encode(rendered, add_special_tokens=False)
+        try:
+            encoding = tokenizer(
+                rendered,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            offset_ids = list(encoding["input_ids"])
+            offsets = list(encoding["offset_mapping"])
+        except (KeyError, NotImplementedError, TypeError, ValueError):
+            return ids, None
+        if ids != offset_ids or len(ids) != len(offsets):
+            return ids, None
+        return ids, offsets
 
 
 def resolve_model_type_from_config(model_name_or_path: str) -> Optional[str]:
