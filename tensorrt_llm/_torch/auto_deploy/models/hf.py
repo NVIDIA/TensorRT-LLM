@@ -108,7 +108,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         "legacy": False,
         "padding_side": "left",
         "truncation_side": "left",
-        "trust_remote_code": True,
         "use_fast": True,
     }
 
@@ -125,6 +124,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self._quant_config_reader: QuantConfigReader | None = None
         # Ingest defaults for tokenizer and model kwargs
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
+        self.tokenizer_kwargs["trust_remote_code"] = self.trust_remote_code
         self.model_kwargs = deep_merge_dicts(
             self._model_defaults,
             self.model_kwargs or {},
@@ -251,7 +251,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
         model_config, unused_kwargs = AutoConfig.from_pretrained(
-            self.model, return_unused_kwargs=True, trust_remote_code=True
+            self.model,
+            return_unused_kwargs=True,
+            trust_remote_code=self.trust_remote_code,
         )
         model_config, nested_unused_kwargs = self._recursive_update_config(
             model_config, self.model_kwargs
@@ -281,8 +283,8 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                 model = self.automodel_cls.from_config(
                     model_config,
                     **{
-                        "trust_remote_code": True,
                         **unused_kwargs,
+                        "trust_remote_code": self.trust_remote_code,
                     },
                 )
 
@@ -377,9 +379,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
             self.model,
             config=model_config,
             **{
-                "trust_remote_code": True,
                 "tp_plan": "auto",
                 **unused_kwargs,
+                "trust_remote_code": self.trust_remote_code,
                 "dtype": "auto",  # takes precedence over unused_kwargs!
             },
         )
