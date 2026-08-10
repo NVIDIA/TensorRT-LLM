@@ -33,8 +33,10 @@ from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
+    from packaging.version import Version
 except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.version import Version
 
 build_run = partial(run, shell=True, check=True)
 
@@ -65,6 +67,28 @@ def working_directory(path):
 
 def get_project_dir():
     return Path(__file__).parent.resolve().parent
+
+
+def apply_version_override(project_dir: Path,
+                           version_override: Optional[str]) -> None:
+    """Apply the requested package version before building the wheel."""
+    if not version_override:
+        return
+
+    version_file = project_dir / "tensorrt_llm" / "version.py"
+    version_content = version_file.read_text()
+    version_match = re.search(r'(?m)^__version__ = "([^"]+)"$', version_content)
+    current_version = version_match.group(1)
+
+    resolved_version = version_override
+    if version_override.startswith((".", "+")):
+        resolved_version = current_version
+        if not current_version.endswith(version_override):
+            resolved_version += version_override
+    resolved_version = str(Version(resolved_version))
+    version_file.write_text(
+        version_content.replace(f'__version__ = "{current_version}"',
+                                f'__version__ = "{resolved_version}"', 1))
 
 
 def get_source_dir():
@@ -533,12 +557,14 @@ def main(*,
          mypyc: bool = False,
          require_dynamic_attributions: bool = False,
          plat_name: Optional[str] = None,
-         yes: bool = False):
+         yes: bool = False,
+         version_override: Optional[str] = None):
 
     if clean:
         clean_wheel = True
 
     project_dir = get_project_dir()
+    apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
     # Get all submodules and check their folder exists. If not,
@@ -1345,6 +1371,11 @@ def add_arguments(parser: ArgumentParser):
         default=False,
         help=
         "Skip interactive confirmation prompts (useful for non-interactive builds)",
+    )
+    parser.add_argument(
+        "--version-override",
+        help="Package version override. A leading '.' or '+' appends to the "
+        "current version; any other value replaces it.",
     )
 
 
