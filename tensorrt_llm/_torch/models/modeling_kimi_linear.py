@@ -78,7 +78,8 @@ import gc
 import json
 import os
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set,
+                    Tuple)
 
 import torch
 from safetensors import safe_open
@@ -2143,6 +2144,23 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "tokens_per_block": 64,
             }
         }
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["PYTHON"]:
+        """Kimi K3 disaggregated serving requires the Python transceiver.
+
+        Only the Python NIXL transceiver (KvCacheTransceiverV2) can move
+        the KDA recurrent state; the C++ transceiver has no KDA support.
+        Adopted when the user leaves
+        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the
+        effective backend is NIXL. An explicit non-Python runtime is
+        rejected by ``get_kv_cache_manager_cls`` rather than silently
+        routed to a path that cannot transfer the recurrent state.
+        """
+        return "PYTHON"
 
     # ------------------------------------------------------------------
     # Weight loading (streams the 1.5TB checkpoint; only the rank-local
