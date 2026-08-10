@@ -211,7 +211,7 @@ def test_build_page_table():
 def _make_v1_dsa_manager(
     pp_size: int = 1,
     pp_rank: int = 0,
-    indexer_k_cache_layer_mask=None,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
 ) -> KVCacheManager:
     """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style).
 
@@ -312,8 +312,29 @@ def test_v1_dsa_masked_indexer_page_table_covers_owning_layers():
 
 
 @pytest.mark.cuda
-def test_v1_dsa_indexer_replicated_transfer_across_pp():
-    """PP1 ctx sends the DSA indexer K cache into two PP2 gen ranks.
+def test_v1_dsa_fully_masked_indexer_group_omits_pool() -> None:
+    """A PP stage without an indexer-owning layer advertises no indexer pool."""
+    manager = _make_v1_dsa_manager(indexer_k_cache_layer_mask=[False] * 4)
+    try:
+        page_table = build_page_table(manager)
+        assert len(page_table.layer_groups[0].pool_views) == 1
+        assert len(page_table.pool_groups[0].pools) == 1
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "indexer_k_cache_layer_mask",
+    [
+        pytest.param(None, id="dense"),
+        pytest.param([True, False, True, False], id="masked"),
+    ],
+)
+def test_v1_dsa_indexer_replicated_transfer_across_pp(
+    indexer_k_cache_layer_mask: list[bool] | None,
+) -> None:
+    """PP1 ctx sends a dense or masked DSA indexer K cache into two PP2 gen ranks.
 
     Exercises the full python path on real V1 managers: page-table build,
     role-set matching, ReplicatedMapper layer-strided offsets, and a
@@ -326,8 +347,15 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
     from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
-    ctx = _make_v1_dsa_manager()
-    gens = [_make_v1_dsa_manager(pp_size=2, pp_rank=r) for r in range(2)]
+    ctx = _make_v1_dsa_manager(indexer_k_cache_layer_mask=indexer_k_cache_layer_mask)
+    gens = [
+        _make_v1_dsa_manager(
+            pp_size=2,
+            pp_rank=r,
+            indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
+        )
+        for r in range(2)
+    ]
     try:
         ctx_extractor = KVRegionExtractorV1(ctx)
         ctx_ri = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
@@ -343,8 +371,10 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
         block_ids = np.array([0, 2, 3], dtype=np.int64)
         ctx_pt = ctx_extractor.page_table
         idx_pool = get_physical_pool(ctx_pt, 0, 1)
-        layers_per_gen = 2
-        per_layer = idx_pool.slot_bytes // 4
+        num_indexer_layers = int(ctx_pool_tensor.shape[1])
+        assert num_indexer_layers % len(gens) == 0
+        layers_per_gen = num_indexer_layers // len(gens)
+        per_layer = idx_pool.slot_bytes // num_indexer_layers
 
         for gen_pp_rank, gen in enumerate(gens):
             gen_ri = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
@@ -361,9 +391,8 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
                 ctx_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
                 gen_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
             )
-            # This gen rank holds 2 of the 4 layers; the fragment is the
-            # contiguous 2-layer range at this PP stage's offset within
-            # the ctx slot.
+            # Each gen rank holds a contiguous subset of the owning layers;
+            # masked-out layers do not consume bytes in either pool.
             assert pair.src.memory.bytes_per_region == layers_per_gen * per_layer
             expected_src_off = gen_pp_rank * layers_per_gen * per_layer
             base_ptrs = idx_pool.base_address + block_ids * idx_pool.slot_bytes

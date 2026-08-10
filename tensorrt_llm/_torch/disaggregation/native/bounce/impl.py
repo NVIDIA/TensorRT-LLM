@@ -62,8 +62,8 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: List[int]
-    ) -> Optional["VmmBounceTransport"]:
+        cls, agent, cfg, *, device_id: int, block_bytes_per_group: list[int | None]
+    ) -> VmmBounceTransport | None:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
         chunk = cfg.chunk_mb * _MIB
@@ -99,7 +99,7 @@ class VmmBounceTransport(BounceTransport):
         device_id: int,
         capacity_bytes: int,
         phys_chunk_size: int,
-        block_bytes_per_group: List[int],
+        block_bytes_per_group: list[int | None],
         min_bytes: int = DEFAULT_MIN_BYTES,
         min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,

@@ -333,8 +333,8 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         # its packed row in the (possibly masked) pool. When the mask is absent
         # every layer owns a row (dense/legacy layout) and this reduces to the
         # equal-sized packing in local-layer order.
-        if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
-            local_indexer_mask = getattr(kv_cache_manager, "indexer_k_cache_local_layer_mask", None)
+        if kv_cache_manager.enable_indexer_k_cache:
+            local_indexer_mask = kv_cache_manager.indexer_k_cache_local_layer_mask
             owning_layer_ids = [
                 lid
                 for lid in local_layer_ids
@@ -345,6 +345,12 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
             # simply transfers nothing for this rank's indexer.
             if owning_layer_ids:
                 indexer_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
+                if indexer_pool.shape[1] != len(owning_layer_ids):
+                    raise RuntimeError(
+                        "The DSA indexer K-cache pool row count does not match "
+                        "the number of indexer-owning layers in its layer group: "
+                        f"{indexer_pool.shape[1]} rows for {len(owning_layer_ids)} layers"
+                    )
                 # indexer_pool shape: (numBlocks, numIndexerLayers, kvFactor,
                 # blockSize), dtype=UINT8. numIndexerLayers is the number of
                 # owning layers on this rank (== the attention layer count when
