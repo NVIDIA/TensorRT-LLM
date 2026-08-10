@@ -155,9 +155,8 @@ def assert_acceptance_length(test_key: str, al_value: float) -> None:
 
     entry = baselines.get(test_key)
     if entry is None:
-        raise KeyError(
-            f"No acceptance-length baseline for '{test_key}'. "
-            f"Add an entry to {yaml_path} after a GPU run.")
+        raise KeyError(f"No acceptance-length baseline for '{test_key}'. "
+                       f"Add an entry to {yaml_path} after a GPU run.")
 
     if populate:
         entry["ref_al"] = al_value
@@ -166,10 +165,8 @@ def assert_acceptance_length(test_key: str, al_value: float) -> None:
         with open(yaml_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(baselines, f, sort_keys=False)
 
-        print(
-            f"[AL] populated {test_key}: "
-            f"ref_al={entry['ref_al']:.6f}, min_al={entry['min_al']:.6f}"
-        )
+        print(f"[AL] populated {test_key}: "
+              f"ref_al={entry['ref_al']:.6f}, min_al={entry['min_al']:.6f}")
         return
     min_al = entry.get("min_al")
     if min_al is None:
