@@ -28,6 +28,26 @@ storage_types = ["http", "etcd"]
 
 
 @pytest.mark.asyncio
+async def test_registration_failure_without_retry_returns_false():
+    config = DisaggClusterConfig(cluster_uri="http://localhost:18000",
+                                 cluster_name="test",
+                                 minimal_instances=MinimalInstances(
+                                     context_servers=1, generation_servers=1),
+                                 inactive_timeout_sec=INACTIVE_TIMEOUT,
+                                 heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+    storage = AsyncMock()
+    storage.set.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+
+    registered = await worker.register_worker(retry_interval=0)
+
+    assert not registered
+    assert worker._last_heartbeat == 0
+    assert worker._heartbeat_task is None
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_recovery_overwrites_stale_registration():
     config = DisaggClusterConfig(cluster_uri="http://localhost:18000",
                                  cluster_name="test",

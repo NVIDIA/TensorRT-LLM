@@ -345,6 +345,7 @@ class DisaggClusterWorker:
                     validator,
                     retry_interval,
                     overwrite_if_exists=overwrite_if_exists)
+            return False
         else:
             logger.info(
                 f"Worker {self.worker_info.worker_id} registration successful")
