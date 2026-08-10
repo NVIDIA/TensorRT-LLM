@@ -23,7 +23,7 @@ except ModuleNotFoundError as e:
     raise ModuleNotFoundError(
         "The SMG gRPC adapter requires the optional 'smg-grpc-proto' package, "
         "which is not part of the default TensorRT-LLM installation. Install it "
-        'with: pip install "tensorrt_llm[devel]"',
+        'with: pip install "tensorrt_llm[grpc-smg]"',
         name=e.name,
     ) from e
 

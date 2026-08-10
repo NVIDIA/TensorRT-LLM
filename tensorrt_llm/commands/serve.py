@@ -1124,7 +1124,7 @@ def launch_visual_gen_server(
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
     "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
-    "Requires the tensorrt_llm[devel] extra.",
+    "Requires the tensorrt_llm[grpc-smg] extra.",
     status="prototype")
 @stability_option(
     "--served_model_name",
@@ -1370,7 +1370,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 raise ValueError(
                     "gRPC serving with the SMG protocol requires the optional "
                     "'smg-grpc-proto' package. Install it with: "
-                    'pip install "tensorrt_llm[devel]"')
+                    'pip install "tensorrt_llm[grpc-smg]"')
 
             from tensorrt_llm.grpc.smg.server import launch_smg_server
 

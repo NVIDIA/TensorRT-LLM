@@ -141,6 +141,11 @@ devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
 mx_deps = ["modelexpress==0.4.1"]
+# Gateway protocol adapters are opt-in extras: the default installation must
+# not carry any gateway protobuf package. The single source of truth for each
+# gateway pin lives here; the devel extra aggregates them so developers and CI
+# get the adapters without a separate install step.
+grpc_smg_deps = ["smg-grpc-proto>=0.4.2"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -484,8 +489,9 @@ setup(
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
-        "devel": devel_deps,
+        "devel": devel_deps + grpc_smg_deps,
         "mx": mx_deps,
+        "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,
     install_requires=required_deps,

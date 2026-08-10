@@ -33,7 +33,7 @@ def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
     """A missing 'smg-grpc-proto' yields an actionable install hint.
 
     Importing the SMG bindings must fail with a ``pip install
-    "tensorrt_llm[devel]"`` hint rather than a bare ImportError.
+    "tensorrt_llm[grpc-smg]"`` hint rather than a bare ImportError.
     """
     real_import = builtins.__import__
 
@@ -47,7 +47,7 @@ def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
     monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.smg.bindings", raising=False)
     monkeypatch.setattr(builtins, "__import__", import_without_smg)
 
-    with pytest.raises(ModuleNotFoundError, match=r"tensorrt_llm\[devel\]") as exc_info:
+    with pytest.raises(ModuleNotFoundError, match=r"tensorrt_llm\[grpc-smg\]") as exc_info:
         import tensorrt_llm.grpc.smg.bindings  # noqa: F401
 
     assert exc_info.value.name == "smg_grpc_proto"
@@ -71,7 +71,7 @@ def test_smg_bindings_preserves_unrelated_import_error(monkeypatch):
         importlib.import_module("tensorrt_llm.grpc.smg.bindings")
 
     assert exc_info.value.name == "google.protobuf"
-    assert "tensorrt_llm[devel]" not in str(exc_info.value)
+    assert "tensorrt_llm[grpc-smg]" not in str(exc_info.value)
 
 
 def test_smg_bindings_present_smoke():
