@@ -207,68 +207,19 @@ TokenIdExt::TokenIdExt(Digest const& digestValue)
 {
 }
 
-TokenIdExt::~TokenIdExt()
+void TokenIdExt::freeSlot(uint32_t index) noexcept
 {
-    if (isDigest())
-    {
-        DigestPool::instance().free(digestIndex());
-    }
+    DigestPool::instance().free(index);
 }
 
-TokenIdExt::TokenIdExt(TokenIdExt const& other)
-    // Clone a digest into a fresh slot; a normal token just copies its bits.
-    : mBits(other.isDigest() ? (DigestPool::instance().duplicate(other.digestIndex()) | kTagMask) : other.mBits)
+uint32_t TokenIdExt::duplicateSlot(uint32_t index)
 {
-}
-
-TokenIdExt& TokenIdExt::operator=(TokenIdExt const& other)
-{
-    if (this != &other)
-    {
-        // Allocate the clone before releasing our slot (self-safe, exception-safe).
-        uint32_t const newBits
-            = other.isDigest() ? (DigestPool::instance().duplicate(other.digestIndex()) | kTagMask) : other.mBits;
-        if (isDigest())
-        {
-            DigestPool::instance().free(digestIndex());
-        }
-        mBits = newBits;
-    }
-    return *this;
-}
-
-TokenIdExt& TokenIdExt::operator=(TokenIdExt&& other) noexcept
-{
-    if (this != &other)
-    {
-        if (isDigest())
-        {
-            DigestPool::instance().free(digestIndex());
-        }
-        mBits = other.mBits;
-        other.mBits = kBadToken;
-    }
-    return *this;
+    return DigestPool::instance().duplicate(index);
 }
 
 Digest const& TokenIdExt::digest() const
 {
     return DigestPool::instance().get(digestIndex());
-}
-
-bool TokenIdExt::operator==(TokenIdExt const& other) const
-{
-    if (mBits == other.mBits)
-    {
-        return true;
-    }
-    // Distinct bits are unequal unless both are digests whose 32-byte contents
-    // match (equal digests may live in different pool slots — no dedup).
-    if (isDigest() && other.isDigest())
-    {
-        return digest() == other.digest();
-    }
-    return false;
 }
 
 namespace detail

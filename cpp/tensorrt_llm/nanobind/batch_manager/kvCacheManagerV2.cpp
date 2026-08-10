@@ -101,16 +101,16 @@ static std::pair<std::vector<kv::TokenIdExt>, bool> castTokenIterable(nb::handle
 // view of the tokens; fn must consume it synchronously (it may release the GIL — the backing
 // buffer must outlive the call).
 //
-// Fast path: a contiguous 1-D int32 buffer (numpy view, memoryview, array.array, torch tensor) is
-// reinterpret_cast to TokenIdExt const* — no copy, no per-token boxing — since a normal token id
-// is bit-identical to a 4-byte TokenIdExt (see tokenIdExt.h). convert=false keeps it strictly
-// zero-copy; a non-int32 / non-contiguous input falls through.
+// Fast path: a contiguous 1-D int32 CPU buffer (numpy view, memoryview, array.array, torch CPU
+// tensor) is reinterpret_cast to TokenIdExt const* — no copy, no per-token boxing — since a normal
+// token id is bit-identical to a 4-byte TokenIdExt (see tokenIdExt.h). convert=false keeps it
+// strictly zero-copy; a non-int32 / non-contiguous input falls through.
 //
 // Fallback: any int|bytes(32) iterable via castTokenIterable — the multimodal/digest path.
 template <class Fn>
 static auto withTokens(nb::handle tokens, Fn&& fn)
 {
-    nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig> arr;
+    nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> arr;
     if (nb::try_cast(tokens, arr, /*convert=*/false))
     {
         auto const count = static_cast<int32_t>(arr.shape(0));

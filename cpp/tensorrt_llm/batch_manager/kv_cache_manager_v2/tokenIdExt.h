@@ -92,9 +92,35 @@ public:
     // Multi-modal digest (tag 1): copies `digest` into a fresh pool slot.
     explicit TokenIdExt(Digest const& digest);
 
-    ~TokenIdExt();
-    TokenIdExt(TokenIdExt const& other);            // clones a digest slot
-    TokenIdExt& operator=(TokenIdExt const& other); // clones a digest slot
+    ~TokenIdExt()
+    {
+        if (isDigest())
+        {
+            freeSlot(digestIndex());
+        }
+    }
+
+    // Clones a digest slot; a normal token just copies its bits.
+    TokenIdExt(TokenIdExt const& other)
+        : mBits(other.isDigest() ? (duplicateSlot(other.digestIndex()) | kTagMask) : other.mBits)
+    {
+    }
+
+    // Clones a digest slot; a normal token just copies its bits.
+    TokenIdExt& operator=(TokenIdExt const& other)
+    {
+        if (this != &other)
+        {
+            // Allocate the clone before releasing our slot (self-safe, exception-safe).
+            uint32_t const newBits = other.isDigest() ? (duplicateSlot(other.digestIndex()) | kTagMask) : other.mBits;
+            if (isDigest())
+            {
+                freeSlot(digestIndex());
+            }
+            mBits = newBits;
+        }
+        return *this;
+    }
 
     TokenIdExt(TokenIdExt&& other) noexcept
         : mBits(other.mBits)
@@ -102,7 +128,19 @@ public:
         other.mBits = kBadToken; // steal the slot; leave source empty
     }
 
-    TokenIdExt& operator=(TokenIdExt&& other) noexcept;
+    TokenIdExt& operator=(TokenIdExt&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (isDigest())
+            {
+                freeSlot(digestIndex());
+            }
+            mBits = other.mBits;
+            other.mBits = kBadToken;
+        }
+        return *this;
+    }
 
     [[nodiscard]] bool isDigest() const noexcept
     {
@@ -128,7 +166,20 @@ public:
 
     // Value equality: normal/tag-mismatch compare raw bits; digest-vs-digest
     // compares the pooled 32 bytes (equal content in different slots is equal).
-    bool operator==(TokenIdExt const& other) const;
+    bool operator==(TokenIdExt const& other) const
+    {
+        if (mBits == other.mBits)
+        {
+            return true;
+        }
+        // Distinct bits are unequal unless both are digests whose 32-byte contents
+        // match (equal digests may live in different pool slots — no dedup).
+        if (isDigest() && other.isDigest())
+        {
+            return digest() == other.digest();
+        }
+        return false;
+    }
 
     bool operator!=(TokenIdExt const& other) const
     {
@@ -142,11 +193,20 @@ private:
         return mBits & kValueMask;
     }
 
+    static void freeSlot(uint32_t index) noexcept;
+    [[nodiscard]] static uint32_t duplicateSlot(uint32_t index);
+
     uint32_t mBits{kBadToken};
 };
 
+// Binary compatibility with int32_t is a deliberate design contract, not a coincidence: a
+// non-negative token id has the same 4-byte little-endian image as the TokenIdExt holding it.
+// The nanobind zero-copy ingest path relies on it to view a contiguous int32 token buffer as
+// TokenIdExt without copying, and Hasher::update relies on it to bulk-hash an all-normal run in
+// one Write.
 static_assert(sizeof(TokenIdExt) == 4, "TokenIdExt must be exactly 4 bytes for bulk hashing");
 static_assert(std::is_standard_layout_v<TokenIdExt>, "TokenIdExt must be standard-layout for byte-stream hashing");
+static_assert(alignof(TokenIdExt) == alignof(int32_t), "TokenIdExt must align like int32_t for zero-copy token views");
 
 // The digest pool that backs digest-tagged TokenIdExt is an implementation
 // detail hidden entirely in tokenIdExt.cpp (anonymous namespace). Only this
