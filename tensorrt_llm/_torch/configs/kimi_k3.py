@@ -77,12 +77,10 @@ class KimiK3VisionConfig(PretrainedConfig):
         self.vt_intermediate_size = vt_intermediate_size
         self.merge_kernel_size = tuple(merge_kernel_size)
         self.merge_type = merge_type
-        self._attn_implementation = _attn_implementation
 
         # MM Projector config
         self.mm_projector_type = mm_projector_type
-        self.mm_hidden_size = (mm_hidden_size
-                               if mm_hidden_size is not None else vt_hidden_size)
+        self.mm_hidden_size = mm_hidden_size if mm_hidden_size is not None else vt_hidden_size
         self.projector_hidden_act = projector_hidden_act
         self.projector_ln_eps = projector_ln_eps
         self.text_hidden_size = text_hidden_size
@@ -100,6 +98,12 @@ class KimiK3VisionConfig(PretrainedConfig):
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
 
+        # transformers v5 PretrainedConfig.__init__ assigns
+        # `attn_implementation` (default None) over any `_attn_implementation`
+        # set beforehand, so route the default through the kwarg instead of
+        # assigning the private attribute directly. An explicit
+        # `attn_implementation` passed by the caller still wins.
+        kwargs.setdefault("attn_implementation", _attn_implementation)
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
 

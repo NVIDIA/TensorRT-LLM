@@ -50,20 +50,27 @@ MAX_TOKENS=256
 CONF_THRESHOLD=""
 CONF_POLICY=first_below
 SKIP_BASELINE=0
+# Abort with a usage error when a value-taking option has no value ($1 is the
+# option name, $2 the remaining positional-argument count of the caller);
+# without this, `set -u` aborts on the unbound $2 instead.
+require_value() {
+    [[ $2 -ge 2 ]] || { echo "error: $1 requires a value" >&2; usage >&2; exit 2; }
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)        MODEL=$2; shift 2 ;;
+        --model)        require_value --model $#; MODEL=$2; shift 2 ;;
         --model=*)      MODEL=${1#*=}; shift ;;
-        --drafter)      DRAFTER=$2; shift 2 ;;
+        --drafter)      require_value --drafter $#; DRAFTER=$2; shift 2 ;;
         --drafter=*)    DRAFTER=${1#*=}; shift ;;
-        --image)        CONTAINER_IMAGE=$2; shift 2 ;;
+        --image)        require_value --image $#; CONTAINER_IMAGE=$2; shift 2 ;;
         --image=*)      CONTAINER_IMAGE=${1#*=}; shift ;;
-        --outdir)       OUTDIR=$2; shift 2 ;;
+        --outdir)       require_value --outdir $#; OUTDIR=$2; shift 2 ;;
         --outdir=*)     OUTDIR=${1#*=}; shift ;;
-        --num-prompts)  NUM_PROMPTS=$2; shift 2 ;;
-        --max-tokens)   MAX_TOKENS=$2; shift 2 ;;
-        --confidence-threshold) CONF_THRESHOLD=$2; shift 2 ;;
-        --confidence-policy)    CONF_POLICY=$2; shift 2 ;;
+        --num-prompts)  require_value --num-prompts $#; NUM_PROMPTS=$2; shift 2 ;;
+        --max-tokens)   require_value --max-tokens $#; MAX_TOKENS=$2; shift 2 ;;
+        --confidence-threshold) require_value --confidence-threshold $#; CONF_THRESHOLD=$2; shift 2 ;;
+        --confidence-policy)    require_value --confidence-policy $#; CONF_POLICY=$2; shift 2 ;;
         --skip-baseline) SKIP_BASELINE=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;

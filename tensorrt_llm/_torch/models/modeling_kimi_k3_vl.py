@@ -357,6 +357,26 @@ class KimiK3VisionModel(KimiK25VisionModel):
             self.merge_kernel_size = (2, 2)
         self.merge_type = vision_cfg.get("merge_type", "sd2_tpool")
 
+        # This tower hardcodes the released K3 vision architecture
+        # (K3PatchEmbed3d: bias-free conv; K3EncoderLayer: RMSNorm +
+        # bias-free attention; K3VisionMLP: bias-free, gelu_tanh). Reject a
+        # checkpoint that asks for a variant these modules do not build, so
+        # the load fails loudly instead of silently producing wrong outputs.
+        for field, supported in (
+            ("norm_type", "rmsnorm"),
+            ("mlp_type", "mlp2"),
+            ("activation_func", "gelu_pytorch_tanh"),
+            ("pos_emb_type", "divided_fixed"),
+            ("attn_bias", False),
+            ("patch_embed_proj_bias", False),
+            ("linear_bias", False),
+        ):
+            value = vision_cfg.get(field, supported)
+            if value != supported:
+                raise ValueError(
+                    f"Kimi K3 vision tower supports {field}={supported!r}, got {value!r}"
+                )
+
         text_config = getattr(pretrained_config, "text_config", pretrained_config)
         self.model_dtype = model_dtype
         self.text_hidden_size = (

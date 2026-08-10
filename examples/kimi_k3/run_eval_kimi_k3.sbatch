@@ -204,7 +204,10 @@ case "$MODE" in
     dflash)
         [[ -e "$DFLASH_DRAFTER" ]] || { echo "error: drafter path does not exist: $DFLASH_DRAFTER" >&2; exit 2; }
         EVAL_CONFIG=$REPO/examples/kimi_k3/.eval_dflash_runtime.$SLURM_JOB_ID.yaml
-        sed "s|speculative_model: .*|speculative_model: $DFLASH_DRAFTER|" \
+        # Escape sed replacement metacharacters (\, & and the | delimiter) so
+        # arbitrary drafter paths substitute literally.
+        DFLASH_ESC=$(printf '%s' "$DFLASH_DRAFTER" | sed 's/[&|\\]/\\&/g')
+        sed "s|speculative_model: .*|speculative_model: $DFLASH_ESC|" \
             "$REPO/examples/kimi_k3/eval_extra_llm_options_dflash.yaml" > "$EVAL_CONFIG"
         CLEANUP_FILES+=("$EVAL_CONFIG")
         MAX_BATCH_SIZE=8
