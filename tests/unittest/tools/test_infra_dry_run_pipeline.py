@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 GROOVY = (REPO_ROOT / "jenkins" / "L0_Test.groovy").read_text()
 PARENT_GROOVY = (REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy").read_text()
 SLURM_RUN = (REPO_ROOT / "jenkins" / "scripts" / "slurm_run.sh").read_text()
+SLURM_INSTALL_PATH = REPO_ROOT / "jenkins" / "scripts" / "slurm_install.sh"
 
 
 def _function_body(source, name, next_name):
@@ -113,6 +117,84 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             SLURM_RUN.index('if [[ "${infraDryRun:-false}" == "true" ]]'),
             SLURM_RUN.index("eval $pytestCommand"),
         )
+
+    def test_slurm_artifact_download_replaces_existing_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            archive_path = temp_path / "TensorRT-LLM.tar.gz"
+            wget_record_path = temp_path / "wget-output-path"
+            tar_record_path = temp_path / "tar-input-path"
+            archive_path.write_text("stale\n")
+
+            script = r'''
+source "$SLURM_INSTALL_PATH"
+retry_command() {
+    if [[ "$1" == "--timeout" ]]; then
+        shift 2
+    fi
+    "$@"
+}
+wget() {
+    local output_path=""
+    while (( "$#" )); do
+        if [[ "$1" == "-O" ]]; then
+            output_path="$2"
+            shift 2
+        else
+            shift
+        fi
+    done
+    if [[ -z "$output_path" ]]; then
+        output_path="$resourcePathNode/$tarName"
+        [[ ! -e "$output_path" ]] || output_path="${output_path}.1"
+    fi
+    printf 'fresh\n' > "$output_path"
+    printf '%s\n' "$output_path" > "$WGET_RECORD_PATH"
+}
+tar() {
+    [[ "$1" == "-zxf" ]]
+    [[ "$2" == "$EXPECTED_ARCHIVE_PATH" ]]
+    grep -qx fresh "$2"
+    mkdir -p "$resourcePathNode/TensorRT-LLM/src"
+    printf '%s\n' "$2" > "$TAR_RECORD_PATH"
+}
+apt-get() { :; }
+nvidia-smi() { :; }
+pip3() { :; }
+python3() { :; }
+export -f pip3 wget
+slurm_install_setup
+'''
+            env = {
+                **os.environ,
+                "SLURM_INSTALL_PATH": str(SLURM_INSTALL_PATH),
+                "resourcePathNode": temp_dir,
+                "tarName": archive_path.name,
+                "llmTarfile": "https://artifacts.example/TensorRT-LLM.tar.gz",
+                "SLURM_LOCALID": "0",
+                "SLURM_JOB_ID": "123",
+                "SLURM_NODEID": "0",
+                "pytestCommand": "pytest",
+                "stageName": "test-stage",
+                "HOST_NODE_NAME": "test-host",
+                "EXPECTED_ARCHIVE_PATH": str(archive_path),
+                "WGET_RECORD_PATH": str(wget_record_path),
+                "TAR_RECORD_PATH": str(tar_record_path),
+            }
+            subprocess.run(
+                ["bash", "-c", script],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            expected_tmp = f"{archive_path}.tmp.123.0"
+            self.assertEqual(wget_record_path.read_text(), f"{expected_tmp}\n")
+            self.assertEqual(archive_path.read_text(), "fresh\n")
+            self.assertEqual(tar_record_path.read_text(), f"{archive_path}\n")
+            self.assertFalse(Path(f"{archive_path}.1").exists())
+            self.assertFalse(Path(expected_tmp).exists())
 
     def test_direct_branch_follows_existing_shard_setup(self):
         body = _function_body(
