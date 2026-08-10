@@ -589,16 +589,26 @@ BounceSender::BounceSender(BounceContext& ctx)
 std::shared_future<TransferState> BounceSender::submit(
     TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
 {
+    auto promise = std::make_shared<std::promise<TransferState>>();
+    auto fut = promise->get_future().share();
     BounceTransferPlan plan;
+    try
     {
         BounceNvtxScope planScope(kNvtxBuildPlan, "buildPlan nDesc=%zu", srcDescs.getDescs().size());
         plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkSizeBytes,
             std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkSizeBytes / 256ULL), !mCtx.cfg.disableScatterRunMerging);
     }
+    catch (std::exception const& e)
+    {
+        // The eligibility gate (shouldUseBounce) screens the plan's preconditions, so this is a
+        // should-not-happen defense: resolve the future to FAILURE (the caller's task fails and can
+        // retry on the standard path) instead of letting the exception unwind out of submit().
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
+        promise->set_value(TransferState::kFAILURE);
+        return fut;
+    }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
-
-    auto promise = std::make_shared<std::promise<TransferState>>();
-    auto fut = promise->get_future().share();
     if (numChunks == 0)
     {
         promise->set_value(TransferState::kSUCCESS);
@@ -818,6 +828,20 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         for (std::uint32_t i = 0; i < nDesc; ++i)
         {
             nTotal += piecesFor(chunk.sizes[i], splitBudget(nTotal, nDesc - 1 - i, maxEntries));
+        }
+        // Same capacity guard as the scatter path: planBufs is capacity-unchecked, so writing more
+        // than maxEntries would overflow the pinned/scratch plan buffers. The bound holds by
+        // construction today (submit's maxDescsPerChunk and the ExecPool's maxDescs derive from the
+        // same expression), but a divergence must fail the flow, not corrupt the heap.
+        if (nTotal > maxEntries)
+        {
+            TLLM_LOG_WARNING(
+                "BounceTransport(%s): rid=%llu chunk=%u plan entries %zu > exec capacity %zu; abandoning flow",
+                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, nTotal, maxEntries);
+            mCtx.exec->release(ctx);
+            mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
+            req.pendingCredits.clear(); // abandon: the request then fails via checkTimeouts
+            break;
         }
         auto const bufs = planBufs(ctx, nTotal);
         std::size_t idx = 0;
@@ -1505,47 +1529,65 @@ void BounceTransport::ioLoop()
     std::string blob;
     while (!mCtx.stop.load(std::memory_order_acquire))
     {
-        // Adaptive poll wait. When there is GPU/RDMA work to poll — gather/write in flight on the
-        // sender (localHeldCount>0) or scatter in flight on the receiver (mScattering) — use a 0ms
-        // timeout so cudaEventQuery / getXferStatus / scatter completions are detected ASAP (low
-        // latency on the critical path; also keeps UCX progress driven). When fully idle (only
-        // waiting on a control message), sleep up to 1ms so the IO thread doesn't busy-spin a core.
-        // A request merely waiting for a GRANT (nothing posted yet) is NOT "busy", so a stalled /
-        // unreachable peer won't spin a core until requestTimeoutMs. Both checks are IO-thread-only.
-        bool const busy = mSender.busy() || mReceiver.busy();
-        int const timeoutMs = busy ? 0 : 1;
-        bool work = false;
-        if (mCtx.channel->recv(peer, blob, timeoutMs))
+        // Exception boundary: this is a thread entry, so anything escaping here would
+        // std::terminate the process. recv() can throw zmq::error_t (e.g. EINTR/ETERM from
+        // zmq_poll) and the handlers may throw on peer input; log, back off briefly (so a
+        // persistent error can't hot-spin the core), and keep serving — in-flight requests still
+        // resolve via checkTimeouts, never a hang (R5).
+        try
         {
-            dispatch(peer, blob);
-            work = true;
+            tick(peer, blob);
         }
-        work |= mSender.drainGatherReady(); // post writes for chunks whose gather kernel just finished
-        work |= mSender.pollSenderHandles();
-        work |= mReceiver.drainScatterDone();
-        work |= mSender.drainOrphanLocal(); // recycle failed-but-in-flight write regions once their write ends
-        drainForgets();
-        mSender.drainPendingPosts();        // retry credits parked when the arena was full (onAck freed regions)
-        mSender.checkTimeouts();
-        // Idle backoff: when there IS in-flight work (busy → 0ms poll) but nothing actually advanced
-        // this pass — the classic case being a gather stalled behind unrelated model kernels (gather
-        // event stays NotReady) — keep latency low for the first few spins, then sleep briefly so we
-        // don't peg a core at 100%. Any control message or forward progress resets the counter.
-        if (work)
+        catch (std::exception const& e)
         {
-            mIdleSpins = 0;
+            TLLM_LOG_WARNING("BounceTransport(%s): IO tick failed: %s", mCtx.selfName.c_str(), e.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        else if (busy)
+    }
+}
+
+void BounceTransport::tick(std::string& peer, std::string& blob)
+{
+    // Adaptive poll wait. When there is GPU/RDMA work to poll — gather/write in flight on the
+    // sender (localHeldCount>0) or scatter in flight on the receiver (mScattering) — use a 0ms
+    // timeout so cudaEventQuery / getXferStatus / scatter completions are detected ASAP (low
+    // latency on the critical path; also keeps UCX progress driven). When fully idle (only
+    // waiting on a control message), sleep up to 1ms so the IO thread doesn't busy-spin a core.
+    // A request merely waiting for a GRANT (nothing posted yet) is NOT "busy", so a stalled /
+    // unreachable peer won't spin a core until requestTimeoutMs. Both checks are IO-thread-only.
+    bool const busy = mSender.busy() || mReceiver.busy();
+    int const timeoutMs = busy ? 0 : 1;
+    bool work = false;
+    if (mCtx.channel->recv(peer, blob, timeoutMs))
+    {
+        dispatch(peer, blob);
+        work = true;
+    }
+    work |= mSender.drainGatherReady(); // post writes for chunks whose gather kernel just finished
+    work |= mSender.pollSenderHandles();
+    work |= mReceiver.drainScatterDone();
+    work |= mSender.drainOrphanLocal(); // recycle failed-but-in-flight write regions once their write ends
+    drainForgets();
+    mSender.drainPendingPosts();        // retry credits parked when the arena was full (onAck freed regions)
+    mSender.checkTimeouts();
+    // Idle backoff: when there IS in-flight work (busy → 0ms poll) but nothing actually advanced
+    // this pass — the classic case being a gather stalled behind unrelated model kernels (gather
+    // event stays NotReady) — keep latency low for the first few spins, then sleep briefly so we
+    // don't peg a core at 100%. Any control message or forward progress resets the counter.
+    if (work)
+    {
+        mIdleSpins = 0;
+    }
+    else if (busy)
+    {
+        constexpr std::uint32_t kSpinBeforeBackoff = 64;
+        if (mIdleSpins < kSpinBeforeBackoff)
         {
-            constexpr std::uint32_t kSpinBeforeBackoff = 64;
-            if (mIdleSpins < kSpinBeforeBackoff)
-            {
-                ++mIdleSpins;
-            }
-            else
-            {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-            }
+            ++mIdleSpins;
+        }
+        else
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 }

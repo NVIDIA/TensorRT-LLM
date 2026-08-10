@@ -85,6 +85,10 @@ public:
     [[nodiscard]] std::size_t freeCount();
 
 private:
+    /// Free every allocated context resource (never throws; used by the destructor and the
+    /// constructor's failure path).
+    void destroyContexts();
+
     int mDeviceId{0};
     std::vector<ExecCtx> mCtxs;
     std::mutex mMu;

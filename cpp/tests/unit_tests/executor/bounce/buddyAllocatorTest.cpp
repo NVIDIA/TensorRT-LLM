@@ -298,9 +298,13 @@ TEST(BuddyAllocator, FragmentationBlocksLargeAllocDespiteFreeBytes)
     for (auto o : all)
     {
         if (o % (2 * kMin) == 0)
+        {
             a.free(o);
+        }
         else
+        {
             held.push_back(o);
+        }
     }
     EXPECT_EQ(a.freeBytes(), 4 * kMin);          // half the arena is free...
     EXPECT_EQ(a.maxAllocBytes(), kMin);          // ...but only as isolated order-0 blocks

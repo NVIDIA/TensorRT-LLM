@@ -439,6 +439,9 @@ public:
 
 private:
     void ioLoop();
+    /// One reactor pass (recv+dispatch, drains, timeouts). `peer`/`blob` are caller-owned scratch
+    /// buffers reused across ticks. Runs inside ioLoop()'s exception boundary.
+    void tick(std::string& peer, std::string& blob);
     void dispatch(std::string const& peer, std::string const& blob);
     /// Apply queued forgetPeer() requests on the IO thread (reclaim receiver credits + fail
     /// sender requests to the gone peer).

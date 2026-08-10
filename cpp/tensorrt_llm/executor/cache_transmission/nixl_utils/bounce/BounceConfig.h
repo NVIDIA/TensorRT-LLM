@@ -43,8 +43,9 @@ struct BounceConfig
     std::uint32_t scatterWorkerCount{4};                     // TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT
     std::size_t minDescriptorCount{1024};                    // TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT
     std::size_t maxAverageDescriptorSizeBytes{16ULL << 10};  // TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES
-    int requestTimeoutMs{30000};                             // TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS
-    bool disableFabricMemory{false};                         // TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY
+    int requestTimeoutMs{30000};     // TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS; <=0 DISABLES the timeout
+                                     // (checkTimeouts no-ops; used by tests that intentionally wait)
+    bool disableFabricMemory{false}; // TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY
     // TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER: launch a chunk's gather at submit() time, before the
     // receiver's GRANT arrives, overlapping the WANT->GRANT control round-trip with the gather
     // kernel. Eager (credit-less) staging regions are capped at HALF the arena so that on a

@@ -113,13 +113,19 @@ void NixlNotifControlChannel::sendTo(std::string const& peer, std::string const&
     // affected request degrades to a request-timeout FAILURE. genNotif is safe from any
     // thread (the agent is created with thread-safe sync; the data plane already relies on this).
     BounceNvtxScope sendScope(kNvtxZmqSend, "notifSend bytes=%zu", blob.size());
-    std::lock_guard<std::mutex> lk(mMu);
-    if (mPeers.find(peer) == mPeers.end())
     {
-        TLLM_LOG_WARNING("NixlNotifControlChannel(%s): sendTo unknown peer %s (call addPeer first)", mSelfName.c_str(),
-            peer.c_str());
-        return;
+        std::lock_guard<std::mutex> lk(mMu);
+        if (mPeers.find(peer) == mPeers.end())
+        {
+            TLLM_LOG_WARNING("NixlNotifControlChannel(%s): sendTo unknown peer %s (call addPeer first)",
+                mSelfName.c_str(), peer.c_str());
+            return;
+        }
     }
+    // genNotif runs OUTSIDE mMu: it is a fabric operation and the same mutex gates recv()'s inbox
+    // pop, so holding it here would stall the reactor for the duration of the send (scatter workers
+    // send ACKs concurrently). A removePeer racing this send just makes genNotif fail -> warned,
+    // which matches the fire-and-forget contract above.
     nixl_status_t const st = mAgent->genNotif(peer, blob);
     if (st != NIXL_SUCCESS)
     {

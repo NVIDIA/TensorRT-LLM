@@ -76,7 +76,9 @@ endif()
 if(NIXL_ROOT)
   # The reactor tests also need zmq for the control plane (cppzmq is fetched
   # when NIXL is on); all of them share this source set + include/link sets.
-  if(ZMQ_FOUND)
+  # Same gate as the zmq-only tier above: without the fetched cppzmq header the
+  # sources compile-fail on zmq.hpp even though libzmq itself was found.
+  if(ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
     set(BOUNCE_REACTOR_SRCS
         ${BOUNCE_DIR}/BounceTransport.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp

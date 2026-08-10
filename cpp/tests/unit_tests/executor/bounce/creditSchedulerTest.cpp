@@ -282,11 +282,14 @@ TEST(CreditScheduler, MoreSendersThanRegionsNoStarvation)
     for (auto const& p : {"A", "B", "C"})
     {
         if (s.heldCount(p) > 0)
+        {
             served.insert(p);
+        }
     }
     int guard = 0;
     while (served.size() < 3 && guard++ < 50)
     {
+        ASSERT_FALSE(m.owner.empty()) << "no region is held; cannot drive recycling";
         auto off = m.owner.begin()->first;
         auto flow = m.owner.begin()->second;
         m.free(off);
@@ -294,7 +297,9 @@ TEST(CreditScheduler, MoreSendersThanRegionsNoStarvation)
         for (auto const& p : {"A", "B", "C"})
         {
             if (s.heldCount(p) > 0)
+            {
                 served.insert(p);
+            }
         }
         checkConservation(s, {"A", "B", "C"}, 2);
     }

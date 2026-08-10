@@ -48,48 +48,76 @@ ExecPool::ExecPool(
     int greatestPriority = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
     mCtxs.resize(count);
-    for (std::uint32_t i = 0; i < count; ++i)
+    // A mid-loop TLLM_CUDA_CHECK throw would skip the destructor (the object is not fully
+    // constructed), leaking every stream/event/buffer allocated so far -> clean up and rethrow.
+    try
     {
-        auto& c = mCtxs[i];
-        c.id = i;
-        c.scratchBytes = scratchBytes;
-        TLLM_CUDA_CHECK(cudaMalloc(&c.scratch, scratchBytes));
-        // Map the pinned buffer when kernels should read plan arrays in place without an H2D copy.
-        TLLM_CUDA_CHECK(cudaHostAlloc(
-            &c.hostPinned, scratchBytes, useZeroCopyArguments ? cudaHostAllocMapped : cudaHostAllocDefault));
-        if (useZeroCopyArguments)
+        for (std::uint32_t i = 0; i < count; ++i)
         {
-            TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&c.hostPinnedDev, c.hostPinned, 0));
+            auto& c = mCtxs[i];
+            c.id = i;
+            c.scratchBytes = scratchBytes;
+            TLLM_CUDA_CHECK(cudaMalloc(&c.scratch, scratchBytes));
+            // Map the pinned buffer when kernels should read plan arrays in place without an H2D copy.
+            TLLM_CUDA_CHECK(cudaHostAlloc(
+                &c.hostPinned, scratchBytes, useZeroCopyArguments ? cudaHostAllocMapped : cudaHostAllocDefault));
+            if (useZeroCopyArguments)
+            {
+                TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&c.hostPinnedDev, c.hostPinned, 0));
+            }
+            if (useCubCopy && cubTempBytes > 0)
+            {
+                TLLM_CUDA_CHECK(cudaMalloc(&c.cubTemp, cubTempBytes));
+                c.cubTempBytes = cubTempBytes;
+            }
+            TLLM_CUDA_CHECK(cudaStreamCreateWithPriority(&c.stream, cudaStreamNonBlocking, greatestPriority));
+            TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&c.event, cudaEventDisableTiming));
+            mFree.push_back(i);
         }
-        if (useCubCopy && cubTempBytes > 0)
-        {
-            TLLM_CUDA_CHECK(cudaMalloc(&c.cubTemp, cubTempBytes));
-            c.cubTempBytes = cubTempBytes;
-        }
-        TLLM_CUDA_CHECK(cudaStreamCreateWithPriority(&c.stream, cudaStreamNonBlocking, greatestPriority));
-        TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&c.event, cudaEventDisableTiming));
-        mFree.push_back(i);
+    }
+    catch (...)
+    {
+        destroyContexts();
+        throw;
     }
 }
 
 ExecPool::~ExecPool()
 {
+    destroyContexts();
+}
+
+void ExecPool::destroyContexts()
+{
     // Select the owning device before freeing; otherwise CUDA teardown targets the current device of
-    // this thread. A destructor cannot throw, so every cleanup uses the warn-only check.
+    // this thread. Must not throw (runs from the destructor and the constructor's failure path), so
+    // every cleanup uses the warn-only check. Fields of never-initialized contexts are nullptr.
     TLLM_CUDA_CHECK_WARN(cudaSetDevice(mDeviceId));
     for (auto& c : mCtxs)
     {
         if (c.scratch != nullptr)
+        {
             TLLM_CUDA_CHECK_WARN(cudaFree(c.scratch));
+        }
         if (c.cubTemp != nullptr)
+        {
             TLLM_CUDA_CHECK_WARN(cudaFree(c.cubTemp));
+        }
         if (c.hostPinned != nullptr)
+        {
             TLLM_CUDA_CHECK_WARN(cudaFreeHost(c.hostPinned)); // also frees its hostPinnedDev alias
+        }
         if (c.stream != nullptr)
+        {
             TLLM_CUDA_CHECK_WARN(cudaStreamDestroy(c.stream));
+        }
         if (c.event != nullptr)
+        {
             TLLM_CUDA_CHECK_WARN(cudaEventDestroy(c.event));
+        }
     }
+    mCtxs.clear();
+    mFree.clear();
 }
 
 ExecCtx* ExecPool::tryAcquire()
