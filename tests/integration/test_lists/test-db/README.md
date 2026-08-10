@@ -58,6 +58,15 @@ pytest -v --test-list=/TensorRT-LLM/src/l0_e2e.txt --output-dir=/tmp/logs
 
 This command runs the tests specified in the test list and outputs the results to the specified directory.
 
+## Check Test List (CI)
+
+Jenkins **Check Test List** runs `scripts/check_test_list.py --l0 --qa --waive --validate`.
+L0/QA/waive collection uses pure-Python stubs of the compiled modules
+(`tests/integration/defs/stubify_bindings.py`, loaded only via
+`-p stubify_bindings`), so no TensorRT-LLM wheel or C++
+compile is required. Pre-commit runs check_test_list.py only with `--validate` and
+`--check-duplicate-waives`, which does not require stubs.
+
 ## Additional Information
 - The `--context` parameter in the `trt-test-db` command specifies which context to search in the YAML files.
 - The `--match-exact` parameter provides system information used to filter tests based on the conditions defined in the YAML files.
