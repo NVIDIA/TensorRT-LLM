@@ -190,6 +190,9 @@ class AutoPipeline:
             if "Cosmos3" in class_name:
                 return "Cosmos3OmniMoTPipeline"
 
+            if "MiniMaxH3" in class_name:
+                return "MiniMaxH3Pipeline"
+
         #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2 specific)
         detected = AutoPipeline._detect_from_single_safetensors(checkpoint_dir)
