@@ -3589,7 +3589,7 @@ class PyExecutor:
         any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
         if any_need_check > 0:
             if local_need_check and not all_gen_first:
-                logger.warning(
+                logger.debug(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
                 # Local conditions warrant a blocking wait for at least one
