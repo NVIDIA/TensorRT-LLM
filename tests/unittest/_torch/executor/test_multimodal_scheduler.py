@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalEncoderContractError,
+    MultimodalModelMixin,
+)
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -446,6 +449,35 @@ def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
     assert handled == [("bad MM output", {"requests": [failed], "charge_budget": False})]
 
 
+def test_forward_multimodal_encoder_step_contains_model_contract_error():
+    failed = _request(1, [4])
+    failed.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = ("image", 0)
+    unrelated = _llm_request(2)
+    handled = []
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = MultimodalModelMixin()
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [failed, unrelated]
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(world_size=1)
+    executor.model_engine = engine
+    executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([failed, unrelated])
+    scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
+
+    executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert scheduled_requests.context_requests == [unrelated]
+    assert scheduled_requests.scheduled_mm_encoder_items is None
+    assert len(handled) == 1
+    assert "must be a MultimodalEncoderItemMetadata" in handled[0][0]
+    assert handled[0][1] == {"requests": [failed], "charge_budget": False}
+
+
 def test_forward_multimodal_encoder_step_propagates_system_errors():
     failed = _request(1, [4])
 
@@ -613,7 +645,9 @@ def test_prepare_multimodal_encoder_inputs_rejects_invalid_metadata_types():
         }
     )
 
-    with pytest.raises(TypeError, match="must be a MultimodalEncoderItemMetadata"):
+    with pytest.raises(
+        MultimodalEncoderContractError, match="must be a MultimodalEncoderItemMetadata"
+    ):
         MultimodalModelMixin().prepare_multimodal_encoder_inputs([(multimodal_param, 0)])
 
 
@@ -646,6 +680,47 @@ def test_item_encoder_classifies_output_count_contract_error():
     request = _request(1, [4])
 
     with pytest.raises(MultimodalEncoderRequestError, match="one output per item"):
+        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
+def test_item_encoder_translates_model_contract_errors(failure_stage):
+    class _Model(MultimodalModelMixin):
+        def prepare_multimodal_encoder_inputs(self, _):
+            if failure_stage == "prepare":
+                raise MultimodalEncoderContractError("bad request metadata")
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        def forward_multimodal_encoder_items(self, _):
+            raise MultimodalEncoderContractError("bad encoder output rows")
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    request = _request(1, [4])
+
+    expected = "bad request metadata" if failure_stage == "prepare" else "bad encoder output rows"
+    with pytest.raises(MultimodalEncoderRequestError, match=expected):
+        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
+def test_item_encoder_does_not_translate_system_errors(failure_stage):
+    class _Model(MultimodalModelMixin):
+        def prepare_multimodal_encoder_inputs(self, _):
+            if failure_stage == "prepare":
+                raise torch.cuda.OutOfMemoryError("encoder OOM")
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        def forward_multimodal_encoder_items(self, _):
+            raise torch.cuda.OutOfMemoryError("encoder OOM")
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    request = _request(1, [4])
+
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="encoder OOM"):
         engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
 
 

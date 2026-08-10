@@ -13,10 +13,12 @@ back empty; the row-count check in `forward_multimodal_encoder_items` turns that
 into a hard error, but only after the wasted encoder forward.
 """
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
+    MultimodalEncoderContractError,
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
@@ -190,6 +192,30 @@ def test_partial_selection_only_encodes_selected_items():
     assert len(outputs) == 1
     torch.testing.assert_close(outputs[0], _expected_rows(request, 1))
     assert model.encoder_calls == [ITEM_ROWS["image"][1]]
+
+
+def test_wrong_encoder_output_rows_are_request_contract_error():
+    class _WrongRowsModel(_GroupedEncoderModel):
+        def encode_multimodal_inputs(self, multimodal_params):
+            output = super().encode_multimodal_inputs(multimodal_params)
+            return output[:-1]
+
+    model = _WrongRowsModel()
+    request = _make_request(["image"])
+    encoder_inputs = model.prepare_multimodal_encoder_inputs([(request, 0)])
+
+    with pytest.raises(MultimodalEncoderContractError, match="rows declared"):
+        model.forward_multimodal_encoder_items(encoder_inputs)
+
+
+def test_cache_partition_index_mismatch_is_request_contract_error():
+    request = _make_request(["image"])
+    cache = object()
+
+    with pytest.raises(MultimodalEncoderContractError, match="out of range"):
+        _GroupedEncoderModel.partition_encoder_cache(
+            request, cache, item_indices=[1], keys=[("image",)]
+        )
 
 
 def test_items_from_multiple_requests_stay_separated():

@@ -61,7 +61,8 @@ from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
+from ..models.modeling_multimodal_mixin import (MultimodalEncoderContractError,
+                                                MultimodalModelMixin,
                                                 _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -3328,11 +3329,14 @@ class PyTorchModelEngine(ModelEngine):
             # `LlmRequest`.
             item_keys = (self.get_mm_encoder_item_keys(request)
                          if encoder_cache is not None else None)
-            partition = (self.model.partition_encoder_cache(
-                multimodal_param,
-                encoder_cache,
-                item_indices=item_indices,
-                keys=item_keys) if item_keys is not None else None)
+            try:
+                partition = (self.model.partition_encoder_cache(
+                    multimodal_param,
+                    encoder_cache,
+                    item_indices=item_indices,
+                    keys=item_keys) if item_keys is not None else None)
+            except MultimodalEncoderContractError as error:
+                raise MultimodalEncoderRequestError(str(error)) from error
             if partition is None:
                 # No cache, or the request cannot build stable content keys:
                 # every scheduled item is a miss and its output lives only on
@@ -3349,8 +3353,11 @@ class PyTorchModelEngine(ModelEngine):
                     (request, item_idx, partition.keys[item_idx]))
 
         if miss_items:
-            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
-                miss_items)
+            try:
+                encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
+                    miss_items)
+            except MultimodalEncoderContractError as error:
+                raise MultimodalEncoderRequestError(str(error)) from error
             for encoder_input, _, _ in encoder_inputs:
                 encoder_input.to_device(
                     "multimodal_data",
@@ -3361,8 +3368,11 @@ class PyTorchModelEngine(ModelEngine):
                                             None),
                 )
 
-            outputs = self.model.forward_multimodal_encoder_items(
-                encoder_inputs)
+            try:
+                outputs = self.model.forward_multimodal_encoder_items(
+                    encoder_inputs)
+            except MultimodalEncoderContractError as error:
+                raise MultimodalEncoderRequestError(str(error)) from error
             if len(outputs) != len(miss_owners):
                 raise MultimodalEncoderRequestError(
                     "MM item encoder must return one output per item")
@@ -3445,7 +3455,10 @@ class PyTorchModelEngine(ModelEngine):
         if state is not None and not isinstance(state.cache_item_keys, _Unset):
             return state.cache_item_keys
         mm_data = request.py_multimodal_data
-        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        try:
+            item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        except (TypeError, ValueError) as error:
+            raise MultimodalEncoderRequestError(str(error)) from error
         keys = None if item_metadata is None else (
             self.model.build_encoder_cache_item_keys(
                 request.multimodal_hashes,

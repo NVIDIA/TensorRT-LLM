@@ -54,6 +54,10 @@ from .modeling_multimodal_utils import (
 )
 
 
+class MultimodalEncoderContractError(ValueError):
+    """A request-local MM encoder input or output contract violation."""
+
+
 def _assemble_multimodal_encoder_embeddings(
     item_tensors: Dict[int, torch.Tensor], total_items: int
 ) -> torch.Tensor:
@@ -468,12 +472,19 @@ class MultimodalModelMixin:
             # modality-local indices (plus the modality, which also lets it
             # slice out of an interleaved request); the parallel metadata is
             # prompt-ordered across modalities, so it gets the global ones.
-            residual = self.build_multimodal_encoder_input(
-                multimodal_param,
-                [item_refs[i][1] for i in run_indices],
-                modality=modality,
-            )
-            self._apply_metadata_slice(residual, multimodal_param, run_indices)
+            try:
+                residual = self.build_multimodal_encoder_input(
+                    multimodal_param,
+                    [item_refs[i][1] for i in run_indices],
+                    modality=modality,
+                )
+                self._apply_metadata_slice(residual, multimodal_param, run_indices)
+            except MultimodalEncoderContractError:
+                raise
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise MultimodalEncoderContractError(
+                    f"Invalid multimodal encoder item input: {error}"
+                ) from error
             encoder_inputs.append(
                 (
                     residual,
@@ -500,13 +511,25 @@ class MultimodalModelMixin:
         run_metadata: Optional[MultimodalEncoderItemMetadata] = None
         run_indices: list[int] = []
         for multimodal_param, item_idx in selected_items:
-            metadata = (
-                run_metadata
-                if multimodal_param is run_param
-                else get_multimodal_encoder_item_metadata(multimodal_param.multimodal_data or {})
-            )
+            try:
+                metadata = (
+                    run_metadata
+                    if multimodal_param is run_param
+                    else get_multimodal_encoder_item_metadata(
+                        multimodal_param.multimodal_data or {}
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                raise MultimodalEncoderContractError(str(error)) from error
             if metadata is None:
-                raise ValueError("MM item metadata is required for item encoding")
+                raise MultimodalEncoderContractError(
+                    "MM item metadata is required for item encoding"
+                )
+            if item_idx < 0 or item_idx >= len(metadata.item_refs):
+                raise MultimodalEncoderContractError(
+                    f"MM item index {item_idx} is out of range for "
+                    f"{len(metadata.item_refs)} item(s)"
+                )
             modality = metadata.item_refs[item_idx][0]
             if run_indices and (multimodal_param is not run_param or modality != run_modality):
                 yield run_param, run_indices, run_modality, run_metadata
@@ -541,7 +564,7 @@ class MultimodalModelMixin:
             embeddings = self.encode_multimodal_inputs(group_params)
             expected_length = sum(group_lengths)
             if embeddings.shape[0] != expected_length:
-                raise ValueError(
+                raise MultimodalEncoderContractError(
                     f"MM encoder output length {embeddings.shape[0]} does not "
                     f"match the {expected_length} rows declared by the "
                     "selected items"
@@ -1292,7 +1315,9 @@ class MultimodalModelMixin:
         looked_up = list(range(len(keys))) if item_indices is None else list(item_indices)
         out_of_range = [i for i in looked_up if not 0 <= i < len(keys)]
         if out_of_range:
-            raise IndexError(f"item_indices {out_of_range} out of range for {len(keys)} cache keys")
+            raise MultimodalEncoderContractError(
+                f"item_indices {out_of_range} out of range for {len(keys)} cache keys"
+            )
 
         hits: Dict[int, torch.Tensor] = {}
         miss_indices: list[int] = []
