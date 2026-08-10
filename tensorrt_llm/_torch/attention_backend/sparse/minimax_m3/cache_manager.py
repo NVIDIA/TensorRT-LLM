@@ -135,6 +135,38 @@ class MiniMaxM3SparseIndexCache:
         buf.index_copy_(0, out_cache_loc.to(torch.long), idx_v.to(buf.dtype))
 
 
+def derive_shared_draft_layout(
+    num_layers: Optional[int],
+    num_kv_heads,
+    num_draft: int,
+) -> tuple[list[int], Optional[int]]:
+    """Locate the appended one-model draft tail in the manager's layer range.
+
+    ``num_layers`` is ambiguous at the creation site: for M3 + Eagle3 it
+    carries the pretrained TARGET count (60) while the per-layer
+    ``num_kv_heads`` list is already extended with the draft entries
+    (61); other flows pass the extended count directly. The heads list's
+    length is the unambiguous total, so anchor on it and fall back to
+    ``num_layers`` for scalar heads.
+
+    Returns ``(draft_layer_ids, num_target_layers)``; the target range is
+    ``[0, num_target_layers)`` and the draft tail sits directly above it.
+    ``num_target_layers`` is ``None`` when neither input pins the range.
+    """
+    total = (
+        len(num_kv_heads)
+        if isinstance(num_kv_heads, (list, tuple))
+        else (int(num_layers) if num_layers is not None else None)
+    )
+    if total is None:
+        return [], None
+    if num_layers is not None:
+        total = max(total, int(num_layers))
+    num_target = total - max(0, int(num_draft))
+    draft_ids = list(range(num_target, total))
+    return draft_ids, num_target
+
+
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
@@ -201,12 +233,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # cache); the creation site passes the appended count explicitly
         # (``num_one_model_draft_layers`` in ``_create_kv_cache_manager``).
         num_draft = int(kwargs.pop("num_one_model_draft_layers", 0) or 0)
-        self._shared_draft_layer_ids: list[int] = []
-        if num_draft > 0 and num_layers is not None:
-            self._shared_draft_layer_ids = list(range(int(num_layers) - num_draft, int(num_layers)))
+        self._shared_draft_layer_ids, num_target_layers = derive_shared_draft_layout(
+            num_layers, kwargs.get("num_kv_heads"), num_draft
+        )
         if sparse_layer_ids is None:
-            if num_layers is not None:
-                sparse_layer_ids = list(range(3, int(num_layers) - num_draft))
+            if num_target_layers is not None:
+                sparse_layer_ids = list(range(3, num_target_layers))
             else:
                 sparse_layer_ids = []
         if disable_index_value_layer_ids is None:

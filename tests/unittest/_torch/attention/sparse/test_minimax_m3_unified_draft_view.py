@@ -26,6 +26,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftSubpageView,
+    derive_shared_draft_layout,
 )
 
 DRAFT_LAYER = 60
@@ -98,3 +99,34 @@ def test_bad_page_index_padding_is_safe():
 def test_free_resources_is_noop():
     view = _make_view()
     view.free_resources(object())  # must not raise nor touch the manager
+
+
+def test_draft_layout_target_only_num_layers():
+    # The M3 creation-site flow: num_layers carries the pretrained target
+    # count while the per-layer heads list is already draft-extended.
+    # Anchoring the tail on num_layers instead of the list marked target
+    # layer 59 as draft and dropped its index-K cache (crashed at startup).
+    heads = [4] * 60 + [64]
+    draft_ids, num_target = derive_shared_draft_layout(60, heads, 1)
+    assert draft_ids == [60]
+    assert num_target == 60
+
+
+def test_draft_layout_pre_extended_num_layers():
+    # Flows that pass the extended count directly must resolve identically.
+    heads = [4] * 60 + [64]
+    draft_ids, num_target = derive_shared_draft_layout(61, heads, 1)
+    assert draft_ids == [60]
+    assert num_target == 60
+
+
+def test_draft_layout_no_draft():
+    draft_ids, num_target = derive_shared_draft_layout(60, [4] * 60, 0)
+    assert draft_ids == []
+    assert num_target == 60
+    # Scalar heads (plain M3, no spec) fall back to num_layers.
+    assert derive_shared_draft_layout(60, 4, 0) == ([], 60)
+
+
+def test_draft_layout_unpinned_range():
+    assert derive_shared_draft_layout(None, 4, 1) == ([], None)
