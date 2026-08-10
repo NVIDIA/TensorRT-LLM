@@ -101,6 +101,30 @@ def test_free_resources_is_noop():
     view.free_resources(object())  # must not raise nor touch the manager
 
 
+def test_subdiv_one_degenerates_to_identity():
+    # Retirement path (TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128): one
+    # sub-page per logical block, so the table is K=slot*scale, V=K+1.
+    view = MiniMaxM3DraftSubpageView(_FakeManager(), [DRAFT_LAYER], 128)
+    assert view._subdiv == 1
+    assert view.tokens_per_block == 128
+    assert view.max_blocks_per_seq == 16
+    dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
+    view.copy_batch_block_offsets(dst, request_ids=[1], beam_width=1, num_contexts=1, num_seqs=1)
+    assert dst[0, 0, 0, :2].tolist() == [5 * SCALE, 7 * SCALE]
+    assert dst[0, 0, 1, :2].tolist() == [5 * SCALE + 1, 7 * SCALE + 1]
+
+
+def test_view_rejects_draft_layer_outside_pool_zero():
+    manager = _FakeManager()
+    manager.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([1, 0], dtype=torch.int32)
+    try:
+        MiniMaxM3DraftSubpageView(manager, [DRAFT_LAYER], 32)
+    except AssertionError as e:
+        assert "pool 0" in str(e)
+    else:
+        raise AssertionError("expected the pool-0 sanity check to fire")
+
+
 def test_draft_layout_target_only_num_layers():
     # The M3 creation-site flow: num_layers carries the pretrained target
     # count while the per-layer heads list is already draft-extended.

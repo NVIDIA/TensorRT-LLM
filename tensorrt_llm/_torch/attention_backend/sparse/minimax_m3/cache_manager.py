@@ -25,6 +25,7 @@ Provides:
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -198,12 +199,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # draft manager previously worked around.
     supports_shared_draft_layers = True
 
-    # Workaround: the Eagle3 drafter's trtllm-gen generation kernels hit an
-    # illegal memory access at tokens_per_block=128 (base regression), while
-    # the MSA target requires 128. The dense draft layers have no page-size
-    # constraint, so the separate draft manager runs at 32 (read by
-    # ``_create_one_model_draft_kv_cache_manager``). Remove once the kernel
-    # bug is fixed.
+    # Workaround: two Eagle-draft kernel paths break at
+    # tokens_per_block=128 (which the MSA target requires): the SM103
+    # context-phase trtllm-gen cubin is missing, falling back to an
+    # unfused path whose workspace allocation is unservable (multi-TiB),
+    # and the generation-phase kernel hits an illegal memory access. The
+    # dense draft layers have no page-size constraint, so the drafter
+    # runs at 32: this value sizes the separate draft manager (read by
+    # ``_create_one_model_draft_kv_cache_manager``) and the sub-pages of
+    # ``draft_subpage_view``. Retirement path: once the kernels are
+    # fixed, set TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128 (the view
+    # degenerates to subdiv=1, i.e. the identity block-table expansion)
+    # and drop this attribute after validation.
     draft_manager_tokens_per_block = 32
     _main_kv_layout = "NHD"
 
@@ -267,6 +274,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         super().__init__(*args, **kwargs)
 
         self._draft_subpage_view_obj: Optional["MiniMaxM3DraftSubpageView"] = None
+        if self._shared_draft_layer_ids and not self.is_draft:
+            # Triage anchor: this line at creation plus the
+            # "[unified-kv] draft subpage view active" line at first
+            # dispatch confirm the unified draft KV path end to end.
+            logger.info(
+                f"[unified-kv] draft layers {self._shared_draft_layer_ids} "
+                f"share the target KV cache manager (sparse layers "
+                f"{self.sparse_layer_ids[0]}..{self.sparse_layer_ids[-1]})"
+            )
 
         index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
         if self.is_disagg and index_v_layer_ids:
@@ -305,10 +321,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if self.is_draft or not self._shared_draft_layer_ids:
             return None
         if self._draft_subpage_view_obj is None:
+            subpage_tokens = (
+                int(os.environ.get("TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK", 0) or 0)
+                or self.draft_manager_tokens_per_block
+            )
             self._draft_subpage_view_obj = MiniMaxM3DraftSubpageView(
                 self,
                 self._shared_draft_layer_ids,
-                self.draft_manager_tokens_per_block,
+                subpage_tokens,
             )
             logger.info(
                 f"[unified-kv] draft subpage view active: "
@@ -658,6 +678,18 @@ class MiniMaxM3DraftSubpageView:
         # geometry (slot count, per-layer scale, this layer's K base) comes
         # from the same API the dense-layer trtllm-gen adapter uses.
         gid = draft_layer_ids[0]
+        # The block-offset expansion below reads raw slot ids from pool 0
+        # and the pool pointer is rooted at this layer's K address; both
+        # rest on M3's single mega-slot pool holding every layer.
+        assert manager.num_pools == 1, (
+            f"draft sub-page view requires M3's single mega-slot pool, "
+            f"got num_pools={manager.num_pools}"
+        )
+        local = manager.layer_offsets[gid]
+        assert int(manager.kv_cache_pool_mapping[int(local), 0]) == 0, (
+            f"draft layer {gid} is not in pool 0: "
+            f"{manager.kv_cache_pool_mapping[int(local)].tolist()}"
+        )
         addr_key, _dt, num_slots, scale, _shape = manager._kv_slot_geometry(gid, None)
         self._slot_units = scale * self._subdiv  # slot stride in 32-tok units
         self.num_pools = 1
@@ -670,7 +702,6 @@ class MiniMaxM3DraftSubpageView:
             [[addr_key, 0]], dtype=torch.int64, pin_memory=prefer_pinned()
         )
         mapping = manager.kv_cache_pool_mapping.clone()
-        local = manager.layer_offsets[gid]
         mapping[int(local)] = torch.tensor([0, 0], dtype=mapping.dtype)
         self.kv_cache_pool_mapping = mapping
         # Placeholder host mirror: the dense TRTLLM path plans from device
