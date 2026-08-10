@@ -338,16 +338,31 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     communicator.Barrier()
 
     original_read_extent = rank_striped_read_ahead.RankStripedReadAheadSession._read_extent
+    original_run = rank_striped_read_ahead.RankStripedReadAheadSession._run
+    read_error_recorded = threading.Event()
     if rank == world_size - 1:
 
         def fail_read(_session, _extent):
             raise OSError("rank-local read failure")
 
+        def run_and_record_error(session):
+            original_run(session)
+            if session._read_error is not None:
+                read_error_recorded.set()
+
         rank_striped_read_ahead.RankStripedReadAheadSession._read_extent = fail_read
+        rank_striped_read_ahead.RankStripedReadAheadSession._run = run_and_record_error
     read_loader = _rank_striped_loader()
-    read_weights = read_loader.load_weights(checkpoint_dir, mapping=mapping)
-    read_status = read_loader.last_checkpoint_io_status
-    rank_striped_read_ahead.RankStripedReadAheadSession._read_extent = original_read_extent
+    try:
+        with read_loader.open_weight_session(checkpoint_dir, mapping=mapping) as read_weights:
+            local_error_recorded = rank != world_size - 1 or read_error_recorded.wait(timeout=5)
+            error_recorded = communicator.allgather(local_error_recorded)
+            if not all(error_recorded):
+                raise RuntimeError("Timed out waiting for the injected read failure.")
+        read_status = read_loader.last_checkpoint_io_status
+    finally:
+        rank_striped_read_ahead.RankStripedReadAheadSession._read_extent = original_read_extent
+        rank_striped_read_ahead.RankStripedReadAheadSession._run = original_run
     communicator.Barrier()
 
     return {
