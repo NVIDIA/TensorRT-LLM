@@ -388,9 +388,10 @@ def _swap_linear_to_fp8_weight_read(
     parent: nn.Module,
     attr: str,
     linear_types: Tuple[type, ...] = (nn.Linear,),
-) -> bool:
+) -> int:
     """Replace ``parent.<attr>`` with an FP8 weight-read module if it is a
-    plain linear of one of ``linear_types``; return whether it converted.
+    plain linear of one of ``linear_types``; return the number of modules
+    converted (0 or 1), so callers can accumulate a conversion count.
 
     Frees the original BF16 weight storage immediately: the loader holds a
     transient name->Parameter map that keeps it alive until load returns, so
@@ -399,10 +400,10 @@ def _swap_linear_to_fp8_weight_read(
     """
     child = getattr(parent, attr, None)
     if not isinstance(child, linear_types):
-        return False
+        return 0
     setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
     child.weight.data = child.weight.data.new_empty(0)
-    return True
+    return 1
 
 
 def _convert_moe_mlps_to_fp8_weight_read(
