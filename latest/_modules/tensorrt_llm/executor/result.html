@@ -418,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -761,6 +761,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -770,6 +771,7 @@ window.runMermaid = runMermaid;</script>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -1137,6 +1139,10 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># Cumulative (accepted, drafted) draft-token totals attached by the</span>
+        <span class="c1"># PyTorch executor (LlmResult.spec_dec_totals); backfills</span>
+        <span class="c1"># RequestPerfMetrics.speculative_decoding in _handle_sequence.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_totals</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># Average decoded tokens per runtime iteration; set when the first LLM response arrives.</span>
         <span class="c1"># None indicates not yet available (e.g., before first step/stream).</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1229,6 +1235,33 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">error</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the error message if this result completed with an error.&quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_error_msg</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_maybe_fill_spec_dec_perf_metrics</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">perf_metrics</span><span class="p">:</span> <span class="s2">&quot;tllm.RequestPerfMetrics&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.</span>
+
+<span class="sd">        The C++ runtime accumulates that section in</span>
+<span class="sd">        LlmRequest::updateNumTokensPerIteration, which the PyTorch flow</span>
+<span class="sd">        (TorchSampler) never calls, so the section arrives zeroed even when</span>
+<span class="sd">        drafting ran. The PyTorch executor instead attaches cumulative</span>
+<span class="sd">        (accepted, drafted) totals to the response (LlmResult.spec_dec_totals,</span>
+<span class="sd">        stashed on self in _handle_response); fill the section from them.</span>
+<span class="sd">        No-op when the section is already populated (TRT engine / TRTLLMSampler</span>
+<span class="sd">        paths) or when no drafting occurred.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_totals</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">spec_dec</span> <span class="o">=</span> <span class="n">perf_metrics</span><span class="o">.</span><span class="n">speculative_decoding</span>
+        <span class="k">if</span> <span class="n">spec_dec</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">spec_dec</span><span class="o">.</span><span class="n">total_draft_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">accepted</span><span class="p">,</span> <span class="n">drafted</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_totals</span>
+        <span class="k">if</span> <span class="n">drafted</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">spec_dec</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">SpeculativeDecodingMetrics</span><span class="p">()</span>
+        <span class="n">spec_dec</span><span class="o">.</span><span class="n">total_accepted_draft_tokens</span> <span class="o">=</span> <span class="n">accepted</span>
+        <span class="n">spec_dec</span><span class="o">.</span><span class="n">total_draft_tokens</span> <span class="o">=</span> <span class="n">drafted</span>
+        <span class="n">spec_dec</span><span class="o">.</span><span class="n">acceptance_rate</span> <span class="o">=</span> <span class="n">accepted</span> <span class="o">/</span> <span class="n">drafted</span>
+        <span class="n">perf_metrics</span><span class="o">.</span><span class="n">speculative_decoding</span> <span class="o">=</span> <span class="n">spec_dec</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_handle_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                          <span class="n">finish_reasons</span><span class="p">,</span>
@@ -1340,6 +1373,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">response_tensors</span><span class="o">.</span><span class="n">request_perf_metrics</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_fill_spec_dec_perf_metrics</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span><span class="p">)</span>
 
         <span class="c1"># Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.</span>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_tensors</span><span class="p">,</span> <span class="s1">&#39;time_breakdown_metrics&#39;</span>
@@ -1472,6 +1506,8 @@ window.runMermaid = runMermaid;</script>
                                            <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;per_pos_accepted&#39;</span><span class="p">,</span>
                                             <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_totals</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;spec_dec_totals&#39;</span><span class="p">,</span>
+                                           <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span>
             <span class="c1"># Expose gen-first ctx usage so the postprocessor</span>
             <span class="c1"># (_ctx_usage_from_outputs) can adopt the context-side accounting.</span>
@@ -2383,9 +2419,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

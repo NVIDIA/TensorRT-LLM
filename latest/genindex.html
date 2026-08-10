@@ -418,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -761,6 +761,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -770,6 +771,7 @@ window.runMermaid = runMermaid;</script>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -1220,6 +1222,62 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    --dataset-config-name
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-config-name">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-image-key
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-image-key">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-input-key
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-input-key">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-name
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-name">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-output-key
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-output-key">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-prompt
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-prompt">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-prompt-key
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-prompt-key">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --dataset-split
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-split">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
     --dataset_path
 
       <ul>
@@ -1304,6 +1362,15 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-covost2-dump_samples_path">trtllm-eval-covost2 command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --duration
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-duration">trtllm-bench-latency command line option</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-duration">trtllm-bench-throughput command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1418,6 +1485,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    --generation-config
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-generation-config">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --gpus_per_node
 
       <ul>
@@ -1462,6 +1536,34 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-image_data_format">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --input-max
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-input-max">trtllm-bench-prepare-dataset-token-unif-dist command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --input-mean
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-input-mean">trtllm-bench-prepare-dataset-token-norm-dist command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --input-min
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-input-min">trtllm-bench-prepare-dataset-token-unif-dist command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --input-stdev
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-input-stdev">trtllm-bench-prepare-dataset-token-norm-dist command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1513,6 +1615,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    --log-level
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-log-level">trtllm-bench-prepare-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
     --log_level
 
       <ul>
@@ -1552,6 +1661,20 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-log_samples">trtllm-eval-mmmu command line option</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu_pro-log_samples">trtllm-eval-mmmu_pro command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --lora-dir
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-lora-dir">trtllm-bench-prepare-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --max-input-len
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-max-input-len">trtllm-bench-prepare-dataset-real-dataset command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1805,6 +1928,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-model_path">trtllm-bench command line option</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --moe_cluster_parallel_size
 
@@ -1819,8 +1944,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-moe_expert_parallel_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --no-telemetry
 
@@ -1865,6 +1988,17 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-no_skip_tokenizer_init">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --num-requests
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-num-requests">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-num-requests">trtllm-bench-prepare-dataset-token-norm-dist command line option</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-num-requests">trtllm-bench-prepare-dataset-token-unif-dist command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1978,6 +2112,48 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-otlp_traces_endpoint">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-output">trtllm-bench-prepare-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output-len-dist
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-output-len-dist">trtllm-bench-prepare-dataset-real-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output-max
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-output-max">trtllm-bench-prepare-dataset-token-unif-dist command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output-mean
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-output-mean">trtllm-bench-prepare-dataset-token-norm-dist command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output-min
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-output-min">trtllm-bench-prepare-dataset-token-unif-dist command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --output-stdev
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-output-stdev">trtllm-bench-prepare-dataset-token-norm-dist command line option</a>
 </li>
       </ul></li>
       <li>
@@ -2124,6 +2300,20 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-longbench_v2-rag">trtllm-eval-longbench_v2 command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --rand-task-id
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-rand-task-id">trtllm-bench-prepare-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --random-seed
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-random-seed">trtllm-bench-prepare-dataset command line option</a>
 </li>
       </ul></li>
       <li>
@@ -2340,6 +2530,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    --stdout
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-stdout">trtllm-bench-prepare-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
     --streaming
 
       <ul>
@@ -2410,6 +2607,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-target_output_len">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --task-id
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-task-id">trtllm-bench-prepare-dataset command line option</a>
 </li>
       </ul></li>
       <li>
@@ -2572,6 +2776,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    --trust-remote-code
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-trust-remote-code">trtllm-bench-prepare-dataset command line option</a>
+</li>
+      </ul></li>
+      <li>
     --trust_remote_code
 
       <ul>
@@ -2690,6 +2901,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.__init__">(tensorrt_llm.llmapi.BatchingType method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.__init__">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.__init__">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.__init__">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -2738,6 +2951,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.__init__">(tensorrt_llm.llmapi.LoRARequest method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.__init__">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.__init__">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.__init__">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -2747,6 +2962,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.__init__">(tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.__init__">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.__init__">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.__init__">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
@@ -2791,6 +3008,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.__init__">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.__init__">(tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.__init__">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.__init__">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
@@ -2885,6 +3104,40 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.additional_model_outputs">additional_model_outputs (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.additional_snapshot_offsets_from_end">additional_snapshot_offsets_from_end (tensorrt_llm.llmapi.MambaStateConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.additional_snapshot_offsets_from_start">additional_snapshot_offsets_from_start (tensorrt_llm.llmapi.MambaStateConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.advanced_sampling_mode">advanced_sampling_mode (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.advanced_sampling_mode">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
+</li>
+      </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulingParams.agent_hierarchy">agent_hierarchy (tensorrt_llm.llmapi.SchedulingParams attribute)</a>
@@ -2899,6 +3152,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.algorithm">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.algorithm">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.algorithm">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
 </li>
       </ul></li>
       <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.alloc">alloc (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats attribute)</a>
@@ -3007,23 +3262,31 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType">BatchingType (class in tensorrt_llm.llmapi)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_search_diversity_rate">beam_search_diversity_rate (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_width_array">beam_width_array (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.begin_thinking_phase_token">begin_thinking_phase_token (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.best_of">best_of (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.beta">beta (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.bit_count">bit_count() (tensorrt_llm.llmapi.DisaggScheduleStyle method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.bit_length">bit_length() (tensorrt_llm.llmapi.DisaggScheduleStyle method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.block_reuse_policy">block_reuse_policy (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.block_reuse_config">block_reuse_config (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.block_size">block_size (tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig">BlockReuseConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.Config">BlockReuseConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.budget">budget (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms.build_custom_args_for_linear">build_custom_args_for_linear() (tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms method)</a>
 
@@ -3067,6 +3330,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.Config">CalibConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.calibration_path">calibration_path (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulerConfig.capacity_scheduler_policy">capacity_scheduler_policy (tensorrt_llm.llmapi.SchedulerConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CapacitySchedulerPolicy">CapacitySchedulerPolicy (class in tensorrt_llm.llmapi)</a>
@@ -3103,6 +3368,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.center">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.changes_physical_kv_length">changes_physical_kv_length (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.check_eagle_choices">check_eagle_choices() (tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 
       <ul>
@@ -3150,6 +3417,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.construct">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.construct">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.construct">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.construct">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -3180,6 +3449,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.construct">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.construct">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.construct">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.construct">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -3187,6 +3458,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.construct">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.construct">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.construct">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.construct">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -3211,6 +3484,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.construct">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.construct">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.construct">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.construct">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
@@ -3252,6 +3527,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.copy">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.copy">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.copy">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.copy">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -3282,6 +3559,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.copy">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.copy">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.copy">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.copy">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -3289,6 +3568,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.copy">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.copy">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.copy">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.copy">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -3313,6 +3594,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.copy">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.copy">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.copy">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.copy">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
@@ -3448,6 +3731,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.dict">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.dict">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.dict">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.dict">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -3478,6 +3763,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.dict">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.dict">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.dict">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.dict">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -3485,6 +3772,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.dict">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.dict">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.dict">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.dict">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -3510,6 +3799,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.dict">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.dict">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.dict">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
@@ -3524,6 +3815,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_mm_encoder">disable_mm_encoder (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler">disable_overlap_scheduler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.disable_periodic_mamba_snapshots_for_conversations">disable_periodic_mamba_snapshots_for_conversations() (tensorrt_llm.llmapi.KvCacheConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.disagg_request_id">disagg_request_id (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
 </li>
@@ -3695,6 +3988,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_early_first_token_response">enable_early_first_token_response (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_encoder_decoder_mixed_cuda_graph">enable_encoder_decoder_mixed_cuda_graph (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_energy_metrics">enable_energy_metrics (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph">enable_fullgraph (tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
@@ -3773,15 +4068,23 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.encode_only">encode_only (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig">EncodeCudaGraphConfig (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.Config">EncodeCudaGraphConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.encoder_cache_max_bytes">encoder_cache_max_bytes (tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.encoder_cuda_graph">encoder_cuda_graph (tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.encoder_cuda_graph_config">encoder_cuda_graph_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.encoder_max_batch_size">encoder_max_batch_size (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.encoder_max_num_tokens">encoder_max_num_tokens (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.encoder_side_stream_max_ahead">encoder_side_stream_max_ahead (tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.end_id">end_id (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
@@ -3808,6 +4111,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.event_buffer_max_size">event_buffer_max_size (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.eviction_mode">eviction_mode (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.exclude_input_from_output">exclude_input_from_output (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
@@ -3837,6 +4142,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.Config.extra">(tensorrt_llm.llmapi.AutoDecodingConfig.Config attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.Config.extra">(tensorrt_llm.llmapi.BlockReuseConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.Config.extra">(tensorrt_llm.llmapi.CacheTransceiverConfig.Config attribute)</a>
 </li>
@@ -3868,6 +4175,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.Config.extra">(tensorrt_llm.llmapi.LookaheadDecodingConfig.Config attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.Config.extra">(tensorrt_llm.llmapi.MambaStateConfig.Config attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.Config.extra">(tensorrt_llm.llmapi.MedusaDecodingConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.Config.extra">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.Config attribute)</a>
@@ -3875,6 +4184,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.Config.extra">(tensorrt_llm.llmapi.MoeConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.Config.extra">(tensorrt_llm.llmapi.MTPDecodingConfig.Config attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.Config.extra">(tensorrt_llm.llmapi.MultimodalConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.Config.extra">(tensorrt_llm.llmapi.NGramDecodingConfig.Config attribute)</a>
 </li>
@@ -3901,6 +4212,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.Config.extra">(tensorrt_llm.llmapi.TorchCompileConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.Config.extra">(tensorrt_llm.llmapi.TorchLlmArgs.Config attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.Config.extra">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.Config.extra">(tensorrt_llm.llmapi.UserProvidedDecodingConfig.Config attribute)</a>
 </li>
@@ -3985,6 +4298,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.FP8_BLOCK_SCALES">FP8_BLOCK_SCALES (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.fp8_context_mla_kv_len_cap">fp8_context_mla_kv_len_cap (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN">FP8_PER_CHANNEL_PER_TOKEN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig">FP8BMMQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
@@ -4018,6 +4333,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.from_orm">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.from_orm">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.from_orm">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.from_orm">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4048,6 +4365,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.from_orm">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.from_orm">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.from_orm">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.from_orm">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -4055,6 +4374,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.from_orm">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.from_orm">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.from_orm">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.from_orm">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -4079,6 +4400,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.from_orm">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.from_orm">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.from_orm">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.from_orm">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
@@ -4189,6 +4512,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.generate_async">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.generation_config">generation_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.GENERATION_FIRST">GENERATION_FIRST (tensorrt_llm.llmapi.DisaggScheduleStyle attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CompletionOutput.generation_logits">generation_logits (tensorrt_llm.llmapi.CompletionOutput attribute)</a>
@@ -4501,6 +4826,12 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.index_n_heads">(tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.index_share_for_mtp_iteration">index_share_for_mtp_iteration (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.index_share_for_mtp_iteration">(tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig attribute)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.index_topk">index_topk (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 
       <ul>
@@ -4750,6 +5081,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.json">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.json">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.json">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.json">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -4780,6 +5113,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.json">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.json">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.json">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -4787,6 +5122,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.json">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.json">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.json">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.json">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -4811,6 +5148,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.json">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.json">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.json">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
@@ -5067,6 +5406,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.mamba_state_cache_interval">mamba_state_cache_interval (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.mamba_state_config">mamba_state_config (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig">MambaStateConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.Config">MambaStateConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.markov_head_type">markov_head_type (tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.markov_rank">markov_rank (tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
@@ -5215,6 +5560,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.max_num_tokens">(tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.max_num_turns">max_num_turns (tensorrt_llm.llmapi.BlockReuseConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.max_seq_len">max_seq_len (tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 
       <ul>
@@ -5295,6 +5642,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.metrics">metrics (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.migrate_legacy_mamba_interval">migrate_legacy_mamba_interval() (tensorrt_llm.llmapi.KvCacheConfig method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.min_p">min_p (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.min_tokens">min_tokens (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -5361,6 +5710,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_computed_fields">(tensorrt_llm.llmapi.BlockReuseConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_computed_fields">(tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_computed_fields">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
@@ -5391,6 +5742,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_computed_fields">(tensorrt_llm.llmapi.MambaStateConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_computed_fields">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
@@ -5398,6 +5751,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_computed_fields">(tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_computed_fields">(tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
@@ -5423,6 +5778,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_computed_fields">(tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_computed_fields">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
@@ -5430,6 +5787,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_config">(tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_config">(tensorrt_llm.llmapi.BlockReuseConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_config">(tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
@@ -5461,6 +5820,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_config">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_config">(tensorrt_llm.llmapi.MambaStateConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_config">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_config">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
@@ -5468,6 +5829,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_config">(tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_config">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_config">(tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_config">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
@@ -5493,6 +5856,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_config">(tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_config">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_config">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
@@ -5500,6 +5865,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_construct">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_construct">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_construct">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -5531,6 +5898,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_construct">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_construct">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_construct">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_construct">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -5538,6 +5907,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_construct">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_construct">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_construct">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_construct">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -5563,6 +5934,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_construct">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_construct">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_construct">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -5570,6 +5943,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_copy">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_copy">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_copy">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
@@ -5601,6 +5976,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_copy">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_copy">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_copy">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_copy">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -5608,6 +5985,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_copy">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_copy">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_copy">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_copy">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -5633,6 +6012,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_copy">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_copy">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_copy">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
@@ -5640,6 +6021,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_dump">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_dump">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_dump">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
@@ -5671,6 +6054,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_dump">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_dump">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_dump">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_dump">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -5678,6 +6063,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_dump">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_dump">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_dump">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_dump">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -5703,6 +6090,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_dump">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_dump">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
@@ -5710,6 +6099,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_dump_json">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_dump_json">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
@@ -5741,6 +6132,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_dump_json">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_dump_json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -5748,6 +6141,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_dump_json">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_dump_json">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -5773,6 +6168,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_dump_json">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_dump_json">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
@@ -5780,6 +6177,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_extra">(tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_extra">(tensorrt_llm.llmapi.BlockReuseConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_extra">(tensorrt_llm.llmapi.CacheTransceiverConfig property)</a>
 </li>
@@ -5811,6 +6210,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_extra">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_extra">(tensorrt_llm.llmapi.MambaStateConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_extra">(tensorrt_llm.llmapi.MedusaDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_extra">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig property)</a>
@@ -5818,6 +6219,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_extra">(tensorrt_llm.llmapi.MoeConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_extra">(tensorrt_llm.llmapi.MTPDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_extra">(tensorrt_llm.llmapi.MultimodalConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_extra">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
 </li>
@@ -5843,6 +6246,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_extra">(tensorrt_llm.llmapi.TorchCompileConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_extra">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_extra">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
@@ -5852,6 +6257,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_fields">(tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_fields">(tensorrt_llm.llmapi.BlockReuseConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_fields">(tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
@@ -5883,6 +6290,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_fields">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_fields">(tensorrt_llm.llmapi.MambaStateConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_fields">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_fields">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
@@ -5890,6 +6299,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_fields">(tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_fields">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_fields">(tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_fields">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
@@ -5915,6 +6326,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_fields">(tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_fields">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_fields">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
@@ -5922,6 +6335,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_fields_set">(tensorrt_llm.llmapi.BlockReuseConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_fields_set">(tensorrt_llm.llmapi.CacheTransceiverConfig property)</a>
 </li>
@@ -5953,6 +6368,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_fields_set">(tensorrt_llm.llmapi.MambaStateConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.MedusaDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_fields_set">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig property)</a>
@@ -5960,6 +6377,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_fields_set">(tensorrt_llm.llmapi.MoeConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.MTPDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_fields_set">(tensorrt_llm.llmapi.MultimodalConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
 </li>
@@ -5985,6 +6404,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_fields_set">(tensorrt_llm.llmapi.TorchCompileConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_fields_set">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
@@ -5992,6 +6413,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_json_schema">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_json_schema">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6023,6 +6446,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_json_schema">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_json_schema">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6030,6 +6455,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_json_schema">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_json_schema">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6055,6 +6482,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_json_schema">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_json_schema">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -6064,6 +6493,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_parametrized_name">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_parametrized_name">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6095,6 +6526,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_parametrized_name">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_parametrized_name">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6102,6 +6535,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_parametrized_name">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_parametrized_name">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6127,13 +6562,19 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_parametrized_name">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_parametrized_name">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_path">model_path (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_post_init">model_post_init() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_post_init">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_post_init">(tensorrt_llm.llmapi.BlockReuseConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_post_init">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
@@ -6165,6 +6606,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_post_init">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_post_init">(tensorrt_llm.llmapi.MambaStateConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_post_init">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_post_init">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
@@ -6172,6 +6615,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_post_init">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_post_init">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_post_init">(tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_post_init">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
@@ -6197,6 +6642,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_post_init">(tensorrt_llm.llmapi.TorchCompileConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_post_init">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_post_init">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
@@ -6204,6 +6651,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_rebuild">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_rebuild">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6235,6 +6684,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_rebuild">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_rebuild">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6242,6 +6693,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_rebuild">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_rebuild">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6267,6 +6720,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_rebuild">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_rebuild">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -6274,6 +6729,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_validate">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_validate">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6305,6 +6762,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_validate">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_validate">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_validate">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_validate">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6312,6 +6771,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_validate">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_validate">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_validate">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_validate">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6337,6 +6798,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_validate">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_validate">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_validate">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -6344,6 +6807,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_validate_json">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_validate_json">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6375,6 +6840,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_validate_json">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_validate_json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6382,6 +6849,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_validate_json">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_validate_json">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6407,6 +6876,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_validate_json">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_validate_json">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -6414,6 +6885,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.model_validate_strings">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_validate_strings">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6445,6 +6918,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.model_validate_strings">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_validate_strings">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6452,6 +6927,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_validate_strings">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.model_validate_strings">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6476,6 +6953,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.model_validate_strings">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.model_validate_strings">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.model_validate_strings">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
@@ -6531,6 +7010,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.multimodal_hashes">multimodal_hashes (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig">MultimodalConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.Config">MultimodalConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder">MultimodalEncoder (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_gemm.MultiStreamGemm">MultiStreamGemm (class in tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_gemm)</a>
@@ -6574,6 +7057,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.normalize_max_stats_len">normalize_max_stats_len() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.normalize_optional_fields_to_defaults">normalize_optional_fields_to_defaults() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.normalize_scores">normalize_scores (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.num_attention_heads">num_attention_heads (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
 </li>
@@ -6693,10 +7178,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.Config">PARDDecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.parse_encoder_cache_max_bytes">parse_encoder_cache_max_bytes() (tensorrt_llm.llmapi.MultimodalConfig class method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.parse_file">parse_file() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_file">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.parse_file">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.parse_file">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6728,6 +7217,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.parse_file">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.parse_file">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.parse_file">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.parse_file">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6735,6 +7226,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.parse_file">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.parse_file">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.parse_file">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.parse_file">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6760,6 +7253,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.parse_file">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.parse_file">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.parse_file">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -6767,6 +7262,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_obj">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.parse_obj">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.parse_obj">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6798,6 +7295,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.parse_obj">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.parse_obj">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.parse_obj">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.parse_obj">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6805,6 +7304,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.parse_obj">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.parse_obj">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.parse_obj">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.parse_obj">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6830,6 +7331,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.parse_obj">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.parse_obj">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.parse_obj">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -6837,6 +7340,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_raw">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.parse_raw">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.parse_raw">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -6868,6 +7373,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.parse_raw">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.parse_raw">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.parse_raw">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.parse_raw">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -6875,6 +7382,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.parse_raw">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.parse_raw">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.parse_raw">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.parse_raw">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -6899,6 +7408,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.parse_raw">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.parse_raw">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.parse_raw">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.parse_raw">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
@@ -6925,9 +7436,15 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.perf_metrics_max_requests">perf_metrics_max_requests (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.perf_metrics_output_dir">perf_metrics_output_dir (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.periodic_snapshot_interval">periodic_snapshot_interval (tensorrt_llm.llmapi.MambaStateConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.pipeline_parallel_size">pipeline_parallel_size (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.PipelineCache">PipelineCache (class in tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.policy">policy (tensorrt_llm.llmapi.BlockReuseConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ReorderRequestPolicyConfig.policy_args">policy_args (tensorrt_llm.llmapi.ReorderRequestPolicyConfig attribute)</a>
 </li>
@@ -7358,6 +7875,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.schema">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.schema">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.schema">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.schema">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -7388,6 +7907,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.schema">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.schema">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.schema">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.schema">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -7395,6 +7916,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.schema">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.schema">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.schema">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.schema">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -7420,6 +7943,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.schema">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.schema">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.schema">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
@@ -7427,6 +7952,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.schema_json">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.schema_json">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.schema_json">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
@@ -7458,6 +7985,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.schema_json">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.schema_json">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.schema_json">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.schema_json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -7465,6 +7994,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.schema_json">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.schema_json">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.schema_json">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.schema_json">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -7489,6 +8020,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.schema_json">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.schema_json">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.schema_json">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.schema_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
@@ -7529,10 +8062,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.setup_async">setup_async() (tensorrt_llm.llmapi.AsyncLLM method)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.setup_async">setup_async() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+</li>
       <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding.Sharding">Sharding (class in tensorrt_llm._torch.auto_deploy.transform.library.sharding)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.SHARDING">SHARDING (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
@@ -7773,6 +8306,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.supports_backend">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.supports_block_reuse">supports_block_reuse() (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.supports_speculative_decoding">supports_speculative_decoding() (tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.swapcase">swapcase() (tensorrt_llm.llmapi.BatchingType method)</a>
 
       <ul>
@@ -8886,7 +9423,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13AttentionType4kMLAE">tensorrt_llm::executor::kv_cache::CacheState::AttentionType::kMLA (C++ enumerator)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32b">tensorrt_llm::executor::kv_cache::CacheState::CacheState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE11ModelConfigRKN7runtime11WorldConfigERKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibbb10SizeType3210SizeType32b">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateENSt6vectorI10SizeType32EE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32b">[2]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32bRKNSt6vectorI10SizeType32EE">tensorrt_llm::executor::kv_cache::CacheState::CacheState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE11ModelConfigRKN7runtime11WorldConfigERKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibbb10SizeType3210SizeType32bRKNSt6vectorI10SizeType32EE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateENSt6vectorI10SizeType32EE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32bRKNSt6vectorI10SizeType32EE">[2]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState18getAttentionConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getAttentionConfig (C++ function)</a>
 </li>
@@ -8905,6 +9442,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState30getIndexerKCacheQuantBlockSizeEv">tensorrt_llm::executor::kv_cache::CacheState::getIndexerKCacheQuantBlockSize (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState22getIndexerKCacheUseFp4Ev">tensorrt_llm::executor::kv_cache::CacheState::getIndexerKCacheUseFp4 (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState23getIndexerLayerNumPerPPEv">tensorrt_llm::executor::kv_cache::CacheState::getIndexerLayerNumPerPP (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState14getModelConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getModelConfig (C++ function)</a>
 </li>
@@ -8933,6 +9472,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState28mIndexerKCacheQuantBlockSizeE">tensorrt_llm::executor::kv_cache::CacheState::mIndexerKCacheQuantBlockSize (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState20mIndexerKCacheUseFp4E">tensorrt_llm::executor::kv_cache::CacheState::mIndexerKCacheUseFp4 (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState21mIndexerLayerNumPerPPE">tensorrt_llm::executor::kv_cache::CacheState::mIndexerLayerNumPerPP (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState12mModelConfigE">tensorrt_llm::executor::kv_cache::CacheState::mModelConfig (C++ member)</a>
 </li>
@@ -9191,6 +9732,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache8MpiStateeqERK8MpiState">tensorrt_llm::executor::kv_cache::MpiState::operator== (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache8MpiState8toStringEv">tensorrt_llm::executor::kv_cache::MpiState::toString (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache31promoteHostLibraryToGlobalScopeEv">tensorrt_llm::executor::kv_cache::promoteHostLibraryToGlobalScope (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache13RegisterDescsE">tensorrt_llm::executor::kv_cache::RegisterDescs (C++ type)</a>
 </li>
@@ -11218,8 +11761,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInputE">tensorrt_llm::runtime::DecodingInput (C++ class)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput12badWordsLensE">tensorrt_llm::runtime::DecodingInput::badWordsLens (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput13badWordsListsE">tensorrt_llm::runtime::DecodingInput::badWordsLists (C++ member)</a>
@@ -11256,6 +11797,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput11EagleInputs13nextDraftLensE">tensorrt_llm::runtime::DecodingInput::EagleInputs::nextDraftLens (C++ member)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput11EagleInputs14nextDraftPathsE">tensorrt_llm::runtime::DecodingInput::EagleInputs::nextDraftPaths (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput11EagleInputs15nextDraftTokensE">tensorrt_llm::runtime::DecodingInput::EagleInputs::nextDraftTokens (C++ member)</a>
@@ -13590,6 +14133,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.translate">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig">TriAttentionKvCacheCompressionConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.Config">TriAttentionKvCacheCompressionConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
       <li>
     trtllm-bench command line option
 
@@ -13629,6 +14176,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-dataset">--dataset</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-duration">--duration</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-engine_dir">--engine_dir</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-ep">--ep</a>
@@ -13661,6 +14210,84 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    trtllm-bench-prepare-dataset command line option
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-log-level">--log-level</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-lora-dir">--lora-dir</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-output">--output</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-rand-task-id">--rand-task-id</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-random-seed">--random-seed</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-stdout">--stdout</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-task-id">--task-id</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-trust-remote-code">--trust-remote-code</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-bench-prepare-dataset-real-dataset command line option
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-config-name">--dataset-config-name</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-image-key">--dataset-image-key</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-input-key">--dataset-input-key</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-name">--dataset-name</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-output-key">--dataset-output-key</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-prompt">--dataset-prompt</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-prompt-key">--dataset-prompt-key</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-dataset-split">--dataset-split</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-max-input-len">--max-input-len</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-num-requests">--num-requests</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-real-dataset-output-len-dist">--output-len-dist</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-bench-prepare-dataset-token-norm-dist command line option
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-input-mean">--input-mean</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-input-stdev">--input-stdev</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-num-requests">--num-requests</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-output-mean">--output-mean</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-norm-dist-output-stdev">--output-stdev</a>
+</li>
+      </ul></li>
+      <li>
+    trtllm-bench-prepare-dataset-token-unif-dist command line option
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-input-max">--input-max</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-input-min">--input-min</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-num-requests">--num-requests</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-output-max">--output-max</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-prepare-dataset-token-unif-dist-output-min">--output-min</a>
+</li>
+      </ul></li>
+      <li>
     trtllm-bench-throughput command line option
 
       <ul>
@@ -13683,6 +14310,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-dataset">--dataset</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-enable_chunked_context">--disable_chunked_context</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-duration">--duration</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-enable_chunked_context">--enable_chunked_context</a>
 </li>
@@ -14656,6 +15285,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">--free_gpu_memory_fraction</a>
 </li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-generation-config">--generation-config</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">--gpus_per_node</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-grpc">--grpc</a>
@@ -14750,6 +15381,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.update_forward_refs">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.update_forward_refs">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.update_forward_refs">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -14780,6 +15413,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.update_forward_refs">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.update_forward_refs">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -14787,6 +15422,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.update_forward_refs">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.update_forward_refs">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -14812,11 +15449,15 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.update_forward_refs">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.update_forward_refs">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.update_weights">update_weights() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.upper">upper() (tensorrt_llm.llmapi.BatchingType method)</a>
 
       <ul>
@@ -14827,8 +15468,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.upper">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.use_beam_search">use_beam_search (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_cute_dsl_bf16_bmm">use_cute_dsl_bf16_bmm (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -14918,6 +15557,8 @@ window.runMermaid = runMermaid;</script>
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.validate">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BlockReuseConfig.validate">(tensorrt_llm.llmapi.BlockReuseConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.validate">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.validate">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -14948,6 +15589,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MambaStateConfig.validate">(tensorrt_llm.llmapi.MambaStateConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.validate">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.validate">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
@@ -14955,6 +15598,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.validate">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.validate">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.validate">(tensorrt_llm.llmapi.MultimodalConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.validate">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
@@ -14979,6 +15624,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.validate">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.validate">(tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig.validate">(tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.validate">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
@@ -15036,11 +15683,7 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_draft_target_config">validate_draft_target_config() (tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_dtype">validate_dtype() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
-
-      <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_dtype">(tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 </li>
-      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_eagle_choices">validate_eagle_choices() (tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 
       <ul>
@@ -15060,8 +15703,14 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encode_only_torch_compile_config">validate_encode_only_torch_compile_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.validate_encoder_cuda_graph_config">validate_encoder_cuda_graph_config() (tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_cuda_graph_config">(tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_modes">validate_encoder_modes() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.validate_encoder_optimization_compatibility">validate_encoder_optimization_compatibility() (tensorrt_llm.llmapi.MultimodalConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_runtime_sizes">validate_encoder_runtime_sizes() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 </li>
@@ -15082,6 +15731,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer">validate_load_balancer() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_lora_config_consistency">validate_lora_config_consistency() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_mamba_snapshot_offsets">validate_mamba_snapshot_offsets() (tensorrt_llm.llmapi.KvCacheConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_attention_window">validate_max_attention_window() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
 </li>
@@ -15176,6 +15827,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.validate_target_sparsity">validate_target_sparsity() (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalConfig.video_pruning_rate">video_pruning_rate (tensorrt_llm.llmapi.MultimodalConfig attribute)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.VISUALIZE">VISUALIZE (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
 </li>
@@ -15378,9 +16031,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

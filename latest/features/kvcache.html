@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -654,10 +656,55 @@ credit:</p>
 </pre></div>
 </div>
 </section>
+<section id="mamba-snapshot-boundaries">
+<h3>Mamba Snapshot Boundaries<a class="headerlink" href="#mamba-snapshot-boundaries" title="Link to this heading">#</a></h3>
+<p>Hybrid Mamba models must retain the recurrent Mamba state together with the
+attention KV prefix. Snapshot policy is grouped under
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_config</span></code>. <code class="docutils literal notranslate"><span class="pre">periodic_snapshot_interval</span></code> controls
+periodic boundaries. They are disabled by default; set the interval to a
+positive value to enable them. The deprecated
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.mamba_state_cache_interval</span></code> alias remains accepted for
+compatibility and is copied to the nested field during validation. New code and
+configuration files should use the nested field. The prototype
+<code class="docutils literal notranslate"><span class="pre">additional_snapshot_offsets_from_start</span></code> and
+<code class="docutils literal notranslate"><span class="pre">additional_snapshot_offsets_from_end</span></code> options add fixed boundaries. Start
+offsets count tokens from the beginning of the prompt. End offsets count
+backward from the prompt end, and an end offset of <code class="docutils literal notranslate"><span class="pre">0</span></code> selects the final
+prompt boundary. The <code class="docutils literal notranslate"><span class="pre">per_conversation</span></code> block reuse policy disables periodic
+Mamba snapshots, so configure one or more explicit stable boundaries (usually
+an end offset of <code class="docutils literal notranslate"><span class="pre">0</span></code>) when using it with a hybrid Mamba model. For example:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">avg_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+<span class="w">  </span><span class="nt">block_reuse_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">policy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">per_conversation</span>
+<span class="w">    </span><span class="nt">max_num_turns</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">  </span><span class="nt">mamba_state_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">periodic_snapshot_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0</span>
+<span class="w">    </span><span class="nt">additional_snapshot_offsets_from_start</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">128</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">additional_snapshot_offsets_from_end</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">32</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>This retains snapshots after the first 128 tokens, at the end of the prompt,
+and before the final 32 prompt tokens. Positions outside a particular prompt
+are ignored. Set <code class="docutils literal notranslate"><span class="pre">avg_seq_len</span></code> to the workload’s average total sequence length
+so V2 can size the attention KV and Mamba state pools in the right proportion.
+If neither <code class="docutils literal notranslate"><span class="pre">avg_seq_len</span></code> nor an explicit <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> is configured, hybrid
+Mamba models warn and fall back to half of <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, which can produce a
+suboptimal pool split. Exact explicit boundaries currently require
+<code class="docutils literal notranslate"><span class="pre">MambaHybridCacheManagerV2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_beam_width=1</span></code>, and no KV connector. Hybrid
+Mamba models select V2 by default when
+<code class="docutils literal notranslate"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">auto</span></code>; set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> to select the V1 C++
+compatibility manager. In disaggregated serving, V2 Mamba requires the Python
+NIXL transceiver (<code class="docutils literal notranslate"><span class="pre">transceiver_runtime:</span> <span class="pre">PYTHON</span></code>); V1 routes support periodic
+snapshots only.</p>
+</section>
 <section id="kv-cache-salting-for-secure-reuse">
 <h3>KV Cache Salting for Secure Reuse<a class="headerlink" href="#kv-cache-salting-for-secure-reuse" title="Link to this heading">#</a></h3>
 <p>KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a <code class="docutils literal notranslate"><span class="pre">cache_salt</span></code> parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users’ requests.</p>
 <p>To use cache salting, specify the <code class="docutils literal notranslate"><span class="pre">cache_salt</span></code> parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.</p>
+<p>This isolation is enforced entirely by the block-key hash: the salt is mixed into the hashed input and prefix matching is decided by digest equality alone (blocks are not re-compared token-by-token). The block-key hash is therefore required to be a cryptographic hash with strong collision resistance and a 256-bit digest (SHA-256 provides ~128-bit collision resistance, which is ample here); substituting a non-cryptographic hash would allow crafted collisions to bypass salt isolation and must not be done.</p>
 </section>
 <section id="multimodal-uuid-support-for-cache-identification">
 <h3>Multimodal UUID Support for Cache Identification<a class="headerlink" href="#multimodal-uuid-support-for-cache-identification" title="Link to this heading">#</a></h3>
@@ -774,6 +821,7 @@ dropped before reaching the executor.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#datatype">Datatype</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-much-memory-is-allocated-to-kv-cache">How Much Memory is Allocated to KV Cache</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-disable-cross-request-reuse">Enable/Disable Cross Request Reuse</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mamba-snapshot-boundaries">Mamba Snapshot Boundaries</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-salting-for-secure-reuse">KV Cache Salting for Secure Reuse</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-uuid-support-for-cache-identification">Multimodal UUID Support for Cache Identification</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-offloading-to-host-memory">Enable Offloading to Host Memory</a></li>
@@ -873,9 +921,9 @@ dropped before reaching the executor.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

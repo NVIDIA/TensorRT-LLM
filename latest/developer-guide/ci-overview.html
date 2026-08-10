@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -591,7 +593,23 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="continuous-integration-overview">
+  <!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<section id="continuous-integration-overview">
 <h1>Continuous Integration Overview<a class="headerlink" href="#continuous-integration-overview" title="Link to this heading">#</a></h1>
 <p>This page explains how TensorRT‑LLM’s CI is organized and how individual tests map to Jenkins stages. Most stages execute integration tests defined in YAML files, while unit tests run as part of a merge‑request pipeline. The sections below describe how to locate a test and trigger the stage that runs it.</p>
 <section id="table-of-contents">
@@ -603,6 +621,7 @@
 <li><p><a class="reference internal" href="#jenkins-stage-names"><span class="xref myst">Jenkins stage names</span></a></p></li>
 <li><p><a class="reference internal" href="#finding-the-stage-for-a-test"><span class="xref myst">Finding the stage for a test</span></a></p></li>
 <li><p><a class="reference internal" href="#waiving-tests"><span class="xref myst">Waiving tests</span></a></p></li>
+<li><p><a class="reference internal" href="#multi-gpu-tests"><span class="xref myst">Multi-GPU Tests</span></a></p></li>
 <li><p><a class="reference internal" href="#triggering-ci-best-practices"><span class="xref myst">Triggering CI Best Practices</span></a></p></li>
 </ol>
 </section>
@@ -616,7 +635,7 @@
 <p>Integration tests are listed under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code>. Most YAML files are named after the GPU or configuration they run on (for example <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code>). Some files, like <code class="docutils literal notranslate"><span class="pre">l0_sanity_check.yml</span></code>, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">stage</span></code>: either <code class="docutils literal notranslate"><span class="pre">pre_merge</span></code> or <code class="docutils literal notranslate"><span class="pre">post_merge</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: <code class="docutils literal notranslate"><span class="pre">pytorch</span></code>, <code class="docutils literal notranslate"><span class="pre">tensorrt</span></code> or <code class="docutils literal notranslate"><span class="pre">triton</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: for example <code class="docutils literal notranslate"><span class="pre">pytorch</span></code>, <code class="docutils literal notranslate"><span class="pre">autodeploy</span></code>, <code class="docutils literal notranslate"><span class="pre">cpp</span></code> or <code class="docutils literal notranslate"><span class="pre">fmha</span></code>. Grep the YAML files for <code class="docutils literal notranslate"><span class="pre">backend:</span></code> to see the values currently in use.</p></li>
 </ul>
 <p>Example from <code class="docutils literal notranslate"><span class="pre">l0_a30.yml</span></code>:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="w">      </span><span class="nt">terms</span><span class="p">:</span>
@@ -634,17 +653,18 @@
 <section id="jenkins-stage-names">
 <h2>Jenkins stage names<a class="headerlink" href="#jenkins-stage-names" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> maps stage names to these YAML files.  For A100 the mapping includes:</p>
-<div class="highlight-groovy notranslate"><div class="highlight"><pre><span></span><span class="w">    </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-1&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
-<span class="w">    </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-2&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
+<div class="highlight-groovy notranslate"><div class="highlight"><pre><span></span><span class="w">    </span><span class="s2">&quot;A100X-PyTorch-1&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">],</span>
+<span class="w">    </span><span class="s2">&quot;A100X-PyTorch-Post-Merge-1&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">],</span>
 </pre></div>
 </div>
 <p>The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> from that YAML file are selected when a <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> stage runs.</p>
+<p>Stage names are unbracketed, with <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> embedded directly in the name. Copy the name exactly as it appears in the Groovy map. Jenkins <code class="docutils literal notranslate"><span class="pre">stage_list</span></code> matches names without a <code class="docutils literal notranslate"><span class="pre">*</span></code> wildcard exactly, so a stale spelling such as <code class="docutils literal notranslate"><span class="pre">A100X-Triton-[Post-Merge]-1</span></code> silently selects nothing. The mapping script’s <code class="docutils literal notranslate"><span class="pre">--stages</span></code> option is stricter: it reports unknown names and near-match suggestions on stderr.</p>
 </section>
 <section id="finding-the-stage-for-a-test">
 <h2>Finding the stage for a test<a class="headerlink" href="#finding-the-stage-for-a-test" title="Link to this heading">#</a></h2>
 <ol class="arabic simple">
 <li><p>Locate the test in the appropriate YAML file under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code> and note its <code class="docutils literal notranslate"><span class="pre">stage</span></code> and <code class="docutils literal notranslate"><span class="pre">backend</span></code> values.</p></li>
-<li><p>Search <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> for a stage whose YAML file matches (for example <code class="docutils literal notranslate"><span class="pre">l0_a100</span></code>) and whose name contains <code class="docutils literal notranslate"><span class="pre">[Post-Merge]</span></code> if the YAML entry uses <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code>.</p></li>
+<li><p>Search <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> for a stage whose YAML file matches (for example <code class="docutils literal notranslate"><span class="pre">l0_a100</span></code>) and whose name contains <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> if the YAML entry uses <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code>.</p></li>
 <li><p>The resulting stage name(s) are what you pass to Jenkins via the <code class="docutils literal notranslate"><span class="pre">stage_list</span></code> parameter when triggering a job.</p></li>
 </ol>
 <section id="using-test-to-stage-mapping-py">
@@ -653,7 +673,7 @@
 <code class="docutils literal notranslate"><span class="pre">scripts/test_to_stage_mapping.py</span></code> automates the lookup:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span><span class="s2">&quot;unittest/_torch/sampler/test_beam_search.py&quot;</span>
 python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span>test_beam_search
-python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--stages<span class="w"> </span>A100X-Triton-Post-Merge-1
+python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--stages<span class="w"> </span>A100X-PyTorch-Post-Merge-1
 python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--test-list<span class="w"> </span>my_tests.txt
 python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--test-list<span class="w"> </span>my_tests.yml
 </pre></div>
@@ -666,7 +686,7 @@ not interpret the <code class="docutils literal notranslate"><span class="pre">[
 tests in a newline‑separated text file or a YAML list and supply it with
 <code class="docutils literal notranslate"><span class="pre">--test-list</span></code>.</p>
 <p>To run the same tests on your pull request, comment:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-1,A100X-Triton-[Post-Merge]-2&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;A100X-PyTorch-Post-Merge-1&quot;</span>
 </pre></div>
 </div>
 <p>This executes the same tests that run post-merge for this hardware/backend.</p>
@@ -687,6 +707,26 @@ full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 </div>
 <p>Changes to <code class="docutils literal notranslate"><span class="pre">waives.txt</span></code> should include a bug link or brief explanation so other
 developers understand why the test is disabled.</p>
+</section>
+<section id="multi-gpu-tests">
+<h2>Multi-GPU Tests<a class="headerlink" href="#multi-gpu-tests" title="Link to this heading">#</a></h2>
+<p>Running multi-GPU tests (<code class="docutils literal notranslate"><span class="pre">--add-multi-gpu-test</span></code>, <code class="docutils literal notranslate"><span class="pre">--only-multi-gpu-test</span></code>) requires the
+<code class="docutils literal notranslate"><span class="pre">ci:</span> <span class="pre">full</span> <span class="pre">pre-merge</span> <span class="pre">approved</span></code> label on the PR. Without this label the
+<code class="docutils literal notranslate"><span class="pre">[Test-x86_64-Multi-GPU]</span> <span class="pre">Remote</span> <span class="pre">Run</span></code> and <code class="docutils literal notranslate"><span class="pre">[Test-SBSA-Multi-GPU]</span> <span class="pre">Remote</span> <span class="pre">Run</span></code> stages will
+fail with an explanatory error.</p>
+<p>To obtain the label, ask a member of <code class="docutils literal notranslate"><span class="pre">NVIDIA/trt-llm-ci-approvers</span></code> to apply it. Only
+members of that team can add the label; unauthorized additions are automatically removed
+by the <code class="docutils literal notranslate"><span class="pre">Guard</span> <span class="pre">Full</span> <span class="pre">Pre-Merge</span> <span class="pre">Approval</span> <span class="pre">Label</span></code> GitHub Actions workflow.</p>
+<p>Once the label is present, re-trigger CI with the same command you used
+originally. For example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Run the normal pipeline plus multi-GPU stages</span>
+/bot<span class="w"> </span>run<span class="w"> </span>--add-multi-gpu-test
+
+<span class="c1"># Run only multi-GPU stages</span>
+/bot<span class="w"> </span>run<span class="w"> </span>--only-multi-gpu-test
+</pre></div>
+</div>
+<p>Post-merge pipelines and GitLab MR builds are exempt from this label check.</p>
 </section>
 <section id="triggering-ci-best-practices">
 <h2>Triggering CI Best Practices<a class="headerlink" href="#triggering-ci-best-practices" title="Link to this heading">#</a></h2>
@@ -711,11 +751,13 @@ default pre-merge set:</p>
 </pre></div>
 </div>
 <p>Both options accept stage names and wildcard patterns defined in
-<code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. The <code class="docutils literal notranslate"><span class="pre">&quot;*&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;*Post-Merge*&quot;</span></code>, and <code class="docutils literal notranslate"><span class="pre">&quot;*PerfSanity*&quot;</span></code>
-selectors require the same approval label, including when they appear in a
-comma-separated list. Equivalent escaped or repeated-star forms are treated the
-same. Other stage selectors, including explicit stage names and other limited
-wildcard patterns, retain their existing behavior.</p>
+<code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. Explicit Post-merge stage test doesn’t need
+<code class="docutils literal notranslate"><span class="pre">ci:</span> <span class="pre">post-merge</span> <span class="pre">approved</span></code> PR label to run. However, the <code class="docutils literal notranslate"><span class="pre">&quot;*&quot;</span></code>,
+<code class="docutils literal notranslate"><span class="pre">&quot;*Post-Merge*&quot;</span></code>, and <code class="docutils literal notranslate"><span class="pre">&quot;*PerfSanity*&quot;</span></code> selectors require the same approval
+label, including when they appear in a comma-separated list. Equivalent escaped
+or repeated-star forms are treated the same. Other stage selectors, including
+explicit stage names and other limited wildcard patterns, retain their existing
+behavior.</p>
 <p>Being selective keeps CI turnaround fast and conserves hardware resources.</p>
 </section>
 <section id="avoiding-unnecessary-disable-fail-fast-usage">
@@ -784,6 +826,7 @@ wildcard patterns, retain their existing behavior.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#waiving-tests">Waiving tests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-tests">Multi-GPU Tests</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#triggering-ci-best-practices">Triggering CI Best Practices</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#triggering-post-merge-tests">Triggering Post-merge tests</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#avoiding-unnecessary-disable-fail-fast-usage">Avoiding unnecessary <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> usage</a></li>
@@ -880,9 +923,9 @@ wildcard patterns, retain their existing behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

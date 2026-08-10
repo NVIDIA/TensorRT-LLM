@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -638,6 +640,10 @@
 <td><p></p></td>
 <td><p>TopK LogProbs</p></td>
 </tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>Penalties</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -691,21 +697,66 @@ One can specify which sampler to use explicitly with:</p>
             <span class="n">sampling_params_1</span><span class="p">])</span>
 </pre></div>
 </div>
+<section id="model-generation-config-defaults">
+<h3>Model generation config defaults<a class="headerlink" href="#model-generation-config-defaults" title="Link to this heading">#</a></h3>
+<p>The PyTorch backend can use compatible sampling defaults explicitly specified
+in a model’s <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>. This behavior is opt-in:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">,</span>
+          <span class="n">generation_config</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>For <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, enable it on the command line:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>nvidia/Llama-3.1-8B-Instruct-FP8<span class="w"> </span>--generation-config<span class="w"> </span>auto
+</pre></div>
+</div>
+<p>or in the server YAML configuration:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">generation_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">auto</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">generation_config</span></code> option has two modes:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">trtllm</span></code> (default) keeps the TRT-LLM sampling behavior and defaults.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> loads supported sampling values from the model’s
+<code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>.</p></li>
+</ul>
+<p>In <code class="docutils literal notranslate"><span class="pre">auto</span></code> mode, values are resolved in this order:</p>
+<ol class="arabic simple">
+<li><p>A value explicitly specified by the request.</p></li>
+<li><p>A value explicitly present in <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>.</p></li>
+<li><p>The existing default for the LLM API or serving protocol.</p></li>
+</ol>
+<p>The supported fields are <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code>,
+<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">no_repeat_ngram_size</span></code>, <code class="docutils literal notranslate"><span class="pre">length_penalty</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">early_stopping</span></code> when its value is a boolean or integer. Defaults synthesized
+by Hugging Face Transformers for fields absent from the JSON file are not
+applied.</p>
+<p>TRT-LLM’s existing model-specific handling of <code class="docutils literal notranslate"><span class="pre">eos_token_id</span></code>, BART
+<code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, and Whisper suppression tokens remains active in both
+modes.</p>
+</section>
 <section id="llm-api-sampling-behavior-when-using-torch-sampler">
 <h3>LLM API sampling behavior when using Torch Sampler<a class="headerlink" href="#llm-api-sampling-behavior-when-using-torch-sampler" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The sampling is controlled via <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>.</p></li>
 <li><p>By default (<code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">None</span></code>), greedy sampling is used
-(unless top-p decay is active, see below).</p></li>
-<li><p>If either <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, and/or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">1</span></code>, is specified, sampling is greedy,
-irrespective of the values of the remaining parameters.</p></li>
+(unless min-p or top-p decay is active, see below). With
+<code class="docutils literal notranslate"><span class="pre">generation_config='auto'</span></code>, values explicitly specified in the model’s
+<code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code> take the place of these defaults; see
+<a class="reference internal" href="#model-generation-config-defaults"><span class="xref myst">Model generation config defaults</span></a>.</p></li>
+<li><p>If either <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">1</span></code>, and/or <code class="docutils literal notranslate"><span class="pre">min_p</span> <span class="pre">=</span> <span class="pre">1</span></code>, is specified,
+sampling is greedy, irrespective of the values of the remaining parameters.</p></li>
 <li><p>Otherwise, sampling proceeds according to the specified sampling parameter values and any
-unspecified parameters default to <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">1.0</span></code>:</p>
+unspecified parameters default to <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">1.0</span></code>:</p>
 <ul>
 <li><p>The logits are scaled by <code class="docutils literal notranslate"><span class="pre">1/temperature</span></code> before applying softmax to compute probabilities.
 Sampling is performed according to these probabilities.</p></li>
-<li><p>If <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code> (or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">vocab_size</span></code>) and <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>, the output tokens are sampled
-from the entire vocabulary.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code> (or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">vocab_size</span></code>), <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">min_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, the output tokens
+are sampled from the entire vocabulary.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;</span> <span class="pre">min_p</span> <span class="pre">&lt;</span> <span class="pre">1</span></code> is specified, the sampling is restricted to the tokens whose probability
+is at least <code class="docutils literal notranslate"><span class="pre">min_p</span></code> times the probability of the most likely token (“min-p sampling”).
+When combined with <code class="docutils literal notranslate"><span class="pre">top_k</span></code> and/or <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code> is applied first.</p></li>
 <li><p>If <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">&lt;</span> <span class="pre">top_k</span> <span class="pre">&lt;</span> <span class="pre">vocab_size</span></code> is specified, the sampling is restricted to
 the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> highest-probability tokens.</p></li>
 <li><p>If <code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;</span> <span class="pre">top_p</span> <span class="pre">&lt;</span> <span class="pre">1.0</span></code> is specified, the sampling is further restricted to a minimal subset
@@ -730,6 +781,35 @@ is sampled (default <code class="docutils literal notranslate"><span class="pre"
 modes that route draft tokens through the Torch Sampler; such requests are rejected.</p></li>
 </ul>
 </li>
+<li><p>Positive Min-P is not supported in combination with one-model speculative decoding. Such
+requests are rejected at admission.</p></li>
+<li><p>Occurrence penalties are supported: <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presence_penalty</span></code> and
+<code class="docutils literal notranslate"><span class="pre">frequency_penalty</span></code> discourage (or encourage) the model from reusing tokens it has
+already seen. All three rewrite the logits before temperature scaling, driven by the
+occurrence history of the prompt plus everything generated so far. Writing <code class="docutils literal notranslate"><span class="pre">c</span></code> for the
+number of times a token has occurred in that history:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> (default <code class="docutils literal notranslate"><span class="pre">1.0</span></code>) rescales the logit of every token with <code class="docutils literal notranslate"><span class="pre">c</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>:
+the logit is divided by the penalty when it is non-negative and multiplied by it when
+it is negative. The two branches move a positive and a negative logit the same way, so
+a value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1</span></code> always pushes a seen token down, and a value <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1</span></code> always pulls it up.
+Must be <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">presence_penalty</span></code> (default <code class="docutils literal notranslate"><span class="pre">0.0</span></code>) subtracts the penalty itself from every token with
+<code class="docutils literal notranslate"><span class="pre">c</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>. The amount does not depend on <code class="docutils literal notranslate"><span class="pre">c</span></code>, so it controls whether a token reappears,
+not how often.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">frequency_penalty</span></code> (default <code class="docutils literal notranslate"><span class="pre">0.0</span></code>) subtracts the penalty multiplied by <code class="docutils literal notranslate"><span class="pre">c</span></code>, so the
+more often a token has already been produced, the harder it is pushed down.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">prompt_ignore_length</span></code> (default <code class="docutils literal notranslate"><span class="pre">0</span></code>) excludes the first N prompt tokens from the
+presence and frequency counts. Those ignored tokens still count for
+<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>. Values <code class="docutils literal notranslate"><span class="pre">&lt;=</span> <span class="pre">0</span></code> have no effect, and values larger than the prompt
+are clamped to the prompt length.</p></li>
+<li><p>Occurrence penalties are not supported in combination with beam search; such requests
+are rejected.</p></li>
+</ul>
+</li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">no_repeat_ngram_size</span> <span class="pre">=</span> <span class="pre">n</span></code> is specified, any token that would recreate an <code class="docutils literal notranslate"><span class="pre">n</span></code>-gram already
+present in the sequence (prompt included) is excluded from sampling. <code class="docutils literal notranslate"><span class="pre">None</span></code> or <code class="docutils literal notranslate"><span class="pre">0</span></code> disables
+the restriction.</p></li>
 </ul>
 </section>
 <section id="performance">
@@ -745,6 +825,67 @@ required for speculative decoding (rejection sampling).</p>
 can greatly reduce the overall latency of the sampling step when request batches are comprised
 of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).</p>
 </section>
+</section>
+<section id="advanced-sampling-mode-speculative-decoding">
+<h2>Advanced sampling mode (speculative decoding)<a class="headerlink" href="#advanced-sampling-mode-speculative-decoding" title="Link to this heading">#</a></h2>
+<p>For one-model speculative decoding (e.g. MTP-Eagle one-model), the per-request
+advanced sampler applies a <code class="docutils literal notranslate"><span class="pre">top_k</span></code> mask, a temperature softmax, and a <code class="docutils literal notranslate"><span class="pre">top_p</span></code>
+filter before sampling each draft/target token. When a deployment fixes its
+sampling configuration such that a filter is always disabled (<code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">0</span></code> /
+<code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">vocab_size</span></code>, or <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>), that filter’s kernel is pure overhead.</p>
+<p><code class="docutils literal notranslate"><span class="pre">advanced_sampling_mode</span></code> (on <code class="docutils literal notranslate"><span class="pre">DecodingBaseConfig</span></code>, so it is available to any
+speculative config) lets you skip those redundant kernels for a fixed deploy
+config. The output is identical to <code class="docutils literal notranslate"><span class="pre">FULL</span></code> whenever the skipped filter is already
+disabled, so this is a lossless throughput optimization for advanced use cases:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Mode</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">top_k</span></code> kernel</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">top_p</span></code> kernel</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">full</span></code> (default)</p></td>
+<td><p>applied</p></td>
+<td><p>applied</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">no_topk</span></code></p></td>
+<td><p><strong>skipped</strong></p></td>
+<td><p>applied</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">no_topp</span></code></p></td>
+<td><p>applied</p></td>
+<td><p><strong>skipped</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">no_topk_no_topp</span></code></p></td>
+<td><p><strong>skipped</strong></p></td>
+<td><p><strong>skipped</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Notes:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">full</span></code> is the default and always safe; the specialization is opt-in.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">advanced_sampling_mode</span></code> and <code class="docutils literal notranslate"><span class="pre">use_rejection_sampling</span></code> are independent: every mode
+works with rejection sampling on or off; the flag no longer gates the mode choice.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">no_topp</span></code> and <code class="docutils literal notranslate"><span class="pre">no_topk_no_topp</span></code> disable <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, switching the sampler from the
+fused <code class="docutils literal notranslate"><span class="pre">top_p_sampling_from_probs</span></code> to the cheaper <code class="docutils literal notranslate"><span class="pre">sampling_from_probs</span></code>; <code class="docutils literal notranslate"><span class="pre">no_topk</span></code>
+keeps <code class="docutils literal notranslate"><span class="pre">top_p</span></code>.</p></li>
+<li><p>Greedy requests are handled natively (via a sentinel temperature that makes the
+softmax collapse to a one-hot argmax), so any mode supports mixed greedy +
+sampling batches without a special case.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">advanced_sampling_mode</span></code> is a deploy-time choice; it is <em>not</em> part of the CUDA
+graph key, so it adds no extra warmup graphs.</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">MTPDecodingConfig</span>
+
+<span class="n">spec_config</span> <span class="o">=</span> <span class="n">MTPDecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
+    <span class="n">advanced_sampling_mode</span><span class="o">=</span><span class="s2">&quot;no_topk_no_topp&quot;</span><span class="p">,</span>  <span class="c1"># temperature-only deploy config</span>
+<span class="p">)</span>
+</pre></div>
+</div>
 </section>
 <section id="beam-search">
 <h2>Beam search<a class="headerlink" href="#beam-search" title="Link to this heading">#</a></h2>
@@ -863,10 +1004,12 @@ of requests with very heterogeneous sampling strategies (e.g. a mix of requests 
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#general-usage">General usage</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#model-generation-config-defaults">Model generation config defaults</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api-sampling-behavior-when-using-torch-sampler">LLM API sampling behavior when using Torch Sampler</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-sampling-mode-speculative-decoding">Advanced sampling mode (speculative decoding)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#beam-search">Beam search</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#logits-processor">Logits processor</a></li>
 </ul>
@@ -960,9 +1103,9 @@ of requests with very heterogeneous sampling strategies (e.g. a mix of requests 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

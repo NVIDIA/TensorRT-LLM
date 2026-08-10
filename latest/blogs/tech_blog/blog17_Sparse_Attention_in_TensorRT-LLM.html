@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -816,7 +818,7 @@
 <p>Figure 4 illustrates the prediction implementation within TensorRT LLM. To support the prediction module, we define corresponding metadata classes—<code class="docutils literal notranslate"><span class="pre">RocketVanillaAttentionMetadata</span></code> and <code class="docutils literal notranslate"><span class="pre">RocketTrtllmAttentionMetadata</span></code>—that pre-allocate all necessary buffers. This is one key advantage of encapsulating sparse attention within the <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> layer: by leveraging the metadata infrastructure, many CPU-side preparation steps can be computed in advance during the <code class="docutils literal notranslate"><span class="pre">prepare</span></code> phase, enabling better overlap between CPU and GPU work.</p>
 <p><strong>Attention operator.</strong> Once prediction produces <code class="docutils literal notranslate"><span class="pre">sparse_kv_indices</span></code> and <code class="docutils literal notranslate"><span class="pre">sparse_attn_indices</span></code>, they are passed to <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code>. Since RocketKV typically operates with GQA attention, it fits naturally into the framework’s sparse computation path. In the context phase, <code class="docutils literal notranslate"><span class="pre">updateSparseKvCacheAfterFmha</span></code> post-processes the KV cache to retain only the budgeted tokens per KV head. In the generation phase, <code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code> selects the relevant pages based on the sparse indices, and the attention kernel then computes over this reduced set.</p>
 <p><strong>Auxiliary memory management.</strong> Managing the paged KT cache presented another challenge. <code class="docutils literal notranslate"><span class="pre">RocketKVCacheManager</span></code> inherits from <code class="docutils literal notranslate"><span class="pre">KVCacheManager</span></code> and extends it with a dedicated <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> for the auxiliary KT cache at the Python level. The main KV cache and the KT cache share block IDs for each request, so that the lifecycle of KT cache blocks is automatically tied to the corresponding KV cache blocks. The <code class="docutils literal notranslate"><span class="pre">BlockManager</span></code> handles slot allocation and deallocation for the KT cache independently, while <code class="docutils literal notranslate"><span class="pre">RocketKVCacheManager</span></code> overrides methods such as <code class="docutils literal notranslate"><span class="pre">get_cache_bytes_per_token</span></code> and <code class="docutils literal notranslate"><span class="pre">prepare_resources</span></code> to ensure that memory sizing accounts for the extra KT cache footprint and that the correct KT cache pointers are passed to prediction kernels at each step. This design keeps the integration lightweight and easy to iterate on, though it inherits the limitations of Python-level management—namely, no automatic support for KV cache reuse or disaggregated serving.</p>
-<p>The concrete implementation can be found in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/rocket.py</span></code>.</p>
+<p>The concrete implementation can be found in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/rocket/</span></code>.</p>
 </section>
 </section>
 <section id="deepseek-sparse-attention-dsa">
@@ -848,7 +850,7 @@
 <p>As with RocketKV, a dedicated metadata class <code class="docutils literal notranslate"><span class="pre">DSATrtllmAttentionMetadata</span></code> is defined to pre-allocate and prepare the buffers needed by the prediction and conversion kernels, enabling efficient CPU–GPU overlap.</p>
 <p><strong>Attention operator.</strong> Because the sparse MLA attention kernel already supports token-level sparse computation natively, DSA requires minimal changes at the operator level. The primary task is to ensure that the inputs conform to the kernel’s expectations—specifically, providing the KV cache pool base address and global token offsets.</p>
 <p><strong>Auxiliary memory management.</strong> DSA requires an auxiliary <strong>indexer K cache</strong> to store the low-rank K projections for reuse across decoding steps. <code class="docutils literal notranslate"><span class="pre">DSAKVCacheManager</span></code> inherits from <code class="docutils literal notranslate"><span class="pre">KVCacheManager</span></code>, but unlike RocketKV’s Python-level KT cache management, DSA’s indexer K cache is integrated directly into the C++ <code class="docutils literal notranslate"><span class="pre">KVCacheManager</span></code>. This design enables compatibility with advanced features such as KV cache reuse, chunked prefill, and disaggregated serving—features that would be difficult to support with a Python-level manager.</p>
-<p>The concrete implementation can be found in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/dsa.py</span></code>.</p>
+<p>The concrete implementation can be found in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/dsa/</span></code>.</p>
 <p>For a comprehensive description of DSA kernel optimizations, precision strategies, feature support (MTP, disaggregated serving, Wide-EP), and benchmark results, please refer to the dedicated blog post: <a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html"><span class="std std-doc">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</span></a>.</p>
 </section>
 </section>
@@ -1179,9 +1181,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

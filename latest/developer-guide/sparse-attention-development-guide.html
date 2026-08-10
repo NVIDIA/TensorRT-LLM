@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -738,18 +740,28 @@ KV eviction are tracked as future work.</p>
 <h3>Prediction hooks<a class="headerlink" href="#prediction-hooks" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> exposes two prediction methods that algorithm-specific
 subclasses override:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sparse_kv_indices</span><span class="p">,</span> <span class="n">sparse_kv_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sparse_kv_predict</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">metadata</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
-<span class="n">sparse_attn_indices</span><span class="p">,</span> <span class="n">sparse_attn_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sparse_attn_predict</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">metadata</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sparse_kv_indices</span><span class="p">,</span> <span class="n">sparse_kv_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sparse_kv_predict</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">metadata</span><span class="p">,</span> <span class="n">forward_args</span><span class="p">)</span>
+<span class="n">sparse_attn_indices</span><span class="p">,</span> <span class="n">sparse_attn_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sparse_attn_predict</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">metadata</span><span class="p">,</span> <span class="n">forward_args</span><span class="p">)</span>
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">hooks.py</span></code> writes these results to <code class="docutils literal notranslate"><span class="pre">SparseRuntimeParams</span></code>. SkipSoftmax writes
+its thresholds to the same runtime interface consumed by <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code>.
+<code class="docutils literal notranslate"><span class="pre">AttentionForwardArgs.sparse_backend_args</span></code> carries algorithm inputs from the
+module to the backend, while <code class="docutils literal notranslate"><span class="pre">sparse_runtime_params</span></code> carries lowered inputs
+from the backend to <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code>.</p>
 <p>Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head’s sparse pattern.</p>
 <p>Algorithm implementations live under
 <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/</span></code>:</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">rocket.py</span></code>, <code class="docutils literal notranslate"><span class="pre">dsa.py</span></code> — concrete algorithms.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">kernel.py</span></code> — custom Triton kernels (importance scoring, Top-K).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">utils.py</span></code> — dispatch helpers.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rocket/</span></code> — RocketKV backend, metadata, cache manager, parameters, and kernels.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dsa/</span></code> — DSA backend, indexer, metadata, cache manager, parameters, custom ops, and kernels.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">deepseek_v4/</span></code> — DeepSeek-V4 backend, indexer, metadata, cache manager,
+parameters, module hooks, and index conversion kernels.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">skip_softmax/</span></code> — SkipSoftmax parameter parsing and runtime scheduler.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">hooks.py</span></code> — typed MLA/Attention module adapters and common backend
+prediction orchestration.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">registry.py</span></code> — backend, metadata, and cache-manager dispatch helpers.</p></li>
 </ul>
 </section>
 <section id="attentionop-behavior">
@@ -826,7 +838,7 @@ the bottom of the file.</p>
 <code class="docutils literal notranslate"><span class="pre">VanillaAttention</span></code> if appropriate) in
 <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/</span></code>. Override one or both
 prediction methods.</p>
-<p><strong><code class="docutils literal notranslate"><span class="pre">sparse_kv_predict(self,</span> <span class="pre">q,</span> <span class="pre">k,</span> <span class="pre">metadata,</span> <span class="pre">**kwargs)</span></code></strong></p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">sparse_kv_predict(self,</span> <span class="pre">q,</span> <span class="pre">k,</span> <span class="pre">metadata,</span> <span class="pre">forward_args)</span></code></strong></p>
 <ul class="simple">
 <li><p><strong>Behavior</strong>: return the indices of tokens to retain in the KV cache.</p></li>
 <li><p><strong>Outputs</strong>:</p>
@@ -843,7 +855,7 @@ indices for head <code class="docutils literal notranslate"><span class="pre">h<
 in-place gather (<code class="docutils literal notranslate"><span class="pre">updateSparseKvCacheAfterFmha</span></code>) is safe. The sort
 cost buys compatibility with chunked prefill and similar features.</p></li>
 </ul>
-<p><strong><code class="docutils literal notranslate"><span class="pre">sparse_attn_predict(self,</span> <span class="pre">q,</span> <span class="pre">k,</span> <span class="pre">metadata,</span> <span class="pre">**kwargs)</span></code></strong></p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">sparse_attn_predict(self,</span> <span class="pre">q,</span> <span class="pre">k,</span> <span class="pre">metadata,</span> <span class="pre">forward_args)</span></code></strong></p>
 <ul class="simple">
 <li><p><strong>Behavior</strong>: return the sparse indices used by the generation-phase
 attention computation.</p></li>
@@ -888,9 +900,12 @@ serving). Significantly higher implementation cost.</p></li>
 <h3>4. Registration and dispatch<a class="headerlink" href="#registration-and-dispatch" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Register the new config + backend in
-<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/utils.py</span></code> and
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/registry.py</span></code> and
 <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/pyexecutor/_util.py</span></code> so the runtime routes
 requests to your backend when the config is present.</p></li>
+<li><p>If the algorithm customizes module-layer behavior, implement and register a
+concrete <code class="docutils literal notranslate"><span class="pre">MLASparseHooks</span></code> or <code class="docutils literal notranslate"><span class="pre">AttentionSparseHooks</span></code> adapter from the
+algorithm’s <code class="docutils literal notranslate"><span class="pre">module.py</span></code>.</p></li>
 <li><p>If your algorithm exposes new C++ parameters, plumb them through
 <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/attentionOp.cpp</span></code> and
 <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/sparseAttentionKernels.h</span></code>.</p></li>
@@ -924,8 +939,6 @@ framework coverage to context-phase sparse compute.</p></li>
 eviction as a compromise that keeps KV cache flexibility manageable.</p></li>
 <li><p><strong>Unified auxiliary memory management</strong> — let custom auxiliary pools
 inherit KV-cache features (reuse, offloading) by default.</p></li>
-<li><p><strong>Code refactoring</strong> — as more algorithms land, unify the
-framework-level scaffolding for maintainability.</p></li>
 </ul>
 </section>
 </section>
@@ -1087,9 +1100,9 @@ framework-level scaffolding for maintainability.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       

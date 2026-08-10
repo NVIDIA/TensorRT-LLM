@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc24';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc23" />
+  <meta name="docsearch:version" content="1.3.0rc24" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -412,6 +412,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
@@ -421,6 +422,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
 
 
 <li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
@@ -643,6 +645,31 @@
 <li><p>Set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_START_STOP=A-B</span></code> to specify the range of the iterations to be collected.</p></li>
 <li><p>Set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_TORCH_PROFILE_TRACE=&lt;path&gt;</span></code>, and the results will be saved to <code class="docutils literal notranslate"><span class="pre">&lt;path&gt;</span></code>.</p></li>
 </ol>
+<p>For VisualGen, use <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_VISUAL_GEN_START_STOP</span></code> instead. Numeric ranges select
+per-request denoise steps, while <code class="docutils literal notranslate"><span class="pre">predenoise</span></code>, <code class="docutils literal notranslate"><span class="pre">postdenoise</span></code>, and <code class="docutils literal notranslate"><span class="pre">all</span></code> select the
+corresponding generation phases. For example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">TLLM_PROFILE_VISUAL_GEN_START_STOP</span><span class="o">=</span><span class="m">0</span>-4<span class="w"> </span><span class="se">\</span>
+<span class="nv">TLLM_TORCH_PROFILE_TRACE</span><span class="o">=</span>/tmp/visual-gen-trace.json<span class="w"> </span><span class="se">\</span>
+python<span class="w"> </span>examples/visual_gen/quickstart_example.py
+</pre></div>
+</div>
+<p>Each process writes its trace to a rank-specific path such as
+<code class="docutils literal notranslate"><span class="pre">/tmp/visual-gen-trace-rank-0.json</span></code>. If a process captures more than one
+window, later traces add a window suffix such as
+<code class="docutils literal notranslate"><span class="pre">/tmp/visual-gen-trace-rank-0-window-1.json</span></code>.</p>
+<p>These ranges use the existing VisualGen CUDA/Nsight boundaries. <code class="docutils literal notranslate"><span class="pre">all</span></code> captures
+the complete request from text encoding through VAE decode. <code class="docutils literal notranslate"><span class="pre">predenoise</span></code>
+captures text encoding, latent preparation, and denoise-loop setup;
+<code class="docutils literal notranslate"><span class="pre">postdenoise</span></code> captures VAE decode and the remaining request work.</p>
+<p>Two contracts worth knowing: a numeric range never extends past the denoise loop
+it selects (a stop index beyond the last step closes at the last step instead),
+and on a pipeline that runs more than one denoise loop per request, the per-loop
+modes apply to each loop — a numeric range writes one trace per loop, while
+<code class="docutils literal notranslate"><span class="pre">postdenoise</span></code> arms after the first loop rather than the last. All windows open at
+the pipeline’s inference entry point, so executor-side request preparation falls
+outside them even though it counts toward the reported <code class="docutils literal notranslate"><span class="pre">generation</span></code> latency.</p>
+<p>For the per-mode specifics, see <code class="docutils literal notranslate"><span class="pre">parse_profile_range</span></code> in
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/visual_gen/profiler.py</span></code>.</p>
 </section>
 <section id="visualize-the-pytorch-profiler-results">
 <h3>Visualize the PyTorch profiler results<a class="headerlink" href="#visualize-the-pytorch-profiler-results" title="Link to this heading">#</a></h3>
@@ -942,9 +969,9 @@ trtllm-serve<span class="w"> </span>...
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 30, 2026.</p>
+  <p>Last updated on August 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1cef02e">1cef02e</a>.</p>
   
 </div></div>
       
