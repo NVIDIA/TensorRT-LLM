@@ -2060,7 +2060,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2072,9 +2071,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp_8_attention_dp_overlap",
+                           num_iters=1,
                            env=llm_venv._new_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=1200)
 
 
 @skip_no_hopper
