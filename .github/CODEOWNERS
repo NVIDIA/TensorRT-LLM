@@ -498,9 +498,13 @@
 /tests/unittest/_torch/memory/test_gms_backend.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-startup-devs
 /tests/unittest/_torch/misc/test_pinned_weight_staging.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-startup-devs
 /tests/unittest/_torch/misc/test_virtual_memory.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-startup-devs
+/tests/unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-startup-devs
+/tests/unittest/_torch/models/checkpoints/hf/test_weight_loader.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-startup-devs
 /tests/unittest/_torch/models/checkpoints/mx @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-startup-devs
 /tests/unittest/_torch/weight_sharing @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-startup-devs
 /tests/unittest/llmapi/test_gms_args.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-startup-devs
+/tests/unittest/llmapi/test_mx_args.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-startup-devs
+/tests/unittest/utils/post_transform_qualification.py @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-startup-devs
 
 # ===== GOVERNANCE / LEGAL GATES =====
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
