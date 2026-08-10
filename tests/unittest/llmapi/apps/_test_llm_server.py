@@ -2,7 +2,7 @@ import concurrent.futures
 import time
 
 import pytest
-from apps.fastapi_server import LLM, BuildConfig, LlmServer
+from apps.fastapi_server import LLM, LlmServer
 from fastapi.testclient import TestClient
 
 import tensorrt_llm.profiler as profiler
@@ -14,10 +14,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 @pytest.fixture(scope="module")
 def client():
-    build_config = BuildConfig()
-    build_config.max_batch_size = 8
-    build_config.max_seq_len = 512
-    llm = LLM(llama_model_path, build_config=build_config)
+    llm = LLM(llama_model_path, max_batch_size=8, max_seq_len=512)
 
     app_instance = LlmServer(llm)
     client = TestClient(app_instance.app)

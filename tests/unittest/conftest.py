@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@ import sys
 import traceback
 import warnings
 from functools import partial
+from pathlib import Path
 from typing import Any, Generator
 
 try:
@@ -38,6 +39,15 @@ from tensorrt_llm._utils import print_all_stacks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+# Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
+# non-top-level conftest: a repo-root invocation like `pytest tests` loads
+# this file as a NESTED conftest and would fail collection; and not via "-p"
+# in pytest.ini addopts, which imports at preparse, before the ini pythonpath
+# entries are usable). The wrappers below forward to the plugin; hooks are
+# idempotent, so a repo-root run that also dispatches from tests/conftest.py
+# is harmless.
+from test_common import s3_output
+from test_common import session_prefetcher_hooks as _prefetch_hooks
 
 
 def dump_threads(signum, frame):
@@ -45,11 +55,21 @@ def dump_threads(signum, frame):
 
 
 def pytest_configure(config):
+    _prefetch_hooks.pytest_configure(config)
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
 
     # Dump all threads' stacks when SIGALRM is received
     signal.signal(signal.SIGALRM, dump_threads)
+
+    # xdist worker processes must not register PeriodicJUnitXML: all worker
+    # reports are forwarded to the controller via xdist and processed there,
+    # so registering on workers causes concurrent writers to the same
+    # unfinished_test.txt and races out cleanup entries.
+    if hasattr(config, "workerinput"):
+        return
 
     # Register PeriodicJUnitXML when invoked from integration test_unittests.py
     periodic = config.getoption("--periodic-junit", default=False)
@@ -94,6 +114,9 @@ def pytest_runtest_protocol(item, nextitem):
             import os
 
             import torch
+            if torch.cuda.device_count() == 0:
+                return
+
             worker_count = int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', 1))
 
             if (torch.cuda.memory_reserved(0) + torch.cuda.memory_allocated(0)
@@ -188,6 +211,34 @@ def pytest_addoption(parser):
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
     )
+    # S3 upload options — must be registered here so they are recognized when
+    # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
+    parser.addoption("--output-dir",
+                     action="store",
+                     default=None,
+                     help="output directory for test logs")
+    s3_output.add_options(parser)
+
+
+def _is_cpu_only_markexpr(config) -> bool:
+    markexpr = getattr(config.option, "markexpr", "") or ""
+    return "cpu_only" in markexpr and "not cpu_only" not in markexpr
+
+
+def pytest_ignore_collect(collection_path, config):
+    if not _is_cpu_only_markexpr(config):
+        return None
+
+    path = Path(str(collection_path))
+    if path.name == "conftest.py" or path.suffix != ".py":
+        return None
+    if not (path.name.startswith("test_") or path.name.endswith("_test.py")):
+        return None
+
+    try:
+        return "pytest.mark.cpu_only" not in path.read_text()
+    except OSError:
+        return None
 
 
 def apply_waives_ut(waives_file, items: list[pytest.Item], config):
@@ -285,6 +336,7 @@ def pytest_sessionstart(session):
     if session.config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
     # To counter TransformerEngine v2.3's lazy_compile deferral,
     # which will cause Pytest thinks there's a thread leakage.
@@ -327,10 +379,13 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module", params=[2, 4, 8])
+@pytest.fixture(scope="module")
 def mpi_pool_executor(request):
     """
     Start an MPIPoolExecutor with `request.param` workers.
+
+    Consumers must set the worker count via indirect parametrization, e.g.
+    ``@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)``.
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
@@ -380,16 +435,10 @@ def _maybe_force_ray(request, monkeypatch, ray_mode):
 
     # Only patch the torch LLM class
     if hasattr(test_mod, 'LLM'):
-        try:
-            from tensorrt_llm._tensorrt_engine import LLM as LLM_legacy
-            is_trtllm_backend = (test_mod.LLM is LLM_legacy)
-        except Exception:
-            is_trtllm_backend = False
-        if not is_trtllm_backend:
-            monkeypatch.setattr(test_mod,
-                                'LLM',
-                                wrap_llm(test_mod.LLM),
-                                raising=False)
+        monkeypatch.setattr(test_mod,
+                            'LLM',
+                            wrap_llm(test_mod.LLM),
+                            raising=False)
     if hasattr(test_mod, 'LLM_torch'):
         monkeypatch.setattr(test_mod,
                             'LLM_torch',
@@ -433,6 +482,9 @@ def process_gpu_memory_info_available():
 
 @pytest.fixture(scope="function")
 def setup_ray_cluster() -> Generator[int, None, None]:
+    import time
+
+    os.environ.setdefault("RAY_raylet_start_wait_time_s", "120")
     runtime_env = {
         "env_vars": {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
@@ -444,11 +496,32 @@ def setup_ray_cluster() -> Generator[int, None, None]:
         "ignore_reinit_error": True,
         "runtime_env": runtime_env
     }
+    # Retry ray.init() to handle transient GCS/raylet startup timeouts on busy CI nodes.
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ray.init(address="local", **ray_init_args)
+            break
+        except Exception:
+            if ray.is_initialized():
+                ray.shutdown()
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(5)
     try:
-        ray.init(address="local", **ray_init_args)
         gcs_addr = ray.get_runtime_context().gcs_address
         port = int(gcs_addr.split(":")[1])
+        # Allow raylet to complete GCS registration before tests create actors.
+        time.sleep(2)
         yield port
     finally:
         if ray.is_initialized():
             ray.shutdown()
+
+
+def pytest_runtest_setup(item):
+    _prefetch_hooks.pytest_runtest_setup(item)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

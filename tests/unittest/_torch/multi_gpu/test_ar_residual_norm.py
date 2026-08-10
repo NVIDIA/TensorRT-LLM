@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from torch import nn
 
 import tensorrt_llm
 from tensorrt_llm._torch.compilation.backend import Backend

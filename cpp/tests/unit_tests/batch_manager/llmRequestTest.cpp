@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
@@ -97,7 +98,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_TRUE(llmReq.getStopWordsList().has_value());
         {
             auto badWordsTensor = llmReq.getBadWordsList().value();
-            EXPECT_EQ(badWordsTensor->getDataType(), nvinfer1::DataType::kINT32);
+            EXPECT_EQ(badWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
             EXPECT_EQ(badWordsTensor->getShape().nbDims, 3);
             EXPECT_EQ(badWordsTensor->getShape().d[0], 1);
             EXPECT_EQ(badWordsTensor->getShape().d[1], 2);
@@ -119,7 +120,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
 
         {
             auto stopWordsTensor = llmReq.getStopWordsList().value();
-            EXPECT_EQ(stopWordsTensor->getDataType(), nvinfer1::DataType::kINT32);
+            EXPECT_EQ(stopWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
             EXPECT_EQ(stopWordsTensor->getShape().nbDims, 3);
             EXPECT_EQ(stopWordsTensor->getShape().d[0], 1);
             EXPECT_EQ(stopWordsTensor->getShape().d[1], 2);
@@ -151,7 +152,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[0], 1);
         EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[1], vocabSize);
         EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[2], hiddenSize);
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getDataType(), nvinfer1::DataType::kFLOAT);
+        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getDataType(), tensorrt_llm::DataType::kFLOAT);
         EXPECT_EQ(llmReq.getPromptVocabSize().value(), vocabSize);
         VecUniqueTokens uniqueTokens;
         for (size_t i = 0; i < inputTokens.size(); ++i)
@@ -373,7 +374,7 @@ TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
     EXPECT_EQ(llmReq.mPromptLen, 5);
 
     SizeType32 vocabSizePadded = 32000;
-    nvinfer1::DataType logitsDataType = nvinfer1::DataType::kFLOAT;
+    tensorrt_llm::DataType logitsDataType = tensorrt_llm::DataType::kFLOAT;
 
     // Test the allocation of context logits
     EXPECT_EQ(llmReq.getContextLogitsHost(), nullptr);
@@ -462,7 +463,7 @@ TEST_F(LlmRequestTest, testCreateRequests)
     SizeType32 maxNewTokens{60};
     tb::LlmRequest::RequestIdType requestId{77};
     SizeType32 vocabSize{32};
-    nvinfer1::DataType dtype{nvinfer1::DataType::kHALF};
+    tensorrt_llm::DataType dtype{tensorrt_llm::DataType::kHALF};
 
     tr::SamplingConfig samplingConfig(1);
     samplingConfig.randomSeed = std::vector<texec::RandomSeedType>{7};
@@ -749,6 +750,79 @@ TEST_P(ParamTest, createResponse)
             EXPECT_TRUE(result.isFinal) << "seqIdx " << seqIdx;
         }
     }
+}
+
+// Regression test for nvbug/5961736: createResult() must produce a valid
+// response with contextPhaseParams when the request is in
+// kDISAGG_CONTEXT_COMPLETE, not just kDISAGG_CONTEXT_TRANS_IN_PROGRESS.
+// Without the fix, createResult() returns nullopt for CONTEXT_COMPLETE,
+// causing ctx_request_id=None in the disaggregated serving response.
+TEST_F(LlmRequestTest, createResultDisaggContextComplete)
+{
+    VecTokens inputTokens{1, 2, 3, 4, 5};
+    SizeType32 maxNewTokens{10};
+    texec::IdType requestId{42};
+
+    // Build an executor::Request and configure it as context-only with ContextPhaseParams.
+    texec::Request execReq(inputTokens, maxNewTokens);
+    execReq.setRequestType(texec::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
+    texec::ContextPhaseParams ctxParams({100}, requestId, static_cast<void*>(nullptr), std::nullopt);
+    execReq.setContextPhaseParams(std::move(ctxParams));
+
+    tb::LlmRequest llmReq(requestId, execReq);
+    EXPECT_TRUE(llmReq.isContextOnlyRequest());
+
+    // Add a generated token (required by createResult's firstGenTokens extraction).
+    llmReq.addNewTokens(VecTokens{42});
+
+    // Verify isFinished() covers DISAGG_CONTEXT_COMPLETE.
+    llmReq.setState(tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+    EXPECT_TRUE(llmReq.isFinished());
+
+    // This is the regression case — without the fix, createResult() returns nullopt
+    // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
+    // or its context-phase branch.
+    auto response = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    ASSERT_TRUE(response.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
+    EXPECT_TRUE(response->contextPhaseParams.has_value())
+        << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";
+    EXPECT_EQ(response->contextPhaseParams->getReqId(), requestId);
+    EXPECT_TRUE(response->isSequenceFinal);
+}
+
+TEST_F(LlmRequestTest, generationOnlyRequestAdoptsContextPhaseDraftTokens)
+{
+    VecTokens inputTokens{1, 2, 3, 4, 5};
+    VecTokens firstGenTokens{100};
+    VecTokens draftTokens{101, 102, 103};
+    SizeType32 maxNewTokens{10};
+    texec::IdType requestId{42};
+
+    texec::Request execReq(inputTokens, maxNewTokens);
+    execReq.setRequestType(texec::RequestType::REQUEST_TYPE_GENERATION_ONLY);
+    execReq.setContextPhaseParams(
+        texec::ContextPhaseParams{firstGenTokens, requestId, static_cast<void*>(nullptr), draftTokens});
+    auto const expectedContextPhaseTokens = static_cast<SizeType32>(firstGenTokens.size() + draftTokens.size());
+    auto const expectedDraftTokens = static_cast<SizeType32>(draftTokens.size());
+
+    tb::LlmRequest llmReq(requestId, execReq);
+
+    EXPECT_TRUE(llmReq.isGenerationOnlyRequest());
+    EXPECT_EQ(llmReq.getNumDraftTokens(), expectedDraftTokens);
+    EXPECT_EQ(*llmReq.getDraftTokens(), draftTokens);
+    EXPECT_EQ(llmReq.getNumContextPhaseGenerationTokens(), expectedContextPhaseTokens);
+
+    texec::Request lateExecReq(inputTokens, maxNewTokens);
+    lateExecReq.setRequestType(texec::RequestType::REQUEST_TYPE_GENERATION_ONLY);
+    tb::LlmRequest lateLlmReq(requestId, lateExecReq);
+    EXPECT_EQ(lateLlmReq.getNumDraftTokens(), 0);
+
+    lateLlmReq.setContextPhaseParams(
+        texec::ContextPhaseParams{firstGenTokens, requestId, static_cast<void*>(nullptr), draftTokens});
+
+    EXPECT_EQ(lateLlmReq.getNumDraftTokens(), expectedDraftTokens);
+    EXPECT_EQ(*lateLlmReq.getDraftTokens(), draftTokens);
+    EXPECT_EQ(lateLlmReq.getNumContextPhaseGenerationTokens(), expectedContextPhaseTokens);
 }
 
 INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,

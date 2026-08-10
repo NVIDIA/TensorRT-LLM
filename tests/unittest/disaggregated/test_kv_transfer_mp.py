@@ -7,11 +7,20 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+# Force a deterministic UCX config regardless of what the cluster/CI injects;
+# see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+# Limit NIXL busy-polling progress threads; see test_kv_transfer.py for the
+# full rationale (intermittent 120s timeouts on shared CI nodes,
+# https://nvbugs/6426834).
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -114,6 +123,8 @@ def worker_fn(
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    # Use 4 worker threads for KV transfer to exercise multi-thread code paths
+    os.environ["TRTLLM_KV_TRANSFER_NUM_THREADS"] = "4"
 
     # Initialize distributed (use gloo for single GPU compatibility)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
@@ -319,8 +330,8 @@ def worker_fn(
             ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence(
-                ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+            kv_cache_manager.impl.add_sequence_batch(
+                [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request]
             )
 
             # Create sender session
@@ -331,11 +342,15 @@ def worker_fn(
                 kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
                 dtype=np.int64,
             )
-            send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            send_future = sender_session.send(send_kv_slice)
+            send_kv_slice = KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=[block_ids],
+                token_range=TokenRange(start=0, end=req_len),
+            )
+            sender_session.send(send_kv_slice)
 
             # Wait for send to complete
-            send_future.result()
+            sender_session.wait_complete()
             assert sender_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification
@@ -361,8 +376,8 @@ def worker_fn(
             )
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence(
-                gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
+            kv_cache_manager.impl.add_sequence_batch(
+                [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
             )
 
             # Create receiver session
@@ -373,11 +388,15 @@ def worker_fn(
                 kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
                 dtype=np.int64,
             )
-            recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            recv_future = receiver_session.receive(recv_kv_slice)
+            recv_kv_slice = KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=[block_ids],
+                token_range=TokenRange(start=0, end=req_len),
+            )
+            receiver_session.receive(recv_kv_slice)
 
             # Wait for receive to complete
-            recv_future.result()
+            receiver_session.wait_complete(blocking=True)
             assert receiver_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification
@@ -536,25 +555,46 @@ def worker_fn(
     dist.destroy_process_group()
 
 
-def run_transfer_worker_mp(ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int):
+def _is_port_conflict_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a port conflict (EADDRINUSE)."""
+    msg = str(exc).lower()
+    return "eaddrinuse" in msg or "address already in use" in msg
+
+
+def run_transfer_worker_mp(
+    ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int, max_port_retries: int = 5
+):
     """Multi-process test for TransferWorker using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
-    master_port = find_free_port()
 
-    print(
-        f"Starting {world_size} processes for test: "
-        f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
-    )
+    for attempt in range(max_port_retries):
+        master_port = find_free_port()
 
-    # Use mp.spawn to start all processes
-    mp.spawn(
-        worker_fn,
-        args=(world_size, master_addr, master_port, ctx_tp, ctx_pp, gen_tp, gen_pp),
-        nprocs=world_size,
-        join=True,
-    )
+        print(
+            f"Starting {world_size} processes for test: "
+            f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
+            f" (port={master_port}, attempt {attempt + 1}/{max_port_retries})"
+        )
+
+        try:
+            # Use mp.spawn to start all processes
+            mp.spawn(
+                worker_fn,
+                args=(world_size, master_addr, master_port, ctx_tp, ctx_pp, gen_tp, gen_pp),
+                nprocs=world_size,
+                join=True,
+            )
+            break  # success
+        except Exception as e:
+            if _is_port_conflict_error(e) and attempt < max_port_retries - 1:
+                print(
+                    f"Port {master_port} conflict on attempt {attempt + 1}/{max_port_retries}, "
+                    f"retrying with a new port..."
+                )
+                continue
+            raise
 
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 

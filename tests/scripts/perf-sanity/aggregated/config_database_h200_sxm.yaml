@@ -1,5 +1,6 @@
 server_configs:
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -17,7 +18,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -33,29 +34,30 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc32_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
-  max_batch_size: 1024
+  max_batch_size: 32
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 1024
+    max_batch_size: 128
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.75
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
-  max_num_tokens: 5248
-  max_seq_len: 2068
+  max_num_tokens: 1216
+  max_seq_len: 2304
   client_configs:
   - name: con32_isl1024_osl1024
     concurrency: 32
@@ -66,6 +68,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc2048_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -88,7 +91,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -104,6 +107,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -121,7 +125,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -137,6 +141,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc16_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -154,7 +159,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -170,6 +175,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc512_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -191,7 +197,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -207,6 +213,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -224,7 +231,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -240,29 +247,30 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc16_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
-  max_batch_size: 512
+  max_batch_size: 16
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 16
+    max_batch_size: 128
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.75
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
-  max_num_tokens: 10304
-  max_seq_len: 9416
+  max_num_tokens: 8320
+  max_seq_len: 9472
   client_configs:
   - name: con16_isl8192_osl1024
     concurrency: 16
@@ -273,29 +281,35 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc256_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
-  max_batch_size: 512
+  max_batch_size: 32
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 256
+    max_batch_size: 128
+  enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.75
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
     backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
-  max_num_tokens: 10304
-  max_seq_len: 9416
+  max_num_tokens: 8320
+  max_seq_len: 9472
   client_configs:
   - name: con256_isl8192_osl1024
     concurrency: 256
@@ -309,24 +323,23 @@ server_configs:
   model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
+  max_batch_size: 4
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 4
+  print_iter_log: true
   kv_cache_config:
+    dtype: auto
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
+  stream_interval: 20
   moe_config:
     backend: TRITON
-  num_postprocess_workers: 4
-  print_iter_log: true
-  stream_interval: 20
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
-  max_seq_len: 2068
+  max_seq_len: 2304
   client_configs:
   - name: con4_isl1024_osl1024
     concurrency: 4
@@ -402,63 +415,60 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc128_gpu4
+- name: openai_gpt_oss_120b_1024_1024_conc4_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-  max_batch_size: 128
+  max_batch_size: 4
   cuda_graph_config:
     enable_padding: true
+    max_batch_size: 4
   print_iter_log: true
   kv_cache_config:
+    dtype: auto
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
     backend: TRITON
-  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
-  max_seq_len: 2068
+  max_seq_len: 2304
   client_configs:
-  - name: con128_isl1024_osl1024
-    concurrency: 128
+  - name: con4_isl1024_osl1024
+    concurrency: 4
     iterations: 10
     isl: 1024
     osl: 1024
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc384_gpu4
+- name: openai_gpt_oss_120b_1024_1024_conc32_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-  max_batch_size: 384
+  max_batch_size: 32
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 384
+    max_batch_size: 32
   print_iter_log: true
   kv_cache_config:
+    dtype: auto
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
     backend: TRITON
-  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
-  max_seq_len: 2068
+  max_seq_len: 2304
   client_configs:
-  - name: con384_isl1024_osl1024
-    concurrency: 384
+  - name: con32_isl1024_osl1024
+    concurrency: 32
     iterations: 10
     isl: 1024
     osl: 1024
@@ -910,6 +920,156 @@ server_configs:
     concurrency: 384
     iterations: 10
     isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_1024_1024_conc8_gpu1
+  model_name: gpt_oss_120b_fp4
+  gpus: 1
+  match_mode: scenario
+  max_batch_size: 8
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 8
+  print_iter_log: true
+  kv_cache_config:
+    dtype: auto
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRITON
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 2304
+  client_configs:
+  - name: con8_isl1024_osl1024
+    concurrency: 8
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_1024_1024_conc64_gpu1
+  model_name: gpt_oss_120b_fp4
+  gpus: 1
+  match_mode: scenario
+  max_batch_size: 64
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 64
+  print_iter_log: true
+  kv_cache_config:
+    dtype: auto
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRITON
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 2304
+  client_configs:
+  - name: con64_isl1024_osl1024
+    concurrency: 64
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_8192_1024_conc4_gpu1
+  model_name: gpt_oss_120b_fp4
+  gpus: 1
+  match_mode: scenario
+  max_batch_size: 4
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 4
+  print_iter_log: true
+  kv_cache_config:
+    dtype: auto
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRITON
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 9472
+  client_configs:
+  - name: con4_isl8192_osl1024
+    concurrency: 4
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_1024_1024_conc4_gpu2
+  model_name: gpt_oss_120b_fp4
+  gpus: 2
+  match_mode: scenario
+  max_batch_size: 4
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 4
+  print_iter_log: true
+  kv_cache_config:
+    dtype: auto
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRITON
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 2
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 2304
+  client_configs:
+  - name: con4_isl1024_osl1024
+    concurrency: 4
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_1024_1024_conc32_gpu2
+  model_name: gpt_oss_120b_fp4
+  gpus: 2
+  match_mode: scenario
+  max_batch_size: 32
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 32
+  print_iter_log: true
+  kv_cache_config:
+    dtype: auto
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRITON
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 2
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 2304
+  client_configs:
+  - name: con32_isl1024_osl1024
+    concurrency: 32
+    iterations: 10
+    isl: 1024
     osl: 1024
     random_range_ratio: 0.0
     backend: openai

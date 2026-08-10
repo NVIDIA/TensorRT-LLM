@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,13 +19,31 @@ import click
 import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
-from .._tensorrt_engine import LLM
-from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
-                        GPQAExtended, GPQAMain, JsonModeEval, LongBenchV1,
-                        LongBenchV2)
-from ..llmapi import BuildConfig, KvCacheConfig
+from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
+                        ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
+                        GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
+                        JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro,
+                        SciCode)
+from ..llmapi import KvCacheConfig
+from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
+from ..usage import config as _telemetry_config
+from .utils import collect_explicit_cli_keys
+
+# CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
+# lock-step with the args class and can't drift.
+_LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+
+# Map Click parameter names to the LlmArgs field name (or merge-function CLI
+# scalar name) used by `update_llm_args_with_extra_options`.
+_CLICK_TO_LLM_ARG = {
+    "tp_size": "tensor_parallel_size",
+    "pp_size": "pipeline_parallel_size",
+    "ep_size": "moe_expert_parallel_size",
+    "kv_cache_free_gpu_memory_fraction": "free_gpu_memory_fraction",
+    "disable_kv_cache_reuse": "enable_block_reuse",
+}
 
 
 @click.group()
@@ -50,7 +68,7 @@ from ..logger import logger, severity_map
 )
 @click.option(
     "--backend",
-    type=click.Choice(["pytorch", "tensorrt"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
     help="The backend to use for evaluation. Default is pytorch backend.")
 @click.option('--log_level',
@@ -59,23 +77,23 @@ from ..logger import logger, severity_map
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.model_fields["max_beam_width"].default,
+              default=_LLM_ARGS_FIELDS["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.model_fields["max_num_tokens"].default,
+    default=_LLM_ARGS_FIELDS["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.model_fields["max_seq_len"].default,
+    default=None,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
@@ -111,12 +129,16 @@ from ..logger import logger, severity_map
               "extra_llm_api_options",
               type=str,
               default=None,
-              help="Path to a YAML file that overwrites the parameters. "
-              "Can be specified as either --config or --extra_llm_api_options.")
+              help="Path to a YAML configuration file. Explicit CLI flags "
+              "take precedence over values in this file. Can be specified "
+              "as either --config or --extra_llm_api_options.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
               default=False,
               help="Flag for disabling KV cache reuse.")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str],
          custom_tokenizer: Optional[str], log_level: str, backend: str,
@@ -124,24 +146,43 @@ def main(ctx, model: str, tokenizer: Optional[str],
          max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
          gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
          trust_remote_code: bool, revision: Optional[str],
-         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
+         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool,
+         telemetry: bool):
     logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config"),
+        translate=_CLICK_TO_LLM_ARG)
 
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         enable_block_reuse=not disable_kv_cache_reuse)
 
     llm_args = {
-        "model": model,
-        "tokenizer": tokenizer,
-        "custom_tokenizer": custom_tokenizer,
-        "tensor_parallel_size": tp_size,
-        "pipeline_parallel_size": pp_size,
-        "moe_expert_parallel_size": ep_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "revision": revision,
-        "kv_cache_config": kv_cache_config,
+        "model":
+        model,
+        "tokenizer":
+        tokenizer,
+        "custom_tokenizer":
+        custom_tokenizer,
+        "tensor_parallel_size":
+        tp_size,
+        "pipeline_parallel_size":
+        pp_size,
+        "moe_expert_parallel_size":
+        ep_size,
+        "gpus_per_node":
+        gpus_per_node,
+        "trust_remote_code":
+        trust_remote_code,
+        "revision":
+        revision,
+        "kv_cache_config":
+        kv_cache_config,
+        "telemetry_config":
+        _telemetry_config.TelemetryConfig(
+            disabled=not telemetry,
+            usage_context=_telemetry_config.UsageContext.CLI_EVAL),
     }
 
     if backend == 'pytorch':
@@ -150,21 +191,16 @@ def main(ctx, model: str, tokenizer: Optional[str],
                         max_num_tokens=max_num_tokens,
                         max_beam_width=max_beam_width,
                         max_seq_len=max_seq_len)
-    elif backend == 'tensorrt':
-        llm_cls = LLM
-        build_config = BuildConfig(max_batch_size=max_batch_size,
-                                   max_num_tokens=max_num_tokens,
-                                   max_beam_width=max_beam_width,
-                                   max_seq_len=max_seq_len)
-        llm_args.update(build_config=build_config)
     else:
         raise click.BadParameter(
             f"{backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(llm_args,
-                                                      extra_llm_api_options)
+        llm_args = update_llm_args_with_extra_options(
+            llm_args,
+            extra_llm_api_options,
+            explicit_cli_keys=explicit_cli_keys)
 
     profiler.start("trtllm init")
     llm = llm_cls(**llm_args)
@@ -185,8 +221,18 @@ main.add_command(GPQAMain.command)
 main.add_command(GPQAExtended.command)
 main.add_command(JsonModeEval.command)
 main.add_command(MMMU.command)
+main.add_command(MMMUPro.command)
+main.add_command(CoVoST2.command)
 main.add_command(LongBenchV1.command)
 main.add_command(LongBenchV2.command)
+main.add_command(AIME2025.command)
+main.add_command(AIME2026.command)
+main.add_command(GPQANemoSkills.command)
+main.add_command(IFBench.command)
+main.add_command(SciCode.command)
+main.add_command(HLE.command)
+main.add_command(AALCR.command)
+main.add_command(ArenaHard.command)
 
 if __name__ == "__main__":
     main()

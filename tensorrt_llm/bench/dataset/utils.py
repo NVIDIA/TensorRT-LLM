@@ -24,6 +24,20 @@ def generate_text_dataset(input_ids, output_lens, task_ids=None, lora_config=Non
         yield json.dumps(d, separators=(",", ":"), ensure_ascii=False)
 
 
+def generate_multi_turn_dataset(all_turns, input_ids, all_metadata, output_lens):
+    for i, turns in enumerate(all_turns):
+        d = {
+            "task_id": i,
+            "turns": turns,
+            "output_tokens": output_lens[i],
+        }
+        if input_ids[i] is not None:
+            d["input_ids"] = input_ids[i]
+        if i < len(all_metadata) and all_metadata[i]:
+            d.update(all_metadata[i])
+        yield json.dumps(d, separators=(",", ":"), ensure_ascii=False)
+
+
 def generate_multimodal_dataset(multimodal_texts, multimodal_image_paths, output_lens):
     for i, (text, image_paths) in enumerate(zip(multimodal_texts, multimodal_image_paths)):
         d = {
@@ -89,6 +103,10 @@ def gen_random_tokens(ip_lens, tokenizer, random_seed):
 
 
 def write_dataset_to_file(dataset_generator, output_file):
+    if output_file is None:
+        for item in dataset_generator:
+            print(item)
+        return
     output_file = Path(output_file)
     os.makedirs(output_file.parent, exist_ok=True)
     with open(output_file, "w") as f:

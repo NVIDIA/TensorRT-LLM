@@ -236,6 +236,8 @@ template<>                    struct packed_as<half,  2>          { using type =
 template<>                    struct packed_as<float,  2>         { using type = float2; };
 template<>                    struct packed_as<int8_t, 2>         { using type = int16_t; };
 template<>                    struct packed_as<int32_t, 2>        { using type = int2; };
+template<>                    struct packed_as<uint, 2>           { using type = uint2; };
+template<>                    struct packed_as<uint, 4>           { using type = uint4; };
 template<>                    struct packed_as<half2, 1>          { using type = half; };
 template<>                    struct packed_as<float2, 1>         { using type = float; };
 #ifdef ENABLE_BF16
@@ -304,10 +306,12 @@ inline int getSMVersion(bool queryRealSmArch = false)
     return sm;
 }
 
-inline bool isSM100Family()
+inline bool isSM100Family(std::optional<int> sm = std::nullopt)
 {
-    int const sm = getSMVersion();
-    return sm == 100 || sm == 103; // To be continued...
+    // Not value_or(): its argument is evaluated eagerly, so an explicit sm
+    // would still trigger a device query (which throws with no device present).
+    int smVersion = sm.has_value() ? *sm : getSMVersion();
+    return smVersion >= 100 && smVersion < 110;
 }
 
 inline int getDevice()

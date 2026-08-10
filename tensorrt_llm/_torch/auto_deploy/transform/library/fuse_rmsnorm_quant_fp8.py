@@ -31,6 +31,7 @@ from ...utils.node_utils import (
     extract_output_tuple,
     is_op,
     is_trivial_passthrough_user,
+    unwrap_input_through_passthrough,
 )
 from ..interface import (
     BaseTransform,
@@ -90,26 +91,24 @@ def _collect_grouped_fp8_linear_users(
     return grouped_users
 
 
-def _is_view_like(node: Node) -> bool:
-    return is_op(node, torch.ops.aten.view.default) or is_op(node, torch.ops.aten.reshape.default)
-
-
 def _unwrap_post_norm_nodes(node: Node) -> Tuple[Node, list[Node]]:
-    current = node
-    post_nodes: list[Node] = []
-    while isinstance(current, Node) and _is_view_like(current):
-        post_nodes.append(current)
-        current = current.args[0]
-    return current, post_nodes
+    return unwrap_input_through_passthrough(node)
 
 
 def _reapply_post_norm_nodes(graph, current: Node, post_nodes: list[Node]) -> Node:
     for post_node in reversed(post_nodes):
-        current = graph.call_function(
-            post_node.target,
-            args=(current, *post_node.args[1:]),
-            kwargs=post_node.kwargs,
-        )
+        if post_node.op == "call_method":
+            current = graph.call_method(
+                post_node.target,
+                args=(current, *post_node.args[1:]),
+                kwargs=post_node.kwargs,
+            )
+        else:
+            current = graph.call_function(
+                post_node.target,
+                args=(current, *post_node.args[1:]),
+                kwargs=post_node.kwargs,
+            )
         current.meta.update(post_node.meta)
     return current
 

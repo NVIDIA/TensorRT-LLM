@@ -34,10 +34,12 @@ def test_ad_guided_decoding_regex_e2e():
     # DemoLLM runtime does not support guided decoding. Need to set runtime to trtllm.
     experiment_config["args"]["runtime"] = "trtllm"
     experiment_config["args"]["world_size"] = 1
+    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+    experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["guided_decoding_backend"] = guided_decoding_backend
 
     experiment_config["prompt"]["batch_size"] = 1
-    experiment_config["prompt"]["queries"] = {"prompt": test_case["prompt"]}
+    experiment_config["prompt"]["queries"] = test_case["prompt"]
 
     cfg = ExperimentConfig(**experiment_config)
 

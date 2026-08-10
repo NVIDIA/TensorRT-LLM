@@ -193,7 +193,7 @@ except ImportError:
             print(
                 f"[info] Start subprocess with call({popenargs}, {simplified_kwargs})"
             )
-        if not 'env' in kwargs:
+        if 'env' not in kwargs:
             kwargs['env'] = os.environ.copy()
 
         with Popen(*popenargs, start_new_session=start_new_session,

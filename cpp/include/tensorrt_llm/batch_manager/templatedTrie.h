@@ -191,6 +191,14 @@ public:
         auto itr = mNextNodes.find(nkey);
         if (itr != mNextNodes.end())
         {
+            // Sever the back-edge on the child before erasing its forward entry.
+            // A shared_ptr to the child may still be held elsewhere (e.g. by
+            // KVCacheBlock::mLookupNode), and without this step a later
+            // clearValue on that child would cascade-prune up through a stale
+            // mPrevNode and assert because this node's mNextNodes no longer
+            // contains it. Passing an empty NodePtr makes the orphan behave
+            // as a root: its own cascade-prune stops at itself.
+            itr->second->setPrevNode(NodePtr{});
             mNextNodes.erase(itr);
             auto const isRoot = mPrevNode.expired();
             auto const canBeDeleted = !isRoot && mValue.empty() && mNextNodes.empty();

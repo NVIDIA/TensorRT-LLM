@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import flashinfer
 import pytest
 import torch
@@ -132,6 +146,7 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         kv_cache,
         # CONSTANTS
         None,
+        None,
         1.0,
         1.0,
     )
@@ -260,6 +275,7 @@ def test_flashinfer_attention_op_decode(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -391,6 +407,7 @@ def test_flashinfer_attention_context_and_generate(
         kv_cache,
         # CONSTANTS
         None,
+        None,
         1.0,
         1.0,
     )
@@ -484,6 +501,7 @@ def test_flashinfer_attention_context_and_generate(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -617,6 +635,7 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -776,6 +795,7 @@ def test_flashinfer_attention_with_fp8_cache(
         kv_cache,
         # CONSTANTS
         None,
+        None,
         K_SCALE,
         V_SCALE,
     )
@@ -883,6 +903,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         kv_cache,
         # CONSTANTS
         None,
+        None,
         1.0,
         1.0,
     )
@@ -976,6 +997,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,

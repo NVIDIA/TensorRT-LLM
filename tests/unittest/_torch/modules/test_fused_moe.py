@@ -2590,14 +2590,14 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE),
                               dtype=dtype).cuda()
 
-        from triton_kernels.numerics_details.mxfp import (
-            downcast_to_mxfp_torch, upcast_from_mxfp_torch)
+        from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp,
+                                                          upcast_from_mxfp)
 
         def fp32_to_mxfp4(tensor):
             tensor = tensor.transpose(1, 2).contiguous()
-            tensor_fp4, tensor_scales = downcast_to_mxfp_torch(tensor,
-                                                               torch.uint8,
-                                                               axis=1)
+            tensor_fp4, tensor_scales = downcast_to_mxfp(tensor,
+                                                         torch.uint8,
+                                                         axis=1)
             tensor_fp4 = tensor_fp4.transpose(1, 2).contiguous()
             tensor_scales = tensor_scales.transpose(1, 2).contiguous()
             return tensor_fp4, tensor_scales
@@ -2605,10 +2605,7 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         def mxfp4_to_fp32(tensor, scales):
             tensor = tensor.transpose(1, 2).contiguous()
             scales = scales.transpose(1, 2).contiguous()
-            tensor = upcast_from_mxfp_torch(tensor,
-                                            scales,
-                                            torch.float32,
-                                            axis=1)
+            tensor = upcast_from_mxfp(tensor, scales, torch.float32, axis=1)
             return tensor.transpose(1, 2).contiguous()
 
         w1_weight_fp4, w1_weight_scale = fp32_to_mxfp4(w1_weight)

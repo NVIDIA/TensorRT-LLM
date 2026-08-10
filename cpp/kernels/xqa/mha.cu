@@ -1475,10 +1475,19 @@ __device__ inline void addAttentionSinks(
 {
     for (uint32_t i = 0; i < globalRowSum.size; i++)
     {
-        uint32_t srcOffset = warp_size * i + laneId();
-        if (srcOffset < headGrpSize)
+        uint32_t const rowOffset = warp_size * i + laneId();
+        if constexpr (SPEC_DEC)
         {
-            globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+            // Spec-dec rows flatten [query token, head], so repeat the sink indices for every token.
+            if (rowOffset < warpTile.y)
+            {
+                uint32_t const srcOffset = rowOffset % headGrpSize;
+                globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+            }
+        }
+        else if (rowOffset < headGrpSize)
+        {
+            globalRowSum[i] += expf(attentionSinks[rowOffset] - globalRowMax[i]);
         }
     }
 }
@@ -1698,7 +1707,7 @@ CUBIN_EXPORT __global__
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
-    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1 + idxHeadTokenInGrp; // ctaTokOffset;
+    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1;
     int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
     uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
     bool const rtIsReallySliding = (cacheSeqLen + actualQSeqLen > slidingWinSize);
@@ -1709,6 +1718,9 @@ CUBIN_EXPORT __global__
 #else
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
+#endif
+#if USE_PAGED_KV_CACHE
+    uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
 #endif
     uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / ctaTile.x;
     uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % ctaTile.x;
@@ -1763,10 +1775,11 @@ CUBIN_EXPORT __global__
         {
 #if BEAM_WIDTH == 1
             uint32_t const idxBeam = 0;
-            pageIdx = getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+            pageIdx = getPage<KCachePageIndices::size>(
+                cacheList, true, idxReq, idxBeam, idxPage, nbPages, nbSkipLeadingPages);
 #else
             auto& dst = smem.kCachePages[warpIdx.x];
-            loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages);
+            loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages, nbSkipLeadingPages);
 #endif
         };
         uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + warpIdx.x * warpTile.x / tokensPerPage;
@@ -2090,11 +2103,12 @@ CUBIN_EXPORT __global__
         {
 #if BEAM_WIDTH == 1
             uint32_t const idxBeam = 0;
-            pageIdx = getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+            pageIdx = getPage<VCachePageIndices::size>(
+                cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages, nbSkipLeadingPages);
 #else
             auto& dst = smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x];
             loadPagesForBeamSearchAsync<grpLoadV ? gemm1WarpsPerGrp : 1U>(
-                grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages);
+                grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages, nbSkipLeadingPages);
 #endif
         };
         uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + cacheVTileSeqLen * warpGrpIdx / tokensPerPage;

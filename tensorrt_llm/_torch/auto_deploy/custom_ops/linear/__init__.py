@@ -19,10 +19,14 @@ This module provides linear layer implementations:
 - linear: Linear layer operations
 - torch_router: MoE router operations
 - swiglu: SwiGLU MLP custom operations
+- silu_mul: Fused SiLU+Mul activation operation
 """
 
 __all__ = [
     "linear",
     "torch_router",
     "swiglu",
+    "silu_mul",
+    "dsv3_fused_a_gemm",
+    "dsv3_router_gemm",
 ]

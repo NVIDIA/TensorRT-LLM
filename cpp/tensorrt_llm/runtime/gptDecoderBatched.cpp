@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -74,7 +75,7 @@ void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, Tenso
 }
 
 void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
-    nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    tensorrt_llm::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxNumSequences > 0);
@@ -247,7 +248,7 @@ CudaEvent GptDecoderBatched::finalize(decoder::DecoderState const& decoderState,
 
     auto [dInput, dOutput] = prepareGatherTree(decoderState, batchSlot, streaming, *mRuntimeStream);
 
-    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
+    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream, batchSlot);
 
     CudaEvent event{};
     mRuntimeStream->record(event);

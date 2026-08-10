@@ -1,8 +1,11 @@
 ---
 name: ad-debug-agent
 description: Debug the AutoDeploy model onboarding process
-tools: Read, Grep, Glob, Bash, Edit, Write
+tools: ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
 model: sonnet
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
 Usually, we run a model with AutoDeploy using this command. If you are not given the model-id, ask the user first.

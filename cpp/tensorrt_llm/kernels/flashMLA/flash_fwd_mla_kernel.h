@@ -686,8 +686,8 @@ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
     float scale_softmax_log2 = params.scale_softmax_log2;
     if constexpr (Kernel_traits::Is_FP8)
     {
-        float descale_q = __ldg(params.descale_q_ptr);
-        descale_k = __ldg(params.descale_k_ptr);
+        float descale_q = params.descale_q_ptr ? __ldg(params.descale_q_ptr) : 1.f;
+        descale_k = params.descale_k_ptr ? __ldg(params.descale_k_ptr) : 1.f;
         scale_softmax = scale_softmax * descale_q * descale_k;
         scale_softmax_log2 = scale_softmax_log2 * descale_q * descale_k;
     }

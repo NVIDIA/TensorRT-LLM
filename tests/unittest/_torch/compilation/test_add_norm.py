@@ -38,7 +38,9 @@ def test_add_norm_fusion(dtype, enable_inductor):
     final_output, inter_output = func(x.clone(), residual.clone(), norm_weight,
                                       eps)
 
-    assert backend.match_count[0] == 1, "Pattern Matching Failed"
+    add_norm_fusion_pass_id = 1
+    assert backend.match_count[
+        add_norm_fusion_pass_id] == 1, "Pattern Matching Failed"
 
     torch_inter_output = x + residual
     torch_final_output = rms_norm(torch_inter_output, norm_weight, eps)

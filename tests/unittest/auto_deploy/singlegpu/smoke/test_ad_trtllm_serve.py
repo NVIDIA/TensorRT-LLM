@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import multiprocessing as mp
 import time
 
@@ -25,6 +39,8 @@ def test_trtllm_serve_openai_chat_completion(tmp_path):
     config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
     extra_args = config["args"]
 
+    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+    extra_args["attn_backend"] = "flashinfer"
     extra_options_path = tmp_path / "extra_llm_api_options.yaml"
     with open(extra_options_path, "w") as f:
         yaml.safe_dump(extra_args, f)

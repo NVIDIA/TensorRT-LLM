@@ -49,6 +49,14 @@ mdformat.................................................................Passed
 
 If any files were modified by this hook, you will need to stage and commit them again.
 
+> **Note:** Python files are split into two groups. **Group A** files get full
+> ruff formatting and linting. **Group B** (legacy) files get yapf/isort/autoflake
+> formatting plus supplemental ruff lint rules via the `ruff-legacy` hook.
+> The legacy hook is baseline-gated: pre-existing violations are tolerated, but
+> new violations introduced by your change will block the commit.
+> See [CODING_GUIDELINES.md](CODING_GUIDELINES.md#pre-commit-linting-supplemental-rules)
+> for details on the two-group system and how to graduate files.
+
 In addition, please try to keep pull requests (PRs) as concise as possible:
 * Avoid committing commented-out code.
 * Wherever possible, each PR should address a single concern. If there are several otherwise-unrelated things that should be fixed to reach a desired endpoint, our recommendation is to open several PRs and indicate the dependencies in the description. The more complex the changes are in a single PR, the more time it will take to review those changes.
@@ -113,9 +121,9 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 
 ## Tests and Code Review for Protected APIs
 
-Some APIs are committed to be stable; any breaking changes to these APIs require careful design and review.
+Some APIs are committed to be stable; breaking changes to these APIs should be avoided and require careful design and review.
 
-This repo contains an [API stability testsuite](./tests/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
+This repo contains an [API stability testsuite](./tests/unittest/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
 
 ```txt
 def test_signature(self):
@@ -130,6 +138,7 @@ tests/api_stability/test_api_stability.py:241: AssertionError
 ```
 
 As the error message suggests, please ask for reviews from the code owners of the corresponding APIs.
+If API stability reference files change, classify the accepted LLM API contract change with `api-compatible` or `api-breaking`; `api-breaking` also requires `BREAKING` in the PR title. See the [API change guide](./docs/source/developer-guide/api-change.md) for details.
 
 
 ## Signing Your Work

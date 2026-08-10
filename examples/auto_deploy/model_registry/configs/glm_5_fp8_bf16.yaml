@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5-FP8 uses the BF16-weight path here.
+tokenizer_kwargs:
+  extra_special_tokens: {}
+model_kwargs:
+  torch_dtype: bfloat16

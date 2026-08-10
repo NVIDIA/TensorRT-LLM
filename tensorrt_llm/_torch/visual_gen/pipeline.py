@@ -1,23 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
 import itertools
 import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from pydantic import Field
 
+from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .config import PipelineComponent
+from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .teacache import TeaCacheBackend
+from .profiler import VisualGenProfiler
+
+
+class ExtraParamSchema(StrictBaseModel):
+    """Schema for a model-specific extra parameter.
+
+    Returned by ``VisualGen.extra_param_specs`` so callers can
+    discover which ``extra_params`` keys are valid for the loaded pipeline.
+    """
+
+    type: str = Field(description="Python type name (e.g. 'float', 'int', 'bool').")
+    default: Any = Field(default=None, description="Default value used when omitted.")
+    description: str = Field(default="", description="Human-readable description.")
+    range: Optional[tuple] = Field(
+        default=None, description="Optional (min, max) range for numeric params."
+    )
+    validator: Optional[Callable[[Any], Any]] = Field(
+        default=None,
+        description="Optional value validator; raises ValueError on invalid "
+        "values. Must be a module-level function (specs are pickled to the "
+        "coordinator in the READY handshake).",
+    )
+
 
 if TYPE_CHECKING:
-    from .config import DiffusionModelConfig
+    from .cache import CacheAccelerator
+    from .config import DiffusionPipelineConfig
 
 
 class BasePipeline(nn.Module):
@@ -25,14 +70,28 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
+    @classmethod
+    def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
+        """Return *cls* or a more specialized subclass based on *config*.
+
+        Override in subclasses to select a variant pipeline at creation
+        time (e.g. upgrading a base pipeline to a two-stage variant when
+        extra checkpoint paths are provided).  The default returns *cls*
+        unchanged.
+        """
+        return cls
+
+    def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
-        self.model_config = model_config
-        self.config = model_config.pretrained_config
-        self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self.pipeline_config = pipeline_config
+        self.config = pipeline_config.primary_pretrained_config
+        self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+
+        # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
+        self.cache_accelerator: Optional["CacheAccelerator"] = None
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -40,6 +99,10 @@ class BasePipeline(nn.Module):
         self.text_encoder: Optional[nn.Module] = None
         self.tokenizer: Optional[Any] = None
         self.scheduler: Optional[Any] = None
+        self._is_warmup: bool = False
+
+        # Profiler window scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profiler = VisualGenProfiler(rank=self.rank)
 
         # Initialize transformer
         self._init_transformer()
@@ -49,15 +112,40 @@ class BasePipeline(nn.Module):
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
 
-    def _setup_cuda_graphs(self):
-        """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.model_config.cuda_graph.enable_cuda_graph:
-            return
+    def run_inference(self, req: Any) -> Any:
+        """Run model-specific inference within shared request profiler boundaries."""
+        if self._is_warmup:
+            return self.infer(req)
+        with self._profiler.request_scope():
+            return self.infer(req)
 
-        if self.model_config.torch_compile.enable_torch_compile:
-            logger.warning(
-                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
-            )
+    def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
+        """Enumerate a denoise loop's steps within its profiling windows.
+
+        ``BasePipeline.denoise()`` uses this, and so must any pipeline that
+        writes its own denoise loop (Qwen-Image, LTX-2 stage 2) — otherwise
+        that loop is silently absent from every trace. Substitute it for the
+        loop's ``enumerate()``; it owns every window boundary the loop has::
+
+            for i, t in self._profile_denoise_steps(timesteps):
+                ...
+        """
+        if self._is_warmup:
+            return enumerate(timesteps)
+        return self._profiler.steps(timesteps)
+
+    def _setup_cuda_graphs(self):
+        """Wrap all transformer components with CUDA graph capture/replay.
+
+        Composes with torch.compile: the runner wraps the (outer) transformer
+        ``forward`` while torch.compile compiles the inner transformer blocks
+        (see ``torch_compile``). Graph capture happens during warmup, by which
+        point the runner's own ``WARMUP_STEPS`` eager iterations have already
+        triggered torch.compile's lazy compilation, so the captured graph
+        contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
+        relies on the same ordering.)
+        """
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         if len(self.transformer_components) > 1:
@@ -68,15 +156,32 @@ class BasePipeline(nn.Module):
         else:
             shared_pool = None
 
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         for name in self.transformer_components:
             model = getattr(self, name, None)
             if model is None:
                 continue
 
-            runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True), shared_pool)
-            logger.info(f"CUDA graph runner: wrapping {name}.forward")
+            runner = CUDAGraphRunner(
+                CUDAGraphRunnerConfig(use_cuda_graph=True),
+                shared_pool,
+            )
+            model.register_cuda_graph_extra_key_fns(runner)
+            logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    @contextlib.contextmanager
+    def disallow_cuda_graph_capture(self):
+        """Run wrapped forwards eagerly instead of capturing new CUDA graphs."""
+        prev = {name: r.allow_capture for name, r in self._cuda_graph_runners.items()}
+        for r in self._cuda_graph_runners.values():
+            r.allow_capture = False
+        try:
+            yield
+        finally:
+            for name, r in self._cuda_graph_runners.items():
+                r.allow_capture = prev[name]
 
     @property
     def rank(self):
@@ -88,9 +193,7 @@ class BasePipeline(nn.Module):
 
     @property
     def dtype(self):
-        if hasattr(self, "transformer"):
-            return next(self.transformer.parameters()).dtype
-        return torch.float32
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -109,6 +212,14 @@ class BasePipeline(nn.Module):
         The executor uses this to check whether a request shape was warmed up.
         """
         return (height, width, num_frames)
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        """Return the warmup cache key for a prepared inference request."""
+        return self.warmup_cache_key(
+            req.params.height,
+            req.params.width,
+            num_frames=req.params.num_frames,
+        )
 
     @property
     def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
@@ -174,7 +285,7 @@ class BasePipeline(nn.Module):
         Returns:
             (shapes, steps) tuple where shapes = list of (h, w, f)
         """
-        warmup_cfg = self.model_config.compilation
+        warmup_cfg = self.pipeline_config.compilation
 
         if warmup_cfg.resolutions is not None or warmup_cfg.num_frames is not None:
             resolutions = (
@@ -208,6 +319,45 @@ class BasePipeline(nn.Module):
         """Return the VAE adapter class for the pipeline."""
         return None
 
+    @property
+    def extra_param_specs(self) -> Dict[str, ExtraParamSchema]:
+        """Model-specific extra parameter specs.
+
+        Subclasses override to declare which ``extra_params`` keys they
+        accept and their metadata.  Maps parameter names to
+        ``ExtraParamSchema`` instances.
+        """
+        return {}
+
+    @property
+    def default_generation_params(self) -> dict:
+        """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
+
+        Keys should match ``VisualGenParams`` field names.  The executor
+        merges these into ``request.params`` before calling ``infer()``.
+        """
+        return {}
+
+    def prepare_request(self, req: Any) -> None:
+        """Prepare model-specific inputs before warmup bookkeeping.
+
+        Subclasses may mutate internal request state and resolve request
+        parameters needed by :meth:`request_warmup_cache_key`. The default
+        implementation is a no-op.
+        """
+
+    def classify_request_failure(self, exc: BaseException) -> Optional[str]:
+        """Failure class for the response channel, or ``None`` if unknown.
+
+        Opt-in per pipeline: a pipeline that knows which of its failures are
+        caused by the request's own content returns ``"client"`` or
+        ``"capacity"`` for those. The default leaves every failure
+        unclassified, because the exception's built-in type alone does not say
+        whose fault it was -- a ``ValueError`` is just as likely to be an
+        internal invariant as a rejected input.
+        """
+        return None
+
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -237,8 +387,6 @@ class BasePipeline(nn.Module):
                 f"Checkpoint directory must contain a 'transformer' subdirectory."
             )
 
-        from .checkpoints import WeightLoader
-
         weight_loader = WeightLoader(components=transformer_components)
         return weight_loader.load_weights(checkpoint_dir, self.mapping)
 
@@ -259,96 +407,164 @@ class BasePipeline(nn.Module):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
-    def _setup_teacache(self, model, coefficients: Optional[Dict] = None):
-        """Setup TeaCache optimization for the transformer model.
+    def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
+        """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
 
-        TeaCache caches transformer block outputs when timestep embeddings change slowly,
-        reducing computation during the denoising loop.
+        Precedence:
+
+        1. User-specified TeaCacheConfig.coefficients — any non-None list skips built-in
+           variant matching.
+
+        2. Pipeline table — if step 1 does not apply and coefficients is a non-empty dict
+           (model-specific tables from the pipeline subclass), match
+           pretrained_config._name_or_path against keys and set coefficients (and optional
+           default_thresh).
+
+        3. If coefficients are still unresolved after step 2, _setup_cache_acceleration
+           raises: TeaCache must not run without resolved coefficients.
 
         Args:
-            model: The transformer model to optimize
-            coefficients: Optional dict of model-specific polynomial coefficients for cache decisions
-                         Format: {model_size: {"ret_steps": [...], "standard": [...]}}
+            coefficients: Optional mapping from variant key to coefficient list or nested
+                dict (ret_steps / standard), from the pipeline subclass.
         """
-        self.cache_backend = None
-
-        # Get teacache config from model_config (always present now)
-        teacache_cfg = self.model_config.teacache
-        if not teacache_cfg.enable_teacache:
+        teacache_cfg = self.pipeline_config.teacache
+        if teacache_cfg is None:
+            return
+        if teacache_cfg.is_explicit_user_override():
+            logger.info(
+                "TeaCache: Using user-configured coefficients "
+                "(skipping built-in checkpoint variant matching)"
+            )
             return
 
-        # Apply model-specific polynomial coefficients
-        # Coefficients are used to rescale embedding distances for cache decisions
-        if coefficients:
-            checkpoint_path = (
-                getattr(self.model_config.pretrained_config, "_name_or_path", "") or ""
-            )
-            for model_size, coeff_data in coefficients.items():
-                # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
-                if model_size.lower() in checkpoint_path.lower():
-                    if isinstance(coeff_data, dict):
-                        # Select coefficient set based on warmup mode
-                        mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                        if mode in coeff_data:
-                            teacache_cfg.coefficients = coeff_data[mode]
-                            logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                        # Apply model-specific default threshold if user didn't explicitly set one
-                        default_thresh = coeff_data.get("default_thresh")
-                        if (
-                            default_thresh is not None
-                            and "teacache_thresh" not in teacache_cfg.model_fields_set
-                        ):
-                            teacache_cfg.teacache_thresh = default_thresh
-                            logger.info(
-                                f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                            )
-                    else:
-                        # Single coefficient list (no mode distinction)
-                        teacache_cfg.coefficients = coeff_data
-                        logger.info(f"TeaCache: Using {model_size} coefficients")
-                    break
-            else:
-                raise ValueError(
-                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
-                    f"Available variants: {list(coefficients.keys())}. "
-                    f"TeaCache is not supported for this model variant."
-                )
+        teacache_explicit = teacache_cfg.model_dump(exclude_unset=True)
 
-        # Initialize and enable TeaCache backend
-        logger.info("TeaCache: Initializing...")
-        self.cache_backend = TeaCacheBackend(teacache_cfg)
-        self.cache_backend.enable(model)
+        if not coefficients:
+            if teacache_cfg.coefficients is None:
+                raise ValueError(
+                    "TeaCache is enabled but no polynomial coefficients were resolved. "
+                    "Set teacache.coefficients in VisualGenArgs, or use a pipeline and "
+                    "checkpoint whose path matches a built-in coefficient table."
+                )
+            return
+
+        checkpoint_path = (
+            getattr(self.pipeline_config.primary_pretrained_config, "_name_or_path", "") or ""
+        )
+
+        for model_size, coeff_data in coefficients.items():
+            # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
+            path_l = checkpoint_path.lower()
+            key_l = model_size.lower()
+            if key_l not in path_l:
+                continue
+
+            if isinstance(coeff_data, dict):
+                # Select coefficient set based on warmup mode
+                mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                if mode not in coeff_data:
+                    logger.warning(
+                        "TeaCache: matched variant %r but table has no %r entry "
+                        "(available keys: %s). Trying other variants.",
+                        model_size,
+                        mode,
+                        list(coeff_data.keys()),
+                    )
+                    continue
+                teacache_cfg.coefficients = coeff_data[mode]
+                logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                # Apply model-specific default threshold if user didn't explicitly set one
+                default_thresh = coeff_data.get("default_thresh")
+                if default_thresh is not None and "teacache_thresh" not in teacache_explicit:
+                    teacache_cfg.teacache_thresh = default_thresh
+                    logger.info(f"TeaCache: Using {model_size} default threshold {default_thresh}")
+                break
+            else:
+                # Single coefficient list (no mode distinction)
+                teacache_cfg.coefficients = coeff_data
+                logger.info(f"TeaCache: Using {model_size} coefficients")
+                break
+        else:
+            raise ValueError(
+                f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                f"Available variants: {list(coefficients.keys())}. "
+                f"Set teacache.coefficients explicitly in VisualGenArgs to use TeaCache anyway, "
+                f"or use a checkpoint path that contains one of the variant keys."
+            )
+
+    def _setup_cache_acceleration(self) -> None:
+        """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
+
+        if getattr(self, "cache_accelerator", None) is not None:
+            self.cache_accelerator.unwrap()
+            self.cache_accelerator = None
+
+        cfg = self.pipeline_config
+
+        if cfg.cache_backend == "cache_dit":
+            acc = CacheDiTAccelerator(self, cfg.cache_dit)
+            acc.wrap()
+            self.cache_accelerator = acc
+            return
+
+        use_teacache = cfg.cache_backend == "teacache"
+        if not use_teacache:
+            return
+
+        acc = TeaCacheAccelerator(self, cfg.teacache)
+        acc.wrap()
+        self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
-        if not self.model_config.parallel.enable_parallel_vae:
-            return
-        if not dist.is_initialized() or dist.get_world_size() <= 1:
-            return
-        if self.vae is None:
+        """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
+
+        ``self._parallel_vae_enabled`` is a *global* mode flag: it is computed
+        from inputs that are identical on every rank (config + mapping +
+        deterministic capability check), so every rank agrees on whether
+        parallel-VAE decode ownership applies. The actual ``ParallelVAEFactory``
+        wrap is a local side effect that only runs on ranks in ``vae_ranks``.
+        """
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
+
+        # Global preconditions — evaluate identically on every rank.
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and self.vae is not None
+            and vgm is not None
+            and ParallelVAEFactory.supports(type(self.vae))
+        )
+        if not self._parallel_vae_enabled:
+            # Quick check to see if it wasn't enabled due to missing support.
+            if (
+                parallel_cfg.parallel_vae_size > 1
+                and self.vae is not None
+                and not ParallelVAEFactory.supports(type(self.vae))
+            ):
+                logger.warning(
+                    f"Parallel VAE not supported for {self.__class__.__name__} "
+                    f"(VAE type: {type(self.vae).__name__}). "
+                    "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
+                    "parallel VAE for this VAE type."
+                )
             return
 
-        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
-        pg = dist.new_group(list(range(dist.get_world_size())))
-        try:
-            self.vae = ParallelVAEFactory.from_vae(
-                self.vae,
-                split_dim=self.model_config.parallel.parallel_vae_split_dim,
-                pg=pg,
-            )
-        except ValueError:
-            logger.warning(
-                f"Parallel VAE not supported for {self.__class__.__name__} "
-                f"(VAE type: {type(self.vae).__name__}). "
-                "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
-                "parallel VAE for this VAE type."
-            )
+        # Local side effect: only ranks in the VAE group wrap the VAE module.
+        if self.rank not in vgm.vae_ranks or vgm.vae_group is None:
             return
 
-        self._parallel_vae_enabled = True
+        self.vae = ParallelVAEFactory.from_vae(
+            self.vae,
+            split_dim=parallel_cfg.parallel_vae_split_dim,
+            pg=vgm.vae_group,
+            adj_groups=vgm.vae_adj_groups,
+        )
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
-            f"world_size={dist.get_world_size(pg)}"
+            f"split_dim={parallel_cfg.parallel_vae_split_dim}, "
+            f"world_size={dist.get_world_size(vgm.vae_group)}"
         )
 
     def torch_compile(self) -> None:
@@ -360,7 +576,7 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
-        tc_config = self.model_config.torch_compile
+        tc_config = self.pipeline_config.torch_compile
 
         # Using default as max-autotune mode takes more initialization time and
         # does not improve performance a lot.
@@ -419,12 +635,14 @@ class BasePipeline(nn.Module):
     def warmup(self) -> None:
         """Run warmup inference to trigger torch.compile and CUDA initialization.
 
-        Resolves warmup shapes from user config or model defaults, then runs
-        a short denoising loop with dummy inputs for each shape. This:
-        1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
-        2. Pre-captures CUDA graphs (if enabled)
-        3. Warms up CUDA kernels and allocators
-        4. Populates any lazy caches (e.g., RoPE frequencies)
+        Resolves warmup shapes from user config or model defaults, then runs a
+        short denoising loop with dummy inputs for each shape, triggering
+        torch.compile, CUDA graph capture (if enabled), and autotuner tuning.
+
+        With autotuning enabled, a single rank tunes and captures in one pass.
+        On multiple ranks, tactics are tuned with capture off, merged across
+        ranks at ``autotune()`` exit, then recaptured — so every rank bakes the
+        same tactic into its graphs.
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
@@ -434,22 +652,61 @@ class BasePipeline(nn.Module):
             logger.info("Warmup disabled (no warmup shapes)")
             return
 
+        shape_list = ", ".join(f"{h}x{w}x{f}" for h, w, f in shapes)
         logger.info(
-            f"Running warmup for {self.__class__.__name__} "
-            f"with {len(shapes)} shapes and {steps} steps..."
+            f"Running warmup for {self.__class__.__name__}: "
+            f"{len(shapes)} shape(s) [{shape_list}], {steps} steps..."
         )
         warmup_start = time.time()
 
-        for height, width, num_frames in shapes:
-            logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
-            self._run_warmup(height, width, num_frames, steps)
-            torch.cuda.synchronize()
+        # Autotuner tuning knobs: cache path from env, plus (multi-rank only) a
+        # world-group communicator that drives the post-tune cross-rank merge.
+        enable_autotune = self.pipeline_config.torch_compile.enable_autotune
+        cache_path = None
+        post_tune_merge_dist = None
+        if enable_autotune:
+            cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                amap = self.pipeline_config.visual_gen_mapping.to_autotuner_mapping()
+                post_tune_merge_dist = _VisualGenAutotuneDist(amap)
+
+        self._is_warmup = True
+        try:
+            if not enable_autotune:
+                self._run_warmup_pass(shapes, steps)
+            elif post_tune_merge_dist is None:
+                # Single rank: nothing to merge; tune and capture in one pass.
+                with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                    self._run_warmup_pass(shapes, steps)
+            else:
+                # Multi rank: tune with capture off, merge tactics across ranks
+                # at autotune() exit, then recapture from the merged tactics
+                # (only needed when CUDA graphs are enabled).
+                with (
+                    self.disallow_cuda_graph_capture(),
+                    autotune(
+                        cache_path=cache_path,
+                        skip_dynamic_tuning_buckets=True,
+                        post_tune_merge_dist=post_tune_merge_dist,
+                    ),
+                ):
+                    self._run_warmup_pass(shapes, steps)
+                if self.pipeline_config.cuda_graph.enable:
+                    self._run_warmup_pass(shapes, steps)
+        finally:
+            self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _run_warmup_pass(self, shapes, steps) -> None:
+        """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
+        for height, width, num_frames in shapes:
+            self._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         """Run warmup for a single shape. Subclasses must override.
@@ -471,40 +728,40 @@ class BasePipeline(nn.Module):
         decode_fn: Callable[[torch.Tensor], Any],
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
-        """Execute VAE decoding. Only rank 0 performs decoding.
-        If parallel VAE is enabled, all processes perform decoding.
+        """Execute VAE decoding.
+
+        Decode ownership is decided from the global ``_parallel_vae_enabled``
+        flag set by ``setup_parallel_vae``:
+
+        - parallel-VAE mode on: ranks in ``vgm.vae_ranks`` decode collectively.
+        - parallel-VAE mode off: only rank 0 decodes.
+
+        Non-decoding ranks return ``None`` placeholders.
 
         Args:
-            latents: Primary latents to decode (e.g., video)
-            decode_fn: Decoder function for primary latents
+            latents: Primary latents to decode (e.g., video).
+            decode_fn: Decoder function for primary latents.
             extra_latents: Optional dict of additional latents to decode.
-                          Format: {name: (latents_tensor, decode_fn)}
-                          Example: {"audio": (audio_latents, audio_decode_fn)}
+                Format: ``{name: (latents_tensor, decode_fn)}``.
+                Example: ``{"audio": (audio_latents, audio_decode_fn)}``.
 
         Returns:
-            Single result if no extra_latents, tuple of results if extra_latents provided.
-            Non-rank-0 processes return None placeholders.
+            Single result if no ``extra_latents``, else a tuple of results.
+            Non-decoding ranks return ``None`` (or a tuple of ``None``).
         """
-
         if self._parallel_vae_enabled:
+            vgm = self.pipeline_config.visual_gen_mapping
+            decode_ranks = set(vgm.vae_ranks)
+        else:
+            decode_ranks = {0}
+
+        if self.rank in decode_ranks:
             primary_result = decode_fn(latents)
             if extra_latents:
                 extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
                 return (primary_result,) + tuple(extra_results)
             return primary_result
 
-        if self.rank == 0:
-            primary_result = decode_fn(latents)
-
-            if extra_latents:
-                extra_results = []
-                for name, (extra_latent, extra_decode_fn) in extra_latents.items():
-                    extra_results.append(extra_decode_fn(extra_latent))
-                return (primary_result,) + tuple(extra_results)
-
-            return primary_result
-
-        # Return None placeholders for non-rank-0 processes
         n_results = 1 + (len(extra_latents) if extra_latents else 0)
         return (None,) * n_results if n_results > 1 else None
 
@@ -515,6 +772,26 @@ class BasePipeline(nn.Module):
         std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
         noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
         return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+
+    @staticmethod
+    def _resolve_step_guidance_scale(
+        t: torch.Tensor,
+        guidance_scale: float,
+        guidance_interval: Optional[Tuple[float, float]] = None,
+        guidance_scale_2: Optional[float] = None,
+        boundary_timestep: Optional[float] = None,
+    ) -> float:
+        """Per-step CFG scale, including two-stage and guidance-interval gating."""
+        current = guidance_scale
+        t_scalar = t.item() if t.dim() == 0 else t[0].item()
+        if guidance_scale_2 is not None and boundary_timestep is not None:
+            if t_scalar < boundary_timestep:
+                current = guidance_scale_2
+        if guidance_interval is not None:
+            interval_lo, interval_hi = guidance_interval
+            if not (interval_lo <= t_scalar <= interval_hi):
+                current = 1.0
+        return current
 
     def _setup_cfg_config(
         self, guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors=None
@@ -533,11 +810,14 @@ class BasePipeline(nn.Module):
         Returns:
             Dict with CFG configuration including split tensors
         """
-        # Access parallel config directly (always present now)
-        cfg_size = self.model_config.parallel.dit_cfg_size
-        ulysses_size = self.model_config.parallel.dit_ulysses_size
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
 
-        cfg_group = self.rank // ulysses_size
+        is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
         do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
 
@@ -545,7 +825,12 @@ class BasePipeline(nn.Module):
 
         if do_cfg_parallel:
             if self.rank == 0:
-                logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
+                if attn2d_row_size * attn2d_col_size > 1:
+                    logger.info(
+                        f"CFG Parallel: cfg_size={cfg_size}, "
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}, "
+                        f"ulysses_size={ulysses_size}"
+                    )
 
             # Split main embeddings
             if is_split_embeds:
@@ -553,15 +838,14 @@ class BasePipeline(nn.Module):
             else:
                 neg_embeds, pos_embeds = prompt_embeds.chunk(2)
 
-            local_embeds = pos_embeds if cfg_group == 0 else neg_embeds
+            local_embeds = pos_embeds if is_conditional else neg_embeds
 
             # Split extra tensors if provided
             if extra_cfg_tensors:
                 for name, (pos_tensor, neg_tensor) in extra_cfg_tensors.items():
                     if pos_tensor is not None and neg_tensor is not None:
-                        local_extras[name] = pos_tensor if cfg_group == 0 else neg_tensor
+                        local_extras[name] = pos_tensor if is_conditional else neg_tensor
                     elif pos_tensor is not None:
-                        # Only positive provided, use it for both
                         local_extras[name] = pos_tensor
         else:
             local_embeds = None
@@ -578,9 +862,7 @@ class BasePipeline(nn.Module):
 
         return {
             "enabled": do_cfg_parallel,
-            "cfg_size": cfg_size,
-            "ulysses_size": ulysses_size,
-            "cfg_group": cfg_group,
+            "seq_parallel_size": seq_parallel_size,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
@@ -590,17 +872,29 @@ class BasePipeline(nn.Module):
         self,
         latents,
         extra_stream_latents,
+        step_index,
         timestep,
         local_embeds,
         forward_fn,
         guidance_scale,
         guidance_rescale,
-        ulysses_size,
+        seq_parallel_size,
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_pg = vgm.cfg_group if vgm else None
+        cfg_size = vgm.cfg_size if vgm else 1
+
         t_start = time.time()
-        result = forward_fn(latents, extra_stream_latents, timestep, local_embeds, local_extras)
+        result = forward_fn(
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            local_embeds,
+            local_extras,
+        )
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
@@ -613,22 +907,24 @@ class BasePipeline(nn.Module):
 
         c_start = time.time()
 
-        # All-gather primary noise (must be contiguous for NCCL)
+        # All-gather primary noise over the CFG group.
+        # Each entry in gather_list corresponds to one CFG rank
+        # (index 0 = conditional, index 1 = unconditional).
         noise_pred_local = noise_pred_local.contiguous()
-        gather_list = [torch.empty_like(noise_pred_local) for _ in range(self.world_size)]
-        dist.all_gather(gather_list, noise_pred_local)
+        gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
+        dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
         noise_cond = gather_list[0]
-        noise_uncond = gather_list[ulysses_size]
+        noise_uncond = gather_list[1]
         noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
         # All-gather extra stream noises
         extra_noise_preds = {}
         for name, noise_local in extra_noise_locals.items():
             noise_local = noise_local.contiguous()
-            gather_list_extra = [torch.empty_like(noise_local) for _ in range(self.world_size)]
-            dist.all_gather(gather_list_extra, noise_local)
+            gather_list_extra = [torch.empty_like(noise_local) for _ in range(cfg_size)]
+            dist.all_gather(gather_list_extra, noise_local, group=cfg_pg)
             noise_cond_extra = gather_list_extra[0]
-            noise_uncond_extra = gather_list_extra[ulysses_size]
+            noise_uncond_extra = gather_list_extra[1]
             extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
                 noise_cond_extra - noise_uncond_extra
             )
@@ -648,15 +944,17 @@ class BasePipeline(nn.Module):
         self,
         latents,
         extra_stream_latents,
+        step_index,
         timestep,
         prompt_embeds,
         forward_fn,
         guidance_scale,
         guidance_rescale,
         local_extras,
+        do_cfg: bool = False,
     ):
         """Execute single denoising step without CFG parallel."""
-        if guidance_scale > 1.0:
+        if do_cfg:
             latent_input = torch.cat([latents] * 2)
             # Duplicate extra stream latents for CFG
             extra_stream_input = {
@@ -671,7 +969,12 @@ class BasePipeline(nn.Module):
 
         t_start = time.time()
         result = forward_fn(
-            latent_input, extra_stream_input, timestep_expanded, prompt_embeds, local_extras
+            latent_input,
+            extra_stream_input,
+            step_index,
+            timestep_expanded,
+            prompt_embeds,
+            local_extras,
         )
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
@@ -684,7 +987,7 @@ class BasePipeline(nn.Module):
         t_transformer = time.time() - t_start
 
         c_start = time.time()
-        if guidance_scale > 1.0:
+        if do_cfg:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
@@ -719,16 +1022,22 @@ class BasePipeline(nn.Module):
         timestep,
         scheduler,
         extra_stream_schedulers,
+        scheduler_step_kwargs=None,
     ):
         """Execute scheduler step for all streams."""
+        step_kwargs = scheduler_step_kwargs or {}
         t_start = time.time()
-        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False, **step_kwargs)[0]
 
         # Step schedulers for extra streams
         for name, noise_extra in extra_noise_preds.items():
             if name in extra_stream_schedulers:
                 extra_stream_latents[name] = extra_stream_schedulers[name].step(
-                    noise_extra, timestep, extra_stream_latents[name], return_dict=False
+                    noise_extra,
+                    timestep,
+                    extra_stream_latents[name],
+                    return_dict=False,
+                    **step_kwargs,
                 )[0]
 
         t_sched = time.time() - t_start
@@ -749,6 +1058,9 @@ class BasePipeline(nn.Module):
         extra_streams: Optional[Dict[str, Tuple[torch.Tensor, Any]]] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_timestep: Optional[float] = None,
+        guidance_interval: Optional[Tuple[float, float]] = None,
+        post_step_fn: Optional[Callable] = None,
+        scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -758,8 +1070,11 @@ class BasePipeline(nn.Module):
             prompt_embeds: Text embeddings (positive)
             guidance_scale: CFG strength (1.0 = no guidance)
             forward_fn: Transformer forward function
-                       Signature: forward_fn(latents, extra_stream_latents, timestep,
-                                            encoder_hidden_states, extra_tensors_dict)
+                       Signature: forward_fn(latents, extra_stream_latents, step_index,
+                                            timestep, encoder_hidden_states,
+                                            extra_tensors_dict)
+                       step_index is the ordinal denoising-loop index, distinct
+                       from the scheduler timestep value.
                        Returns: (primary_noise, extra_stream_noises_dict) or just primary_noise
             timesteps: Optional custom timesteps (defaults to scheduler.timesteps)
             neg_prompt_embeds: Optional negative text embeddings for CFG
@@ -775,6 +1090,14 @@ class BasePipeline(nn.Module):
                              to guidance_scale_2 when timestep < boundary_timestep.
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
+            guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
+                              is active. Outside the interval the effective scale is 1.0
+                              (conditional prediction only); both branches still run.
+            post_step_fn: Optional callable applied after each scheduler step,
+                         invoked as ``post_step_fn(latents) -> latents``.
+                         Use for constraints that must hold throughout denoising.
+            scheduler_step_kwargs: Extra keyword arguments forwarded to every
+                         scheduler's ``step()`` call.
 
         Returns:
             Single latents if no extra_streams
@@ -786,14 +1109,9 @@ class BasePipeline(nn.Module):
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
 
-        # Reset TeaCache state for new generation
-        # Sets warmup/cutoff steps based on total_steps
-        if (
-            hasattr(self, "cache_backend")
-            and self.cache_backend
-            and self.cache_backend.is_enabled()
-        ):
-            self.cache_backend.refresh(total_steps)
+        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
+        if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+            self.cache_accelerator.refresh(total_steps)
 
         if self.rank == 0:
             if has_extra_streams:
@@ -807,6 +1125,7 @@ class BasePipeline(nn.Module):
         cfg_config = self._setup_cfg_config(
             guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors
         )
+        do_cfg = guidance_scale > 1.0
         do_cfg_parallel = cfg_config["enabled"]
         prompt_embeds = cfg_config["prompt_embeds"]
         local_extras = cfg_config["local_extras"]
@@ -821,41 +1140,55 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
-        for i, t in enumerate(timesteps):
+        for i, t in self._profile_denoise_steps(timesteps):
             step_start = time.time()
 
-            # Two-stage denoising: switch guidance scale at boundary
-            current_guidance_scale = guidance_scale
-            if guidance_scale_2 is not None and boundary_timestep is not None:
-                t_scalar = t.item() if t.dim() == 0 else t[0].item()
-                if t_scalar < boundary_timestep:
-                    current_guidance_scale = guidance_scale_2
+            current_guidance_scale = self._resolve_step_guidance_scale(
+                t,
+                guidance_scale,
+                guidance_interval,
+                guidance_scale_2,
+                boundary_timestep,
+            )
 
             # Denoise
             with nvtx_range(f"denoise_step {i}"):
                 if do_cfg_parallel:
                     timestep = t.expand(latents.shape[0])
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
+                    (
+                        noise_pred,
+                        extra_noise_preds,
+                        t_trans,
+                        t_cfg,
+                    ) = self._denoise_step_cfg_parallel(
                         latents,
                         extra_stream_latents,
+                        i,
                         timestep,
                         cfg_config["local_embeds"],
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
-                        cfg_config["ulysses_size"],
+                        cfg_config["seq_parallel_size"],
                         local_extras,
                     )
                 else:
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
+                    (
+                        noise_pred,
+                        extra_noise_preds,
+                        t_trans,
+                        t_cfg,
+                    ) = self._denoise_step_standard(
                         latents,
                         extra_stream_latents,
+                        i,
                         t,
                         prompt_embeds,
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
                         local_extras,
+                        do_cfg=do_cfg,
                     )
 
             # Scheduler step for all streams
@@ -867,7 +1200,11 @@ class BasePipeline(nn.Module):
                 t,
                 scheduler,
                 extra_stream_schedulers,
+                scheduler_step_kwargs=scheduler_step_kwargs,
             )
+
+            if post_step_fn is not None:
+                latents = post_step_fn(latents)
 
             # Logging
             if self.rank == 0:
@@ -885,23 +1222,35 @@ class BasePipeline(nn.Module):
             logger.info("=" * 80)
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
-            # Log TeaCache performance statistics
-            # Shows how many transformer steps were skipped (cache hits) vs computed
-            if (
-                hasattr(self, "cache_backend")
-                and self.cache_backend
-                and self.cache_backend.is_enabled()
-            ):
-                stats = self.cache_backend.get_stats()
+            # Single logging site for TeaCache and Cache-DiT.
+            if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+                stats = self.cache_accelerator.get_stats()
                 if stats:
-                    logger.info(
-                        f"TeaCache: {stats['hit_rate']:.1%} hit rate ({stats['cached']}/{stats['total']} steps)"
-                    )
+                    if self.pipeline_config.cache_backend == "cache_dit":
+                        logger.info("Cache-DiT stats: %s", stats)
+                    elif self.pipeline_config.cache_backend == "teacache":
+                        first_val = next(iter(stats.values()), None)
+                        if isinstance(first_val, dict):
+                            for key, s in stats.items():
+                                if "hit_rate" in s:
+                                    logger.info(
+                                        f"TeaCache {key}: {s['hit_rate']:.1%} hit rate "
+                                        f"({s['cached']}/{s['total']} steps)"
+                                    )
+                        elif "hit_rate" in stats:
+                            logger.info(
+                                f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                                f"({stats['cached']}/{stats['total']} steps)"
+                            )
+                    else:
+                        logger.info("Cache acceleration stats: %s", stats)
 
         return (latents, extra_stream_latents) if has_extra_streams else latents
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
+        self._profiler.close_window()
+
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

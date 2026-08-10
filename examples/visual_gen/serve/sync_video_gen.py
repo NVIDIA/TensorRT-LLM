@@ -32,6 +32,7 @@ def test_sync_video_generation(
     fps: int = 24,
     size: str = "256x256",
     output_file: str = "output_sync.mp4",
+    format: str = "auto",
 ):
     """Test synchronous video generation with direct HTTP requests.
 
@@ -79,6 +80,7 @@ def test_sync_video_generation(
                 "size": size,
                 "seconds": str(duration),
                 "fps": str(fps),
+                "format": format,
             }
 
             # Add the file
@@ -103,18 +105,25 @@ def test_sync_video_generation(
                     "size": size,
                     "seconds": duration,
                     "fps": fps,
+                    "format": format,
                 },
             )
 
         print(f"\nStatus code: {response_video.status_code}")
 
         if response_video.status_code == 200:
-            # Determine actual file extension from Content-Type header
-            content_type = response_video.headers.get("content-type", "video/mp4")
-            if "x-msvideo" in content_type or "avi" in content_type:
-                actual_ext = ".avi"
+            # Determine the on-disk extension. Tensor formats are
+            # selected by the request and the server returns
+            # ``application/octet-stream``; encoder formats can be
+            # disambiguated from Content-Type (mp4 vs avi).
+            if format in ("safetensors", "pt"):
+                actual_ext = f".{format}"
             else:
-                actual_ext = ".mp4"
+                content_type = response_video.headers.get("content-type", "video/mp4")
+                if "x-msvideo" in content_type or "avi" in content_type:
+                    actual_ext = ".avi"
+                else:
+                    actual_ext = ".mp4"
 
             # Adjust output filename if extension doesn't match
             output_path = Path(output_file)
@@ -214,6 +223,17 @@ Examples:
         default="output_sync.mp4",
         help="Output video file path (extension may change based on server encoder: .mp4 or .avi)",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="auto",
+        choices=["mp4", "avi", "auto", "safetensors", "pt"],
+        help=(
+            "Generation content encoding format. Video encoders: mp4 / "
+            "avi / auto. Tensor payloads: safetensors / pt carry video + "
+            "audio + scalar metadata in a single file."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -239,6 +259,7 @@ Examples:
         fps=args.fps,
         size=args.size,
         output_file=args.output,
+        format=args.format,
     )
 
     sys.exit(0 if success else 1)

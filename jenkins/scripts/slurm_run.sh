@@ -7,28 +7,6 @@ trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAN
 cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
-set_value_in_command() {
-    # Parameters
-    local key="$1"
-    local value="$2"
-    local command="$3"
-
-    # Transform the key
-    local placeholder="__PLACEHOLDER_${key}__"
-
-    # Check if placeholder exists
-    if [[ "$command" != *"$placeholder"* ]]; then
-        echo "Error: placeholder '$placeholder' not found in the command" >&2
-        return 1
-    fi
-
-    # Replace all occurrences
-    local result="${command//${placeholder}/${value}}"
-
-    # Return the result
-    echo "$result"
-}
-
 # Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
     # Update HOME/.gitconfig
@@ -54,32 +32,24 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
-# get trtllm wheel path and add to pytest command
+# Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-# In disaggregated mode, we only set coverage config file in benchmark pytest.
-if [[ -z "${DISAGG_SERVING_TYPE:-}" || "${DISAGG_SERVING_TYPE}" == "BENCHMARK" ]]; then
-    pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
-fi
 
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then
-    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+    sed -i "s|@TRTLLM_WHEEL_PATH@|$trtllmWhlPath|g" "$coverageConfigFile"
 else
     # Sleep 30 seconds to wait for the coverage config file to be saved
     sleep 30
 fi
 
-containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
-containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
-containerLDLibPath=$LD_LIBRARY_PATH
-containerLDLibPath=$(echo "$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
-if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
-  containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
-  containerLDLibPath="${containerLDLibPath%:}"
-fi
-export LD_LIBRARY_PATH=$containerLDLibPath
+# Library path + UCX/PMIx fixups shared with the disagg cache-transceiver
+# precheck (slurm_precheck_run.sh) -- keeping them in one place guarantees the
+# precheck observes the same network environment as the real test steps.
+source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
+slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
@@ -133,11 +103,8 @@ if [ $pytest_exit_code -eq 4 ]; then
 fi
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    if [[ "$stageName" == *PyTorch* ]]; then
-        basePerfFilename="base_perf_pytorch.csv"
-    else
-        basePerfFilename="base_perf.csv"
-    fi
+    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
+    basePerfFilename="base_perf_pytorch.csv"
     basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
     echo "Check Perf Result"
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \

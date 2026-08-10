@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
@@ -17,6 +15,8 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl, register_auto_model
 
 
@@ -177,7 +177,7 @@ class CLIPVisionTransformer(nn.Module):
 
 
 @register_auto_model("CLIPVisionModel")
-class CLIPVisionModel(nn.Module):
+class CLIPVisionModel(nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[CLIPVisionConfig]):
         super().__init__()
@@ -191,12 +191,6 @@ class CLIPVisionModel(nn.Module):
 
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=
-            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
-            max_num_tokens=model_config.max_num_tokens,
-            kv_cache_manager=None,
-        )
 
     def prepare_attn_metadata(self, batch_size):
         """

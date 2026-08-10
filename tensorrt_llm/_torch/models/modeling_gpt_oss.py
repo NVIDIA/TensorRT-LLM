@@ -1,5 +1,4 @@
-import os
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import torch
 from torch import nn
@@ -7,7 +6,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -25,9 +24,6 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod, TritonFusedMoE,
                                  create_moe)
-from ..modules.fused_moe.routing import (get_cached_perfect_router_logits,
-                                         precompute_common_perfect_router_logits
-                                         )
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -35,6 +31,9 @@ from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, filter_weights, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
@@ -55,7 +54,7 @@ class AttentionBlock(Attention):
             type=PositionEmbeddingType.yarn,
             rope=RopeParams(
                 dim=pretrained_config.head_dim,
-                theta=pretrained_config.rope_theta,
+                theta=get_hf_rope_theta(pretrained_config, 10000.0),
                 scale_type=RotaryScalingType.yarn,
                 scale=pretrained_config.rope_scaling['factor'],
                 max_positions=pretrained_config.max_position_embeddings,
@@ -64,7 +63,10 @@ class AttentionBlock(Attention):
                 beta_fast=pretrained_config.rope_scaling['beta_fast'],
                 beta_slow=pretrained_config.rope_scaling['beta_slow'],
                 duplicate_data=False),
-            is_neox=False,
+            # GPT-OSS applies NeoX-style (rotate-half) RoPE, matching the HF
+            # reference. The fused kernel ignores this flag for yarn (which
+            # masked the wrong value); the unfused path honors it.
+            is_neox=True,
         )
 
         super().__init__(
@@ -83,6 +85,12 @@ class AttentionBlock(Attention):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
+
+        if self.attn_backend != "TRTLLM":
+            raise ValueError(
+                f"GPT-OSS model uses attention sinks, which are only supported "
+                f"with attn_backend='TRTLLM'. Current backend: {self.attn_backend}."
+            )
 
         # Only apply sliding window to every other layer
         self.sliding_window = pretrained_config.sliding_window if layer_idx % 2 == 0 else None
@@ -193,14 +201,6 @@ class MLPBlock(torch.nn.Module):
 
         self.experts = create_moe(**moe_params)
 
-        # Perfect router caching - precompute common logits if enabled
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            precompute_common_perfect_router_logits(
-                num_experts=pretrained_config.num_local_experts,
-                experts_per_token=pretrained_config.num_experts_per_tok,
-                moe_ep_size=config.mapping.moe_ep_size,
-                dtype=pretrained_config.torch_dtype)
-
     @staticmethod
     def swiglu(x, alpha: float = 1.702):
         """
@@ -211,24 +211,6 @@ class MLPBlock(torch.nn.Module):
         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
         out_glu = x_glu * torch.sigmoid(alpha * x_glu)
         return out_glu * (x_linear + 1)
-
-    def _create_ideal_expert_load_balanced_logits(
-            self, num_tokens: int, num_experts: int,
-            device: torch.device) -> torch.Tensor:
-        """
-        Create ideal logits that produce GPU-aware load balanced expert assignment.
-         This method now uses the global cache to access precomputed logits to optimize performance.
-        """
-        pretrained_config = self.config.pretrained_config
-
-        # Use global cached logits
-        return get_cached_perfect_router_logits(
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            experts_per_token=pretrained_config.experts_per_token,
-            moe_ep_size=self.config.mapping.moe_ep_size,
-            device=device,
-            dtype=pretrained_config.torch_dtype)
 
     def compute_gate_output(self,
                             x: torch.Tensor,
@@ -260,13 +242,6 @@ class MLPBlock(torch.nn.Module):
         t = x
 
         g = self.compute_gate_output(t, lora_params=lora_params)
-        # Use ideal load balanced logits if enabled, otherwise use gate output
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
-            # Only use this for testing load balancing strategies, not for actual inference
-            num_tokens, num_experts = g.shape
-            g = self._create_ideal_expert_load_balanced_logits(
-                num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
         # When attention_dp is not enabled, don't pass those parameters
         expert_output = self.experts(x=t, router_logits=g)
@@ -296,14 +271,6 @@ class MLPBlock(torch.nn.Module):
                 t = allgather(t, self.mapping, dim=0, sizes=all_rank_num_tokens)
 
         g = self.compute_gate_output(t, lora_params=lora_params)
-        # Use ideal load balanced logits if enabled, otherwise use gate output
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
-            # Only use this for testing load balancing strategies, not for actual inference
-            # The gate is still computed to maintain realistic performance measurement
-            num_tokens, num_experts = g.shape
-            g = self._create_ideal_expert_load_balanced_logits(
-                num_tokens=num_tokens, num_experts=num_experts, device=x.device)
 
         # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
         # Pass the normalized tensor (t) as input to experts, not x
@@ -588,6 +555,34 @@ class Transformer(DecoderModel):
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Select KV cache manager V2 by default.
+
+        GPT-OSS applies a sliding window to every other layer
+        (see ``AttentionBlock.__init__``), so the KV cache is VSWA: two
+        distinct attention window sizes. V2 groups layers by lifecycle and
+        coalesces buffers within each pool group, which sizes the
+        sliding-window and full-attention pools independently instead of
+        statically dividing memory between them.
+
+        Users keep full control: an explicit
+        ``kv_cache_config.use_kv_cache_manager_v2`` otherwise wins over this
+        default. Two-model speculative decoding is the exception, since V2
+        sizes both the target and draft KV cache managers from the full
+        budget: ``auto`` demotes this default to V1 there and an explicit
+        ``True`` is rejected, both in
+        ``llm_utils._resolve_kv_cache_manager_v2_auto``.
+        """
+        return {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     params_map = {
         # TRTLLM module name : GptOss module name
         "qkv_proj": "qkv",
@@ -670,7 +665,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         else:
             self.load_hf_weights(weights)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.block[:self.config.num_hidden_layers]):
             if idx == 0:

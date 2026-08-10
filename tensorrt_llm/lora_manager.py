@@ -17,15 +17,14 @@ import yaml
 
 from tensorrt_llm.bindings import internal as tb_internal
 
-from ._utils import pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
-from .layers.linear import ColumnLinear
+from ._utils import release_gc, str_dtype_to_torch, torch_to_numpy
 from .lora_helper import (
     LoraConfig,
     get_default_trtllm_modules_to_hf_modules,
     get_missing_qkv_modules_from_lora_modules,
 )
 from .mapping import Mapping
-from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
+from .models.convert_utils import get_model_path, load_state_dict
 
 if TYPE_CHECKING:
     from .runtime import ModelConfig
@@ -426,23 +425,13 @@ class NemoLoraLoader:
         return self.lora_target_modules
 
 
-def load_nemo_lora(model, lora_config: LoraConfig):
-    lora_loader = NemoLoraLoader(lora_config.lora_dir)
-
-    if not lora_loader.is_valid:
-        raise ValueError(f"Failed to load NeMo LoRA from {lora_config.lora_dir}")
-
-    if len(lora_config.lora_target_modules) == 0:
-        lora_config.lora_target_modules = lora_loader.lora_target_modules
-
-
 def load_torch_hf_lora(lora_config: LoraConfig):
-    """This is a shortned version of load_hf_lora that is used for torch models.
+    """Load an HF LoRA checkpoint for the PyTorch workflow.
 
-    Main problem is model.config in legacy code is custom (defined in the legacy code) whereas
-    pivot model config is the transformer's one.
+    Populates lora_config (trtllm_modules_to_hf_modules and inferred
+    lora_target_modules) from the HF adapter directory. The actual weights are
+    loaded later by LoraManager when requests arrive with LoRA UIDs.
     """
-    # TODO smor- need to comibe with load_hf_lora
     if not lora_config.trtllm_modules_to_hf_modules:
         lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
@@ -530,94 +519,6 @@ def load_torch_lora(lora_config: LoraConfig):
         )
 
 
-def load_hf_lora(
-    model,
-    lora_config: LoraConfig,
-    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
-):
-    trtllm_modules_to_hf_modules = (
-        trtllm_modules_to_hf_modules or get_default_trtllm_modules_to_hf_modules()
-    )
-    lora_config.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
-
-    lora_loader = HfLoraLoader(lora_config.lora_dir)
-
-    if len(lora_config.lora_target_modules) == 0:
-        lora_config.lora_target_modules = lora_loader.get_target_modules(
-            trtllm_modules_to_hf_modules
-        )
-    if len(lora_config.lora_target_modules) == 0:
-        raise ValueError(
-            "lora_target_modules is empty. "
-            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
-        )
-
-    missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
-    lora_config.lora_target_modules.extend(missing_qkv_modules)
-
-    if lora_loader.is_valid:
-        config = model.config
-        torch_dtype = str_dtype_to_torch(config.dtype)
-        # the lora checkpoint might finetune the embedding
-        if lora_loader.vocab_size != 0:
-            config.vocab_size = lora_loader.vocab_size
-        mapping = config.mapping
-        if mapping.is_first_pp_rank() and lora_loader.embed_tokens is not None:
-            weight = lora_loader.embed_tokens
-            if config.use_parallel_embedding:
-                weight = split_matrix_tp(
-                    weight,
-                    mapping.tp_size,
-                    mapping.tp_rank,
-                    dim=config.embedding_sharding_dim,
-                )
-            if model.transformer.vocab_embedding.weight.raw_value.shape != weight.shape:
-                model.transformer.vocab_embedding = model.transformer.vocab_embedding.__class__(
-                    num_embeddings=config.vocab_size,
-                    embedding_dim=config.hidden_size,
-                    dtype=config.dtype,
-                    tp_size=mapping.tp_size if config.use_parallel_embedding else 1,
-                    tp_group=mapping.tp_group if config.use_parallel_embedding else None,
-                    sharding_dim=config.embedding_sharding_dim,
-                    tp_rank=mapping.tp_rank,
-                )
-            model.transformer.vocab_embedding.weight.value = weight.to(torch_dtype)
-        if mapping.is_last_pp_rank() and lora_loader.lm_head is not None:
-            weight = lora_loader.lm_head
-            vocab_size = lora_loader.vocab_size
-            if vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-                pad_width = vocab_size_padded - vocab_size
-
-                weight = torch.from_numpy(
-                    np.pad(
-                        torch_to_numpy(weight),
-                        ((0, pad_width), (0, 0)),
-                        "constant",
-                        constant_values=0,
-                    )
-                )
-            else:
-                vocab_size_padded = vocab_size
-            if model.lm_head.weight.raw_value.shape != weight.shape:
-                model.lm_head = ColumnLinear(
-                    config.hidden_size,
-                    vocab_size_padded,
-                    bias=False,
-                    dtype=config.dtype,
-                    tp_group=mapping.tp_group,
-                    tp_size=mapping.tp_size,
-                    gather_output=True,
-                )
-            model.lm_head.weight.value = split_matrix_tp(
-                weight,
-                mapping.tp_size,
-                mapping.tp_rank,
-                dim=0,
-            ).to(torch_dtype)
-
-
 def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
     """Unpack model config and weights from a NeMo .nemo archive file.
 
@@ -650,7 +551,9 @@ def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.T
 
         model_weights_bytes = model_weights_file.read()
         model_weights_dict = torch.load(
-            io.BytesIO(model_weights_bytes), map_location=torch.device("cpu")
+            io.BytesIO(model_weights_bytes),
+            map_location=torch.device("cpu"),
+            weights_only=True,
         )
 
         return model_config_dict, model_weights_dict
@@ -730,8 +633,11 @@ class LoraManager(object):
 
         self._lora_uid_counter = 0
         self._lora_uid_to_low_ranks: Dict[str, Dict[int, Dict[str, int]]] = {}
-        # hold the torch tensors and prevent them from being freed
-        # TODO(enweiz): free device tensors if it's used for c++ runtime only
+        # When cpp_peft_cache_manager is provided (PyTorch backend), the C++
+        # PeftCacheManager manages its own GPU cache with proper eviction.
+        # The Python-side GPU tensors are only needed by the legacy TRT backend
+        # which reads raw data_ptr() values via input_buffers().
+        self._retain_device_tensors = cpp_peft_cache_manager is None
         self._lora_weights: List[torch.Tensor] = []
         self._lora_weights_pointers_list: Dict[str, Dict[int, Dict[str, List[int]]]] = {}
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
@@ -864,15 +770,14 @@ class LoraManager(object):
                         t_out = t_out.cuda().to(str_dtype_to_torch(model_config.dtype)).contiguous()
                         rank = t_in.shape[0]
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = int(rank)
-                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
-                            t_in.data_ptr(),
-                            t_out.data_ptr(),
-                            0,
-                        ]
-
-                        # prevent torch free this buffer
-                        self._lora_weights.append(t_in)
-                        self._lora_weights.append(t_out)
+                        if self._retain_device_tensors:
+                            self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                                t_in.data_ptr(),
+                                t_out.data_ptr(),
+                                0,
+                            ]
+                            self._lora_weights.append(t_in)
+                            self._lora_weights.append(t_out)
                         self._cpp_lora_weights[uid].append(
                             torch.concatenate([t_in.flatten().cpu(), t_out.flatten().cpu()])
                         )
@@ -1154,24 +1059,27 @@ class LoraManager(object):
                         scale = float(hf_config["lora_alpha"]) / np.sqrt(effective_rank)
                     else:
                         scale = float(hf_config["lora_alpha"]) / effective_rank
+
+                    # Cast to model dtype before scaling
+                    # fp8 tensors don't support scalar multiply in PyTorch
+                    model_dtype = str_dtype_to_torch(model_config.dtype)
+                    t_in = t_in.to(model_dtype)
+                    t_out = t_out.to(model_dtype)
                     t_out = t_out * scale
-                    t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
-                    t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
                     if is_dora and t_mag is not None:
-                        t_mag = t_mag.to(str_dtype_to_torch(model_config.dtype))
+                        t_mag = t_mag.to(model_dtype)
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = effective_rank
-                    self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
-                        t_in.data_ptr(),
-                        t_out.data_ptr(),
-                        t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
-                    ]
-
-                    # prevent torch free this buffer
-                    self._lora_weights.append(t_in)
-                    self._lora_weights.append(t_out)
-                    if is_dora and t_mag is not None:
-                        self._lora_weights.append(t_mag)
+                    if self._retain_device_tensors:
+                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                            t_in.data_ptr(),
+                            t_out.data_ptr(),
+                            t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
+                        ]
+                        self._lora_weights.append(t_in)
+                        self._lora_weights.append(t_out)
+                        if is_dora and t_mag is not None:
+                            self._lora_weights.append(t_mag)
 
                     t_in_cpu = t_in.flatten().cpu()
                     t_out_cpu = t_out.flatten().cpu()

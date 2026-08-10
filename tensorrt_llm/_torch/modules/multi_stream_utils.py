@@ -37,7 +37,8 @@ def maybe_execute_in_parallel(
         fn1: Callable,
         event0: torch.cuda.Event,
         event1: torch.cuda.Event,
-        aux_stream: Optional[torch.cuda.Stream] = None) -> tuple[Any, Any]:
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        disable_on_compile: bool = False) -> tuple[Any, Any]:
     """Utility function to run two functions in two cuda streams in parallel. Multi-stream is
     only enabled when cuda graph is turned on because switch stream has extra host overhead.
 
@@ -52,12 +53,18 @@ def maybe_execute_in_parallel(
         event1 (torch.cuda.Event): cuda event for fn1
         aux_stream (Optional[torch.cuda.Stream]): the second cuda stream for fn1.
             Multi-stream is disabled when aux_stream is None.
+        disable_on_compile (bool): if True, disable multi-stream when
+            torch.compile is tracing. Callers that are not inside a custom op
+            should set this to True so that stream/event ops are not captured
+            by dynamo. Callers inside custom ops (e.g. attention, MoE) should
+            leave this as False since custom ops are opaque to the compiler.
 
     Returns:
         tuple[Any, Any]: the return values of fn0() and fn1()
     """
 
-    multi_stream = do_multi_stream() and aux_stream is not None
+    multi_stream = (do_multi_stream() and aux_stream is not None and
+                    not (disable_on_compile and torch.compiler.is_compiling()))
 
     if multi_stream:
         event0.record()

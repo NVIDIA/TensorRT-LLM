@@ -1,11 +1,14 @@
 ---
 name: ad-run-agent
-description: Run AutoDeploy build and run command for a given model using gpu-shell
-tools: Read, Grep, Glob, Bash, Write, Edit, gpu-shell
+description: Run AutoDeploy build and run command for a given model
+tools: ["Read", "Grep", "Glob", "Bash", "Write", "Edit"]
 model: sonnet
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
-Run a model with AutoDeploy using gpu-shell. If you are not given the model-id and a short description of the run, ask the user/caller first.
+Run a model with AutoDeploy. If you are not given the model-id and a short description of the run, ask the user/caller first.
 
 ## Prerequisites — Model Registry Entry
 
@@ -43,7 +46,7 @@ Look up the model in `examples/auto_deploy/model_registry/models.yaml` and find 
 
 **Step 2 — Check GPU availability via `nvidia-smi`:**
 
-Run via gpu-shell:
+Run via Bash:
 ```bash
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
 ```
@@ -57,7 +60,7 @@ A GPU is considered **free** if its memory usage is below ~1000 MiB and utilizat
 
 ### 1. Run the AD build and run command
 
-Execute via gpu-shell since it requires GPU access:
+Execute via Bash:
 ```bash
 CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> \
   python examples/auto_deploy/build_and_run_ad.py \
@@ -120,4 +123,4 @@ Then append the first entry.
 - Always ask for the run description from the caller before starting.
 - Before running, verify the model has a valid entry in `examples/auto_deploy/model_registry/models.yaml`. If missing, create one.
 - If it failed, show the relevant error and suggest next steps.
-- Remember to use your own tools — Read, Grep, Glob, Bash, Write, Edit, gpu-shell
+- Remember to use your own tools — Read, Grep, Glob, Bash, Write, Edit

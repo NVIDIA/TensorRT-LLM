@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 from typing import Tuple
 
@@ -23,9 +24,13 @@ import triton.language as tl
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import prefer_pinned
+
+REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
+REPLAY_WORK_CACHE_SLOT = 1
+REPLAY_WORK_PNAT = 2
+REPLAY_WORK_CACHE_BUF_IDX = 3
+REPLAY_WORK_ITEM_WIDTH = 4
 
 
 @triton.jit
@@ -33,9 +38,9 @@ def _cu_seqlens_triton_kernel(
     cu_seqlens_ptr,  # [num_seqs + 1]
     chunk_indices_ptr,  # [N] output
     chunk_offsets_ptr,  # [N] output
-    num_seqs: tl.constexpr,
+    num_seqs,
     chunk_size: tl.constexpr,
-    N: tl.constexpr,
+    N,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Computes chunk_indices and chunk_offsets in a single kernel launch."""
@@ -65,10 +70,34 @@ def _cu_seqlens_triton_kernel(
     tl.store(chunk_offsets_ptr + offsets, chunk_offsets.to(tl.int32), mask=mask)
 
 
+def compute_extra_chunks_cpu(seq_lens, num_seqs: int, chunk_size: int) -> int:
+    """Count extra chunks caused by misaligned sequence boundaries.
+
+    Computes from CPU seq_lens to avoid GPU->CPU synchronization.
+    """
+    cumsum = 0
+    extra = 0
+    for i in range(num_seqs - 1):
+        cumsum += int(seq_lens[i])
+        if cumsum % chunk_size != 0:
+            extra += 1
+    return extra
+
+
 def cu_seqlens_to_chunk_indices_offsets_triton(
         cu_seqlens: torch.Tensor,
-        chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized version of cu_seqlens_to_chunk_indices_offsets."""
+        chunk_size: int,
+        total_seqlens: int = -1,
+        extra_chunks: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized version of cu_seqlens_to_chunk_indices_offsets.
+
+    Args:
+        total_seqlens: If provided (>= 0), avoids a GPU->CPU sync to read
+            cu_seqlens[-1].  Callers that already know the total number of
+            context tokens should pass it here.
+        extra_chunks: If provided (>= 0), avoids a GPU->CPU sync to compute
+            the number of extra chunks from misaligned sequence boundaries.
+    """
     device = cu_seqlens.device
     num_seqs = cu_seqlens.numel() - 1
 
@@ -77,7 +106,8 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
                 torch.empty(0, dtype=torch.int, device=device))
 
     cu = cu_seqlens.to(dtype=torch.int64)
-    total_seqlens = cu[-1].item()
+    if total_seqlens < 0:
+        total_seqlens = cu[-1].item()
 
     if num_seqs == 1:
         # Fast path for single sequence (no boundaries to process)
@@ -85,10 +115,11 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
         return (torch.arange(N, device=device, dtype=torch.int),
                 torch.zeros(N, device=device, dtype=torch.int))
 
-    seq_starts = cu[1:-1]
-    misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
-    p = torch.cumsum(misaligned, dim=0)
-    extra_chunks = p[-1].item() if p.numel() > 0 else 0
+    if extra_chunks < 0:
+        seq_starts = cu[1:-1]
+        misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
+        p = torch.cumsum(misaligned, dim=0)
+        extra_chunks = p[-1].item() if p.numel() > 0 else 0
     N = (total_seqlens + chunk_size - 1) // chunk_size + extra_chunks
     chunk_indices = torch.empty(N, device=device, dtype=torch.int)
     chunk_offsets = torch.empty(N, device=device, dtype=torch.int)
@@ -113,19 +144,26 @@ def cu_seqlens_to_chunk_indices_offsets(
         chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
-        cu_seqlens (torch.Tensor): 1D tensor of cumulative sequence lengths, shape (num_seqs + 1,). The first element should be 0. Each entry represents the starting index of a sequence in the flattened token array.
+        cu_seqlens (torch.Tensor): 1D tensor of cumulative sequence lengths,
+            shape (num_seqs + 1,). The first element should be 0. Each entry
+            represents the starting index of a sequence in the flattened token
+            array.
         chunk_size (int): The size of each physical mamba chunk (number of tokens per chunk).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - chunk_indices (torch.Tensor): 1D tensor of indices indicating the physical chunk for each logical chunk.
-            - chunk_offsets (torch.Tensor): 1D tensor of offsets indicating the starting index of each logical chunk within its physical chunk.
+            - chunk_offsets (torch.Tensor): 1D tensor of offsets indicating
+              the starting index of each logical chunk within its physical
+              chunk.
 
     This function computes the chunk indices and offsets for the given cu_seqlens and chunk_size.
     Both are tensors of integers with length N, where N is the number of logical (pseudo) chunks.
-    A logical chunk is a sequence of tokens that are all part of the same sequence and are all in the same physical mamba chunk.
+    A logical chunk is a sequence of tokens that are all part of the same sequence
+    and are all in the same physical mamba chunk.
     In other words, a logical chunk changes every time we cross a sequence boundary or a physical mamba chunk boundary.
-    Logical chunks are needed to handle batched requests with initial states (see _state_passing_fwd and _chunk_scan_fwd).
+    Logical chunks are needed to handle batched requests with initial states
+    (see _state_passing_fwd and _chunk_scan_fwd).
     The chunk_indices tensor contains the index of the physical chunk for each logical chunk.
     The chunk_offsets tensor contains the offset (AKA starting index) of the logical chunk in the physical chunk.
 
@@ -137,9 +175,12 @@ def cu_seqlens_to_chunk_indices_offsets(
 
     In this example, we have 2 sequences, each with 5 tokens. The physical chunk size is 8 tokens.
     We have three logical chunks:
-    - the first logical chunk starts at token 0 in the first physical chunk and contains all 5 tokens from the first sequence
-    - the second logical chunk starts at token 5 in the first physical chunk and contains first 3 tokens from the second sequence
-    - the third logical chunk starts at token 0 in the second physical chunk and contains the remaining 2 tokens from the second sequence
+    - the first logical chunk starts at token 0 in the first physical chunk and
+      contains all 5 tokens from the first sequence
+    - the second logical chunk starts at token 5 in the first physical chunk
+      and contains first 3 tokens from the second sequence
+    - the third logical chunk starts at token 0 in the second physical chunk
+      and contains the remaining 2 tokens from the second sequence
     """
 
     total_seqlens = cu_seqlens[-1]
@@ -174,6 +215,23 @@ def cu_seqlens_to_chunk_indices_offsets(
 
 class Mamba2Metadata:
 
+    # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
+    # ``prepare()`` forces ``has_initial_states_cpu[:num_contexts]`` to True so
+    # the ``HAS_INITSTATES=True`` variants of the SSD Triton kernels compile
+    # during warmup. Class-scoped (not env-var) so it cannot leak into real
+    # inference from a stray shell export or a forked worker.
+    _warmup_force_initial_states: bool = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def force_initial_states_for_warmup(cls):
+        prev = cls._warmup_force_initial_states
+        cls._warmup_force_initial_states = True
+        try:
+            yield
+        finally:
+            cls._warmup_force_initial_states = prev
+
     def __init__(self, max_batch_size: int, chunk_size: int):
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
@@ -203,6 +261,25 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        # int64 mirror of state_indices, refreshed once per prepare() so
+        # per-layer consumers that need long indices (index_select /
+        # index_copy_) do not each launch an int32->int64 cast kernel
+        # inside the decode CUDA graph (69 KDA layers x ~1.7us for Kimi K3).
+        self._state_indices_long = torch.zeros(max_batch_size,
+                                               dtype=torch.long,
+                                               device="cuda")
+        self.state_indices_long = self._state_indices_long[:0]
+        # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
+        # detect cache-manager buffer reallocation that would silently break
+        # CUDA graph replays.
+        self._state_indices_aliased_ptr = None
+
+        self.replay_work_items = torch.zeros(max_batch_size,
+                                             REPLAY_WORK_ITEM_WIDTH,
+                                             dtype=torch.int32,
+                                             device="cuda")
+        self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.replay_num_decodes = 0
 
         # Pre-allocated buffers.
         self._arange_buffer = torch.arange(max_batch_size + 1,
@@ -212,6 +289,72 @@ class Mamba2Metadata:
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
+
+    def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
+                                   num_contexts: int):
+        self.replay_num_decodes = 0
+        if not getattr(kv_cache_manager, 'use_replay_state_update', False):
+            return
+        num_decodes = batch_size - num_contexts
+        self.replay_num_decodes = num_decodes
+        if num_decodes == 0:
+            return
+        if getattr(kv_cache_manager, 'use_gdn_cached_replay_all_layer_commit',
+                   False):
+            from tensorrt_llm._torch.modules.fla.cached_replay import \
+                CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
+            # The fused small-batch GDN kernel commits its checkpoint in-layer
+            # and indexes cache metadata directly. Work items are only consumed
+            # by the partitioned replay + all-layer commit path.
+            if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
+                return
+
+        self.replay_n_writes.zero_()
+        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
+            raise RuntimeError(
+                "Replay state update is enabled, but the KV cache manager "
+                "does not expose replay state update metadata.")
+
+        replay_metadata = kv_cache_manager.get_replay_state_update_metadata()
+        if replay_metadata is None:
+            raise RuntimeError(
+                "Replay state update is enabled for a decode batch, but the "
+                "KV cache manager returned no replay state update metadata.")
+
+        prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
+        cache_buf_idx = replay_metadata.cache_buf_idx
+        replay_step_width = replay_metadata.replay_step_width
+        replay_history_size = replay_metadata.replay_history_size
+
+        position_in_decode_batch = torch.arange(
+            num_decodes, dtype=torch.int32, device=self.state_indices.device)
+        cache_slot = self.state_indices[num_contexts:batch_size]
+        cache_slot_idx = cache_slot.to(torch.long)
+        pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
+        active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
+
+        # Keep field order and write-first partitioning in sync with the
+        # AutoDeploy replay metadata path in shim/interface.py.
+        writes = (pnat + replay_step_width > replay_history_size)
+        writes_i32 = writes.to(torch.int32)
+        write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
+        n_writes = torch.sum(writes_i32, dim=0, keepdim=True).to(torch.int32)
+        no_write_offsets = position_in_decode_batch - write_offsets
+        output_offsets = torch.where(writes, write_offsets,
+                                     n_writes + no_write_offsets)
+        output_offsets = output_offsets.to(torch.long)
+
+        work_items = self.replay_work_items[:num_decodes]
+        work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH].scatter_(
+            0, output_offsets, position_in_decode_batch)
+        work_items[:, REPLAY_WORK_CACHE_SLOT].scatter_(0, output_offsets,
+                                                       cache_slot)
+        work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
+        work_items[:,
+                   REPLAY_WORK_CACHE_BUF_IDX].scatter_(0, output_offsets,
+                                                       active_cache_buf_idx)
+        self.replay_n_writes.copy_(n_writes)
 
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
@@ -225,18 +368,63 @@ class Mamba2Metadata:
         if (kv_cache_manager is not None
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
-            if use_cpp_mamba_cache_manager():
-                batch_request_ids = request_ids[:batch_size]
-                is_padding = [
-                    req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
-                    for req_id in batch_request_ids
-                ]
-                indices = kv_cache_manager.get_state_indices(
-                    batch_request_ids, is_padding)
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
+            batch_request_ids = request_ids[:batch_size]
+            max_draft_len = getattr(kv_cache_manager,
+                                    "speculative_num_draft_tokens", 0) or 0
+            is_padding = [
+                CUDA_GRAPH_DUMMY_REQUEST_ID - max_draft_len <= req_id <=
+                CUDA_GRAPH_DUMMY_REQUEST_ID for req_id in batch_request_ids
+            ]
+            indices = kv_cache_manager.get_state_indices(
+                batch_request_ids, is_padding)
+            if isinstance(indices,
+                          torch.Tensor) and indices.device.type == 'cuda':
+                # Alias the cache manager's CUDA buffer directly instead of
+                # copying. Iterating a CUDA tensor and assigning each 0-d
+                # slice to a CPU tensor would trigger one cudaMemcpyAsync +
+                # cudaStreamSynchronize per element.
+                #
+                # Safe under CUDA graphs only when the source buffer has a
+                # stable data pointer across all calls. If a cache manager
+                # reallocates this buffer between iterations, captured kernels
+                # would still read from the address seen at capture time, so
+                # we assert stability here.
+                if self._state_indices_aliased_ptr is None:
+                    self._state_indices_aliased_ptr = indices.data_ptr()
+                else:
+                    assert indices.data_ptr(
+                    ) == self._state_indices_aliased_ptr, (
+                        "kv_cache_manager.get_state_indices() must return a "
+                        "buffer with a stable data pointer when CUDA graphs "
+                        "are used; got a different address than the first "
+                        "call.")
+                self.state_indices = indices
+            elif isinstance(indices, torch.Tensor):
+                # CPU tensor → bulk H2D
+                self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
+            else:
+                # indices is a Python sequence (e.g. List[int]); data
+                # already lives on host, CPU staging is fine. One bulk
+                # conversion instead of a per-element tensor write.
+                assert len(indices) == batch_size, (
+                    f"get_state_indices() returned {len(indices)} entries for "
+                    f"a batch of {batch_size} requests.")
+                self.state_indices_cpu[:batch_size].copy_(
+                    torch.as_tensor(indices,
+                                    dtype=self.state_indices_cpu.dtype))
+                self.state_indices[:batch_size].copy_(
+                    self.state_indices_cpu[:batch_size], non_blocking=True)
+
+        # Refresh the int64 mirror once per step (outside the decode graph)
+        # so layers can index pools without a per-layer cast kernel.
+        self._state_indices_long[:batch_size].copy_(
+            self.state_indices[:batch_size])
+        self.state_indices_long = self._state_indices_long[:batch_size]
+
+        self._prepare_replay_work_items(kv_cache_manager, batch_size,
+                                        num_contexts)
 
         if num_contexts > 0:
             torch.cumsum(context_lens,
@@ -274,6 +462,15 @@ class Mamba2Metadata:
                                                   device='cpu')
 
             self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            # Warmup-only override: force HAS_INITSTATES=True path so the
+            # HAS_INITSTATES=True variants of _state_passing_fwd_kernel,
+            # _chunk_scan_fwd_kernel, and _chunk_state_varlen_kernel compile
+            # during warmup instead of the first real-request iter that hits
+            # chunked prefill with cached tokens. Gate is a class-scoped
+            # context manager (see ``force_initial_states_for_warmup``) so it
+            # cannot silently affect real inference.
+            if Mamba2Metadata._warmup_force_initial_states:
+                self.has_initial_states_cpu[:num_contexts].fill_(True)
             # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
             self.has_initial_states[:num_contexts].copy_(
                 self.has_initial_states_cpu[:num_contexts], non_blocking=True)
@@ -282,8 +479,14 @@ class Mamba2Metadata:
                 self.has_initial_states_cpu[:num_contexts].any())
 
             if self.use_initial_states:
+                _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,
+                                                  num_contexts, self.chunk_size)
+
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
-                    self.cu_seqlens[:num_contexts + 1], self.chunk_size)
+                    self.cu_seqlens[:num_contexts + 1],
+                    self.chunk_size,
+                    total_seqlens=num_ctx_tokens,
+                    extra_chunks=_extra)
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None
@@ -291,3 +494,14 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        # Complete any deferred recurrent-state block onboards scheduled by
+        # CppMambaHybridCacheManager.prepare_resources(). prepare_resources
+        # only enqueues the async cudaMemcpyAsync calls and sets a pending
+        # flag; we sync the onboard stream here, so CPU-side prep
+        # work in _prepare_tp_inputs overlaps with the in-flight transfers.
+        # Cheap no-op on cache managers without this method or when no
+        # transfers were scheduled this iteration.
+        flush = getattr(kv_cache_manager, "flush_state_transfers", None)
+        if flush is not None:
+            flush()

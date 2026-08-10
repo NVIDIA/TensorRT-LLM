@@ -16,7 +16,7 @@
 """Definition of the quant module that can be used for PTQ."""
 
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from flashinfer import bmm_fp8
@@ -24,7 +24,7 @@ from torch import nn
 
 from ..torch_libs.float8_python_api import addmm_float8_unwrapped
 
-TRTLLM_FP4_OP_AVAILABLE = True
+TRTLLM_FP4_OP_AVAILABLE = hasattr(torch.ops, "trtllm")
 
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
 TRTLLM_NVFP4_ROW_SIZE = 128
@@ -109,7 +109,8 @@ def _trtllm_fp8_prequant_linear_core(
     enable_cuda_core = False
     if torch.cuda.is_available():
         capability = torch.cuda.get_device_capability(0)
-        enable_cuda_core = capability == (8, 9) or capability == (12, 0)
+        # enable cuda core for sm89, sm120, and sm121
+        enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
 
     if x.shape[0] <= 8 and enable_cuda_core:
         output = torch.ops.trtllm.cuda_scaled_mm(
@@ -143,6 +144,10 @@ def trtllm_quant_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     out_dtype: Optional[str] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP8 linear op similar to torch.nn.linear using TensorRT-LLM FP8 operations.
 
@@ -193,6 +198,10 @@ def trtllm_quant_fp8_linear_fake(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     out_dtype: Optional[str] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     # Match real op behavior: FP8 input requires explicit output dtype.
     if input.dtype == torch.float8_e4m3fn:
@@ -258,6 +267,10 @@ def fp8_linear(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP8 linear op similar to torch.nn.linear.
 
@@ -333,6 +346,10 @@ def fp8_linear_fake(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
 
@@ -419,6 +436,10 @@ def nvfp4_linear(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP4 linear op similar to torch.nn.linear.
 
@@ -487,6 +508,10 @@ def fp4_linear_fake(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 

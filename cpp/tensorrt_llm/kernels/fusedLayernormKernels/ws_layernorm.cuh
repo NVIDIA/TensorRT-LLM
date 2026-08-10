@@ -40,7 +40,7 @@ struct DummyFusedOperator
     }
 
     template <size_t ELEMS_PER_THREAD, typename T>
-    __device__ __forceinline__ void post_process(int m, int n_base, T packed_input)
+    __device__ __forceinline__ void post_process(int m, int n_base, T packed_input, bool write_output = true)
     {
     }
 };
@@ -655,9 +655,14 @@ struct WarpSpecializedLayerNorm
 
                 auto n_base = (thread_id + i * 128) * Traits::PACKED_ELEMS_PER_COMPUTE;
                 auto in_bound = n_base < param.n;
-                if (!in_bound)
+
+                // FP4Converter uses __shfl_xor_sync — all warp threads must stay converged.
+                if constexpr (std::is_same_v<typename Traits::FusedOperator, void>)
                 {
-                    break;
+                    if (!in_bound)
+                    {
+                        break;
+                    }
                 }
 
                 if constexpr (Traits::GAMMA)
@@ -753,16 +758,22 @@ struct WarpSpecializedLayerNorm
                             = normed_output;
                         if constexpr (Traits::UNNORMED_OUTPUT)
                         {
-                            reinterpret_cast<decltype(output)*>(
-                                &shared->output_vec[0][buffer_id][m_offset * Traits::N_BLOCK + n_base])[0]
-                                = output;
+                            if (in_bound)
+                            {
+                                reinterpret_cast<decltype(output)*>(
+                                    &shared->output_vec[0][buffer_id][m_offset * Traits::N_BLOCK + n_base])[0]
+                                    = output;
+                            }
                         }
                     }
                     else
                     {
                         if constexpr (Traits::UNNORMED_OUTPUT)
                         {
-                            reinterpret_cast<decltype(output)*>(&param.output[m * param.n + n_base])[0] = output;
+                            if (in_bound)
+                            {
+                                reinterpret_cast<decltype(output)*>(&param.output[m * param.n + n_base])[0] = output;
+                            }
                         }
                         // TODO: Move this generic writeback into dummy fused operator.
                         if constexpr (std::is_same_v<typename Traits::FusedOperator, void>)
@@ -774,13 +785,16 @@ struct WarpSpecializedLayerNorm
                         {
                             fused_operator
                                 .template post_process<Traits::PACKED_ELEMS_PER_COMPUTE, decltype(normed_output)>(
-                                    m, n_base, normed_output);
+                                    m, n_base, normed_output, in_bound);
                         }
                         if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
                         {
-                            reinterpret_cast<decltype(high_precision_normed_output)*>(
-                                &param.high_precision_normed_output[m * param.n + n_base])[0]
-                                = high_precision_normed_output;
+                            if (in_bound)
+                            {
+                                reinterpret_cast<decltype(high_precision_normed_output)*>(
+                                    &param.high_precision_normed_output[m * param.n + n_base])[0]
+                                    = high_precision_normed_output;
+                            }
                         }
                     }
                 }

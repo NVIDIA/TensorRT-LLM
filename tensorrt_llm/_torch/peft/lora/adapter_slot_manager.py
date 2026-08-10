@@ -71,10 +71,13 @@ class AdapterSlotManager:
                 self.task2slot[task_id] = evicted_slot
         return self.task2slot[task_id], evicted_task
 
-    def remove_evicted_slots_in_cpp(self, peft_cache_manager: PeftCacheManager):
+    def remove_evicted_slots_in_cpp(self, peft_cache_manager: Optional[PeftCacheManager]):
         """
         Validate slots by removing tasks that are not cached in PeftCacheManager.
         """
+        if peft_cache_manager is None:
+            return
+
         for task_id in self.slot2task:
             if task_id is not None:
                 if not peft_cache_manager.is_task_cached_device(task_id):

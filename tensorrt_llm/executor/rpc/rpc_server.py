@@ -32,7 +32,7 @@ class RPCServer:
 
         Args:
             instance: The instance whose methods will be exposed via RPC.
-            hmac_key (bytes, optional): HMAC key for encryption.
+            hmac_key (bytes, optional): HMAC key for encryption. Auto-generated if not provided.
             num_workers (int): Number of worker threads or worker tasks that help parallelize the task execution.
             timeout (int): Timeout for RPC calls.
             async_run_task (bool): Whether to run the task asynchronously.
@@ -41,7 +41,7 @@ class RPCServer:
         be blocked by the thread pool.
         """
         self._instance = instance
-        self._hmac_key = hmac_key
+        self._hmac_key = hmac_key if hmac_key is not None else os.urandom(32)
         self._num_workers = num_workers
         self._address = None
         self._timeout = timeout
@@ -88,6 +88,10 @@ class RPCServer:
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.shutdown()
 
+    @property
+    def hmac_key(self) -> bytes:
+        return self._hmac_key
+
     def bind(self, address: str = "tcp://*:5555") -> None:
         """
         Bind the server to the specified address.
@@ -108,8 +112,7 @@ class RPCServer:
         self._client_socket = ZeroMqQueue(address=(address, self._hmac_key),
                                           is_server=True,
                                           is_async=True,
-                                          use_hmac_encryption=self._hmac_key
-                                          is not None,
+                                          use_hmac_encryption=True,
                                           socket_type=socket_type,
                                           name="rpc_server")
         logger.info(f"RPCServer is bound to {self._address}")

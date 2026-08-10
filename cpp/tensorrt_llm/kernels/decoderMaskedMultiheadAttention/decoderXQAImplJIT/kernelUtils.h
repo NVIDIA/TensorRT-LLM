@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
 bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
 bool supportConfigTllmGen(
     XQAParams const& xqaParams, int SM, bool forConfigurePlugin, TllmGenFmhaRunner const* tllmRunner);
+
+bool appliesRoPEInXqaKernel(XQAParams const& xqaParams, bool isQGMMAKernel);
 
 } // namespace jit
 } // namespace kernels

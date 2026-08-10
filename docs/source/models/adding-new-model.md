@@ -18,7 +18,7 @@ This guide provides a step-by-step process for adding a new model in PyTorch Bac
 ## Prerequisites
 
 Before you begin, ensure you have the following:
-- A working installation of TensorRT-LLM. Follow these [instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+- A working installation of TensorRT-LLM. Follow these [instructions](../installation/build-from-source.md).
 
 ## Step-by-Step Guide
 

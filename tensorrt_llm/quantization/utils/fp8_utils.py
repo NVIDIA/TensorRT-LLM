@@ -223,6 +223,78 @@ def check_sf_layout(sf: torch.Tensor,
     return sf
 
 
+def unpack_col_major_tma_aligned_packed_tensor(
+    packed: torch.Tensor,
+    mn: int,
+    k: int,
+) -> torch.Tensor:
+    """Inverse of :func:`get_col_major_tma_aligned_packed_tensor`.
+
+    Recovers a ``(mn, k)`` float32 UE8M0 scale tensor from the packed
+    int32 col-major layout produced by the forward transform.
+
+    Only valid when the original scales were UE8M0 (all power-of-two),
+    which is guaranteed after :func:`resmooth_to_fp8_e8m0`.
+    """
+    assert packed.dtype == torch.int
+
+    remove_dim = False
+    if packed.dim() == 2:
+        packed = packed.unsqueeze(0)
+        remove_dim = True
+    b = packed.shape[0]
+
+    aligned_mn = get_tma_aligned_size(mn, 4)  # int32 element_size = 4
+    aligned_k = align(k, 4)
+
+    # The packed tensor may have col-major strides from the forward
+    # transform.  Flatten to 1-D via clone() so dtype views always work.
+    packed.shape[-2] * packed.shape[-1]
+    flat_int = packed.reshape(b, -1).clone()  # (b, mn * cols) contiguous
+
+    # Pad mn back to aligned_mn (forward sliced [:mn])
+    if mn < aligned_mn:
+        extra = (aligned_mn - mn) * packed.shape[-1]
+        pad = torch.zeros(b, extra, device=packed.device, dtype=torch.int)
+        flat_int = torch.cat([flat_int, pad], dim=1)
+        aligned_mn * packed.shape[-1]
+
+    # int32 → uint8: 4 bytes per element
+    flat_bytes = flat_int.view(torch.uint8)  # (b, n_int32 * 4)
+    unpacked = flat_bytes.view(b, aligned_mn, aligned_k)
+
+    # Slice away padding, reconstruct float32 from UE8M0 exponent byte
+    ue8m0 = unpacked[:, :mn, :k]  # (b, mn, k) uint8
+    float_bits = ue8m0.to(torch.int32) << 23
+    result = float_bits.reshape(b, -1).view(torch.float32).reshape(b, mn, k)
+
+    return result.squeeze(0) if remove_dim else result
+
+
+def inverse_transform_sf(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Recover a ``(nb_m, nb_k)`` float32 block-scale grid from a packed SF.
+
+    This reverses the ``(FP32, 128, 128) → (INT, 1, 128)`` path in
+    :func:`transform_sf_into_required_layout` (the path taken by
+    ``FP8BlockScalesLinearMethod.post_load_weights`` on SM100f / SM120).
+    """
+    nb_k = ceil_div(k, block_size)
+
+    # Step 1: unpack to per-row float32 UE8M0 grid  (mn, nb_k)
+    per_row = unpack_col_major_tma_aligned_packed_tensor(sf, mn, nb_k)
+
+    # Step 2: collapse replicated rows back to (nb_m, nb_k).
+    # Forward did index_select with indices = arange(mn) // block_size,
+    # so rows within a 128-block are identical.  Take one per block.
+    per_block = per_row[::block_size]  # (nb_m, nb_k)
+    return per_block
+
+
 @nvtx_range("[DG] transform_sf_into_required_layout")
 def transform_sf_into_required_layout(sf: torch.Tensor,
                                       mn: int,
@@ -297,6 +369,8 @@ def _silu_and_mul_post_quant_kernel(
     BLOCK: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -336,6 +410,15 @@ def _silu_and_mul_post_quant_kernel(
                 mask=local_mask < size_k,
                 other=0.0,
             ).to(tl.float32)
+            if HAS_SWIGLU_LIMIT:
+                # gate is fp32; clamp directly. up is in input dtype (bf16/fp16);
+                # cast the limit constant to that dtype to avoid a fp32 round-trip
+                # on every element.
+                gate = tl.minimum(gate, SWIGLU_LIMIT)
+                limit_native = tl.cast(SWIGLU_LIMIT, input_ptr.dtype.element_ty)
+                neg_limit_native = tl.cast(-SWIGLU_LIMIT,
+                                           input_ptr.dtype.element_ty)
+                up = tl.maximum(tl.minimum(up, limit_native), neg_limit_native)
             gate = gate / (1 + tl.exp(-gate))
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
@@ -366,6 +449,7 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     """
     input shape [g, m, k]
@@ -373,6 +457,11 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale [g, k // 4, m // 2 // 128], dtype int32
     quant_group_size int
     masked_m shape [g]
+    swiglu_limit optional Python float (uniform across experts); when provided,
+        the gate input is clamped to (-inf, limit] before silu and the up
+        branch is clamped to [-limit, limit] before the multiply. Baked into
+        the kernel as a constexpr — caller supplies a host-side float, no
+        per-expert tensor / global load.
     """
 
     assert input.is_contiguous()
@@ -405,6 +494,10 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_NUM_PER_EXPERT,
         expert_num,
     )
+    # Gate on > 0 (matching torch.ops.trtllm.silu_and_mul) so a 0.0/negative
+    # limit is a no-op clamp rather than collapsing all activations to 0.
+    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0.0
+    swiglu_limit_value = float(swiglu_limit) if has_swiglu_limit else 0.0
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -420,6 +513,8 @@ def silu_and_mul_masked_post_quant_fwd(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        SWIGLU_LIMIT=swiglu_limit_value,
     )
     output_scale = output_scale.transpose(1, 2)[:, :m, :]
     check_sf_layout(
