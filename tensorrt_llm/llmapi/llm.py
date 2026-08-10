@@ -1625,14 +1625,6 @@ class BaseLLM:
             self.mpi_session.shutdown()
             self.mpi_session = None
 
-        # Return cached CUDA allocations back to the driver so that subsequent
-        # LLM instances in the same process (e.g. back-to-back tests) see the
-        # full available GPU memory.
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
 
