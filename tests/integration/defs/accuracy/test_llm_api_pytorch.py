@@ -99,7 +99,8 @@ def _latest_kv_cache_stats(llm):
 
 def _compute_acceptance_length(llm) -> float:
     """Mean acceptance length over speculative iterations (requires
-    enable_iter_perf_stats=True). Used by the AL-regression tests."""
+    enable_iter_perf_stats=True). Used by the AL-regression tests.
+    """
     stats = llm.get_stats(timeout=2)
     spec_iters = [
         stat['specDecodingStats'] for stat in stats
