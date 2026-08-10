@@ -1611,10 +1611,16 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
             "TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES": "64MB",
             "TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT": "1",
             "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES": "1MB",
+            # Pin the transport deterministically: the child would otherwise inherit
+            # developer/CI UCX settings (an injected UCX_NET_DEVICES or differing
+            # UCX_TLS can fail the transfer or oversubscribe CPUs).
+            "UCX_TLS": "^ib,gdr_copy",
+            "TRTLLM_NIXL_NUM_THREADS": "1",
             "TLLM_LOG_LEVEL": "INFO",
             "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
         }
     )
+    env.pop("UCX_NET_DEVICES", None)
     # Do not override TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY: the test must
     # exercise the production default, including automatic cudaMalloc fallback
     # on devices without fabric-memory support.
