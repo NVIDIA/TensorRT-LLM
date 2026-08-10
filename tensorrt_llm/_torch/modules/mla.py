@@ -48,6 +48,7 @@ from ..attention_backend.sparse.dsa import (
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph
 from ..utils import (
     Fp4QuantizedTensor,
     compute_swizzled_sf_shape,
@@ -216,6 +217,13 @@ def mla_custom_op_inplace(
         mla_layer.forward_impl(
             position_ids, hidden_states, metadata, output=output, latent_cache_gen=latent_cache_gen
         )
+
+
+# Breakable-CUDA-graph variant: runs the metadata-dependent MLA attention
+# eagerly between captured graph segments, writing into the pre-allocated
+# ``output`` buffer (see ``eager_on_graph``). Used by K3 MLA layers under a
+# breakable prefill CUDA graph.
+maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
 
 
 @torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())

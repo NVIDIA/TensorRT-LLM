@@ -22,7 +22,8 @@ from ....models.modeling_utils import QuantConfig
 from ...attention_backend import AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
-from ..mla import MLA
+from ...pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+from ..mla import MLA, maybe_bcg_mla_custom_op_inplace
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 
@@ -211,14 +212,20 @@ class KimiK3MLAAttention(MLA):
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantConfig] = None,
+        runtime_model_config: Optional[ModelConfig] = None,
     ) -> None:
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
             max_position_embeddings=max_position_embeddings,
         )
-        model_config = ModelConfig(
+        mla_model_config = ModelConfig(
             quant_config=quant_config if quant_config is not None else QuantConfig()
         )
+        # Share the runtime's ``extra_attrs`` so the base ``MLA`` registers
+        # itself into ``mla_layers`` (enables the breakable-CUDA-graph
+        # eager-on-graph attention op for K3 MLA layers).
+        if runtime_model_config is not None:
+            mla_model_config.extra_attrs = runtime_model_config.extra_attrs
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -235,7 +242,7 @@ class KimiK3MLAAttention(MLA):
             layer_idx=layer_idx,
             dtype=dtype,
             dense_bias=False,
-            config=model_config,
+            config=mla_model_config,
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
@@ -244,7 +251,9 @@ class KimiK3MLAAttention(MLA):
         # K3 calls forward_impl() directly to insert its output gate before
         # the base row-parallel o_proj. The original executor metadata remains
         # intact, so MLA performs its native mixed context/generation split.
-        self.register_to_config = False
+        # ``register_to_config`` is left as set by the base ``MLA`` (True when
+        # a shared ``extra_attrs`` was threaded above): it gates the breakable
+        # -CUDA-graph eager-on-graph attention op.
 
         self.use_output_gate = use_output_gate
 
@@ -289,10 +298,26 @@ class KimiK3MLAAttention(MLA):
             hidden_states,
             attn_metadata.num_contexts,
         )
-        super().forward_impl(
-            None,
-            hidden_states,
-            attn_metadata,
-            output=attn_out,
-        )
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            # Breakable prefill CUDA graph: run the metadata-dependent MLA
+            # attention eagerly between captured segments, writing into the
+            # graph-allocated ``attn_out``. The output gate + row-parallel
+            # o_proj below stay on-graph.
+            maybe_bcg_mla_custom_op_inplace(
+                hidden_states,
+                None,
+                self.layer_idx_str,
+                attn_out,
+                None,
+                None,
+                None,
+                False,
+            )
+        else:
+            super().forward_impl(
+                None,
+                hidden_states,
+                attn_metadata,
+                output=attn_out,
+            )
         return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
