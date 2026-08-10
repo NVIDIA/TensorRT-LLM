@@ -5881,13 +5881,19 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Runs on a CPU node ("build" pod type, kubernetes-cpu cloud) — it needs no
     // GPU and no TRT-LLM wheel, only its own `pip install -e agent-flow[test]`.
     // CBTS narrows this to agent-flow-only changes via
-    // jenkins/scripts/cbts/rules/agent_flow_rule.py; the stage key below MUST
-    // match AGENT_FLOW_STAGE in that rule or CBTS Layer 2 will drop it.
+    // jenkins/scripts/cbts/rules/agent_flow_rule.py; AGENT_FLOW_STAGE in that
+    // rule MUST equal the stage name below or CBTS Layer 2 will drop it.
     agentFlowTestSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    // Single source of truth for the stage name: it is both the map key (which
+    // cacheErrorAndUploadResult uses for the results dir it tars and feeds to
+    // junit) and the name passed to runLLMAgentFlowTest (which writes
+    // results.xml into that dir). If the two ever diverge, junit finds no
+    // report ("No test report files were found").
+    def agentFlowStageName = "CPU-AgentFlow-UnitTest"
     agentFlowTestConfigs = [
-        "AgentFlow-UnitTest": [agentFlowTestSpec, {
+        (agentFlowStageName): [agentFlowTestSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
-            runLLMAgentFlowTest(pipeline, "AgentFlow-UnitTest")
+            runLLMAgentFlowTest(pipeline, agentFlowStageName)
         }],
     ]
 

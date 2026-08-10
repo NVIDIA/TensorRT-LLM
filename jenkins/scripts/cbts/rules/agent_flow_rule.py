@@ -15,7 +15,7 @@
 
 ``agent-flow/`` is a self-contained sub-project (own ``pyproject.toml``,
 own dependencies, pure-CPU pytest suite) with a single dedicated CI stage
-``AgentFlow-UnitTest``. Nothing outside ``agent-flow/`` imports it, and it
+``CPU-AgentFlow-UnitTest``. Nothing outside ``agent-flow/`` imports it, and it
 imports nothing from the TRT-LLM wheel, so an agent-flow-only change needs
 exactly that one CPU stage and none of the GPU test-db stages.
 
@@ -36,7 +36,7 @@ from blocks import Stage, YAMLIndex
 from .base import PRInputs, Rule, RuleResult
 
 # Stage key as declared in jenkins/L0_Test.groovy. Keep in sync.
-AGENT_FLOW_STAGE = "AgentFlow-UnitTest"
+AGENT_FLOW_STAGE = "CPU-AgentFlow-UnitTest"
 
 # Every changed file under this prefix is claimed by the rule.
 _AGENT_FLOW_PREFIX = "agent-flow/"
