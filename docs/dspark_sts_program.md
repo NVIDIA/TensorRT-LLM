@@ -498,7 +498,13 @@ cap-accept 模式(同一 planner 决策,提交完整块全量验证、接受端�
 - **E(否)**:仅 device-windows 模式走 D2D。零收益模式分叉,制造未来漂移面。
 - NEXT_N 抬全局上界同时排掉一个 host 侧潜伏雷:#19(取消 tier 阶梯量化)实施后 host 也可能在小 tier bucket 发超 tier 窗口,同样会截断 Phase 1。
 
-# 分析
+### #32 nsys 取证:四次报告丢失的根因与 v6 修正(08-09 00:20)
+
+四轮 nsys 采集(SIGINT 版 / TERM 版 / 手动收尾版 / v5 stop-shutdown 版)全部丢失报告,根因**不是收尾方式,而是采集从未开始**:v5 用 `--capture-range-end=stop-shutdown` 时应用理应在 iter 2050 被自动关停,实测 pin3 应用活过 iter 2110 → `cudaProfilerStart` 触发器从未被 nsys 看见。
+
+- **代码侧验证(py_executor.py)**:触发门只有 `iter_counter ∈ profile_start_iters and not is_warmup`(L1739-1748),打印的 `iter = N` 与触发比较用的是**同一个计数器**(L1725),三条执行循环(pp/普通/overlap)都套着 `profile_step`——TRT-LLM 侧路径无问题,且触发时会打 `"Profiling started at iteration N."` 日志(此后可用该行判别触发与注入哪个失效)。
+- **真凶(官方配方对照,perf-analysis.md)**:`trtllm-serve` 的 worker 进程是 **fork-before-exec** 派生的,nsys 缺 `--trace-fork-before-exec=true` 时不会向 fork 出的子进程注入 → worker 里的 `cudaProfilerStart` 对 nsys 不可见,capture 永远不开始,报告永远不落盘。nsys 退出时抱怨的 "re-parented processes" 即其指纹。
+- **v6 修正**:`--trace-fork-before-exec=true` + `--cuda-graph-trace node`(后者让 CUDA graph 内的 kernel 逐个展开——我们全部计算都在图里,做 pin5 vs pin3 kernel 对拍必须要 node 粒度)。两轮已重发(pin5@743961 / pin3@743962)。
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
