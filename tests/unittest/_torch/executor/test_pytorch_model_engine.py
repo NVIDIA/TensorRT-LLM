@@ -15,6 +15,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
     MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
     MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -42,7 +43,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
+from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
+                                          BaseMultimodalInputProcessor)
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.mapping import CpType, Mapping
@@ -1182,11 +1184,38 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine.model = DummyLegacyMultimodalIndexModel()
         engine.input_processor = None
         engine.llm_args = SimpleNamespace(
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False)
 
         self.assertTrue(engine.is_multimodal)
         with self.assertRaisesRegex(ValueError, "multimodal models"):
             engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_allows_text_decoder_with_multimodal_processor(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = Mock(spec=DecoderModelForCausalLM)
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False)
+
+        self.assertTrue(engine.is_multimodal)
+        engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_allows_multimodal_wrapper_in_text_only_mode(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+        engine.model.mm_encoder = None
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=True)
+
+        self.assertTrue(engine.is_multimodal)
+        engine._validate_breakable_cuda_graph_compatibility()
 
     def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
         engine = object.__new__(PyTorchModelEngine)

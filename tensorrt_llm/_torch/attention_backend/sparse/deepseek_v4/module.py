@@ -271,6 +271,8 @@ def project_sparse_attn_output(
 ) -> torch.Tensor:
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
+    # BCG/mixed-batch epilogue fusion runs o_a_proj at the end of attention,
+    # so this 3D tensor is O-LoRA output and only o_b_proj remains.
     if attn_output_tensor.ndim == 3:
         return self.o_b_proj(attn_output_tensor.flatten(1))
 

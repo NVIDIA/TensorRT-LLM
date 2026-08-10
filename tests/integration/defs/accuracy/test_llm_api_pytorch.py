@@ -6336,6 +6336,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                     max_num_tokens=512,
                     max_batch_size=4,
                     disable_overlap_scheduler=True,
+                    disable_mm_encoder=True,
                     kv_cache_config=self.kv_cache_config,
                     cuda_graph_config=CudaGraphConfig(enable_padding=True,
                                                       max_batch_size=4),

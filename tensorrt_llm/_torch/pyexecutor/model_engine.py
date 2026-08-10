@@ -3137,8 +3137,18 @@ class PyTorchModelEngine(ModelEngine):
         return isinstance(self.input_processor, BaseMultimodalInputProcessor)
 
     def _validate_breakable_cuda_graph_compatibility(self) -> None:
-        if (self.llm_args.prefill_cuda_graph_backend
-                == PrefillCudaGraphBackend.BREAKABLE and self.is_multimodal):
+        if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
+            return
+
+        if isinstance(self.model, DecoderModelForCausalLM):
+            return
+        decoder_model = getattr(self.model, "llm", None)
+        if (self.llm_args.disable_mm_encoder
+                and isinstance(decoder_model, DecoderModelForCausalLM)
+                and getattr(self.model, "mm_encoder", None) is None):
+            return
+        if (isinstance(self.model, MultimodalModelMixin) or isinstance(
+                self.input_processor, BaseMultimodalInputProcessor)):
             raise ValueError(
                 "breakable prefill CUDA graph does not support multimodal models"
             )
