@@ -20,7 +20,7 @@ implementation of block hashing without importing the whole router module.
 import bisect
 import os
 from collections import OrderedDict
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Protocol, TypedDict, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
@@ -52,6 +52,27 @@ truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 BlockHash = Union[int, str]
+
+
+class _OffsetEncoding(TypedDict):
+    input_ids: list[int]
+    offset_mapping: list[tuple[int, int]]
+
+
+class _OffsetTokenizer(Protocol):
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        """Encode text into canonical token IDs."""
+        ...
+
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ) -> _OffsetEncoding:
+        """Encode text and optionally return character offsets."""
+        ...
+
 
 __all__ = [
     "KV_CACHE_HASH_ALGO_DEFAULT",
@@ -223,8 +244,8 @@ class BlockHashMixin:
         )
         if self._incremental_tokenize:
             logger.info(
-                "Incremental router tokenization enabled with %d-token rollback",
-                self._incremental_tokenize_rollback,
+                f"Incremental router tokenization enabled with "
+                f"{self._incremental_tokenize_rollback}-token rollback"
             )
 
     def _get_tokenizer(self, model: str):
@@ -248,7 +269,10 @@ class BlockHashMixin:
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
-    def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
+    def _encode_with_prefix_cache(
+        self, rendered: str, key: int, tokenizer: _OffsetTokenizer
+    ) -> list[int]:
+        """Tokenize a rendered prompt while reusing a stable cached prefix."""
         cache = getattr(self, "_tok_prefix_cache", None)
         if cache is None:
             cache = self._tok_prefix_cache = OrderedDict()
@@ -277,7 +301,7 @@ class BlockHashMixin:
             # Retokenize the token immediately before the changed text. BPE
             # merges may cross the character-level common-prefix boundary.
             cut_token = max(0, stable_tokens - self._incremental_tokenize_rollback)
-            cut_char = previous_offsets[cut_token][0]
+            cut_char = 0 if cut_token == 0 else previous_offsets[cut_token][0]
             suffix_ids, suffix_offsets = self._encode_with_offsets(rendered[cut_char:], tokenizer)
             if suffix_offsets is not None:
                 ids = previous_ids[:cut_token] + suffix_ids
@@ -303,9 +327,8 @@ class BlockHashMixin:
             full_ids = tokenizer.encode(rendered, add_special_tokens=False)
             if ids != full_ids:
                 logger.error(
-                    "Incremental tokenization mismatch; falling back to full encode "
-                    "for cache key %s",
-                    key,
+                    f"Incremental tokenization mismatch; falling back to full "
+                    f"encode for cache key {key}"
                 )
                 ids = full_ids
                 offsets = None
@@ -318,8 +341,9 @@ class BlockHashMixin:
 
     @staticmethod
     def _encode_with_offsets(
-        rendered: str, tokenizer
+        rendered: str, tokenizer: _OffsetTokenizer
     ) -> tuple[list[int], Optional[list[tuple[int, int]]]]:
+        """Return canonical token IDs and validated offsets when supported."""
         ids = tokenizer.encode(rendered, add_special_tokens=False)
         try:
             encoding = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)

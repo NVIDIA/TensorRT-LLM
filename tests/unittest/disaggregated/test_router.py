@@ -2342,9 +2342,11 @@ class _BoundaryMergingTokenizer:
     }
 
     def __init__(self):
+        """Initialize tokenizer call tracing."""
         self.calls = []
 
     def _tokenize(self, text):
+        """Greedily tokenize text and return character offsets."""
         ids = []
         offsets = []
         position = 0
@@ -2368,6 +2370,7 @@ class _BoundaryMergingTokenizer:
                  text,
                  add_special_tokens=False,
                  return_offsets_mapping=False):
+        """Return a tokenizer-style mapping and record the input."""
         del add_special_tokens
         self.calls.append(text)
         ids, offsets = self._tokenize(text)
@@ -2377,12 +2380,81 @@ class _BoundaryMergingTokenizer:
         return result
 
     def encode(self, text, add_special_tokens=False):
+        """Return canonical token IDs."""
         del add_special_tokens
         return self._tokenize(text)[0]
 
 
+class _LeadingWhitespaceTokenizer:
+
+    @staticmethod
+    def _tokenize(text):
+        """Tokenize non-whitespace characters with source offsets."""
+        ids = []
+        offsets = []
+        for position, character in enumerate(text):
+            if character.isspace():
+                continue
+            ids.append(ord(character))
+            offsets.append((position, position + 1))
+        return ids, offsets
+
+    def __call__(self,
+                 text,
+                 add_special_tokens=False,
+                 return_offsets_mapping=False):
+        """Return token IDs and optional offsets."""
+        del add_special_tokens
+        ids, offsets = self._tokenize(text)
+        result = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+    def encode(self, text, add_special_tokens=False):
+        """Return canonical token IDs."""
+        del add_special_tokens
+        return self._tokenize(text)[0]
+
+
+class _OffsetFailureTokenizer(_BoundaryMergingTokenizer):
+
+    def __init__(self):
+        """Initialize selectable offset failure behavior."""
+        super().__init__()
+        self.offset_failure = None
+
+    def __call__(self, *args, **kwargs):
+        """Return unavailable or inconsistent offsets when configured."""
+        result = super().__call__(*args, **kwargs)
+        if self.offset_failure == "unavailable":
+            raise NotImplementedError
+        if self.offset_failure == "invalid":
+            result["offset_mapping"] = result["offset_mapping"][:-1]
+        return result
+
+
+class _WideBoundaryMergingTokenizer(_BoundaryMergingTokenizer):
+
+    _TOKENS = {
+        "e\nactual": 3,
+        "\nactual": 1,
+        "\n": 2,
+    }
+
+    def __init__(self):
+        """Initialize canonical-encode call tracing."""
+        super().__init__()
+        self.encode_calls = []
+
+    def encode(self, text, add_special_tokens=False):
+        """Record and return canonical token IDs."""
+        self.encode_calls.append(text)
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
 def test_prefix_cache_rolls_back_boundary_token(servers):
-    """AgentX replaces the previous synthetic ``<think>`` generation prefix.
+    r"""AgentX replaces the previous synthetic ``<think>`` generation prefix.
 
     The old rendered prompt ends in ``assistant\n<think>\n``. On the next
     turn, the actual assistant response replaces that final ``<think>\n``,
@@ -2408,6 +2480,69 @@ def test_prefix_cache_rolls_back_boundary_token(servers):
 
     assert result == tokenizer.encode(current)
     assert tokenizer.calls == [current_suffix]
+
+
+def test_prefix_cache_zero_cut_includes_changed_leading_text(servers):
+    """A zero-token cut must start before a tokenizer-skipped prefix."""
+    with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _LeadingWhitespaceTokenizer()
+        key = 43
+        previous = " cached"
+        current = "Xcached"
+        assert router._encode_with_prefix_cache(
+            previous, key, tokenizer) == tokenizer.encode(previous)
+        result = router._encode_with_prefix_cache(current, key, tokenizer)
+
+    assert result == tokenizer.encode(current)
+
+
+@pytest.mark.parametrize("offset_failure", ["unavailable", "invalid"])
+def test_prefix_cache_falls_back_for_unusable_offsets(servers, offset_failure):
+    """Unavailable or inconsistent offsets trigger canonical tokenization."""
+    with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _OffsetFailureTokenizer()
+        key = 44
+        previous = "stable\n"
+        current = "stable\nactual response"
+        assert router._encode_with_prefix_cache(
+            previous, key, tokenizer) == tokenizer.encode(previous)
+        tokenizer.calls.clear()
+        tokenizer.offset_failure = offset_failure
+        result = router._encode_with_prefix_cache(current, key, tokenizer)
+
+    assert result == tokenizer.encode(current)
+    assert tokenizer.calls == ["\nactual response", current]
+
+
+def test_prefix_cache_periodic_verification_falls_back(servers):
+    """Periodic verification replaces a divergent incremental encoding."""
+    env = {
+        "TRTLLM_INCREMENTAL_TOKENIZE": "1",
+        "TRTLLM_INCREMENTAL_TOKENIZE_VERIFY_EVERY": "1",
+    }
+    with mock.patch.dict(os.environ, env):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _WideBoundaryMergingTokenizer()
+        key = 45
+        previous = "stable\n"
+        current = "stable\nactual response"
+        assert router._encode_with_prefix_cache(
+            previous, key, tokenizer) == tokenizer.encode(previous)
+        tokenizer.calls.clear()
+        tokenizer.encode_calls.clear()
+        result = router._encode_with_prefix_cache(current, key, tokenizer)
+
+    assert result == tokenizer.encode(current)
+    assert tokenizer.calls == ["\nactual response"]
+    assert tokenizer.encode_calls == ["\nactual response", current, current]
 
 
 def test_prefix_cache_tokenize_matches_full_encode(servers):
