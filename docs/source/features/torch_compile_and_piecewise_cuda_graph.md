@@ -59,10 +59,21 @@ prefill_cuda_graph_backend: breakable
 prefill_capture_num_tokens: [128, 256, 512]
 ```
 
-The first version of the breakable backend supports BF16 Qwen3.5 on one GPU for
-context-only, tensor/pipeline parallelism and mixed context/decode batches with KV cache. Speculative
-decoding, LoRA, multimodal inputs, and context
-logits fall back to eager execution or are rejected during initialization.
+The breakable backend is experimental. The integration coverage in this change
+includes BF16 Qwen3.5 on one GPU and NVFP4 DeepSeek models on multiple GPUs,
+with both context-only and mixed context/decode batches using the KV cache.
+
+The following restrictions are enforced:
+
+- `torch_compile_config`, LoRA, and multimodal models are rejected during
+  engine initialization.
+- Speculative decoding is supported.
+- Context-logit requests run eagerly instead of replaying a breakable CUDA
+  graph.
+
+Other model families, quantization modes, and parallel configurations are not
+yet covered by this experimental backend's integration tests and should be
+validated before use.
 
 ## Tips for Piecewise CUDA Graph
 

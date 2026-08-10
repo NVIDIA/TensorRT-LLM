@@ -81,6 +81,12 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream) -> No
     other_is_capture = other is capturing or other.cuda_stream == capture_ptr
     if self_is_capture and not other_is_capture:
         if not _is_stream_capturing(other):
+            logger.warning(
+                "Dropping a wait from the breakable CUDA graph capture stream "
+                "to a non-capturing stream; this dependency will not be "
+                "preserved during replay.",
+                stacklevel=2,
+            )
             return
         _original_wait_stream(self, other)
         forked.discard(other)

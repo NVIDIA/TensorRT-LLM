@@ -5666,12 +5666,14 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
             if self.torch_compile_config is None:
                 self.torch_compile_config = TorchCompileConfig()
-        elif (self.prefill_cuda_graph_backend
-              == PrefillCudaGraphBackend.BREAKABLE
-              and self.torch_compile_config is not None):
-            raise ValueError(
-                "breakable prefill CUDA graph does not support torch_compile_config"
-            )
+        elif self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
+            if self.torch_compile_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support torch_compile_config"
+                )
+            if self.enable_lora or self.lora_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support LoRA")
 
         return self
 

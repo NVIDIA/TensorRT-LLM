@@ -494,6 +494,7 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
+        self._validate_breakable_cuda_graph_compatibility()
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
         self._enable_scheduler_aware_adp_dummy = (
@@ -3134,6 +3135,13 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(self.model, MultimodalModelMixin):
             return True
         return isinstance(self.input_processor, BaseMultimodalInputProcessor)
+
+    def _validate_breakable_cuda_graph_compatibility(self) -> None:
+        if (self.llm_args.prefill_cuda_graph_backend
+                == PrefillCudaGraphBackend.BREAKABLE and self.is_multimodal):
+            raise ValueError(
+                "breakable prefill CUDA graph does not support multimodal models"
+            )
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the
@@ -7271,6 +7279,7 @@ class PyTorchModelEngine(ModelEngine):
                     can_run_breakable_graph = (
                         breakable_runner is not None
                         and get_per_request_prefill_cuda_graph_flag()
+                        and not gather_context_logits
                         and breakable_runner.has_graph(num_tokens))
                     if can_run_breakable_graph and not breakable_runner.is_warming_up:
                         outputs = breakable_runner.execute(

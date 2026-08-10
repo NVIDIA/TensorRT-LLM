@@ -2047,6 +2047,30 @@ class TestPiecewiseCudaGraphCaptureDefaults:
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
                 torch_compile_config=TorchCompileConfig())
 
+    def test_breakable_allows_speculative_decoding(self):
+        speculative_config = MTPDecodingConfig(max_draft_len=1)
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            speculative_config=speculative_config)
+        assert args.speculative_config == speculative_config
+
+    @pytest.mark.parametrize("lora_kwargs", [
+        {
+            "enable_lora": True
+        },
+        {
+            "lora_config": LoraConfig(lora_target_modules=["attn_q"])
+        },
+    ])
+    def test_breakable_rejects_lora(self, lora_kwargs):
+        with pytest.raises(ValueError, match="LoRA"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                **lora_kwargs,
+            )
+
     def test_prefill_filter_sorts_dedupes_and_drops_nonpositive(self):
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_prefill_capture_num_tokens

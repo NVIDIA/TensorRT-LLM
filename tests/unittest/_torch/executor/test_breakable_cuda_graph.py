@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import logging
+
 import pytest
 import torch
 from torch import nn
@@ -159,6 +161,22 @@ def test_side_stream_is_joined_before_segment_end():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(output, torch.full_like(output, 8))
+
+
+def test_dropped_wait_stream_logs_callsite(caplog):
+    side_stream = torch.cuda.Stream()
+
+    def body():
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger=("tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph"),
+    ):
+        _capture(body)
+
+    record = next(record for record in caplog.records if "Dropping a wait" in record.message)
+    assert record.funcName == "body"
 
 
 class _Body(nn.Module):
