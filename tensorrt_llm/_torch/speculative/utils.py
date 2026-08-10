@@ -523,6 +523,16 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
+_draft_kv_mode_logged = False
+
+
+def _log_draft_kv_mode_once(mode: str) -> None:
+    global _draft_kv_mode_logged
+    if not _draft_kv_mode_logged:
+        _draft_kv_mode_logged = True
+        logger.info(f"[unified-kv] draft KV resolved: {mode}")
+
+
 def resolve_draft_kv_cache_manager(resource_manager):
     """Resolve the draft-side KV manager for one-model speculative decoding.
 
@@ -535,10 +545,15 @@ def resolve_draft_kv_cache_manager(resource_manager):
     draft_manager = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
     if draft_manager is not None:
+        _log_draft_kv_mode_once("separate draft manager")
         return draft_manager
     target_manager = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
-    return getattr(target_manager, "draft_subpage_view", None)
+    view = getattr(target_manager, "draft_subpage_view", None)
+    _log_draft_kv_mode_once(
+        "target manager's draft sub-page view" if view is not None else
+        "none (drafter attends the shared manager directly)")
+    return view
 
 
 def get_draft_kv_cache_manager(spec_config, resource_manager):
