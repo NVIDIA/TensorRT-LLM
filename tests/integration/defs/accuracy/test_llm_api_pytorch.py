@@ -7884,8 +7884,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
-                                 inferencemax, attention_dp,
-                                 overlap_scheduler, use_msa, cuda_graph):
+                                 inferencemax, attention_dp, overlap_scheduler,
+                                 use_msa, cuda_graph):
         """Disaggregated arm of test_nvfp4_eagle3.
 
         CI coverage for Eagle3 + the unified (shared) draft KV cache
@@ -7898,8 +7898,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         silently, acceptance; accuracy is asserted here, acceptance stats
         stay with the aggregated arm which exercises the same view code).
         """
-        if not (attention_dp and overlap_scheduler and cuda_graph
-                and use_msa):
+        if not (attention_dp and overlap_scheduler and cuda_graph and use_msa):
             pytest.skip("the disagg arm pins the AgentX serving shape "
                         "(attention-DP gen + overlap scheduler + CUDA "
                         "graphs + MSA)")
@@ -8007,10 +8006,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
         if disagg:
-            self._run_nvfp4_eagle3_disagg(model_name, model_path,
-                                          max_draft_len, inferencemax,
-                                          attention_dp, overlap_scheduler,
-                                          use_msa, cuda_graph)
+            self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
+                                          inferencemax, attention_dp,
+                                          overlap_scheduler, use_msa,
+                                          cuda_graph)
             return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
