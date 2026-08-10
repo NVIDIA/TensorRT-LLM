@@ -1079,6 +1079,11 @@ class MoE(nn.Module):
         )
 
     @property
+    def has_nvfp4_activation_quantization(self):
+        assert self._weights_created
+        return self.quant_method.quantizes_nvfp4_activations
+
+    @property
     def has_w4a8_nvfp4_fp8(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(

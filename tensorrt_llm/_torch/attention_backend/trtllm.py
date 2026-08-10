@@ -643,6 +643,56 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:self.num_seqs],
         )
 
+    def prepare_encoder_decoder_from_precomputed_lengths(
+            self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
+            context_kv_tokens: int, generation_kv_tokens: int,
+            max_kv_len: int) -> None:
+        """Prepare encoder-decoder attention from precomputed lengths."""
+        super().prepare()
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        assert self.kv_cache_manager is not None
+        assert self.draft_kv_cache_manager is None
+        assert not self.is_spec_decoding_enabled
+        assert self.kv_cache_params.num_extra_kv_tokens == 0
+        assert not self.enable_flash_mla
+        assert not self.enable_helix
+        assert not self.enable_context_mla_with_cached_kv
+        assert self.request_ids is not None
+        assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+            f"The max KV cache length of input sequences ({max_kv_len}) "
+            "exceeds the KV cache manager's maximum supported length "
+            f"({self.kv_cache_manager.max_seq_len}).")
+
+        num_seqs = self.num_seqs
+        self.prompt_lens_cuda[:num_seqs].copy_(prompt_lens, non_blocking=True)
+        self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
+        self.host_total_kv_lens[0] = context_kv_tokens
+        self.host_total_kv_lens[1] = generation_kv_tokens
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:num_seqs].fill_(1)
+
+        max_blocks = None
+        if self.kv_cache_manager.tokens_per_block:
+            max_blocks = ceil_div(max_kv_len,
+                                  self.kv_cache_manager.tokens_per_block)
+        self.kv_cache_manager.copy_batch_block_offsets(
+            self.kv_cache_block_offsets,
+            self.request_ids,
+            self.beam_width,
+            self.num_contexts,
+            num_seqs,
+            max_blocks=max_blocks)
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
+            kv_lens=kv_lens,
+            prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
+            prompt_lens_cpu=prompt_lens,
+            host_request_types=self.host_request_types[:num_seqs],
+        )
+
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
         extra_attrs = get_model_extra_attrs()
@@ -1597,17 +1647,51 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             else:
                 forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
-            from .utils import append_mla_latent_cache
-            append_mla_latent_cache(
-                metadata.kv_cache_manager,
-                self.get_local_layer_idx(metadata),
-                metadata.request_ids,
-                metadata.seq_lens.tolist(),
-                metadata.kv_cache_params.num_cached_tokens_per_seq,
-                forward_args.latent_cache,
-                kv_layout=metadata.kv_layout,
-                seq_start=num_ctx,
-            )
+            from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+
+            # Hybrid (mamba/masked-layer) KV managers take the graph-safe
+            # append; the same predicate interface.py uses to detect hybrid
+            # managers for mamba metadata. Dense MLA models keep the
+            # host-side path unchanged.
+            if isinstance(metadata.kv_cache_manager, BaseMambaCacheManager):
+                from .utils import \
+                    append_mla_latent_cache_generation_cuda_graph_safe
+
+                # The write positions must come from device tensors: the host
+                # lists (request ids, seq lens, cached-token counts) are
+                # frozen into the graph at capture time and corrupt the cache
+                # on replay. The helper falls back to the host-side loop for
+                # eager forwards only; under CUDA graphs it scatters
+                # device-side for any uniform q_len (1 for plain decode,
+                # 1 + draft_len for padded spec-dec verification batches).
+                append_mla_latent_cache_generation_cuda_graph_safe(
+                    metadata,
+                    # NOTE: get_buffers / layer_offsets take the GLOBAL layer
+                    # index (they map through layer_offsets internally).
+                    # Passing the local offset double-maps and breaks hybrid
+                    # models whose KV manager covers a masked layer subset
+                    # (e.g. Kimi K3).
+                    self.layer_idx,
+                    forward_args.latent_cache,
+                )
+            else:
+                # TODO(TRTLLM-15193): this host-side path freezes write
+                # positions at CUDA graph capture time and may corrupt the
+                # cache on replay IF a non-hybrid MLA model reaches this path
+                # under graph capture. Investigate whether that is reachable;
+                # if so, the graph-safe branch above is a correctness fix to
+                # generalize, not an optimization.
+                from .utils import append_mla_latent_cache
+                append_mla_latent_cache(
+                    metadata.kv_cache_manager,
+                    self.get_local_layer_idx(metadata),
+                    metadata.request_ids,
+                    metadata.seq_lens.tolist(),
+                    metadata.kv_cache_params.num_cached_tokens_per_seq,
+                    forward_args.latent_cache,
+                    kv_layout=metadata.kv_layout,
+                    seq_start=num_ctx,
+                )
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
             self, q, k, metadata, forward_args)
