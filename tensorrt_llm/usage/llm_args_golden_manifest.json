@@ -528,7 +528,8 @@
     },
     {
       "allowed_values": [
-        "encode"
+        "encode",
+        "feature_encode"
       ],
       "annotation": "Literal['encode']",
       "converter": "",
