@@ -32,7 +32,7 @@ import openai
 import pytest
 import requests
 import yaml
-from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
@@ -197,17 +197,18 @@ def launch_disaggregated_llm(
     _apply_perf_flags(ctx_server_config)
     _apply_perf_flags(gen_server_config)
 
-    # Always assign free port dynamically for service discovery
-    serve_port = get_free_port()
-    disaggregated_server_config["port"] = serve_port
+    # Let the kernel assign the port inside trtllm-serve and report it back,
+    # rather than reserving one here and racing whoever takes it before the
+    # server binds. See https://nvbugs/6567057 and https://nvbugs/6435121.
+    disaggregated_server_config["port"] = 0
+    disagg_addr_path = os.path.join(temp_dir.name, "disagg_server.addr")
 
-    # Use HTTP service discovery
-    cluster_uri = f"http://localhost:{serve_port}"
-    print(f"Using HTTP service discovery at {cluster_uri}")
-
-    # Create service discovery config
+    # Create service discovery config. The server hosts the HTTP cluster
+    # storage on its own port, so the port in *its* copy of cluster_uri is
+    # never read (HttpClusterStorageServer.__init__ ignores the URI); only the
+    # workers dial it, and they get the resolved address below.
     disagg_cluster = {
-        "cluster_uri": cluster_uri,
+        "cluster_uri": "http://localhost:0",
         "cluster_name": "test_cluster",
         "heartbeat_interval_sec": 5,
         "inactive_timeout_sec": 10,
@@ -230,15 +231,14 @@ def launch_disaggregated_llm(
     disaggregated_server_config["internal_request_auth_key"] = (
         internal_request_auth_key)
 
-    # Inject into worker configs
+    # Inject into worker configs. disagg_cluster is replaced in
+    # write_worker_configs below, once the server's real address is known.
     ctx_server_config = {
         **ctx_server_config,
-        "disagg_cluster": disagg_cluster,
         "internal_request_auth_key": internal_request_auth_key,
     }
     gen_server_config = {
         **gen_server_config,
-        "disagg_cluster": disagg_cluster,
         "internal_request_auth_key": internal_request_auth_key,
     }
 
@@ -246,12 +246,20 @@ def launch_disaggregated_llm(
         yaml.dump(disaggregated_server_config, f)
     ctx_server_config_path = os.path.join(temp_dir.name,
                                           "ctx_server_config.yaml")
-    with open(ctx_server_config_path, "w") as f:
-        yaml.dump(ctx_server_config, f)
     gen_server_config_path = os.path.join(temp_dir.name,
                                           "gen_server_config.yaml")
-    with open(gen_server_config_path, "w") as f:
-        yaml.dump(gen_server_config, f)
+
+    def write_worker_configs(cluster_uri):
+        """Write the worker configs once the server's real address is known."""
+        worker_cluster = {**disagg_cluster, "cluster_uri": cluster_uri}
+        with open(ctx_server_config_path, "w") as f:
+            yaml.dump({
+                **ctx_server_config, "disagg_cluster": worker_cluster
+            }, f)
+        with open(gen_server_config_path, "w") as f:
+            yaml.dump({
+                **gen_server_config, "disagg_cluster": worker_cluster
+            }, f)
 
     args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
 
@@ -402,15 +410,29 @@ def launch_disaggregated_llm(
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
         disaggregated_serving_config_path, "--server_start_timeout",
-        str(server_waiting_timeout), "-r", "360000"
+        str(server_waiting_timeout), "-r", "360000", "--report_addr",
+        disagg_addr_path
     ]
+    # The disagg server must come up first: it owns the cluster storage the
+    # workers register with, and only it knows the port the kernel handed it.
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
-            multi_popen(ctx_servers, "ctx") as ctx_processes,
-            multi_popen(gen_servers, "gen") as gen_processes,
-            multi_popen([(base_env, server_cmd)], "disagg") as server_processes,
+            contextlib.ExitStack() as server_stack,
     ):
+        server_processes = server_stack.enter_context(
+            multi_popen([(base_env, server_cmd)], "disagg"))
+        _, serve_port = wait_for_reported_addr(disagg_addr_path,
+                                               server_waiting_timeout,
+                                               server_processes[0])
+        print(f"Using HTTP service discovery at http://localhost:{serve_port}")
+        write_worker_configs(f"http://localhost:{serve_port}")
+
+        ctx_processes = server_stack.enter_context(
+            multi_popen(ctx_servers, "ctx"))
+        gen_processes = server_stack.enter_context(
+            multi_popen(gen_servers, "gen"))
+
         start_time = time.time()
         server_is_ready = False
         while time.time() - start_time < server_waiting_timeout:

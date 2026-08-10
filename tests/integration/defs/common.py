@@ -671,6 +671,41 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
+def wait_for_reported_addr(addr_path, timeout, process=None):
+    """Read the address a server reported to its --report_addr file.
+
+    The file only appears once trtllm-serve has bound its socket, and that
+    socket stays bound from then on, so the address cannot be stolen between
+    this read and its use -- unlike a port reserved before the server starts.
+
+    Args:
+        addr_path: Path passed to the server's --report_addr.
+        timeout: Seconds to wait for the file to appear.
+        process: Optional Popen of the server, polled so that a crash fails
+            fast instead of burning the whole timeout.
+
+    Returns:
+        tuple[str, int]: The host and port the server bound.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"server exited with code {process.returncode} before "
+                f"reporting its address to {addr_path}")
+        try:
+            with open(addr_path) as f:
+                reported = f.read().strip()
+        except FileNotFoundError:
+            reported = ""
+        if reported:
+            host, _, port = reported.rpartition(":")
+            return host, int(port)
+        time.sleep(0.5)
+    raise TimeoutError(f"server did not report its address to {addr_path} "
+                       f"within {timeout}s")
+
+
 PORTS_IN_USE = set()
 
 # Size of the window carved out just below the kernel's ephemeral range, used
