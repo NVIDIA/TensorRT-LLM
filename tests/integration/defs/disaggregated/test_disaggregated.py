@@ -2383,10 +2383,14 @@ def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
     and the denominator — stress tests cancel a fraction of requests on purpose.
     """
     export_path = os.path.join(artifact_dir, "profile_export.jsonl")
-    assert os.path.exists(export_path), (
-        f"aiperf per-record export not found at {export_path}; cannot enforce "
-        "the request error-rate gate. If this aiperf version/export level does "
-        "not produce it, pass max_error_rate=None explicitly.")
+    # Explicit raise (not assert): asserts are stripped under python -O, which
+    # would defer the failure to open() without this diagnostic.
+    if not os.path.exists(export_path):
+        raise FileNotFoundError(
+            f"aiperf per-record export not found at {export_path}; cannot "
+            "enforce the request error-rate gate. If this aiperf "
+            "version/export level does not produce it, pass "
+            "max_error_rate=None explicitly.")
     total = 0
     cancelled = 0
     # (code, type) -> [count, example message]
