@@ -26,6 +26,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftSubpageView,
+    MiniMaxM3KVCacheManagerV2,
     derive_shared_draft_layout,
 )
 
@@ -115,6 +116,32 @@ def test_subdiv_one_degenerates_to_identity():
     view.copy_batch_block_offsets(dst, request_ids=[1], beam_width=1, num_contexts=1, num_seqs=1)
     assert dst[0, 0, 0, :2].tolist() == [5 * SCALE, 7 * SCALE]
     assert dst[0, 0, 1, :2].tolist() == [5 * SCALE + 1, 7 * SCALE + 1]
+
+
+def test_manager_property_builds_and_caches_view():
+    # Exercise the property itself (construction + the log statement), not
+    # just direct view construction: a stale field reference in the log
+    # f-string once raised AttributeError here, which the resolver's
+    # defaulted getattr silently swallowed into "no view".
+    class _FakeSharedManager(_FakeManager):
+        is_draft = False
+        draft_manager_tokens_per_block = 32
+
+        def __init__(self):
+            super().__init__()
+            self._shared_draft_layer_ids = [DRAFT_LAYER]
+            self._draft_subpage_view_obj = None
+
+    manager = _FakeSharedManager()
+    prop = MiniMaxM3KVCacheManagerV2.draft_subpage_view
+    view = prop.fget(manager)
+    assert isinstance(view, MiniMaxM3DraftSubpageView)
+    assert view.tokens_per_block == 32
+    assert prop.fget(manager) is view  # cached on second access
+
+    manager_draft = _FakeSharedManager()
+    manager_draft.is_draft = True
+    assert prop.fget(manager_draft) is None
 
 
 def test_view_rejects_draft_layer_outside_pool_zero():
