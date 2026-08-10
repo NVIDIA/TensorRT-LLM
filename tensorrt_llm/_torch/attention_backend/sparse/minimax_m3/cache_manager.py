@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
@@ -709,7 +710,8 @@ class MiniMaxM3DraftSubpageView:
         self.host_kv_cache_block_offsets = torch.zeros(
             (manager.num_pools, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        self._slots_host: Optional[torch.Tensor] = None
+        self._slots_host: Optional[np.ndarray] = None
+        self._out_host: Optional[torch.Tensor] = None
         self._arange: Optional[torch.Tensor] = None
 
     def __getattr__(self, name):
@@ -739,28 +741,34 @@ class MiniMaxM3DraftSubpageView:
         max_slots = max_units // sub
         # Raw mega-pool slot ids per request (M3's bypass semantics).
         slot_rows = self._manager._get_batch_cache_indices_by_pool_id(request_ids, pool_id=0)
+        cap = max(num_seqs, dst_tensor.shape[1])
         if (
             self._slots_host is None
             or self._slots_host.shape[0] < num_seqs
             or self._slots_host.shape[1] != max_slots
         ):
-            self._slots_host = torch.zeros(
-                (max(num_seqs, dst_tensor.shape[1]), max_slots), dtype=dst_tensor.dtype
+            self._slots_host = np.zeros((cap, max_slots), dtype=np.int32)
+            self._out_host = torch.empty(
+                (cap, 2, max_slots * sub), dtype=dst_tensor.dtype, pin_memory=prefer_pinned()
             )
             self._arange = torch.arange(sub, dtype=dst_tensor.dtype)
-        slots = self._slots_host[:num_seqs]
-        slots.zero_()
-        # Ragged fill is the only per-row work; all arithmetic below is one
-        # fused expansion across the batch. Pad/BAD_PAGE_INDEX entries clamp
-        # to slot 0 (safe pages: kernels never read past kv_lens).
+        slots_np = self._slots_host[:num_seqs]
+        slots_np.fill(0)
+        # Ragged fill is the only per-row work (numpy parses each row's list
+        # at C speed); all arithmetic below is one fused expansion across the
+        # batch, written into a persistent pinned staging buffer so the H2D
+        # copy is genuinely asynchronous. Pad/BAD_PAGE_INDEX entries clamp to
+        # slot 0 (safe pages: kernels never read past kv_lens).
         for i, row in enumerate(slot_rows[:num_seqs]):
             n = min(len(row), max_slots)
             if n > 0:
-                slots[i, :n] = torch.as_tensor(row[:n], dtype=dst_tensor.dtype)
-        slots.clamp_(min=0)
-        k = (slots * self._slot_units).unsqueeze(-1) + self._arange
-        host = torch.stack((k, k + sub), dim=1).reshape(num_seqs, 2, max_slots * sub)
-        dst_tensor[0, :num_seqs].copy_(host, non_blocking=True)
+                slots_np[i, :n] = row[:n]
+        np.clip(slots_np, 0, None, out=slots_np)
+        slots = torch.from_numpy(slots_np).to(dst_tensor.dtype)
+        out = self._out_host[:num_seqs].view(num_seqs, 2, max_slots, sub)
+        torch.add(slots.unsqueeze(-1) * self._slot_units, self._arange, out=out[:, 0])
+        torch.add(out[:, 0], sub, out=out[:, 1])
+        dst_tensor[0, :num_seqs].copy_(self._out_host[:num_seqs], non_blocking=True)
 
 
 def get_minimax_m3_kv_cache_manager_cls():
