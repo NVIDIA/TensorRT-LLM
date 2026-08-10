@@ -1022,6 +1022,40 @@ class TestSchedulerCacheBounds:
         assert scheduler.model_outputs == [None, None]
         assert scheduler.timestep_list == [None, None]
 
+    def test_release_drops_state_from_uncached_live_schedulers(self) -> None:
+        """The caller-override case: a one-off scheduler never enters the cache.
+
+        Walking only ``_scheduler_cache`` leaves its latent-sized ``model_outputs``
+        pinned until the next request replaces the attribute.
+        """
+
+        def _one_off():
+            return SimpleNamespace(
+                config=SimpleNamespace(solver_order=2),
+                model_outputs=[torch.zeros(4), torch.zeros(4)],
+                timestep_list=[torch.zeros(1), torch.zeros(1)],
+            )
+
+        pipeline = self._pipeline()
+        pipeline._scheduler_for(7.5)  # non-cacheable shift: memoizes nothing
+        assert pipeline._scheduler_cache == {}
+        pipeline.scheduler = _one_off()
+        pipeline.audio_scheduler = _one_off()
+
+        pipeline._release_scheduler_solver_state()
+
+        for label, scheduler in (
+            ("video", pipeline.scheduler),
+            ("audio", pipeline.audio_scheduler),
+        ):
+            assert scheduler.model_outputs == [None, None], label
+            assert scheduler.timestep_list == [None, None], label
+
+    def test_release_tolerates_absent_schedulers(self) -> None:
+        """Edge has no audio tower, so ``audio_scheduler`` may never be assigned."""
+        pipeline = self._pipeline()
+        pipeline._release_scheduler_solver_state()
+
 
 class TestEnvelopeAdvisory:
     def _warnings(self, monkeypatch):

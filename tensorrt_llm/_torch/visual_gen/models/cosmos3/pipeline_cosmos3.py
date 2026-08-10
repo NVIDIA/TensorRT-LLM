@@ -563,8 +563,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         request anyway, so this only shortens how long they are held; it frees
         references rather than allocating, and generation is strictly serial, so
         nothing else can be mid-loop on these instances.
+
+        The live schedulers are covered too: a caller-supplied ``flow_shift``
+        outside the cacheable set builds a one-off instance that never enters the
+        cache, and it stays reachable here until the next request replaces it.
         """
-        for scheduler in (getattr(self, "_scheduler_cache", None) or {}).values():
+        cached_schedulers = self._scheduler_cache.values()
+        live_schedulers = (getattr(self, "scheduler", None), getattr(self, "audio_scheduler", None))
+        for scheduler in (*cached_schedulers, *live_schedulers):
+            if scheduler is None:
+                continue
             order = getattr(getattr(scheduler, "config", None), "solver_order", None)
             if order is None:
                 continue
