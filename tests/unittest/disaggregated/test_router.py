@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import os
 import random
 import threading
 from pathlib import Path
@@ -2330,6 +2331,76 @@ def _grow_conversation():
         convo.append({"role": "assistant", "content": f"resp{turn} " * 30})
         convo.append({"role": "user", "content": f"q{turn} " * 12})
         yield [dict(m) for m in convo]
+
+
+class _BoundaryMergingTokenizer:
+    """Greedy tokenizer whose longest token can cross a changed boundary."""
+
+    _TOKENS = {
+        "abc": 1,
+        "ab": 2,
+        "zz": 3,
+        "X": 4,
+        "Y": 5,
+    }
+
+    def __init__(self):
+        self.calls = []
+
+    def _tokenize(self, text):
+        ids = []
+        offsets = []
+        position = 0
+        vocabulary = sorted(self._TOKENS, key=len, reverse=True)
+        while position < len(text):
+            token = next(
+                (item
+                 for item in vocabulary if text.startswith(item, position)),
+                None)
+            if token is None:
+                token = text[position]
+                token_id = 1000 + ord(token)
+            else:
+                token_id = self._TOKENS[token]
+            ids.append(token_id)
+            offsets.append((position, position + len(token)))
+            position += len(token)
+        return ids, offsets
+
+    def __call__(self,
+                 text,
+                 add_special_tokens=False,
+                 return_offsets_mapping=False):
+        del add_special_tokens
+        self.calls.append(text)
+        ids, offsets = self._tokenize(text)
+        result = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return self._tokenize(text)[0]
+
+
+def test_prefix_cache_rolls_back_boundary_token(servers):
+    with mock.patch.dict(os.environ, {"TRTLLM_INCREMENTAL_TOKENIZE": "1"}):
+        router = KvCacheAwareRouter(server_role=None,
+                                    servers=servers,
+                                    tokens_per_block=4)
+        tokenizer = _BoundaryMergingTokenizer()
+        key = 42
+        previous = "stable-prefix-zzabX"
+        current = "stable-prefix-zzabcY"
+        assert not current.startswith(previous)
+        assert router._encode_with_prefix_cache(
+            previous, key, tokenizer) == tokenizer.encode(previous)
+        tokenizer.calls.clear()
+        result = router._encode_with_prefix_cache(current, key, tokenizer)
+
+    assert result == tokenizer.encode(current)
+    assert tokenizer.calls == ["abcY"]
 
 
 def test_prefix_cache_tokenize_matches_full_encode(servers):

@@ -17,6 +17,7 @@ Extracted from ``router.py`` so the surface routers there can share a single
 implementation of block hashing without importing the whole router module.
 """
 
+import bisect
 import os
 from collections import OrderedDict
 from typing import Iterable, List, Optional, Union
@@ -206,6 +207,13 @@ class BlockHashMixin:
         self._tokenizer_dir = tokenizer_dir
         self._model_path = model_path
         self._use_harmony = use_harmony
+        self._incremental_tokenize = os.environ.get("TRTLLM_INCREMENTAL_TOKENIZE", "0") == "1"
+        self._incremental_tokenize_rollback = max(
+            1, int(os.environ.get("TRTLLM_INCREMENTAL_TOKENIZE_ROLLBACK_TOKENS", "1"))
+        )
+        self._incremental_tokenize_verify_every = max(
+            0, int(os.environ.get("TRTLLM_INCREMENTAL_TOKENIZE_VERIFY_EVERY", "0"))
+        )
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
@@ -213,6 +221,11 @@ class BlockHashMixin:
             f", model_path={self._model_path}"
             f", use_harmony={self._use_harmony}"
         )
+        if self._incremental_tokenize:
+            logger.info(
+                "Incremental router tokenization enabled with %d-token rollback",
+                self._incremental_tokenize_rollback,
+            )
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
@@ -240,17 +253,83 @@ class BlockHashMixin:
         if cache is None:
             cache = self._tok_prefix_cache = OrderedDict()
         entry = cache.get(key)
+        used_incremental = False
         if entry is not None and rendered == entry[0]:
             ids = entry[1]
+            offsets = entry[2]
+        elif self._incremental_tokenize and entry is not None and entry[2]:
+            previous_text, previous_ids, previous_offsets = entry
+            prefix_limit = min(len(previous_text), len(rendered))
+            low, high = 0, prefix_limit
+            while low < high:
+                middle = (low + high + 1) // 2
+                if previous_text[:middle] == rendered[:middle]:
+                    low = middle
+                else:
+                    high = middle - 1
+            common_prefix_chars = low
+
+            stable_tokens = bisect.bisect_right(
+                previous_offsets,
+                common_prefix_chars,
+                key=lambda offset: offset[1],
+            )
+            # Retokenize the token immediately before the changed text. BPE
+            # merges may cross the character-level common-prefix boundary.
+            cut_token = max(0, stable_tokens - self._incremental_tokenize_rollback)
+            cut_char = previous_offsets[cut_token][0]
+            suffix_ids, suffix_offsets = self._encode_with_offsets(rendered[cut_char:], tokenizer)
+            if suffix_offsets is not None:
+                ids = previous_ids[:cut_token] + suffix_ids
+                offsets = previous_offsets[:cut_token] + [
+                    (start + cut_char, end + cut_char) for start, end in suffix_offsets
+                ]
+                used_incremental = True
+            else:
+                ids, offsets = self._encode_with_offsets(rendered, tokenizer)
+        elif self._incremental_tokenize:
+            ids, offsets = self._encode_with_offsets(rendered, tokenizer)
         else:
-            # Tokenizing a suffix independently is not generally composable:
-            # BPE/SentencePiece merges can cross the cached string boundary.
             ids = tokenizer.encode(rendered, add_special_tokens=False)
-        cache[key] = (rendered, ids)
+            offsets = None
+
+        verify_count = getattr(self, "_incremental_tokenize_verify_count", 0) + 1
+        self._incremental_tokenize_verify_count = verify_count
+        if (
+            used_incremental
+            and self._incremental_tokenize_verify_every > 0
+            and verify_count % self._incremental_tokenize_verify_every == 0
+        ):
+            full_ids = tokenizer.encode(rendered, add_special_tokens=False)
+            if ids != full_ids:
+                logger.error(
+                    "Incremental tokenization mismatch; falling back to full encode "
+                    "for cache key %s",
+                    key,
+                )
+                ids = full_ids
+                offsets = None
+
+        cache[key] = (rendered, ids, offsets)
         cache.move_to_end(key)
         while len(cache) > 1024:
             cache.popitem(last=False)
         return ids
+
+    @staticmethod
+    def _encode_with_offsets(
+        rendered: str, tokenizer
+    ) -> tuple[list[int], Optional[list[tuple[int, int]]]]:
+        ids = tokenizer.encode(rendered, add_special_tokens=False)
+        try:
+            encoding = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
+            offset_ids = list(encoding["input_ids"])
+            offsets = list(encoding["offset_mapping"])
+        except (KeyError, NotImplementedError, TypeError, ValueError):
+            return ids, None
+        if ids != offset_ids or len(ids) != len(offsets):
+            return ids, None
+        return ids, offsets
 
     def _get_model_type(self) -> Optional[str]:
         model_path = self._model_path or self._tokenizer_dir
