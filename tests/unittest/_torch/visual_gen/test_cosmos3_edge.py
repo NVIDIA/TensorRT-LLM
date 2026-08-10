@@ -748,7 +748,6 @@ class TestStrictLoading:
 def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
     pipeline.family = family
-    pipeline.rank = 0
     pipeline.sampling = Cosmos3SamplingPolicy()
     pipeline.audio_gen = False
     pipeline.action_gen = False
@@ -1088,11 +1087,15 @@ class TestEnvelopeAdvisory:
         assert "num_frames=25" in records[0]
 
     def test_only_rank_zero_advises(self, monkeypatch):
-        """Every rank of a TP/Ulysses worker runs this; only one should speak."""
+        """Every rank of a TP/Ulysses worker runs this; only one should speak.
+
+        ``rank`` is a read-only property derived from ``torch.distributed``, so a
+        non-zero rank is simulated by shadowing it on the class.
+        """
         records = self._warnings(monkeypatch)
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-        pipeline.rank = 1
-        self._advise(pipeline, num_frames=25)  # out of envelope on rank 0
+        monkeypatch.setattr(type(pipeline), "rank", property(lambda self: 1))
+        self._advise(pipeline, num_frames=25)  # out of envelope, so rank 0 would warn
         assert records == []
 
     def test_family_without_envelope_never_logs(self, monkeypatch):
