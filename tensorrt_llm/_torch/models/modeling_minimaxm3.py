@@ -706,7 +706,8 @@ class MiniMaxM3MoE(nn.Module):
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
 
-        # Resolved on first use, once the expert weights and their scales exist.
+        # Resolved on first use, once the expert weights and their scales
+        # exist. The answer cannot change after weight load.
         self._routed_expert_input_scale: Optional[torch.Tensor] = None
         self._routed_expert_input_scale_resolved = False
 
@@ -714,13 +715,9 @@ class MiniMaxM3MoE(nn.Module):
     def routed_expert_input_scale(self) -> Optional[torch.Tensor]:
         """NVFP4 global activation scale for the routed experts, or None.
 
-        Non-None only when the routed experts quantize their input to NVFP4
-        with a static per-layer scale and no reshaping, which is the
-        precondition for producing that quantized input in an upstream
-        kernel's epilogue instead of in the MoE's own quantize.
-
-        Resolved once on first use rather than per forward: this sits on the
-        decode serial chain, and the answer cannot change after weight load.
+        Non-None only when the experts quantize their input to NVFP4 with a
+        static per-layer scale and no reshaping, which is what lets an
+        upstream kernel produce that quantized input in its epilogue.
         """
         if self._routed_expert_input_scale_resolved:
             return self._routed_expert_input_scale
@@ -733,14 +730,14 @@ class MiniMaxM3MoE(nn.Module):
         if not experts.has_nvfp4:
             return None
         if getattr(experts, "fc31_act_scale", None) is not None:
-            # NVFP4_AWQ folds a per-channel pre-quant scale into the activation
-            # before quantizing, which an RMSNorm epilogue cannot reproduce.
+            # NVFP4_AWQ applies a per-channel pre-quant scale before
+            # quantizing, which an RMSNorm epilogue cannot reproduce.
             return None
         w3_w1_weight = getattr(experts, "w3_w1_weight", None)
         if w3_w1_weight is None or w3_w1_weight.shape[-1] * 2 != self.hidden_dim:
-            # The MoE pads the activation up to the weight's hidden extent
-            # before quantizing; an epilogue producing exactly hidden_dim
-            # columns cannot stand in for that.
+            # The MoE pads the activation to the weight's hidden extent before
+            # quantizing, which an epilogue emitting exactly hidden_dim
+            # columns cannot do.
             return None
         return getattr(experts, "fc31_input_scale", None)
 
@@ -756,8 +753,7 @@ class MiniMaxM3MoE(nn.Module):
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
             # The experts take the pre-quantized activation when the caller
-            # produced one; the gate and the shared expert still need the bf16
-            # norm, which is why the producer keeps emitting both.
+            # supplies one.
             return self.experts(
                 hidden_states if hidden_states_fp4 is None else hidden_states_fp4,
                 router_logits,
@@ -2396,15 +2392,14 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, Optional[Fp4QuantizedTensor], torch.Tensor]:
         """As _apply_pre_feed_forward_norm, but also quantizes the MoE input.
 
-        The routed experts want their activation in NVFP4, and the standalone
-        quantize that produces it is a separate launch on the serial chain
-        between the o_proj AllReduce and the first expert GEMM. The fused
-        AllReduce epilogue can emit it from the same bf16 norm result it
-        already computes, which is bitwise what the standalone kernel reads.
+        The routed experts consume NVFP4, and the AllReduce epilogue emits it
+        from the same bf16 norm result it already computes, saving the
+        standalone quantize between the AllReduce and the first expert GEMM.
+        The OUT_ variant is required because the router gate and the shared
+        expert still consume the bf16 norm.
 
-        The OUT_ variant is required: the router gate and the shared expert
-        both still consume the bf16 norm. Returns a None fp4 tensor when the
-        fold does not apply, leaving the MoE to quantize for itself.
+        Returns a None fp4 tensor when the fold does not apply, leaving the
+        MoE to quantize for itself.
         """
         scale = self.block_sparse_moe.routed_expert_input_scale
         if not self.pre_feed_forward_fusion or scale is None:
@@ -2422,8 +2417,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 trigger_completion_at_end=False,
             ),
         )
-        # LINEAR rather than the default swizzled SF layout: the trtllm-gen MoE
-        # asserts a non-swizzled scaling factor.
+        # The op emits LINEAR scale factors.
         act = Fp4QuantizedTensor(act_fp4, act_sf, is_sf_swizzled=False)
         return norm_out, act, residual
 

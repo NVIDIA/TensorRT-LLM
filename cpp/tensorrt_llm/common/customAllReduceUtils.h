@@ -95,7 +95,7 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
     auto const fusion_op_entry = mapFusionOpToIndex.find(fusionOp);
     if (fusion_op_entry == mapFusionOpToIndex.end())
     {
-        // A fusion op the sweep never covered. NCCL runs every op via the
+        // The sweep never covered this op. NCCL runs every op through the
         // decomposed fallback, so it is the safe answer.
         return AllReduceStrategyType::NCCL;
     }

@@ -330,24 +330,22 @@ def run_nvfp4_linear_sf_op(
 ):
     """The linear-SF epilogue must match the standalone quantize bitwise.
 
-    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF exists so a consumer wanting
-    the trtllm-gen (row-major) scale factor layout can have its activation
-    quantized inside the AllReduce instead of in a kernel of its own. That is
-    only a valid substitution if it produces exactly what the standalone
-    quantize would have, so compare against the swizzled epilogue for the
-    parts that do not depend on layout, and against fp4_quantize on the
-    epilogue's own bf16 norm output for the part that does.
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF lets a consumer of the
+    row-major scale factor layout have its activation quantized inside the
+    AllReduce, which is only a valid substitution if the result is exactly
+    what the standalone quantize would produce. Compare against the swizzled
+    epilogue for the parts that do not depend on layout, and against
+    fp4_quantize on the epilogue's own bf16 norm output for the part that
+    does.
     """
     del fusion_op
 
     def fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0,
                      is_sf_swizzled_layout):
-        # Nested so that "ops" stays out of this function's own co_names:
-        # these worker functions are shipped to the ranks by value, and
-        # cloudpickle pulls in any sys.modules entry under a referenced module
-        # whose name components all appear there. torch.ops is such an entry,
-        # and its type subclasses ModuleType rather than being it, so it misses
-        # cloudpickle's module reducer and fails as a plain unpicklable object.
+        # Nested so that "ops" stays out of the worker's own co_names. Workers
+        # are shipped to the ranks by value, and cloudpickle then pulls in
+        # sys.modules["torch.ops"], whose type only subclasses ModuleType and
+        # so misses the module reducer, leaving an unpicklable object.
         return torch.ops.trtllm.fp4_quantize(x, global_scale, sf_vec_size,
                                              sf_use_ue8m0,
                                              is_sf_swizzled_layout)
@@ -384,12 +382,11 @@ def run_nvfp4_linear_sf_op(
     lin_norm, lin_fp4, lin_sf, lin_res = fused(
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)
 
-    del swz_sf  # Swizzled scale factors are the thing that is meant to differ.
+    del swz_sf  # The scale factor layout is what is meant to differ.
 
     def assert_same_bytes(actual, expected, what):
-        # Byte-wise rather than torch.testing.assert_close: these are FP4 and
-        # FP8 scale-factor tensors, and the comparison wanted here is identity,
-        # not closeness.
+        # Byte-wise rather than assert_close: these are FP4 values and FP8
+        # scale factors, and the comparison wanted here is identity.
         a = actual.reshape(-1).view(torch.uint8)
         b = expected.reshape(-1).view(torch.uint8)
         assert a.shape == b.shape, f"{what}: {a.shape} vs {b.shape}"
@@ -397,7 +394,7 @@ def run_nvfp4_linear_sf_op(
             a,
             b), (f"{what}: {(a != b).sum().item()} of {a.numel()} bytes differ")
 
-    # Only the scale factor layout changes, so everything else must be equal.
+    # Everything but the scale factors must be equal.
     assert_same_bytes(lin_norm, swz_norm, "norm_out vs swizzled")
     assert_same_bytes(lin_res, swz_res, "residual_out vs swizzled")
     assert_same_bytes(lin_fp4, swz_fp4, "quant_fp4 vs swizzled")
@@ -405,8 +402,8 @@ def run_nvfp4_linear_sf_op(
     # Linear layout is unpadded, unlike the swizzled layout's 128x4 blocks.
     assert lin_sf.numel() == x.shape[0] * (hidden_size // 16)
 
-    # The substitution this op exists for: quantizing the epilogue's own bf16
-    # norm output must give back the epilogue's fp4 output and scale factors.
+    # Quantizing the epilogue's own norm output must reproduce its fp4 output
+    # and scale factors.
     ref_fp4, ref_sf = fp4_quantize(lin_norm, scale, 16, False, False)
     assert_same_bytes(lin_fp4, ref_fp4, "quant_fp4 vs standalone quantize")
     assert_same_bytes(lin_sf, ref_sf, "scale_out vs standalone quantize")
