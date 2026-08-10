@@ -7883,8 +7883,111 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task = GSM8K(model_name)
                 task.evaluate(llm)
 
+    def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
+                                 inferencemax, attention_dp,
+                                 overlap_scheduler, use_msa, cuda_graph):
+        """Disaggregated arm of test_nvfp4_eagle3.
+
+        CI coverage for Eagle3 + the unified (shared) draft KV cache
+        crossing the disaggregated transceiver: context TP2 -> attention-DP
+        generation TP2 on one 4-GPU node, NIXL transport, block reuse on
+        the context servers -- the InferenceMAX/AgentX serving shape. The
+        drafter's KV rides the shared logical blocks, so this arm guards
+        both sub-page addressing and native drafter-KV transfer end to end
+        (a corrupted or dropped drafter cache collapses accuracy or, more
+        silently, acceptance; accuracy is asserted here, acceptance stats
+        stay with the aggregated arm which exercises the same view code).
+        """
+        if not (attention_dp and overlap_scheduler and cuda_graph
+                and use_msa):
+            pytest.skip("the disagg arm pins the AgentX serving shape "
+                        "(attention-DP gen + overlap scheduler + CUDA "
+                        "graphs + MSA)")
+        from .test_disaggregated_serving import launch_disaggregated_llm
+        speculative_config = {
+            "decoding_type": "Eagle3",
+            "max_draft_len": max_draft_len,
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            "eagle3_one_model": True,
+        }
+        common_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "speculative_config": speculative_config,
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "fuse_qkv_index_projection": True,
+                "indexer_kv_dtype": "fp8",
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+            "max_seq_len": 16384 if inferencemax else 4096,
+            "trust_remote_code": True,
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "enable_attention_dp": False,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": True,
+                "dtype": "fp8",
+            },
+            "max_batch_size": 32,
+            "max_num_tokens": 8192,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": False,
+            "enable_attention_dp": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "dtype": "fp8",
+            },
+            # Decode-only token budget: (1 + draft_len) verify tokens per
+            # request x max_batch_size, as in the AgentX gen servers.
+            "max_batch_size": 64,
+            "max_num_tokens": 256,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "max_batch_size": 64,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      model_path,
+                                      server_waiting_timeout=1800) as llm:
+            # The launcher stamps quant_algo=NVFP4 from the model name; the
+            # checkpoint's hf_quant_config is MIXED_PRECISION (which is what
+            # the in-process arm asserts and the accuracy references key on).
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            task = (GSM8KInferenceMax(model_name)
+                    if inferencemax else GSM8K(model_name))
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("disagg", [False, True])
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
@@ -7892,7 +7995,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa, cuda_graph, eval_mode):
+                          overlap_scheduler, use_msa, cuda_graph, eval_mode,
+                          disagg):
         if use_msa:
             from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
                 msa_package_available
@@ -7902,6 +8006,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
+        if disagg:
+            self._run_nvfp4_eagle3_disagg(model_name, model_path,
+                                          max_draft_len, inferencemax,
+                                          attention_dp, overlap_scheduler,
+                                          use_msa, cuda_graph)
+            return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
