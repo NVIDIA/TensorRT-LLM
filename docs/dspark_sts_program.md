@@ -625,6 +625,8 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 - **代码级根因(待定位)**:两个调度器共享的容量/槽记账把每个 DSpark 请求按 ~2 份计(嫌疑:spec 序列槽为 draft 复占、或 GNE 容量对 spec 请求的双倍预留);`get_max_num_sequences`=pp×bs=128 本身无恙。290ms 步时 = 减半批的伴生病(62 行时慢 2.7×,机理与槽争抢/eager 待nsys确认)。
 - 观测注记:cap 尾部到 67-75(非硬 64)——完成中请求可能释放半槽,支持"槽复占"方向。
 
+**修复后 Pro 表(08-10 10:55,maxbs=256 满批 + #32 修复,--from-iter-log,4 pin × 3 burst 双节点)**:`postfix_pro_table.json`,bs128 实测 L2/3/4/5 = **80.8/90.3/102.7/110.3ms**(n=47-81/cell)——**完美单调,w4 异常消失,GB300"平台+悬崖"楼梯消失**(确证均为 #32 prep 串行化 + #31 半批的伪影);固定 39.3ms + α(128)=9.1ms,θ(768)=61.9ms = **步时 56% 可裁**(Flash 为 54%,但 Pro 绝对杠杆 2.4×)。w5→w2 省 26.7% 步时。下一步:Pro@DEP8 三臂终局(scheduled-新表 vs notrim,maxbs=256),节点已排。
+
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
