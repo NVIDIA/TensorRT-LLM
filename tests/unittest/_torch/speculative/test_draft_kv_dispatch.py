@@ -64,3 +64,26 @@ def test_shared_manager_falls_back_to_subpage_view():
 def test_plain_shared_manager_resolves_to_none():
     resources = _FakeResources({ResourceManagerType.KV_CACHE_MANAGER: _PlainSharedTarget()})
     assert resolve_draft_kv_cache_manager(resources) is None
+
+
+def test_no_target_manager_resolves_to_none():
+    assert resolve_draft_kv_cache_manager(_FakeResources({})) is None
+
+
+class _BrokenViewTarget:
+    @property
+    def draft_subpage_view(self):
+        raise AttributeError("max_blocks_per_seq")
+
+
+def test_broken_view_construction_propagates():
+    # A failure inside view construction must surface, not silently
+    # downgrade to "no view" (getattr's default would swallow it and the
+    # drafter would attend the shared manager at the wrong page size).
+    resources = _FakeResources({ResourceManagerType.KV_CACHE_MANAGER: _BrokenViewTarget()})
+    try:
+        resolve_draft_kv_cache_manager(resources)
+    except AttributeError as e:
+        assert "max_blocks_per_seq" in str(e)
+    else:
+        raise AssertionError("expected the construction failure to propagate")

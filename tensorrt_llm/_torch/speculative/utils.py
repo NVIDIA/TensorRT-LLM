@@ -523,13 +523,13 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
-_draft_kv_mode_logged = False
+_last_draft_kv_mode = None
 
 
-def _log_draft_kv_mode_once(mode: str) -> None:
-    global _draft_kv_mode_logged
-    if not _draft_kv_mode_logged:
-        _draft_kv_mode_logged = True
+def _log_draft_kv_mode(mode: str) -> None:
+    global _last_draft_kv_mode
+    if mode != _last_draft_kv_mode:
+        _last_draft_kv_mode = mode
         logger.info(f"[unified-kv] draft KV resolved: {mode}")
 
 
@@ -545,12 +545,23 @@ def resolve_draft_kv_cache_manager(resource_manager):
     draft_manager = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
     if draft_manager is not None:
-        _log_draft_kv_mode_once("separate draft manager")
+        _log_draft_kv_mode("separate draft manager")
         return draft_manager
     target_manager = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
-    view = getattr(target_manager, "draft_subpage_view", None)
-    _log_draft_kv_mode_once(
+    if target_manager is None:
+        _log_draft_kv_mode("none (no target manager registered)")
+        return None
+    # Probe the class descriptor, then access the attribute directly: a
+    # plain getattr default would also swallow an AttributeError raised
+    # *inside* view construction, silently downgrading a broken view to
+    # "no view" (the drafter would then attend the shared manager at the
+    # wrong page size instead of failing loudly).
+    if getattr(type(target_manager), "draft_subpage_view", None) is None:
+        _log_draft_kv_mode("none (shared manager without a draft view)")
+        return None
+    view = target_manager.draft_subpage_view
+    _log_draft_kv_mode(
         "target manager's draft sub-page view" if view is not None else
         "none (drafter attends the shared manager directly)")
     return view
