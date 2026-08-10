@@ -42,6 +42,8 @@ def _make_attention_pair() -> tuple[KimiKDALinearAttention, KimiKDALinearAttenti
         "dtype": torch.bfloat16,
     }
     optimized = KimiKDALinearAttention(**common).to("cuda")
+    with torch.no_grad():
+        optimized.dt_bias.zero_()
     reference = KimiKDALinearAttention(**common, use_optimized_prefill=False).to("cuda")
     reference.load_state_dict(optimized.state_dict())
 
