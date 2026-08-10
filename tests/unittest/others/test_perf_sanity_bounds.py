@@ -31,6 +31,11 @@ import time
 
 import pytest
 
+# Required to run in the CPU-Generic stage: tests/unittest/conftest.py's
+# pytest_ignore_collect drops any file whose source lacks this literal when
+# pytest runs with -m cpu_only. Nothing here needs a GPU.
+pytestmark = pytest.mark.cpu_only
+
 _INTEGRATION = os.path.join(os.path.dirname(__file__), "..", "..", "integration")
 if _INTEGRATION not in sys.path:
     sys.path.insert(0, os.path.abspath(_INTEGRATION))
