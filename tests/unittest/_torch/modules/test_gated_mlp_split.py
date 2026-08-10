@@ -88,6 +88,17 @@ def _set_scales(linear, weight_scale=WEIGHT_SCALE, input_scale=INPUT_SCALE):
     linear.inv_input_scale.data.fill_(1.0 / input_scale)
 
 
+def _set_weights(linear):
+    """Give the projection finite weights.
+
+    Linear allocates FP8 weights uninitialized, so a test that skips this reads
+    whatever the caching allocator hands back -- NaN often enough to matter. Any
+    torch.equal assertion then fails regardless of the behaviour under test,
+    because torch.equal is False for NaN even when both sides are bit-identical.
+    """
+    linear.weight.data.copy_(_fp8(*linear.weight.shape))
+
+
 @requires_cuda
 def test_default_topology_is_unchanged():
     """The default must stay byte-for-byte what existing callers already build."""
@@ -182,6 +193,7 @@ def test_shared_input_is_quantized_once():
     """
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 
@@ -210,6 +222,7 @@ def test_fp8_output_feeds_down_proj():
     """SwiGLU emits FP8 for an FP8 down_proj, so down_proj skips its own quant."""
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 
@@ -232,6 +245,7 @@ def test_post_load_weights_rejects_mismatched_input_scales():
     """
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 
@@ -255,6 +269,7 @@ def test_post_load_weights_ignores_scales_for_bf16():
 def test_torch_compile_fullgraph():
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 
@@ -270,6 +285,7 @@ def test_torch_compile_fullgraph():
 def test_cuda_graph_capture():
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 
@@ -287,6 +303,7 @@ def test_lora_is_rejected_on_split_path():
     """
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.02
 
@@ -298,6 +315,7 @@ def test_lora_is_rejected_on_split_path():
 def test_non_swiglu_activation_is_rejected_on_split_path():
     mlp = _make(True, activation=F.gelu)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.02
 
@@ -348,6 +366,7 @@ def test_rank3_activations(shape):
     """
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 
@@ -364,6 +383,7 @@ def test_rank3_activations(shape):
 def test_rank3_compile_and_cuda_graph():
     mlp = _make(True)
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        _set_weights(linear)
         _set_scales(linear)
     mlp.post_load_weights()
 

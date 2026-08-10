@@ -104,6 +104,35 @@ def test_matches_fused_with_swiglu_limit(swiglu_limit):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "swiglu_alpha, swiglu_beta",
+    [(1.702, 1.0), (1.702, 0.0), (1.0, 1.0)],
+    ids=["swigluoai", "alpha_only", "beta_only"],
+)
+def test_matches_fused_with_alpha_beta(swiglu_alpha, swiglu_beta):
+    """alpha gains inside the sigmoid, beta offsets up; both must be plumbed.
+
+    Defaulting them drops the kernel to the alpha=1, beta=0 special case, which
+    is numerically wrong rather than merely unsupported -- and silently so.
+    """
+    gate, up = _pair(256, 512, torch.bfloat16)
+
+    expected = _reference(gate, up, swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta)
+    actual = swiglu_2in(gate, up, swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_alpha_beta_defaults_match_plain_swiglu():
+    """Omitting alpha/beta must stay bit-identical to plain silu_and_mul."""
+    gate, up = _pair(256, 512, torch.bfloat16)
+
+    assert torch.equal(
+        swiglu_2in(gate, up), swiglu_2in(gate, up, swiglu_alpha=1.0, swiglu_beta=0.0)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("m, n", [(256, 512), (1760, 12288)], ids=lambda v: str(v))
 def test_fp8_output_matches_fused(m, n):
     """With an FP8 down_proj, GatedMLP asks SwiGLU to emit FP8 directly.
