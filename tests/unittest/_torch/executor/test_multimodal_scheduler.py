@@ -478,6 +478,39 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     assert handled[0][1] == {"requests": [failed], "charge_budget": False}
 
 
+def test_forward_multimodal_encoder_step_contains_stale_schedule():
+    unrelated = _llm_request(2)
+    handled = []
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = MultimodalModelMixin()
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [unrelated]
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(world_size=1)
+    executor.model_engine = engine
+    executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([unrelated])
+    scheduled_requests.scheduled_mm_encoder_items = {1: [0]}
+
+    executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert scheduled_requests.context_requests == [unrelated]
+    assert scheduled_requests.scheduled_mm_encoder_items is None
+    assert handled == [
+        (
+            "Scheduled MM request 1 is no longer active",
+            {
+                "requests": [],
+                "charge_budget": False,
+            },
+        )
+    ]
+
+
 def test_forward_multimodal_encoder_step_propagates_system_errors():
     failed = _request(1, [4])
 
@@ -739,6 +772,29 @@ def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
     assert "video" not in mm_data
     assert mm_data["multimodal_embedding"] is embedding
     assert "multimodal_embed_mask_cumsum" in mm_data
+
+
+def test_terminate_request_releases_partial_multimodal_encoder_state():
+    request = _request(1, [4, 4])
+    _record(request.py_mm_encoder_state, 0)
+    freed = []
+
+    executor = object.__new__(PyExecutor)
+    executor.resource_manager = SimpleNamespace(free_resources=freed.append)
+    executor._prefetched_request_ids = {request.py_request_id}
+    executor._disagg_timed_out_ctx_cancelled_ids = {request.py_request_id}
+    executor._disagg_timed_out_gen_cancelled_ids = {request.py_request_id}
+    executor.gather_all_responses = False
+    executor.dist = SimpleNamespace(rank=1)
+
+    executor._do_terminate_request(request)
+
+    assert freed == [request]
+    assert request.py_mm_encoder_state is None
+    assert request.py_multimodal_data == {}
+    assert executor._prefetched_request_ids == set()
+    assert executor._disagg_timed_out_ctx_cancelled_ids == set()
+    assert executor._disagg_timed_out_gen_cancelled_ids == set()
 
 
 def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
