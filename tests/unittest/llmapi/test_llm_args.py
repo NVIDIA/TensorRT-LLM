@@ -43,6 +43,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           EncodeCudaGraphConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
+                                          FeatureEncoderCudaGraphConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig,
                                           MambaStateConfig, MoeConfig,
@@ -317,6 +318,65 @@ class TestEncoderRuntimeSizes:
                                   invalid_value):
         with pytest.raises(ValidationError):
             llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
+@pytest.mark.cpu_only
+class TestFeatureEncoderCudaGraphConfig:
+    """Cover the fixed-shape feature encoder branch of encoder_cuda_graph_config.
+
+    A feature encoder emits the same number of positions for every request, so
+    `batch_sizes` is its only bucket dimension. The token-shaped
+    `EncodeCudaGraphConfig` fields must not be expressible here, or a caller
+    could supply values the encoder graph runner silently overrides.
+    """
+
+    @pytest.mark.parametrize("batch_sizes", [[], [0], [-1], [1, -2]])
+    def test_rejects_non_positive_or_empty_batch_sizes(self, batch_sizes):
+        with pytest.raises(ValidationError):
+            FeatureEncoderCudaGraphConfig(batch_sizes=batch_sizes)
+
+    def test_sorts_and_deduplicates_batch_sizes(self):
+        cfg = FeatureEncoderCudaGraphConfig(batch_sizes=[4, 2, 2, 1])
+        assert cfg.batch_sizes == [1, 2, 4]
+
+    @pytest.mark.parametrize("field", ["num_tokens", "seq_lens"])
+    def test_rejects_token_shaped_buckets(self, field):
+        # These belong to EncodeCudaGraphConfig; accepting them here would be
+        # accepting a value the runner discards.
+        with pytest.raises(ValidationError):
+            FeatureEncoderCudaGraphConfig(batch_sizes=[1], **{field: [64]})
+
+    @pytest.mark.parametrize(
+        "config_dict, expected_type",
+        [
+            (dict(batch_sizes=[1, 2]), FeatureEncoderCudaGraphConfig),
+            (dict(batch_sizes=[1], seq_lens=[64],
+                  num_tokens=[64]), EncodeCudaGraphConfig),
+            (dict(mode="feature_encode",
+                  batch_sizes=[1]), FeatureEncoderCudaGraphConfig),
+        ],
+        ids=["bare_batch_sizes", "token_buckets", "explicit_mode"],
+    )
+    def test_encoder_config_mode_is_inferred(self, config_dict, expected_type):
+        llm_args = TorchLlmArgs(model=llama_model_path,
+                                encoder_max_batch_size=8,
+                                encoder_cuda_graph_config=config_dict)
+        assert isinstance(llm_args.encoder_cuda_graph_config, expected_type)
+
+    def test_feature_config_does_not_require_token_buckets(self):
+        llm_args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=8,
+            encoder_cuda_graph_config=FeatureEncoderCudaGraphConfig(
+                batch_sizes=[1, 2]))
+        assert llm_args.encoder_cuda_graph_config.batch_sizes == [1, 2]
+
+    def test_token_config_still_requires_token_buckets(self):
+        with pytest.raises(ValueError):
+            TorchLlmArgs(model=llama_model_path,
+                         encoder_max_batch_size=8,
+                         encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                             batch_sizes=[1, 2]))
 
 
 @pytest.mark.cpu_only

@@ -18,13 +18,16 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    CUDAGraphRunner, EncoderCUDAGraphRunner, KeyType,
-    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
+    CUDAGraphRunner, EncoderCUDAGraphRunner, EncoderCUDAGraphRunnerConfig,
+    KeyType, _restore_spec_decode_capture_state,
+    _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
     _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                          EncodeCudaGraphConfig,
+                                          FeatureEncoderCudaGraphConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchLlmArgs)
 
@@ -1018,6 +1021,118 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    @staticmethod
+    def _feature_encoder_runner(batch_sizes, fixed_seq_len=1500):
+        """A feature-mode runner with capture disabled, so no CUDA is touched."""
+        config = EncoderCUDAGraphRunnerConfig(
+            use_cuda_graph=False,
+            cuda_graph_padding_enabled=True,
+            cuda_graph_batch_sizes=batch_sizes,
+            cuda_graph_num_tokens=[],
+            cuda_graph_seq_lens=[],
+            max_cuda_graph_batch_size=max(batch_sizes),
+            max_cuda_graph_num_tokens=max(batch_sizes) * fixed_seq_len,
+            max_num_tokens=max(batch_sizes) * fixed_seq_len,
+            max_seq_len=fixed_seq_len,
+            cuda_graph_mem_pool=None,
+            is_encoder_decoder=True,
+            use_fixed_sequence_slots=False,
+            feature_shape=(480000, ),
+            feature_dtype=torch.float32,
+            fixed_seq_len=fixed_seq_len,
+        )
+        return EncoderCUDAGraphRunner(config)
+
+    def test_feature_encoder_capture_keys_are_all_reachable(self) -> None:
+        # Every request contributes exactly fixed_seq_len positions, so the
+        # only reachable key per batch size is (bs, bs * fixed, fixed). The
+        # token path's cross product would also emit keys whose token count no
+        # batch can produce, and capture_keys drives mixed encoder/decoder
+        # decoder-graph warmup.
+        fixed = 1500
+        batch_sizes = [1, 2, 4, 8]
+        runner = self._feature_encoder_runner(batch_sizes, fixed)
+
+        self.assertEqual(
+            sorted(runner.capture_keys),
+            [(bs, bs * fixed, fixed) for bs in batch_sizes],
+        )
+
+    def test_feature_encoder_capture_layout_is_uniform(self) -> None:
+        fixed = 1500
+        runner = self._feature_encoder_runner([2], fixed)
+        self.assertEqual(
+            runner._capture_sequence_lengths[(2, 2 * fixed, fixed)],
+            [fixed, fixed])
+
+    def test_derived_feature_encoder_batch_sizes_are_dense_below_eight(
+            self) -> None:
+        # The padding guard refuses a graph once padding would add more than
+        # MAX_FEATURE_PADDING_RATIO of encoder work, so sparse low buckets
+        # would leave batch sizes 5-7 permanently eager.
+        derived = PyTorchModelEngine._derive_feature_encoder_batch_sizes(32)
+        self.assertEqual(derived, [1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32])
+
+    def test_derived_feature_encoder_batch_sizes_respect_cap(self) -> None:
+        self.assertEqual(
+            PyTorchModelEngine._derive_feature_encoder_batch_sizes(6),
+            [1, 2, 3, 4, 5, 6])
+        self.assertEqual(
+            PyTorchModelEngine._derive_feature_encoder_batch_sizes(1), [1])
+
+    @staticmethod
+    def _encoder_spec_engine(encoder_cuda_graph_config,
+                             declares_spec: bool,
+                             tp_size: int = 1):
+        """A bare engine carrying only what `_encoder_graph_spec` reads."""
+        spec = ((480000, ), torch.float32, 1500)
+
+        class _Model:
+            model_config = SimpleNamespace(is_encoder_decoder=True)
+
+            if declares_spec:
+
+                def encoder_graph_spec(self):
+                    return spec
+
+        engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+        engine.encoder_cuda_graph_config = encoder_cuda_graph_config
+        engine.is_draft_model = False
+        engine.model = _Model()
+        engine.mapping = SimpleNamespace(tp_size=tp_size)
+        return engine, spec
+
+    def test_encoder_graph_spec_returns_spec_for_feature_config(self) -> None:
+        engine, spec = self._encoder_spec_engine(
+            FeatureEncoderCudaGraphConfig(batch_sizes=[1, 2]),
+            declares_spec=True)
+        self.assertEqual(engine._encoder_graph_spec(), spec)
+
+    def test_encoder_graph_spec_rejects_feature_config_on_token_model(
+            self) -> None:
+        # A token encoder cannot satisfy the fixed-shape contract, and a bare
+        # `batch_sizes` config is read as feature mode, so the message has to
+        # point at both possibilities.
+        engine, _ = self._encoder_spec_engine(
+            FeatureEncoderCudaGraphConfig(batch_sizes=[1]), declares_spec=False)
+        with self.assertRaises(ValueError) as ctx:
+            engine._encoder_graph_spec()
+        self.assertIn("EncodeCudaGraphConfig", str(ctx.exception))
+
+    def test_encoder_graph_spec_declines_token_config_on_feature_model(
+            self) -> None:
+        engine, _ = self._encoder_spec_engine(EncodeCudaGraphConfig(
+            batch_sizes=[1], num_tokens=[1500], seq_lens=[1500]),
+                                              declares_spec=True)
+        self.assertEqual(engine._encoder_graph_spec(), (None, None, None))
+
+    def test_encoder_graph_spec_declines_tensor_parallel(self) -> None:
+        engine, _ = self._encoder_spec_engine(
+            FeatureEncoderCudaGraphConfig(batch_sizes=[1]),
+            declares_spec=True,
+            tp_size=2)
+        self.assertEqual(engine._encoder_graph_spec(), (None, None, None))
 
     def test_encoder_cuda_graph_stages_and_restores_fixed_sequence_slots(
             self) -> None:
