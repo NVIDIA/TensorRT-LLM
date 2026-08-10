@@ -81,8 +81,11 @@ def test_block_table_expansion():
     expect_v = [v + 4 for v in expect_k]
     assert dst[0, 0, 0, :8].tolist() == expect_k
     assert dst[0, 0, 1, :8].tolist() == expect_v
-    # Unallocated tail stays at the safe pad written by the expansion (zeros).
-    assert dst[0, 0, 0, 8:].tolist() == [0] * (max_units - 8)
+    # Unallocated tail slots clamp to slot 0, so entries tile its sub-pages —
+    # inert pads: kernels never read past the row's real block count (same
+    # property as test_bad_page_index_padding_is_safe).
+    assert dst[0, 0, 0, 8:].tolist() == [0, 1, 2, 3] * ((max_units - 8) // 4)
+    assert dst[0, 0, 1, 8:].tolist() == [4, 5, 6, 7] * ((max_units - 8) // 4)
 
 
 def test_bad_page_index_padding_is_safe():
