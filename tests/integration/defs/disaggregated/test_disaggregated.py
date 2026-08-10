@@ -2371,7 +2371,9 @@ def get_config_for_benchmark(model_root, backend):
     return serve_config
 
 
-def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
+def enforce_aiperf_error_rate(artifact_dir,
+                              max_error_rate,
+                              expected_records=None):
     """Fail if the fraction of non-cancellation request errors exceeds max_error_rate.
 
     aiperf exits 0 and counts HTTP 500s as completed requests, so without this
@@ -2381,6 +2383,19 @@ def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
     "error" object with code/type/message. Intentional client-side cancellations
     (HTTP 499 / RequestCancellationError) are excluded from both the numerator
     and the denominator — stress tests cancel a fraction of requests on purpose.
+
+    Record schema validated against aiperf==0.8.0 (the pin in
+    requirements-dev.txt): each JSONL line is a MetricRecordInfo object
+    ({"metadata", "metrics", "error"}), and both cancellation construction
+    sites in aiperf's aiohttp client emit exactly error.code == 499 with
+    error.type == "RequestCancellationError". Reference gate output from the
+    35000-request DeepSeek R1 FP4 validation run (cancellation_rate=10):
+    [aiperf-gate] non-cancellation errors: 0/31561 (0.00%), cancelled: 3439.
+
+    The export must be substantive for the gate to pass: an empty or
+    unparsable export, an all-cancelled record set, or a record count far
+    below expected_records fails loudly instead of degrading into a silent
+    pass (a broken export is itself evidence of a broken run).
     """
     export_path = os.path.join(artifact_dir, "profile_export.jsonl")
     # Explicit raise (not assert): asserts are stripped under python -O, which
@@ -2393,6 +2408,7 @@ def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
             "max_error_rate=None explicitly.")
     total = 0
     cancelled = 0
+    decode_failures = 0
     # (code, type) -> [count, example message]
     error_counts: dict[tuple, list] = {}
     with open(export_path, "r", errors="replace") as f:
@@ -2403,6 +2419,7 @@ def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                decode_failures += 1
                 continue
             total += 1
             error = record.get("error")
@@ -2416,14 +2433,37 @@ def enforce_aiperf_error_rate(artifact_dir, max_error_rate):
             entry = error_counts.setdefault((code, err_type),
                                             [0, error.get("message", "")])
             entry[0] += 1
+    # Substantiveness checks: never let a broken export read as a clean run.
+    # A single truncated trailing line is tolerated; wholesale parse failure
+    # means the record format changed and the gate can no longer be trusted.
+    if decode_failures > max(1, (total + decode_failures) // 100):
+        raise AssertionError(
+            f"{export_path}: {decode_failures} of {total + decode_failures} "
+            "lines failed to parse as JSON — the export is corrupt or the "
+            "aiperf record format changed; refusing to compute an error rate "
+            "from it.")
+    if total == 0:
+        raise AssertionError(
+            f"{export_path} contained no parseable request records — the "
+            "benchmark produced no per-request accounting, which itself "
+            "indicates a broken run.")
+    if expected_records is not None and total < expected_records * 0.9:
+        raise AssertionError(
+            f"{export_path} contained only {total} records but "
+            f"~{expected_records} were expected — per-request accounting is "
+            "incomplete; refusing to compute an error rate from it.")
     considered = total - cancelled
     if considered <= 0:
-        return
+        raise AssertionError(
+            f"all {total} records in {export_path} were classified as "
+            "cancelled — implausible at the configured cancellation rate and "
+            "indicates a broken run or cancellation-classification drift.")
     errors = sum(count for count, _ in error_counts.values())
     error_rate = errors / considered
     print(
         f"[aiperf-gate] non-cancellation errors: {errors}/{considered} "
         f"({error_rate:.2%}), cancelled: {cancelled}, "
+        f"decode failures: {decode_failures}, "
         f"threshold: {max_error_rate:.2%}",
         flush=True)
     if error_rate > max_error_rate:
@@ -2592,7 +2632,9 @@ def run_disaggregated_aiperf(config_file,
         # of requests, so this is the only check that catches a mid-run error
         # storm on this path (the fatal-pattern scan above is hang/OOM only).
         if max_error_rate is not None:
-            enforce_aiperf_error_rate(artifact_dir, max_error_rate)
+            enforce_aiperf_error_rate(artifact_dir,
+                                      max_error_rate,
+                                      expected_records=request_count)
 
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(

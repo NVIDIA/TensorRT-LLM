@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""GPU-free unit tests for the aiperf error-rate gate.
+
+The gate (enforce_aiperf_error_rate) is applied by default to every
+disaggregated stress config, so these synthetic profile_export.jsonl cases
+prove it (a) fires on the server-error storm it exists to catch, (b) passes a
+healthy run with intentional cancellations, and (c) refuses to treat a broken
+or implausible export as a clean pass. Run with:
+
+    pytest -sv disaggregated/test_aiperf_gate.py
+"""
+
+import json
+
+import pytest
+from test_disaggregated import enforce_aiperf_error_rate
+
+
+def _record(error=None):
+    rec = {
+        "metadata": {"x_request_id": "id"},
+        "metrics": {"request_latency": 1.0},
+    }
+    if error is not None:
+        rec["error"] = error
+    return rec
+
+
+_CANCEL = {
+    "code": 499,
+    "type": "RequestCancellationError",
+    "message": "Request cancelled 0.500s after being sent",
+}
+_SERVER_500 = {
+    "code": 500,
+    "type": "InternalServerError",
+    "message": '{"detail":"Internal server error Cluster is not ready"}',
+}
+
+
+def _write_export(tmp_path, records, raw_lines=()):
+    export = tmp_path / "profile_export.jsonl"
+    with open(export, "w") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
+        for line in raw_lines:
+            f.write(line + "\n")
+    return str(tmp_path)
+
+
+def test_fires_on_error_storm(tmp_path):
+    """Replay of the nvbugs/6472256 CI failure distribution: must fire."""
+    records = (
+        [_record(_CANCEL)] * 3038
+        + [_record(_SERVER_500)] * 4359
+        + [_record()] * (35000 - 3038 - 4359)
+    )
+    artifact_dir = _write_export(tmp_path, records)
+    with pytest.raises(AssertionError, match="exceeds threshold"):
+        enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=35000)
+
+
+def test_passes_healthy_run_with_cancellations(tmp_path):
+    records = [_record()] * 898 + [_record(_CANCEL)] * 100 + [_record(_SERVER_500)] * 2
+    artifact_dir = _write_export(tmp_path, records)
+    enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=1000)
+
+
+def test_missing_export_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="profile_export.jsonl"):
+        enforce_aiperf_error_rate(str(tmp_path), 0.05)
+
+
+def test_empty_export_fails(tmp_path):
+    artifact_dir = _write_export(tmp_path, [])
+    with pytest.raises(AssertionError, match="no parseable request records"):
+        enforce_aiperf_error_rate(artifact_dir, 0.05)
+
+
+def test_all_cancelled_fails(tmp_path):
+    artifact_dir = _write_export(tmp_path, [_record(_CANCEL)] * 50)
+    with pytest.raises(AssertionError, match="classified as \\W*cancelled"):
+        enforce_aiperf_error_rate(artifact_dir, 0.05)
+
+
+def test_corrupt_export_fails(tmp_path):
+    """Wholesale parse failure (format change) must not read as a clean run."""
+    artifact_dir = _write_export(tmp_path, [_record()] * 10, raw_lines=["{not json"] * 10)
+    with pytest.raises(AssertionError, match="failed to parse"):
+        enforce_aiperf_error_rate(artifact_dir, 0.05)
+
+
+def test_single_truncated_line_tolerated(tmp_path):
+    """One partial trailing line (killed writer) does not fail the gate."""
+    artifact_dir = _write_export(tmp_path, [_record()] * 200, raw_lines=['{"metadata": {"x_req'])
+    enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=200)
+
+
+def test_incomplete_accounting_fails(tmp_path):
+    """Far fewer records than requests => refuse to compute a rate."""
+    artifact_dir = _write_export(tmp_path, [_record()] * 100)
+    with pytest.raises(AssertionError, match="accounting is \\W*incomplete"):
+        enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=1000)
+
+
+def test_gate_disabled_paths_not_affected(tmp_path):
+    """expected_records=None skips the plausibility check (dataset-entry runs)."""
+    artifact_dir = _write_export(tmp_path, [_record()] * 5)
+    enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=None)
