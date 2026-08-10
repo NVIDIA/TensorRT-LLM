@@ -49,6 +49,7 @@ _RECEIVER_FAILURE_MARKERS = (
     "invalid sourceidentity",
 )
 _MATCHED_PARAMS_PATTERN = re.compile(r"Matched\s+(\d+)/(\d+)\s+params", re.IGNORECASE)
+_RANK_LOG_PATTERN = re.compile(r"rank(\d+)\.log", re.IGNORECASE)
 _TRANSFERRED_PARAMS_PATTERN = re.compile(
     r"Rank\s+(\d+):\s+transferred\s+(\d+)\s+params",
     re.IGNORECASE,
@@ -355,13 +356,23 @@ def _load_tokens(output_path: Path) -> list[list[int]]:
     return token_ids
 
 
-def _transfer_log_text(transfer_log_dir: Path) -> str:
+def _transfer_logs_by_rank(transfer_log_dir: Path) -> dict[int, str]:
     logs = tuple(
         path for path in transfer_log_dir.rglob("*") if path.is_file() and path.stat().st_size > 0
     )
     if not logs:
         pytest.fail(f"ModelExpress created no receiver transfer logs in {transfer_log_dir}")
-    return "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in sorted(logs))
+
+    logs_by_rank = {}
+    for path in sorted(logs):
+        match = _RANK_LOG_PATTERN.fullmatch(path.name)
+        if match is None:
+            pytest.fail(f"Unexpected ModelExpress receiver transfer log: {path}")
+        rank = int(match.group(1))
+        if rank in logs_by_rank:
+            pytest.fail(f"ModelExpress created multiple receiver transfer logs for rank {rank}")
+        logs_by_rank[rank] = path.read_text(encoding="utf-8", errors="replace")
+    return logs_by_rank
 
 
 def _assert_transfer_evidence(
@@ -370,7 +381,12 @@ def _assert_transfer_evidence(
     receiver_transfer_log_dir: Path,
 ) -> None:
     receiver_log = receiver_log_path.read_text(encoding="utf-8", errors="replace")
-    all_receiver_logs = receiver_log + "\n" + _transfer_log_text(receiver_transfer_log_dir)
+    transfer_logs = _transfer_logs_by_rank(receiver_transfer_log_dir)
+    expected_ranks = set(range(case.tp_size))
+    assert set(transfer_logs) == expected_ranks, (
+        f"Expected receiver transfer logs for ranks {expected_ranks}, got {set(transfer_logs)}"
+    )
+    all_receiver_logs = receiver_log + "\n" + "\n".join(transfer_logs.values())
     all_receiver_logs_lower = all_receiver_logs.lower()
 
     for marker in _RECEIVER_FAILURE_MARKERS:
@@ -378,21 +394,26 @@ def _assert_transfer_evidence(
             f"MX receiver logs contain failure marker {marker!r}"
         )
 
-    matched_params = _MATCHED_PARAMS_PATTERN.findall(all_receiver_logs)
-    assert len(matched_params) >= case.tp_size, (
-        f"Expected at least {case.tp_size} matched-parameter summaries, got {matched_params}"
-    )
-    assert all(int(matched) == int(total) > 0 for matched, total in matched_params), (
-        f"MX receiver reported incomplete parameter matches: {matched_params}"
-    )
+    for rank in sorted(expected_ranks):
+        rank_log = transfer_logs[rank]
+        matched_params = _MATCHED_PARAMS_PATTERN.findall(rank_log)
+        assert len(matched_params) == 1, (
+            f"Expected one matched-parameter summary for rank {rank}, got {matched_params}"
+        )
+        matched, total = (int(value) for value in matched_params[0])
+        assert matched == total > 0, (
+            f"MX receiver rank {rank} reported incomplete parameter match {matched}/{total}"
+        )
 
-    transferred_params = _TRANSFERRED_PARAMS_PATTERN.findall(all_receiver_logs)
-    transferred_ranks = {int(rank) for rank, count in transferred_params if int(count) > 0}
-    expected_ranks = set(range(case.tp_size))
-    assert transferred_ranks.issuperset(expected_ranks), (
-        f"Expected transferred ranks {expected_ranks}, observed {transferred_ranks}; "
-        f"transfer summaries: {transferred_params}"
-    )
+        transferred_params = _TRANSFERRED_PARAMS_PATTERN.findall(rank_log)
+        assert len(transferred_params) == 1, (
+            f"Expected one transfer summary for rank {rank}, got {transferred_params}"
+        )
+        transferred_rank, transferred_count = (int(value) for value in transferred_params[0])
+        assert transferred_rank == rank and transferred_count == matched, (
+            f"MX receiver rank {rank} matched {matched} params but reported transfer summary "
+            f"{transferred_params[0]}"
+        )
 
 
 @pytest.mark.parametrize("case", _MX_CASES)
