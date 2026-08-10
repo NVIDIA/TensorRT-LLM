@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -63,6 +63,8 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_posit
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -1247,7 +1249,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
         FlashInfer backend is required for hybrid attention (per-layer
@@ -1264,8 +1266,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     @classmethod
     def get_preferred_transceiver_runtime(
         cls,
-        pretrained_config=None,
-    ):
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
         return "PYTHON"
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):

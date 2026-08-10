@@ -1,6 +1,6 @@
 import copy
 import dataclasses
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
@@ -26,6 +26,9 @@ from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
                                         fuse_input_embeds)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 class Gemma3InputProcessor(BaseMultimodalInputProcessor,
@@ -176,6 +179,28 @@ class Gemma3MultiModalProjector(torch.nn.Module):
         content_format=ContentFormat.STRING,
     ))
 class Gemma3VLM(PreTrainedModel):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Gemma3 VLM defaults — same V2 KV-cache manager selection as
+        Gemma3ForCausalLM (the wrapped text model).
+
+        The FLASHINFER attention backend is not set here: the text sub-model
+        config pins it internally in get_sub_model_config.
+        """
+        return {
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
+            },
+        }
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
         if _is_mm_disagg():

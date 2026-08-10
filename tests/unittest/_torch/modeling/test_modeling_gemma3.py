@@ -2,6 +2,7 @@ import unittest
 from copy import deepcopy
 from dataclasses import dataclass
 
+import pytest
 import torch
 from _torch.helpers import make_hf_hybrid_cache_for_tests
 from parameterized import parameterized
@@ -18,8 +19,16 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
+from tensorrt_llm._torch.models.modeling_gemma3vl import Gemma3VLM
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmapiKvCacheConfig
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_transceiver_runtime_auto,
+                                           apply_model_defaults_to_llm_args)
 from tensorrt_llm.mapping import Mapping
 
 GEMMA3_1B_CONFIG = {
@@ -686,10 +695,46 @@ class TestGemma3(unittest.TestCase):
         torch.testing.assert_close(attention_mask, expected_attention_mask)
 
 
-def test_gemma3_model_defaults_select_v2():
-    defaults = Gemma3ForCausalLM.get_model_defaults(object())
-    assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+@pytest.mark.parametrize(
+    ("architecture", "model_cls"),
+    [("Gemma3ForCausalLM", Gemma3ForCausalLM),
+     ("Gemma3ForConditionalGeneration", Gemma3VLM)],
+)
+def test_gemma3_defaults_resolve_to_v2(architecture: str,
+                                       model_cls: type) -> None:
+    """The checkpoint's architectures[0] must map to the class carrying the
+    defaults, and those defaults must survive the production resolution
+    ordering (transceiver first, then KV-cache manager) on the NIXL
+    disaggregated route — the route where a missing transceiver preference
+    silently downgrades the V2 default back to V1."""
+    assert MODEL_CLASS_MAPPING[architecture] is model_cls
+
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="auto"),
+    )
+    original_setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
+    defaults = model_cls.get_model_defaults(llm_args)
+    apply_model_defaults_to_llm_args(llm_args, defaults)
+    _resolve_transceiver_runtime_auto(llm_args, model_cls)
+    _resolve_kv_cache_manager_v2_auto(llm_args,
+                                      defaults,
+                                      original_setting=original_setting)
+
+    assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
 
-def test_gemma3_prefers_python_transceiver():
-    assert Gemma3ForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+@pytest.mark.parametrize("model_cls", [Gemma3ForCausalLM, Gemma3VLM])
+def test_gemma3_explicit_user_setting_wins(model_cls: type) -> None:
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=LlmapiKvCacheConfig(use_kv_cache_manager_v2=False))
+    original_setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
+    defaults = model_cls.get_model_defaults(llm_args)
+    apply_model_defaults_to_llm_args(llm_args, defaults)
+    _resolve_kv_cache_manager_v2_auto(llm_args,
+                                      defaults,
+                                      original_setting=original_setting)
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False

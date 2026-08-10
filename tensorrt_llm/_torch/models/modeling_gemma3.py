@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import nn
@@ -25,6 +25,9 @@ from ..modules.rms_norm import RMSNorm
 from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 class Gemma3TextScaledWordEmbedding(Embedding):
@@ -293,7 +296,12 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Gemma3-specific defaults.
+
+        Enables the V2 KV-cache manager, which sizes the sliding-window and
+        full-attention pools independently for Gemma3's VSWA layout.
+        """
         return {
             "kv_cache_config": {
                 "use_kv_cache_manager_v2": True,
@@ -303,8 +311,9 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     @classmethod
     def get_preferred_transceiver_runtime(
         cls,
-        pretrained_config=None,
-    ):
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
         return "PYTHON"
 
     def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
