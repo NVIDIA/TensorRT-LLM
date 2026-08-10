@@ -274,7 +274,7 @@ def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
 
 
 @pytest.mark.cuda
-def test_v1_dsa_masked_indexer_page_table_covers_owning_layers():
+def test_v1_dsa_masked_indexer_page_table_covers_owning_layers() -> None:
     """The masked indexer view covers only the owning layers.
 
     A per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2) gives
