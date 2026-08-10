@@ -293,7 +293,10 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        // Programmatic bounce v2 observability (deployment checks and tests; no log parsing).
+        .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
+        .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount);
 #endif
 
     // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally

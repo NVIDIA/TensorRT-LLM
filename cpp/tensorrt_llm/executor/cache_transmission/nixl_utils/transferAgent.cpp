@@ -881,8 +881,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // scattered+ACKed at the peer (or FAILURE) — never hangs.
     if (shouldUseBounce(request))
     {
+        mBounceSubmitCount.fetch_add(1, std::memory_order_relaxed);
         // Debug-level so it's silent by default but lets ops confirm the bounce fast path actually
         // engaged for a given write (enable via TLLM_LOG_LEVEL_BY_MODULE "debug:executor").
+        // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.
         TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce path engaged for write to %s (%zu descs)", mName.c_str(),
             request.getRemoteName().c_str(), request.getSrcDescs().getDescs().size());
         auto fut = mBounce->transport->submit(request.getSrcDescs(), request.getDstDescs(), request.getRemoteName());
