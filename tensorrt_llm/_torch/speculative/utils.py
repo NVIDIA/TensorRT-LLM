@@ -526,7 +526,12 @@ def get_num_extra_kv_tokens(spec_config):
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
     Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache.
+    mode where the target model manages a separate draft KV cache, or — when
+    the draft layers share the target manager — the target manager's draft
+    sub-page view, if it exposes one (e.g. MiniMax-M3, whose shared drafter
+    pool runs at a smaller kernel page size than the target's
+    tokens_per_block). The view is draft-manager-shaped for the attention
+    metadata (offsets/pointers/tokens_per_block) but owns no block lifecycle.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -534,8 +539,13 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         return None
     if not spec_config.spec_dec_mode.use_one_engine():
         return None
-    return resource_manager.get_resource_manager(
+    draft_manager = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if draft_manager is not None:
+        return draft_manager
+    target_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    return getattr(target_manager, "draft_subpage_view", None)
 
 
 def update_spec_config_from_model_config(spec_config, model_config):
