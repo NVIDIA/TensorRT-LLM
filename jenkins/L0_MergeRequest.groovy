@@ -1304,6 +1304,8 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                 }
             })
         }
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception e) {
         echo "CBTS early coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
     }
