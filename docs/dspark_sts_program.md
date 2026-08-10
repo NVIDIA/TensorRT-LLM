@@ -607,6 +607,12 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 **⚠ 实验作废公告(08-10 06:35)**:上述 KV-fraction 排除与 max_num_tokens=8192 判别**全部作废**——744499 是 2 节点作业,而各轮的 serve/客户端/pkill srun(-N1)随机落节点,导致**僵尸 serve 跨轮累积**(清点:bia0038 上 12 个、bia0042 上 2 个 trtllm 进程),burst 常打到旧 serve(带统计客户端坐实:1024 全 OK 而新 serve 日志 0 流量)。可信的仅有首轮复现(60-62 众数,fresh serve)。已全节点清理 + 所有 srun 钉死 `-w bia0038`,判别链从头重跑。教训入册:**多节点分配上做单节点实验,每个 srun 必须显式 -w**。
 
+**干净判决链(08-10 08:30,单节点钉死后全部重跑)**:
+- 复现坐实:1024 全局真实在飞(带统计客户端 1024 全 OK 且与服务端 200 计数一致),rank0 持有满份额 128 活跃请求(`currank_total_requests = 128/1024`),ctx 在前 3 个 iter 内全部完成(准入一次到位),此后**每步只调度 60-63 个**,kv_cache_util 仅 0.014。
+- 干净排除:① KV 配额(35.4 vs 60.1GiB,直方图不变);② max_num_tokens(4096 vs 8192,不变)→ block 粒度计费假设也随之排除;③ 客户端;④ 准入速率。
+- 新观测:步时 ~290ms @ 62 行(缺健康基线,eager 嫌疑未证);SWA 固定成本 8.1GiB = max_batch_size(128) × 63.6MB/请求,定容公式按满批预留(sizing 侧无恙)。
+- 进行中的二分:v1 KV 管理器(`use_kv_cache_manager_v2: false`)vs python 调度器(`use_python_scheduler: true`)各跑一轮——若 v1 恢复 128 → 病灶在 v2 管理器的调度集成;若 python 调度器恢复 → 病灶在 C++ 容量调度器与 v2 的适配。
+
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
