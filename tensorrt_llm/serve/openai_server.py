@@ -336,8 +336,8 @@ class OpenAIServer(_VideoRoutesMixin):
             IncrementalTokenizationCache.from_environment(frontend_name))
         if self._incremental_tokenizer.enabled:
             logger.info(
-                "Incremental tokenization configured for %s with %d-token rollback",
-                frontend_name, self._incremental_tokenizer.rollback_tokens)
+                f"Incremental tokenization configured for {frontend_name} with "
+                f"{self._incremental_tokenizer.rollback_tokens}-token rollback")
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
@@ -1462,9 +1462,9 @@ class OpenAIServer(_VideoRoutesMixin):
             raise
 
     async def _maybe_incremental_tokenize_chat_prompt(
-            self, prompt: Union[str, List[int]],
+            self, prompt: str | list[int],
             request: ChatCompletionRequest,
-            has_multimodal: bool) -> Union[str, List[int]]:
+            has_multimodal: bool) -> str | list[int]:
         """Use the shared cache for eligible conversation-keyed text prompts."""
         if (not self._incremental_tokenizer.enabled
                 or not isinstance(prompt, str)

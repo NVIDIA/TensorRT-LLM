@@ -55,6 +55,8 @@ class OffsetTokenizer(Protocol):
 class IncrementalTokenizationCache:
     """Boundary-safe rendered-prompt token cache shared by frontends and routers."""
 
+    _PREFIX_SCAN_CHUNK_SIZE = 64 * 1024
+
     def __init__(
         self,
         *,
@@ -71,7 +73,7 @@ class IncrementalTokenizationCache:
         self.max_entries = max(1, max_entries)
         self._cache: OrderedDict[
             Hashable,
-            tuple[str, list[int], Optional[list[tuple[int, int]]]],
+            tuple[str, list[int], list[tuple[int, int]] | None],
         ] = OrderedDict()
         self._lock = threading.Lock()
         self._verify_count = 0
@@ -104,10 +106,26 @@ class IncrementalTokenizationCache:
         elif self.enabled and entry is not None and entry[2]:
             previous_text, previous_ids, previous_offsets = entry
             prefix_limit = min(len(previous_text), len(rendered))
-            low, high = 0, prefix_limit
+            common_prefix_chars = 0
+            chunk_size = self._PREFIX_SCAN_CHUNK_SIZE
+            while common_prefix_chars + chunk_size <= prefix_limit:
+                chunk_end = common_prefix_chars + chunk_size
+                if (
+                    previous_text[common_prefix_chars:chunk_end]
+                    != rendered[common_prefix_chars:chunk_end]
+                ):
+                    break
+                common_prefix_chars = chunk_end
+
+            # Locate the exact mismatch within at most one bounded chunk.
+            low = common_prefix_chars
+            high = min(common_prefix_chars + chunk_size, prefix_limit)
             while low < high:
                 middle = (low + high + 1) // 2
-                if previous_text[:middle] == rendered[:middle]:
+                if (
+                    previous_text[common_prefix_chars:middle]
+                    == rendered[common_prefix_chars:middle]
+                ):
                     low = middle
                 else:
                     high = middle - 1
@@ -144,10 +162,8 @@ class IncrementalTokenizationCache:
             full_ids = tokenizer.encode(rendered, add_special_tokens=False)
             if ids != full_ids:
                 logger.error(
-                    "Incremental tokenization mismatch in %s; "
-                    "falling back to full encode for cache key %r",
-                    self.name,
-                    key,
+                    f"Incremental tokenization mismatch in {self.name}; "
+                    f"falling back to full encode for cache key {key!r}"
                 )
                 ids = full_ids
                 offsets = None
@@ -163,18 +179,16 @@ class IncrementalTokenizationCache:
             else:
                 incremental_hits = 0
 
-        if incremental_hits == 1 or incremental_hits % 1000 == 0:
+        if incremental_hits and (incremental_hits == 1 or incremental_hits % 1000 == 0):
             logger.info(
-                "Incremental tokenization exercised in %s: hits=%d",
-                self.name,
-                incremental_hits,
+                f"Incremental tokenization exercised in {self.name}: hits={incremental_hits}"
             )
         return ids
 
     @staticmethod
     def _encode_with_offsets(
         rendered: str, tokenizer: OffsetTokenizer
-    ) -> tuple[list[int], Optional[list[tuple[int, int]]]]:
+    ) -> tuple[list[int], list[tuple[int, int]] | None]:
         """Return canonical token IDs and validated offsets when supported."""
         ids = tokenizer.encode(rendered, add_special_tokens=False)
         try:
