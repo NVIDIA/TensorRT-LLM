@@ -24,7 +24,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 GROOVY = (REPO_ROOT / "jenkins" / "L0_Test.groovy").read_text()
 PARENT_GROOVY = (REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy").read_text()
 SLURM_RUN = (REPO_ROOT / "jenkins" / "scripts" / "slurm_run.sh").read_text()
+LLMAPI_LAUNCHER = (REPO_ROOT / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch").read_text()
+EXECUTOR_UTILS = (REPO_ROOT / "tensorrt_llm" / "executor" / "utils.py").read_text()
+MPI_SESSION = (REPO_ROOT / "tensorrt_llm" / "llmapi" / "mpi_session.py").read_text()
 SLURM_INSTALL_PATH = REPO_ROOT / "jenkins" / "scripts" / "slurm_install.sh"
+BENCHMARK_PATH = REPO_ROOT / "tests" / "integration" / "defs" / "infra_dry_run_benchmark.py"
+BENCHMARK = BENCHMARK_PATH.read_text()
+DRY_RUN_DB_PATH = (
+    REPO_ROOT / "tests" / "integration" / "test_lists" / "test-db" / "infra_dry_run.yml"
+)
 
 
 def _function_body(source, name, next_name):
@@ -42,39 +50,53 @@ def _map_keys(source, assignment_index):
 
 
 class InfraDryRunPipelineTest(unittest.TestCase):
-    def test_direct_command_selects_python_or_torchrun(self):
-        body = _function_body(
-            GROOVY,
-            "getInfraDryRunDirectCommand",
-            "getPytestBaseCommandLine",
+    def test_dry_run_is_a_test_db_selected_positional_pytest_module(self):
+        process = _function_body(GROOVY, "processShardTestList", "isValidSlurmJobId")
+        platform = _function_body(
+            GROOVY, "runLLMTestlistOnPlatformImpl", "runLLMTestlistOnPlatform"
         )
-        self.assertIn("torch.cuda.device_count()", body)
-        self.assertIn("if [ '${deviceType}' = 'cpu' ]", body)
-        self.assertIn('if [ "\\$gpu_count" -gt 1 ]', body)
-        self.assertIn('torchrun --standalone --nproc-per-node="\\$gpu_count"', body)
-        self.assertIn("python3 ${benchmarkArgs}", body)
-        self.assertIn('stageName.startsWith("CPU-") ? "cpu" : "cuda"', body)
-        self.assertIn("\"--device '${deviceType}'\"", body)
-
-    def test_direct_command_is_posix_shell_compatible(self):
-        body = _function_body(
-            GROOVY,
-            "getInfraDryRunDirectCommand",
-            "getPytestBaseCommandLine",
+        self.assertTrue(BENCHMARK_PATH.is_file())
+        self.assertFalse(BENCHMARK_PATH.name.startswith("test_"))
+        self.assertEqual(DRY_RUN_DB_PATH.read_text().splitlines()[1], "infra_dry_run:")
+        self.assertIn(
+            "infra_dry_run_benchmark.py::test_infra_dry_run_benchmark",
+            DRY_RUN_DB_PATH.read_text(),
         )
-        self.assertIn("set -eu", body)
-        self.assertNotIn("pipefail", body)
+        self.assertIn('positionalTest=""', process)
+        self.assertIn("if (positionalTest)", process)
+        self.assertIn("testListCmd += [positionalTest]", process)
+        self.assertIn(
+            "effectiveTestList = infraDryRun ? INFRA_DRY_RUN_TEST_CONTEXT : testList", platform
+        )
+        self.assertIn("extraArgs += [benchmarkPath]", platform)
+        self.assertIn("--test-list=${preprocessedLists.regular}", platform)
+        self.assertIn("rerunFailedTests(", platform)
+        self.assertIn("runIsolatedTests(", platform)
+        self.assertNotIn("getInfraDryRunDirectCommand", GROOVY)
+        self.assertIn("create_mpi_comm_session", BENCHMARK)
+        self.assertIn("session.submit_sync(", BENCHMARK)
+        self.assertIn("_pickleable_llmapi_rank_task(), timeout_seconds", BENCHMARK)
+        self.assertNotIn("torchrun", BENCHMARK)
+        self.assertNotIn("subprocess", BENCHMARK)
+        self.assertFalse(
+            (REPO_ROOT / "jenkins" / "scripts" / "infra_dry_run_benchmark.py").exists()
+        )
 
     def test_docs_dry_run_bypasses_normal_doc_build_and_keeps_results(self):
+        prepared = _function_body(GROOVY, "runInfraDryRunInPreparedWorkspace", "runLLMDocBuild")
         body = _function_body(GROOVY, "runLLMDocBuild", "launchTestListCheck")
         dry_guard = body.index("if (isInfraDryRun())")
-        benchmark = body.index("getInfraDryRunDirectCommand(", dry_guard)
+        benchmark = body.index("runInfraDryRunInPreparedWorkspace(", dry_guard)
         early_return = body.index("return", benchmark)
         sphinx = body.index("make html")
         self.assertLess(dry_guard, benchmark)
         self.assertLess(benchmark, early_return)
         self.assertLess(early_return, sphinx)
-        self.assertIn('"${WORKSPACE}/${stageName}"', body[dry_guard:early_return])
+        self.assertIn("renderTestDB(", prepared)
+        self.assertIn("processShardTestList(", prepared)
+        self.assertIn("getPytestBaseCommandLine(", prepared)
+        self.assertIn("withCredentials([", prepared)
+        self.assertIn("benchmarkPath", prepared)
 
         doc_jobs = GROOVY[
             GROOVY.index("docBuildConfigs = [") : GROOVY.index("// Python version and OS")
@@ -82,7 +104,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn('runLLMDocBuild(pipeline, VANILLA_CONFIG, "A10-Build_Docs")', doc_jobs)
         self.assertIn("{}, !isInfraDryRun(), attemptTag", doc_jobs)
 
-    def test_package_sanity_uses_the_shared_direct_benchmark_path(self):
+    def test_package_sanity_uses_the_shared_platform_pytest_path(self):
         package_jobs = GROOVY[
             GROOVY.index("sanityCheckJobs =") : GROOVY.index(
                 "multiGpuJobs =", GROOVY.index("sanityCheckJobs =")
@@ -92,12 +114,22 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("toStageName(values[1], key)", package_jobs)
         self.assertNotIn('"CPU-', package_jobs)
 
-    def test_slurm_command_allocates_one_task_per_gpu(self):
-        body = _function_body(GROOVY, "getInfraDryRunNodeArgs", "getInfraDryRunDirectCommand")
-        self.assertIn('"--nodes=${nodeCount}"', body)
-        self.assertIn('"--ntasks=${gpuCount}"', body)
-        self.assertIn('"--ntasks-per-node=${gpusPerNode}"', body)
-        self.assertIn('"--gpus-per-node=${gpusPerNode}"', body)
+    def test_slurm_uses_standard_resources_and_pytest_command(self):
+        body = GROOVY[
+            GROOVY.index("def runLLMTestlistWithSbatch") : GROOVY.index("def runLLMTestlistOnSlurm")
+        ]
+        self.assertIn("String[] taskArgs = getNodeArgs(", body)
+        self.assertNotIn("getInfraDryRunNodeArgs", GROOVY)
+        self.assertIn(
+            "effectiveTestList = infraDryRun ? INFRA_DRY_RUN_TEST_CONTEXT : testList", body
+        )
+        self.assertIn("effectiveSplitId = infraDryRun ? 1 : splitId", body)
+        self.assertIn("effectiveSplits = infraDryRun ? 1 : splits", body)
+        self.assertIn("effectivePerfMode = infraDryRun ? false : perfMode", body)
+        self.assertIn("infra_dry_run_waives.txt", body)
+        self.assertIn("${INFRA_DRY_RUN_BENCHMARK}", body)
+        self.assertIn('pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"', body)
+        self.assertIn("if(nodeCount > 1) {", body)
 
     def test_slurm_maps_ranks_and_uses_stable_rendezvous(self):
         for assignment in (
@@ -112,11 +144,30 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("20000 + SLURM_JOB_ID % 20000", GROOVY)
         self.assertIn("--container-env=MASTER_ADDR", GROOVY)
         self.assertIn("--container-env=MASTER_PORT", GROOVY)
-        self.assertIn("--distributed-timeout-seconds 900", SLURM_RUN)
         self.assertLess(
-            SLURM_RUN.index('if [[ "${infraDryRun:-false}" == "true" ]]'),
+            SLURM_RUN.index('if [[ "${infraDryRun:-false}" == "true"'),
             SLURM_RUN.index("eval $pytestCommand"),
         )
+        self.assertNotIn("infra_dry_run_benchmark.py", SLURM_RUN)
+        self.assertNotIn("exit $?", SLURM_RUN)
+        self.assertIn("export TLLM_SPAWN_PROXY_PROCESS=1", LLMAPI_LAUNCHER)
+        self.assertIn('if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]', LLMAPI_LAUNCHER)
+        self.assertIn("python3 -m tensorrt_llm.llmapi.mgmn_worker_node", LLMAPI_LAUNCHER)
+        self.assertIn("unset RANK LOCAL_RANK WORLD_SIZE", SLURM_RUN)
+
+    def test_llmapi_session_contract_matches_the_benchmark_adapter(self):
+        create_session = _function_body(EXECUTOR_UTILS, "create_mpi_comm_session", "has_event_loop")
+        remote_session = MPI_SESSION[
+            MPI_SESSION.index("class RemoteMpiCommSessionClient") : MPI_SESSION.index(
+                "class RemoteMpiCommSessionServer"
+            )
+        ]
+        self.assertIn("n_workers: int", create_session)
+        self.assertIn("RemoteMpiCommSessionClient(", create_session)
+        self.assertIn("def submit_sync(self, task, *args, **kwargs) -> List[T]", remote_session)
+        self.assertIn("return res", remote_session)
+        self.assertIn("pickle.dumps(obj)", (REPO_ROOT / "tensorrt_llm/executor/ipc.py").read_text())
+        self.assertIn("_pickleable_llmapi_rank_task()", BENCHMARK)
 
     def test_slurm_artifact_download_replaces_existing_archive(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -126,7 +177,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             tar_record_path = temp_path / "tar-input-path"
             archive_path.write_text("stale\n")
 
-            script = r'''
+            script = r"""
 source "$SLURM_INSTALL_PATH"
 retry_command() {
     if [[ "$1" == "--timeout" ]]; then
@@ -164,7 +215,7 @@ pip3() { :; }
 python3() { :; }
 export -f pip3 wget
 slurm_install_setup
-'''
+"""
             env = {
                 **os.environ,
                 "SLURM_INSTALL_PATH": str(SLURM_INSTALL_PATH),
@@ -196,27 +247,27 @@ slurm_install_setup
             self.assertFalse(Path(f"{archive_path}.1").exists())
             self.assertFalse(Path(expected_tmp).exists())
 
-    def test_direct_branch_follows_existing_shard_setup(self):
+    def test_dry_pytest_failure_propagates_without_rerun_or_isolation(self):
         body = _function_body(
             GROOVY,
             "runLLMTestlistOnPlatformImpl",
             "runLLMTestlistOnPlatform",
         )
-        command_index = body.index("getInfraDryRunDirectCommand(")
-        self.assertLess(body.index("processShardTestList("), command_index)
-        self.assertGreater(body.index("withCredentials([", command_index), command_index)
-        self.assertGreater(body.index("No tests were executed", command_index), command_index)
+        command_area = body.index('withEnv(["LD_LIBRARY_PATH=')
+        branch_start = body.index("if (infraDryRun) {", command_area)
+        dry_branch = body[branch_start : body.index("try {", branch_start)]
+        self.assertIn('${pytestCommand.join(" ")}', dry_branch)
+        self.assertNotIn("rerunFailedTests", dry_branch)
+        self.assertNotIn("runIsolatedTests", dry_branch)
+        self.assertNotIn("catch", dry_branch)
 
-    def test_infra_junit_is_required_and_cbts_is_disabled(self):
+    def test_standard_junit_is_used_and_cbts_is_disabled(self):
         self.assertIn(
-            'junit(testResults: "${stageName}/results-infra_dry_run*.xml")',
+            'junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")',
             GROOVY,
         )
-        self.assertNotIn(
-            'junit(allowEmptyResults: true, testResults: "${stageName}/results-infra_dry_run',
-            GROOVY,
-        )
-        self.assertIn("Failed to collect infrastructure dry-run JSON results", GROOVY)
+        self.assertNotIn("results-infra_dry_run", GROOVY)
+        self.assertNotIn("infra_dry_run*.json", GROOVY)
         cbts_body = _function_body(GROOVY, "isCbtsStage", "scpFromRemoteCmd")
         self.assertIn("if (isInfraDryRun())", cbts_body)
         self.assertIn("return false", cbts_body)

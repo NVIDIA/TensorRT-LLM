@@ -71,18 +71,18 @@ env | sort
 echo "Full Command: $pytestCommand"
 
 if [[ "${infraDryRun:-false}" == "true" ]]; then
-    export RANK="$SLURM_PROCID"
-    export LOCAL_RANK="$SLURM_LOCALID"
-    export WORLD_SIZE="$SLURM_NTASKS"
-    export MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR must be set by the Slurm launch script}"
-    export MASTER_PORT="${MASTER_PORT:?MASTER_PORT must be set by the Slurm launch script}"
-
-    python3 "$llmSrcNode/jenkins/scripts/infra_dry_run_benchmark.py" \
-        --output-dir "$jobWorkspace" \
-        --stage "$stageName" \
-        --commit "${gitlabCommit:-}" \
-        --distributed-timeout-seconds 900
-    exit $?
+    if [[ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]]; then
+        export RANK="$SLURM_PROCID"
+        export LOCAL_RANK="$SLURM_LOCALID"
+        export WORLD_SIZE="$SLURM_NTASKS"
+        export MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR must be set by the Slurm launch script}"
+        export MASTER_PORT="${MASTER_PORT:?MASTER_PORT must be set by the Slurm launch script}"
+    else
+        # A single-node dry run is one pytest controller which spawns local
+        # workers.  Do not let ambient launcher variables select the external
+        # multi-node rank path.
+        unset RANK LOCAL_RANK WORLD_SIZE
+    fi
 fi
 
 # For single-node test runs or disaggregated benchmark/server runs, clear all
