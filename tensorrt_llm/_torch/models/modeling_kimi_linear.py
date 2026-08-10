@@ -99,7 +99,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model
+from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
@@ -2245,8 +2245,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         """Load every non-expert trunk parameter concurrently (with the
         per-parameter TP-shard / pad / fuse conversions) and return the
         number of parameters loaded."""
-        from .modeling_utils import run_concurrently
-
         # The checkpoint stores every MLA KV-B head as interleaved [K | V]
         # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
         # instead, so context can project directly into the FMHA layout and
@@ -2473,8 +2471,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     ) -> None:
         """Load the rank-local MXFP4 expert slices of every MoE layer into
         the backend expert slots, then verify every slot was filled."""
-        from .modeling_utils import run_concurrently
-
         device = next(self.parameters()).device
 
         def load_expert(
