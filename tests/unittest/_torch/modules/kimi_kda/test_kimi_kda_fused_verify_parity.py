@@ -59,12 +59,12 @@ def _is_blackwell():
     if not torch.cuda.is_available():
         return False
     prop = torch.cuda.get_device_properties(0)
-    return prop.major * 10 + prop.minor in (100, 103)
+    return prop.major * 10 + prop.minor in (100, 103, 107)
 
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
-    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103"),
+    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103/sm107"),
     pytest.mark.skipif(not _HAVE_DEPS, reason=f"deps: {_DEP_ERR}"),
 ]
 
