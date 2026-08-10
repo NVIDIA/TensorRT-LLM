@@ -411,9 +411,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
-    SLOWER_MLA_GENERATION_KERNELS = {
-        (576, 512, 32),
-    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -533,7 +530,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
-        tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -569,14 +565,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
-            )
-
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
-            return (
-                False,
-                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
-                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
-                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
@@ -745,7 +733,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
-                    tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
@@ -991,7 +978,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
-            kv_cache=kv_pool,
+            kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
@@ -1147,7 +1134,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
-            kv_cache=kv_pool,
+            kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
