@@ -4066,7 +4066,7 @@ class PyTorchModelEngine(ModelEngine):
          attn_all_rank_num_tokens) = self._get_padding_params(
              total_num_tokens, scheduled_requests.num_context_requests,
              attn_all_rank_num_tokens)
-        set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
+        set_per_request_prefill_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = (padded_num_tokens
                                            if padded_num_tokens
                                            != total_num_tokens else None)
