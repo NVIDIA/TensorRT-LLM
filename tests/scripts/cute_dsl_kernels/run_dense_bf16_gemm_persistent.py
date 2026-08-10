@@ -339,6 +339,8 @@ def run(
 
         torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
 
+    # make_ptr stores only raw addresses, so retain each generated tensor until
+    # the benchmark has finished using its JIT arguments.
     backing_tensors = []
 
     if use_strided:
