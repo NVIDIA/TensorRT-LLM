@@ -26,14 +26,14 @@ The structure closely mirrors the in-tree K2.5 model
 (``modeling_kimi_k25.py``); this file only carries the K3-specific deltas and
 reuses everything numerically identical from the K2.5 implementation:
 
-    delta                | K2.5                       | K3
-    ---------------------+----------------------------+---------------------------
-    vision norms         | LayerNorm                  | RMSNorm (torch.nn.RMSNorm)
-    attention head_dim   | vt_hidden_size // heads     | qkv_hidden_size // heads
-    patch-embed conv bias| True                       | False
-    vision qkv/o/MLP bias| True                       | False
-    projector            | PatchMergerMLP (pre_norm)  | PatchMergerMLPV2 (post_norm)
-    text backbone        | DeepseekV3ForCausalLM      | KimiLinearForCausalLM
+    delta                 | K2.5                       | K3
+    ----------------------+----------------------------+-----------------------------
+    vision norms          | LayerNorm                  | RMSNorm (torch.nn.RMSNorm)
+    attention head_dim    | vt_hidden_size // heads    | qkv_hidden_size // heads
+    patch-embed conv bias | True                       | False
+    vision qkv/o/MLP bias | True                       | False
+    projector             | PatchMergerMLP (pre_norm)  | PatchMergerMLPV2 (post_norm)
+    text backbone         | DeepseekV3ForCausalLM      | KimiLinearForCausalLM
 """
 
 import copy
@@ -54,6 +54,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
+from ..pyexecutor.config_utils import resolve_hf_torch_dtype
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_kimi_k25 import (
     _MEDIA_PLACEHOLDER_TOKEN_ID,
@@ -293,10 +294,11 @@ class KimiK3VisionModel(KimiK25VisionModel):
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
         # Vision tower is not quantized (checkpoint quant ignore list covers
-        # vision_tower.* / mm_projector.*): keep only the kv-cache quant algo.
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
-        )
+        # vision_tower.* / mm_projector.*), and its encoder layers keep no KV
+        # cache — so do not carry the text model's kv_cache_quant_algo over:
+        # for cache-less vision attention it could only steer kernel selection
+        # (a past instance of that failure mode is #12851).
+        self.model_config.quant_config = QuantConfig()
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this
@@ -321,13 +323,12 @@ class KimiK3VisionModel(KimiK25VisionModel):
         if not model_config.mapping.enable_attention_dp:
             self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
-        model_dtype = (
-            getattr(pretrained_config, "torch_dtype", None)
-            or getattr(pretrained_config, "dtype", None)
-            or torch.bfloat16
-        )
-        if isinstance(model_dtype, str):
-            model_dtype = getattr(torch, model_dtype, torch.bfloat16)
+        # Normalize the checkpoint dtype once (covers both the modern `dtype`
+        # and legacy `torch_dtype` field names, string forms, and "auto") and
+        # write the concrete torch.dtype back — after this, every access in
+        # this file can simply read model_config.torch_dtype, whose property
+        # assumes pretrained_config.torch_dtype is already concrete.
+        model_dtype = resolve_hf_torch_dtype(pretrained_config) or torch.bfloat16
         pretrained_config.torch_dtype = model_dtype
 
         hidden_dim = vision_cfg.get("vt_hidden_size", vision_cfg.get("hidden_size", 1024))
@@ -441,12 +442,21 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
         **kwargs,
     ) -> None:
         config = model_config.pretrained_config
+        # PreTrainedModel.__init__ resolves config._attn_implementation and
+        # rejects the default "sdpa" unless the class declares support. This
+        # wrapper never runs HF attention itself (TRT-LLM attention is wired
+        # inside the sub-modules), so declare support to keep HF init happy.
         self._supports_sdpa = True
         # Skip the K2.5 parent __init__ (it wires DeepSeek-V3 + K2.5 vision);
         # initialize the HF PreTrainedModel machinery directly, then build the
         # K3 components below.
         PreTrainedModel.__init__(self, config)
 
+        # Re-entry guard (mirrors the K2.5 wrapper): the tail of this __init__
+        # repoints model_config.pretrained_config at the text_config and remaps
+        # the quant exclude list, so running the body twice on the same
+        # instance would fail the text_config assert below. If the text
+        # backbone already exists this is a re-init on a built instance: no-op.
         if hasattr(self, "llm"):
             return
 
