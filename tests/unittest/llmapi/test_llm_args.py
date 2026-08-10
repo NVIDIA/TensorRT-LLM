@@ -70,6 +70,23 @@ from .test_llm import llama_model_path
 
 
 @pytest.mark.cpu_only
+def test_generation_config_mode_defaults_and_validation() -> None:
+    assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
+    assert (TorchLlmArgs(model=llama_model_path,
+                         generation_config="auto").generation_config == "auto")
+
+    with pytest.raises(ValidationError, match="generation_config"):
+        TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
+def test_generation_config_auto_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError,
+                       match="AutoDeploy does not support generation_config"):
+        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
+
+
+@pytest.mark.cpu_only
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,
@@ -1808,6 +1825,73 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.seq_lens == [8, 32]
         assert args.cuda_graph_config.max_seq_len == 32
 
+    def test_encoder_decoder_cuda_graph_user_interface(self):
+        encoder_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[16, 64],
+            seq_lens=[8, 32],
+            enable_padding=True,
+        )
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            cuda_graph_config=DecodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
+            ),
+            encoder_cuda_graph_config=encoder_config,
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert isinstance(args.encoder_cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.encoder_cuda_graph_config.batch_sizes == [1, 4]
+        assert args.enable_encoder_decoder_mixed_cuda_graph
+
+        disabled_args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=encoder_config,
+            enable_encoder_decoder_mixed_cuda_graph=False,
+        )
+
+        assert not disabled_args.enable_encoder_decoder_mixed_cuda_graph
+
+    def test_encoder_cuda_graph_config_validation(self):
+        invalid_cases = [
+            (
+                {
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        num_tokens=[16, 64],
+                        seq_lens=[8, 32],
+                        enable_padding=True,
+                    ),
+                },
+                "encoder_cuda_graph_config requires encoder_max_batch_size",
+            ),
+            (
+                {
+                    "encoder_max_batch_size":
+                    4,
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        enable_padding=True,
+                    ),
+                },
+                ("encoder_cuda_graph_config requires "
+                 "num_tokens/max_num_token and seq_lens/max_seq_len"),
+            ),
+        ]
+
+        for kwargs, error_match in invalid_cases:
+            with pytest.raises(ValidationError, match=error_match):
+                TorchLlmArgs(
+                    model=llama_model_path,
+                    **kwargs,
+                )
+
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -2523,6 +2607,50 @@ class TestServeDefaults:
         )
         assert merged["tensor_parallel_size"] == 1
 
+    def test_serve_generation_config_cli_over_yaml_precedence(self,
+                                                              tmp_path) -> None:
+        """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
+        from unittest import mock
+
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("generation_config: auto\n", encoding="utf-8")
+
+        with (
+                mock.patch(
+                    "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                    return_value=False),
+                mock.patch("tensorrt_llm.commands.serve.device_count",
+                           return_value=1),
+                mock.patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=["dummy/model", "--config",
+                      str(config_path)],
+                standalone_mode=False,
+            )
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
+            mock_launch_server.reset_mock()
+            config_path.write_text("generation_config: trtllm\n",
+                                   encoding="utf-8")
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--config",
+                    str(config_path),
+                    "--generation-config",
+                    "auto",
+                ],
+                standalone_mode=False,
+            )
+
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
         assert is_non_default_or_required("model", "test-model", "pytorch",
@@ -3098,7 +3226,7 @@ class TestSkipSoftmaxAttentionConfig:
     @staticmethod
     def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
         sparse_params = config.to_sparse_params(**kwargs)
-        return sparse_params.scheduler.get_kernel_params()
+        return sparse_params.scheduler.get_runtime_params()
 
     def test_python_api_parses_skip_softmax_config(self):
         args = TorchLlmArgs(

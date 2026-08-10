@@ -2401,7 +2401,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // ensures we only match catalog rows tagged SLURM or BOTH.
       def c = FailureClassifier.classify(e, InfraFailure.SLURM)
       if (c instanceof PipelineInterruption) throw e
-      if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+      if (!(c instanceof InfraFailure)) {
+        // UserFailure -> don't retry, but leave a trace: a failure whose
+        // exception matches no catalog pattern lands here and would
+        // otherwise decline the retry with no log output at all.
+        echo "[INFRA-RETRY] ${stageName}: SLURM attempt failed with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+        throw e
+      }
 
       rememberAvoidedSlurmNodeLists(avoidedSlurmNodeListsByCluster, attemptPlacementContext.lastSlurmClusterName, attemptPlacementContext.lastSlurmNodeList, stageName)
 
@@ -5068,7 +5074,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 }
                 def c = FailureClassifier.classify(e, InfraFailure.K8S)
                 if (c instanceof PipelineInterruption) throw e
-                if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+                if (!(c instanceof InfraFailure)) {
+                    // UserFailure -> don't retry, but leave a trace: a pod/agent
+                    // launch exception missing from PATTERN_CATALOG (e.g. a
+                    // pod-scheduling timeout) lands here and would otherwise
+                    // vanish with no log output at all.
+                    echo "[INFRA-RETRY] ${stageName}: pod/agent launch failed before execution with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+                    throw e
+                }
 
                 rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
 
@@ -5153,7 +5166,12 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             // exhausted its own budget) from being treated as K8s infra here.
             def c = FailureClassifier.classify(e, InfraFailure.K8S)
             if (c instanceof PipelineInterruption) throw e
-            if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+            if (!(c instanceof InfraFailure)) {
+                // UserFailure -> don't retry, but leave a trace so the decline
+                // is diagnosable from the console (see the launch-loop twin above).
+                echo "[INFRA-RETRY] ${stageName}: stage failed with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+                throw e
+            }
 
             rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
 
