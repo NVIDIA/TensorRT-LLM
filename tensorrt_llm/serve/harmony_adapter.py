@@ -1077,20 +1077,25 @@ class HarmonyAdapter:
         ``finish_reason="stop"`` — indistinguishable from the model choosing
         not to call a tool. Warn loudly so this is diagnosable instead of
         silent.
+
+        The decoded text is only inspected, never logged: it holds the tool
+        call's arguments, which routinely carry user data and occasionally
+        secrets, and this path can fire at warning level in production.
         """
         text = self._safe_decode_utf8(discarded, "DISCARDED_TOKENS: ")
         stop_tokens = set(self.get_stop_tokens())
+        recipient = re.search(r"to=(functions\.[\w-]+)", text)
 
-        if any(token in stop_tokens
-               for token in discarded) or "to=functions." in text:
+        if recipient or any(token in stop_tokens for token in discarded):
+            dropped = recipient.group(1) if recipient else "unknown recipient"
             logger.warning(
                 f"Discarded {len(discarded)} token(s) forming a complete but "
-                f"malformed harmony message; any tool call it carried has been "
-                f"dropped from the response. Discarded text: {text!r}")
+                f"malformed harmony message; a tool call for {dropped} has "
+                f"been dropped from the response.")
         else:
             logger.debug(
                 f"Stripped {len(discarded)} token(s) of an incomplete trailing "
-                f"harmony message: {text!r}")
+                f"harmony message.")
 
     def harmony_output_to_openai(
             self,

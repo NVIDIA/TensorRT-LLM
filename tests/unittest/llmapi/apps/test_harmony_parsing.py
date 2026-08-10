@@ -1340,10 +1340,10 @@ class TestStripIncompleteMessagesReporting:
 
     @pytest.fixture
     def adapter(self):
-        try:
-            return HarmonyAdapter(harmony_input=False, harmony_output=False)
-        except Exception as e:
-            pytest.skip(f"Cannot create HarmonyAdapter: {e}")
+        # Deliberately not guarded: the module-level pytestmark already skips
+        # when harmony is unavailable, so a construction failure here is a real
+        # regression and must fail rather than silently skip.
+        return HarmonyAdapter(harmony_input=False, harmony_output=False)
 
     @staticmethod
     def _completion_tokens(adapter):
@@ -1404,7 +1404,10 @@ class TestStripIncompleteMessagesReporting:
         assert result.get("tool_calls", []) == []
         assert mock_logger.warning.called, "tool call was dropped silently"
         logged = " ".join(str(c) for c in mock_logger.warning.call_args_list)
-        assert "get_weather" in logged
+        # The warning names the dropped function so it can be acted on...
+        assert "functions.get_weather" in logged
+        # ...but must not leak the tool arguments, which carry user data.
+        assert "Rome" not in logged
 
     def test_truncated_tail_does_not_warn(self, adapter):
         """A genuinely truncated trailing header is benign and stays quiet.
@@ -1428,6 +1431,9 @@ class TestStripIncompleteMessagesReporting:
 
         assert result.get("tool_calls", []) == []
         mock_logger.warning.assert_not_called()
+        # Still reported, just at a level that does not cry wolf.
+        debugged = " ".join(str(c) for c in mock_logger.debug.call_args_list)
+        assert "incomplete trailing harmony message" in debugged
 
 
 def test_none_tokenizer_num_postprocess_workers():
