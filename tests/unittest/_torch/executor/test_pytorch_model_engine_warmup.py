@@ -19,11 +19,18 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine,
+    _ContextOnlyCompiledModel,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
+)
+from tensorrt_llm._torch.utils import (
+    get_per_request_piecewise_cuda_graph_flag,
+    set_per_request_piecewise_cuda_graph_flag,
 )
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig
@@ -64,6 +71,20 @@ class _DummyModel(torch.nn.Module):
         # invoke forward are all patched), but must exist for engine init.
         batch_size = kwargs["input_ids"].size(0)
         return {"logits": torch.randn((batch_size, 10), device="cuda")}
+
+
+class _RecordingModel(torch.nn.Module):
+    """Record which side of the context-only compile router ran."""
+
+    def __init__(self, result: str):
+        super().__init__()
+        self.result = result
+        self.calls = 0
+
+    def forward(self, **kwargs):
+        del kwargs
+        self.calls += 1
+        return self.result
 
 
 class _DummyModelEngine(PyTorchModelEngine):
@@ -172,6 +193,34 @@ def _capture_tllm_logs():
 
     with patch.object(_me_mod.logger, "info", side_effect=_record):
         yield records
+
+
+class TestContextOnlyCompiledModel(unittest.TestCase):
+    """Exercise the host-visible routing used by piecewise context graphs."""
+
+    def setUp(self):
+        self.previous_piecewise_flag = get_per_request_piecewise_cuda_graph_flag()
+
+    def tearDown(self):
+        set_per_request_piecewise_cuda_graph_flag(self.previous_piecewise_flag)
+
+    def test_routes_only_capture_eligible_context_to_compiled_model(self):
+        eager_model = _RecordingModel("eager")
+        compiled_model = _RecordingModel("compiled")
+        model = _ContextOnlyCompiledModel(eager_model, compiled_model)
+
+        set_per_request_piecewise_cuda_graph_flag(True)
+        self.assertEqual(model(attn_metadata=SimpleNamespace(num_contexts=1)), "compiled")
+
+        set_per_request_piecewise_cuda_graph_flag(False)
+        self.assertEqual(model(attn_metadata=SimpleNamespace(num_contexts=1)), "eager")
+
+        set_per_request_piecewise_cuda_graph_flag(True)
+        self.assertEqual(model(attn_metadata=SimpleNamespace(num_contexts=0)), "eager")
+        self.assertEqual(model(attn_metadata=None), "eager")
+
+        self.assertEqual(compiled_model.calls, 1)
+        self.assertEqual(eager_model.calls, 3)
 
 
 class TestWarmupCleanup(unittest.TestCase):

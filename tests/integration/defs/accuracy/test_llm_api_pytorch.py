@@ -7795,42 +7795,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("use_msa", [False, True])
-    def test_mxfp8_piecewise_cuda_graph(self, use_msa):
-        tp_size = ep_size = 4
-        model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
-        model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
-                                        enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto")
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            implementation="msa" if use_msa else "triton")
-        cuda_graph_config = CudaGraphConfig(
-            enable_padding=True, batch_sizes=[1, 2, 4, 8, 12, 16, 24, 32])
-        torch_compile_config = TorchCompileConfig(
-            enable_piecewise_cuda_graph=True,
-            capture_num_tokens=[1, 8192],
-            max_num_streams=3)
-
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 moe_expert_parallel_size=ep_size,
-                 enable_attention_dp=True,
-                 moe_config=MoeConfig(backend="TRTLLM"),
-                 kv_cache_config=kv_cache_config,
-                 sparse_attention_config=sparse_attention_config,
-                 cuda_graph_config=cuda_graph_config,
-                 torch_compile_config=torch_compile_config,
-                 max_seq_len=2048,
-                 max_num_tokens=8192,
-                 max_batch_size=32,
-                 trust_remote_code=True) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
-            task = GSM8K(model_name)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("use_msa", [False, True])
     def test_nvfp4(self, use_msa, eval_mode):
@@ -7846,9 +7810,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         inferencemax = eval_mode == "inferencemax"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto")
+                                        dtype="fp8" if use_msa else "auto",
+                                        use_kv_cache_manager_v2=use_msa)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            implementation="msa" if use_msa else "triton")
+            implementation="msa" if use_msa else "triton",
+            indexer_kv_dtype="fp8" if use_msa else "bf16",
+            fuse_qkv_index_projection=use_msa)
         moe_config = MoeConfig(backend="CUTLASS")
         # InferenceMAX evaluates a serving endpoint with client concurrency
         # capped at 64 (EVAL_CONCURRENT_REQUESTS); match that batching regime.

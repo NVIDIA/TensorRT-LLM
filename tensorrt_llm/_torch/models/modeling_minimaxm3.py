@@ -802,8 +802,8 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
     idx_q: Optional[torch.Tensor],
     idx_k: Optional[torch.Tensor],
     layer_idx: str,
@@ -814,13 +814,48 @@ def minimax_m3_attn_custom_op_inplace(
     num_tokens = attn_metadata.num_tokens
     attn_layer._dispatch_attention_backend(
         q[:num_tokens],
-        k[:num_tokens],
-        v[:num_tokens],
+        k[:num_tokens] if k is not None else None,
+        v[:num_tokens] if v is not None else None,
         idx_q[:num_tokens] if idx_q is not None else None,
         idx_k[:num_tokens] if idx_k is not None else None,
         attn_metadata,
         output[:num_tokens],
     )
+
+
+@torch.library.custom_op("trtllm::minimax_m3_fused_sparse_qkv_producer", mutates_args=())
+def minimax_m3_fused_sparse_qkv_producer(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+) -> List[torch.Tensor]:
+    """Run the existing fused sparse producer in a captured graph segment."""
+    attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    packed = attn_layer.qkv_proj(hidden_states)
+    result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed,
+        position_ids,
+        attn_metadata,
+        allow_graph_padding=True,
+    )
+    if result is None:
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+    return list(result)
+
+
+@minimax_m3_fused_sparse_qkv_producer.register_fake
+def _minimax_m3_fused_sparse_qkv_producer_fake(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+) -> List[torch.Tensor]:
+    del position_ids
+    _, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    num_tokens = hidden_states.shape[0]
+    return [
+        hidden_states.new_empty((num_tokens, attn_layer.q_size), dtype=torch.float8_e4m3fn),
+        hidden_states.new_empty((num_tokens, attn_layer.index_q_size), dtype=torch.float8_e4m3fn),
+    ]
 
 
 class MiniMaxM3Attention(Attention):
@@ -1315,6 +1350,8 @@ class MiniMaxM3Attention(Attention):
         packed: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        *,
+        allow_graph_padding: bool = False,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the vLLM-style horizontal producer for every sparse batch.
 
@@ -1329,7 +1366,9 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
-        if is_torch_compiling() or int(packed.shape[0]) != int(attn_metadata.num_tokens):
+        if not allow_graph_padding and (
+            is_torch_compiling() or int(packed.shape[0]) != int(attn_metadata.num_tokens)
+        ):
             return None
         if (
             packed.dtype != torch.bfloat16
@@ -1887,7 +1926,10 @@ class MiniMaxM3Attention(Attention):
         prewritten_main_kv = k is None or v is None
         assert (k is None) == (v is None)
         if prewritten_main_kv:
-            assert attn_metadata._msa_prewritten_layer == self.attn.layer_idx
+            # Captured cache writes replay without replaying Python-side state.
+            # Re-publish the marker in this eager boundary before the paged-GQA
+            # helper consumes it.
+            attn_metadata._msa_prewritten_layer = self.attn.layer_idx
 
         if self.is_sparse_attention_layer:
             assert idx_q is not None
@@ -1965,6 +2007,22 @@ class MiniMaxM3Attention(Attention):
                 "attn_metadata; received None."
             )
 
+        if (
+            self.register_to_config
+            and is_torch_compiling()
+            and self.enable_fused_qkv_index_projection
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and self._emit_fp8_main_qkv()
+            and self.attn.indexer_kv_dtype == "fp8"
+        ):
+            q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
+                hidden_states,
+                position_ids,
+                self.layer_idx_str,
+            )
+            o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+            return self.o_proj(o, all_reduce_params=all_reduce_params)
+
         # Project, per-head Gemma RMSNorm, and partial RoPE for the main and
         # index branches. Each branch fuses norm and RoPE into one bf16 kernel,
         # falling back to separate norm and RoPE otherwise. The branches read
@@ -2017,10 +2075,38 @@ class MiniMaxM3Attention(Attention):
                 q, k = self.rotary_emb(position_ids, [q, k])
             return q, k, v
 
+        graph_fp8_indexer = (
+            self.register_to_config
+            and is_torch_compiling()
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and self.attn.indexer_kv_dtype == "fp8"
+        )
+
         def _index_norm_rope():
             idx_qk = (
                 packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
             )
+            if graph_fp8_indexer:
+                # Keep index norm, partial RoPE, and FP8 conversion in the
+                # captured piece. The resulting compact FP8 index-Q/K tensors
+                # cross the attention boundary; only their dynamic paged-cache
+                # scatter and sparse selection remain eager.
+                fused_idx = self._fused_qk_norm_rope(
+                    idx_qk,
+                    position_ids,
+                    num_heads_q=self.sparse_num_index_heads,
+                    num_heads_k=1,
+                    num_heads_v=0,
+                    head_dim=self.sparse_index_dim,
+                    q_norm=self.index_q_norm,
+                    k_norm=self.index_k_norm,
+                    out_fp8=True,
+                )
+                if fused_idx is None:
+                    raise RuntimeError(
+                        "MiniMax-M3 piecewise graph expected FP8 index Q/K preparation."
+                    )
+                return self._split_index_qk(fused_idx)
             fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
             if fp8_idx_q is not None:
                 # Index-K was inserted directly into the paged side cache.
