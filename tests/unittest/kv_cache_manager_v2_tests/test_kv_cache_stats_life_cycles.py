@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel
-from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import KvCache
+from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import _KVCache
 from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
     AttnLifeCycle,
     LifeCycleId,
@@ -41,7 +41,7 @@ HOST_LEVEL = CacheLevel(GPU_LEVEL + 1)
 
 
 def _make_recorder():
-    """Duck-typed KvCache exposing only what the stats recorders touch.
+    """Duck-typed _KVCache exposing only what the stats recorders touch.
 
     The recording methods are bound off the real class, so the life-cycle
     filtering under test is the production implementation.
@@ -64,7 +64,7 @@ def _make_recorder():
         "_record_migrated_slots",
         "_record_dropped_pages",
     ):
-        setattr(recorder, name, getattr(KvCache, name).__get__(recorder))
+        setattr(recorder, name, getattr(_KVCache, name).__get__(recorder))
     return recorder, committed
 
 
