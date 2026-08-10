@@ -25,7 +25,6 @@ import os
 from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import pytest
 import torch
@@ -41,7 +40,17 @@ from tensorrt_llm.visual_gen.args import (
     VisualGenArgs,
 )
 
-pytestmark = pytest.mark.cosmos3
+pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mpi_env():
+    """TLLM_DISABLE_MPI has to be set before the imports above, so it cannot be
+    a fixture -- but leaving it set makes any later module in the same process
+    inherit it. Drop it on the way out, as test_cosmos3_pipeline.py does."""
+    yield
+    os.environ.pop("TLLM_DISABLE_MPI", None)
+
 
 # Verbatim ``quantization_config`` shape exported by ModelOpt 0.44.0 into the
 # published Cosmos3 FP8 checkpoints' ``transformer/config.json``. Only the keys

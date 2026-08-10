@@ -168,14 +168,20 @@ def _run_cosmos3_lpips_pipeline(
     height=COSMOS3_LPIPS_HEIGHT,
     width=COSMOS3_LPIPS_WIDTH,
     num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+    output_type="video",
 ):
     """Run a Cosmos3 pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
-    or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
-    decoded on the worker's NVDEC) yields the video-to-video path; passing
-    ``image`` yields the image-to-video path.
+    or ``None`` if generation produced no video. Passing ``video`` (encoded MP4
+    bytes, decoded on the worker's NVDEC) yields the video-to-video path;
+    passing ``image`` yields the image-to-video path.
+
+    ``output_type="image"`` selects the real text-to-image path and returns
+    ``(B, H, W, C)`` instead. It is not the same as ``num_frames=1``: the
+    pipeline keys T2I off ``output_type``, which also swaps in
+    ``COSMOS3_T2I_PARAMS``, the T2I system prompt and the image resolution
+    template, so a one-frame video run exercises none of that.
 
     ``model_subpath`` selects the checkpoint under ``LLM_MODELS_ROOT`` and is a
     tuple of path components, so nested checkpoints (the FP8 builds ship inside
@@ -218,10 +224,15 @@ def _run_cosmos3_lpips_pipeline(
                     use_guardrails=False,
                     video=video,
                     image=image,
+                    output_type=output_type,
                 )
-            if result is None or result.video is None:
+            if result is None:
                 return None
-            return result.video.detach().cpu()
+            # T2I returns image (B, H, W, C) and leaves video unset.
+            produced = result.image if output_type == "image" else result.video
+            if produced is None:
+                return None
+            return produced.detach().cpu()
         finally:
             del pipeline
             _cleanup_cuda()
@@ -726,6 +737,12 @@ def _assert_cosmos3_fp8_decode_not_collapsed(video, label, expected_frames, free
     """
     assert video is not None, f"{label} produced no video"
     assert video.dtype == torch.uint8, f"{label}: expected uint8 frames, got {video.dtype}"
+    if video.dim() == 4:
+        # T2I returns (B, H, W, C) -- no frame axis. unsqueeze is a view, not a copy.
+        assert expected_frames == 1, (
+            f"{label}: got a rank-4 image but expected {expected_frames} frames"
+        )
+        video = video.unsqueeze(1)
     assert video.shape[1] == expected_frames, (
         f"{label}: expected {expected_frames} frames, got {video.shape[1]}"
     )
@@ -749,7 +766,9 @@ def _assert_cosmos3_fp8_decode_not_collapsed(video, label, expected_frames, free
     )
 
 
-def _run_cosmos3_fp8_smoke(model_subpath, label, num_frames, video=None, image=None):
+def _run_cosmos3_fp8_smoke(
+    model_subpath, label, num_frames, video=None, image=None, output_type="video"
+):
     return _run_cosmos3_lpips_pipeline(
         num_frames,
         video=video,
@@ -759,6 +778,7 @@ def _run_cosmos3_fp8_smoke(model_subpath, label, num_frames, video=None, image=N
         height=COSMOS3_FP8_SMOKE_HEIGHT,
         width=COSMOS3_FP8_SMOKE_WIDTH,
         num_inference_steps=COSMOS3_FP8_SMOKE_NUM_INFERENCE_STEPS,
+        output_type=output_type,
     )
 
 
@@ -783,8 +803,13 @@ def test_cosmos3_fp8_decode_is_not_collapsed(model_subpath, label, task):
     # what the transformer generated. V2V pins latent frames (0, 1) -> pixel
     # frames 0-4 of its 9, leaving 8. I2V pins latent frame 0 -> pixel frame 0,
     # so the last frame is the furthest from the conditioning.
+    output_type = "video"
     if task == "t2i":
+        # output_type drives T2I, not num_frames: it also selects
+        # COSMOS3_T2I_PARAMS, the T2I system prompt and the image resolution
+        # template, none of which a one-frame video run would touch.
         num_frames, video, image, free_frame = 1, None, None, None
+        output_type = "image"
     elif task == "v2v":
         num_frames, video, image, free_frame = (
             COSMOS3_LPIPS_V2V_NUM_FRAMES,
@@ -803,7 +828,12 @@ def test_cosmos3_fp8_decode_is_not_collapsed(model_subpath, label, task):
         num_frames, video, image, free_frame = COSMOS3_FP8_SMOKE_NUM_FRAMES, None, None, None
 
     generated = _run_cosmos3_fp8_smoke(
-        model_subpath, f"{label} checkpoint", num_frames, video=video, image=image
+        model_subpath,
+        f"{label} checkpoint",
+        num_frames,
+        video=video,
+        image=image,
+        output_type=output_type,
     )
     _assert_cosmos3_fp8_decode_not_collapsed(
         generated, f"{label} {task}", num_frames, free_frame=free_frame
