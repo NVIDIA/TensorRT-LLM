@@ -70,7 +70,7 @@ def _prefill_threshold(
     timestep: Optional[float] = None,
 ) -> float:
     assert isinstance(sparse_params, SkipSoftmaxParams)
-    return sparse_params.scheduler.get_kernel_params(
+    return sparse_params.scheduler.get_runtime_params(
         timestep=timestep
     ).threshold_scale_factor_prefill
 

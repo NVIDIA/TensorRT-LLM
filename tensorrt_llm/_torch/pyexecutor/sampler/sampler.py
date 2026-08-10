@@ -82,8 +82,6 @@ from tensorrt_llm.sampling_params import (
     check_logprobs_limit,
 )
 
-from ...speculative.interface import get_force_num_accepted_tokens
-from ...speculative.spec_tree_manager import SpecTreeManager
 from ...utils import torch_multi_arange
 from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -98,7 +96,7 @@ from .logprobs import (
     get_logprobs_from_request,
     store_logprobs_list_to_request,
 )
-from .penalties import PenaltyHandler
+from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
     DEFAULT_STEP_IDX,
@@ -107,6 +105,7 @@ from .sampler_common import (
     _request_get_sampling_params,
     add_token,
     int_tensor,
+    request_random_seed,
 )
 from .sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN,
@@ -115,6 +114,7 @@ from .sampler_strategy import (
     FlashInferGroupedStrategySampler,
     Fusions,
     GenericStrategyKeyType,
+    RequestSeeds,
     Strategy,
     StrategyMetadata,
     TopPDecayMetadata,
@@ -135,6 +135,14 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+
+    # Type-only: importing the speculative package at module level would
+    # re-create the import cycle sampler.sampler -> speculative ->
+    # (draft_target/mtp) -> pyexecutor.sampler that this package's lazy
+    # __init__ exists to avoid. The cycle only resolves when speculative is
+    # imported first; a process whose first touch is sampler.sampler (e.g. a
+    # test module, with the top-level package now lazy) would break.
+    from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
     _ModelType = TypeVar("_ModelType", bound=DecoderModel)
     _ConfigType = TypeVar("_ConfigType", bound=PretrainedConfig)
@@ -690,6 +698,180 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
         return result, need_raw_logprobs
 
 
+class _SeedManager:
+    """Per-sequence-slot RNG state implementing ``SamplingParams.seed``.
+
+    A seeded request must produce the same tokens regardless of which other
+    requests share its batch, so its RNG stream cannot come from a single
+    batch-wide ``torch.Generator`` whose state advances by the batch's total
+    draw count. Instead each row is sampled with an explicit Philox
+    ``(seed, offset)`` pair: ``seed`` is the user's seed and ``offset`` is that
+    request's own running draw count, both indexed by sequence slot.
+
+    Requests without a seed fall back to ``global_seed`` and share the same
+    per-slot offset counter, which keeps them deterministic per slot but
+    intentionally does not reproduce the pre-existing batch-wide generator
+    stream token-for-token.
+
+    .. warning::
+       This plumbing is complete but **not yet effective for batched requests**.
+       The pinned ``flashinfer-python`` (0.6.15) reads only ``seed[0]`` and
+       ``offset[0]`` from the tensors it is handed and separates rows by
+       ``blockIdx.x`` instead, so every row of a grouped sampling call draws
+       from the first row's seed. A seeded request is reproducible only when it
+       is the first row of its strategy group. ``observe`` emits a one-time
+       warning when a seeded request is seen. The per-row state is kept here so
+       that honoring ``SamplingParams.seed`` becomes a FlashInfer version bump
+       rather than a redesign. ``TRTLLMSampler`` is unaffected -- its C++
+       ``curandBatchInitialize`` seeds each slot's state individually.
+
+       Upstream fix in progress: https://github.com/flashinfer-ai/flashinfer/pull/2345
+       ("add per-request generator support for sampling kernels"), which also
+       switches ``curand_init`` to ``subsequence=0`` for per-request RNG. Note
+       that it exposes the feature as ``generator=(seed_arr, offset_arr)``
+       rather than the current ``seed=``/``offset=`` arguments, and advances
+       ``offset_arr`` in-kernel -- so adopting it means passing the tuple and
+       dropping ``advance`` below, not just bumping the pin.
+    """
+
+    # Philox offset units reserved per row per sampling call.
+    #
+    # An offset must advance by at least the number of random values the kernel
+    # consumed, or the next call replays part of the same stream. That count is
+    # not uniform: flashinfer sizes its offset allocation as ``batch_size`` for
+    # categorical/min-p sampling but ``batch_size * 32`` for the top-k/top-p
+    # rejection samplers, whose per-row consumption is data-dependent and only
+    # bounded by that reserve.
+    #
+    # Rather than mirror flashinfer's per-op arithmetic here -- a detail that
+    # can change upstream without any signal to this code -- every row advances
+    # by the largest reserve. Offsets are int64, so spending 32 units where 1
+    # would do costs nothing observable, and the stream stays non-overlapping
+    # for every strategy.
+    OFFSET_STRIDE = 32
+
+    def __init__(self, *, max_num_sequences: int, global_seed: int):
+        self._global_seed = global_seed
+        # Indexed by py_seq_slot. Host-side int64; copied to device per step.
+        self._seeds = torch.full((max_num_sequences,), global_seed, dtype=torch.int64)
+        self._offsets = torch.zeros((max_num_sequences,), dtype=torch.int64)
+        # Request id currently owning each slot, so that slot reuse by a new
+        # request re-seeds instead of inheriting the previous occupant's stream.
+        self._slot_owner: list[Optional[int]] = [None] * max_num_sequences
+        # Per-slot flag: does the request currently occupying this slot carry a
+        # user seed? Recomputed per step from the scheduled requests rather than
+        # accumulated, so a finished seeded request stops forcing the per-row
+        # path (and its cost) onto later unseeded requests.
+        self._slot_seeded: list[bool] = [False] * max_num_sequences
+        # Whether the batch observed in the current step contains a seeded
+        # request. While false, the sampler keeps using the plain generator
+        # path and pays nothing.
+        self._any_seeded = False
+        # Whether the batch observed in the current step is a draft batch.
+        self._batch_is_draft = False
+
+    @property
+    def any_seeded(self) -> bool:
+        """Whether per-row seeds apply to the batch observed this step.
+
+        False for draft batches: their slot numbers come from a different
+        ``SeqSlotManager`` and would index the wrong requests' RNG state, so
+        draft sampling stays on the shared generator.
+        """
+        return self._any_seeded and not self._batch_is_draft
+
+    def observe(self, requests: list[LlmRequest]) -> None:
+        """Seed any slot whose occupant changed, and recompute ``any_seeded``.
+
+        Called at the top of each sampling step rather than at slot-allocation
+        time, which keeps this state owned entirely by the sampler. Resetting
+        the offset on ownership change is what makes a seeded request start at
+        the beginning of its stream instead of wherever the slot's previous
+        occupant left off.
+
+        ``any_seeded`` reflects only the requests passed in, so it falls back to
+        False once no scheduled request carries a seed.
+
+        Draft batches are ignored. ``ModelDrafter`` allocates draft slots from
+        its own ``SeqSlotManager`` over the same numeric range, so a draft
+        request can occupy a slot number that a live target request owns here.
+        Observing it would look like a change of occupant and reset that
+        target's offset, making it replay a stretch of its Philox stream. Draft
+        sampling keeps using the shared generator.
+        """
+        # Batches are homogeneous (see TorchSampler._is_draft_batch), so the
+        # first request decides for the whole batch.
+        self._batch_is_draft = bool(requests) and requests[0].py_is_draft
+        if self._batch_is_draft:
+            return
+
+        any_seeded = False
+        for request in requests:
+            seq_slot = request.py_seq_slot
+            if seq_slot is None:
+                continue
+            request_id = request.py_request_id
+            if self._slot_owner[seq_slot] != request_id:
+                self._slot_owner[seq_slot] = request_id
+                seed = request_random_seed(request)
+                self._seeds[seq_slot] = self._global_seed if seed is None else seed
+                self._offsets[seq_slot] = 0
+                self._slot_seeded[seq_slot] = seed is not None
+                if seed is not None:
+                    logger.warning_once(
+                        "SamplingParams.seed is only partially effective with the "
+                        "TorchSampler: the pinned FlashInfer reads a single "
+                        "seed/offset per sampling call and distinguishes rows "
+                        "internally, so when several requests are sampled together "
+                        "only the first row's seed applies. Seeded requests are "
+                        "therefore not yet reproducible unless sampled alone. Use "
+                        "the TRTLLM sampler for fully per-request seeding; "
+                        "TorchSampler support will land once FlashInfer honors "
+                        "per-row seeds (tracked in "
+                        "https://github.com/flashinfer-ai/flashinfer/pull/2345).",
+                        key="torch_sampler_per_request_seed_unsupported",
+                    )
+            any_seeded = any_seeded or self._slot_seeded[seq_slot]
+        # Derived from this step's requests only; a seeded request that has
+        # since finished no longer keeps the per-row path enabled.
+        self._any_seeded = any_seeded
+
+    def make_row_seeds(
+        self,
+        slots_per_row: list[int],
+        *,
+        device: torch.device,
+    ) -> RequestSeeds:
+        """Build the per-row ``(seed, offset)`` for one grouped sampling call.
+
+        ``slots_per_row`` gives the sequence slot of each logits row, already
+        expanded per step (a request drawing N tokens this iteration occupies N
+        consecutive rows). Rows of the same request are spaced ``OFFSET_STRIDE``
+        apart so each draw consumes a distinct stretch of the request's stream.
+        """
+        slots = torch.tensor(slots_per_row, dtype=torch.int64)
+        seeds = self._seeds[slots]
+        # Within-call, per-request draw index, scaled by the stride so rows of
+        # the same request occupy disjoint stretches: 0, 32, 64, ...
+        seen: dict[int, int] = {}
+        within_list: list[int] = []
+        for slot in slots_per_row:
+            draw = seen.get(slot, 0)
+            within_list.append(draw * self.OFFSET_STRIDE)
+            seen[slot] = draw + 1
+        within = torch.tensor(within_list, dtype=torch.int64)
+        offsets = self._offsets[slots] + within
+        return RequestSeeds(
+            seed=seeds.to(device=device, non_blocking=True),
+            offset=offsets.to(device=device, non_blocking=True),
+        )
+
+    def advance(self, slots_per_row: list[int]) -> None:
+        """Advance each slot past the stream its rows consumed this step."""
+        for slot in slots_per_row:
+            self._offsets[slot] += self.OFFSET_STRIDE
+
+
 @dataclass(kw_only=True, frozen=True)
 class _BatchedSamplingResult:
     # Original request indices for all requests (permuted due to batching by strategy):
@@ -1024,6 +1206,7 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    single_step_greedy: bool = False
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -1449,7 +1632,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._global_seed = 42
         self._generator: torch.Generator | None = None
 
-        # Force number of accepted tokens for speculative decoding testing
+        # Per-request RNG state backing SamplingParams.seed. Kept per sequence
+        # slot so a seeded request's stream depends only on its own step count,
+        # not on batch composition.
+        self._seed_manager = _SeedManager(
+            max_num_sequences=self.max_num_sequences,
+            global_seed=self._global_seed,
+        )
+
+        # Force number of accepted tokens for speculative decoding testing.
+        # Imported here (not at module level) to keep sampler.sampler off the
+        # speculative import cycle; see the TYPE_CHECKING note above.
+        from ...speculative.interface import get_force_num_accepted_tokens
+
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
 
         self._async_worker_init(args.enable_async_worker)
@@ -1474,6 +1669,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._prev_first_finish_reasons_host: list[torch.Tensor | None] = [
             None
         ] * self.max_num_sequences
+        self._stable_greedy_request_ids: list[int] = []
+        self._stable_greedy_seq_slots: list[int] = []
+        self._stable_greedy_seq_slots_host: Optional[torch.Tensor] = None
+        self._stable_greedy_seq_slots_cuda: Optional[torch.Tensor] = None
 
     @staticmethod
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
@@ -1509,7 +1708,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     def get_spec_tree_manager(
         self, resource_manager: Optional[ResourceManager]
-    ) -> Optional[SpecTreeManager]:
+    ) -> Optional["SpecTreeManager"]:
         if resource_manager is None:
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -1751,7 +1950,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_tensor: torch.Tensor,
         new_tokens_list: list[list[list[int]]],
         finish_reasons: FinishReasonsList,
-        spec_tree_manager: SpecTreeManager,
+        spec_tree_manager: "SpecTreeManager",
     ) -> int:
         """Tree verification for draft token tree based speculative decoding.
 
@@ -2557,6 +2756,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._pending_steps[slot] -= 1
 
         assert state.host is not None
+        # Reuse sample_async's qualification instead of rechecking every
+        # request after the asynchronous sample completes.
+        if state.single_step_greedy:
+            self._update_requests_single_beam_single_step(state)
+            return
+
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
         first_finish_reasons = (
@@ -2622,6 +2827,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         if reason in _valid_finish_reasons:
                             req.finish_by(reason, DEFAULT_BEAM_IDX)
                     req.py_num_accepted_draft_tokens = 0
+                    req.py_num_draft_tokens_verified = 0
                     req.py_rewind_len = 0
                     req.py_decoding_iter += 1
                 return
@@ -2671,6 +2877,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     ]
                     req.py_result.set_first_gen_log_probs(first_gen_log_probs)
                 req.py_num_accepted_draft_tokens = 0
+                req.py_num_draft_tokens_verified = 0
                 req.py_rewind_len = 0
             else:
                 processed = 1
@@ -2684,9 +2891,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
+                    # Pair the acceptance count with the real proposal count
+                    # of the same step: py_draft_tokens is padded to the
+                    # static max for CUDA graphs, so use the pre-padding
+                    # length the drafter recorded. py_rewind_len keeps the
+                    # padded length (padding occupies KV cache).
+                    effective_len = req.py_draft_tokens_effective_len
+                    req.py_num_draft_tokens_verified = (
+                        min(effective_len, actual_draft_len)
+                        if effective_len is not None
+                        else actual_draft_len
+                    )
                     req.py_rewind_len = actual_draft_len - num_accepted
                 else:
                     req.py_num_accepted_draft_tokens = 0
+                    req.py_num_draft_tokens_verified = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
                 if actual_draft_len > 0:
@@ -2706,6 +2925,48 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._top_p_decay.retire_slot(req)
 
         self._penalty_handler.update_token_counts(finalized_token_updates)
+
+    @nvtx_range("_update_requests_single_beam_single_step")
+    def _update_requests_single_beam_single_step(self, state: SampleStateTorch) -> None:
+        """Update the common greedy, single-token case without draft machinery."""
+        assert state.host is not None
+        requests = [
+            request
+            for request in state.requests
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        if not requests:
+            return
+
+        all_new_tokens = state.host.new_tokens.tolist()
+        if len(requests) == len(state.requests):
+            new_tokens = all_new_tokens
+        else:
+            new_tokens = [
+                new_token
+                for request, new_token in zip(state.requests, all_new_tokens)
+                if request.state != LlmRequestState.GENERATION_COMPLETE
+            ]
+        add_new_tokens_to_requests(requests, new_tokens, DEFAULT_BEAM_IDX)
+
+        # sample_async deliberately omits the device finish-reason tensor for
+        # this qualified path; completion is derived from compact host tokens.
+        assert state.host.finish_reasons is None
+        for request, new_token in zip(requests, new_tokens):
+            # The stable greedy path excludes stop words. Keep EOS ahead of the
+            # length check so a terminal EOS at the token limit is reported as
+            # END_ID, matching _handle_stop_criteria.
+            if new_token == request.py_end_id:
+                request.finish_by(FinishReason.END_ID, DEFAULT_BEAM_IDX)
+            elif (
+                request.max_beam_num_tokens - request.py_orig_prompt_len
+                >= request.py_max_new_tokens
+                or request.max_beam_num_tokens >= self.max_seq_len
+            ):
+                request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            request.py_decoding_iter += 1
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
@@ -2764,6 +3025,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
+            single_step_greedy,
         ) = self._process_requests(
             scheduled_requests,
             model_outputs,
@@ -2790,22 +3052,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # their buffers in the store.
             # Assume that either all requests are drafts or none are drafts
             is_draft_batch = requests[0].py_is_draft
-            finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
-                seq_slots_host=seq_slots_host,
-                is_draft_batch=is_draft_batch,
-                seq_slots_cuda=seq_slots_cuda,
-                seq_lens_cuda=seq_lens_cuda,
-                new_tokens_cuda=new_tokens,
-                first_finish_reasons_cuda=(
-                    beam_search_store.first_finish_reasons
-                    if beam_search_store is not None
-                    else None
-                ),
-            )
-            finish_reasons_host = self._copy_to_host(finish_reasons_device)
+            if not single_step_greedy:
+                assert seq_lens_host is not None
+                assert seq_lens_cuda is not None
+                finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
+                    seq_slots_host=seq_slots_host,
+                    is_draft_batch=is_draft_batch,
+                    seq_slots_cuda=seq_slots_cuda,
+                    seq_lens_cuda=seq_lens_cuda,
+                    new_tokens_cuda=new_tokens,
+                    first_finish_reasons_cuda=(
+                        beam_search_store.first_finish_reasons
+                        if beam_search_store is not None
+                        else None
+                    ),
+                )
+                finish_reasons_host = self._copy_to_host(finish_reasons_device)
 
             if self._use_beam_search:
                 assert beam_search_store is not None
+                assert seq_lens_cuda is not None
                 first_finish_reasons = beam_search_store.first_finish_reasons
                 first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
                 self._update_original_tokens(
@@ -2848,6 +3114,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
+            single_step_greedy=single_step_greedy,
         )
 
     @staticmethod
@@ -2868,7 +3135,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_dest_indices: torch.Tensor,
         max_beam_width: int,
         d2t: torch.Tensor | None,
-    ) -> None:
+    ) -> torch.Tensor:
         """Applies fast greedy sampling to the logits.
 
         Performs argmax, applies d2t translation if present, and scatters
@@ -2887,6 +3154,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
             0, batch_dest_indices_expanded, next_tokens_expanded
         )
+        return next_tokens
 
     @staticmethod
     def _apply_embedding_bias(
@@ -2994,6 +3262,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> _BatchedSamplingResult:
         cuda_device = logits_cuda.device
 
+        self._seed_manager.observe(requests)
+
         grouped_requests, need_raw_logprobs = self._request_grouper.group_requests_by_strategy_key(
             requests,
             pin_memory=prefer_pinned(),
@@ -3081,11 +3351,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 group_logits_cuda = logits_cuda
                 logit_indices_for_sampler = group_logits_cuda_indices_cuda
 
+            group_steps_per_request = req_num_steps[group_req_indices].tolist()
             group_strategies_per_step = [  # convert from per-request to per-step
                 strat
-                for strat, steps in zip(group_strategies, req_num_steps[group_req_indices].tolist())
+                for strat, steps in zip(group_strategies, group_steps_per_request)
                 for _ in range(steps)
             ]
+
+            # Per-request seeds only when some live request actually asked for
+            # one; otherwise the shared generator keeps the previous behavior.
+            group_seeds: Optional[RequestSeeds] = None
+            if self._seed_manager.any_seeded:
+                group_slots_per_step = [
+                    slot
+                    for slot, steps in zip(
+                        seq_slots[group_req_indices].tolist(), group_steps_per_request
+                    )
+                    for _ in range(steps)
+                ]
+                group_seeds = self._seed_manager.make_row_seeds(
+                    group_slots_per_step, device=cuda_device
+                )
+                self._seed_manager.advance(group_slots_per_step)
 
             group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
                 self._grouped_sampler_cls.sample_grouped_strategies(
@@ -3096,6 +3383,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     return_probs=needs_probs,
                     group_logit_indices=logit_indices_for_sampler,
                     group_metadata=group_metadata,
+                    seeds=group_seeds,
                 )
             )
             batch_next_tokens_offset_end = (
@@ -3781,9 +4069,88 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
     ) -> tuple[
-        list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        list[LlmRequest],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        bool,
     ]:
         raw_logits_cuda = model_outputs["logits"]
+
+        generation_requests = scheduled_requests.generation_requests
+        request_ids = [request.py_request_id for request in generation_requests]
+        maybe_seq_slots = [request.py_seq_slot for request in generation_requests]
+        has_stable_greedy_batch = (
+            self._stable_greedy_request_ids == request_ids
+            and self._stable_greedy_seq_slots == maybe_seq_slots
+        )
+        can_use_stable_greedy_path = (
+            bool(generation_requests)
+            and self.max_beam_width == 1
+            and scheduled_requests.num_context_requests == 0
+            and len(generation_requests) <= raw_logits_cuda.shape[0]
+            and model_outputs.get("d2t") is None
+            and all(
+                not request.is_dummy and get_draft_token_length(request) == 0
+                for request in generation_requests
+            )
+            and (
+                has_stable_greedy_batch
+                or all(
+                    request._py_embedding_bias_1d is None
+                    and not getattr(request, "py_bad_words", None)
+                    and not getattr(request, "py_no_repeat_ngram_size", None)
+                    and not has_occurrence_penalty(request)
+                    and not request.py_min_length
+                    and not request.py_return_log_probs
+                    and not request.py_stop_words_list
+                    and _request_strategy(request, vocab_size=2**31) == GREEDY
+                    for request in generation_requests
+                )
+            )
+        )
+        if can_use_stable_greedy_path:
+            if has_stable_greedy_batch:
+                assert self._stable_greedy_seq_slots_host is not None
+                assert self._stable_greedy_seq_slots_cuda is not None
+                seq_slots_host = self._stable_greedy_seq_slots_host
+                seq_slots_cuda = self._stable_greedy_seq_slots_cuda
+            else:
+                assert all(seq_slot is not None for seq_slot in maybe_seq_slots)
+                seq_slots = [cast(int, seq_slot) for seq_slot in maybe_seq_slots]
+                seq_slots_host = torch.tensor(
+                    seq_slots, dtype=torch.int32, pin_memory=prefer_pinned()
+                )
+                seq_slots_cuda = seq_slots_host.to(
+                    device="cuda", dtype=torch.int64, non_blocking=True
+                )
+                self._stable_greedy_request_ids = request_ids
+                self._stable_greedy_seq_slots = seq_slots
+                self._stable_greedy_seq_slots_host = seq_slots_host
+                self._stable_greedy_seq_slots_cuda = seq_slots_cuda
+
+            next_tokens = self._fast_greedy_sample_kernel(
+                raw_logits_cuda[: len(generation_requests)],
+                new_tokens_cuda,
+                seq_slots_cuda,
+                self.max_beam_width,
+                None,
+            )
+            new_tokens_host = self._copy_to_host(next_tokens)
+            return (
+                generation_requests,
+                seq_slots_host,
+                None,
+                seq_slots_cuda,
+                None,
+                new_tokens_host,
+                True,
+            )
+
+        self._stable_greedy_request_ids = []
+        self._stable_greedy_seq_slots = []
 
         sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
             scheduled_requests,
@@ -3906,6 +4273,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 seq_slots_cuda,
                 seq_lens_cuda,
                 new_tokens_host,
+                False,
             )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
@@ -3961,6 +4329,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
+            False,
         )
 
     @override

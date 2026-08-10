@@ -196,12 +196,11 @@ def load_internal_apis():
     import types
 
     import tensorrt_llm
-    import tensorrt_llm._torch.models  # noqa: F401 - populates the model registry
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
     from tensorrt_llm._torch.distributed import Distributed
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
     from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
@@ -232,7 +231,7 @@ def load_internal_apis():
         KvCacheConfigCpp=trtllm_executor.KvCacheConfig,
         DisaggregatedParams=DisaggregatedParams,
         Distributed=Distributed,
-        MODEL_CLASS_MAPPING=MODEL_CLASS_MAPPING,
+        get_registered_model_class=get_registered_model_class,
         HangDetector=HangDetector,
         KVCacheManager=KVCacheManager,
         KVCacheManagerV2=KVCacheManagerV2,
@@ -314,7 +313,8 @@ def _lookup_model_cls(model_dir):
     hf_view = type("HFConfigView", (), hf_cfg)  # attribute access for the pref hook
     if not archs:
         return None, hf_view
-    return load_internal_apis().MODEL_CLASS_MAPPING.get(archs[0]), hf_view
+    # Resolves the lazily imported provider on demand, like serving does.
+    return load_internal_apis().get_registered_model_class(archs[0]), hf_view
 
 
 def resolve_model_prefs(model_dir, side, cache_cfg):

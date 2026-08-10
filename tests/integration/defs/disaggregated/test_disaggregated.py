@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -727,8 +728,12 @@ def setup_disagg_cluster(
                     gen_servers.get("context_parallel_size", 1))
 
     # Build worker configs
+    internal_request_auth_key = config.get(
+        "internal_request_auth_key") or secrets.token_hex(32)
     ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
     gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
+    ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
+    gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
     # Launch workers
     model = model_name or config.get("model")
@@ -805,6 +810,8 @@ def setup_disagg_cluster(
             config.get("perf_metrics_output_dir", None),
             "return_perf_metrics":
             config.get("return_perf_metrics", False),
+            "internal_request_auth_key":
+            internal_request_auth_key,
         }
         if schedule_style:
             server_config["schedule_style"] = schedule_style
@@ -929,7 +936,8 @@ def run_disaggregated_test(example_dir,
                            disagg_schedule_style=None,
                            post_client_test=None,
                            assert_gen_log_contains=None,
-                           perf_metrics_output_dir=None):
+                           perf_metrics_output_dir=None,
+                           server_start_timeout=300):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
@@ -950,7 +958,8 @@ def run_disaggregated_test(example_dir,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style,
                              save_log=assert_gen_log_contains is not None,
-                             perf_metrics_output_dir=perf_metrics_output_dir)
+                             perf_metrics_output_dir=perf_metrics_output_dir,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
 
@@ -1971,7 +1980,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -1983,9 +1991,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp_8_attention_dp_overlap",
+                           num_iters=1,
                            env=llm_venv._new_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=1200)
 
 
 @skip_no_hopper

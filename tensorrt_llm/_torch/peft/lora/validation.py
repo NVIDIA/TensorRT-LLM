@@ -93,7 +93,7 @@ def check_moe_lora_supported(
 
     Args:
         moe_backend_name: The resolved `moe_backend` string (e.g. "CUTLASS",
-            "WIDEEP", "TRTLLM"). Comparison is case-insensitive.
+            "CUTEDSL", "TRTLLM"). Comparison is case-insensitive.
         lora_config: The model's `LoraConfig`, or None.
         quant_config: The model's `QuantConfig`, or None. We only reject when
             the layer is actually quantized (`quant_mode.has_any_quant`).

@@ -38,8 +38,30 @@ else
     export CUDA_VISIBLE_DEVICES=${cuda_devices}
 fi
 
-# Clear UCX_TLS for specific clusters
-unset UCX_TLS
+# Container runtimes (pyxis/enroot) reset image-defined variables like PATH
+# at container start, so values passed via srun --export are lost for them.
+# Allow the launcher config to prepend entries from inside the container.
+# srun --export keeps any quotes in the exported values literal; strip them.
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND:-}"
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND#\'}"; TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND%\'}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND:-}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND#\'}"; TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND%\'}"
+if [ -n "${TRTLLM_PATH_PREPEND:-}" ]; then
+    export PATH="${TRTLLM_PATH_PREPEND}:${PATH}"
+fi
+if [ -n "${TRTLLM_PYTHONPATH_PREPEND:-}" ]; then
+    export PYTHONPATH="${TRTLLM_PYTHONPATH_PREPEND}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
+# Clear UCX_TLS for specific clusters. Some clusters instead need an
+# explicit transport list (e.g. NVL72 nodes whose verbs transports cannot
+# initialize): set TRTLLM_WORKER_UCX_TLS in worker_env_var to re-pin
+# UCX_TLS here, after the container-provided value is cleared.
+if [ -n "${TRTLLM_WORKER_UCX_TLS:-}" ]; then
+    export UCX_TLS="${TRTLLM_WORKER_UCX_TLS}"
+else
+    unset UCX_TLS
+fi
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
@@ -63,7 +85,14 @@ else
     nsys_prefix="nsys profile -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
 fi
 
+# In-place (.pth-style) TRT-LLM installs may lack the trtllm-serve console
+# script; fall back to the module entry point in that case.
+trtllm_serve_cmd="trtllm-serve"
+if ! command -v trtllm-serve >/dev/null 2>&1; then
+    trtllm_serve_cmd="python3 -m tensorrt_llm.commands.serve"
+fi
+
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
-    trtllm-serve ${model_path} \
+    ${trtllm_serve_cmd} ${model_path} \
         --host $(hostname) --port ${port} \
         --config ${config_file}

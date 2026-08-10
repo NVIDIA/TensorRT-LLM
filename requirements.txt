@@ -38,6 +38,7 @@ pydantic-settings[yaml]
 msgspec
 omegaconf
 pillow
+PyNvVideoCodec~=2.1.0
 optimum
 # evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
 datasets==3.1.0
@@ -57,7 +58,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.15
+flashinfer-python==0.6.16
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema

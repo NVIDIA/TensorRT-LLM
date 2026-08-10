@@ -34,11 +34,10 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
-from ..models import AutoModelForCausalLM, LlamaForCausalLM
+from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
-                                     DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+                                     get_registered_model_class, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
@@ -342,17 +341,29 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
-    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
-        profiles=(PostTransformProfile(
-            profile_id="llama-for-causal-lm-target-v1",
-            root_model_class=LlamaForCausalLM,
-            architecture="LlamaForCausalLM",
-            model_type="llama",
-            speculative_mode=None,
-            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        ), ))
+    _POST_TRANSFORM_PROFILE_REGISTRY: Optional[
+        PostTransformProfileRegistry] = None
+
+    @classmethod
+    def _post_transform_profile_registry(cls) -> PostTransformProfileRegistry:
+        # Built on first use: the profile references a model-zoo class, and
+        # importing it here (not at module level) keeps the zoo lazy for
+        # processes that import model_loader but never qualify a model.
+        if cls._POST_TRANSFORM_PROFILE_REGISTRY is None:
+            from ..models.modeling_llama import LlamaForCausalLM
+            cls._POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
+                profiles=(PostTransformProfile(
+                    profile_id="llama-for-causal-lm-target-v1",
+                    root_model_class=LlamaForCausalLM,
+                    architecture="LlamaForCausalLM",
+                    model_type="llama",
+                    speculative_mode=None,
+                    protocol_version=cls.
+                    _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                    transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+                    transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                ), ))
+        return cls._POST_TRANSFORM_PROFILE_REGISTRY
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -416,13 +427,6 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
-        if llm_args.speculative_config is not None:
-            from tensorrt_llm._torch.speculative import \
-                update_spec_config_from_model_config
-
-            update_spec_config_from_model_config(llm_args.speculative_config,
-                                                 config.pretrained_config)
-
         model_cls = AutoModelForCausalLM._resolve_class(config)
         use_kv_cache_manager_v2 = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
@@ -439,6 +443,15 @@ class ModelLoader:
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
 
+        if llm_args.speculative_config is not None:
+            from tensorrt_llm._torch.speculative import \
+                update_spec_config_from_model_config
+
+            # Model defaults reconstruct nested Pydantic configs and drop
+            # init=False runtime fields such as num_nextn_predict_layers.
+            update_spec_config_from_model_config(llm_args.speculative_config,
+                                                 config.pretrained_config)
+
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class
         # (e.g. MTPDraftModelForCausalLM), which must not drop the target
@@ -446,8 +459,8 @@ class ModelLoader:
         preference_cls = model_cls
         architectures = getattr(config.pretrained_config, 'architectures', None)
         if architectures:
-            preference_cls = MODEL_CLASS_MAPPING.get(architectures[0],
-                                                     model_cls)
+            preference_cls = get_registered_model_class(
+                architectures[0]) or model_cls
 
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
@@ -553,7 +566,8 @@ class ModelLoader:
 
             loads_draft_weights = (
                 self.spec_config is not None
-                and self.spec_config.spec_dec_mode.need_load_draft_weights())
+                and (self.spec_config.spec_dec_mode.need_load_draft_weights()
+                     or self.spec_config._use_shared_kv_cache))
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,
@@ -704,8 +718,7 @@ class ModelLoader:
                     self._call_load_weights(model.load_weights, weights,
                                             self.weight_mapper)
 
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights:
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -840,8 +853,7 @@ class ModelLoader:
                                     "commit an unpopulated model to the GMS "
                                     "pool.")
 
-                            if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                            ):
+                            if loads_draft_weights:
                                 draft_weights = checkpoint_loader.load_weights(
                                     self.spec_config.speculative_model,
                                     mapping=self.mapping)
@@ -968,8 +980,7 @@ class ModelLoader:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 initialize_dummy_weights(model)
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights:
                     model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:
@@ -1131,7 +1142,7 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
-        return cls._POST_TRANSFORM_PROFILE_REGISTRY.qualify(
+        return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
             model_type=config_identity.model_type,
