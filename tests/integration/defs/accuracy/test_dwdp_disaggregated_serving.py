@@ -2,6 +2,20 @@
 
 Separated from test_disaggregated_serving.py to isolate MPI-dependent test
 infrastructure for easier maintenance.
+
+NOTE: these tests are intentionally not registered in any CI test list. DWDP
+accuracy is gated in CI by test_dwdp_aggregated.py, which exercises the same
+expert-sharing paths without the disaggregated KV cache transceiver and is
+therefore not exposed to per-cluster transport configuration. This file is kept
+as a manual reproduction of the disaggregated DWDP path; run it directly with
+pytest.
+
+When running it manually, check the launcher's UCX settings first: SLURM
+enroot/pyxis injects ``UCX_TLS=tcp`` from the host MPI stack on some clusters,
+which pins the KV cache transceiver to a transport that can fail there and hang
+the run in ``check_gen_transfer_status``. Clear or pin ``UCX_TLS`` for the
+cluster before running -- see jenkins/scripts/slurm_env_setup.sh and
+examples/disaggregated/slurm/benchmark/start_worker_dwdp.sh.
 """
 
 import contextlib
