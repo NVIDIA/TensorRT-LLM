@@ -669,6 +669,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if head:
             parts.append(head)
         if duration_template is not None and (num_frames > 1 or force_duration_template):
+            # Fractional on purpose: the reference's text path keeps the exact value
+            # and lets the template's own precision render it, unlike its JSON path,
+            # which truncates (cosmos-framework _format_prompt_with_template).
             duration = num_frames / frame_rate
             parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
         if resolution_template is not None:
@@ -701,6 +704,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     if duration_template is not None and (
                         num_frames > 1 or force_duration_template
                     ):
+                        # Truncated, not rounded, and integer-valued even though the
+                        # text template above stays fractional: both mirror the
+                        # reference (cosmos-framework _format_json_prompt_with_template).
                         data["duration"] = f"{int(num_frames / frame_rate)}s"
                         data["fps"] = float(frame_rate)
                     else:
