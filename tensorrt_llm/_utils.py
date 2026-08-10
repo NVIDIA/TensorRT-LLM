@@ -1180,18 +1180,22 @@ def set_prometheus_multiproc_dir() -> object:
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
-def confidential_compute_enabled() -> bool:
-    """
-    Query NVML for the confidential compute state
+@lru_cache(maxsize=1)
+def get_cc_and_nvle_status() -> tuple[bool, bool]:
+    """Query NVML for the confidential compute and NVLink encryption state.
+
+    Returns:
+        A tuple of ``(cc_enabled, nvle_enabled)``.
     """
 
     try:
         import pynvml
     except ImportError:
-        logger.error("pynvml not available; assuming CC=off")
-        return False
+        logger.error("pynvml not available; assuming CC and NVLE are off")
+        return False, False
 
     cc_enabled = False
+    nvle_enabled = False
 
     try:
         pynvml.nvmlInit()
@@ -1201,29 +1205,37 @@ def confidential_compute_enabled() -> bool:
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
         ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
         pynvml._nvmlCheckReturn(ret)
-        cc_enabled = (
-            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
-            or cc_settings.multiGpuMode
-            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
-            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+        # PPCIE implies CC, but NVLE does not necessarily
+        cc_enabled = (cc_settings.ccFeature
+                      == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+                      or cc_settings.multiGpuMode
+                      == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE)
+        nvle_enabled = (
+            cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
     except pynvml.NVMLError_NotSupported:
         # Simple query for older GPUs
         try:
             cc_state = pynvml.nvmlSystemGetConfComputeState()
             cc_enabled = (
                 cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED)
-        except Exception as e:
-            logger.error(f"Error querying confidential compute state: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error querying confidential compute state: {str(e)}")
+        except pynvml.NVMLError as error:
+            logger.error(f"Error querying CC and NVLE state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.error(f"Error querying CC and NVLE state: {error!s}")
     finally:
         # Shutdown
         try:
             pynvml.nvmlShutdown()
-        except:
+        except pynvml.NVMLError:
             # Ignore shutdown errors
             pass
 
+    return cc_enabled, nvle_enabled
+
+
+def confidential_compute_enabled() -> bool:
+    """Return whether confidential compute restrictions are enabled."""
+    cc_enabled, _ = get_cc_and_nvle_status()
     return cc_enabled
 
 
