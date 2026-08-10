@@ -80,9 +80,14 @@ def _make_executor(
     # MagicMock would be truthy and non-iterable in the suspend helper.
     padding_dummies = dict(padding_dummies or {})
     exe.model_engine = MagicMock()
+    exe.resource_manager = MagicMock()
     if has_cuda_graph_runner:
         exe.model_engine.cuda_graph_runner = MagicMock()
         exe.model_engine.cuda_graph_runner.padding_dummy_requests = padding_dummies
+        # Mirror the real helper: pop the dummy from the runner's map.
+        exe.model_engine.cuda_graph_runner.release_padding_dummy.side_effect = (
+            lambda _rm, draft_len: padding_dummies.pop(draft_len, None) is not None
+        )
     else:
         exe.model_engine.cuda_graph_runner = None
 
@@ -304,15 +309,20 @@ class TestPaddingDummies:
         """Nothing reschedules a padding dummy, and the runner hands back a
         cached dummy without checking that its cache is live -- so one that
         cannot be resumed must not be left suspended in the runner's map.
+
+        The release goes through the runner rather than the KV cache manager
+        directly: a dummy is registered with up to four managers, and the
+        runner owns that list.
         """
         dummy = _make_request(999)
         exe = _make_executor(padding_dummies={0: dummy})
         exe.kv_cache_manager.resume_request.return_value = False
+        runner = exe.model_engine.cuda_graph_runner
 
         self._fire(exe, monkeypatch)
 
-        exe.kv_cache_manager.free_resources.assert_called_once_with(dummy)
-        assert exe.model_engine.cuda_graph_runner.padding_dummy_requests == {}
+        runner.release_padding_dummy.assert_called_once_with(exe.resource_manager, 0)
+        exe.kv_cache_manager.free_resources.assert_not_called()
 
     def test_already_suspended_padding_dummy_is_left_alone(self, monkeypatch):
         dummy = _make_request(999)

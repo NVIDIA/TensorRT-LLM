@@ -4488,10 +4488,9 @@ class PyExecutor:
         one that cannot be resumed is released and dropped from the runner
         instead, falling back to lazy re-creation on a later padded step.
 
-        Note: the release only covers the main KV cache manager, matching
-        ``_add_cross_dummy_request``'s own failure path.  A dummy that also
-        holds draft or cross-attention KV cache entries keeps those until
-        the runner is cleared.
+        The release goes through ``CUDAGraphRunner.release_padding_dummy`` so
+        that every manager the dummy was registered with is covered, not just
+        the main KV cache manager.
         """
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
@@ -4503,8 +4502,7 @@ class PyExecutor:
                 "Could not resume the CUDA graph padding dummy request "
                 f"(draft_len={draft_len}) after a KV pool rebalance; "
                 "releasing it and falling back to lazy re-creation.")
-            mgr.free_resources(dummy)
-            runner.padding_dummy_requests.pop(draft_len, None)
+            runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
     def control_action(self,
