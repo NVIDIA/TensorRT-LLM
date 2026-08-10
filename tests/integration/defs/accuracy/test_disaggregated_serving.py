@@ -624,9 +624,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     # overlap scheduler is token-invariant (unit-tested); only block-reuse changes which KV is transferred
-    @pytest.mark.parametrize("ctx_enable_block_reuse,gen_enable_block_reuse",
-                             [(True, True), (False, False)],
-                             ids=["block_reuse", "no_block_reuse"])
+    # The mismatched pair is kept on purpose: it is the only combination where
+    # the two servers disagree about which blocks are already resident, so it
+    # exercises a different transfer path than either symmetric case.
+    @pytest.mark.parametrize(
+        "ctx_enable_block_reuse,gen_enable_block_reuse", [(True, True),
+                                                          (True, False),
+                                                          (False, False)],
+        ids=["block_reuse", "ctx_block_reuse_only", "no_block_reuse"])
     def test_auto_dtype(self, ctx_enable_block_reuse, gen_enable_block_reuse):
         ctx_server_config = {
             "disable_overlap_scheduler": False,
