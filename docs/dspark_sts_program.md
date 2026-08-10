@@ -524,6 +524,27 @@ cap-accept 模式(同一 planner 决策,提交完整块全量验证、接受端�
 
 **初步指认**:短窗桶的病灶集中在 **MoE grouped GEMM 的 tile 阶梯**——token 桶变小 → 换小 tile → 每 token 效率近乎腰斩,GEMM 时间不随 token 线性下降,形成 #32 的"常数惩罚";与 GB300 Pro frac 表的平台+悬崖楼梯(MoE 更重 → 惩罚更大)跨模型同构。另见 pin3 独有的 FMHA 变体(1.0%)待查。**定论等 v7b 的 (128,768) vs (128,384) 同批次干净对拍。**
 
+### #32 定论:短窗惩罚 = `_prepare_inputs` 的 host 同步链,不是 kernel 病态(08-09 23:40,v7b 清洁窗)
+
+v7b 两轮对准命中:pin5b(122±3 请求,桶 768)/ pin3b(122±2 请求,桶 512),窗口 iter 2000-2050 全程均质满批,**同 padded_bs=128 的干净对拍**。步时(窗内 `prev_device_step_time` 均值):pin5b **51.39ms**,pin3b **58.25ms**——token −33%,步时 **+13.3%**,在 nsys 在场下复现 iter-log 矩阵的短窗惩罚。
+
+**三层分解(每 50-iter 窗口,rank0):**
+
+| 层 | pin5b | pin3b | 判读 |
+|---|---|---|---|
+| GPU kernel 总时间 | 2638.7ms | 2281.9ms(0.865) | kernel 变**快**了,不是 kernel 病态 |
+| GPU 空转间隙(>merge)| 162ms(~1 个大隙/步)| **844ms(~7 个/步,单隙 6-8.7ms)** | 慢的全部来自空隙 |
+| `_prepare_inputs` NVTX 相位 | 1253.7ms(25.1ms/步)| **1977.4ms(39.5ms/步)** | 惩罚源头相位 |
+| 其中 cudaEventSynchronize | 100 次 / 0.9ms(免费)| **300 次 / 1078.2ms(21.6ms/步)** | **6 次/步阻塞 D2H,平均 3.6ms/次** |
+
+**机理**:短窗(w<max)激活压缩器 ragged 元数据路径(`deepseek_v4.py` 的 `_compute_gen_compressed_position_ids` / `_compute_compressed_mask` 等,inductor 编成 `triton_poi_fused_arange_clamp_index_lt_searchsorted_*`);其数据依赖形状迫使调用方按 compress_ratio 把 0-dim CUDA 张量读回 host(代码注释自供:`gen_output_offsets` "pre-extracted by the caller to avoid .item() inside compiled code"、`ctx_output_sizes` "0-dim-CUDA fallback costs two implicit D2H syncs per ratio")。每步 6 次阻塞读 → 排空 launch 流水线 → GPU 干等 host 跑 python(空隙期间 host 不在任何 CUDA API 里)→ 每步净损 ~14ms。满窗(w=max)时形状与静态捕获一致走快路径,2 次/步事件同步且零耗时——这就是为什么 iter-log 矩阵里"ragged 机制税"在满窗下只有 +1.5ms,而 w4/w3 一压就 +12%/+34%。
+
+**修订与含义**:
+- 首轮(排水窗)对拍的"MoE tile 换挡"故事在同 bs 下**不成立**(大 tile 两侧都是 2300 实例、0.94)——那是批大小混杂的假象,撤回。
+- kernel 家族缩放(次要但真实):MoE grouped GEMM 0.94(权重搬运主导,token 不敏感)、nvjet 1.00、elementwise 0.88、FMHA 0.74、topK 0.69——Flash 的 θ_model 本来就小,**该省的 33% token 本来也只值 ~13% kernel 时间**;但 prep 同步链把它反噬成 +13% 步时。
+- **裁剪经济学翻案路径**:修掉 prep 同步链(方向:元数据形状改由 host 端窗口计划推导,或直接用 padded 均匀形状——文档注释明言 reserved slots 会在 postprocess 被 mask,按桶静态化本就是容忍的设计),短窗步时应回到 ≤ 满窗水平,届时 Pro@DEP8 复测才是 trim 产品线的真判决。#11(ragged 路径无额外同步验证)就此有了答案:**有,6 次/步,已点名**。
+- 跨栈注记:GB300 Pro 的 w4 异常应为同一 prep 路径(同代码);SGLang 的 28→33ms 是另一栈,不并案。
+
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
 1. **host 未复现**:初测 +8.3%(poetry 128/rank)在四轮中缩为 [0.0, +1.9, +1.3, +2.2]%;arena 侧 [−2.4, 0.0, −1.4, −5.6]%。host 整体 ≈ 0±3%,poetry 微正、arena 微负。host 调度行为本身跨节点完全可复现(trim 22.4-22.7%,accept 1.66-1.67,四轮逐位一致)——**是收益不存在,不是实验不稳**。
