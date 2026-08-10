@@ -120,3 +120,33 @@ def test_gate_disabled_paths_not_affected(tmp_path):
     """expected_records=None skips the plausibility check (dataset-entry runs)."""
     artifact_dir = _write_export(tmp_path, [_record()] * 5)
     enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=None)
+
+
+def test_was_cancelled_metadata_fallback(tmp_path):
+    """Cancellations are excluded even if the error shape drifts.
+
+    A future aiperf may record cancellations with a different error type, a
+    null code, or no error object at all; metadata.was_cancelled still
+    classifies them as intentional cancellations rather than server errors.
+    """
+    drifted_error = {"code": None, "type": "ClientDisconnected", "message": "x"}
+    records = [_record()] * 900
+    for rec_error in ([drifted_error] * 50, [None] * 50):
+        for err in rec_error:
+            rec = _record(err)
+            rec["metadata"]["was_cancelled"] = True
+            records.append(rec)
+    artifact_dir = _write_export(tmp_path, records)
+    # 100 drifted cancellations at 10% must not trip the 5% threshold.
+    enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=1000)
+
+
+def test_non_request_records_excluded_from_denominator(tmp_path):
+    """Records without metrics/error (future metadata lines) do not dilute the rate."""
+    records = [_record()] * 90 + [_record(_SERVER_500)] * 10
+    non_request = [{"summary": {"total": 100}}] * 900
+    artifact_dir = _write_export(tmp_path, records + non_request)
+    # 10 errors over 100 requests = 10% — must fire even though 900 metadata
+    # lines would dilute it to ~1% if they were counted as requests.
+    with pytest.raises(AssertionError, match="exceeds threshold"):
+        enforce_aiperf_error_rate(artifact_dir, 0.05, expected_records=100)

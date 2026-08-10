@@ -2409,6 +2409,7 @@ def enforce_aiperf_error_rate(artifact_dir,
     total = 0
     cancelled = 0
     decode_failures = 0
+    non_request = 0
     # (code, type) -> [count, example message]
     error_counts: dict[tuple, list] = {}
     with open(export_path, "r", errors="replace") as f:
@@ -2421,13 +2422,29 @@ def enforce_aiperf_error_rate(artifact_dir,
             except json.JSONDecodeError:
                 decode_failures += 1
                 continue
+            if not isinstance(record, dict) or ("metrics" not in record
+                                                and "error" not in record):
+                # Non-request records would inflate the denominator and
+                # under-report the rate. The aiperf==0.8.0 record export is
+                # request-only, but stay robust to future metadata additions.
+                non_request += 1
+                continue
             total += 1
             error = record.get("error")
+            # Schema-drift fallback: per-record metadata carries was_cancelled
+            # independently of the error object's code/type, so a cancelled
+            # request is excluded even if a future aiperf changes the error
+            # shape (or omits the error object for cancellations entirely).
+            metadata = record.get("metadata") or {}
+            was_cancelled = bool(metadata.get("was_cancelled"))
             if not error:
+                if was_cancelled:
+                    cancelled += 1
                 continue
             code = error.get("code")
             err_type = error.get("type")
-            if code == 499 or err_type == "RequestCancellationError":
+            if (code == 499 or err_type == "RequestCancellationError"
+                    or was_cancelled):
                 cancelled += 1
                 continue
             entry = error_counts.setdefault((code, err_type),
@@ -2464,6 +2481,7 @@ def enforce_aiperf_error_rate(artifact_dir,
         f"[aiperf-gate] non-cancellation errors: {errors}/{considered} "
         f"({error_rate:.2%}), cancelled: {cancelled}, "
         f"decode failures: {decode_failures}, "
+        f"non-request records: {non_request}, "
         f"threshold: {max_error_rate:.2%}",
         flush=True)
     if error_rate > max_error_rate:
