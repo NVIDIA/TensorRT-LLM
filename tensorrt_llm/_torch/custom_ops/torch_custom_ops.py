@@ -1232,7 +1232,7 @@ def nvfp4_gemm(
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
             Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
-            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
 
     Returns:
         Output tensor [m, n] with dtype=output_dtype

@@ -702,7 +702,6 @@ class Runner:
             "CUTLASS",
             "DEEPGEMM",
             "TRTLLM",
-            "WIDEEP",
         ]:
             raise NotImplementedError(
                 f'Not support replace routing method for moe_backend "{self.model_config.moe_backend}",'
