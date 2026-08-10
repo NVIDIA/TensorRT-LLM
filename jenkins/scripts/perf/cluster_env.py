@@ -44,15 +44,12 @@ UCX_ENV_RULES = [
         "rocep198s0:1,rocep199s0:1,rocep205s0:1,rocep206s0:1"
         " UCX_IB_GID_INDEX=auto UCX_IB_TRAFFIC_CLASS=52 UCX_IB_SL=0",
     ),
-    # oci-aga: avoid transports that fail on this VF fabric, disable DEVX to
-    # avoid UAR allocation failures, and pin the GPU-connected rail VFs.
+    # oci-aga: use the transport set and IPv4 TCP priority validated on this
+    # cluster.
     (
         "oci-aga*",
         "*",
-        "export UCX_TLS=^tcp,rc_gda,gga UCX_IB_MLX5_DEVX=n "
-        "UCX_NET_DEVICES="
-        "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1 "
-        "UCX_IB_TRAFFIC_CLASS=96 TRTLLM_NIXL_NUM_THREADS=1",
+        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
     ),
     # nsc-svg: UCX picks wrong RDMA devices; pin the usable mlx5 ports.
     (
