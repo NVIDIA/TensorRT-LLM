@@ -7214,7 +7214,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                  cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                    enable_padding=True),
                  speculative_config=mtp_config,
-                 enable_iter_perf_stats=True,
                  nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(self.MODEL_NAME)
@@ -7223,13 +7222,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            acceptance_length = _compute_acceptance_length(llm)
-            print(f"[AL] test_nvfp4_marlin_adp_4gpus mtp_nextn={mtp_nextn} "
-                  f"acceptance_length = {acceptance_length:.3f}")
-            assert_acceptance_length(
-                f"TestNemotronV3Super::test_nvfp4_marlin_adp_4gpus"
-                f"[mtp_nextn_{mtp_nextn}]",
-                acceptance_length)
 
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(4)
@@ -7328,6 +7320,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="TRTLLM"),
                 speculative_config=mtp_config if use_mtp else None,
+                enable_iter_perf_stats=True,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
@@ -7335,7 +7328,19 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
+            if (tp_size, ep_size, periodic_snapshot_interval, attention_dp, use_mtp) == (
+                4, 4, 512, True, True
+            ):
+                acceptance_length = _compute_acceptance_length(llm)
+                print(
+                    "[AL] test_nvfp4_4gpus_block_reuse "
+                    f"acceptance_length = {acceptance_length:.3f}"
+                )
+                assert_acceptance_length(
+                    "TestNemotronV3Super::test_nvfp4_4gpus_block_reuse"
+                    "[DEP4_MTP_ON]",
+                    acceptance_length,
+                )
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize(
