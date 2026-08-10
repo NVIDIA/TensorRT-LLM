@@ -315,12 +315,52 @@ def test_resolve_model_prefs_auto_propagates_model_default_failure(monkeypatch):
         def get_model_defaults(cls, _llm_args):
             raise RuntimeError("model hook failed")
 
-    monkeypatch.setattr(rp, "load_internal_apis", lambda: types.SimpleNamespace())
+    api = types.SimpleNamespace(TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs))
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
     monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (FailingModel, object()))
     cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+    side = {
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 2, "pp": 1, "cp": 1},
+    }
 
     with pytest.raises(RuntimeError, match="get_model_defaults failed.*refusing to assume V1"):
-        rp.resolve_model_prefs("/model", {"use_kv_cache_manager_v2": "auto"}, cache_cfg)
+        rp.resolve_model_prefs("/model", side, cache_cfg)
+
+
+def test_resolve_model_prefs_passes_real_parallelism_to_model_defaults(monkeypatch):
+    captured = []
+
+    class Model:
+        @classmethod
+        def get_model_defaults(cls, llm_args):
+            captured.append(llm_args)
+            return {"use_kv_cache_manager_v2": True}
+
+    api = types.SimpleNamespace(
+        TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        resolve_kv_cache_manager_v2_auto=lambda _shim, defaults: defaults[
+            "use_kv_cache_manager_v2"
+        ],
+    )
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (Model, object()))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+    side = {
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 4, "pp": 2, "cp": 3},
+    }
+
+    assert rp.resolve_model_prefs("/model", side, cache_cfg)
+    assert len(captured) == 1
+    assert vars(captured[0]) == {
+        "model": "/model",
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 2,
+        "context_parallel_size": 3,
+        "kv_cache_config": {"use_kv_cache_manager_v2": "auto"},
+        "cache_transceiver_config": cache_cfg,
+    }
 
 
 def test_resolve_model_prefs_auto_propagates_resolver_failure(monkeypatch):
@@ -332,13 +372,20 @@ def test_resolve_model_prefs_auto_propagates_resolver_failure(monkeypatch):
     def fail_resolver(_shim, _defaults):
         raise RuntimeError("resolver failed")
 
-    api = types.SimpleNamespace(resolve_kv_cache_manager_v2_auto=fail_resolver)
+    api = types.SimpleNamespace(
+        TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        resolve_kv_cache_manager_v2_auto=fail_resolver,
+    )
     monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
     monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (Model, object()))
     cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+    side = {
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 1, "pp": 1, "cp": 1},
+    }
 
     with pytest.raises(RuntimeError, match="V2 'auto' resolution failed.*refusing to assume V1"):
-        rp.resolve_model_prefs("/model", {"use_kv_cache_manager_v2": "auto"}, cache_cfg)
+        rp.resolve_model_prefs("/model", side, cache_cfg)
 
 
 def test_resolve_model_prefs_explicit_v1_does_not_require_model(monkeypatch):
@@ -347,6 +394,23 @@ def test_resolve_model_prefs_explicit_v1_does_not_require_model(monkeypatch):
     cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
 
     assert not rp.resolve_model_prefs(None, {"use_kv_cache_manager_v2": False}, cache_cfg)
+
+
+def test_resolve_model_prefs_runtime_auto_failure_is_not_silently_demoted(monkeypatch):
+    def fail_runtime_resolver(*_args):
+        raise RuntimeError("model runtime hook failed")
+
+    api = types.SimpleNamespace(resolve_transceiver_runtime_auto=fail_runtime_resolver)
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (type("Model", (), {}), None))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="auto")
+
+    with pytest.raises(RuntimeError, match="may differ from serving"):
+        rp.resolve_model_prefs(
+            "/model",
+            {"use_kv_cache_manager_v2": False},
+            cache_cfg,
+        )
 
 
 def test_model_kv_shape_vocab_size(tmp_path):
@@ -471,7 +535,8 @@ def test_disabled_precheck_does_not_require_or_export_model_root(monkeypatch):
     assert not any(line.startswith("export LLM_MODELS_ROOT=") for line in lines)
 
 
-def test_enabled_precheck_requires_model_root(monkeypatch):
+@pytest.mark.parametrize("llm_models_root", [None, ""])
+def test_enabled_precheck_requires_model_root(monkeypatch, llm_models_root):
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
 
     with pytest.raises(ValueError, match="requires LLM_MODELS_ROOT"):
@@ -481,6 +546,7 @@ def test_enabled_precheck_requires_model_root(monkeypatch):
             "$config",
             "unset UCX_TLS &&",
             max_world=8,
+            llm_models_root=llm_models_root,
         )
 
 
@@ -595,7 +661,7 @@ class TestMultiPeerOrchestration:
         ctx_dp_rank = 0
         disagg_info_endpoint = None
 
-    def _mk_runner(self, role, server_idx, plan, work_dir, monkeypatch, fail_ctx=False):
+    def _mk_runner(self, role, server_idx, plan, work_dir, monkeypatch):
         import sys
         import types
 
@@ -612,8 +678,6 @@ class TestMultiPeerOrchestration:
         calls = {"waves": 0}
 
         def ctx_run_wave(peer_idx, li, req_len, rep, wave):
-            if fail_ctx:
-                raise rp._TransferError("injected ctx failure")
             calls["waves"] += 1
             return {p: self._FakeParams() for p in wave}, {}
 
@@ -623,7 +687,7 @@ class TestMultiPeerOrchestration:
         runner._calls = calls
         return runner
 
-    def _run(self, tmp_path, monkeypatch, fail_ctx_idx=None):
+    def _run(self, tmp_path, monkeypatch, fail_peer_idx=None):
         import threading
 
         monkeypatch.setenv("SLURM_JOB_ID", "777")
@@ -646,17 +710,27 @@ class TestMultiPeerOrchestration:
         noop = lambda *a, **k: None  # noqa: E731 - signal.alarm needs main thread
 
         gen = self._mk_runner("gen", 0, plan, work, monkeypatch)
-        ctxs = [
-            self._mk_runner(
-                "ctx",
-                i,
-                plan,
-                work,
-                monkeypatch,
-                fail_ctx=(fail_ctx_idx is not None and i == fail_ctx_idx),
-            )
-            for i in range(2)
-        ]
+        ctxs = [self._mk_runner("ctx", i, plan, work, monkeypatch) for i in range(2)]
+
+        if fail_peer_idx is not None:
+            real_gen_run_peer = rp.gen_run_peer
+
+            def fail_before_transfer(runner, peer_idx, arm, disarm):
+                if peer_idx != fail_peer_idx:
+                    return real_gen_run_peer(runner, peer_idx, arm, disarm)
+                sock, key = rp._gen_open_session(runner, peer_idx, arm)
+                reason = "injected pre-transfer failure"
+                # Publish fail-fast before the peer handles our abort, so both
+                # sides deterministically classify this as the same safe,
+                # pre-dispatch failure rather than an ownership-fatal abort.
+                rp.raise_abort_flag(runner.work_dir, f"ctx_{peer_idx} TRANSFER_ERROR: {reason}")
+                try:
+                    runner._leader_send_recv(sock, ("abort", reason), key)
+                finally:
+                    sock.close(linger=0)
+                raise rp._TransferError(reason)
+
+            monkeypatch.setattr(rp, "gen_run_peer", fail_before_transfer)
 
         failures = []
 
@@ -671,12 +745,18 @@ class TestMultiPeerOrchestration:
         ]
         for t in threads:
             t.start()
-        rp._drive_ctx_peers(
-            gen, noop, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
-        )
-        for t in threads:
-            t.join(timeout=60)
-            assert not t.is_alive(), "ctx serve thread wedged"
+        try:
+            rp._drive_ctx_peers(
+                gen, noop, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
+            )
+        finally:
+            # Always join every peer, even when the driver raises. Asserting
+            # inside the loop can itself strand later peers and trip CI's
+            # pytest-threadleak hook.
+            for thread in threads:
+                thread.join(timeout=5)
+            leaked = [thread.name for thread in threads if thread.is_alive()]
+            assert not leaked, f"ctx serve threads wedged: {leaked}"
         return plan, gen, ctxs, failures
 
     def test_two_ctx_full_pass(self, tmp_path, monkeypatch):
@@ -697,22 +777,23 @@ class TestMultiPeerOrchestration:
     def test_ctx_failure_last_peer(self, tmp_path, monkeypatch):
         # The failing pair is driven LAST: the earlier healthy peer already
         # completed, so there is nothing left to fail-fast/skip.
-        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_ctx_idx=1)
+        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_peer_idx=1)
         # gen side: healthy peer unaffected, failing peer gets a clear verdict
         by_peer = {c["peer"]: c["status"] for c in gen.recorder.cases}
         assert by_peer == {"ctx_0": "PASS", "ctx_1": "TRANSFER_ERROR"}
-        # ctx_1's own serve loop surfaced the failure (its peer is gen_0)
-        assert ("gen_0", "_TransferError") in failures
+        assert not failures
         # ctx_0 served its full schedule and got the deferred done
         assert [c["status"] for c in ctxs[0].recorder.cases] == ["PASS"]
+        assert [c["status"] for c in ctxs[1].recorder.cases] == ["SKIP"]
 
     def test_fail_fast_skips_remaining(self, tmp_path, monkeypatch):
         # The FIRST-driven pair fails: the remaining pair must be skipped
         # (not tested against a fabric already known bad), and told to abort
         # so it tears down promptly instead of waiting out its handshake alarm.
-        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_ctx_idx=0)
+        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_peer_idx=0)
         by_peer = {c["peer"]: c["status"] for c in gen.recorder.cases}
         assert by_peer == {"ctx_0": "TRANSFER_ERROR", "ctx_1": "SKIP"}
+        assert not failures
         # ctx_1 never ran a single transfer wave: fail-fast reached it first.
         assert ctxs[1]._calls["waves"] == 0
         # ctx_1 recorded a non-failing SKIP (its driver aborted the session).

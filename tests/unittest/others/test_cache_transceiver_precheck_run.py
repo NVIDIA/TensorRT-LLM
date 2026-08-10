@@ -110,6 +110,25 @@ def test_request_block_views_excludes_untransferred_speculative_page(prompt_len,
     assert views == [(4, buffer, list(range(expected_blocks)))]
 
 
+@pytest.mark.parametrize("available_blocks", [0, 1])
+def test_request_block_views_rejects_prompt_under_allocation(available_blocks):
+    allocated = [-1] + list(range(available_blocks))
+    kvm = types.SimpleNamespace(
+        tokens_per_block=128,
+        pp_layers=[4],
+        get_batch_cache_indices=lambda _request_ids, layer_idx: [allocated],
+        get_buffers=lambda *_args, **_kwargs: pytest.fail(
+            "buffer lookup must not occur after under-allocation"
+        ),
+    )
+
+    with pytest.raises(
+        rp._TransferError,
+        match=rf"rid=7 layer=4: required=2 available={available_blocks}",
+    ):
+        list(rp._request_block_views(kvm, rid=7, prompt_len=256))
+
+
 # --------------------------------------------------------------------------- #
 # HMAC control-channel wire format
 # --------------------------------------------------------------------------- #
@@ -365,11 +384,12 @@ def test_resolve_model_prefs_allows_registered_class_without_defaults_hook(monke
     cache_cfg = types.SimpleNamespace(transceiver_runtime="CPP")
     calls = []
 
-    def resolve_v2(shim, defaults):
-        calls.append((shim, defaults))
+    def resolve_v2(shim, resolved_model_cls, pretrained_config):
+        calls.append((shim, resolved_model_cls, pretrained_config))
         return False
 
-    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (model_cls, object()))
+    hf_view = object()
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (model_cls, hf_view))
     monkeypatch.setattr(
         rp,
         "load_internal_apis",
@@ -382,7 +402,7 @@ def test_resolve_model_prefs_allows_registered_class_without_defaults_hook(monke
 
     assert use_v2 is False
     assert len(calls) == 1
-    assert calls[0][1] == {}
+    assert calls[0][1:] == (model_cls, hf_view)
 
 
 # --------------------------------------------------------------------------- #
@@ -1036,6 +1056,8 @@ class TestInternalApiContract:
     def test_config_constructors(self, api):
         cache_cfg = api.CacheTransceiverConfig(backend="UCX", max_tokens_in_buffer=1024)
         assert hasattr(cache_cfg, "transceiver_runtime")
+        llm_args = api.TorchLlmArgs(model="/tmp/model", tensor_parallel_size=2)
+        assert llm_args.tensor_parallel_size == 2
         api.KvCacheConfigCpp(max_tokens=64, enable_block_reuse=False)
         api.MTPDecodingConfig(num_nextn_predict_layers=1)
         api.Mapping(

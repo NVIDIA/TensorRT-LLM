@@ -58,9 +58,34 @@ _PROCESS_TIMEOUT_SECONDS = 120
 _TERMINATE_GRACE_SECONDS = 5
 
 
+def _load_driver_subset(
+    module_name: str,
+    selected_names: set[str],
+    stubs: dict[str, Any],
+) -> types.ModuleType:
+    """Execute selected driver definitions with injected runtime stand-ins."""
+    source = Path(DRIVER_SCRIPT).read_text()
+    tree = ast.parse(source, filename=DRIVER_SCRIPT)
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in selected_names
+    ]
+    module = types.ModuleType(module_name)
+    module.__dict__.update(stubs)
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), DRIVER_SCRIPT, "exec"),
+        module.__dict__,
+    )
+    missing = selected_names - set(module.__dict__)
+    assert not missing, f"{module_name}: driver definitions not loaded: {sorted(missing)}"
+    return module
+
+
 def _load_driver_ownership_helpers() -> types.ModuleType:
     """Load pure ownership helpers without importing GPU/MPI runtime modules."""
     selected_names = {
+        "_Timeout",
         "_TransferError",
         "_FatalTransferError",
         "_request_ids",
@@ -74,15 +99,9 @@ def _load_driver_ownership_helpers() -> types.ModuleType:
         "_exchange_release_decision",
         "_hard_abort_process",
     }
-    source = Path(DRIVER_SCRIPT).read_text()
-    tree = ast.parse(source, filename=DRIVER_SCRIPT)
-    selected = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in selected_names
-    ]
-    module = types.ModuleType("cache_transceiver_harness_ownership")
-    module.__dict__.update(
+    return _load_driver_subset(
+        "cache_transceiver_harness_ownership",
+        selected_names,
         {
             "Any": Any,
             "Iterable": Iterable,
@@ -97,14 +116,8 @@ def _load_driver_ownership_helpers() -> types.ModuleType:
             "os": os,
             "pickle": pickle,
             "signal": signal,
-        }
+        },
     )
-    exec(
-        compile(ast.Module(body=selected, type_ignores=[]), DRIVER_SCRIPT, "exec"), module.__dict__
-    )
-    missing = selected_names - set(module.__dict__)
-    assert not missing, f"driver ownership helpers not loaded: {sorted(missing)}"
-    return module
 
 
 OWNERSHIP = _load_driver_ownership_helpers()
@@ -128,15 +141,9 @@ def _load_driver_request_flow() -> types.ModuleType:
         "_wait_gen_complete",
         "run_one_request",
     }
-    source = Path(DRIVER_SCRIPT).read_text()
-    tree = ast.parse(source, filename=DRIVER_SCRIPT)
-    selected = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in selected_names
-    ]
-    module = types.ModuleType("cache_transceiver_harness_request_flow")
-    module.__dict__.update(
+    return _load_driver_subset(
+        "cache_transceiver_harness_request_flow",
+        selected_names,
         {
             "Any": Any,
             "Iterable": Iterable,
@@ -156,15 +163,8 @@ def _load_driver_request_flow() -> types.ModuleType:
             "tensorrt_llm": types.SimpleNamespace(logger=MagicMock()),
             "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(synchronize=MagicMock())),
             "verify_request": MagicMock(),
-        }
+        },
     )
-    exec(
-        compile(ast.Module(body=selected, type_ignores=[]), DRIVER_SCRIPT, "exec"),
-        module.__dict__,
-    )
-    missing = selected_names - set(module.__dict__)
-    assert not missing, f"driver request flow not loaded: {sorted(missing)}"
-    return module
 
 
 REQUEST_FLOW = _load_driver_request_flow()
@@ -619,6 +619,25 @@ class TestTransferOwnershipHelpers:
 
         assert not safe
         assert "invalid" in reason
+
+    def test_context_release_handshake_sends_invalid_peer_verdict(self):
+        socket = _FakeDecisionSocket(("UNKNOWN", ""))
+
+        safe, reason = OWNERSHIP._exchange_release_decision(
+            "ctx", _FakeDecisionComm(), True, socket, True
+        )
+
+        expected = "invalid gen peer release status: 'UNKNOWN'"
+        assert not safe
+        assert reason == expected
+        assert socket.sent == [("FATAL", expected)]
+
+    def test_release_handshake_preserves_timeout(self):
+        socket = _FakeDecisionSocket()
+        socket.recv = MagicMock(side_effect=OWNERSHIP._Timeout("release deadline expired"))
+
+        with pytest.raises(OWNERSHIP._Timeout, match="release deadline expired"):
+            OWNERSHIP._exchange_release_decision("gen", _FakeDecisionComm(), True, socket, True)
 
     def test_hard_abort_falls_back_to_sigkill(self, monkeypatch):
         comm = _FakeDecisionComm()

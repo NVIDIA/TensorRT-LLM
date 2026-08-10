@@ -27,6 +27,8 @@ block, so config parity is by construction rather than by copying values.
 import json
 import os
 import shlex
+from collections.abc import Mapping
+from typing import Any
 
 # Optional per-yaml overrides live under a `cache_transceiver_precheck:` block.
 PRECHECK_DEFAULTS = {
@@ -157,21 +159,35 @@ def precheck_enabled(cfg):
 
 
 def precheck_prefix_lines(
-    cfg,
-    benchmark_mode,
-    config_path_expr,
-    ucx_tls_cmd,
-    max_world,
-    llm_models_root=None,
-    stage_name="",
-):
+    cfg: Mapping[str, Any],
+    benchmark_mode: str,
+    config_path_expr: str,
+    ucx_tls_cmd: str,
+    max_world: int,
+    stage_name: str = "",
+    llm_models_root: str | None = None,
+) -> list[str]:
     """Launch-script export lines wiring the precheck gate.
 
     Single owner of the enable/kill-switch policy, the step-timeout default,
     and the export names the gate consumes — shared by
     jenkins/scripts/perf/submit.py and jenkins/scripts/perf/local/submit.py.
-    `config_path_expr` and the env-var references are launch-script-side
-    expressions ($llmSrcNode etc.), expanded at sbatch runtime.
+
+    Args:
+        cfg: Parsed perf-sanity YAML configuration.
+        benchmark_mode: Precheck benchmark mode passed to the driver.
+        config_path_expr: Launch-script expression resolving the YAML path,
+            expanded at sbatch runtime along with its environment references.
+        ucx_tls_cmd: Shell prefix selecting the UCX transports.
+        max_world: Largest role world size, used to derive the step timeout.
+        stage_name: Optional stage name for the synthetic JUnit report.
+        llm_models_root: Model-root path exported when the precheck is enabled.
+
+    Returns:
+        Generated launch-script export lines shared by both submit modules.
+
+    Raises:
+        ValueError: If the precheck is enabled without a nonempty model root.
     """
     knobs = cfg.get("cache_transceiver_precheck", {}) or {}
     enabled = precheck_enabled(cfg)
@@ -194,7 +210,7 @@ def precheck_prefix_lines(
         f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS {cmd} --role gen"',
     ]
     if enabled:
-        if llm_models_root is None:
+        if not llm_models_root:
             raise ValueError("enabled cache-transceiver precheck requires LLM_MODELS_ROOT")
         # Keep this as a top-level assignment. shlex.quote() is not safe when
         # nested inside the double-quoted pytestCommand exports below.

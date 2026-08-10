@@ -433,11 +433,15 @@ def _exchange_release_decision(
         try:
             if role == "gen":
                 zmq_sock.send(pickle.dumps((local_status, role_reason)))
-                peer_status, peer_reason = pickle.loads(zmq_sock.recv())
+            peer_status, peer_reason = pickle.loads(zmq_sock.recv())
+            peer_role = "ctx" if role == "gen" else "gen"
+            if peer_status not in ("COMPLETE", "FATAL"):
+                combined_safe = False
+                combined_reason = f"invalid {peer_role} peer release status: {peer_status!r}"
+            elif role == "gen":
                 combined_safe = role_safe and peer_status == "COMPLETE"
                 combined_reason = "" if combined_safe else str(peer_reason or role_reason)
             else:
-                peer_status, peer_reason = pickle.loads(zmq_sock.recv())
                 combined_safe = role_safe and peer_status == "COMPLETE"
                 combined_reason = (
                     ""
@@ -446,12 +450,10 @@ def _exchange_release_decision(
                     if not role_safe
                     else str(peer_reason or "gen did not prove transfer completion")
                 )
+            if role != "gen":
                 zmq_sock.send(
                     pickle.dumps(("COMPLETE" if combined_safe else "FATAL", combined_reason))
                 )
-            if peer_status not in ("COMPLETE", "FATAL"):
-                combined_safe = False
-                combined_reason = f"invalid {role} peer release status: {peer_status!r}"
         except _Timeout:
             raise
         except Exception as e:  # noqa: BLE001 - converted to process-fatal ownership outcome

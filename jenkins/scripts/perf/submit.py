@@ -649,6 +649,10 @@ def get_test_output_dir(script_prefix_lines, test_case_name):
     return os.path.join(output_dir, test_case_name) if test_case_name else output_dir
 
 
+class _PytestCommandEnvMissing(ValueError):
+    """A valid pytestCommand does not provide the requested leading variable."""
+
+
 def extract_pytest_command_env(script_prefix_lines, name):
     """Read a leading environment assignment from the exported pytest command."""
     line = next((ln for ln in script_prefix_lines if "export pytestCommand=" in ln), None)
@@ -674,7 +678,26 @@ def extract_pytest_command_env(script_prefix_lines, name):
         key, value = token.split("=", 1)
         if key == name:
             return value
-    raise ValueError(f"pytestCommand does not set leading environment variable {name}")
+    raise _PytestCommandEnvMissing(
+        f"pytestCommand does not set leading environment variable {name}"
+    )
+
+
+def _resolve_llm_models_root(script_prefix_lines):
+    """Resolve the precheck model root from pytestCommand or the submitter env."""
+    try:
+        return extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+    except _PytestCommandEnvMissing as e:
+        fallback = os.environ.get("LLM_MODELS_ROOT")
+        if fallback:
+            return fallback
+        # Fail closed when the precheck is enabled: without the model root it
+        # cannot reproduce serving's KV shape and model-specific defaults, so
+        # disabling the gate here would silently run an unvalidated workload.
+        raise ValueError(
+            f"{e}; LLM_MODELS_ROOT is also absent from the submitter environment "
+            "(pytestCommand is assembled by getPytestBaseCommandLine in L0_Test.groovy)"
+        ) from e
 
 
 def remove_whitespace_lines(lines):
@@ -882,9 +905,7 @@ def main():
         pcfg = _import_precheck_config(args.llm_src)
         precheck_enabled = pcfg.precheck_enabled(config)
         llm_models_root = (
-            extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
-            if precheck_enabled
-            else None
+            _resolve_llm_models_root(script_prefix_lines) if precheck_enabled else None
         )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
@@ -896,8 +917,8 @@ def main():
                     hardware_config["gpus_per_ctx_server"],
                     hardware_config["gpus_per_gen_server"],
                 ),
-                llm_models_root=llm_models_root,
                 stage_name=args.stage_name,
+                llm_models_root=llm_models_root,
             )
         )
         srun_args_lines.extend(

@@ -251,20 +251,35 @@ def test_context_transfer_status_block_all_uses_blocking_wait() -> None:
     assert 12 not in transceiver._send_reqs
 
 
-def test_context_transfer_status_timeout_retains_session_and_request() -> None:
+def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch) -> None:
     session = _FakeSession(rid=16, wait_result=WaitResult.TIMEOUT)
     req = _FakeRequest()
     transceiver = _make_transceiver({16: session}, {16: req})
+    transceiver.kv_transfer_timeout_ms = None
+    warning = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.logger.warning",
+        warning,
+    )
 
     completed, failed = transceiver.check_context_transfer_status(None)
 
+    completed_again, failed_again = transceiver.check_context_transfer_status(None)
+
     assert completed == []
     assert failed == []
-    assert session.blocking_calls == [True]
+    assert completed_again == []
+    assert failed_again == []
+    assert session.blocking_calls == [True, True]
     assert not session.closed
     assert session.aux_slot == 0
     assert transceiver._send_sessions == {16: session}
     assert transceiver._send_reqs == {16: req}
+    assert warning.call_count == 2
+    messages = [args[0] for args, _kwargs in warning.call_args_list]
+    assert all("rid=16" in message for message in messages)
+    assert all("finite block-all fallback" in message for message in messages)
+    assert all("keeping it in progress" in message for message in messages)
 
 
 def test_context_transfer_status_zero_budget_processes_task_level_failure() -> None:
@@ -468,6 +483,30 @@ def test_tx_session_blocking_wait_times_out_stalled_task_and_does_not_reset_dead
     assert task.wait_calls == pytest.approx([0.25, 0.25, 0.1])
     assert not session._closed
     assert not session.has_failed()
+
+    wait_call_count = len(task.wait_calls)
+    assert session.wait_complete(blocking=True) == WaitResult.TIMEOUT
+    assert len(task.wait_calls) == wait_call_count
+
+
+def test_tx_session_blocking_wait_uses_finite_overall_fallback_when_unset(
+    monkeypatch,
+) -> None:
+    clock = _FakeClock()
+    task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=False, on_wait=clock.advance)
+    session = _make_tx_session([task], timeout_s=0.25)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.native.transfer._FALLBACK_TX_OVERALL_TIMEOUT_S",
+        0.6,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.native.transfer.time.monotonic",
+        clock.monotonic,
+    )
+
+    assert session.wait_complete(blocking=True) == WaitResult.TIMEOUT
+    assert task.wait_calls == pytest.approx([0.25, 0.25, 0.1])
+    assert session._deadline_monotonic_s == pytest.approx(0.6)
 
     wait_call_count = len(task.wait_calls)
     assert session.wait_complete(blocking=True) == WaitResult.TIMEOUT

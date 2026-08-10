@@ -242,6 +242,7 @@ def load_internal_apis():
         CacheTransceiverConfig,
         KvCacheConfig,
         MTPDecodingConfig,
+        TorchLlmArgs,
     )
     from tensorrt_llm.llmapi.llm_utils import (
         _resolve_kv_cache_manager_v2_auto,
@@ -270,6 +271,7 @@ def load_internal_apis():
         CacheTransceiverConfig=CacheTransceiverConfig,
         KvCacheConfig=KvCacheConfig,
         MTPDecodingConfig=MTPDecodingConfig,
+        TorchLlmArgs=TorchLlmArgs,
         resolve_kv_cache_manager_v2_auto=_resolve_kv_cache_manager_v2_auto,
         resolve_transceiver_runtime_auto=_resolve_transceiver_runtime_auto,
         Mapping=Mapping,
@@ -308,7 +310,13 @@ def _request_block_views(kvm, rid, prompt_len):
         # block boundary those tokens allocate an additional page, but the
         # transceiver intentionally trims its slice to prompt_len blocks.
         # Verify the same payload range instead of the untransferred page.
-        valid = [b for b in blocks if b >= 0][:num_prompt_blocks]
+        valid = [b for b in blocks if b >= 0]
+        if len(valid) < num_prompt_blocks:
+            raise _TransferError(
+                f"KV under-allocation for rid={rid} layer={global_layer}: "
+                f"required={num_prompt_blocks} available={len(valid)}"
+            )
+        valid = valid[:num_prompt_blocks]
         if not valid:
             continue
         buf = kvm.get_buffers(global_layer, kv_layout="HND")
@@ -379,12 +387,11 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             shim = types.SimpleNamespace(cache_transceiver_config=cache_cfg)
             api.resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
-        except Exception as e:  # noqa: BLE001 - fall back to the create() default (CPP)
-            print(
-                f"[precheck] WARNING: transceiver_runtime 'auto' resolution failed "
-                f"({e!r}); create_kv_cache_transceiver will fall back to CPP",
-                flush=True,
-            )
+        except Exception as e:  # noqa: BLE001 - resolver spans model extension hooks
+            raise RuntimeError(
+                "transceiver_runtime 'auto' resolution failed; refusing to validate "
+                "a runtime that may differ from serving"
+            ) from e
 
     if setting == "auto":
         try:
@@ -1009,15 +1016,10 @@ class PrecheckRunner:
 
     def ctx_finish_wave(self, reqs):
         """Wait for all in-flight sends of this wave, then free."""
-        try:
-            import tensorrt_llm
+        import tensorrt_llm
 
-            t0 = time.monotonic()
-            local_err = None
-        except _Timeout:
-            raise
-        except Exception as e:  # noqa: BLE001 - sends are already in flight
-            raise _FatalTransferError(f"ctx transfer ownership proof could not start: {e!r}") from e
+        t0 = time.monotonic()
+        local_err = None
         try:
             completed, failed = self.xcvr.check_context_transfer_status(None)  # block-all
             completed_rids = set(completed)
@@ -1068,17 +1070,12 @@ class PrecheckRunner:
         Warmup reps skip the (CPU-heavy) byte verification: their result is
         discarded by the caller either way, transfer errors still raise.
         """
-        try:
-            import torch
+        import torch
 
-            import tensorrt_llm
+        import tensorrt_llm
 
-            owned = self._owned(wave)
-            reqs, local_err = {}, None
-        except _Timeout:
-            raise
-        except Exception as e:  # noqa: BLE001 - ctx sends are already in flight
-            raise _FatalTransferError(f"gen receive ownership proof could not start: {e!r}") from e
+        owned = self._owned(wave)
+        reqs, local_err = {}, None
         try:
             for pair in owned:
                 rid = self._pair_rid(peer_idx, li, rep, pair)
@@ -1108,14 +1105,9 @@ class PrecheckRunner:
             # after partially dispatching local work. Quiescence is unknown.
             raise _FatalTransferError(f"gen receive setup failed: {reason}")
 
-        try:
-            mismatch = ""
-            t0 = time.monotonic()
-            transfer_error = None
-        except _Timeout:
-            raise
-        except Exception as e:  # noqa: BLE001 - transfer quiescence is unknown
-            raise _FatalTransferError(f"gen transfer ownership proof could not start: {e!r}") from e
+        mismatch = ""
+        t0 = time.monotonic()
+        transfer_error = None
         try:
             if self.runtime == "PYTHON":
                 completed, failed, cancelled = self.xcvr.check_gen_transfer_status(None)

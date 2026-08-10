@@ -86,6 +86,11 @@ KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
 _FALLBACK_TX_WAIT_SLICE_S = 1.0
+# ``kv_transfer_timeout_ms=None`` disables request cancellation, but block-all
+# callers still need a finite ownership-proof deadline instead of waiting
+# forever on a wedged peer. Non-blocking serving polls do not consult this
+# deadline, so the fallback is intentionally local to TxSession.
+_FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
 @dataclass
@@ -1294,8 +1299,11 @@ class TxSession(TxSessionBase):
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
-            if not self.kv_tasks and self._overall_timeout_s is not None:
-                self._deadline_monotonic_s = time.monotonic() + self._overall_timeout_s
+            if not self.kv_tasks:
+                overall_timeout_s = self._overall_timeout_s
+                if overall_timeout_s is None or overall_timeout_s <= 0:
+                    overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -1401,6 +1409,17 @@ class TxSession(TxSessionBase):
                 if self.aux_task.status != TaskStatus.TRANSFERRED:
                     return None
             return WaitResult.COMPLETED
+
+        # send() normally anchors this once, at the first dispatched KV task.
+        # Keep direct/internal TxSession construction bounded as well, and never
+        # reset the deadline on a later block-all call.
+        if self._deadline_monotonic_s is None:
+            overall_timeout_s = self._overall_timeout_s
+            if overall_timeout_s is None or overall_timeout_s <= 0:
+                overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+            with self.lock:
+                if self._deadline_monotonic_s is None:
+                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
 
         # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
         # deadline is shared by every KV task and aux; it is never reset by a

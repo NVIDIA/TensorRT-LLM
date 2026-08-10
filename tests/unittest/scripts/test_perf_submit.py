@@ -304,3 +304,32 @@ def test_extract_pytest_command_env_rejects_malformed_export(ci_submit_module: M
 
     with pytest.raises(ValueError, match="cannot parse exported pytestCommand"):
         ci_submit_module.extract_pytest_command_env(lines, "LLM_MODELS_ROOT")
+
+
+def test_resolve_llm_models_root_falls_back_to_submitter_env(
+    ci_submit_module: ModuleType, monkeypatch
+):
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models/from-env")
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest LLM_MODELS_ROOT=/too-late"']
+
+    assert ci_submit_module._resolve_llm_models_root(lines) == "/models/from-env"
+
+
+def test_resolve_llm_models_root_explains_both_missing_sources(
+    ci_submit_module: ModuleType, monkeypatch
+):
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest"']
+
+    with pytest.raises(ValueError, match="getPytestBaseCommandLine in L0_Test.groovy"):
+        ci_submit_module._resolve_llm_models_root(lines)
+
+
+def test_resolve_llm_models_root_does_not_mask_malformed_command(
+    ci_submit_module: ModuleType, monkeypatch
+):
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models/from-env")
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest']
+
+    with pytest.raises(ValueError, match="cannot parse exported pytestCommand"):
+        ci_submit_module._resolve_llm_models_root(lines)
