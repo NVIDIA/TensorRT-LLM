@@ -32,6 +32,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
     LifeCycleId,
     SsmLifeCycle,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2._stats import KVCacheIterationStatsDelta
 
 ATTN_LC = LifeCycleId(0)
 SSM_LC = LifeCycleId(1)
@@ -93,6 +94,32 @@ def test_host_drop_is_recorded_for_every_life_cycle(life_cycle: LifeCycleId) -> 
     assert set(by_life_cycle) == {life_cycle}
     assert by_life_cycle[life_cycle].iter_host_dropped_blocks == 1
     assert by_life_cycle[life_cycle].iter_host_dropped_bytes == PAGE_BYTES
+
+
+@pytest.mark.parametrize("life_cycle", [ATTN_LC, SSM_LC])
+def test_direct_iteration_stats_are_recorded_for_every_life_cycle(
+    life_cycle: LifeCycleId,
+) -> None:
+    """SSM deferred copies must reach iteration stats.
+
+    The resume() deferred copy reports iter_intra_device_copy_* through this
+    recorder for SSM life cycles too, matching the C++ backend.
+    """
+    recorder, committed = _make_recorder()
+
+    recorder._record_direct_iteration_stats(
+        life_cycle,
+        KVCacheIterationStatsDelta(
+            iter_intra_device_copy_blocks=1,
+            iter_intra_device_copy_bytes=PAGE_BYTES,
+        ),
+    )
+
+    assert len(committed) == 1
+    _, by_life_cycle = committed[0]
+    assert set(by_life_cycle) == {life_cycle}
+    assert by_life_cycle[life_cycle].iter_intra_device_copy_blocks == 1
+    assert by_life_cycle[life_cycle].iter_intra_device_copy_bytes == PAGE_BYTES
 
 
 def test_onboard_counts_globally_only_for_attention() -> None:

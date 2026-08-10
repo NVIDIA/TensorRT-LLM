@@ -1293,6 +1293,9 @@ class _KVCache:
                         )
                         if changed:
                             self.manager.mark_stats_dirty(self.id)
+                # Block-reuse accounting above is attention-only, but the copy
+                # itself is reported for every life cycle, SSM included —
+                # matching the C++ backend's deferred-copy loop (kvCache.cpp).
                 self._record_direct_iteration_stats(
                     lc_idx,
                     KVCacheIterationStatsDelta(
