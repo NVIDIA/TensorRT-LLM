@@ -180,14 +180,12 @@ def run_msa_paged_gqa(
             minimax_m3_sparse_attn_decode,
         )
 
-        # The Triton kernel dequantizes the FP8 cache into q's dtype, so q stays
-        # wide here. An already-E4M3 q from the fused producer widens exactly,
-        # leaving the same values the fmha_sm100 path would have used.
-        gen_q = q_view[gen_tok0:]
-        if gen_q.dtype != out_view.dtype:
-            gen_q = gen_q.to(out_view.dtype)
+        # The Triton kernel widens an E4M3 q from the fused producer in-register
+        # and runs the QK/PV math at out_view.dtype, so no widened copy is
+        # materialized here. E4M3 widens exactly, leaving the same values the
+        # fmha_sm100 path would have used.
         minimax_m3_sparse_attn_decode(
-            gen_q,
+            q_view[gen_tok0:],
             k_paged,
             v_paged,
             # [total_q, num_kv_heads, topk] -> head-major, contiguous when the
