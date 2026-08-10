@@ -73,16 +73,8 @@ class BaseCheckpointLoader(ABC):
     @contextmanager
     def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
                             **kwargs) -> Iterator[dict[str, Any]]:
-        """Open a synchronous weight-load session by default.
-
-        Specialized loaders may keep source-specific work alive while the
-        returned weights are materialized. Calling ``self.load_weights`` is
-        intentional so subclasses retain their polymorphic behavior.
-        """
+        """Keep loader-specific work alive while weights are materialized."""
         yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
-
-    def coordinate_checkpoint_io_request(self, mapping: Mapping) -> None:
-        """Validate a distributed I/O request before format-specific work."""
 
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""

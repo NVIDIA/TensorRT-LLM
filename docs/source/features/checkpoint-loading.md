@@ -95,72 +95,51 @@ service deployment, and configuration details, see
 
 ## Checkpoint I/O Policies
 
-The checkpoint format and checkpoint I/O policy are separate choices. The
-format selects how weights are represented and mapped, while
-`checkpoint_io_policy` selects how supported checkpoint bytes move from
-storage into the host page cache:
+Checkpoint format describes how weights are represented and mapped. The
+experimental `checkpoint_io_policy` independently controls how file-backed
+checkpoint bytes reach host memory:
 
-| Policy | Behavior |
-|---|---|
-| `native` (default) | Preserves the existing loader. For eligible HF SafeTensors checkpoints, its current page-cache prefetch completes before native tensor materialization begins. |
-| `rank_striped_read_ahead` | Divides bounded SafeTensors file extents among node-local ranks and reads them concurrently in the background while SafeTensors mapping and the model's native `load_weights`/H2D path proceed. Post-load hooks run after read-ahead is joined. |
-
-Rank-striped read-ahead is currently a prototype for the PyTorch backend with
-`checkpoint_format: HF` and `load_format: auto`. It applies only to regular HF
-SafeTensors checkpoints. Checkpoints that require model-specific lazy loading,
-partial-checkpoint runs, the raw HF weight cache, `.bin` or `.pth` files,
-custom checkpoint loaders, MX, and GMS continue through their native paths.
-Distributed activation requires an active MPI model-load communicator; Ray or
-Torch-distributed execution without that communicator falls back to native I/O.
-The default budget permits at most 16 readers per rank and 64 per active
-model-load group on each node. Multiple independent loader groups colocated on
-one physical node each enforce their own budget. Within a group with more ranks
-than reader slots, a deterministic active-rank subset owns all extents;
-inactive ranks still run native materialization, and no checkpoint extent is
-omitted.
-
-The optimization is best effort. Before model mutation, an eligibility,
-memory-admission, planning, or reader-start failure cleans up its resources and
-falls back coherently to native demand-paged mapping without launching a second
-full-file prefetch. If an advisory background read fails after materialization
-has started, TensorRT LLM cancels and joins the readers but does not reload a
-partially mutated model; successful native materialization remains
-authoritative. Mapping, transformation, H2D, and other model-load failures are
-not retried on the same model instance. Cancellation is observed between
-bounded reads; a filesystem syscall blocked inside the kernel can therefore
-delay reader shutdown. Cleanup does not evict pages already admitted to the
-Linux page cache; those pages remain normally reclaimable by the operating
-system.
-
-Startup logs distinguish four states so a configured experiment is not mistaken
-for an activated optimization:
-
-- `requested`: the configured policy.
-- `selected`: the policy chosen after preflight checks.
-- `activated`: whether background rank-striped reads actually started.
-- `effective`: the path that successfully contributed to the completed load.
-
-Configure the requested policy through `checkpoint_io_policy`; the other three
-states are runtime diagnostics reported in startup logs. For example:
+- `native` (default) preserves the existing checkpoint loader and its
+  synchronous SafeTensors prefetch.
+- `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
+  Node-local ranks issue disjoint background `pread` requests into the Linux
+  page cache while the existing mapping, transformation, and H2D path runs.
+  Once every rank finishes materialization, unfinished advisory reads are
+  cancelled. Shutdown can still wait for at most one in-flight 8 MiB
+  synchronous read per worker; degraded storage can therefore delay the join.
 
 ```yaml
-backend: pytorch
 checkpoint_format: HF
 load_format: auto
 checkpoint_io_policy: rank_striped_read_ahead
 ```
 
-```python
-from tensorrt_llm import LLM
+The optimized path currently requires identical policy configuration across
+all ranks, the automatically constructed HF loader (`checkpoint_loader` must
+be unset), SafeTensors, and an active MPI model-load communicator for
+distributed jobs. Lazy Kimi
+loading, raw-weight caching, partial-model loading, and `.bin`/`.pth` select
+native materialization before model mutation. MX and custom or explicitly
+provided loaders are unsupported configurations and are rejected during
+argument validation. With a valid node communicator, fallback preserves native
+prefetch collectives on that load group; if communicator setup failed, it
+safely skips prefetch.
+Memory admission reserves cgroup-aware startup headroom. Reader setup failures
+also clean up and fall back before mapping; mapping, transformation, or H2D
+failure after activation never retries a partially mutated model. A later
+advisory read failure keeps successfully materialized weights.
 
-llm = LLM(
-    model="/models/llama",
-    backend="pytorch",
-    checkpoint_format="HF",
-    load_format="auto",
-    checkpoint_io_policy="rank_striped_read_ahead",
-)
-```
+Read-ahead is intentionally not TP/PP/CP/EP-selective: each active load group
+may warm one logical checkpoint copy per node, although the work stops when
+materialization completes. The 64-reader budget is per active load group per
+node, not a host-wide arbitration mechanism across colocated independent
+TRT-LLM instances. Rank-striped logs distinguish requested, selected,
+activated, and effective policy; activation logs also report the local reader
+assignment.
+
+This policy remains separate from future ModelStreamer, MX, GMS, or snapshot
+integration. Those systems may change the source or bypass raw loading without
+requiring a new combined checkpoint format.
 
 ## Using Checkpoint Loaders
 

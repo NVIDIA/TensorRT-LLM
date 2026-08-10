@@ -329,22 +329,31 @@ def _construct_checkpoint_loader(
     mx_config: Optional[ModelExpressConfig] = None,
     mx_model_name: Optional[str] = None,
     checkpoint_io_policy: str = "native",
+    partial_model_loading: bool = False,
 ) -> Optional[BaseCheckpointLoader]:
     if backend == "_autodeploy":
         return None
 
     from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
         BaseCheckpointLoader
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+        HfWeightLoader
     from tensorrt_llm._torch.models.modeling_utils import (
         get_checkpoint_weight_loader, get_config_loader)
 
     if checkpoint_loader is None:
         checkpoint_weight_loader_cls = get_checkpoint_weight_loader(
             checkpoint_format)
-        if checkpoint_format == "HF":
+        if (checkpoint_format == "HF"
+                and checkpoint_weight_loader_cls is HfWeightLoader):
             checkpoint_weight_loader = checkpoint_weight_loader_cls(
-                checkpoint_io_policy=checkpoint_io_policy)
+                checkpoint_io_policy=checkpoint_io_policy,
+                partial_model_loading=partial_model_loading,
+            )
         else:
+            if (checkpoint_format == "HF" and checkpoint_io_policy != "native"):
+                raise ValueError("rank-striped checkpoint I/O requires the "
+                                 "built-in HfWeightLoader")
             checkpoint_weight_loader = checkpoint_weight_loader_cls()
         config_loader = get_config_loader(checkpoint_format)()
 
@@ -370,9 +379,8 @@ def _construct_checkpoint_loader(
 
 def _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir: str,
                                     **kwargs):
-    """Open a checkpoint session without requiring it from duck loaders."""
-    open_session = getattr(type(checkpoint_loader), "open_weight_session", None)
-    if open_session is None:
+    """Preserve duck-typed loaders that predate the session interface."""
+    if getattr(type(checkpoint_loader), "open_weight_session", None) is None:
         return nullcontext(
             checkpoint_loader.load_weights(checkpoint_dir, **kwargs))
     return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
@@ -383,28 +391,23 @@ def _timed_checkpoint_weight_session(
     checkpoint_loader: Any,
     checkpoint_dir: str,
     metrics: dict[str, float],
+    checkpoint_preparation_metric_name: str,
     **kwargs: Any,
 ) -> Iterator[dict[str, Any]]:
     """Time synchronous session setup and teardown around materialization."""
     session = _open_checkpoint_weight_session(checkpoint_loader,
                                               checkpoint_dir, **kwargs)
-    with timing_metric(
-            ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
-            metrics):
+    with timing_metric(checkpoint_preparation_metric_name, metrics):
         weights = session.__enter__()
     try:
         yield weights
     except BaseException:
-        with timing_metric(
-                ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
-                metrics):
+        with timing_metric(checkpoint_preparation_metric_name, metrics):
             suppress = session.__exit__(*sys.exc_info())
         if not suppress:
             raise
     else:
-        with timing_metric(
-                ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
-                metrics):
+        with timing_metric(checkpoint_preparation_metric_name, metrics):
             session.__exit__(None, None, None)
 
 
@@ -823,11 +826,6 @@ class ModelLoader:
             # real GMS tensors are bound.
             gms_post_load_handled = False
             if load_format == LoadFormat.AUTO:
-                coordinate_checkpoint_io = getattr(
-                    checkpoint_loader, "coordinate_checkpoint_io_request", None)
-                if coordinate_checkpoint_io is not None:
-                    coordinate_checkpoint_io(self.mapping)
-
                 # Pass model= so format-specific loaders (e.g. MX) can
                 # write weights directly into parameter buffers via P2P.
                 # Generic loaders ignore model=; loaders that can consume a
@@ -851,27 +849,13 @@ class ModelLoader:
 
                 weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
-                with _timed_checkpoint_weight_session(
-                        checkpoint_loader, weights_checkpoint_dir,
-                        self._metrics, **load_weights_kwargs) as weights:
-                    # When MX P2P succeeds, weights are already in model
-                    # params. A non-empty dict contains tensors that should be
-                    # merged through the standard materialization path.
-                    weights_preloaded = checkpoint_loader.is_weights_preloaded()
-                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                        model, config)
-
-                    if weights:
-                        with timing_metric(
-                                ModelLoaderMetricNames.
-                                WEIGHT_POPULATION_SECONDS.value, self._metrics):
-                            self._call_load_weights(model.load_weights, weights,
-                                                    self.weight_mapper)
-                            if torch.cuda.is_available():  # CPU guard
-                                torch.cuda.synchronize()
+                weights_preloaded = self._materialize_checkpoint_weights(
+                    checkpoint_loader, weights_checkpoint_dir, model, config,
+                    load_weights_kwargs)
 
                 if loads_draft_weights:
-                    self._load_separate_draft_weights(model, checkpoint_loader)
+                    self._materialize_draft_checkpoint_weights(
+                        checkpoint_loader, model)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
@@ -1718,6 +1702,53 @@ class ModelLoader:
                     f"max_draft_len. Extra MTP layer instances will share "
                     f"checkpoint weights via mod-indexing.")
         return config
+
+    def _materialize_checkpoint_weights(self, checkpoint_loader,
+                                        checkpoint_dir: str, model, config,
+                                        load_weights_kwargs: dict) -> bool:
+        """Keep loader-specific work alive through weight materialization."""
+        with _timed_checkpoint_weight_session(
+                checkpoint_loader, checkpoint_dir, self._metrics,
+                ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
+                **load_weights_kwargs) as weights:
+            weights_preloaded = checkpoint_loader.is_weights_preloaded()
+            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                model, config)
+            if weights:
+                with timing_metric(
+                        ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                        self._metrics):
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
+                    if torch.cuda.is_available():  # CPU guard
+                        torch.cuda.synchronize()
+        return weights_preloaded
+
+    def _materialize_draft_checkpoint_weights(self, checkpoint_loader,
+                                              model) -> None:
+        """Keep loader-specific work alive through draft materialization."""
+        with _timed_checkpoint_weight_session(
+                checkpoint_loader, self.spec_config.speculative_model,
+                self._metrics, ModelLoaderMetricNames.
+                DRAFT_CHECKPOINT_PREPARATION_SECONDS.value,
+                mapping=self.mapping) as weights:
+            if model.draft_config is not None:
+                draft_model_arch = model.draft_config.pretrained_config.architectures[
+                    0]
+                draft_weight_mapper = AutoCheckpointMapper.get(
+                    checkpoint_loader.checkpoint_format, draft_model_arch)
+                draft_weight_mapper.init_model_and_config(
+                    model.draft_model, model.draft_config)
+            else:
+                # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+                draft_weight_mapper = self.weight_mapper
+            with timing_metric(
+                    ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.value,
+                    self._metrics):
+                self._call_load_weights(model.load_draft_weights, weights,
+                                        draft_weight_mapper)
+                if torch.cuda.is_available():  # CPU guard
+                    torch.cuda.synchronize()
 
     def _call_load_weights(self,
                            load_method: Callable,

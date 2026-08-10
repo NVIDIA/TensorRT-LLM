@@ -60,30 +60,22 @@ class HfCheckpointLoader(BaseCheckpointLoader):
     @contextmanager
     def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
                             **kwargs) -> Iterator[dict[str, Any]]:
-        """Keep native HF read-ahead alive during materialization.
-
-        MX and Mistral subclass this loader and override ``load_weights``.
-        Delegate those and custom weight loaders through the polymorphic base
-        session instead of bypassing their format-specific behavior.
-        """
-        if (type(self) is not HfCheckpointLoader
-                or type(self.weight_loader) is not HfWeightLoader):
-            with super().open_weight_session(checkpoint_dir,
-                                             mapping=mapping,
-                                             **kwargs) as weights:
+        """Delegate the optimized session only for the built-in HF path."""
+        if (type(self) is HfCheckpointLoader
+                and type(self.weight_loader) is HfWeightLoader
+                and self.weight_loader.checkpoint_io_policy != "native"):
+            with self.weight_loader.open_weight_session(checkpoint_dir,
+                                                        mapping=mapping,
+                                                        **kwargs) as weights:
                 yield weights
             return
 
-        with self.weight_loader.open_weight_session(checkpoint_dir,
-                                                    mapping=mapping,
-                                                    **kwargs) as weights:
+        # MX, Mistral, and custom subclasses retain their polymorphic
+        # load_weights implementations.
+        with super().open_weight_session(checkpoint_dir,
+                                         mapping=mapping,
+                                         **kwargs) as weights:
             yield weights
-
-    def coordinate_checkpoint_io_request(self, mapping: Mapping) -> None:
-        """Reject rank-divergent native-HF I/O policy requests."""
-        if (type(self) is HfCheckpointLoader
-                and type(self.weight_loader) is HfWeightLoader):
-            self.weight_loader.coordinate_checkpoint_io_request(mapping)
 
     def get_default_config_loader(self) -> HfConfigLoader:
         return HfConfigLoader()

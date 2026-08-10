@@ -25,6 +25,8 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+    HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -90,24 +92,12 @@ def test_generation_config_auto_rejects_autodeploy() -> None:
 
 
 @pytest.mark.cpu_only
-def test_checkpoint_io_policy_defaults_to_native() -> None:
-    args = TorchLlmArgs(model=llama_model_path)
-
-    assert args.checkpoint_io_policy == "native"
-    assert args.checkpoint_format == "HF"
-
-
-@pytest.mark.cpu_only
-def test_rank_striped_checkpoint_io_policy_accepts_hf_safetensors_path(
-) -> None:
-    args = TorchLlmArgs(
-        model=llama_model_path,
-        checkpoint_format="HF",
-        load_format="auto",
-        checkpoint_io_policy="rank_striped_read_ahead",
-    )
-
+def test_checkpoint_io_policy_defaults_and_accepts_rank_striped() -> None:
+    assert TorchLlmArgs(model=llama_model_path).checkpoint_io_policy == "native"
+    args = TorchLlmArgs(model=llama_model_path,
+                        checkpoint_io_policy="rank_striped_read_ahead")
     assert args.checkpoint_io_policy == "rank_striped_read_ahead"
+    assert args.checkpoint_format == "HF"
 
 
 @pytest.mark.cpu_only
@@ -116,35 +106,28 @@ def test_rank_striped_checkpoint_io_policy_accepts_hf_safetensors_path(
     [
         ({
             "checkpoint_format": "MX"
-        }, "requires checkpoint_format='HF'"),
+        }, "automatically constructed HF loader"),
+        ({
+            "checkpoint_loader": HfCheckpointLoader()
+        }, "checkpoint_loader must be unset"),
         ({
             "load_format": "dummy"
-        }, "requires load_format='auto'"),
+        }, "load_format='auto'"),
         ({
-            "checkpoint_loader": object()
-        }, "cannot be combined with a custom checkpoint_loader"),
+            "checkpoint_io_policy": "unknown"
+        }, "checkpoint_io_policy"),
     ],
 )
-def test_rank_striped_checkpoint_io_policy_rejects_unsupported_loader_paths(
+def test_rank_striped_checkpoint_io_rejects_unsupported_config(
         kwargs: dict[str, Any], message: str) -> None:
+    options = {"checkpoint_io_policy": "rank_striped_read_ahead", **kwargs}
     with pytest.raises(ValidationError, match=message):
-        TorchLlmArgs(
-            model=llama_model_path,
-            checkpoint_io_policy="rank_striped_read_ahead",
-            **kwargs,
-        )
+        TorchLlmArgs(model=llama_model_path, **options)
 
 
 @pytest.mark.cpu_only
-def test_checkpoint_io_policy_rejects_unknown_value() -> None:
-    with pytest.raises(ValidationError, match="checkpoint_io_policy"):
-        TorchLlmArgs(model=llama_model_path,
-                     checkpoint_io_policy="unknown_policy")
-
-
-@pytest.mark.cpu_only
-def test_rank_striped_checkpoint_io_policy_rejects_autodeploy() -> None:
-    with pytest.raises(ValidationError, match="only by the PyTorch backend"):
+def test_rank_striped_checkpoint_io_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError, match="PyTorch backend"):
         AutoDeployLlmArgs(
             model=llama_model_path,
             checkpoint_io_policy="rank_striped_read_ahead",

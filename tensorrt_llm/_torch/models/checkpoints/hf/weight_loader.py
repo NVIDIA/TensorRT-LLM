@@ -23,7 +23,6 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any, Callable, List
 
 import psutil
@@ -35,9 +34,14 @@ from mpi4py import MPI as _MPI
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
+from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
+    RankStripedReadAheadSession, build_local_plan, close_node_communicator,
+    coordinate_error, effective_available_host_memory, memory_admission)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
+                                 local_mpi_comm, local_mpi_rank, local_mpi_size,
+                                 mpi_comm, mpi_disabled)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -45,14 +49,7 @@ _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
-_NO_EFFECTIVE_IO_POLICY = "none"
-_SUPPORTED_IO_POLICIES = frozenset({_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY})
-_DEFAULT_PREFETCH_CHUNK_SIZE = 256 * 1024 * 1024
-_PREFETCH_READ_SIZE = 8 * 1024 * 1024
-_DEFAULT_PREFETCH_WORKERS_PER_RANK = 16
-_DEFAULT_PREFETCH_WORKERS_PER_NODE = 64
-_DEFAULT_HOST_MEMORY_HEADROOM_BYTES = 16 * 1024 * 1024 * 1024
-_DEFAULT_HOST_MEMORY_HEADROOM_FRACTION = 0.1
+_SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -88,174 +85,11 @@ class _LazySafetensorsWeights(ConsumableWeightsDict):
 
 @dataclass
 class _CheckpointIOStatus:
-    """Last-load state used for logs, tests, and startup diagnostics."""
-
     requested: str
     selected: str
-    activated: bool
-    effective: str
+    activated: bool = False
+    effective: str = "none"
     fallback_reason: str | None = None
-    local_workers: int = 0
-    assigned_bytes: int = 0
-    completed_bytes: int = 0
-    read_ahead_seconds: float = 0.0
-    exposed_tail_seconds: float = 0.0
-
-
-@dataclass(frozen=True)
-class _CheckpointFilePlan:
-    """A rank-coherent checkpoint discovery result."""
-
-    file_kind: str
-    weight_files: tuple[str, ...]
-    discovery_signature: tuple[Any, ...]
-
-
-class _RankStripedReadAheadSession:
-    """Own background host reads and their node-local communicator.
-
-    Chunk planning and all MPI operations stay on the caller thread. The
-    coordinator thread executes only precomputed POSIX reads.
-    """
-
-    def __init__(
-        self,
-        loader: "HfWeightLoader",
-        *,
-        node_communicator,
-        local_chunks: list[tuple[str, int, int]],
-        max_workers: int,
-        local_rank: int,
-    ) -> None:
-        self._loader = loader
-        self._node_communicator = node_communicator
-        self._local_chunks = local_chunks
-        self._max_workers = max_workers
-        self._local_rank = local_rank
-        self._thread: threading.Thread | None = None
-        self._cancel_event = threading.Event()
-        self._completed_bytes = 0
-        self._completed_bytes_lock = threading.Lock()
-        self._started_at = time.perf_counter()
-        self._completed_at: float | None = None
-        self._read_error: Exception | None = None
-        self._finished = False
-        self._communicator_freed = False
-
-    def start(self) -> None:
-        if not self._local_chunks:
-            self._completed_at = time.perf_counter()
-            return
-        self._thread = threading.Thread(
-            target=self._run,
-            name="trtllm-rank-striped-read-ahead",
-            daemon=True,
-        )
-        try:
-            self._thread.start()
-        except Exception:
-            self._thread = None
-            self._completed_at = time.perf_counter()
-            raise
-
-    def _record_chunk(self, length: int) -> None:
-        with self._completed_bytes_lock:
-            self._completed_bytes += length
-
-    def _run(self) -> None:
-        try:
-            self._loader._prefetch_chunks(
-                self._local_chunks,
-                self._max_workers,
-                cancel_event=self._cancel_event,
-                completion_callback=self._record_chunk,
-            )
-        except Exception as error:
-            self._read_error = error
-        finally:
-            self._completed_at = time.perf_counter()
-
-    def cancel_and_close(self) -> Exception | None:
-        """Cancel local work, join it, and release the communicator."""
-        self._cancel_event.set()
-        cleanup_error = None
-        if self._thread is not None:
-            self._thread.join()
-        if self._completed_at is None:
-            self._completed_at = time.perf_counter()
-        try:
-            self._free_communicator()
-        except Exception as error:
-            cleanup_error = error
-        return cleanup_error
-
-    def _free_communicator(self) -> None:
-        if (self._node_communicator is not None
-                and not self._communicator_freed):
-            self._node_communicator.Free()
-            self._communicator_freed = True
-
-    def finish(self, body_error: BaseException | None = None) -> None:
-        """Join readers and coordinate failures after materialization."""
-        if self._finished:
-            return
-        self._finished = True
-        if body_error is not None:
-            self._cancel_event.set()
-
-        tail_started = time.perf_counter()
-        coordinated_body_error = self._loader._coordinate_rank_error(
-            "rank-striped model materialization", body_error)
-        if coordinated_body_error is not None:
-            self._cancel_event.set()
-
-        if self._thread is not None:
-            self._thread.join()
-        if self._completed_at is None:
-            self._completed_at = time.perf_counter()
-
-        coordinated_read_error = self._loader._coordinate_rank_error(
-            "rank-striped background read-ahead", self._read_error)
-        status = self._loader._last_checkpoint_io_status
-        status.completed_bytes = self._completed_bytes
-        status.read_ahead_seconds = self._completed_at - self._started_at
-        status.exposed_tail_seconds = max(0.0,
-                                          self._completed_at - tail_started)
-
-        communicator_error = None
-        try:
-            self._free_communicator()
-        except Exception as error:
-            communicator_error = error
-        coordinated_communicator_error = self._loader._coordinate_rank_error(
-            "rank-striped communicator cleanup", communicator_error)
-
-        if coordinated_body_error is not None:
-            status.effective = _NO_EFFECTIVE_IO_POLICY
-            status.fallback_reason = str(coordinated_body_error)
-            self._loader._log_checkpoint_io_status()
-            raise coordinated_body_error
-
-        if coordinated_communicator_error is not None:
-            status.effective = _NO_EFFECTIVE_IO_POLICY
-            status.fallback_reason = str(coordinated_communicator_error)
-            self._loader._log_checkpoint_io_status()
-            raise coordinated_communicator_error
-
-        if coordinated_read_error is None:
-            status.effective = _RANK_STRIPED_IO_POLICY
-        else:
-            # Read-ahead is advisory. Native SafeTensors materialization has
-            # already succeeded, so never reload a partially mutated model.
-            status.effective = _NATIVE_IO_POLICY
-            status.fallback_reason = str(coordinated_read_error)
-            logger.warning(
-                "Rank-striped checkpoint read-ahead degraded after "
-                "activation; keeping the successfully materialized model "
-                "without retrying the HF loader: "
-                f"{coordinated_read_error}")
-
-        self._loader._log_checkpoint_io_status()
 
 
 @register_checkpoint_weight_loader("MX")
@@ -267,45 +101,18 @@ class HfWeightLoader(BaseWeightLoader):
     Loads weights from SafeTensors/bin/pth files.
     """
 
-    def __init__(
-        self,
-        *,
-        checkpoint_io_policy: str = _NATIVE_IO_POLICY,
-        prefetch_chunk_size: int = _DEFAULT_PREFETCH_CHUNK_SIZE,
-        prefetch_workers_per_node: int = _DEFAULT_PREFETCH_WORKERS_PER_NODE,
-        prefetch_workers_per_rank: int = _DEFAULT_PREFETCH_WORKERS_PER_RANK,
-        host_memory_headroom_bytes: int = _DEFAULT_HOST_MEMORY_HEADROOM_BYTES,
-        host_memory_headroom_fraction:
-        float = _DEFAULT_HOST_MEMORY_HEADROOM_FRACTION,
-    ) -> None:
+    def __init__(self,
+                 checkpoint_io_policy: str = _NATIVE_IO_POLICY,
+                 *,
+                 partial_model_loading: bool = False) -> None:
         if checkpoint_io_policy not in _SUPPORTED_IO_POLICIES:
             raise ValueError("checkpoint_io_policy must be one of "
-                             f"{sorted(_SUPPORTED_IO_POLICIES)}, got "
+                             f"{_SUPPORTED_IO_POLICIES}, got "
                              f"{checkpoint_io_policy!r}")
-        if prefetch_chunk_size <= 0:
-            raise ValueError("prefetch_chunk_size must be positive")
-        if prefetch_workers_per_node <= 0:
-            raise ValueError("prefetch_workers_per_node must be positive")
-        if prefetch_workers_per_rank <= 0:
-            raise ValueError("prefetch_workers_per_rank must be positive")
-        if host_memory_headroom_bytes < 0:
-            raise ValueError("host_memory_headroom_bytes must be nonnegative")
-        if not 0.0 <= host_memory_headroom_fraction < 1.0:
-            raise ValueError(
-                "host_memory_headroom_fraction must be in [0.0, 1.0)")
-
         self._checkpoint_io_policy = checkpoint_io_policy
-        self._prefetch_chunk_size = prefetch_chunk_size
-        self._prefetch_workers_per_node = prefetch_workers_per_node
-        self._prefetch_workers_per_rank = prefetch_workers_per_rank
-        self._host_memory_headroom_bytes = host_memory_headroom_bytes
-        self._host_memory_headroom_fraction = host_memory_headroom_fraction
+        self._partial_model_loading = partial_model_loading
         self._last_checkpoint_io_status = _CheckpointIOStatus(
-            requested=checkpoint_io_policy,
-            selected=_NATIVE_IO_POLICY,
-            activated=False,
-            effective=_NO_EFFECTIVE_IO_POLICY,
-        )
+            requested=checkpoint_io_policy, selected=checkpoint_io_policy)
 
     @property
     def checkpoint_io_policy(self) -> str:
@@ -313,26 +120,13 @@ class HfWeightLoader(BaseWeightLoader):
 
     @property
     def last_checkpoint_io_status(self) -> _CheckpointIOStatus:
-        """Return a snapshot of the most recent checkpoint I/O decision."""
         return replace(self._last_checkpoint_io_status)
 
     def _reset_checkpoint_io_status(self) -> None:
-        selected = (self._checkpoint_io_policy if self._checkpoint_io_policy
-                    == _NATIVE_IO_POLICY else _RANK_STRIPED_IO_POLICY)
         self._last_checkpoint_io_status = _CheckpointIOStatus(
             requested=self._checkpoint_io_policy,
-            selected=selected,
-            activated=False,
-            effective=_NO_EFFECTIVE_IO_POLICY,
+            selected=self._checkpoint_io_policy,
         )
-
-    def _select_native_io(self, reason: str | None = None) -> None:
-        status = self._last_checkpoint_io_status
-        status.selected = _NATIVE_IO_POLICY
-        status.activated = False
-        status.effective = _NATIVE_IO_POLICY
-        status.fallback_reason = reason
-        self._log_checkpoint_io_status()
 
     def _log_checkpoint_io_status(self) -> None:
         status = self._last_checkpoint_io_status
@@ -340,12 +134,7 @@ class HfWeightLoader(BaseWeightLoader):
             f"Checkpoint I/O policy: requested={status.requested}, "
             f"selected={status.selected}, activated={status.activated}, "
             f"effective={status.effective}, fallback_reason="
-            f"{status.fallback_reason or 'none'}, "
-            f"local_workers={status.local_workers}, "
-            f"assigned_bytes={status.assigned_bytes}, "
-            f"completed_bytes={status.completed_bytes}, "
-            f"read_ahead_seconds={status.read_ahead_seconds:.3f}, "
-            f"exposed_tail_seconds={status.exposed_tail_seconds:.3f}.", )
+            f"{status.fallback_reason or 'none'}.")
 
     @staticmethod
     def _is_weight_cache_enabled() -> bool:
@@ -463,56 +252,36 @@ class HfWeightLoader(BaseWeightLoader):
         # materialized module weights.
         return ConsumableWeightsDict(dict(weights))
 
-    @classmethod
-    def _get_active_node_load_context(cls) -> tuple[int, int, int]:
-        """Return active-group local rank/size and conservative free memory.
+    @staticmethod
+    def _get_local_available_host_memory(local_communicator=None) -> int:
+        """Determine the minimum available memory observed on the local node
+        and distribute it to all local ranks
 
-        The process-wide ``local_comm`` is created at module import and may
-        include colocated ranks that later select different model-load
-        subcommunicators. Derive node membership from the active communicator
-        instead so independent TRT-LLM instances cannot deadlock each other.
+        Because psutil.virtual_memory().available is just a snapshot in time,
+        it is possible for the local ranks to get different numbers due to
+        timing differences. This can lead to disagreement among the local ranks
+        as to whether prefetch should be enabled, which causes a deadlock,
+        because the ranks that think prefetch is enabled will wait at a local
+        mpi barrier indefinitely for the ranks that do not.
         """
-        if (not ENABLE_MULTI_DEVICE or mpi_disabled()
-                or mpi_comm().Get_size() == 1):
-            return 0, 1, cls._get_effective_available_host_memory()
+        available_host_memory = psutil.virtual_memory().available
+        if ENABLE_MULTI_DEVICE:
+            communicator = (local_mpi_comm() if local_communicator is None else
+                            local_communicator)
+            return communicator.allreduce(available_host_memory, op=_MPI.MIN)
+        return available_host_memory
 
-        communicator = mpi_comm()
-        processor_name = _MPI.Get_processor_name()
-        available_host_memory = None
-        admission_error = None
-        try:
-            available_host_memory = cls._get_effective_available_host_memory()
-        except Exception as error:
-            admission_error = f"{type(error).__name__}: {error}"
-        observations = communicator.allgather(
-            (processor_name, available_host_memory, admission_error))
-        for rank, (_, _, peer_error) in enumerate(observations):
-            if peer_error is not None:
-                raise RuntimeError(
-                    "Rank "
-                    f"{rank} failed during native checkpoint memory "
-                    f"admission: {peer_error}")
-        assert available_host_memory is not None
-        local_ranks = [
-            rank for rank, (peer_name, _, _) in enumerate(observations)
-            if peer_name == processor_name
-        ]
-        active_rank = communicator.Get_rank()
-        return (
-            local_ranks.index(active_rank),
-            len(local_ranks),
-            min(observations[rank][1] for rank in local_ranks),
-        )
-
-    def _with_weight_cache(self, weight_files: List[str],
+    def _with_weight_cache(self,
+                           weight_files: List[str],
                            use_consolidated: bool,
-                           load_fn) -> ConsumableWeightsDict:
+                           mirror_load_collectives: bool,
+                           load_fn,
+                           local_communicator=None) -> ConsumableWeightsDict:
         """Wrap ``load_fn`` with the optional raw-weight cache.
 
-        Key -> hit -> evict-before-load (so CPU never holds the old cached and
-        the new loading weights at once) -> load -> store. Distributed
-        synchronization is owned by ``_load_weights_native`` so cache hits and
-        misses execute the same active-communicator collective sequence.
+        Key -> hit (optionally joining the local barrier the miss path is
+        about to enter) -> evict-before-load (so CPU never holds the old
+        cached and the new loading weights at once) -> load -> store.
         """
         cache_key = self._weight_files_cache_key(
             weight_files,
@@ -521,6 +290,20 @@ class HfWeightLoader(BaseWeightLoader):
             cached_weights = self._get_cached_weights(cache_key)
             if cached_weights is not None:
                 logger.info("Reusing cached HF checkpoint weights.")
+                if mirror_load_collectives:
+                    # Rank-local caches can diverge, so a hit on one rank must
+                    # enqueue EXACTLY the collectives a miss on another rank
+                    # enqueues, in the same order, or the job deadlocks. The
+                    # safetensors miss path performs an Allreduce (inside
+                    # _get_local_available_host_memory) and then a Barrier;
+                    # mirror both here (the allreduce result is unused).
+                    if local_communicator is None:
+                        self._get_local_available_host_memory()
+                        local_mpi_barrier()
+                    else:
+                        self._get_local_available_host_memory(
+                            local_communicator)
+                        local_communicator.Barrier()
                 return cached_weights
             self._evict_to_make_room()
         weights = load_fn()
@@ -545,8 +328,7 @@ class HfWeightLoader(BaseWeightLoader):
     def _load_lazy_safetensors(
             self,
             checkpoint_dir: str,
-            use_consolidated: bool = False,
-            weight_files: List[str] | None = None) -> dict[str, Any]:
+            use_consolidated: bool = False) -> dict[str, Any]:
         """Return a dict of name -> lazy safetensors slices.
 
         Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
@@ -555,18 +337,17 @@ class HfWeightLoader(BaseWeightLoader):
         and read only its rank-local shard (e.g. Kimi K3 expert-parallel
         expert slices) without ever holding the full checkpoint in RAM.
         """
-        if weight_files is None:
-            weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
-            # Same sharded-vs-consolidated selection as the eager path below:
-            # when both flavors are present, keep only the requested one.
-            filtered_weight_files = [
-                x for x in weight_files
-                if ("consolidated" in os.path.split(x)[1]) == use_consolidated
-            ]
-            if filtered_weight_files:
-                weight_files = filtered_weight_files
+        weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         if not weight_files:
             raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+        # Same sharded-vs-consolidated selection as the eager path below:
+        # when both flavors are present, keep only the requested one.
+        filtered_weight_files = [
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1]) == use_consolidated
+        ]
+        if len(filtered_weight_files) > 0:
+            weight_files = filtered_weight_files
         weights: dict[str, Any] = {}
         handles = []
         for file_name in weight_files:
@@ -596,11 +377,13 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
-        """Load synchronously for direct callers.
-
-        ModelLoader uses :meth:`open_weight_session` so rank-striped host reads
-        may remain active while the returned tensors are materialized.
-        """
+        """Load synchronously for callers without a materialization session."""
+        if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
+            self._reset_checkpoint_io_status()
+            weights = self._load_weights_native(checkpoint_dir, mapping,
+                                                use_consolidated, **kwargs)
+            self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+            return weights
         with self.open_weight_session(checkpoint_dir,
                                       mapping=mapping,
                                       use_consolidated=use_consolidated,
@@ -613,17 +396,35 @@ class HfWeightLoader(BaseWeightLoader):
                             mapping: Mapping,
                             use_consolidated: bool = False,
                             **kwargs) -> Iterator[dict[str, Any]]:
-        """Keep rank-striped read-ahead alive through model materialization."""
+        """Keep opt-in read-ahead alive through model materialization."""
         self._reset_checkpoint_io_status()
         if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
             weights = self._load_weights_native(checkpoint_dir, mapping,
                                                 use_consolidated, **kwargs)
-            self._select_native_io()
+            self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
             yield weights
             return
 
-        weights, session = self._open_rank_striped_read_ahead(
-            checkpoint_dir, mapping, use_consolidated, **kwargs)
+        active_communicator = self._active_communicator(mapping)
+        if mapping.world_size > 1 and active_communicator is None:
+            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            weights = self._fallback_to_native(
+                checkpoint_dir,
+                mapping,
+                use_consolidated,
+                "distributed rank-striped read-ahead requires an active MPI communicator",
+                **kwargs,
+            )
+            yield weights
+            return
+
+        weights, session = self._start_rank_striped_read_ahead(
+            checkpoint_dir,
+            mapping,
+            use_consolidated,
+            active_communicator,
+            **kwargs,
+        )
         if session is None:
             yield weights
             return
@@ -636,579 +437,437 @@ class HfWeightLoader(BaseWeightLoader):
             raise
         finally:
             try:
-                session.finish(body_error)
-            except Exception:
+                read_error = session.finish(body_error)
+            except Exception as error:
+                status = self._last_checkpoint_io_status
+                status.effective = "none"
+                status.fallback_reason = str(error)
+                self._log_checkpoint_io_status()
                 if body_error is None:
                     raise
-                logger.exception(
-                    "Suppressing rank-striped session cleanup failure to "
-                    "preserve the model-materialization exception.")
-
-    def _load_weights_native(self,
-                             checkpoint_dir: str,
-                             mapping: Mapping,
-                             use_consolidated: bool = False,
-                             checkpoint_plan: _CheckpointFilePlan | None = None,
-                             allow_prefetch: bool = True,
-                             **kwargs) -> dict[str, Any]:
-        del mapping, kwargs
-        if checkpoint_plan is None:
-            checkpoint_plan = self._get_coherent_checkpoint_plan(
-                checkpoint_dir, use_consolidated, "native checkpoint discovery")
-
-        weight_files = list(checkpoint_plan.weight_files)
-        weights = None
-        load_error = None
-        try:
-            if checkpoint_plan.file_kind == "lazy_safetensors":
-                weights = self._load_lazy_safetensors(
-                    checkpoint_dir,
-                    use_consolidated,
-                    weight_files=weight_files,
-                )
-            elif checkpoint_plan.file_kind == "safetensors":
-                local_rank, local_size, effective_available = (
-                    self._get_active_node_load_context())
-                checkpoint_size = sum(
-                    size for _, size in checkpoint_plan.discovery_signature[1])
-                weights = self._load_native_safetensors(
-                    weight_files,
-                    use_consolidated,
-                    allow_prefetch=allow_prefetch,
-                    checkpoint_size=checkpoint_size,
-                    effective_available=effective_available,
-                    local_rank=local_rank,
-                    local_size=local_size,
-                )
-            elif checkpoint_plan.file_kind in ("bin", "pth"):
-                weights = self._with_weight_cache(
-                    weight_files,
-                    use_consolidated,
-                    load_fn=lambda: self._load_weights_in_parallel(
-                        weight_files,
-                        self._load_bin_or_path_file,
-                        "Loading bin weights in parallel",
-                    ),
-                )
+                logger.error(
+                    "Suppressing rank-striped cleanup failure to preserve "
+                    "the model-materialization exception: "
+                    f"{type(error).__name__}: {error}")
             else:
-                raise RuntimeError(
-                    f"No weight files found in {checkpoint_dir}.")
-        except Exception as error:
-            load_error = error
+                status = self._last_checkpoint_io_status
+                if read_error is None:
+                    status.effective = _RANK_STRIPED_IO_POLICY
+                else:
+                    # Read-ahead is advisory. The native mmap/materialization
+                    # path succeeded, so never retry a partially mutated model.
+                    status.effective = _NATIVE_IO_POLICY
+                    status.fallback_reason = str(read_error)
+                    logger.warning(
+                        "Rank-striped read-ahead degraded after activation; "
+                        "keeping the successfully materialized model: "
+                        f"{read_error}")
+                self._log_checkpoint_io_status()
 
-        if (not ENABLE_MULTI_DEVICE or mpi_disabled()
-                or mpi_comm().Get_size() == 1):
-            if load_error is not None:
-                raise load_error
-            coordinated_load_error = None
-        else:
-            coordinated_load_error = self._coordinate_rank_error(
-                "native checkpoint load", load_error)
-        if coordinated_load_error is not None:
-            raise coordinated_load_error
-        assert weights is not None
-        return weights
+    @staticmethod
+    def _active_communicator(mapping: Mapping):
+        """Return and validate the communicator used by the opt-in policy."""
+        if not ENABLE_MULTI_DEVICE or mpi_disabled():
+            return None
+        communicator = mpi_comm()
+        communicator_size = communicator.Get_size()
+        if mapping.world_size != communicator_size:
+            raise RuntimeError(
+                "Rank-striped read-ahead requires mapping.world_size to "
+                "match the active MPI communicator size "
+                f"({communicator_size}); received {mapping.world_size}.")
+        return communicator
 
-    def _discover_checkpoint_plan(
-        self,
-        checkpoint_dir: str,
-        use_consolidated: bool,
-    ) -> _CheckpointFilePlan:
-        is_lazy_checkpoint = self._is_kimi_k3_checkpoint(checkpoint_dir)
+    @staticmethod
+    def _selected_safetensors_files(checkpoint_dir: str,
+                                    use_consolidated: bool) -> list[str]:
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         filtered_weight_files = [
-            file_name for file_name in weight_files
-            if ("consolidated" in os.path.split(file_name)[1]
-                ) == use_consolidated
+            path for path in weight_files
+            if ("consolidated" in os.path.split(path)[1]) == use_consolidated
         ]
-        if filtered_weight_files:
-            weight_files = filtered_weight_files
+        return filtered_weight_files or weight_files
 
-        if is_lazy_checkpoint:
-            file_kind = "lazy_safetensors"
-        elif weight_files:
-            file_kind = "safetensors"
-        else:
-            weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.bin"))
-            if weight_files:
-                file_kind = "bin"
-            else:
-                weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.pth"))
-                file_kind = "pth" if weight_files else "missing"
-
-        discovery_signature = (
-            file_kind,
-            tuple((os.path.basename(file_name), os.path.getsize(file_name))
-                  for file_name in weight_files),
-        )
-        return _CheckpointFilePlan(
-            file_kind=file_kind,
-            weight_files=tuple(weight_files),
-            discovery_signature=discovery_signature,
-        )
-
-    def _get_coherent_checkpoint_plan(
-        self,
-        checkpoint_dir: str,
-        use_consolidated: bool,
-        phase: str,
-    ) -> _CheckpointFilePlan:
-        checkpoint_plan = None
-        discovery_error = None
+    def _close_unactivated_session(
+            self,
+            session,
+            node_communicator,
+            active_communicator,
+            phase: str,
+            *,
+            preserve_node_communicator: bool = False) -> None:
+        cleanup_error = None
         try:
-            checkpoint_plan = self._discover_checkpoint_plan(
-                checkpoint_dir, use_consolidated)
+            if session is not None:
+                cleanup_error = (session.cancel_reads()
+                                 if preserve_node_communicator else
+                                 session.cancel_and_close())
+            elif not preserve_node_communicator:
+                close_node_communicator(node_communicator)
         except Exception as error:
-            discovery_error = error
+            cleanup_error = error
+        coordinated_cleanup_error = coordinate_error(active_communicator, phase,
+                                                     cleanup_error)
+        if coordinated_cleanup_error is not None:
+            raise coordinated_cleanup_error
 
-        coordinated_discovery_error = self._coordinate_rank_error(
-            phase, discovery_error)
-        if coordinated_discovery_error is not None:
-            raise coordinated_discovery_error
-        assert checkpoint_plan is not None
+    def _fallback_to_native(self,
+                            checkpoint_dir: str,
+                            mapping: Mapping,
+                            use_consolidated: bool,
+                            reason: str,
+                            active_communicator=None,
+                            node_communicator=None,
+                            session=None,
+                            **kwargs) -> dict[str, Any]:
+        status = self._last_checkpoint_io_status
+        status.activated = False
+        status.fallback_reason = reason
+        try:
+            self._close_unactivated_session(
+                session,
+                node_communicator,
+                active_communicator,
+                "rank-striped fallback reader cleanup",
+                preserve_node_communicator=True,
+            )
+        except BaseException:
+            try:
+                close_node_communicator(node_communicator)
+            except Exception as close_error:
+                logger.error(
+                    "Failed to close the rank-striped node communicator after "
+                    "reader cleanup failed: "
+                    f"{type(close_error).__name__}: {close_error}")
+            raise
+        fallback_communicator = node_communicator
+        if (fallback_communicator is None
+                and (active_communicator is None
+                     or active_communicator.Get_size() == 1)):
+            fallback_communicator = active_communicator
+        allow_prefetch = not (mapping.world_size > 1
+                              and fallback_communicator is None)
+        load_error = None
+        try:
+            weights = self._load_weights_native(
+                checkpoint_dir,
+                mapping,
+                use_consolidated,
+                _local_communicator=fallback_communicator,
+                _allow_prefetch=allow_prefetch,
+                **kwargs)
+        except BaseException as error:
+            load_error = error
+            weights = None
+        close_error = None
+        try:
+            close_node_communicator(node_communicator)
+        except Exception as error:
+            close_error = error
+        coordinated_load_error = coordinate_error(
+            active_communicator, "rank-striped native fallback", load_error)
+        coordinated_close_error = coordinate_error(
+            active_communicator, "rank-striped fallback cleanup", close_error)
+        if coordinated_load_error is not None:
+            status.effective = "none"
+            status.fallback_reason = str(coordinated_load_error)
+            self._log_checkpoint_io_status()
+            if coordinated_close_error is not None:
+                logger.error("Rank-striped cleanup also failed during native "
+                             f"fallback: {coordinated_close_error}")
+            raise coordinated_load_error
+        if coordinated_close_error is not None:
+            status.effective = "none"
+            status.fallback_reason = str(coordinated_close_error)
+            self._log_checkpoint_io_status()
+            raise coordinated_close_error
+        assert weights is not None
+        status.effective = _NATIVE_IO_POLICY
+        self._log_checkpoint_io_status()
+        return weights
 
-        signatures = self._allgather_rank_values(
-            checkpoint_plan.discovery_signature)
-        if any(signature != signatures[0] for signature in signatures[1:]):
-            raise RuntimeError(
-                f"{phase} must match across all model-load ranks; received "
-                f"{signatures}.")
-        return checkpoint_plan
-
-    def _open_rank_striped_read_ahead(
+    def _start_rank_striped_read_ahead(
         self,
         checkpoint_dir: str,
         mapping: Mapping,
         use_consolidated: bool,
+        active_communicator,
         **kwargs,
-    ) -> tuple[dict[str, Any], _RankStripedReadAheadSession | None]:
-        """Start bounded rank-striped reads before native materialization."""
-        del kwargs
-        if mapping.world_size > 1 and (not ENABLE_MULTI_DEVICE
-                                       or mpi_disabled()):
-            return self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                "distributed rank-striped read-ahead requires the active MPI "
-                "model-load communicator",
-            )
-        if ENABLE_MULTI_DEVICE and not mpi_disabled():
-            communicator = mpi_comm()
-            mapping_sizes = communicator.allgather(mapping.world_size)
-            communicator_size = communicator.Get_size()
-            if any(world_size != communicator_size
-                   for world_size in mapping_sizes):
-                raise RuntimeError(
-                    "Rank-striped checkpoint I/O requires every "
-                    "mapping.world_size to match the active MPI "
-                    f"communicator size ({communicator_size}); received "
-                    f"{mapping_sizes}.")
-
-        checkpoint_plan = self._get_coherent_checkpoint_plan(
-            checkpoint_dir,
-            use_consolidated,
-            "rank-striped checkpoint discovery",
-        )
-        weight_files = list(checkpoint_plan.weight_files)
-        file_kind = checkpoint_plan.file_kind
-        discovery_signature = checkpoint_plan.discovery_signature
-
-        if file_kind != "safetensors":
-            reasons = {
-                "lazy_safetensors":
-                "the checkpoint requires model-specific lazy SafeTensors "
-                "loading",
-                "bin":
-                ".bin checkpoints use native checkpoint I/O",
-                "pth":
-                ".pth checkpoints use native checkpoint I/O",
-                "missing":
-                "no SafeTensors checkpoint files were found",
-            }
-            return self._fallback_to_native(checkpoint_dir,
-                                            mapping,
-                                            use_consolidated,
-                                            reasons[file_kind],
-                                            checkpoint_plan=checkpoint_plan)
-
+    ) -> tuple[dict[str, Any], RankStripedReadAheadSession | None]:
         node_communicator = None
         split_error = None
         try:
-            node_communicator = self._get_active_node_communicator()
+            if (active_communicator is not None
+                    and active_communicator.Get_size() > 1):
+                node_communicator = active_communicator.Split_type(
+                    _MPI.COMM_TYPE_SHARED)
         except Exception as error:
             split_error = error
-        coordinated_split_error = self._coordinate_rank_error(
-            "rank-striped node communicator creation", split_error)
+        coordinated_split_error = coordinate_error(
+            active_communicator, "rank-striped node communicator creation",
+            split_error)
         if coordinated_split_error is not None:
-            self._close_node_communicator(
-                node_communicator, "rank-striped communicator creation cleanup")
-            return self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                str(coordinated_split_error),
-                checkpoint_plan=checkpoint_plan,
-            )
+            self._close_unactivated_session(
+                None, node_communicator, active_communicator,
+                "rank-striped node communicator cleanup")
+            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            return self._fallback_to_native(checkpoint_dir, mapping,
+                                            use_consolidated,
+                                            str(coordinated_split_error),
+                                            active_communicator, **kwargs), None
 
-        stats = None
-        num_layers = None
-        cache_enabled = None
-        effective_available = None
+        weight_files = []
+        stats = []
+        available_memory = 0
+        eligibility_reason = None
         preflight_error = None
         try:
-            stats = [(file_name, os.stat(file_name))
-                     for file_name in weight_files]
-            num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-            cache_enabled = self._is_weight_cache_enabled()
-            effective_available = self._get_effective_available_host_memory()
+            if self._is_kimi_k3_checkpoint(checkpoint_dir):
+                eligibility_reason = (
+                    "the checkpoint requires model-specific lazy SafeTensors loading"
+                )
+            weight_files = self._selected_safetensors_files(
+                checkpoint_dir, use_consolidated)
+            stats = [(path, os.stat(path)) for path in weight_files]
+            if not weight_files:
+                eligibility_reason = "no SafeTensors checkpoint files were found"
+            elif (self._is_weight_cache_enabled()
+                  and self._weight_cache_max_entries() > 0):
+                eligibility_reason = "the raw HF weight cache is enabled"
+            elif (self._partial_model_loading
+                  or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
+                eligibility_reason = "partial model loading was requested"
+            available_memory = effective_available_host_memory()
         except Exception as error:
             preflight_error = error
 
-        coordinated_preflight_error = self._coordinate_rank_error(
-            "rank-striped preflight", preflight_error)
+        coordinated_preflight_error = coordinate_error(
+            active_communicator, "rank-striped preflight", preflight_error)
         if coordinated_preflight_error is not None:
-            self._close_node_communicator(node_communicator,
-                                          "rank-striped preflight cleanup")
-            raise coordinated_preflight_error
-        assert stats is not None
-        assert num_layers is not None
-        assert cache_enabled is not None
-        assert effective_available is not None
+            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            return self._fallback_to_native(checkpoint_dir, mapping,
+                                            use_consolidated,
+                                            str(coordinated_preflight_error),
+                                            active_communicator,
+                                            node_communicator, **kwargs), None
 
-        checkpoint_size = sum(stat.st_size for _, stat in stats)
-        backing_signature = tuple(
-            (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-            for _, stat in stats)
-        node_reason = None
-        node_collective_error = None
+        local_rank = 0
+        local_size = 1
+        node_error = None
         try:
+            backing_signature = tuple(
+                (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                for _, stat in stats)
             if node_communicator is not None:
-                backing_signatures = node_communicator.allgather(
-                    backing_signature)
-                if any(signature != backing_signatures[0]
-                       for signature in backing_signatures[1:]):
-                    node_reason = (
-                        "node-local ranks resolved the checkpoint to "
-                        "different backing files")
-                effective_available = node_communicator.allreduce(
-                    effective_available, op=_MPI.MIN)
+                local_rank = node_communicator.Get_rank()
+                local_size = node_communicator.Get_size()
+                observations = node_communicator.allgather(
+                    (backing_signature, available_memory))
+                if any(observation[0] != observations[0][0]
+                       for observation in observations[1:]):
+                    eligibility_reason = (
+                        "node-local ranks resolved different backing files")
+                available_memory = min(observation[1]
+                                       for observation in observations)
         except Exception as error:
-            node_collective_error = error
-        coordinated_node_error = self._coordinate_rank_error(
-            "rank-striped node preflight", node_collective_error)
-        if coordinated_node_error is not None:
-            self._close_node_communicator(
-                node_communicator, "rank-striped node preflight cleanup")
-            return self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                str(coordinated_node_error),
-                checkpoint_plan=checkpoint_plan,
-            )
+            node_error = error
 
-        headroom = max(
-            self._host_memory_headroom_bytes,
-            int(effective_available * self._host_memory_headroom_fraction),
-        )
-        if cache_enabled:
-            node_reason = (
-                "the raw HF weight cache is enabled and requires the native "
-                "collective sequence")
-        elif num_layers != 0:
-            node_reason = (
-                "TLLM_OVERRIDE_LAYER_NUM requests partial checkpoint loading")
-        elif checkpoint_size > max(0, effective_available - headroom):
-            node_reason = (
-                f"checkpoint bytes ({checkpoint_size}) exceed effective host "
-                f"memory ({effective_available}) after startup headroom "
+        coordinated_node_error = coordinate_error(
+            active_communicator, "rank-striped node preflight", node_error)
+        if coordinated_node_error is not None:
+            self._close_unactivated_session(
+                None, node_communicator, active_communicator,
+                "rank-striped node preflight cleanup")
+            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            return self._fallback_to_native(checkpoint_dir, mapping,
+                                            use_consolidated,
+                                            str(coordinated_node_error),
+                                            active_communicator, **kwargs), None
+
+        file_sizes = [(path, stat.st_size) for path, stat in stats]
+        checkpoint_bytes = sum(size for _, size in file_sizes)
+        admitted, headroom = memory_admission(checkpoint_bytes,
+                                              available_memory)
+        if eligibility_reason is None and not admitted:
+            eligibility_reason = (
+                f"checkpoint bytes ({checkpoint_bytes}) exceed available "
+                f"host memory ({available_memory}) after startup headroom "
                 f"({headroom})")
 
-        policy_inputs = self._allgather_rank_values(
-            (discovery_signature, num_layers, cache_enabled, node_reason))
-        if any(inputs[0] != policy_inputs[0][0]
-               for inputs in policy_inputs[1:]):
-            self._close_node_communicator(node_communicator,
-                                          "rank-striped selection cleanup")
+        discovery_signature = tuple(
+            (os.path.basename(path), size) for path, size in file_sizes)
+        selections = ([
+            (discovery_signature, eligibility_reason)
+        ] if active_communicator is None else active_communicator.allgather(
+            (discovery_signature, eligibility_reason)))
+        if any(selection[0] != selections[0][0]
+               for selection in selections[1:]):
+            self._close_unactivated_session(
+                None, node_communicator, active_communicator,
+                "rank-striped discovery mismatch cleanup")
             raise RuntimeError(
-                "Rank-striped checkpoint selection changed during preflight.")
-        fallback_reasons = [(rank, inputs[3])
-                            for rank, inputs in enumerate(policy_inputs)
-                            if inputs[3] is not None]
+                "SafeTensors checkpoint discovery must match "
+                f"across model-load ranks; received {selections}.")
+        fallback_reasons = [(rank, selection[1])
+                            for rank, selection in enumerate(selections)
+                            if selection[1] is not None]
         if fallback_reasons:
-            self._close_node_communicator(node_communicator,
-                                          "rank-striped admission cleanup")
             rank, reason = fallback_reasons[0]
-            return self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                f"rank {rank}: {reason}",
-                checkpoint_plan=checkpoint_plan,
-            )
+            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            return self._fallback_to_native(checkpoint_dir, mapping,
+                                            use_consolidated,
+                                            f"rank {rank}: {reason}",
+                                            active_communicator,
+                                            node_communicator, **kwargs), None
 
-        local_rank, local_size = self._get_local_rank_and_size(
-            node_communicator)
+        self._last_checkpoint_io_status.selected = _RANK_STRIPED_IO_POLICY
         session = None
-        planning_error = None
+        setup_error = None
         try:
-            local_chunks, max_workers = self._local_prefetch_plan(
-                weight_files, local_rank, local_size)
-            session = _RankStripedReadAheadSession(
-                self,
-                node_communicator=node_communicator,
-                local_chunks=local_chunks,
-                max_workers=max_workers,
-                local_rank=local_rank,
-            )
-            status = self._last_checkpoint_io_status
-            status.selected = _RANK_STRIPED_IO_POLICY
-            status.local_workers = max_workers
-            status.assigned_bytes = sum(length for _, _, length in local_chunks)
+            plan = build_local_plan(file_sizes, local_rank, local_size)
+            session = RankStripedReadAheadSession(active_communicator,
+                                                  node_communicator,
+                                                  plan).start()
         except Exception as error:
-            planning_error = error
-
-        coordinated_planning_error = self._coordinate_rank_error(
-            "rank-striped read planning", planning_error)
-        if coordinated_planning_error is not None:
-            cleanup_error = None
-            if session is not None:
-                cleanup_error = session.cancel_and_close()
-            else:
-                try:
-                    self._free_node_communicator(node_communicator)
-                except Exception as error:
-                    cleanup_error = error
-            coordinated_cleanup_error = self._coordinate_rank_error(
-                "rank-striped planning cleanup", cleanup_error)
-            if coordinated_cleanup_error is not None:
-                raise coordinated_cleanup_error
-            return self._fallback_to_native_after_selection(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                str(coordinated_planning_error),
-                checkpoint_plan=checkpoint_plan,
-            )
+            setup_error = error
+        coordinated_setup_error = coordinate_error(active_communicator,
+                                                   "rank-striped reader setup",
+                                                   setup_error)
+        if coordinated_setup_error is not None:
+            return self._fallback_to_native(checkpoint_dir, mapping,
+                                            use_consolidated,
+                                            str(coordinated_setup_error),
+                                            active_communicator,
+                                            node_communicator, session,
+                                            **kwargs), None
         assert session is not None
 
-        start_error = None
-        try:
-            session.start()
-        except Exception as error:
-            start_error = error
-        coordinated_start_error = self._coordinate_rank_error(
-            "rank-striped read-ahead start", start_error)
-        if coordinated_start_error is not None:
-            cleanup_error = session.cancel_and_close()
-            coordinated_cleanup_error = self._coordinate_rank_error(
-                "rank-striped start cleanup", cleanup_error)
-            if coordinated_cleanup_error is not None:
-                raise coordinated_cleanup_error
-            return self._fallback_to_native_after_selection(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                str(coordinated_start_error),
-                checkpoint_plan=checkpoint_plan,
-            )
-
-        self._last_checkpoint_io_status.activated = True
+        status = self._last_checkpoint_io_status
+        status.activated = True
         logger.info("Rank-striped checkpoint read-ahead activated: "
                     f"local_rank={local_rank}, local_size={local_size}, "
-                    f"workers={max_workers}, assigned_bytes="
-                    f"{self._last_checkpoint_io_status.assigned_bytes}, "
-                    f"checkpoint_bytes={checkpoint_size}.")
+                    f"workers={plan.workers}, assigned_bytes="
+                    f"{plan.assigned_bytes}, checkpoint_bytes="
+                    f"{checkpoint_bytes}.")
 
         weights = None
         mapping_error = None
         try:
             weights = self._load_weights_in_parallel(
-                weight_files,
-                self._load_safetensors_file,
-                "Mapping safetensors weights in parallel",
-            )
-        except Exception as error:
+                weight_files, self._load_safetensors_file,
+                "Mapping safetensors weights in parallel")
+        except BaseException as error:
             mapping_error = error
-        coordinated_mapping_error = self._coordinate_rank_error(
-            "rank-striped SafeTensors mapping", mapping_error)
+        coordinated_mapping_error = coordinate_error(
+            active_communicator, "rank-striped SafeTensors mapping",
+            mapping_error)
         if coordinated_mapping_error is not None:
             cleanup_error = session.cancel_and_close()
-            coordinated_cleanup_error = self._coordinate_rank_error(
-                "rank-striped mapping cleanup", cleanup_error)
+            coordinated_cleanup_error = coordinate_error(
+                active_communicator, "rank-striped mapping cleanup",
+                cleanup_error)
             if coordinated_cleanup_error is not None:
-                logger.error(
-                    "Rank-striped cleanup also failed after SafeTensors "
-                    f"mapping failure: {coordinated_cleanup_error}")
-            status = self._last_checkpoint_io_status
-            status.effective = _NO_EFFECTIVE_IO_POLICY
+                logger.error("Rank-striped cleanup also failed after mapping "
+                             f"failure: {coordinated_cleanup_error}")
+            status.effective = "none"
             status.fallback_reason = str(coordinated_mapping_error)
             self._log_checkpoint_io_status()
             raise coordinated_mapping_error
         assert weights is not None
         return weights, session
 
-    def _fallback_to_native(
-        self,
-        checkpoint_dir: str,
-        mapping: Mapping,
-        use_consolidated: bool,
-        reason: str,
-        *,
-        checkpoint_plan: _CheckpointFilePlan | None = None,
-    ) -> tuple[dict[str, Any], None]:
-        weights = self._load_weights_native(
-            checkpoint_dir,
-            mapping,
-            use_consolidated,
-            checkpoint_plan=checkpoint_plan,
-            allow_prefetch=False,
-        )
-        self._select_native_io(reason)
-        return weights, None
+    def _load_weights_native(self,
+                             checkpoint_dir: str,
+                             mapping: Mapping,
+                             use_consolidated: bool = False,
+                             *,
+                             _local_communicator=None,
+                             _allow_prefetch: bool = True,
+                             **kwargs) -> dict[str, Any]:
+        if self._is_kimi_k3_checkpoint(checkpoint_dir):
+            return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
+        weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
+        # Some model checkpoint directories contain not only the sharded safetensors, but one
+        # consolidated tensor. In the presence of both, we favor the former unless specified explicitly, as there really is no need
+        # to prefetch the (usually) ridiculously large consolidated tensor into memory in such a case.
+        filtered_weight_files = [
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1]) == use_consolidated
+        ]
+        if len(filtered_weight_files) > 0:
+            weight_files = filtered_weight_files
+        if weight_files:
+            if _local_communicator is None and _allow_prefetch:
+                return self._with_weight_cache(
+                    weight_files,
+                    use_consolidated,
+                    mirror_load_collectives=True,
+                    load_fn=lambda: self._prefetch_and_load(weight_files))
+            return self._with_weight_cache(
+                weight_files,
+                use_consolidated,
+                mirror_load_collectives=_allow_prefetch,
+                load_fn=lambda: self._prefetch_and_load(
+                    weight_files, _local_communicator, _allow_prefetch),
+                local_communicator=_local_communicator)
 
-    def _fallback_to_native_after_selection(
-        self,
-        checkpoint_dir: str,
-        mapping: Mapping,
-        use_consolidated: bool,
-        reason: str,
-        *,
-        checkpoint_plan: _CheckpointFilePlan,
-    ) -> tuple[dict[str, Any], None]:
-        weights = self._load_weights_native(
-            checkpoint_dir,
-            mapping,
-            use_consolidated,
-            checkpoint_plan=checkpoint_plan,
-            allow_prefetch=False,
-        )
-        status = self._last_checkpoint_io_status
-        status.activated = False
-        status.effective = _NATIVE_IO_POLICY
-        status.fallback_reason = reason
-        self._log_checkpoint_io_status()
-        return weights, None
+        weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
+        if not weight_files:
+            weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
-    @staticmethod
-    def _allgather_rank_values(value):
-        if ENABLE_MULTI_DEVICE and not mpi_disabled():
-            return mpi_comm().allgather(value)
-        return [value]
+        if weight_files:
+            return self._with_weight_cache(
+                weight_files,
+                use_consolidated,
+                mirror_load_collectives=False,
+                load_fn=lambda: self._load_weights_in_parallel(
+                    weight_files, self._load_bin_or_path_file,
+                    "Loading bin weights in parallel"))
 
-    def coordinate_checkpoint_io_request(self, mapping: Mapping) -> None:
-        """Reject rank-divergent policies before either path enqueues work."""
-        if not ENABLE_MULTI_DEVICE or mpi_disabled():
-            return
-        communicator = mpi_comm()
-        communicator_size = communicator.Get_size()
-        requests = communicator.allgather(
-            (self._checkpoint_io_policy, mapping.world_size, communicator_size))
-        mapping_sizes = [request[1] for request in requests]
-        if any(world_size != communicator_size for world_size in mapping_sizes):
-            raise RuntimeError(
-                "Checkpoint I/O requires every mapping.world_size to match "
-                f"the active MPI communicator size ({communicator_size}); "
-                f"received {mapping_sizes}.")
-        policies = [request[0] for request in requests]
-        if any(peer_policy != policies[0] for peer_policy in policies[1:]):
-            raise RuntimeError("checkpoint_io_policy must match across "
-                               f"all model-load ranks; received {policies}.")
+        raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
-    @classmethod
-    def _coordinate_rank_error(cls, phase: str,
-                               error: BaseException | None) -> Exception | None:
-        error_message = (None if error is None else
-                         f"{type(error).__name__}: {error}")
-        error_messages = cls._allgather_rank_values(error_message)
-        for rank, rank_error in enumerate(error_messages):
-            if rank_error is not None:
-                return RuntimeError(
-                    f"Rank {rank} failed during {phase}: {rank_error}")
-        return None
+    def _prefetch_and_load(
+            self,
+            weight_files: List[str],
+            local_communicator=None,
+            allow_prefetch: bool = True) -> ConsumableWeightsDict:
+        # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
+        # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
+        prefetch_size = sum(os.path.getsize(file) for file in weight_files)
+        # If the layer number is overridden, it indicates that only a subset of layers are loaded.
+        # Prefetching all layers is unnecessary.
+        num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
+        if allow_prefetch:
+            available_memory = (
+                self._get_local_available_host_memory()
+                if local_communicator is None else
+                self._get_local_available_host_memory(local_communicator))
+            enable_prefetch = (prefetch_size < available_memory * 0.9
+                               and num_layers == 0)
+        else:
+            enable_prefetch = False
+        if enable_prefetch:
+            logger.info(
+                f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
+            )
+            if local_communicator is None:
+                self.prefetch_files(weight_files)
+            else:
+                self.prefetch_files(weight_files, local_communicator)
+        # Sync all local ranks unconditionally. `enable_prefetch` depends on
+        # `psutil.virtual_memory().available`, a per-rank volatile value, so
+        # different ranks may take different branches; gating the barrier on
+        # it would deadlock between ranks that prefetched and ranks that
+        # skipped. Ranks that didn't prefetch reach the barrier immediately.
+        if allow_prefetch:
+            if local_communicator is None:
+                local_mpi_barrier()
+            else:
+                local_communicator.Barrier()
 
-    @staticmethod
-    def _get_active_node_communicator():
-        if (ENABLE_MULTI_DEVICE and not mpi_disabled()
-                and mpi_comm().Get_size() > 1):
-            return mpi_comm().Split_type(_MPI.COMM_TYPE_SHARED)
-        return None
-
-    @staticmethod
-    def _free_node_communicator(node_communicator) -> None:
-        if node_communicator is not None:
-            node_communicator.Free()
-
-    @classmethod
-    def _close_node_communicator(cls, node_communicator, phase: str) -> None:
-        cleanup_error = None
-        try:
-            cls._free_node_communicator(node_communicator)
-        except Exception as error:
-            cleanup_error = error
-        coordinated_cleanup_error = cls._coordinate_rank_error(
-            phase, cleanup_error)
-        if coordinated_cleanup_error is not None:
-            raise coordinated_cleanup_error
-
-    @staticmethod
-    def _get_local_rank_and_size(node_communicator=None) -> tuple[int, int]:
-        if node_communicator is None:
-            return 0, 1
-        return node_communicator.Get_rank(), node_communicator.Get_size()
-
-    def _load_native_safetensors(
-        self,
-        weight_files: List[str],
-        use_consolidated: bool,
-        *,
-        allow_prefetch: bool,
-        checkpoint_size: int,
-        effective_available: int,
-        local_rank: int,
-        local_size: int,
-    ) -> ConsumableWeightsDict:
-        """Coordinate cache lookup and synchronous native prefetch."""
-        cache_key = None
-        cached_weights = None
-        preparation_error = None
-        try:
-            num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-            enable_prefetch = (allow_prefetch and num_layers == 0
-                               and checkpoint_size < effective_available * 0.9)
-            if self._is_weight_cache_enabled():
-                cache_key = self._weight_files_cache_key(
-                    weight_files, use_consolidated)
-                cached_weights = self._get_cached_weights(cache_key)
-                if cached_weights is None:
-                    self._evict_to_make_room()
-            if cached_weights is None and enable_prefetch:
-                prefetch_size = sum(
-                    os.path.getsize(file) for file in weight_files)
-                logger.info(
-                    f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
-                )
-                self.prefetch_files(weight_files,
-                                    local_rank=local_rank,
-                                    local_size=local_size)
-        except Exception as error:
-            preparation_error = error
-        coordinated_preparation_error = self._coordinate_rank_error(
-            "native checkpoint cache lookup and prefetch", preparation_error)
-        if coordinated_preparation_error is not None:
-            raise coordinated_preparation_error
-
-        if cached_weights is not None:
-            logger.info("Reusing cached HF checkpoint weights.")
-            return cached_weights
-
-        weights = self._load_weights_in_parallel(
+        return self._load_weights_in_parallel(
             weight_files, self._load_safetensors_file,
             "Loading safetensors weights in parallel")
-        if cache_key is not None:
-            self._cache_loaded_weights(cache_key, weights)
-        return weights
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:
@@ -1255,175 +914,6 @@ class HfWeightLoader(BaseWeightLoader):
                                       mmap=False)
         finally:
             return part_weights
-
-    @classmethod
-    def _get_effective_available_host_memory(cls) -> int:
-        """Return reclaim-aware host availability capped by cgroup limits."""
-        host_available = psutil.virtual_memory().available
-        cgroup_available = cls._get_cgroup_available_host_memory()
-        if cgroup_available is None:
-            return host_available
-        return min(host_available, cgroup_available)
-
-    @staticmethod
-    def _get_cgroup_available_host_memory() -> int | None:
-        """Best-effort cgroup-v1/v2 remaining-memory discovery."""
-        relative_path = ""
-        try:
-            for line in Path("/proc/self/cgroup").read_text().splitlines():
-                fields = line.split(":", 2)
-                if len(fields) == 3 and fields[0] == "0":
-                    relative_path = fields[2].lstrip("/")
-                    break
-                if len(fields) == 3 and "memory" in fields[1].split(","):
-                    relative_path = fields[2].lstrip("/")
-        except (OSError, UnicodeError):
-            pass
-
-        roots = [Path("/sys/fs/cgroup")]
-        if relative_path:
-            roots.append(Path("/sys/fs/cgroup") / relative_path)
-        v1_root = Path("/sys/fs/cgroup/memory")
-        roots.append(v1_root / relative_path if relative_path else v1_root)
-
-        available_values = []
-        seen = set()
-        for root in roots:
-            if root in seen:
-                continue
-            seen.add(root)
-            for limit_name, current_name, unlimited_threshold in (
-                ("memory.max", "memory.current", None),
-                ("memory.limit_in_bytes", "memory.usage_in_bytes", 1 << 60),
-            ):
-                try:
-                    raw_limit = (root / limit_name).read_text().strip()
-                    if raw_limit == "max":
-                        continue
-                    limit = int(raw_limit)
-                    if (unlimited_threshold is not None
-                            and limit >= unlimited_threshold):
-                        continue
-                    current = int((root / current_name).read_text().strip())
-                except (OSError, UnicodeError, ValueError):
-                    continue
-                available_values.append(max(0, limit - current))
-
-        if not available_values:
-            return None
-        return min(available_values)
-
-    @staticmethod
-    def _distribute_worker_budget(
-        local_size: int,
-        workers_per_node: int,
-        workers_per_rank: int,
-    ) -> tuple[int, ...]:
-        """Distribute an exact node budget as evenly as possible."""
-        if local_size <= 0:
-            raise ValueError("local_size must be positive")
-        if workers_per_node <= 0 or workers_per_rank <= 0:
-            raise ValueError("worker budgets must be positive")
-        worker_budget = min(workers_per_node, local_size * workers_per_rank)
-        base_workers, extra_workers = divmod(worker_budget, local_size)
-        return tuple(base_workers + (rank < extra_workers)
-                     for rank in range(local_size))
-
-    def _local_prefetch_plan(
-        self,
-        file_names: List[str],
-        local_rank: int,
-        local_size: int,
-    ) -> tuple[list[tuple[str, int, int]], int]:
-        """Return complete, disjoint extents and this rank's worker count."""
-        chunks = []
-        for file_name in sorted(file_names):
-            file_size = os.path.getsize(file_name)
-            for offset in range(0, file_size, self._prefetch_chunk_size):
-                chunks.append((file_name, offset,
-                               min(self._prefetch_chunk_size,
-                                   file_size - offset)))
-
-        worker_counts = self._distribute_worker_budget(
-            local_size,
-            self._prefetch_workers_per_node,
-            self._prefetch_workers_per_rank,
-        )
-        active_ranks = [
-            rank for rank, worker_count in enumerate(worker_counts)
-            if worker_count > 0
-        ]
-        if local_rank not in active_ranks or not chunks:
-            return [], 0
-        active_ordinal = active_ranks.index(local_rank)
-        local_chunks = chunks[active_ordinal::len(active_ranks)]
-        return local_chunks, min(worker_counts[local_rank], len(local_chunks))
-
-    @staticmethod
-    def _prefetch_one_chunk(
-        file_name: str,
-        offset: int,
-        length: int,
-        cancel_event: threading.Event | None = None,
-    ) -> None:
-        """Read one bounded file extent into the Linux page cache."""
-        with open(file_name, "rb", buffering=0) as checkpoint_file:
-            file_descriptor = checkpoint_file.fileno()
-            read_offset = offset
-            remaining = length
-            while remaining > 0:
-                if cancel_event is not None and cancel_event.is_set():
-                    return
-                read_size = min(remaining, _PREFETCH_READ_SIZE)
-                data = os.pread(file_descriptor, read_size, read_offset)
-                if not data:
-                    raise OSError(
-                        f"Unexpected EOF while reading {file_name} at byte "
-                        f"offset {read_offset}.")
-                bytes_read = len(data)
-                read_offset += bytes_read
-                remaining -= bytes_read
-
-    def _prefetch_chunks(
-        self,
-        local_chunks: list[tuple[str, int, int]],
-        max_workers: int,
-        *,
-        cancel_event: threading.Event,
-        completion_callback: Callable[[int], None],
-    ) -> None:
-        """Execute a precomputed plan without MPI calls on worker threads."""
-        if not local_chunks:
-            return
-        if max_workers <= 0:
-            raise ValueError(
-                "a nonempty read plan requires at least one worker")
-
-        def prefetch_chunk(chunk: tuple[str, int, int]) -> None:
-            try:
-                self._prefetch_one_chunk(*chunk, cancel_event=cancel_event)
-                if not cancel_event.is_set():
-                    completion_callback(chunk[2])
-            except Exception:
-                cancel_event.set()
-                raise
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(prefetch_chunk, chunk) for chunk in local_chunks
-            ]
-            try:
-                for index, future in enumerate(futures):
-                    if cancel_event.is_set():
-                        for pending_future in futures[index:]:
-                            pending_future.cancel()
-                    if not future.cancelled():
-                        future.result()
-            except Exception:
-                cancel_event.set()
-                for pending_future in futures:
-                    pending_future.cancel()
-                raise
 
     def _prefetch_one_file(
             self,
@@ -1494,19 +984,19 @@ class HfWeightLoader(BaseWeightLoader):
                     report_progress(num_read)
         return total_read
 
-    def prefetch_files(self,
-                       file_names: List[str],
-                       *,
-                       local_rank: int = 0,
-                       local_size: int = 1):
+    def prefetch_files(self, file_names: List[str], local_communicator=None):
         """
         Prefetch safetensors files to memory so that the weight loading will be much faster.
         When multiple ranks run in parallel, each rank will prefetch some files.
         """
-        if local_size <= 0 or not 0 <= local_rank < local_size:
-            raise ValueError("local rank and size must describe a valid group")
-        # Each active-group rank prefetches a disjoint file stripe.
-        local_file_names = file_names[local_rank::local_size]
+        # Find out the files to prefetch for the current rank.
+        # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
+        if local_communicator is None:
+            rank, size = local_mpi_rank(), local_mpi_size()
+        else:
+            rank = local_communicator.Get_rank()
+            size = local_communicator.Get_size()
+        local_file_names = file_names[rank::size]
         if len(local_file_names) == 0:
             return
 
