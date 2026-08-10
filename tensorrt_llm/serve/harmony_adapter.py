@@ -1057,7 +1057,40 @@ class HarmonyAdapter:
                 # The last message is complete, we're done
                 break
 
+        # clean_tokens is always a prefix of tokens, so the discarded span is
+        # the remaining suffix.
+        if len(clean_tokens) < len(tokens):
+            self._log_discarded_tokens(tokens[len(clean_tokens):])
+
         return clean_tokens
+
+    def _log_discarded_tokens(self, discarded: list[int]) -> None:
+        """Report tokens dropped by :meth:`_strip_incomplete_messages`.
+
+        A trailing message with no ``<|message|>`` token is usually a
+        generation that was cut short (e.g. ``max_tokens`` was hit), and
+        discarding it is correct and unremarkable.
+
+        It is *not* benign when the discarded span carries a stop token or a
+        tool recipient: that message was complete, merely malformed, and
+        dropping it turns a tool call into an empty ``tool_calls`` list with
+        ``finish_reason="stop"`` — indistinguishable from the model choosing
+        not to call a tool. Warn loudly so this is diagnosable instead of
+        silent.
+        """
+        text = self._safe_decode_utf8(discarded, "DISCARDED_TOKENS: ")
+        stop_tokens = set(self.get_stop_tokens())
+
+        if any(token in stop_tokens
+               for token in discarded) or "to=functions." in text:
+            logger.warning(
+                f"Discarded {len(discarded)} token(s) forming a complete but "
+                f"malformed harmony message; any tool call it carried has been "
+                f"dropped from the response. Discarded text: {text!r}")
+        else:
+            logger.debug(
+                f"Stripped {len(discarded)} token(s) of an incomplete trailing "
+                f"harmony message: {text!r}")
 
     def harmony_output_to_openai(
             self,

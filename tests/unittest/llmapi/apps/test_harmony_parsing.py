@@ -1327,6 +1327,109 @@ class TestStreamOptionsUsage:
                 harmony_adapter.cleanup_stream_state(request_id)
 
 
+class TestStripIncompleteMessagesReporting:
+    """_strip_incomplete_messages must not discard tool calls silently.
+
+    NVBug 6456085 / GitHub #16377: when a tool-call message reaches the
+    adapter with a malformed header (no <|message|> token), the whole
+    message was dropped with no log output at all. The response then looked
+    like a normal refusal to call the tool -- HTTP 200, finish_reason
+    "stop", populated reasoning_content, and an empty tool_calls list --
+    which no caller can distinguish from the model declining to act.
+    """
+
+    @pytest.fixture
+    def adapter(self):
+        try:
+            return HarmonyAdapter(harmony_input=False, harmony_output=False)
+        except Exception as e:
+            pytest.skip(f"Cannot create HarmonyAdapter: {e}")
+
+    @staticmethod
+    def _completion_tokens(adapter):
+        """Canonical harmony completion tokens: analysis msg + tool call."""
+        try:
+            from openai_harmony import Conversation, Message, Role
+        except (ImportError, ModuleNotFoundError):
+            pytest.skip("openai_harmony not importable")
+
+        analysis = Message.from_role_and_content(
+            Role.ASSISTANT, "User asks weather in Rome. Use function."
+        ).with_channel("analysis")
+        tool = (
+            Message.from_role_and_content(Role.ASSISTANT, '{"city": "Rome"}')
+            .with_channel("commentary")
+            .with_recipient("functions.get_weather")
+            .with_content_type("<|constrain|>json")
+        )
+        tokens = adapter.encoding.render_conversation(Conversation.from_messages([analysis, tool]))
+        # parse_messages_from_completion_tokens(role=ASSISTANT) expects the
+        # stream the model emits, i.e. without the leading <|start|>assistant.
+        return list(tokens[2:])
+
+    def test_wellformed_tool_call_is_parsed_without_warning(self, adapter):
+        """Baseline: an intact stream yields the tool call and logs nothing."""
+        tokens = self._completion_tokens(adapter)
+
+        with patch("tensorrt_llm.serve.harmony_adapter.logger") as mock_logger:
+            result = adapter.harmony_output_to_openai(
+                harmony_output_tokens=tokens,
+                available_tools=None,
+                tool_choice=None,
+            )
+
+        assert len(result.get("tool_calls", [])) == 1
+        assert result["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert not result.get("_harmony_parsing_failed", False)
+        mock_logger.warning.assert_not_called()
+
+    def test_malformed_tool_call_header_is_reported(self, adapter):
+        """A dropped tool call must produce a warning, not silence."""
+        tokens = self._completion_tokens(adapter)
+        message_token = 200008  # <|message|>
+        # Drop the <|message|> that opens the tool-call body, leaving a
+        # complete-but-malformed message -- the shape reported in #10612.
+        idx = len(tokens) - 1 - tokens[::-1].index(message_token)
+        malformed = tokens[:idx] + tokens[idx + 1 :]
+
+        with patch("tensorrt_llm.serve.harmony_adapter.logger") as mock_logger:
+            result = adapter.harmony_output_to_openai(
+                harmony_output_tokens=malformed,
+                available_tools=None,
+                tool_choice=None,
+            )
+
+        # The tool call is still lost -- recovering malformed model output is
+        # out of scope -- but the loss is now visible.
+        assert result.get("tool_calls", []) == []
+        assert mock_logger.warning.called, "tool call was dropped silently"
+        logged = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+        assert "get_weather" in logged
+
+    def test_truncated_tail_does_not_warn(self, adapter):
+        """A genuinely truncated trailing header is benign and stays quiet.
+
+        Hitting max_tokens mid-header is normal; only complete-but-malformed
+        messages (carrying a stop token or a tool recipient) are worth a
+        warning, otherwise the signal is drowned out.
+        """
+        tokens = self._completion_tokens(adapter)
+        start_token = 200006  # <|start|>
+        idx = len(tokens) - 1 - tokens[::-1].index(start_token)
+        # Keep the analysis message plus a bare, contentless <|start|>.
+        truncated = tokens[: idx + 1]
+
+        with patch("tensorrt_llm.serve.harmony_adapter.logger") as mock_logger:
+            result = adapter.harmony_output_to_openai(
+                harmony_output_tokens=truncated,
+                available_tools=None,
+                tool_choice=None,
+            )
+
+        assert result.get("tool_calls", []) == []
+        mock_logger.warning.assert_not_called()
+
+
 def test_none_tokenizer_num_postprocess_workers():
     server = object.__new__(OpenAIServer)
     server.tokenizer = None
