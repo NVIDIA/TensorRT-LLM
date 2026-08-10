@@ -99,7 +99,7 @@ def split_k_is_supported(k: int, split_k: int, ab_dtype: torch.dtype) -> bool:
 
 
 def default_split_k(num_tokens: int) -> int:
-    """How many CTAs to put on the K dimension, from the microbenchmark sweep.
+    """How many CTAs to put on the K dimension, measured on B200.
 
     The mainloop alone keeps wanting 32 partitions, but the partials go back
     through memory and Torch will not reduce them for less than about 1.8us, so
@@ -130,7 +130,7 @@ def fold_is_supported(tactic: Tactic, stacked_n: int) -> bool:
 
 
 def default_tactic(num_tokens: int) -> Tactic:
-    """Tile and cluster shape, from the microbenchmark's tuning sweep.
+    """Tile and cluster shape, measured on B200 at 128 experts and 6144 hidden.
 
     N is at most 256 even with both weight terms, so the grid is essentially
     M / tile_m CTAs and the tile shape decides how few CTAs the work lands on.
