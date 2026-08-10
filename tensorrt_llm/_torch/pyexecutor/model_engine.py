@@ -815,9 +815,14 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
         # Pinned staging buffers for async H2D copies on the ragged path; see
-        # _pinned_host / _pinned_host_record.
+        # _pinned_host / _pinned_host_record. Two slots per key: the WAR guard
+        # on a slot only waits for the H2D enqueued two steps ago, so in
+        # steady state the wait is free. A single slot would serialize step
+        # N+1's prepare against step N's stream position (measured 6 blocking
+        # event syncs / 21.6 ms per step on short-window batches).
         self._pinned_host_cache = {}
         self._pinned_host_events = {}
+        self._pinned_host_active = {}
 
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
@@ -4280,19 +4285,24 @@ class PyTorchModelEngine(ModelEngine):
         grown monotonically.
         """
         values = list(values)
-        cache = self._pinned_host_cache
-        # WAR guard: the buffer must not be rewritten while its previous
-        # non_blocking H2D is still queued. Callers record the key's event via
-        # _pinned_host_record after enqueuing; waiting here closes the window.
-        evt = self._pinned_host_events.get(key)
+        # WAR guard: a slot must not be rewritten while its previous
+        # non_blocking H2D is still queued. Callers record the active slot's
+        # event via _pinned_host_record after enqueuing; two slots alternate,
+        # so this wait targets the copy from two steps ago and is free in
+        # steady state (a single slot would stall prepare behind the previous
+        # step's stream position).
+        slot = 1 - self._pinned_host_active.get(key, 1)
+        evt = self._pinned_host_events.get((key, slot))
         if evt is not None:
             evt.synchronize()
-        buf = cache.get(key)
+        bufs = self._pinned_host_cache.setdefault(key, [None, None])
+        buf = bufs[slot]
         if buf is None or buf.numel() < len(values) or buf.dtype != dtype:
             buf = torch.empty(max(len(values), 1),
                               dtype=dtype,
                               pin_memory=prefer_pinned())
-            cache[key] = buf
+            bufs[slot] = buf
+        self._pinned_host_active[key] = slot
         view = buf[:len(values)]
         if values:
             view.copy_(torch.tensor(values, dtype=dtype))
@@ -4308,9 +4318,12 @@ class PyTorchModelEngine(ModelEngine):
         if torch.cuda.is_current_stream_capturing():
             return
         for key in keys:
-            evt = self._pinned_host_events.get(key)
+            slot = self._pinned_host_active.get(key)
+            if slot is None:
+                continue
+            evt = self._pinned_host_events.get((key, slot))
             if evt is None:
-                evt = self._pinned_host_events[key] = torch.cuda.Event()
+                evt = self._pinned_host_events[(key, slot)] = torch.cuda.Event()
             evt.record()
 
     def _attach_accept_caps(self, spec_metadata, generation_requests) -> None:
