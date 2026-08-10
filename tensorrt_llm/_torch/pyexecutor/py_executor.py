@@ -5026,33 +5026,6 @@ class PyExecutor:
                         f"length_penalty {invalid} is negative; only "
                         "non-negative values are supported.")
 
-            # Beam search keeps a pool of finished candidates, which the
-            # context server can already populate on its first step. That pool
-            # is not part of the disaggregated handoff (ContextPhaseParams
-            # carries only the first generated tokens) and is cleared on the
-            # generation side, so a completion the context phase found would be
-            # silently dropped -- reachable under aggregation but not under
-            # disaggregation.
-            #
-            # This applies to every early_stopping mode and to both samplers:
-            # TorchSampler now serves all modes from the candidate-beams-array
-            # path, and the C++ decoder behind TRTLLMSampler maintains the pool
-            # unconditionally (beamSearchLayer.cu assigns numBeamsCBA with no
-            # mode check). Reject until the handoff carries the pool;
-            # TRTLLM-14792.
-            # NB: is_context_only_request is a property, but
-            # is_generation_only_request is a plain method -- it must be called,
-            # otherwise the bound method is truthy and this matches every request.
-            if (request.is_context_only_request
-                    or request.is_generation_only_request()):
-                if sampling_config.beam_width > 1:
-                    raise ValueError(
-                        "Beam search is not supported with disaggregated "
-                        "serving: the finished-candidate pool built during the "
-                        "context phase is not transferred to the generation "
-                        "server, so completions found there would be silently "
-                        "dropped. Use beam_width=1.")
-
         # Check token ID ranges
         self._validate_token_id_range(request)
 
@@ -6430,12 +6403,13 @@ class PyExecutor:
                                                      first_gen_tokens) -> bool:
         """Update beam sampler state with context-side first-token data.
 
-        NB: currently unreachable past the beam_width <= 1 guard. Admission
-        rejects beam search under disaggregated serving (see
-        _validate_request), because the finished-candidate pool the context
-        server builds is not part of the handoff. Kept rather than deleted:
-        this is the seeding half of that handoff and becomes live again once
-        the pool is transferred; TRTLLM-14792.
+        Seeds this side's beam state from the handoff: the per-beam token, its
+        cumulative log-prob, and an identity cache indirection. A beam whose
+        token is the end id finished during prefill and is latched for harvest
+        so the first CBA step pools it here -- the context server's own pool is
+        not transferred (TRTLLM-14792), which is why its end id is masked for
+        the CBA op so such a token stays in the beam slot and survives the
+        handoff.
         """
         if beam_width <= 1:
             return True
@@ -6516,6 +6490,26 @@ class PyExecutor:
         # at index prompt_len. No generated-length counter needs seeding to
         # match: length_penalty normalizes by seq_lens - prompt_lens, which
         # counts that token because it occupies the first generated slot.
+
+        # A beam whose handed-off token is the end id finished during prefill.
+        # The context server keeps such a token in its beam slot rather than
+        # pooling it (its end id is masked for the CBA op, see
+        # _group_requests_with_metadata), precisely so it survives the handoff
+        # and can be pooled here instead. Raise the harvest latch and the first
+        # CBA step folds the path into this side's pool and frees the slot --
+        # the same route stop words take.
+        end_id = req.py_end_id
+        if end_id is not None and end_id >= 0:
+            finished_beams = [
+                beam_idx for beam_idx in range(beam_width)
+                if first_gen_tokens[beam_idx] == end_id
+            ]
+            if finished_beams:
+                pending_harvest = beam_search_store.pending_harvest
+                pending_harvest[seq_slot,
+                                torch.tensor(finished_beams,
+                                             device=pending_harvest.device,
+                                             dtype=torch.long)] = True
         return True
 
     @staticmethod
@@ -6966,6 +6960,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
+    @torch.inference_mode()
     def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)

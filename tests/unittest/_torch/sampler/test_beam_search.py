@@ -448,17 +448,14 @@ def test_beam_search_disagg_e2e(
     input_prompts,
     model_kwargs: dict[str, Any],
 ) -> None:
-    """Beam search must be rejected under disaggregated serving.
+    """Beam search is admitted under disaggregated serving.
 
-    Every early_stopping mode keeps a pool of finished candidates, which the
-    context server can already populate on its first step. That pool is not
-    part of the handoff -- ContextPhaseParams carries only the first generated
-    tokens -- and is cleared on the generation side, so a completion found
-    during the context phase would be silently dropped. This holds for both
-    samplers: TorchSampler serves every mode from the candidate-beams-array
-    path, and the C++ decoder behind TRTLLMSampler maintains the pool
-    unconditionally. Rejected at admission until the handoff carries the pool
-    (TRTLLM-14792).
+    The context server's finished-candidate pool is not part of the handoff
+    (TRTLLM-14792), so the CBA op runs with that side's end id masked: an end
+    candidate stays in its beam slot rather than being pooled, travels as
+    first_gen_tokens, and the generation server pools it there instead. Every
+    early_stopping mode goes through the same route, so admission accepts them
+    all rather than rejecting beam search outright.
     """
     sampling_params = SamplingParams(
         max_tokens=fixed_params["max_tokens"],
@@ -489,24 +486,28 @@ def test_beam_search_disagg_e2e(
     ctx_llm = _build_llm(fixed_params, prompts, disagg_kwargs)
     try:
         with ctx_llm:
-            # Every mode is rejected, including the default (early_stopping
-            # unset, i.e. True).
+            # Every mode goes through the same route, including the default
+            # (early_stopping unset, i.e. True).
             for early_stopping in (None, 0, 1, 2):
                 params = deepcopy(sampling_params)
                 if early_stopping is not None:
                     params.early_stopping = early_stopping
-                with pytest.raises(RequestError,
-                                   match=".*not supported with disaggregated"
-                                   " serving.*"):
-                    _ = ctx_llm.generate(
-                        deepcopy(prompts),
-                        sampling_params=params,
-                        disaggregated_params=[
-                            DisaggregatedParams(request_type="context_only",
-                                                disagg_request_id=200)
-                        ],
-                        use_tqdm=False,
-                    )
+                outputs = ctx_llm.generate(
+                    deepcopy(prompts),
+                    sampling_params=params,
+                    disaggregated_params=[
+                        DisaggregatedParams(request_type="context_only",
+                                            disagg_request_id=200)
+                    ],
+                    use_tqdm=False,
+                )
+                # The context phase hands off one token per beam; admission no
+                # longer rejects it, which is what this pins.
+                assert len(outputs) == len(prompts)
+                ctx_params = outputs[0].disaggregated_params
+                assert ctx_params is not None
+                assert len(ctx_params.first_gen_tokens
+                           ) == fixed_params["max_beam_width"]
     finally:
         ctx_llm.shutdown()
 

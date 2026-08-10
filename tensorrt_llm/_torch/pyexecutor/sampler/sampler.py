@@ -2247,6 +2247,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     group_seq_lens_cuda = seq_lens[value.indices].to(
                         device="cuda", non_blocking=True
                     )  # Should be on device for beam search
+                # Context-only (disaggregated prefill) requests hand off after
+                # this single step, so the finished-candidate pool they would
+                # build is discarded rather than transferred. Mask their end id
+                # to the "no end token" sentinel (< 0) so an end candidate stays
+                # in its beam slot instead: the slot's token is what reaches the
+                # generation server as first_gen_tokens, which lets that side
+                # rebuild the pool entry itself. Data-only -- the op sees a
+                # tensor, so this adds no branch to the compiled step.
+                cba_end_ids = self._finish_reasons_handler.store.end_ids_cuda
+                if beam_search_store.cba is not None and any(
+                    requests[i].is_context_only_request for i in value.indices.tolist()
+                ):
+                    cba_end_ids = cba_end_ids.clone()
+                    ctx_slots = [
+                        requests[i].py_seq_slot
+                        for i in value.indices.tolist()
+                        if requests[i].is_context_only_request
+                    ]
+                    cba_end_ids[
+                        torch.tensor(ctx_slots, device=cba_end_ids.device, dtype=torch.long)
+                    ] = -1
                 metadata = BeamSearchMetadata(
                     cache_indirection=beam_search_store.cache_indirection,
                     cache_indirection_buffer=beam_search_store.cache_indirection_buffer,
@@ -2264,7 +2285,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     cba=None
                     if beam_search_store.cba is None
                     else CBAState(
-                        end_ids=self._finish_reasons_handler.store.end_ids_cuda,
+                        end_ids=cba_end_ids,
                         prompt_lens=beam_search_store.prompt_lens,
                         original_tokens=beam_search_store.original_tokens,
                         batch_dones=beam_search_store.batch_dones,
@@ -2424,7 +2445,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 continue
 
             if req.py_beam_width > 1:
-                if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
+                # Context-only (disaggregated prefill) requests reach the
+                # sampler already flagged as finished -- the context server is
+                # done with them -- but they are migrating, not completing:
+                # the generation server decodes the rest. Finalizing here
+                # would rewrite the beam rows from the beam history, and after
+                # a single step only beam 0 has history; every other beam is
+                # all BEAM_SEARCH_PAD_TOKEN, so set_generated_tokens would
+                # give it an empty generated sequence. The handoff reads the
+                # per-beam first token back out via getTokens().back()
+                # (llmRequest.cpp), which would then hand the generation
+                # server the prompt tail instead of that beam's token. Append
+                # this step's tokens instead and let the generation side own
+                # finalization.
+                if (
+                    not req.is_context_only_request
+                    and (beam_history := _maybe_build_beam_history(req_idx)) is not None
+                ):
                     finalize_beam(req, beam_history)
                 else:
                     # Only the leading beam_width_out columns hold real tokens;
