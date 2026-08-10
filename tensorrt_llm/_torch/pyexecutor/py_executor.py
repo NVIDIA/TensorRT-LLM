@@ -77,7 +77,7 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length,
+                          MultimodalEncoderRequestError, get_draft_token_length,
                           initialize_multimodal_encoder_request,
                           is_multimodal_encoder_ready)
 from .mamba_cache_manager import (BaseMambaCacheManager,
@@ -5967,7 +5967,7 @@ class PyExecutor:
         try:
             self.model_engine.forward_multimodal_encoder_items(
                 self.active_requests, scheduled_items)
-        except Exception as e:
+        except MultimodalEncoderRequestError as e:
             error_msg = str(e)
             logger.error(f"Encountered an error in multimodal encoder forward: "
                          f"{error_msg}\n{traceback.format_exc()}")

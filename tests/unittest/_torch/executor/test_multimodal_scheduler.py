@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueIt
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     MultimodalEncoderProgress,
+    MultimodalEncoderRequestError,
     MultimodalEncoderRequestState,
     get_multimodal_encoder_token_lengths,
     initialize_multimodal_encoder_request,
@@ -423,7 +424,7 @@ def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
     handled = []
 
     def fail_encoder(*_):
-        raise ValueError("bad MM output")
+        raise MultimodalEncoderRequestError("bad MM output")
 
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed, unrelated_context, unrelated_generation]
@@ -443,6 +444,27 @@ def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
     assert scheduled_requests.generation_requests == [unrelated_generation]
     assert scheduled_requests.scheduled_mm_encoder_items is None
     assert handled == [("bad MM output", {"requests": [failed], "charge_budget": False})]
+
+
+def test_forward_multimodal_encoder_step_propagates_system_errors():
+    failed = _request(1, [4])
+
+    def fail_encoder(*_):
+        raise torch.cuda.OutOfMemoryError("encoder OOM")
+
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [failed]
+    executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([failed])
+    scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
+
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="encoder OOM"):
+        executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert scheduled_requests.context_requests == [failed]
+    assert scheduled_requests.scheduled_mm_encoder_items == {failed.request_id: [0]}
 
 
 def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
@@ -593,6 +615,38 @@ def test_prepare_multimodal_encoder_inputs_rejects_invalid_metadata_types():
 
     with pytest.raises(TypeError, match="must be a MultimodalEncoderItemMetadata"):
         MultimodalModelMixin().prepare_multimodal_encoder_inputs([(multimodal_param, 0)])
+
+
+def test_item_encoder_classifies_request_state_contract_errors():
+    class _Model(MultimodalModelMixin):
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    request = _llm_request(1)
+
+    with pytest.raises(MultimodalEncoderRequestError, match="no longer active"):
+        engine.forward_multimodal_encoder_items([], {request.request_id: [0]})
+
+    with pytest.raises(MultimodalEncoderRequestError, match="no encoder item state"):
+        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
+
+
+def test_item_encoder_classifies_output_count_contract_error():
+    class _Model(MultimodalModelMixin):
+        def prepare_multimodal_encoder_inputs(self, _):
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        def forward_multimodal_encoder_items(self, _):
+            return []
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    request = _request(1, [4])
+
+    with pytest.raises(MultimodalEncoderRequestError, match="one output per item"):
+        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
 
 
 def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
@@ -1052,13 +1106,13 @@ def test_mm_encoder_state_progress_and_pending_transitions():
 def test_mm_encoder_state_record_rejects_mismatched_outputs():
     state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
 
-    with pytest.raises(ValueError, match="expected 2"):
+    with pytest.raises(MultimodalEncoderRequestError, match="expected 2"):
         state.record(0, torch.ones(5, 2))
 
     state.record(0, torch.ones(2, 2))
-    with pytest.raises(ValueError, match="matching"):
+    with pytest.raises(MultimodalEncoderRequestError, match="matching"):
         state.record(1, torch.ones(3, 4))  # hidden dim mismatch vs items
-    with pytest.raises(ValueError, match="already recorded"):
+    with pytest.raises(MultimodalEncoderRequestError, match="already recorded"):
         state.record(0, torch.ones(2, 2))  # items encode at most once
 
 

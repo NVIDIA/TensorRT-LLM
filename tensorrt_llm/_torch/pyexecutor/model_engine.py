@@ -91,7 +91,8 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, LlmRequestState, _Unset,
+from .llm_request import (LlmRequest, LlmRequestState,
+                          MultimodalEncoderRequestError, _Unset,
                           get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
@@ -3309,11 +3310,11 @@ class PyTorchModelEngine(ModelEngine):
         for request_id, item_indices in scheduled_items.items():
             request = request_by_id.get(request_id)
             if request is None:
-                raise RuntimeError(
+                raise MultimodalEncoderRequestError(
                     f"Scheduled MM request {request_id} is no longer active")
             state = request.py_mm_encoder_state
             if state is None:
-                raise RuntimeError(
+                raise MultimodalEncoderRequestError(
                     f"Scheduled MM request {request_id} has no encoder "
                     "item state")
             touched_requests[request_id] = request
@@ -3363,7 +3364,7 @@ class PyTorchModelEngine(ModelEngine):
             outputs = self.model.forward_multimodal_encoder_items(
                 encoder_inputs)
             if len(outputs) != len(miss_owners):
-                raise RuntimeError(
+                raise MultimodalEncoderRequestError(
                     "MM item encoder must return one output per item")
 
             for output, (request, item_idx, key) in zip(outputs,

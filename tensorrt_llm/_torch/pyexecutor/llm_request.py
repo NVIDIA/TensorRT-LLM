@@ -56,6 +56,10 @@ REQUEST_TYPE_MAPPING = {
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 
+class MultimodalEncoderRequestError(ValueError):
+    """A request-scoped MM encoder state or output contract violation."""
+
+
 class MultimodalEncoderProgress(Enum):
     """Python-only progress derived from request-local MM item outputs.
 
@@ -237,10 +241,11 @@ class MultimodalEncoderRequestState:
         """
         expected_rows = self.embedding_lengths[item_idx]
         if output.shape[0] != expected_rows:
-            raise ValueError(f"MM item {item_idx} produced {output.shape[0]} "
-                             f"embeddings; expected {expected_rows}")
+            raise MultimodalEncoderRequestError(
+                f"MM item {item_idx} produced {output.shape[0]} embeddings; "
+                f"expected {expected_rows}")
         if self.recorded[item_idx]:
-            raise ValueError(
+            raise MultimodalEncoderRequestError(
                 f"MM item {item_idx} was already recorded; items are "
                 "encoded at most once per request")
         if self.embeddings is None:
@@ -251,7 +256,7 @@ class MultimodalEncoderRequestState:
         elif (self.embeddings.shape[1:] != output.shape[1:]
               or self.embeddings.dtype != output.dtype
               or self.embeddings.device != output.device):
-            raise ValueError(
+            raise MultimodalEncoderRequestError(
                 "MM encoder items for one request must have matching "
                 "output shape, dtype, and device")
         start = self._row_starts[item_idx]
