@@ -1984,9 +1984,16 @@ def _create_kv_cache_manager(
         # drafter's layers to this manager; tell the manager explicitly which
         # tail of the layer range is draft (consumed by managers that expose a
         # draft sub-page view, e.g. MiniMax-M3; the base __init__ ignores it).
+        # Baseline is the TARGET layer count from the pretrained config: the
+        # per-layer heads list may arrive pre-extended from the caller, in
+        # which case num_hidden_layers already includes the draft tail and
+        # cannot serve as the reference. Masked/cross managers yield a
+        # non-positive delta and correctly report 0.
+        target_num_layers = getattr(config, "num_hidden_layers", None)
         num_appended_draft_layers = (len(per_layer_num_kv_heads) -
-                                     num_hidden_layers if isinstance(
-                                         per_layer_num_kv_heads, list) else 0)
+                                     target_num_layers
+                                     if isinstance(per_layer_num_kv_heads, list)
+                                     and target_num_layers is not None else 0)
         manager_extra_kwargs["num_one_model_draft_layers"] = max(
             0, num_appended_draft_layers)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
