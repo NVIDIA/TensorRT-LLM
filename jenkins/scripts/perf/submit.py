@@ -67,6 +67,17 @@ DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
 # Test list parsing
 # --------------------------------------------------------------------------- #
 def _read_test_list_lines(test_list_path):
+    """Read runnable entries from a generated test list.
+
+    Args:
+        test_list_path: Path to the generated test-list file.
+
+    Returns:
+        Non-empty, non-comment test-list lines in source order.
+
+    Raises:
+        ValueError: If the test list has no runnable entries.
+    """
     with open(test_list_path, "r") as f:
         lines = []
         for line in f:
@@ -79,6 +90,14 @@ def _read_test_list_lines(test_list_path):
 
 
 def _pytest_command_tokens(script_prefix_lines):
+    """Parse the exported pytest command from a launch-script prefix.
+
+    Args:
+        script_prefix_lines: Lines from the launch-script prefix.
+
+    Returns:
+        Shell-parsed pytest command tokens, or an empty list when the export is absent.
+    """
     pytest_command_line = next(
         (line for line in script_prefix_lines if "export pytestCommand=" in line), ""
     )
@@ -91,6 +110,15 @@ def _pytest_command_tokens(script_prefix_lines):
 
 
 def _pytest_option(tokens, option):
+    """Return a pytest option's value from command tokens.
+
+    Args:
+        tokens: Shell-parsed pytest command tokens.
+        option: Option name to find, including its leading dashes.
+
+    Returns:
+        The option value, or ``None`` when the option or its value is absent.
+    """
     for index, token in enumerate(tokens):
         if token == option:
             return tokens[index + 1] if index + 1 < len(tokens) else None
@@ -100,7 +128,14 @@ def _pytest_option(tokens, option):
 
 
 def _test_nodeid(test_line):
-    """Strip test-list markers from a line, matching pytest's selected nodeid."""
+    """Strip test-list markers from a line to recover pytest's node ID.
+
+    Args:
+        test_line: Test-list entry, optionally followed by execution markers.
+
+    Returns:
+        The pytest node ID from the entry.
+    """
     return re.split(
         r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?:\s|$)",
         test_line,
@@ -109,6 +144,19 @@ def _test_nodeid(test_line):
 
 
 def _load_pytest_split_durations(tokens, llm_src):
+    """Load pytest-split duration data using the launcher's path fallback.
+
+    Args:
+        tokens: Shell-parsed pytest command tokens.
+        llm_src: TensorRT-LLM source-tree path used for the repository fallback.
+
+    Returns:
+        A pair containing the duration mapping and the path it was loaded from.
+
+    Raises:
+        FileNotFoundError: If neither the configured path nor its repository fallback exists.
+        ValueError: If the duration data is not a mapping or legacy list of pairs.
+    """
     durations_option = _pytest_option(tokens, "--durations-path")
     if durations_option:
         durations_path = durations_option
@@ -138,7 +186,20 @@ def _load_pytest_split_durations(tokens, llm_src):
 
 
 def _select_least_duration_group(lines, durations, splits, group):
-    """Mirror pytest-split's LeastDurationAlgorithm exactly."""
+    """Mirror pytest-split's ``LeastDurationAlgorithm`` exactly.
+
+    Args:
+        lines: Test-list entries to distribute among the split groups.
+        durations: Mapping from pytest node IDs to recorded durations.
+        splits: Number of duration-balanced groups to create.
+        group: One-indexed group to return.
+
+    Returns:
+        Entries assigned to the requested group, in their original test-list order.
+
+    Raises:
+        ValueError: If ``splits`` is less than one or ``group`` is outside its range.
+    """
     if splits < 1:
         raise ValueError(f"pytest --splits must be >= 1, got {splits}")
     if group < 1 or group > splits:

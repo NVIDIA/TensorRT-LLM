@@ -372,7 +372,8 @@ def test_precheck_env_kill_switch_truthy(monkeypatch):
     """
     cfg = {"cache_transceiver_precheck": {"enabled": True}}
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
-    assert _enabled_line(cfg).endswith("=1")  # yaml default
+    assert _enabled_line(cfg).endswith("=1")  # yaml opt-in
+    assert _enabled_line({}).endswith("=0")  # off by default (waived)
     for v in ("1", "true", "on", "YES", " True "):
         monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
         assert _enabled_line(cfg).endswith("=1"), v
