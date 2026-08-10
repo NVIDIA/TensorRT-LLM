@@ -605,6 +605,8 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 **工作假设(判别中)**:调度器步 token 预算按 **KV block 粒度**给 gen 请求计费——Pro block=64 → 4096/64 = **64 请求/步**(众数 60-62 恰在其下,且与最初"64 行步"观察逐位吻合);Flash block=32 → 4096/32 = 128(DEP4 从未撞上,v7b 实测 122 通行)。判别:Pro `max_num_tokens` 4096→8192,若调度跳 ~128 即定案;修复方向 = gen 请求按实际步 token(6)计费,或部署侧提高 max_num_tokens。
 
+**⚠ 实验作废公告(08-10 06:35)**:上述 KV-fraction 排除与 max_num_tokens=8192 判别**全部作废**——744499 是 2 节点作业,而各轮的 serve/客户端/pkill srun(-N1)随机落节点,导致**僵尸 serve 跨轮累积**(清点:bia0038 上 12 个、bia0042 上 2 个 trtllm 进程),burst 常打到旧 serve(带统计客户端坐实:1024 全 OK 而新 serve 日志 0 流量)。可信的仅有首轮复现(60-62 众数,fresh serve)。已全节点清理 + 所有 srun 钉死 `-w bia0038`,判别链从头重跑。教训入册:**多节点分配上做单节点实验,每个 srun 必须显式 -w**。
+
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
