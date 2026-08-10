@@ -281,7 +281,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         reference runtime accepts a wider range, so out-of-envelope requests
         run — they just carry no quality claim. Families without a declared
         envelope get no advisory.
+
+        One line per request, not one per rank: every rank runs this code on a
+        TP/Ulysses worker.
         """
+        if self.rank != 0:
+            return
         env = COSMOS3_ENVELOPES.get(self.family)
         if env is None:
             return

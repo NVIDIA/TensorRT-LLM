@@ -748,6 +748,7 @@ class TestStrictLoading:
 def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
     pipeline.family = family
+    pipeline.rank = 0
     pipeline.sampling = Cosmos3SamplingPolicy()
     pipeline.audio_gen = False
     pipeline.action_gen = False
@@ -1085,6 +1086,14 @@ class TestEnvelopeAdvisory:
         self._advise(_bare_pipeline(NEMOTRON_DENSE_RECIPE.name), num_frames=25)
         assert len(records) == 1
         assert "num_frames=25" in records[0]
+
+    def test_only_rank_zero_advises(self, monkeypatch):
+        """Every rank of a TP/Ulysses worker runs this; only one should speak."""
+        records = self._warnings(monkeypatch)
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.rank = 1
+        self._advise(pipeline, num_frames=25)  # out of envelope on rank 0
+        assert records == []
 
     def test_family_without_envelope_never_logs(self, monkeypatch):
         records = self._warnings(monkeypatch)
