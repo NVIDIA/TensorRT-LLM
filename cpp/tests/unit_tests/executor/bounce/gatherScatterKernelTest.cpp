@@ -145,6 +145,12 @@ TEST(GatherScatterKernel, GatherThenScatterRoundTrip)
 
 TEST(GatherScatterKernel, ZeroBuffersIsNoop)
 {
+    int devs = 0;
+    CUDA_OK(cudaGetDeviceCount(&devs));
+    if (devs == 0)
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
     cudaStream_t stream{};
     CUDA_OK(cudaStreamCreate(&stream));
     EXPECT_EQ(b::launchBatchedCopy(nullptr, nullptr, nullptr, 0, stream), cudaSuccess);

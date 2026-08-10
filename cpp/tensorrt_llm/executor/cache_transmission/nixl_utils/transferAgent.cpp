@@ -259,18 +259,23 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     }
     auto const sourceDeviceId = srcs.front().getDeviceId();
     auto const destinationDeviceId = dsts.front().getDeviceId();
-    if (sourceDeviceId != static_cast<std::uint32_t>(mBounce->deviceId)
-        || !std::all_of(srcs.begin(), srcs.end(),
-            [sourceDeviceId](auto const& desc) { return desc.getDeviceId() == sourceDeviceId; })
-        || !std::all_of(dsts.begin(), dsts.end(),
-            [destinationDeviceId](auto const& desc) { return desc.getDeviceId() == destinationDeviceId; }))
+    if (sourceDeviceId != static_cast<std::uint32_t>(mBounce->deviceId))
     {
         return false;
     }
+    // Screen every precondition BounceTransferPlan::build enforces with TLLM_CHECK: an admitted
+    // request must never throw out of submitTransferRequests — it either runs on bounce or is
+    // routed to the standard per-descriptor NIXL path.
     std::uint64_t totalBytes = 0;
-    for (auto const& d : srcs)
+    for (std::size_t i = 0; i < srcs.size(); ++i)
     {
-        totalBytes += d.getLen();
+        auto const len = srcs[i].getLen();
+        if (len != dsts[i].getLen() || len > cfg.maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
+            || dsts[i].getDeviceId() != destinationDeviceId)
+        {
+            return false;
+        }
+        totalBytes += len;
     }
     std::uint64_t const avg = totalBytes / srcs.size();
     return avg <= cfg.maxAverageDescriptorSizeBytes;
