@@ -3361,6 +3361,9 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: TRTLLM_MX_E2E_REQUIRED
                       value: "1"
         """
+        // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
+        // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
+        // Redis is a native sidecar: Kubernetes < 1.33 must enable SidecarContainers.
         serviceInitContainerConfig = """
                 initContainers:
                   - name: redis

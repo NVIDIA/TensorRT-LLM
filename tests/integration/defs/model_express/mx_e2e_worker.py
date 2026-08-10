@@ -39,6 +39,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mx-url")
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--stop-file", type=Path)
+    parser.add_argument("--max-serve-seconds", type=float, default=1800.0)
     return parser.parse_args()
 
 
@@ -73,6 +74,8 @@ def main() -> None:
     args = _parse_args()
     if args.role == "donor" and (args.ready_file is None or args.stop_file is None):
         raise ValueError("The donor role requires --ready-file and --stop-file")
+    if args.role == "donor" and args.max_serve_seconds <= 0:
+        raise ValueError("The donor role requires --max-serve-seconds > 0")
 
     llm_kwargs = _llm_kwargs(args)
     started = time.perf_counter()
@@ -107,7 +110,13 @@ def main() -> None:
             assert args.ready_file is not None
             assert args.stop_file is not None
             args.ready_file.write_text("ready\n", encoding="utf-8")
+            deadline = time.monotonic() + args.max_serve_seconds
             while not args.stop_file.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"The stop file {args.stop_file} did not appear within "
+                        f"{args.max_serve_seconds}s"
+                    )
                 time.sleep(0.2)
 
 

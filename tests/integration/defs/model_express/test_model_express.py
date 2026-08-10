@@ -249,6 +249,7 @@ def _worker_command(
     mx_url: str | None = None,
     ready_file: Path | None = None,
     stop_file: Path | None = None,
+    max_serve_seconds: int | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -268,6 +269,8 @@ def _worker_command(
         command.extend(("--ready-file", str(ready_file)))
     if stop_file is not None:
         command.extend(("--stop-file", str(stop_file)))
+    if max_serve_seconds is not None:
+        command.extend(("--max-serve-seconds", str(max_serve_seconds)))
     return command
 
 
@@ -371,15 +374,25 @@ def _assert_transfer_evidence(
     all_receiver_logs_lower = all_receiver_logs.lower()
 
     for marker in _RECEIVER_FAILURE_MARKERS:
-        assert marker not in all_receiver_logs_lower
+        assert marker not in all_receiver_logs_lower, (
+            f"MX receiver logs contain failure marker {marker!r}"
+        )
 
     matched_params = _MATCHED_PARAMS_PATTERN.findall(all_receiver_logs)
-    assert len(matched_params) >= case.tp_size
-    assert all(int(matched) == int(total) > 0 for matched, total in matched_params)
+    assert len(matched_params) >= case.tp_size, (
+        f"Expected at least {case.tp_size} matched-parameter summaries, got {matched_params}"
+    )
+    assert all(int(matched) == int(total) > 0 for matched, total in matched_params), (
+        f"MX receiver reported incomplete parameter matches: {matched_params}"
+    )
 
     transferred_params = _TRANSFERRED_PARAMS_PATTERN.findall(all_receiver_logs)
     transferred_ranks = {int(rank) for rank, count in transferred_params if int(count) > 0}
-    assert transferred_ranks.issuperset(range(case.tp_size))
+    expected_ranks = set(range(case.tp_size))
+    assert transferred_ranks.issuperset(expected_ranks), (
+        f"Expected transferred ranks {expected_ranks}, observed {transferred_ranks}; "
+        f"transfer summaries: {transferred_params}"
+    )
 
 
 @pytest.mark.parametrize("case", _MX_CASES)
@@ -434,6 +447,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
                 mx_url=mx_url,
                 ready_file=donor_ready,
                 stop_file=donor_stop,
+                max_serve_seconds=timeout_s + 120,
             ),
             env=donor_environment,
             stdout=donor_log_file,
