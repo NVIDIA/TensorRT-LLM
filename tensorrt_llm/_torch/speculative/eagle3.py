@@ -670,9 +670,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _prepare_attn_metadata_for_spec_dec(
-            self, attn_metadata: AttentionMetadata) -> None:
-        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
+    def _prepare_attn_metadata_for_spec_dec(self,
+                                            attn_metadata: AttentionMetadata,
+                                            *extra_fields: str) -> None:
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata,
+                                                    *extra_fields)
         batch_size = attn_metadata.num_seqs
 
         # Save spec-dec params that the drafting loop will overwrite.

@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheM
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.mapping import Mapping
 
+from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
@@ -80,6 +81,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         # spec_tree_manager is lazily bound from the resource manager.
         self.spec_tree_manager = None
         self._d2t = None
+        self._saved_kv_lens_cuda: Optional[torch.Tensor] = None
 
         # Pre-allocated draft-loop buffers (CUDA-graph safe).
         self.draft_tokens_buffer = torch.zeros(
@@ -169,8 +171,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         sm = get_sm_version()
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
+    def _prepare_attn_metadata_for_spec_dec(
+        self, attn_metadata: AttentionMetadata, *extra_fields: str
+    ) -> None:
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata, *extra_fields)
 
         batch_size = attn_metadata.num_seqs
         if hasattr(attn_metadata, "kv_lens_cuda"):
@@ -203,7 +207,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         last_tokens_idx = torch.cumsum(seq_lens_cuda, dim=0, dtype=torch.long) - 1
         return position_ids, last_tokens_idx
 
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata: AttentionMetadata) -> None:
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         if self._saved_kv_lens_cuda is not None:
