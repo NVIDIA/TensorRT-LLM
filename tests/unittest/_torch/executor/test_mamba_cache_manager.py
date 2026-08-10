@@ -845,8 +845,9 @@ def test_kimi_preferred_transceiver_runtime() -> None:
         CacheTransceiverConfig(backend="NIXL"),  # runtime left at 'auto'
         CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP"),
         CacheTransceiverConfig(backend="UCX", transceiver_runtime="CPP"),
+        CacheTransceiverConfig(backend="UCX", transceiver_runtime="PYTHON"),
     ],
-    ids=["no_config", "auto_unresolved", "explicit_cpp", "ucx_cpp"],
+    ids=["no_config", "auto_unresolved", "explicit_cpp", "ucx_cpp", "ucx_python"],
 )
 def test_kimi_disagg_rejects_non_python_transceiver_route(
     monkeypatch: pytest.MonkeyPatch, cache_transceiver_config
