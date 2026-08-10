@@ -1047,6 +1047,15 @@ class EncoderCUDAGraphRunnerConfig:
     is_encoder_decoder: bool = False
     use_fixed_sequence_slots: bool = False
 
+    # Feature mode (encoders taking fixed-shape per-request feature tensors,
+    # e.g. Whisper's [480000] fp32 waveform). When feature_shape is set, the
+    # runner replaces the input_ids/position_ids static tensors with an
+    # input_features buffer and the graph key degenerates to
+    # (bs, bs * fixed_seq_len, fixed_seq_len).
+    feature_shape: Optional[Tuple[int, ...]] = None
+    feature_dtype: Optional[torch.dtype] = None
+    fixed_seq_len: Optional[int] = None
+
 
 class EncoderCUDAGraphRunner:
     """CUDA graph runner for no-cache encoder forward passes.
@@ -1061,6 +1070,10 @@ class EncoderCUDAGraphRunner:
     """
 
     WARMUP_STEPS = 1
+    MAX_FEATURE_PADDING_RATIO = 9 / 8
+    # Host-side feature mirrors. Two is enough to hide the host fill behind
+    # one in-flight H2D; more would only add pinned memory.
+    FEATURE_MIRROR_SLOTS = 2
 
     def __init__(self, config: EncoderCUDAGraphRunnerConfig):
         self.config = config
@@ -1069,14 +1082,50 @@ class EncoderCUDAGraphRunner:
         self.padding_enabled = config.cuda_graph_padding_enabled
         self.supported_batch_sizes = sorted(config.cuda_graph_batch_sizes)
         self.max_supported_batch_size = config.max_cuda_graph_batch_size
-        self.supported_num_tokens = sorted(config.cuda_graph_num_tokens)
-        self.max_supported_num_tokens = config.max_cuda_graph_num_tokens
-        self.supported_seq_lens = sorted(config.cuda_graph_seq_lens)
+        self.feature_mode = config.feature_shape is not None
         self.is_encoder_decoder = config.is_encoder_decoder
         self.use_fixed_sequence_slots = config.use_fixed_sequence_slots
+
+        if self.feature_mode and not self.is_encoder_decoder:
+            # Nothing structural forbids this - a standalone feature encoder
+            # (audio/vision embedding tower) would land here - but no in-tree
+            # model exercises it, so fail loudly rather than capture untested
+            # shapes.
+            raise NotImplementedError(
+                "Feature-mode encoder CUDA graphs are only supported for "
+                "encoder-decoder models today.")
+
+        if self.feature_mode:
+            # A feature encoder produces a fixed number of positions per
+            # request, so the configured token/seq-len buckets are not free
+            # parameters: they degenerate to multiples of fixed_seq_len over
+            # the batch sizes. Any user-supplied values are ignored.
+            fixed = config.fixed_seq_len
+            self.supported_num_tokens = sorted(
+                bs * fixed for bs in self.supported_batch_sizes)
+            self.max_supported_num_tokens = (self.max_supported_batch_size *
+                                             fixed)
+            self.supported_seq_lens = [fixed]
+        else:
+            self.supported_num_tokens = sorted(config.cuda_graph_num_tokens)
+            self.max_supported_num_tokens = config.max_cuda_graph_num_tokens
+            self.supported_seq_lens = sorted(config.cuda_graph_seq_lens)
+
         self.capture_keys: frozenset[EncoderKeyType] = frozenset()
         self._capture_sequence_lengths: Dict[EncoderKeyType, List[int]] = {}
-        if self.is_encoder_decoder:
+        if self.feature_mode:
+            # Every request contributes exactly fixed_seq_len positions, so one
+            # key per batch size is the complete reachable set. Taking the
+            # token path's cross product of batch sizes and token counts would
+            # instead yield keys no batch can ever match, and `capture_keys`
+            # also drives mixed encoder/decoder decoder-graph warmup.
+            self._capture_sequence_lengths = {
+                (bs, bs * config.fixed_seq_len, config.fixed_seq_len):
+                [config.fixed_seq_len] * bs
+                for bs in self.supported_batch_sizes
+            }
+            self.capture_keys = frozenset(self._capture_sequence_lengths)
+        elif self.is_encoder_decoder:
             self._capture_sequence_lengths = (
                 self._build_encoder_decoder_capture_layouts())
             self.capture_keys = frozenset(self._capture_sequence_lengths)
@@ -1101,10 +1150,26 @@ class EncoderCUDAGraphRunner:
         self.is_warmup_only = False
         self._staging_retirement_event: Optional[torch.cuda.Event] = None
 
+        # `torch.cuda.graph` falls back to a process-wide singleton capture
+        # stream when `stream=` is omitted, so the encoder graphs would capture
+        # on the same stream as the decoder graphs. Sharing it couples the two
+        # graph sets through stream-keyed cuBLAS/cuBLASLt scratch: a serial
+        # split-K GEMM captured into one graph spins forever in
+        # cutlass::Semaphore::wait() once the other graph's matmuls leave that
+        # region non-zero, because the captured graph has no node that re-zeroes
+        # it. Capture on our own stream instead.
+        self._capture_stream: Optional[torch.cuda.Stream] = None
+
         # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
         # prefer_pinned() is false: pageable host buffers are preferred, so the
         # H2D copies must be issued before graph replay instead of captured.
         self._capture_h2d_copy = prefer_pinned()
+
+    def _get_capture_stream(self) -> torch.cuda.Stream:
+        """Return this runner's dedicated capture stream, creating it lazily."""
+        if self._capture_stream is None:
+            self._capture_stream = torch.cuda.Stream()
+        return self._capture_stream
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest supported num_tokens."""
@@ -1112,6 +1177,47 @@ class EncoderCUDAGraphRunner:
             self.config.max_num_tokens if self.is_encoder_decoder else min(
                 self.max_supported_num_tokens, self.config.max_num_tokens))
         max_batch_size = self.max_supported_batch_size
+
+        if self.feature_mode:
+            feature_shape = (max_batch_size, *self.config.feature_shape)
+            self.shared_static_tensors = {
+                "input_features":
+                torch.zeros(feature_shape,
+                            device="cuda",
+                            dtype=self.config.feature_dtype),
+            }
+            self.shared_static_tensors_cpu = {
+                "seq_lens":
+                torch.full((max_batch_size, ),
+                           self.config.fixed_seq_len,
+                           device="cpu",
+                           dtype=torch.int32,
+                           pin_memory=prefer_pinned()),
+            }
+            # Host mirrors are double-buffered; the device buffer is not. The
+            # device buffer is captured into every graph, so its refill must
+            # stay ordered behind the previous replay that reads it - that is
+            # a real data dependency, not an artifact of stream choice. The
+            # *host* fill has no such constraint, so filling mirror B while
+            # the device still drains mirror A takes it off the critical path.
+            # One event per mirror records the H2D that read it; a mirror is
+            # refilled only once its own H2D has completed, which with two
+            # slots is normally already true.
+            self._feature_mirrors = [
+                torch.zeros(feature_shape,
+                            device="cpu",
+                            dtype=self.config.feature_dtype,
+                            pin_memory=prefer_pinned())
+                for _ in range(self.FEATURE_MIRROR_SLOTS)
+            ]
+            self._feature_h2d_events = [
+                torch.cuda.Event() for _ in range(self.FEATURE_MIRROR_SLOTS)
+            ]
+            # Record once so the first use of each slot does not block.
+            for event in self._feature_h2d_events:
+                event.record()
+            self._feature_mirror_slot = 0
+            return
 
         self.shared_static_tensors = {
             "input_ids":
@@ -1400,6 +1506,23 @@ class EncoderCUDAGraphRunner:
             yield inputs
             return
 
+        if self.feature_mode:
+            # A feature pad slot is a full fixed_seq_len request of compute
+            # (zero-filled input rows, outputs discarded at scatter), unlike
+            # the 1-token pads of the token path. Fall back to eager across
+            # large bucket gaps so graph replay cannot add more than 12.5%
+            # encoder work.
+            if (batch_size == 0 or padded_batch_size
+                    > batch_size * self.MAX_FEATURE_PADDING_RATIO):
+                yield inputs
+                return
+            padded_inputs = dict(inputs)
+            padded_inputs['seq_lens'] = (list(inputs['seq_lens']) +
+                                         [self.config.fixed_seq_len] *
+                                         (padded_batch_size - batch_size))
+            yield padded_inputs
+            return
+
         padding_size = padded_batch_size - batch_size
         # Should not pad inputs if it would exceed the max supported number of tokens
         # maybe_get_cuda_graph will check this and fall back to eager if batch size is not in the supported list
@@ -1493,6 +1616,12 @@ class EncoderCUDAGraphRunner:
         seq_lens = inputs['seq_lens']
         padded_batch_size = len(seq_lens)
         if padded_batch_size not in self.supported_batch_sizes:
+            return None, None
+
+        if self.feature_mode and any(s != self.config.fixed_seq_len
+                                     for s in seq_lens):
+            # Fixed-shape contract violated (should not happen for feature
+            # encoders); fall back to eager rather than replay a wrong shape.
             return None, None
 
         key, is_padding_performed, is_padding_successful = self.get_graph_key(
@@ -1717,6 +1846,9 @@ class EncoderCUDAGraphRunner:
         """Warm up and/or capture the forward pass for a graph key."""
         padded_num_tokens = key[1]
 
+        if self.feature_mode:
+            return self._capture_features(key, forward_fn, inputs)
+
         sliced_static_tensors = {
             "input_ids":
             self.shared_static_tensors["input_ids"][:padded_num_tokens],
@@ -1767,6 +1899,7 @@ class EncoderCUDAGraphRunner:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph,
                                   pool=self.memory_pool,
+                                  stream=self._get_capture_stream(),
                                   capture_error_mode="thread_local"):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
@@ -1798,12 +1931,128 @@ class EncoderCUDAGraphRunner:
             self._staging_retirement_event.synchronize()
             self._staging_retirement_event = None
 
+    def _capture_features(
+        self,
+        key: EncoderKeyType,
+        forward_fn: Callable[[Dict[str, Any]], Any],
+        inputs: Dict[str, Any],
+    ) -> Any:
+        """Capture path for the fixed-shape feature mode (enc-dec encoders).
+
+        The capture region receives the static device feature buffer sliced
+        to the padded batch size; in pinned mode the H2D from the pinned CPU
+        mirror is captured inside the graph so replay re-issues it without an
+        eager driver call.
+        """
+        padded_batch_size, _, _ = key
+
+        static_features = (
+            self.shared_static_tensors["input_features"][:padded_batch_size])
+
+        capture_inputs = dict(inputs)
+        capture_inputs["input_features"] = static_features
+
+        attn_md = capture_inputs["attn_metadata"]
+        self.graph_metadata[key] = {
+            "attn_metadata": attn_md,
+        }
+
+        # Feature-mode seq_lens never change for this key: populate the
+        # metadata's device seq_lens once, eagerly, instead of capturing the
+        # H2D like the token path does per replay.
+        attn_md._seq_lens_cuda.copy_(attn_md._seq_lens, non_blocking=True)
+
+        # NOTE: unlike the token path, the input H2D is NOT captured inside
+        # the graph. All buckets share one pinned mirror, and consecutive
+        # encoder batches (different buckets) can be enqueued back-to-back —
+        # a captured H2D would read the mirror at replay-execution time,
+        # after the host has already refilled it for the next batch. The
+        # eager H2D in `_replay_features` is stream-ordered and guarded by
+        # per-mirror events instead.
+        output = None
+        with with_multi_stream(True), piecewise_cuda_graph(False):
+            for _ in range(self.WARMUP_STEPS):
+                output = forward_fn(capture_inputs)
+
+            # The warmup pass runs these shapes eagerly to settle PyTorch and
+            # attention state; it must not build a graph, and its caller
+            # consumes the eager output directly.
+            if self.is_warmup_only:
+                return output
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph,
+                                  pool=self.memory_pool,
+                                  stream=self._get_capture_stream()):
+                output = forward_fn(capture_inputs)
+
+        if self._contains_nested_tensor(output):
+            raise TypeError(
+                "Encoder CUDA graph does not support nested tensor outputs.")
+        self.graphs[key] = graph
+        graph_output = make_weak_ref(output)
+        self.graph_outputs[key] = graph_output
+        self.memory_pool = graph.pool()
+        return graph_output
+
+    def _replay_features(
+        self,
+        key: EncoderKeyType,
+        inputs: Dict[str, Any],
+    ) -> Any:
+        """Replay path for the fixed-shape feature mode."""
+        stored_meta = self.graph_metadata[key]
+        assert inputs["attn_metadata"] is stored_meta["attn_metadata"]
+
+        padded_batch_size, _, _ = key
+        features = inputs["input_features"]
+
+        slot = self._feature_mirror_slot
+        self._feature_mirror_slot = (slot + 1) % self.FEATURE_MIRROR_SLOTS
+
+        # Wait only for the H2D that last read *this* mirror. With two slots
+        # that copy was issued two batches ago, so this is normally already
+        # satisfied and the host proceeds straight to the fill.
+        self._feature_h2d_events[slot].synchronize()
+
+        mirror = self._feature_mirrors[slot]
+        if isinstance(features, list):
+            # Per-request CPU tensors straight from the requests — one copy
+            # into the host mirror, no intermediate packing.
+            rows = 0
+            for f in features:
+                n = int(f.shape[0])
+                mirror[rows:rows + n].copy_(f)
+                rows += n
+        else:
+            rows = int(features.shape[0])
+            mirror[:rows].copy_(features)
+        if rows < padded_batch_size:
+            mirror[rows:padded_batch_size].zero_()
+
+        # Eager, stream-ordered H2D: runs after any previously enqueued replay
+        # on this stream, so it cannot race an in-flight graph reading the
+        # single device buffer. Keeping it on this stream is load-bearing.
+        self.shared_static_tensors["input_features"][:padded_batch_size].copy_(
+            mirror[:padded_batch_size], non_blocking=True)
+        self._feature_h2d_events[slot].record()
+
+        self.graphs[key].replay()
+        return self.graph_outputs[key]
+
     def replay(
         self,
         key: EncoderKeyType,
         inputs: Dict[str, Any],
     ) -> Any:
         """Replay a captured graph with current inputs."""
+        if self.feature_mode:
+            # Feature mode stages through its own double-buffered pinned
+            # mirrors and guards them with per-mirror events; `retire_staging`
+            # covers the token path's shared host staging buffers, which
+            # feature mode does not touch.
+            return self._replay_features(key, inputs)
+
         self.retire_staging()
 
         stored_meta = self.graph_metadata[key]
