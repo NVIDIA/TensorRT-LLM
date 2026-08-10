@@ -35,12 +35,13 @@ other GPU architectures may be added in a future release.
   image. The image passed as `--image` below must already provide
   TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
   container; a build or devel image without them does not work. The Slurm
-  scripts start a fresh container from that image and mount only the
-  repository and the checkpoint, so nothing installed while preparing the
-  build carries over: the repository-root `.venv-3.12` is the build
-  environment created by `build_wheel.py` (it contains Conan and pip, not
-  PyTorch or Transformers), and `pip install --no-deps -e .` installs
-  `tensorrt_llm` alone. With an image that lacks the dependencies, every rank
+  scripts start a fresh container from that image. They mount the
+  repository, including `.venv-3.12`, and the checkpoint, so packages installed in
+  that virtual environment are available. Packages installed only in the preparation
+  container's base environment are not:
+  repository-root `.venv-3.12` is the build environment created by `build_wheel.py`
+  (it contains Conan and pip, not PyTorch or Transformers), and `pip install
+  --no-deps -e .` installs `tensorrt_llm` alone. With an image that lacks the dependencies, every rank
   fails with a `ModuleNotFoundError` that does not name the image, such as
   `No module named 'transformers'`.
 
