@@ -102,7 +102,10 @@ qualification stage. That stage must also allocate the GPUs declared by the
 selected test row.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
-sidecars. Run the recurring two-GPU TP=1 smoke test with:
+sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
+automatically in post-merge pipelines or when a multi-GPU file changes, while
+direct pre-merge dispatch requires the `ci: full pre-merge approved` label.
+Trigger it directly with:
 
 ```text
 /bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-1"

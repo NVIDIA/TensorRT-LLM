@@ -20,7 +20,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -33,6 +32,7 @@ from urllib.parse import urlparse
 
 import pytest
 import torch
+from defs.trt_test_alternative import cleanup_process_tree, popen
 
 from tensorrt_llm._torch.weight_sharing import ArtifactIdentity
 
@@ -296,24 +296,20 @@ def _log_tail(log_path: Path, lines: int = 120) -> str:
 def _run_worker(
     command: list[str], environment: dict[str, str], log_path: Path, timeout_s: int
 ) -> None:
-    with log_path.open("w", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            command,
-            env=environment,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
+    try:
+        with (
+            log_path.open("w", encoding="utf-8") as log_file,
+            popen(
+                command,
+                env=environment,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                suppress_output_info=True,
+            ) as process,
+        ):
             returncode = process.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            _signal_process_group(process, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                _signal_process_group(process, signal.SIGKILL)
-                process.wait(timeout=30)
-            pytest.fail(f"MX E2E worker timed out: {' '.join(command)}\n{_log_tail(log_path)}")
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"MX E2E worker timed out: {' '.join(command)}\n{_log_tail(log_path)}")
     if returncode != 0:
         pytest.fail(
             f"MX E2E worker exited with status {returncode}: "
@@ -336,15 +332,6 @@ def _wait_for_donor(
         time.sleep(0.5)
 
 
-def _signal_process_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        pass
-
-
 def _stop_donor(process: subprocess.Popen[bytes], stop_file: Path) -> int:
     if process.poll() is not None:
         assert process.returncode is not None
@@ -353,11 +340,7 @@ def _stop_donor(process: subprocess.Popen[bytes], stop_file: Path) -> int:
     try:
         return process.wait(timeout=120)
     except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGTERM)
-    try:
-        return process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
+        cleanup_process_tree(process, has_session=True)
         return process.wait(timeout=30)
 
 
@@ -440,8 +423,9 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
 
     donor_environment = _worker_environment(donor_gpu_ids, tmp_path / "donor-transfer-logs")
     donor_returncode = None
-    with donor_log.open("w", encoding="utf-8") as donor_log_file:
-        donor_process = subprocess.Popen(
+    with (
+        donor_log.open("w", encoding="utf-8") as donor_log_file,
+        popen(
             _worker_command(
                 role="donor",
                 model_path=donor_snapshot,
@@ -454,8 +438,9 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
             env=donor_environment,
             stdout=donor_log_file,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+            suppress_output_info=True,
+        ) as donor_process,
+    ):
         try:
             _wait_for_donor(donor_process, donor_ready, donor_log, timeout_s)
             _run_worker(
@@ -476,6 +461,8 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
     assert donor_returncode == 0, (
         f"MX donor exited with status {donor_returncode}\n{_log_tail(donor_log)}"
     )
+    donor_payload = json.loads(donor_output.read_text(encoding="utf-8"))
+    assert donor_payload["server_query_timeout_s"] == 0
     baseline_tokens = _load_tokens(baseline_output)
     assert _load_tokens(donor_output) == baseline_tokens
     assert _load_tokens(receiver_output) == baseline_tokens

@@ -61,8 +61,9 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError("MX donor and receiver roles require --mx-url")
         kwargs["mx_config"] = {
             "server_url": args.mx_url,
-            # ModelExpress 0.4.1 treats zero as no query. The donor should
-            # fall back immediately; the receiver starts only after donor readiness.
+            # ModelExpress 0.4.1 skips polling at zero but still sleeps once
+            # for five seconds before disk fallback. The receiver starts only
+            # after donor readiness, so it can use a bounded discovery window.
             "server_query_timeout_s": 0 if args.role == "donor" else 30,
         }
     return kwargs
@@ -73,8 +74,9 @@ def main() -> None:
     if args.role == "donor" and (args.ready_file is None or args.stop_file is None):
         raise ValueError("The donor role requires --ready-file and --stop-file")
 
+    llm_kwargs = _llm_kwargs(args)
     started = time.perf_counter()
-    with LLM(**_llm_kwargs(args)) as llm:
+    with LLM(**llm_kwargs) as llm:
         load_seconds = time.perf_counter() - started
         sampling_params = SamplingParams(
             max_tokens=8,
@@ -89,10 +91,14 @@ def main() -> None:
                 sampling_params=sampling_params,
             )
         )
+        mx_config = llm_kwargs.get("mx_config")
         payload = {
             "role": args.role,
             "tp_size": args.tp_size,
             "load_seconds": load_seconds,
+            "server_query_timeout_s": (
+                mx_config.get("server_query_timeout_s") if isinstance(mx_config, dict) else None
+            ),
             "token_ids": [list(result.outputs[0].token_ids) for result in results],
         }
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
