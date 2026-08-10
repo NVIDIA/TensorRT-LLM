@@ -363,6 +363,34 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
     assert "conv_state_layout" not in kwargs
 
 
+def test_v2_manager_rejects_model_type_kwarg() -> None:
+    """MambaHybridCacheManagerV2 must fail loudly when handed the V1 managers'
+    `model_type` instead of `conv_state_layout` — silently absorbing it into
+    **kwargs is how the TRTLLM-15216 wrong-layout bug went unnoticed."""
+    with pytest.raises(TypeError, match="conv_state_layout"):
+        MambaHybridCacheManagerV2(
+            16,  # mamba_d_state
+            4,  # mamba_d_conv
+            8,  # mamba_num_heads
+            1,  # mamba_n_groups
+            16,  # mamba_head_dim
+            2,  # mamba_num_layers
+            [True, True],  # mamba_layer_mask
+            torch.float16,
+            torch.float16,
+            KvCacheConfig(),
+            CacheTypeCpp.SELF,
+            num_layers=0,
+            num_kv_heads=1,
+            head_dim=16,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+            model_type="qwen3_next",
+        )
+
+
 @pytest.mark.parametrize(
     ("use_v2", "enable_block_reuse", "expected"),
     [
