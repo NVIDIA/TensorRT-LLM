@@ -510,6 +510,20 @@ cap-accept 模式(同一 planner 决策,提交完整块全量验证、接受端�
 
 **v7(执行中)——采用同事已验证配方**:peihengh 的 dsv4 nsys 战役(同集群同拓扑 B300 + trtllm-llmapi-launch + trtllm-serve)成功出过 `.nsys-rep`,其 start_worker.sh 注释直言 *"Lingjie's hang-avoidance: NSYS_BIN=extracted 2025.5.1"*——与用户"nsys 得用 2025.5.x"的提示互相印证:**容器自带 2026.2.1 有问题,须用 lustre 上提取版 2025.5.1.121**。v7 变更:① nsys 换 `peihengh/dsv4_pipe_clean_20260723/tools/nsys-2025.5.1.121`(容器内烟测可运行);② `--capture-range-end=stop`(cudaProfilerStop 时就地落盘,app 继续跑,绕开 shutdown 死结);③ 照抄其余旗标(`-t cuda,nvtx --cuda-graph-trace node --gpu-metrics-devices=none`);④ **窗口对准**:pin3 v6 的窗口正好砸进 burst 排水缝(iter 2000-2025 只有 1 个请求;pin5 幸运落在稳态 120 请求)——burst 跨度 ≈ max_tokens/accept 与批大小无关(pin5 ~470/pin3 ~515 iter,确定性强),v7 round 先放校准 burst 实测跨度,再用小 filler burst(64 req × 按缺口折算的 max_tokens)把 2000-2050 顶进整 burst 的稳态中段。
 
+### #32 nsys 取证 v7:报告到手 + 初步 kernel 对拍(08-09 22:50)
+
+**五连丢终结**:v7(提取版 nsys 2025.5.1.121 + `--capture-range-end=stop` + 窗口对准)两轮均落盘 27MB 报告(`nsys/pin5_rank0.nsys-rep` / `pin3_rank0.nsys-rep`),窗口 iter 2000-2050,graph 内 kernel node 粒度。对准偏差:两窗都落在 burst 的 ~65% 位置(排水段),pin5 占用 72→23 请求、pin3 57→6——pin3 没够到 padded_bs=128 档,已再发 v7b 两轮(对准收紧到 burst 20-35% 段)补清洁样本。
+
+**混形状粗对拍(初步,待 v7b 清洁窗验证)**:
+| 信号 | pin5(6 tok/req) | pin3(4 tok/req) | 读法 |
+|---|---|---|---|
+| MoE FC1 大 tile `t128x256x256`(swiGlu) | 17.0%,中位 178µs | 3.2%(几乎退场) | 大桶专属,效率最高 |
+| MoE FC1 中 tile `t128x128x256u2` | 1.7% | **8.0%,中位 110µs** | 小桶主力:token 减半,GEMM 只省 38% |
+| MoE FC1 小 tile `t128x64x256u2` | 0.1%,中位 69µs | **5.7%,中位 94µs(m3/m5=1.35)** | 同名 kernel 在 pin3 上下文里慢 35% |
+| FMHA sparse / A2A / topK / 元素级 | — | 比值 0.6-0.8 | 正常随 token 缩放 |
+
+**初步指认**:短窗桶的病灶集中在 **MoE grouped GEMM 的 tile 阶梯**——token 桶变小 → 换小 tile → 每 token 效率近乎腰斩,GEMM 时间不随 token 线性下降,形成 #32 的"常数惩罚";与 GB300 Pro frac 表的平台+悬崖楼梯(MoE 更重 → 惩罚更大)跨模型同构。另见 pin3 独有的 FMHA 变体(1.0%)待查。**定论等 v7b 的 (128,768) vs (128,384) 同批次干净对拍。**
+
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
 1. **host 未复现**:初测 +8.3%(poetry 128/rank)在四轮中缩为 [0.0, +1.9, +1.3, +2.2]%;arena 侧 [−2.4, 0.0, −1.4, −5.6]%。host 整体 ≈ 0±3%,poetry 微正、arena 微负。host 调度行为本身跨节点完全可复现(trim 22.4-22.7%,accept 1.66-1.67,四轮逐位一致)——**是收益不存在,不是实验不稳**。
