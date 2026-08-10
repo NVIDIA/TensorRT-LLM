@@ -406,7 +406,6 @@ unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py 
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_qwen35_35b_fp8 SKIP (https://nvbugs/6567065)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8] SKIP (https://nvbugs/6490036)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_qwen35_35b_fp8 SKIP (https://nvbugs/6567065)
-unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor" SKIP (https://nvbugs/6581047)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TRTLLMSampler-cuda_graph_and_overlap-None-1-1-True-True-False] SKIP (https://nvbugs/6463819)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TorchSampler-no_cuda_graph_and_overlap-stop_token_ids0-1-1-True-True-True] SKIP (https://nvbugs/6581048)
 unittest/_torch/sampler/test_trtllm_sampler.py::test_trtllm_sampler_best_of_with_logprobs SKIP (https://nvbugs/6487837)
