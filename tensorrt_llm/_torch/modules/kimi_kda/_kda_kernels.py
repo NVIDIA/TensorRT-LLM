@@ -28,6 +28,8 @@ from types import ModuleType
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from . import _kda_decode
 
@@ -63,6 +65,102 @@ def get_kda_sm_version() -> int:
 def is_kda_optimized_supported() -> bool:
     """The optimized prefill/decode kernels are Blackwell sm_100 only."""
     return get_kda_sm_version() in (100, 103)
+
+
+@triton.jit
+def _fused_kda_post_conv_kernel(
+    q_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    num_tokens,
+    l2_norm_eps,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Normalize post-convolution Q and K in one launch."""
+    token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    head_idx = tl.program_id(1)
+    dim_offsets = tl.arange(0, BLOCK_DIM)
+    token_mask = token_offsets < num_tokens
+    dim_mask = dim_offsets < HEAD_DIM
+    mask = token_mask[:, None] & dim_mask[None, :]
+
+    head_offsets = head_idx * HEAD_DIM + dim_offsets
+    offsets = token_offsets[:, None].to(tl.int64) * (NUM_HEADS * HEAD_DIM) + head_offsets[None, :]
+
+    q = tl.load(q_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    q /= tl.sqrt(tl.sum(q * q, axis=1) + l2_norm_eps)[:, None]
+    tl.store(q_out_ptr + offsets, q, mask=mask)
+
+    k = tl.load(k_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    k /= tl.sqrt(tl.sum(k * k, axis=1) + l2_norm_eps)[:, None]
+    tl.store(k_out_ptr + offsets, k, mask=mask)
+
+
+def fused_kda_post_conv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    l2_norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse KDA post-convolution Q/K normalization and Q/K/V reshaping.
+
+    Args:
+        q: Query convolution output with shape ``[batch, tokens, num_heads * head_dim]``.
+        k: Key convolution output with the same shape as ``q``.
+        v: Value convolution output with the same shape as ``q``.
+        num_heads: Number of local KDA heads.
+        head_dim: Dimension of each KDA head.
+        l2_norm_eps: Epsilon added to each Q/K squared norm.
+
+    Returns:
+        Contiguous normalized Q and K tensors plus a view of V, each with
+        shape ``[batch, tokens, num_heads, head_dim]``.
+    """
+    expected_dim = num_heads * head_dim
+    if q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
+        raise ValueError(
+            "KDA post-conv expects matching rank-3 Q/K/V tensors, got "
+            f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+        )
+    if q.shape[-1] != expected_dim:
+        raise ValueError(
+            f"KDA post-conv expected feature dimension {expected_dim}, got {q.shape[-1]}"
+        )
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("KDA post-conv requires contiguous Q/K/V convolution outputs")
+
+    output_shape = (*q.shape[:-1], num_heads, head_dim)
+    q_out = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+    k_out = torch.empty_like(q_out)
+    v_out = v.view(output_shape)
+    num_tokens = q.numel() // expected_dim
+    if num_tokens == 0:
+        return q_out, k_out, v_out
+
+    block_tokens = 16
+    block_dim = triton.next_power_of_2(head_dim)
+    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
+    _fused_kda_post_conv_kernel[grid](
+        q,
+        k,
+        q_out,
+        k_out,
+        num_tokens,
+        l2_norm_eps,
+        num_heads,
+        head_dim,
+        block_tokens,
+        block_dim,
+        num_warps=8,
+        num_stages=3,
+    )
+    return q_out, k_out, v_out
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +357,7 @@ class KDAKernelDispatch:
         lower_bound: Optional[float],
         cu_seqlens: Optional[torch.Tensor],
         chunk_size: int = 64,
+        qk_pre_normalized: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
@@ -270,6 +369,9 @@ class KDAKernelDispatch:
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
+
+        ``qk_pre_normalized`` lets callers use the fused KDA post-conv path
+        without normalizing Q/K a second time.
 
         State layout contract (both paths): ``initial_state`` is consumed
         and ``final_state`` returned in the V-first ``[N, H, V, K]`` layout —
@@ -302,8 +404,9 @@ class KDAKernelDispatch:
             from fla.modules.l2norm import l2norm_fwd
 
             use_fused_preprocess = _use_fused_prefill_preprocess()
-            q, _ = l2norm_fwd(q)
-            k, _ = l2norm_fwd(k)
+            if not qk_pre_normalized:
+                q, _ = l2norm_fwd(q)
+                k, _ = l2norm_fwd(k)
             if not use_fused_preprocess:
                 from fla.ops.common.gate import fused_beta_sigmoid
 
@@ -376,7 +479,7 @@ class KDAKernelDispatch:
             scale=scale,
             initial_state=initial_state,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=not qk_pre_normalized,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
             safe_gate=safe_gate,

@@ -2,11 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the optimized Kimi K3 KDA prefill op."""
 
+from collections.abc import Callable
+
 import pytest
 import torch
 
 pytest.importorskip("fla")
 
+from fla.modules.l2norm import l2norm_fwd  # noqa: E402
+
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import fused_kda_post_conv  # noqa: E402
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention  # noqa: E402
 
 NUM_HEADS = 96
@@ -55,6 +60,86 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     relative_l2 = ((actual_float - expected_float).norm() / (expected_float.norm() + 1e-12)).item()
     assert cosine > 0.999
     assert relative_l2 < 3e-2
+
+
+def _legacy_kda_post_conv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output_shape = (*q.shape[:-1], num_heads, head_dim)
+    q, _ = l2norm_fwd(q.view(output_shape))
+    k, _ = l2norm_fwd(k.view(output_shape))
+    return q, k, v.view(output_shape)
+
+
+def _benchmark_cuda(fn: Callable[[], object], warmup: int = 10, iterations: int = 100) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1_000 / iterations
+
+
+@pytest.mark.parametrize(
+    "batch_size,sequence_length,num_heads,head_dim",
+    [(1, 1, 4, 64), (2, 127, 8, 128), (1, 256, 12, 128)],
+)
+@torch.no_grad()
+def test_fused_kda_post_conv_matches_reference(
+    batch_size: int,
+    sequence_length: int,
+    num_heads: int,
+    head_dim: int,
+) -> None:
+    """The fused post-conv path matches separate Q/K normalization."""
+    torch.manual_seed(0)
+    shape = (batch_size, sequence_length, num_heads * head_dim)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    actual_q, actual_k, actual_v = fused_kda_post_conv(q, k, v, num_heads, head_dim)
+    expected_q = q.view(batch_size, sequence_length, num_heads, head_dim).float()
+    expected_k = k.view(batch_size, sequence_length, num_heads, head_dim).float()
+    expected_q *= torch.rsqrt((expected_q * expected_q).sum(dim=-1, keepdim=True) + 1e-6)
+    expected_k *= torch.rsqrt((expected_k * expected_k).sum(dim=-1, keepdim=True) + 1e-6)
+
+    assert actual_q.is_contiguous()
+    assert actual_k.is_contiguous()
+    assert actual_v.is_contiguous()
+    torch.testing.assert_close(actual_q, expected_q.to(q.dtype), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_k, expected_k.to(k.dtype), rtol=1e-2, atol=1e-2)
+    assert torch.equal(actual_v, v.view_as(actual_v))
+
+
+@torch.no_grad()
+def test_fused_kda_post_conv_performance() -> None:
+    """Compare the fused kernel with the legacy two-L2Norm path."""
+    batch_size, sequence_length = 1, 256
+    num_heads, head_dim = 12, 128
+    shape = (batch_size, sequence_length, num_heads * head_dim)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    fused_us = _benchmark_cuda(lambda: fused_kda_post_conv(q, k, v, num_heads, head_dim))
+    legacy_us = _benchmark_cuda(lambda: _legacy_kda_post_conv(q, k, v, num_heads, head_dim))
+    speedup = legacy_us / fused_us
+
+    print(
+        f"\n[KDA post-conv benchmark] shape={shape} "
+        f"fused={fused_us:.2f}us legacy={legacy_us:.2f}us speedup={speedup:.2f}x"
+    )
 
 
 @torch.no_grad()

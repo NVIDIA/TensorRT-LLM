@@ -90,6 +90,7 @@ from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from ..modules.kimi_kda._kda_kernels import fused_kda_post_conv
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -1361,9 +1362,13 @@ class KimiKDARuntime(nn.Module):
         g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
         beta = mixer.b_proj(x).float()
 
-        q = rearrange(q, "... (h d) -> ... h d", d=mixer.head_k_dim)
-        k = rearrange(k, "... (h d) -> ... h d", d=mixer.head_k_dim)
-        v = rearrange(v, "... (h d) -> ... h d", d=mixer.head_dim)
+        q, k, v = fused_kda_post_conv(
+            q,
+            k,
+            v,
+            num_heads=mixer.num_heads,
+            head_dim=mixer.head_dim,
+        )
 
         # Kernel dispatch (in-tree trtllm::kda_prefill or FLA chunk_kda).
         # Both paths exchange states in the pool's V-first [N, H, V, K]
@@ -1382,6 +1387,7 @@ class KimiKDARuntime(nn.Module):
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            qk_pre_normalized=True,
         )
 
         # Persist per-request states into the pools.
