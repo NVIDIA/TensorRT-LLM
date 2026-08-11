@@ -15,12 +15,12 @@
 
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
 import functools
 import math
 import numbers
 import struct
-from collections.abc import Callable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import torch
@@ -30,6 +30,7 @@ from ._tensor_aliasing import (
     _validate_out_does_not_overlap_inputs,
     _validate_tensor_does_not_overlap_inputs,
 )
+
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
@@ -116,7 +117,9 @@ def _decode_policy_from_config(
     seq_len_q = int(config.max_seq_len_q)
     uses_packed_q = bool(config.use_variable_seqlens_q)
     query_layout = (
-        "TOTAL_Q_Hq_D" if uses_packed_q else ("B_Hq_D" if seq_len_q == 1 else "B_SQ_Hq_D")
+        "TOTAL_Q_Hq_D"
+        if uses_packed_q
+        else ("B_Hq_D" if seq_len_q == 1 else "B_SQ_Hq_D")
     )
     return (
         ("seq_len_q", seq_len_q),
@@ -126,7 +129,9 @@ def _decode_policy_from_config(
         ("output_layout", query_layout),
         (
             "window_left",
-            int(config.attention_window_size) - 1 if config.use_sliding_window_causal else -1,
+            int(config.attention_window_size) - 1
+            if config.use_sliding_window_causal
+            else -1,
         ),
         (
             "mma_variant",
@@ -174,7 +179,9 @@ def _planned_full_split_prefix(
         or bool(config.use_sliding_window_causal)
     ):
         return False
-    from .kernels.fmha_decode.fmha_decode_config import compute_runtime_active_splits_kv
+    from .kernels.fmha_decode.fmha_decode_config import (
+        compute_runtime_active_splits_kv,
+    )
 
     configured_splits = int(config.splits_kv)
     if bool(config.uses_nontrivial_grouped_q_layout):
@@ -272,11 +279,15 @@ def _make_decode_workspace_layout(
         partial_o_dtype = torch.float16
 
     byte_end = 0
-    partial_o, byte_end = _append_workspace_section(byte_end, partial_o_shape, partial_o_dtype)
+    partial_o, byte_end = _append_workspace_section(
+        byte_end, partial_o_shape, partial_o_dtype
+    )
     partial_stats, byte_end = _append_workspace_section(
         byte_end, partial_stats_shape, torch.float32
     )
-    split_kv_counter, byte_end = _append_workspace_section(byte_end, counter_shape, torch.int32)
+    split_kv_counter, byte_end = _append_workspace_section(
+        byte_end, counter_shape, torch.int32
+    )
     cu_seqlens_q, byte_end = _append_workspace_section(byte_end, (1,), torch.int32)
     attention_sinks, byte_end = _append_workspace_section(byte_end, (1,), torch.float32)
     return _DecodeWorkspaceLayout(
@@ -300,7 +311,9 @@ def _validate_workspace_buffer(
     if workspace_buffer.dtype not in _WORKSPACE_DTYPES:
         raise TypeError("workspace_buffer must have dtype torch.int8 or torch.uint8")
     if workspace_buffer.device != device:
-        raise ValueError(f"workspace_buffer must be on {device}, got {workspace_buffer.device}")
+        raise ValueError(
+            f"workspace_buffer must be on {device}, got {workspace_buffer.device}"
+        )
     if not workspace_buffer.is_contiguous():
         raise ValueError("workspace_buffer must be contiguous")
     if workspace_buffer.data_ptr() % 32 != 0:
@@ -317,7 +330,9 @@ def _workspace_section_view(
     workspace_buffer: torch.Tensor, section: _WorkspaceSection
 ) -> torch.Tensor:
     workspace_bytes = workspace_buffer.reshape(-1).view(torch.uint8)
-    section_bytes = workspace_bytes[section.byte_offset : section.byte_offset + section.byte_size]
+    section_bytes = workspace_bytes[
+        section.byte_offset : section.byte_offset + section.byte_size
+    ]
     return section_bytes.view(section.dtype).view(section.shape)
 
 
@@ -327,9 +342,13 @@ def _bind_decode_workspace(
     return _DecodeWorkspaceViews(
         partial_o=_workspace_section_view(workspace_buffer, layout.partial_o),
         partial_stats=_workspace_section_view(workspace_buffer, layout.partial_stats),
-        split_kv_counter=_workspace_section_view(workspace_buffer, layout.split_kv_counter),
+        split_kv_counter=_workspace_section_view(
+            workspace_buffer, layout.split_kv_counter
+        ),
         cu_seqlens_q=_workspace_section_view(workspace_buffer, layout.cu_seqlens_q),
-        attention_sinks=_workspace_section_view(workspace_buffer, layout.attention_sinks),
+        attention_sinks=_workspace_section_view(
+            workspace_buffer, layout.attention_sinks
+        ),
     )
 
 
@@ -345,7 +364,8 @@ def _validate_head_dim(head_dim: int) -> int:
     head_dim = _validate_positive_int(head_dim, "head_dim")
     if head_dim not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(
-            f"attention-ts decode requires head_dim in {_SUPPORTED_HEAD_DIMS}, got {head_dim}"
+            "attention-ts decode requires head_dim in "
+            f"{_SUPPORTED_HEAD_DIMS}, got {head_dim}"
         )
     return head_dim
 
@@ -461,7 +481,9 @@ def _validate_layout(kv_layout: str) -> None:
     if not isinstance(kv_layout, str):
         raise TypeError("kv_layout must be a string")
     if kv_layout == "NHD":
-        raise NotImplementedError("attention-ts decode currently supports kv_layout='HND' only")
+        raise NotImplementedError(
+            "attention-ts decode currently supports kv_layout='HND' only"
+        )
     if kv_layout != "HND":
         raise ValueError(f"kv_layout must be exactly 'HND', got {kv_layout!r}")
 
@@ -470,14 +492,17 @@ def _validate_mask(mask_type: str) -> None:
     if not isinstance(mask_type, str):
         raise TypeError("mask_type must be a string")
     if mask_type not in ("dense", "causal"):
-        raise ValueError(f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}")
+        raise ValueError(
+            f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}"
+        )
 
 
 def _validate_page_size(page_size: int) -> int:
     page_size = _validate_positive_int(page_size, "page_size")
     if page_size not in _SUPPORTED_PAGE_SIZES:
         raise ValueError(
-            f"attention-ts decode requires page_size in {_SUPPORTED_PAGE_SIZES}, got {page_size}"
+            "attention-ts decode requires page_size in "
+            f"{_SUPPORTED_PAGE_SIZES}, got {page_size}"
         )
     return page_size
 
@@ -487,11 +512,14 @@ def _validate_head_geometry(num_qo_heads: int, num_kv_heads: int) -> None:
     num_kv_heads = _validate_positive_int(num_kv_heads, "num_kv_heads")
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError(
-            f"num_qo_heads must be divisible by num_kv_heads, got {num_qo_heads} and {num_kv_heads}"
+            "num_qo_heads must be divisible by num_kv_heads, got "
+            f"{num_qo_heads} and {num_kv_heads}"
         )
     head_ratio = num_qo_heads // num_kv_heads
     if head_ratio > 32:
-        raise ValueError(f"attention-ts decode requires 1 <= Hq/Hkv <= 32, got {head_ratio}")
+        raise ValueError(
+            f"attention-ts decode requires 1 <= Hq/Hkv <= 32, got {head_ratio}"
+        )
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -506,7 +534,9 @@ def _validate_scale(value: object, name: str) -> float:
     try:
         value_as_float32 = struct.unpack("=f", struct.pack("=f", value_as_float))[0]
     except (OverflowError, struct.error) as error:
-        raise ValueError(f"{name} must be representable as a positive float32") from error
+        raise ValueError(
+            f"{name} must be representable as a positive float32"
+        ) from error
     if not math.isfinite(value_as_float32) or value_as_float32 <= 0.0:
         raise ValueError(f"{name} must be representable as a positive float32")
     return value_as_float32
@@ -545,7 +575,10 @@ def _validate_dtype_pair(
     supported = (
         (q_dtype == torch.float16 and output_dtype == torch.float16)
         or (q_dtype == torch.bfloat16 and output_dtype == torch.bfloat16)
-        or (q_dtype == torch.float8_e4m3fn and output_dtype in (torch.float16, torch.float8_e4m3fn))
+        or (
+            q_dtype == torch.float8_e4m3fn
+            and output_dtype in (torch.float16, torch.float8_e4m3fn)
+        )
     )
     if not supported:
         raise NotImplementedError(
@@ -616,7 +649,9 @@ def _validate_q(
         )
         raise ValueError(f"q must have shape {expected_layout} for this Q layout")
     if not use_packed_q and seq_len_q > 1 and q.shape[1] != seq_len_q:
-        raise ValueError(f"q sequence length must match seq_len_q ({seq_len_q}), got {q.shape[1]}")
+        raise ValueError(
+            f"q sequence length must match seq_len_q ({seq_len_q}), got {q.shape[1]}"
+        )
     num_heads = int(q.shape[-2])
     if q.shape[0] <= 0 or num_heads <= 0:
         leading_name = "total Q token count" if use_packed_q else "batch size"
@@ -629,18 +664,25 @@ def _validate_q(
     if device is not None and q.device != device:
         raise ValueError(f"q must be on planned device {device}, got {q.device}")
     if not use_packed_q and batch_size is not None and q.shape[0] != batch_size:
-        raise ValueError(f"q batch size must match the plan ({batch_size}), got {q.shape[0]}")
+        raise ValueError(
+            f"q batch size must match the plan ({batch_size}), got {q.shape[0]}"
+        )
     if use_packed_q and batch_size is not None:
         total_q = int(q.shape[0])
         max_total_q = batch_size * seq_len_q
         if total_q < batch_size or total_q > max_total_q:
             raise ValueError(
-                f"packed q token count must be within [{batch_size}, {max_total_q}], got {total_q}"
+                "packed q token count must be within "
+                f"[{batch_size}, {max_total_q}], got {total_q}"
             )
     if num_qo_heads is not None and num_heads != num_qo_heads:
-        raise ValueError(f"q head count must match the plan ({num_qo_heads}), got {num_heads}")
+        raise ValueError(
+            f"q head count must match the plan ({num_qo_heads}), got {num_heads}"
+        )
     if head_dim is not None and q.shape[-1] != head_dim:
-        raise ValueError(f"q head dimension must match the plan ({head_dim}), got {q.shape[-1]}")
+        raise ValueError(
+            f"q head dimension must match the plan ({head_dim}), got {q.shape[-1]}"
+        )
     if q_dtype is not None and q.dtype != q_dtype:
         raise ValueError(f"q dtype must match the plan ({q_dtype}), got {q.dtype}")
     layout = (
@@ -667,7 +709,9 @@ def _validate_qo_indptr(
     if qo_indptr.dtype != torch.int32:
         raise TypeError("qo_indptr must have dtype torch.int32")
     if qo_indptr.device != expected_device:
-        raise ValueError(f"qo_indptr must be on {expected_device}, got {qo_indptr.device}")
+        raise ValueError(
+            f"qo_indptr must be on {expected_device}, got {qo_indptr.device}"
+        )
     if qo_indptr.numel() != batch_size + 1:
         raise ValueError(
             "qo_indptr must have B + 1 elements: expected "
@@ -687,7 +731,9 @@ def _read_packed_q_plan_metadata(
     offsets = tuple(int(value) for value in qo_indptr.tolist())
     if offsets[0] != 0:
         raise ValueError("qo_indptr must start at zero")
-    q_lengths = tuple(end - begin for begin, end in zip(offsets[:-1], offsets[1:], strict=True))
+    q_lengths = tuple(
+        end - begin for begin, end in zip(offsets[:-1], offsets[1:], strict=True)
+    )
     if any(length <= 0 for length in q_lengths):
         raise ValueError("qo_indptr must be strictly increasing")
     exact_max_seq_len_q = max(q_lengths, default=0)
@@ -751,11 +797,13 @@ def _normalize_paged_kv_cache(
     if isinstance(paged_kv_cache, torch.Tensor):
         if paged_kv_cache.ndim != 5 or paged_kv_cache.shape[1] != 2:
             raise ValueError(
-                "combined paged_kv_cache must have shape [num_pages, 2, Hkv, page_size, head_dim]"
+                "combined paged_kv_cache must have shape "
+                "[num_pages, 2, Hkv, page_size, head_dim]"
             )
         if paged_kv_cache.device != expected_device:
             raise ValueError(
-                f"paged_kv_cache must be on {expected_device}, got {paged_kv_cache.device}"
+                f"paged_kv_cache must be on {expected_device}, "
+                f"got {paged_kv_cache.device}"
             )
         k_cache = paged_kv_cache[:, 0]
         v_cache = paged_kv_cache[:, 1]
@@ -763,16 +811,21 @@ def _normalize_paged_kv_cache(
         if len(paged_kv_cache) != 2:
             raise ValueError("paged_kv_cache tuple must contain exactly (K, V)")
         k_cache, v_cache = paged_kv_cache
-        if not isinstance(k_cache, torch.Tensor) or not isinstance(v_cache, torch.Tensor):
+        if not isinstance(k_cache, torch.Tensor) or not isinstance(
+            v_cache, torch.Tensor
+        ):
             raise TypeError("paged_kv_cache tuple members must be torch.Tensor")
         if k_cache.ndim != 4 or v_cache.ndim != 4:
             raise ValueError(
-                "tuple K/V caches must each have shape [num_pages, Hkv, page_size, head_dim]"
+                "tuple K/V caches must each have shape "
+                "[num_pages, Hkv, page_size, head_dim]"
             )
         if k_cache.device != expected_device or v_cache.device != expected_device:
             raise ValueError(f"tuple K/V caches must be on {expected_device}")
     else:
-        raise TypeError("paged_kv_cache must be a combined torch.Tensor or a (K, V) tuple")
+        raise TypeError(
+            "paged_kv_cache must be a combined torch.Tensor or a (K, V) tuple"
+        )
 
     if k_cache.ndim != 4 or v_cache.ndim != 4:
         raise ValueError("K/V cache views must be rank-4 HND tensors")
@@ -919,7 +972,9 @@ def _validate_out(
     if not isinstance(out, torch.Tensor):
         raise TypeError("out must be a torch.Tensor")
     if tuple(out.shape) != expected_shape:
-        raise ValueError(f"out must have shape {expected_shape}, got {tuple(out.shape)}")
+        raise ValueError(
+            f"out must have shape {expected_shape}, got {tuple(out.shape)}"
+        )
     if out.dtype != output_dtype:
         raise ValueError(f"out must have dtype {output_dtype}, got {out.dtype}")
     if out.device != q.device:
@@ -1015,7 +1070,9 @@ def _resolve_decode_launch_spec(
         if config.use_persistent_scheduler:
             return False
         if config.use_cluster_smem_reduction:
-            cluster_capacity = get_max_active_clusters_for_cluster_size(int(config.splits_kv))
+            cluster_capacity = get_max_active_clusters_for_cluster_size(
+                int(config.splits_kv)
+            )
             return cluster_capacity > 0 and logical_grid <= cluster_capacity
         split_fanout = int(config.splits_kv) if config.use_split_kv else 1
         return logical_grid * split_fanout <= max_active_clusters
@@ -1047,9 +1104,13 @@ def _resolve_decode_launch_spec(
             )
             head_band_q_ctas = max(int(head_band_geometry.num_q_ctas(seq_len_q)), 1)
             head_band_cfg = None
-            if head_band_q_ctas > grouped_q_ctas and fits_one_service_wave(cfg, head_band_q_ctas):
+            if head_band_q_ctas > grouped_q_ctas and fits_one_service_wave(
+                cfg, head_band_q_ctas
+            ):
                 try:
-                    head_band_cfg = make_config({"groups_tokens_heads_q": False, "tile_size_q": 8})
+                    head_band_cfg = make_config(
+                        {"groups_tokens_heads_q": False, "tile_size_q": 8}
+                    )
                 except ValueError:
                     head_band_cfg = None
             if head_band_cfg is not None:
@@ -1265,7 +1326,9 @@ def _get_compiled_decode(
 
     reduction_tensor_adapter = None
     if cfg.use_separate_reduction_kernel:
-        from .kernels.fmha_decode.reduction import fmha_decode_separate_reduction_launch
+        from .kernels.fmha_decode.reduction import (
+            fmha_decode_separate_reduction_launch,
+        )
 
         @cute.jit
         def reduction_tensor_adapter(
@@ -1368,7 +1431,9 @@ def _get_compiled_decode(
         )
 
     seq_lens_fake = fake_compact(Int32, (batch_size,), 4)
-    cu_seqlens_q_fake = fake_compact(Int32, (batch_size + 1,) if use_packed_q else (1,), 4)
+    cu_seqlens_q_fake = fake_compact(
+        Int32, (batch_size + 1,) if use_packed_q else (1,), 4
+    )
     indptr_fake = fake_compact(Int32, (batch_size + 1,), 4)
     indices_fake = fake_compact(Int32, (logical_pages,), 4)
     partial_o_fake = fake_compact(partial_dtype, partial_o_shape, 16)
@@ -1501,7 +1566,9 @@ def get_prims_ts_batch_decode_workspace_size(
         out_dtype = q_dtype
     _validate_dtype_pair(q_dtype, kv_dtype, out_dtype)
     inferred_device = (
-        qo_indptr.device if device is None and isinstance(qo_indptr, torch.Tensor) else device
+        qo_indptr.device
+        if device is None and isinstance(qo_indptr, torch.Tensor)
+        else device
     )
     resolved_device, device_index = _resolve_cuda_device(inferred_device)
     if qo_indptr is not None:
@@ -1587,7 +1654,9 @@ def _prepare_decode_runtime(
             f"({runtime_num_kv_heads}, {runtime_page_size}, {runtime_head_dim})"
         )
     if k_cache.dtype != kv_dtype:
-        raise ValueError(f"K/V dtype must match the launch ({kv_dtype}), got {k_cache.dtype}")
+        raise ValueError(
+            f"K/V dtype must match the launch ({kv_dtype}), got {k_cache.dtype}"
+        )
     effective_bmm1_scale = _validate_scale(
         1.0 / math.sqrt(head_dim) if bmm1_scale is None else bmm1_scale,
         "bmm1_scale",
@@ -1740,7 +1809,9 @@ def prims_ts_batch_decode_with_kv_cache(
     exact static maximum used for automatic policy selection and JIT caching.
     Each request must own enough CSR entries for its live length::
 
-        (seq_lens[b] + page_size - 1) // page_size <= (paged_kv_indptr[b + 1] - paged_kv_indptr[b])
+        (seq_lens[b] + page_size - 1) // page_size <= (
+            paged_kv_indptr[b + 1] - paged_kv_indptr[b]
+        )
 
     The indptr must start at zero, increase strictly, and end at
     ``paged_kv_indices.numel()``; every live page ID must index ``kv_cache``.
@@ -1788,7 +1859,9 @@ def prims_ts_batch_decode_with_kv_cache(
         batch_size=batch_size,
     )
     if metadata_device != query.device:
-        raise ValueError(f"paged-KV metadata must be on {query.device}, got {metadata_device}")
+        raise ValueError(
+            f"paged-KV metadata must be on {query.device}, got {metadata_device}"
+        )
     if qo_indptr is not None:
         _validate_qo_indptr(
             qo_indptr,
@@ -2255,7 +2328,9 @@ def batch_decode_with_paged_kv_cache(
         paged_kv_last_page_len,
     )
     if metadata_device != q.device:
-        raise ValueError(f"paged-KV metadata must be on {q.device}, got {metadata_device}")
+        raise ValueError(
+            f"paged-KV metadata must be on {q.device}, got {metadata_device}"
+        )
     if qo_indptr is not None:
         _validate_qo_indptr(
             qo_indptr,
