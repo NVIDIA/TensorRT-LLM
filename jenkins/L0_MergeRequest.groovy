@@ -873,7 +873,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         writeFile file: inputPath, text: inputJson
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
-        if (coverageDb.path) {
+        if (coverageDb) {
             mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
         }
         def output = sh(script: mainCmd, returnStdout: true)
@@ -918,7 +918,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Fetch the touch DB, audit it, and return its `[path, meta]` (both "" on failure).
+// Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
@@ -936,16 +936,16 @@ def _cbtsCoverageAudit(pipeline)
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
-            return [path: "", meta: ""]
+            return null
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
-        return [path: ready.path, meta: ready.meta]
+        return ready
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
-        return [path: "", meta: ""]
+        return null
     }
 }
 
