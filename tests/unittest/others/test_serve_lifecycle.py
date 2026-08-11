@@ -55,6 +55,14 @@ from tensorrt_llm.serve.lifecycle import (
     serve_with_lifecycle,
 )
 
+# Nothing here needs a GPU -- every engine is a fake and no real trtllm-serve
+# is exec'd -- so this belongs in the CPU-only stage. The marker is load-
+# bearing, not decorative: tests/unittest/conftest.py's pytest_ignore_collect
+# drops any file whose source lacks this literal when pytest runs with
+# -m cpu_only, so without it the l0_cpu `unittest/others` entry collects
+# nothing here.
+pytestmark = pytest.mark.cpu_only
+
 # Wall-clock budget a probe gets before it is recorded as a timeout. Generous
 # relative to the ~ms a free event loop needs, so a failure here means the
 # loop was actually blocked, not that CI was slow.
