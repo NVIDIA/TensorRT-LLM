@@ -1474,6 +1474,10 @@ def getPytestBaseCommandLine(
         extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
         extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
         extraInternalEnv += " CBTS_STOP_FILE=${outputPath}/${CBTS_STOP_FILE_NAME}"
+        if (testFilter[(CBTS_CAPTURE_WORKER_IMPORTS)] ?: false) {
+            // Canary the post-lazy-import worker bootstrap before changing the sitecustomize default.
+            extraInternalEnv += " CBTS_DEFER_WORKER_ACTIVATION=0"
+        }
     }
 
     // Container port allocation environment variables for avoiding port conflicts
@@ -2615,6 +2619,9 @@ def CBTS_RESULT = "cbts_result"
 // Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
 @Field
 def CBTS_COVERAGE = "cbts_coverage"
+// Opt-in canary: capture MPI worker imports instead of deferring until the product import settles.
+@Field
+def CBTS_CAPTURE_WORKER_IMPORTS = "cbts_capture_worker_imports"
 // Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
@@ -2642,6 +2649,7 @@ def testFilter = [
     (DETAILED_LOG): false,
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
+    (CBTS_CAPTURE_WORKER_IMPORTS): false,
 ]
 
 @Field

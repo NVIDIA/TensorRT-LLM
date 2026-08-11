@@ -151,9 +151,16 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def DISABLE_CBTS = "disable_cbts"
+@Field
+def CBTS_CAPTURE_WORKER_IMPORTS = "cbts_capture_worker_imports"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+
+def cbtsCaptureWorkerImportsRaw = gitlabParamsFromBot.containsKey(CBTS_CAPTURE_WORKER_IMPORTS) ?
+    gitlabParamsFromBot[CBTS_CAPTURE_WORKER_IMPORTS] : env.CBTS_CAPTURE_WORKER_IMPORTS
+boolean cbtsCaptureWorkerImports = cbtsCaptureWorkerImportsRaw != null &&
+    cbtsCaptureWorkerImportsRaw.toString().toBoolean()
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -175,6 +182,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
+    (CBTS_CAPTURE_WORKER_IMPORTS): cbtsCaptureWorkerImports,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -361,6 +369,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     // Coverage runs only on the official post-merge pipeline.
     testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
+    pipeline.echo("CBTS MPI worker import capture canary: " +
+                  "${testFilter[(CBTS_CAPTURE_WORKER_IMPORTS)] ? 'enabled' : 'deferred'}")
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }

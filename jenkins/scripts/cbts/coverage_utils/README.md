@@ -34,6 +34,15 @@ not lines executed (far cheaper than line tracing).
 
 Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
 
+### MPI worker import canary
+
+`mpi4py.futures` workers defer tracker activation by default because instrumenting the old eager
+product import could exceed the `MpiPoolSession` identity-barrier timeout. After the product lazy
+imports landed, set `CBTS_CAPTURE_WORKER_IMPORTS=1` on the top-level post-merge job (or pass
+`cbts_capture_worker_imports: true` in its trigger JSON) to propagate
+`CBTS_DEFER_WORKER_ACTIVATION=0` to CBTS test runners. This captures the worker import itself while
+leaving the production default unchanged for a controlled timeout and completeness experiment.
+
 ## Granularity
 
 - **Integration tests**: the outer pytest carries `-p cbts_plugin`, so each test-db entry (one pytest item) is its own context.
