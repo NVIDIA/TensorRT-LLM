@@ -26,6 +26,13 @@ Options:
             pytest -- i.e. assert validate-accepts is a subset of collectable.
             Catches resolver soundness bugs and stale entries.
 
+Collection (``--l0`` / ``--qa`` / ``--waive``):
+  These modes run ``pytest --co`` against an installed ``tensorrt_llm``
+  package. When this PR's wheel is not present, ``install_python_dependencies``
+  uses ``TRTLLM_USE_PRECOMPILED=1`` (Python-only editable install that
+  extracts compiled artifacts from a published wheel). Collection sets
+  ``TRT_LLM_NO_LIB_INIT=1`` so import does not require a GPU or CUDA driver.
+
 Note:
 All the perf tests will be excluded since they are generated dynamically.
 """
@@ -940,6 +947,40 @@ def install_python_dependencies(llm_src):
         check=True)
 
 
+def _collection_pytest_env(llm_src: str) -> dict[str, str]:
+    """Env for ``pytest --co`` on a CPU host with a precompiled or local wheel."""
+    existing = os.environ.get("PYTHONPATH", "")
+    pythonpath = os.pathsep.join(p for p in (llm_src, existing) if p)
+    return {
+        **os.environ,
+        "PYTHONPATH": pythonpath,
+        "TRT_LLM_NO_LIB_INIT": "1",
+        # Collection only needs llm_models_root() to be a directory.
+        # Fixtures and weight loads do not run under pytest --co.
+        "LLM_MODELS_ROOT": "/tmp",
+    }
+
+
+def _run_collection_pytest(llm_src: str, test_list: str) -> None:
+    """Run pytest --co with GPU-less import (TRT_LLM_NO_LIB_INIT)."""
+    defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"--test-list={test_list}",
+            f"--output-dir={llm_src}",
+            "-s",
+            "--co",
+            "-q",
+        ],
+        check=True,
+        cwd=defs_dir,
+        env=_collection_pytest_env(llm_src),
+    )
+
+
 def verify_l0_test_lists(llm_src):
     test_db_path = f"{llm_src}/tests/integration/test_lists/test-db"
     test_list = f"{llm_src}/l0_test.txt"
@@ -989,11 +1030,7 @@ def verify_l0_test_lists(llm_src):
     with open(test_list, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(cleaned_lines))
 
-    subprocess.run(
-        f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --test-list={test_list} --output-dir={llm_src} -s --co -q",
-        shell=True,
-        check=True)
+    _run_collection_pytest(llm_src, test_list)
 
 
 def verify_qa_test_lists(llm_src):
@@ -1010,11 +1047,7 @@ def verify_qa_test_lists(llm_src):
     test_def_files = subprocess.check_output(
         f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
     for test_def_file in test_def_files:
-        subprocess.run(
-            f"cd {llm_src}/tests/integration/defs && "
-            f"pytest --test-list={test_def_file} --output-dir={llm_src} -s --co -q",
-            shell=True,
-            check=True)
+        _run_collection_pytest(llm_src, test_def_file)
         # append all the test_def_file to qa_test.txt
         with open(f"{llm_src}/qa_test.txt", "a") as f:
             with open(test_def_file, "r") as test_file:
@@ -1125,11 +1158,7 @@ def verify_waive_list(llm_src, args):
     with open(tmp_waives_file, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(processed_lines))
 
-    subprocess.run(
-        f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --test-list={tmp_waives_file} --output-dir={llm_src} -s --co -q",
-        shell=True,
-        check=True)
+    _run_collection_pytest(llm_src, tmp_waives_file)
 
 
 def main():
