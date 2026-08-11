@@ -50,6 +50,23 @@ def _top_level_workflow_properties(source):
     return set(re.findall(r"(?m)^(?:def\s+)?([A-Z][A-Z0-9_]*)\s*=", source))
 
 
+def _groovy_list_values_after(source, assignment):
+    assignment_start = source.index(assignment)
+    list_start = source.index("[", assignment_start)
+    list_end = source.index("]", list_start)
+    return re.findall(r'"([^"]+)"', source[list_start:list_end])
+
+
+def _pytest_capture_mode(args, initial_mode):
+    capture_mode = initial_mode
+    for arg in args:
+        if arg == "-s":
+            capture_mode = "no"
+        elif arg.startswith("--capture="):
+            capture_mode = arg.split("=", 1)[1]
+    return capture_mode
+
+
 class InfraDryRunPipelineTest(unittest.TestCase):
     def test_dedicated_context_selects_one_standard_pytest_case(self):
         database = DRY_RUN_DB_PATH.read_text()
@@ -94,6 +111,9 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             conditional_properties,
             _top_level_workflow_properties(L0_TEST),
         )
+        upload_args = _groovy_list_values_after(prepared, "extraArgs += [")
+        self.assertTrue(any(arg.startswith("--s3-upload-path=") for arg in upload_args))
+        self.assertEqual(_pytest_capture_mode(upload_args, initial_mode="no"), "fd")
 
     def test_slurm_keeps_only_dry_gates_needed_by_the_standard_runner(self):
         body = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "runLLMTestlistOnSlurm")

@@ -3756,8 +3756,9 @@ def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
     if (ENABLE_UPLOAD_TEST_RESULTS) {
         def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
         extraArgs += [
-            "-s",
+            "--capture=fd",
             "--s3-upload-path=${uploadPath}/${stageName}",
+            "--s3-upload-mode=deferred",
         ]
     }
     def pytestCommand = getPytestBaseCommandLine(
