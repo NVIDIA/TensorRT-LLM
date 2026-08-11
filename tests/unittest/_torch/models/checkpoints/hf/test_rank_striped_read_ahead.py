@@ -263,7 +263,14 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     native_load.assert_not_called()
 
 
-def test_native_and_rank_striped_outputs_match(tmp_path):
+def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
+    # CPU-only CI has no CUDA device from which local_mpi_rank can derive a
+    # rank. Model the single-rank environment explicitly; this test validates
+    # loader output parity, not MPI rank discovery.
+    monkeypatch.setattr(weight_loader_module, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_size", lambda: 1)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_barrier", lambda: None)
+
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
     native_loader = HfWeightLoader()
     native = native_loader.load_weights(str(checkpoint_dir), mapping=Mapping())
