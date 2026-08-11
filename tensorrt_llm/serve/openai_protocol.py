@@ -492,6 +492,14 @@ def _response_format_text_config_to_guided_decoding_params(
         resp_format, reasoning_parser=reasoning_parser)
 
 
+def _record_sampling_params_request_fields(
+        request: OpenAIBaseModel, sampling_params: SamplingParams) -> None:
+    """Preserve explicitly supplied fields across protocol defaulting."""
+    sampling_params._set_request_provided_fields(
+        field_name for field_name in request.model_fields_set
+        if getattr(request, field_name, None) is not None)
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -554,6 +562,15 @@ class CompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
     )
     conversation_params: Optional[ConversationParams] = Field(
         default=None,
@@ -622,6 +639,7 @@ class CompletionRequest(OpenAIBaseModel):
         )
         if return_log_probs:
             sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode="before")
@@ -954,6 +972,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
+    )
 
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")
@@ -1026,6 +1053,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         if return_log_probs:
             sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode='before')
@@ -1203,7 +1231,7 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
                 self.text.format, reasoning_parser=reasoning_parser)
 
-        return SamplingParams(
+        sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -1212,6 +1240,8 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding=guided_decoding,
             thinking_token_budget=self.thinking_token_budget,
         )
+        _record_sampling_params_request_fields(self, sampling_params)
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -1668,7 +1698,12 @@ class VideoGenerationRequest(OpenAIBaseModel):
                                 description="Random seed for reproducibility.")
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description="Optional image reference that guides generation.",
+        description=(
+            "Optional image or video reference that guides generation. PNG or "
+            "JPEG images condition image-to-video; MP4 or AVI video conditions "
+            "video-to-video, with H.264 the tested codec and others "
+            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
+            "base64 bytes; multipart requests upload the file."),
     )
 
     # Resolution

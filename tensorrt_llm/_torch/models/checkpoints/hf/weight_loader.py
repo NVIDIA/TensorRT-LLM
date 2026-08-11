@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import json
 import multiprocessing
 import os
 import threading
@@ -221,11 +222,71 @@ class HfWeightLoader(BaseWeightLoader):
             self._cache_loaded_weights(cache_key, weights)
         return weights
 
+    def cleanup(self) -> None:
+        # Drop lazy safetensors handles (if any) so the mmaps are released.
+        self._lazy_handles = []
+        super().cleanup()
+
+    @staticmethod
+    def _is_kimi_k3_checkpoint(checkpoint_dir: str) -> bool:
+        """Kimi K3 checkpoints (~1.5 TB) must not be materialized in host RAM."""
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        if not os.path.isfile(config_path):
+            return False
+        # Do not swallow read/parse failures: every rank must take the same
+        # branch here (the non-Kimi path enqueues collectives), so a
+        # rank-local transient error routing one rank differently would
+        # deadlock the job. Propagating fails fast on all ranks instead.
+        with open(config_path) as f:
+            model_type = json.load(f).get("model_type")
+        return model_type in ("kimi_k3", "kimi_linear")
+
+    def _load_lazy_safetensors(
+            self,
+            checkpoint_dir: str,
+            use_consolidated: bool = False) -> dict[str, Any]:
+        """Return a dict of name -> lazy safetensors slices.
+
+        Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
+        indexing) materializes only the requested bytes from the mmapped
+        file. This lets a model's ``load_weights`` stream a huge checkpoint
+        and read only its rank-local shard (e.g. Kimi K3 expert-parallel
+        expert slices) without ever holding the full checkpoint in RAM.
+        """
+        weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
+        if not weight_files:
+            raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+        # Same sharded-vs-consolidated selection as the eager path below:
+        # when both flavors are present, keep only the requested one.
+        filtered_weight_files = [
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1]) == use_consolidated
+        ]
+        if len(filtered_weight_files) > 0:
+            weight_files = filtered_weight_files
+        weights: dict[str, Any] = {}
+        handles = []
+        for file_name in weight_files:
+            handle = safetensors.safe_open(file_name,
+                                           framework="pt",
+                                           device="cpu")
+            handles.append(handle)
+            for name in handle.keys():
+                weights[name] = handle.get_slice(name)
+        # Keep the file handles alive for as long as the loader lives; the
+        # slices reference them. Released in cleanup().
+        self._lazy_handles = handles
+        logger.info(f"Lazily opened {len(weight_files)} safetensors files "
+                    f"({len(weights)} tensors) from {checkpoint_dir}")
+        return ConsumableWeightsDict(weights)
+
     def load_weights(self,
                      checkpoint_dir: str,
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
+        if self._is_kimi_k3_checkpoint(checkpoint_dir):
+            return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former unless specified explicitly, as there really is no need

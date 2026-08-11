@@ -103,6 +103,8 @@ class AlltoallMethodType(IntEnum):
     DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 4
+    # NCCL EP: Low-latency expert parallelism via NCCL EP library
+    NcclEP = 5
 
 
 class MoESchedulerKind(Enum):
@@ -1075,6 +1077,11 @@ class MoE(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    @property
+    def has_nvfp4_activation_quantization(self):
+        assert self._weights_created
+        return self.quant_method.quantizes_nvfp4_activations
 
     @property
     def has_w4a8_nvfp4_fp8(self):

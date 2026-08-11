@@ -30,7 +30,7 @@ import itertools
 import logging
 import os
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -52,24 +52,29 @@ from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
+    NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +82,20 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
+    valid_tactics = [
+        [8, 0],
+        [32, 4],
+        [16, 0],
+        [32, 0],
+    ]
+
+    assert _select_explicit_fallback_tactic(valid_tactics) == [32, 0]
+
+    with pytest.raises(RuntimeError, match="no valid fallback tactic"):
+        _select_explicit_fallback_tactic([])
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
@@ -149,6 +168,7 @@ def create_test_backend(
     swiglu_limit: Optional[torch.Tensor] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
+    n_shared_experts: int = 0,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -158,6 +178,11 @@ def create_test_backend(
     pretrained_config.hidden_size = hidden_size
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = dtype
+    if n_shared_experts > 0:
+        # TRTLLMGenFusedMoE reads n_shared_experts off the pretrained config to
+        # decide num_fused_shared_expert (shared-expert fusion, opt-in via
+        # TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1).
+        pretrained_config.n_shared_experts = n_shared_experts
 
     # CUTE_DSL_B12X is internal-only: the user-facing API selects it on the
     # CUTEDSL path when SM120/121 + NVFP4 + flashinfer is importable. Route
@@ -171,8 +196,13 @@ def create_test_backend(
         mapping=mapping,
         moe_backend=moe_backend_value,
     )
+    if n_shared_experts > 0:
+        # The shared-expert-fusion gate runs after the eager create_weights()
+        # in __init__, so weight creation must be deferred (as the real model
+        # engine does) for the fused trailing slots to be allocated.
+        model_config.skip_create_weights_in_init = True
 
-    return create_moe_backend(
+    backend = create_moe_backend(
         moe_cls=backend_cls,
         routing_method=routing_method,
         num_experts=num_experts,
@@ -189,6 +219,9 @@ def create_test_backend(
         weight_loading_mode=weight_loading_mode,
         activation_type=activation_type,
     )
+    if n_shared_experts > 0:
+        backend.create_weights()
+    return backend
 
 
 # ============================================================================
@@ -323,10 +356,50 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert configurable_moe._weights_transformed is False
 
 
+def test_moe_nvfp4_activation_quantization_capability():
+    assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
+    assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations
+
+
 def test_marlin_moe_repack_is_transform_stage():
     assert "transform_weights" in NVFP4MarlinFusedMoEMethod.__dict__
     assert "post_load_weights" not in NVFP4MarlinFusedMoEMethod.__dict__
     assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
+
+
+def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
+    cfg = ModelConfig()
+    cfg.moe_backend = "MARLIN"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+def test_get_moe_cls_marlin_selects_marlin_for_nvfp4():
+    assert get_moe_cls(_marlin_model_config()) is MarlinFusedMoE
+
+
+@pytest.mark.parametrize(
+    "quant_algo",
+    [
+        pytest.param(None, id="unquantized"),
+        pytest.param(QuantAlgo.FP8, id="fp8"),
+    ],
+)
+def test_get_moe_cls_marlin_falls_back_to_cutlass_on_non_nvfp4(quant_algo):
+    """MARLIN + non-NVFP4 layers (e.g. unquantized MTP draft layers in
+    MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE instead of
+    raising, matching CUTEDSL/DENSEGEMM fallback behavior."""
+    assert get_moe_cls(_marlin_model_config(quant_algo)) is CutlassFusedMoE
+
+
+def test_get_moe_cls_marlin_override_quant_config_per_layer():
+    """Per-layer override (the MTP draft-layer path): an unquantized per-layer
+    override falls back to Cutlass even though the global config is NVFP4."""
+    cfg = _marlin_model_config()
+    assert (
+        get_moe_cls(cfg, override_quant_config=QuantConfig(quant_algo=None), layer_idx=52)
+        is CutlassFusedMoE
+    )
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
@@ -474,6 +547,63 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",
     ):
         method.post_load_weights(DummyModule())
+
+
+def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    return MegaMoECuteDsl(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+    )
+
+
+def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Profiling scratch is sized for the largest adaptive bucket.
+    monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    buckets = moe._maxt_buckets
+    assert len(buckets) >= 2, f"expected a multi-bucket ladder, got {buckets}"
+    small_hint = buckets[0]
+    assert moe._select_launch_max_tokens(small_hint) == buckets[0]
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+    assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
+
+
+def test_megamoe_cutedsl_tactic_autotune_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Standard serving must not pay for the 36-tactic sweep by default.
+    monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    assert moe.tactic_autotune is False
+
+
+def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
+    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
+    assert len(decode) == len(prefill) == 36
+    assert {t[-1] for t in decode} == {(1, 1)}
+    assert {t[-1] for t in prefill} == {(2, 4)}
+    # The deterministic fallback stays inside the curated axes.
+    for num_tokens in (64, 4096, 16384):
+        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
+    invalid_tactic[2] = 511
+    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
+        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
 
 
 def run_backend_moe(
@@ -697,13 +827,16 @@ def generate_element_wise_test_params() -> List:
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
-            [None, QuantAlgo.NVFP4],
+            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
         ):
             if skip_reason:
                 continue
             if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
                 continue
             if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
+                continue
+            # INT8 weight-only per-channel non-gated MoE is CUTLASS-path only.
+            if quant_algo == QuantAlgo.W8A16 and backend_type != MoeBackendType.CUTLASS:
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (
@@ -1049,7 +1182,12 @@ def _make_bf16_routing_method(routing_kind: str, top_k: int, num_experts: int, d
 )
 @pytest.mark.parametrize("routing_kind", ["deepseekv3", "renormalize"])
 def test_trtllm_bf16_unquantized_moe(
-    routing_kind, activation_type, seq_len, trtllm_use_router_logits
+    routing_kind,
+    activation_type,
+    seq_len,
+    trtllm_use_router_logits,
+    num_experts=_BF16_UNQUANT_NUM_EXPERTS,
+    top_k=_BF16_UNQUANT_TOP_K,
 ):
     """TRTLLM-Gen BF16 (unquantized) MoE accuracy vs the reference impl."""
     backend_type = MoeBackendType.TRTLLM
@@ -1061,8 +1199,6 @@ def test_trtllm_bf16_unquantized_moe(
     if not can_impl:
         pytest.skip(skip_reason)
 
-    num_experts = _BF16_UNQUANT_NUM_EXPERTS
-    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
@@ -1138,3 +1274,358 @@ def test_trtllm_bf16_unquantized_moe(
         with torch.inference_mode():
             output = run_moe()
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.parametrize("seq_len", [1, 8])
+def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
+    """Kimi-K3 routing shape: 896 experts / top_k 16 without expert groups.
+
+    Exercises the (1024, 32) tier of the trtllm-gen DeepSeekV3 routing
+    kernels, including the cooperative small-batch kernel at num_tokens 1,
+    via the fused-routing path (router logits consumed in-kernel).
+    """
+    test_trtllm_bf16_unquantized_moe(
+        routing_kind="deepseekv3",
+        activation_type=ActivationType.Swiglu,
+        seq_len=seq_len,
+        trtllm_use_router_logits=True,
+        num_experts=896,
+        top_k=16,
+    )
+
+
+# ============================================================================
+# TRTLLM-Gen shared-expert fusion (migrated from deprecated
+# tests/unittest/_torch/thop/serial/test_moe.py::TestMoeFP8 fusion coverage)
+# ============================================================================
+# TRTLLMGenFusedMoE can fold n_shared_experts into the routed grouped GEMM as
+# always-selected experts (opt-in via TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1;
+# requires FP8_BLOCK_SCALES + dp_size==1 + DeepSeekV3 routing). The fused
+# experts occupy trailing weight slots [num_experts, num_experts+n_fused) and
+# receive routing weight 1.0, applied after routed_scaling_factor.
+
+# (num_experts, n_group, topk_group, top_k, n_fused) — shapes taken from the
+# deprecated thop test's expert_info parametrization (n_fused > 0 variants).
+FUSED_SHARED_EXPERT_INFOS = [
+    (32, 8, 4, 8, 1),
+    (256, 8, 4, 8, 2),
+    (72, 1, 1, 6, 1),
+    (72, 1, 1, 6, 2),
+]
+
+
+class _AppendSharedExpertsRouting:
+    """Reference-side routing wrapper: appends the fused shared experts as
+    always-selected entries (ids [num_experts, num_experts+n_fused), weight
+    1.0 after routed scaling) to the wrapped routing method's output."""
+
+    def __init__(self, routing_method, num_experts: int, n_fused: int) -> None:
+        self._routing_method = routing_method
+        self._num_experts = num_experts
+        self._n_fused = n_fused
+
+    def apply(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        ids, weights = self._routing_method.apply(router_logits)
+        num_tokens = ids.shape[0]
+        shared_ids = torch.arange(
+            self._num_experts,
+            self._num_experts + self._n_fused,
+            dtype=ids.dtype,
+            device=ids.device,
+        ).expand(num_tokens, -1)
+        shared_weights = torch.ones(
+            (num_tokens, self._n_fused), dtype=weights.dtype, device=weights.device
+        )
+        return torch.cat([ids, shared_ids], dim=1), torch.cat([weights, shared_weights], dim=1)
+
+
+def _write_fused_shared_expert_slots(
+    backend: MoE, weights: dict, num_experts: int, n_fused: int
+) -> None:
+    """Copy the shared experts' quantized tensors into the trailing weight
+    slots, mirroring DeepSeekFP8BlockScalesFusedMoEMethod's routed-slot layout
+    (w3_w1 slot = [w3; w1] along dim 0; scales likewise)."""
+    for i in range(n_fused):
+        expert_id = num_experts + i
+        slot = num_experts + i
+        dst_w3, dst_w1 = backend.w3_w1_weight.data[slot].chunk(2, dim=0)
+        dst_w3.copy_(weights[f"{expert_id}.w3.weight"].view(dst_w3.dtype))
+        dst_w1.copy_(weights[f"{expert_id}.w1.weight"].view(dst_w1.dtype))
+        backend.w2_weight.data[slot].copy_(
+            weights[f"{expert_id}.w2.weight"].view(backend.w2_weight.dtype)
+        )
+        dst_w3_scale, dst_w1_scale = backend.w3_w1_weight_scaling_factor.data[slot].chunk(2, dim=0)
+        dst_w3_scale.copy_(weights[f"{expert_id}.w3.weight_scale"])
+        dst_w1_scale.copy_(weights[f"{expert_id}.w1.weight_scale"])
+        backend.w2_weight_scaling_factor.data[slot].copy_(weights[f"{expert_id}.w2.weight_scale"])
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="TRTLLM-Gen FP8 block scales requires SM100/103",
+)
+@pytest.mark.parametrize("seq_len", [16, 1024])
+@pytest.mark.parametrize(
+    "expert_info",
+    FUSED_SHARED_EXPERT_INFOS,
+    ids=lambda info: f"e{info[0]}g{info[1]}tg{info[2]}k{info[3]}fused{info[4]}",
+)
+def test_trtllm_fp8_block_scales_fused_shared_experts(
+    expert_info,
+    seq_len: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Fused-shared-expert accuracy for the TRTLLM backend (FP8 block scales).
+
+    Loads routed experts through the regular path, writes the shared experts
+    into the trailing fused slots, and checks the fused kernel against a
+    reference that treats the shared experts as always-selected with weight
+    1.0. Replays every captured tactic; also asserts the small-tile WAR
+    (fused path restricted to tileN >= 32) holds in the autotuner candidates.
+    """
+    num_experts, n_group, topk_group, top_k, n_fused = expert_info
+    hidden_size = 512
+    intermediate_size = 512
+    dtype = torch.bfloat16
+    backend_type = MoeBackendType.TRTLLM
+
+    monkeypatch.setenv("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", "1")
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        e_score_correction_bias = torch.randn(num_experts, dtype=torch.bfloat16, device="cuda")
+        routing_method = DeepSeekV3MoeRoutingMethod(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=2.5,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+        )
+
+        router_logits = torch.randn((seq_len, num_experts), dtype=torch.float32, device="cuda")
+
+        placeholder_x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.FP8_BLOCK_SCALES, placeholder_x, backend_type
+        )
+        # The quantize util covers routed + fused shared experts so create_weights
+        # emits per-expert tensors for all of them and the reference module gets
+        # a GatedMLP per fused slot as well.
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts + n_fused,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        x = quantize_util.create_input(seq_len)
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            n_shared_experts=n_fused,
+        )
+        assert backend.num_fused_shared_expert == n_fused, (
+            "shared-expert fusion gate did not activate"
+        )
+        assert backend.w3_w1_weight.shape[0] == num_experts + n_fused
+
+        # Mirror the real flow (modeling_deepseekv3): load routed experts,
+        # post-process, then fill the trailing fused slots.
+        routed_weights = {k: v for k, v in weights.items() if int(k.split(".")[0]) < num_experts}
+        backend.load_weights([routed_weights])
+        backend.post_load_weights()
+        backend.cuda()
+        _write_fused_shared_expert_slots(backend, weights, num_experts, n_fused)
+
+        ref_routing = _AppendSharedExpertsRouting(routing_method, num_experts, n_fused)
+        ref_fused_moe = quantize_util.create_ref_module(ref_routing)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        AutoTuner.get().clear_cache()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+        def run_moe():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            return run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits=router_logits,
+            )
+
+        autotuner = AutoTuner.get()
+        autotuner.warmup = 0
+        autotuner.repeat = 1
+        autotuner.stream_delay_micro_secs = 10
+
+        with (
+            torch.inference_mode(),
+            autotune(cache_path="/tmp/moe_autotuner_cache_fused_shared.json"),
+        ):
+            _ = run_moe()
+
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+            _ = run_moe()
+
+        # WAR regression check: with num_fused_shared_experts > 0 the C++ side
+        # (fp8BlockScaleMoe.cpp fusedMinTileN, default 32) must exclude the
+        # small-tile (tileN 8/16) dynB cubins from the candidate tactics.
+        moe_tile_ns = []
+        for combo in all_tactics:
+            for _, tactic in combo:
+                if isinstance(tactic, (list, tuple)) and len(tactic) == 2:
+                    moe_tile_ns.append(int(tactic[0]))
+        assert moe_tile_ns, "expected [tileN, config] tactics from the fused MoE runner"
+        assert all(tile_n >= 32 for tile_n in moe_tile_ns), (
+            f"fused path produced small-tile tactics (tileN < 32): {sorted(set(moe_tile_ns))}"
+        )
+
+        replay_tactics_and_check(
+            all_tactics=all_tactics,
+            run_moe_fn=run_moe,
+            check_accuracy_fn=ref_fused_moe.check_accuracy,
+            ref_output=ref_output,
+            backend_type=backend_type,
+            quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+        )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="TRTLLM-Gen FP8 block scales requires SM100/103",
+)
+def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.MonkeyPatch):
+    """Layout-only check of fuse_shared_expert (no kernel launch).
+
+    Builds a shared GatedMLP of intermediate n_fused*I, fuses it, and asserts
+    each trailing slot holds the expected per-expert sub-tensors by
+    definition: slot i's [w3; w1] = gate_up rows [i*I, (i+1)*I) of the up/gate
+    halves, slot i's w2 = down_proj columns [i*I, (i+1)*I) — including the
+    block-scale tensors (the w2 scale split is a historically bug-prone spot).
+    """
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+    num_experts = 8
+    top_k = 2
+    hidden_size = 256
+    intermediate_size = 256
+    n_fused = 2
+    dtype = torch.bfloat16
+    scale_block = 128
+
+    monkeypatch.setenv("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", "1")
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+
+        routing_method = DeepSeekV3MoeRoutingMethod(
+            top_k=top_k,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            callable_e_score_correction_bias=lambda: torch.zeros(
+                num_experts, dtype=dtype, device="cuda"
+            ),
+        )
+        placeholder_x = torch.randn((1, hidden_size), dtype=dtype, device="cuda")
+        _, quant_config, _ = get_test_quant_params(
+            QuantAlgo.FP8_BLOCK_SCALES, placeholder_x, MoeBackendType.TRTLLM
+        )
+
+        backend = create_test_backend(
+            backend_type=MoeBackendType.TRTLLM,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            n_shared_experts=n_fused,
+        )
+        assert backend.num_fused_shared_expert == n_fused
+
+        shared_mlp = GatedMLP(
+            hidden_size=hidden_size,
+            intermediate_size=n_fused * intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=ModelConfig(quant_config=quant_config),
+        )
+        shared_mlp.cuda()
+        # Fill weights/scales with distinct random data (fp8 weights are filled
+        # via a bf16 sample viewed as fp8 bytes; values only need to be unique).
+        gate_up = shared_mlp.gate_up_proj
+        down = shared_mlp.down_proj
+        gate_up.weight.data.copy_(
+            torch.randn(gate_up.weight.shape, dtype=torch.bfloat16, device="cuda")
+            .to(torch.float8_e4m3fn)
+            .view(gate_up.weight.dtype)
+        )
+        down.weight.data.copy_(
+            torch.randn(down.weight.shape, dtype=torch.bfloat16, device="cuda")
+            .to(torch.float8_e4m3fn)
+            .view(down.weight.dtype)
+        )
+        gate_up.weight_scale.data.copy_(
+            torch.rand(gate_up.weight_scale.shape, dtype=torch.float32, device="cuda")
+        )
+        down.weight_scale.data.copy_(
+            torch.rand(down.weight_scale.shape, dtype=torch.float32, device="cuda")
+        )
+
+        backend.fuse_shared_expert(shared_mlp)
+        torch.cuda.synchronize()
+
+        # gate_up_proj rows are [gate(w1); up(w3)]; per-expert i owns rows
+        # [i*I, (i+1)*I) within each half. down_proj columns [i*I, (i+1)*I).
+        w1_all, w3_all = gate_up.weight.data.chunk(2, dim=0)
+        w1_scale_all, w3_scale_all = gate_up.weight_scale.data.chunk(2, dim=0)
+        inter_blocks = intermediate_size // scale_block
+        for i in range(n_fused):
+            slot = num_experts + i
+            rows = slice(i * intermediate_size, (i + 1) * intermediate_size)
+            scale_rows = slice(i * inter_blocks, (i + 1) * inter_blocks)
+
+            dst_w3, dst_w1 = backend.w3_w1_weight.data[slot].chunk(2, dim=0)
+            torch.testing.assert_close(dst_w3, w3_all[rows].view(dst_w3.dtype))
+            torch.testing.assert_close(dst_w1, w1_all[rows].view(dst_w1.dtype))
+            torch.testing.assert_close(
+                backend.w2_weight.data[slot],
+                down.weight.data[:, rows].view(backend.w2_weight.dtype),
+            )
+
+            dst_w3_scale, dst_w1_scale = backend.w3_w1_weight_scaling_factor.data[slot].chunk(
+                2, dim=0
+            )
+            torch.testing.assert_close(dst_w3_scale, w3_scale_all[scale_rows])
+            torch.testing.assert_close(dst_w1_scale, w1_scale_all[scale_rows])
+            torch.testing.assert_close(
+                backend.w2_weight_scaling_factor.data[slot],
+                down.weight_scale.data[:, scale_rows],
+            )

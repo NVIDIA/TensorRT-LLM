@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import hashlib
 import random
@@ -256,7 +270,7 @@ class DropPathStats:
     POSTs to the server, one immediately after — for every conv id this
     branch owns.  Each probe's ``request_id`` (server-assigned, captured
     by the worker from the OpenAI streaming chunk) is recorded here and
-    later joined with trtllm-serve's ``/perf_metrics`` drain to recover
+    later joined with response-carried metrics to recover
     ``num_reused_blocks`` (the per-request KV-cache hit count) and
     ``free_num_blocks`` (the post-call snapshot of the free-block pool).
 
@@ -399,7 +413,7 @@ class QueueExecutor:
                     if event is None:  # sentinel
                         # Fire end-of-branch retention probes BEFORE returning,
                         # so the parent ``wait_all_done`` covers them and the
-                        # client's downstream /perf_metrics drain sees the
+                        # client receives the response-carried metrics for the
                         # probe records.  For a child branch this is at
                         # parallel_end (immediately after any drop_kv_cache);
                         # for the root branch it is at end-of-session.
@@ -503,7 +517,7 @@ class QueueExecutor:
         # ``max_tokens=1, ignore_eos=True`` probe per (conv_id, phase) pair
         # immediately before and after the truncate.  Each probe's
         # request_id is recorded here; the per-request KV-cache hit
-        # accounting is joined in later via /perf_metrics.  The probes
+        # accounting is joined later from response-carried metrics. The probes
         # serialize the truncate against a real before/after measurement
         # so downstream verification can mechanically prove the truncate
         # actually freed the blocks the engine claimed it did (P0.6.a).

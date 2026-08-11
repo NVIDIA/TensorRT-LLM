@@ -28,8 +28,11 @@ from types import SimpleNamespace
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
-from dataclasses import dataclass
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import pytest
@@ -51,13 +54,10 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
-# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
-# contention when creating multiple agents on a single GPU in the same process.
-os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ class KvCacheConfigV2:
     disk_prefetch_num_reqs: int = 4
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
 

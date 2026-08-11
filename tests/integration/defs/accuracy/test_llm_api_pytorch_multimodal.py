@@ -131,6 +131,7 @@ class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
         ],
         ids=["full_budget", "forced_chunked_prefill"],
     )
+    @pytest.mark.skip_less_device_memory(60000)
     def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
@@ -492,7 +493,11 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         mocker,
     ):
         mocker.patch.dict(
-            MMMU.EVALUATE_KWARGS, {"model_type": "mistral_large_3", "is_force_single_image": True}
+            MMMU.EVALUATE_KWARGS,
+            {
+                "model_type": "mistral_common",
+                "is_force_single_image": True,
+            },
         )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,

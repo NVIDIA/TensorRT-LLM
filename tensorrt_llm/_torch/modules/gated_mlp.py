@@ -10,9 +10,10 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
 from ..utils import Fp4QuantizedTensor
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .swiglu import swiglu
 
 
@@ -35,6 +36,8 @@ class GatedMLP(nn.Module):
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
         swiglu_limit: Optional[float] = None,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
     ):
 
         super().__init__()
@@ -45,6 +48,12 @@ class GatedMLP(nn.Module):
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
+        # SwiGLU-OAI shape parameters, left None for plain SwiGLU, where the
+        # kernel defaults to alpha=1.0 and beta=0.0.
+        self.swiglu_alpha = float(
+            swiglu_alpha) if swiglu_alpha is not None else None
+        self.swiglu_beta = float(
+            swiglu_beta) if swiglu_beta is not None else None
 
         config = config or ModelConfig()
         use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
@@ -167,14 +176,22 @@ class GatedMLP(nn.Module):
                     logger.warning(
                         f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
                     )
-                    return swiglu(x, swiglu_limit=self.swiglu_limit)
+                    return swiglu(x,
+                                  swiglu_limit=self.swiglu_limit,
+                                  swiglu_alpha=self.swiglu_alpha,
+                                  swiglu_beta=self.swiglu_beta)
                 else:
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
                                   quant_type=torch.float8_e4m3fn,
-                                  swiglu_limit=self.swiglu_limit)
+                                  swiglu_limit=self.swiglu_limit,
+                                  swiglu_alpha=self.swiglu_alpha,
+                                  swiglu_beta=self.swiglu_beta)
             else:
-                return swiglu(x, swiglu_limit=self.swiglu_limit)
+                return swiglu(x,
+                              swiglu_limit=self.swiglu_limit,
+                              swiglu_alpha=self.swiglu_alpha,
+                              swiglu_beta=self.swiglu_beta)
         elif callable(self.activation):
             return self.activation(x)
         elif self.activation is None:
@@ -184,17 +201,27 @@ class GatedMLP(nn.Module):
                 f"Activation {self.activation} not yet implemented for fused GatedMLP"
             )
 
+    def _is_plain_swiglu(self):
+        """True when the SwiGLU has no alpha gain or (up + beta) offset.
+
+        The fused CuteDSL GEMM+SwiGLU epilogue implements plain silu(gate) * up
+        only; a swigluoai-style alpha/beta must use the Triton swiglu kernel.
+        """
+        return ((self.swiglu_alpha is None or self.swiglu_alpha == 1.0)
+                and (self.swiglu_beta is None or self.swiglu_beta == 0.0))
+
     def _can_fuse_gate_up_swiglu(self):
         """Check if fused GEMM + SwiGLU path is available.
 
         Returns True when all conditions are met:
         - CuteDSL blockscaling mode is enabled (implies Blackwell + CuteDSL)
-        - Activation is SwiGLU (F.silu)
+        - Activation is plain SwiGLU (F.silu), see _is_plain_swiglu
         - gate_up_proj uses NVFP4 quantization
         - gate_up_proj has no bias (bias not supported in fused kernel)
         """
         return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
-                and self.gate_up_proj.has_nvfp4
+                and self._is_plain_swiglu()
+                and self.gate_up_proj.has_nvfp4_activation_quantization
                 and not self.gate_up_proj.has_bias)
 
     def _can_fuse_gate_up_swiglu_fp4out(self):
@@ -207,13 +234,7 @@ class GatedMLP(nn.Module):
         """
         if not self._can_fuse_gate_up_swiglu():
             return False
-        if not self.down_proj.has_nvfp4:
-            return False
-        if self.down_proj.force_dynamic_quantization:
-            return False
-        if self.down_proj.input_scale is None:
-            return False
-        return True
+        return is_static_nvfp4_input_eligible(self.down_proj)
 
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
@@ -336,12 +357,10 @@ class GatedMLP(nn.Module):
 
         h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
 
-        if h1_lora is not None:
-            h1 = h1 + h1_lora
+        h1 = add_lora_result(h1, h1_lora)
 
         h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
-        if h1_lora is not None:
-            h1 = h1 + h1_lora
+        h1 = add_lora_result(h1, h1_lora)
 
         h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,

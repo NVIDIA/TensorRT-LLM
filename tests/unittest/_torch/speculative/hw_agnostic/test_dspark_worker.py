@@ -117,8 +117,13 @@ def test_worker_lazy_init_window_buffers():
     dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
     meta = _make_metadata(max_num_requests=8)
     worker._lazy_init(dm, meta)
-    assert worker._kv_windows.shape == (8, 3, 128, 64)
-    assert worker._ctx_len.shape == (8,)
+    # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
+    assert worker._kv_windows.shape == (9, 3, 128, 64)
+    assert worker._ctx_len.shape == (9,)
+    assert worker._scratch_slot == 8
+    # Dummy-id floor separates real request ids from CUDA-graph padding ids.
+    assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
+    # The scratch row is never handed out through the free pool.
     assert list(worker._free_slots) == list(range(8))
     assert worker._batch_to_slot is not None
     assert worker._batch_to_slot.shape == (8,)
@@ -253,6 +258,101 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert 100 not in worker._req_to_slot
     assert sa in worker._free_slots
     assert int(worker._ctx_len[sa]) == 0
+
+
+def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():
+    """Padded / unknown request IDs route to the scratch row, never a live slot.
+
+    Regression for the rolling-window aliasing bug (GitHub #16767): an unknown
+    request id (CUDA-graph padding, ADP idle request, or a disagg seed forward
+    without a real id) must not overwrite the request that owns slot 0.
+    """
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    # A live request takes the first free slot (0) and populates its window.
+    s_real = worker._assign_slot(100, reset=True)
+    assert s_real == 0
+    worker._ctx_len[s_real] = 17
+    worker._kv_windows[s_real].fill_(1.0)
+
+    # Batch contains the live request plus an unknown id (e.g. graph padding).
+    meta.request_ids = [100, 999]
+    meta.prepare()
+
+    # The unknown id maps to the scratch row, not to slot 0.
+    assert worker._batch_to_slot[:2].tolist() == [s_real, worker._scratch_slot]
+    assert worker._scratch_slot != s_real
+    # It is not silently registered as a real request and did not consume a slot.
+    assert 999 not in worker._req_to_slot
+    assert list(worker._free_slots) == [1, 2, 3]
+    # The live request's rolling window and position are untouched.
+    assert int(worker._ctx_len[s_real]) == 17
+    assert torch.all(worker._kv_windows[s_real] == 1.0)
+
+
+def test_prepare_assigns_slots_to_disagg_generation_requests():
+    """Disagg gen requests (never seeded here) get distinct slots, not one shared row.
+
+    Regression for GitHub #16767: on the disaggregated generation server the
+    prompt is prefilled (and the DSpark window seeded) on the *context* server,
+    so ``_seed_context_windows`` never runs here and ``_req_to_slot`` stays empty.
+    ``prepare()`` must therefore assign each real generation request its own
+    rolling-window slot instead of collapsing them all onto the shared scratch
+    row (which corrupts drafts and collapses accept length at batch size > 1).
+    """
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    # All-generation batch (num_contexts == 0), no prior seeding.
+    meta.request_ids = [1000, 1001]
+    meta.num_generations = 2
+    meta.prepare()
+
+    s0 = worker._req_to_slot[1000]
+    s1 = worker._req_to_slot[1001]
+    assert s0 != s1
+    assert s0 != worker._scratch_slot and s1 != worker._scratch_slot
+    assert worker._batch_to_slot[:2].tolist() == [s0, s1]
+
+    # Stable across steps: the same ids keep their slots (no churn / reassignment).
+    meta.prepare()
+    assert worker._req_to_slot[1000] == s0
+    assert worker._req_to_slot[1001] == s1
+    assert worker._batch_to_slot[:2].tolist() == [s0, s1]
+
+
+def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
+    """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    graph_dummy = CUDA_GRAPH_DUMMY_REQUEST_ID - worker.max_draft_len
+    meta.request_ids = [1000, ATTENTION_DP_DUMMY_REQUEST_ID, graph_dummy]
+    meta.num_generations = 3
+    meta.prepare()
+
+    s_real = worker._req_to_slot[1000]
+    assert s_real != worker._scratch_slot
+    # Dummies are neither registered nor given a real slot; they map to scratch.
+    assert ATTENTION_DP_DUMMY_REQUEST_ID not in worker._req_to_slot
+    assert graph_dummy not in worker._req_to_slot
+    assert worker._batch_to_slot[:3].tolist() == [
+        s_real,
+        worker._scratch_slot,
+        worker._scratch_slot,
+    ]
+    # Exactly one real slot consumed.
+    assert list(worker._free_slots) == [1, 2, 3]
 
 
 def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):

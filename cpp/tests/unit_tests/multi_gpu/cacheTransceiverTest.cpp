@@ -31,6 +31,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/contextTransferCoordinator.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -43,6 +44,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +56,7 @@
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -89,6 +92,95 @@ T serializeDeserialize(T const& val)
 }
 
 } // namespace
+
+TEST(ContextTransferCoordinatorTest, CommitsStaggeredSuccessAndFailureWithoutCollectivePolling)
+{
+    auto& world = tensorrt_llm::mpi::MpiComm::world();
+    if (world.getSize() < 2)
+    {
+        GTEST_SKIP() << "mpirun with at least two processes is required to run this test.";
+    }
+
+    auto comm = std::make_shared<CacheTransceiverComm>(std::addressof(world));
+    {
+        ContextTransferCoordinator coordinator(comm);
+        auto waitForOutcome = [&](std::uint64_t const requestId, bool const expectFailure)
+        {
+            bool observed = false;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+            {
+                auto result = coordinator.poll();
+                observed = expectFailure ? result.failedRequestIds.count(requestId) != 0
+                                         : result.completedRequestIds.count(requestId) != 0;
+                if (!observed)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            EXPECT_TRUE(observed);
+        };
+        auto waitForTimeout = [&](std::uint64_t const requestId)
+        {
+            bool observed = false;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+            {
+                auto const result = coordinator.poll();
+                observed = result.timedOutRequestIds.count(requestId) != 0;
+                if (!observed)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            EXPECT_TRUE(observed);
+        };
+
+        constexpr std::uint64_t kCompletedRequestId = 644815201;
+        world.barrier();
+        if (world.getRank() == world.getSize() - 1)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        coordinator.publishLocalOutcome(kCompletedRequestId, /*failed=*/false);
+        if (world.getRank() != world.getSize() - 1)
+        {
+            auto const earlyResult = coordinator.poll();
+            EXPECT_TRUE(earlyResult.completedRequestIds.empty());
+            EXPECT_TRUE(earlyResult.failedRequestIds.empty());
+        }
+        waitForOutcome(kCompletedRequestId, /*expectFailure=*/false);
+
+        constexpr std::uint64_t kFailedRequestId = 644815202;
+        world.barrier();
+        coordinator.publishLocalOutcome(kFailedRequestId, /*failed=*/world.getRank() == 0);
+        waitForOutcome(kFailedRequestId, /*expectFailure=*/true);
+
+        constexpr std::uint64_t kTimedOutRequestId = 644815203;
+        world.barrier();
+        if (world.getRank() == 0)
+        {
+            coordinator.publishTimeout(kTimedOutRequestId);
+            coordinator.publishTimeout(kTimedOutRequestId);
+        }
+        waitForTimeout(kTimedOutRequestId);
+        coordinator.publishLocalOutcome(kTimedOutRequestId, /*failed=*/false);
+        waitForOutcome(kTimedOutRequestId, /*expectFailure=*/true);
+
+        constexpr std::uint64_t kInvalidOrderingRequestId = 644815204;
+        world.barrier();
+        coordinator.publishLocalOutcome(kInvalidOrderingRequestId, /*failed=*/false);
+        EXPECT_ANY_THROW(coordinator.publishTimeout(kInvalidOrderingRequestId));
+        waitForOutcome(kInvalidOrderingRequestId, /*expectFailure=*/false);
+
+        // Exercise asymmetric but orderly teardown after every decision has committed.
+        if (world.getRank() == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    world.barrier();
+}
 
 class RequestInfoTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -194,7 +286,7 @@ protected:
         return mWorldSize;
     }
 
-    void setUpCacheManager()
+    void setUpCacheManager(bool enableBlockReuse = false)
     {
         auto constexpr numLayers = 4;
         auto constexpr numHeads = 2;
@@ -216,7 +308,6 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr enableBlockReuse = false;
         auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -330,6 +421,21 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
+    // Generation-only request whose DataTransceiverState carries the arbitrary-transfer
+    // provenance marker, as getSerializedDataTransceiverState would produce.
+    auto makeArbitraryLlmRequest(SizeType32 length, LlmRequest::RequestIdType arbitraryId)
+    {
+        constexpr SizeType32 maxNewTokens{1};
+        texec::Request request{VecTokens(length, length), maxNewTokens};
+        auto state = std::make_unique<texec::DataTransceiverState>();
+        state->setCommState(*mContextCommState);
+        state->setCacheState(*mCacheState);
+        state->setIsArbitraryTransferState(true);
+        auto stats = texec::ContextPhaseParams({}, arbitraryId, state.release(), std::nullopt);
+        request.setContextPhaseParams(std::move(stats));
+        return std::make_unique<LlmRequest>(arbitraryId, std::move(request));
+    }
+
     void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
@@ -425,6 +531,79 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     {
         future.get();
     }
+}
+
+TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager(/*enableBlockReuse=*/true);
+    setUpCacheTransceiver();
+
+    // 3 full blocks (tokensPerBlock = 8) so every requested chunk fully matches a stored block.
+    constexpr SizeType32 promptLen = 24;
+    constexpr SizeType32 missPromptLen = 40;
+    constexpr LlmRequest::RequestIdType arbitraryId = 4242;
+    auto constexpr beamIdx{0};
+    auto constexpr beamWidth{1};
+
+    if (isSender)
+    {
+        // Store a patterned request in the reuse tree; no LlmRequest exists on the
+        // sender for the transfers below.
+        auto request = makeLlmRequest(promptLen);
+        mManager->addSequenceBatch(
+            {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
+        for (auto const& windowSize : blockRange.getWindowSizes())
+        {
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+            {
+                TLLM_CUDA_CHECK(cudaMemset(it->data(), request->getPromptLen(), it->getSizeInBytes()));
+            }
+        }
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        // A completed context request carries one generated token beyond the prompt;
+        // without it, storeBlocksForReuse drops the trailing prompt token and the
+        // final block never enters the reuse tree.
+        request->addNewToken(0, beamIdx);
+        mManager->removeSequence(request->mRequestId, request);
+    }
+    else
+    {
+        // Hit: the requested tokens are stored in the sender's reuse tree.
+        std::shared_ptr<LlmRequest> request = makeArbitraryLlmRequest(promptLen, arbitraryId);
+        mManager->addSequenceBatch(
+            {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
+        auto future = mRequester->receiveAsync(request);
+        future.get();
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
+        for (auto const& windowSize : blockRange.getWindowSizes())
+        {
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+            {
+                std::vector<uint8_t> bytes(it->getSizeInBytes());
+                TLLM_CUDA_CHECK(cudaMemcpy(bytes.data(), it->data(), it->getSizeInBytes(), cudaMemcpyDeviceToHost));
+                EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](uint8_t i) { return i == (promptLen & 0xff); }));
+            }
+        }
+
+        // Miss: tokens never stored on the sender are rejected; the rejection
+        // surfaces as an exception on the receive future.
+        std::shared_ptr<LlmRequest> missRequest = makeArbitraryLlmRequest(missPromptLen, arbitraryId + 1);
+        mManager->addSequenceBatch(
+            {{{missRequest->mRequestId, missRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*missRequest)});
+        auto missFuture = mRequester->receiveAsync(missRequest);
+        EXPECT_THROW(missFuture.get(), tensorrt_llm::common::TllmException);
+    }
+    // The sender must not tear down while the receiver's transfers are in flight.
+    tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
 #if ENABLE_MULTI_DEVICE
@@ -582,7 +761,8 @@ protected:
     void setUpCacheManager(int numLayers, int numHeads, int sizePerHead, int tokensPerBlock,
         tensorrt_llm::DataType dataType, int kvFactor = 2, bool isMLA = false, bool enableDPAttention = false,
         bool isWindow = false, bool isIndexerKCache = true, int indexerDimPerHead = 0,
-        int indexerKCacheQuantBlockSize = 128)
+        int indexerKCacheQuantBlockSize = 128,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt)
     {
         mIsWindowAttention = isWindow;
 
@@ -610,6 +790,51 @@ protected:
         for (int ppRank = 0; ppRank < mContextPpSize; ppRank++)
         {
             contextAttentionLayerNumPerPP[ppRank] = getLayerNumPPRank(numLayers, ppRank, mContextPpSize);
+        }
+
+        // Per-PP indexer K cache layer counts for a masked indexer pool (per-layer indexer
+        // mask over the global layers). Without a mask every layer owns a row (dense).
+        if (indexerKCacheLayerMask.has_value())
+        {
+            TLLM_CHECK(static_cast<int>(indexerKCacheLayerMask->size()) == numLayers);
+        }
+        auto countIndexerLayers = [&](int startLayer, int layerCount)
+        {
+            if (!indexerKCacheLayerMask.has_value())
+            {
+                return layerCount;
+            }
+            int count = 0;
+            for (int layerId = startLayer; layerId < startLayer + layerCount; layerId++)
+            {
+                count += indexerKCacheLayerMask->at(layerId) ? 1 : 0;
+            }
+            return count;
+        };
+        mIndexerLayerNumPerPP = std::vector<SizeType32>(mPpSize, 0);
+        std::optional<std::vector<bool>> localIndexerKCacheLayerMask = std::nullopt;
+        {
+            int startLayer = 0;
+            for (int ppRank = 0; ppRank < mPpSize; ppRank++)
+            {
+                mIndexerLayerNumPerPP[ppRank] = countIndexerLayers(startLayer, mAttentionLayerNumPerPP[ppRank]);
+                if (ppRank == mPpRank && indexerKCacheLayerMask.has_value())
+                {
+                    localIndexerKCacheLayerMask = std::vector<bool>(indexerKCacheLayerMask->begin() + startLayer,
+                        indexerKCacheLayerMask->begin() + startLayer + mAttentionLayerNumPerPP[ppRank]);
+                }
+                startLayer += mAttentionLayerNumPerPP[ppRank];
+            }
+        }
+        auto contextIndexerLayerNumPerPP = std::vector<SizeType32>(mContextPpSize, 0);
+        {
+            int startLayer = 0;
+            for (int ppRank = 0; ppRank < mContextPpSize; ppRank++)
+            {
+                contextIndexerLayerNumPerPP[ppRank]
+                    = countIndexerLayers(startLayer, contextAttentionLayerNumPerPP[ppRank]);
+                startLayer += contextAttentionLayerNumPerPP[ppRank];
+            }
         }
 
         if (!isMLA)
@@ -695,17 +920,21 @@ protected:
             /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
             /*kvCacheConnectorManager=*/nullptr, /*enableIndexerKCache=*/isIndexerKCache,
             /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
-            /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);
+            /*indexerKCacheIndexHeadDim=*/indexerDimPerHead,
+            /*indexerKCacheUseFp4=*/false, localIndexerKCacheLayerMask);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
             : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRank, sizePerHead,
             tokensPerBlock, mTpSize, mPpSize, mCpSize, mAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
-            enableDPAttention, DPrank, DPsize, false, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
+            enableDPAttention, DPrank, DPsize, /*enableBlockReuse=*/false, /*enablePartialReuse=*/false,
+            /*hasIndexerKCache=*/isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize,
+            /*indexerKCacheUseFp4=*/false, mIndexerLayerNumPerPP);
         mContextCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRankForContext,
             sizePerHead, tokensPerBlock, mContextTpSize, mContextPpSize, mContextCpSize, contextAttentionLayerNumPerPP,
-            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize, false, isIndexerKCache,
-            indexerDimPerHead, indexerKCacheQuantBlockSize);
+            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize, /*enableBlockReuse=*/false,
+            /*enablePartialReuse=*/false, /*hasIndexerKCache=*/isIndexerKCache, indexerDimPerHead,
+            indexerKCacheQuantBlockSize, /*indexerKCacheUseFp4=*/false, contextIndexerLayerNumPerPP);
 
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
@@ -791,15 +1020,18 @@ protected:
                 = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
 
+            // Generate a per-instance ID so each ctx/gen instance writes to
+            // its own CSV files (mirrors CacheTransceiver behaviour).
+            auto instanceId = "test_" + std::to_string(tensorrt_llm::mpi::MpiComm::world().getRank());
             if (mIsContext)
             {
-                mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter()), instanceId);
             }
             else
             {
-                mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter()), instanceId);
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 
@@ -1071,9 +1303,12 @@ protected:
         }
         else
         {
+            // The (possibly masked) indexer pool lives in "indexer layer space": one row per
+            // full-indexer layer, so global row ids use the indexer per-PP prefix.
+            auto const& layerNumPerPP = isIndexerKCache ? mIndexerLayerNumPerPP : mAttentionLayerNumPerPP;
             for (int ppRank = 0; ppRank < mPpRank; ppRank++)
             {
-                startLayerId += mAttentionLayerNumPerPP[ppRank];
+                startLayerId += layerNumPerPP[ppRank];
             }
         }
         int headSizePerRank;
@@ -1169,9 +1404,12 @@ protected:
         }
         else
         {
+            // The (possibly masked) indexer pool lives in "indexer layer space": one row per
+            // full-indexer layer, so global row ids use the indexer per-PP prefix.
+            auto const& layerNumPerPP = isIndexerKCache ? mIndexerLayerNumPerPP : mAttentionLayerNumPerPP;
             for (int ppRank = 0; ppRank < mPpRank; ppRank++)
             {
-                startLayerId += mAttentionLayerNumPerPP[ppRank];
+                startLayerId += layerNumPerPP[ppRank];
             }
         }
 
@@ -1290,6 +1528,8 @@ protected:
     bool mIsWindowAttention{false};
     int mDupHeadFactor{1};
     std::vector<SizeType32> mAttentionLayerNumPerPP;
+    // Per-PP indexer K cache layer counts (== attention counts without a mask).
+    std::vector<SizeType32> mIndexerLayerNumPerPP;
 
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
@@ -1805,6 +2045,121 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLAWithIndexerKCache, Asymmetrical
         testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         testing::Values(1), testing::Values(true), testing::Values(false), testing::Values(false),
         testing::Values(false), testing::Values(true), testing::Values(256), testing::Values(128)));
+
+// Masked indexer K cache pool (per-layer indexer mask, GLM 5.2-style cross-layer indexer
+// sharing): only full-indexer layers own a pool row, so the indexer pass runs in "indexer
+// layer space". Exercises PP resharding of masked indexer blocks end to end.
+class AsymmetricalCacheTestWithIndexerLayerMask : public AsymmetricalCacheTest
+{
+};
+
+TEST_P(AsymmetricalCacheTestWithIndexerLayerMask, TestCase)
+{
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    tensorrt_llm::DataType dataType = std::get<10>(param);
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
+    int indexerDimPerHead = std::get<17>(param);
+    int indexerKCacheQuantBlockSize = std::get<18>(param);
+
+    if (isIndexerKCache && tensorrt_llm::common::getEnvUseMooncakeKvCache())
+    {
+        // https://nvbugs/5760737
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
+    }
+
+    // GLM 5.2-style schedule (index_topk_freq=4, index_skip_topk_offset=2): full-indexer
+    // layers are {0, 1, 5, 9, ...}; every PP slice below keeps at least one full layer.
+    std::vector<bool> indexerKCacheLayerMask(numLayers);
+    for (int layerId = 0; layerId < numLayers; layerId++)
+    {
+        indexerKCacheLayerMask[layerId] = (std::max(layerId - 2 + 1, 0) % 4) == 0;
+    }
+
+    std::vector<int> lenList = {30, 10, 60, 80};
+
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    if (mIsContext || mIsGeneration)
+    {
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow,
+            isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize, indexerKCacheLayerMask);
+        setUpCacheTransceiver();
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+
+        // the second loop is for cache reuse
+        for (int i = 0; i < 2; i++)
+        {
+            for (auto len : lenList)
+            {
+                requests.emplace_back(makeLlmRequest(len));
+            }
+
+            if (mIsContext)
+            {
+                std::vector<std::future<void>> contextFutures;
+                for (auto&& request : requests)
+                {
+                    contextFutures.push_back(addRequestAndTransportCacheForContext(request));
+                }
+                mComm->barrier();
+                for (auto&& cfuture : contextFutures)
+                {
+                    cfuture.get();
+                }
+            }
+            else
+            {
+                std::vector<std::future<void>> generationFutures;
+                mComm->barrier();
+                for (auto&& request : requests)
+                {
+                    generationFutures.push_back(addRequestAndTransportCacheForGeneration(request));
+                }
+
+                for (auto&& gfuture : generationFutures)
+                {
+                    gfuture.get();
+                }
+                for (auto&& request : requests)
+                {
+                    generationVerifyKVCache(request);
+                }
+            }
+            for (auto&& request : requests)
+            {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
+                mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
+            }
+            requests.clear();
+            mComm->barrier();
+        }
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// 8 layers with full-indexer layers {0, 1, 5}: PP=2 slices hold {2, 1} indexer rows, so
+// ctx/gen PP resharding exchanges masked indexer blocks with asymmetric per-PP counts.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLAWithIndexerKCacheLayerMask, AsymmetricalCacheTestWithIndexerLayerMask,
+    testing::Combine(testing::Values(1), testing::Values(1, 2), testing::Values(1), testing::Values(1),
+        testing::Values(1, 2), testing::Values(1), testing::Values(8), testing::Values(1), testing::Values(4),
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(1), testing::Values(true),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true),
+        testing::Values(256), testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,

@@ -56,7 +56,6 @@ l0_a100:
   tests:
   - unittest/llmapi/test_llm.py -m "part0"
   - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (90)
-  - unittest/llmapi/test_executor.py
 - condition:
     ranges:
       system_gpu_count:
