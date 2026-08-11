@@ -208,6 +208,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  attn_backend=attn_backend,
                  enable_chunked_prefill=True,
                  max_num_tokens=512,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
@@ -443,6 +444,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -567,6 +569,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -701,6 +704,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -767,6 +771,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
                  max_batch_size=max_bs,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -801,6 +806,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
                  max_batch_size=max_bs,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -868,6 +874,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_chunked_prefill=False,
                  max_num_tokens=8192,
                  speculative_config=spec_config,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1549,6 +1556,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         with LLM(
                 self.MODEL_PATH,
                 kv_cache_config=kv_cache_config,
+                max_stats_len=-1,
                 enable_iter_perf_stats=True,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -1671,6 +1679,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
                  max_batch_size=1350,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:  # GSM8K has 1319 requests
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -4070,6 +4079,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  enable_chunked_prefill=False,
                  disable_overlap_scheduler=True,
                  custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True,
                  speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -4526,6 +4536,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
+                 max_stats_len=-1,
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -5389,6 +5400,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
                   speculative_config=spec_config,
+                  max_stats_len=-1,
                   enable_iter_perf_stats=True,
                   **pytorch_config)
 
@@ -7321,6 +7333,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="TRTLLM"),
                 speculative_config=mtp_config if use_mtp else None,
+                max_stats_len=-1,
                 enable_iter_perf_stats=True,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
