@@ -512,6 +512,107 @@ def test_beam_search_disagg_e2e(
         ctx_llm.shutdown()
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_disagg_first_token_is_end_id(
+    fixed_params,
+    input_prompts,
+    model_kwargs: dict[str, Any],
+) -> None:
+    """A context phase that finishes on its only token still hands off.
+
+    This is the case the handoff is built around, and nothing else reaches it:
+    an end candidate would normally be pooled and its beam slot refilled, and
+    the request would be marked finished before it reaches the
+    disagg-transmission state that builds ContextPhaseParams -- so the
+    generation server would get no first_gen_tokens at all and never learn the
+    beam finished. Context-only requests therefore run with their end id
+    masked to the "no end token" sentinel, which keeps the token in its slot
+    and keeps the request on the handoff path.
+
+    Triggering it by prompt would be a lottery, and end_id cannot simply be
+    left unset: these prompts are token ids and the LLM has no tokenizer, so
+    an unset end_id raises. The end id is picked after the fact instead -- run
+    once to see what the beams sample, then declare beam 0's token the end id
+    and rerun, so the context step finishes on its first and only token.
+    """
+    if model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip(
+            "The context-side end-id mask is a TorchSampler path; the C++ "
+            "decoder behind TRTLLMSampler pools the end candidate instead.")
+
+    beam_width = fixed_params["max_beam_width"]
+    base_params = SamplingParams(
+        max_tokens=fixed_params["max_tokens"],
+        n=beam_width,
+        best_of=beam_width,
+        use_beam_search=True,
+        end_id=-1,
+        include_stop_str_in_output=True,
+    )
+
+    disagg_kwargs = deepcopy(model_kwargs)
+    disagg_kwargs |= dict(
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(max_tokens=10000,
+                                      enable_block_reuse=True,
+                                      enable_partial_reuse=True,
+                                      use_kv_cache_manager_v2=True),
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            kv_transfer_timeout_ms=1000,
+            kv_transfer_sender_future_timeout_ms=1000,
+        ),
+    )
+
+    prompts = [[1, 2, 3]]
+
+    def _context_first_gen_tokens(llm, params: SamplingParams) -> list[int]:
+        outputs = llm.generate(
+            deepcopy(prompts),
+            sampling_params=deepcopy(params),
+            disaggregated_params=[
+                DisaggregatedParams(request_type="context_only",
+                                    disagg_request_id=201)
+            ],
+            use_tqdm=False,
+        )
+        assert len(outputs) == len(prompts)
+        ctx_params = outputs[0].disaggregated_params
+        assert ctx_params is not None
+        # None here means the context phase never reached the transmission
+        # state, so ContextPhaseParams was never built -- the handoff, tokens
+        # included, was dropped.
+        assert ctx_params.first_gen_tokens is not None, (
+            "context phase produced no first_gen_tokens")
+        return list(ctx_params.first_gen_tokens)
+
+    ctx_llm = _build_llm(fixed_params, prompts, disagg_kwargs)
+    try:
+        with ctx_llm:
+            # Probe: no end id, so nothing can finish.
+            baseline_tokens = _context_first_gen_tokens(ctx_llm, base_params)
+            assert len(baseline_tokens) == beam_width
+
+            end_id = baseline_tokens[0]
+            end_id_params = deepcopy(base_params)
+            end_id_params.end_id = end_id
+
+            end_id_tokens = _context_first_gen_tokens(ctx_llm, end_id_params)
+
+            # Beam 0's token is the end id and it is still in the handoff.
+            # Were it pooled and the slot refilled, some other candidate would
+            # be here instead; were the request marked finished, there would be
+            # no handoff to read at all.
+            assert len(end_id_tokens) == beam_width
+            assert end_id_tokens[0] == end_id
+            # Masking is per request, so the other beams are unaffected.
+            assert end_id_tokens == baseline_tokens
+    finally:
+        ctx_llm.shutdown()
+
+
 @pytest.mark.parametrize("beam_width", [10])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_large_beam_width_regression(

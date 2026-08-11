@@ -2247,27 +2247,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     group_seq_lens_cuda = seq_lens[value.indices].to(
                         device="cuda", non_blocking=True
                     )  # Should be on device for beam search
-                # Context-only (disaggregated prefill) requests hand off after
-                # this single step, so the finished-candidate pool they would
-                # build is discarded rather than transferred. Mask their end id
-                # to the "no end token" sentinel (< 0) so an end candidate stays
-                # in its beam slot instead: the slot's token is what reaches the
-                # generation server as first_gen_tokens, which lets that side
-                # rebuild the pool entry itself. Data-only -- the op sees a
-                # tensor, so this adds no branch to the compiled step.
+                # Context-only requests already carry the masked end id in the
+                # store -- FinishReasonsHandler.prepare_for_new_request writes
+                # the sentinel for them once, at setup -- so the CBA op reads
+                # it from here with no per-step work.
                 cba_end_ids = self._finish_reasons_handler.store.end_ids_cuda
-                if beam_search_store.cba is not None and any(
-                    requests[i].is_context_only_request for i in value.indices.tolist()
-                ):
-                    cba_end_ids = cba_end_ids.clone()
-                    ctx_slots = [
-                        requests[i].py_seq_slot
-                        for i in value.indices.tolist()
-                        if requests[i].is_context_only_request
-                    ]
-                    cba_end_ids[
-                        torch.tensor(ctx_slots, device=cba_end_ids.device, dtype=torch.long)
-                    ] = -1
                 metadata = BeamSearchMetadata(
                     cache_indirection=beam_search_store.cache_indirection,
                     cache_indirection_buffer=beam_search_store.cache_indirection_buffer,

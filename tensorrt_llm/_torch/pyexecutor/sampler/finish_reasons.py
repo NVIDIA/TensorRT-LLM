@@ -262,7 +262,23 @@ class FinishReasonsHandler:
         self._temp_data.max_lens.append(
             min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
         )
-        self._temp_data.end_ids.append(end_id if (end_id := request.py_end_id) is not None else -1)
+        # Beam-search context-only (disaggregated prefill) requests hand off
+        # after their single step, so their end id is masked to the "no end
+        # token" sentinel (< 0). Two things depend on it: an end candidate is
+        # not pooled by the CBA op, so it stays in its beam slot and travels to
+        # the generation server as first_gen_tokens; and the request is not
+        # marked finished here, so it still reaches the disagg-transmission
+        # state that builds ContextPhaseParams (llmRequest.cpp) -- an END_ID
+        # finish leaves it in GENERATION_COMPLETE, which is neither
+        # isContextFinished() nor finished-due-to-length, so the handoff is
+        # never started and no tokens are produced at all. The generation
+        # server sees the end id itself and pools the beam there
+        # (TRTLLM-14792). Scoped to beam search: single-beam disaggregation
+        # keeps its current end-id behaviour.
+        end_id = request.py_end_id
+        if end_id is None or (request.is_context_only_request and request.py_beam_width > 1):
+            end_id = -1
+        self._temp_data.end_ids.append(end_id)
 
         if (stop_words_list := request.py_stop_words_list) is not None:
             assert (seq_slot := request.py_seq_slot) is not None
