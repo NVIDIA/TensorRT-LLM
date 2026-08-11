@@ -660,7 +660,6 @@ def test_pipelined_transfer_disabled_by_default():
 
     transceiver = MagicMock()
     transceiver._enable_pipelined_transfer = False
-    transceiver._chunk_size_blocks = 64
 
     result = KvCacheTransceiverV2.pipeline_transfer_enabled.fget(transceiver)
     assert result is False
@@ -886,6 +885,74 @@ def test_pipelined_non_last_chunk_does_not_finalize():
     transceiver._finalize_send.assert_not_called()
 
 
+def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
+    """Drive two chunks through respond_and_send_async and a real TxSession."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    rid = 42
+    tokens_per_block = 4
+    source_block_ids = np.arange(4, dtype=np.int64)
+    session = TxSession(
+        request_id=rid,
+        params=_make_params(rid),
+        sender=_stub_sender(),
+        prompt_len=16,
+    )
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._enable_pipelined_transfer = True
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._ever_had_send_session = False
+    transceiver._transfer_worker = SimpleNamespace(create_tx_session=lambda _req: session)
+    transceiver._reuse_adapter = SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        get_block_ids=lambda _req, _idx, _lg: source_block_ids,
+    )
+    transceiver._page_table = SimpleNamespace(
+        layer_groups=[SimpleNamespace(sliding_window_size=None)]
+    )
+    transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
+    transceiver._dp_rank = 0
+    transceiver._context_info_endpoint = "ctx"
+
+    request = SimpleNamespace(
+        py_disaggregated_params=_make_params(rid),
+        request_id=rid,
+        py_request_id=rid,
+        prompt_len=16,
+        py_beam_width=1,
+        py_kv_send_session_retired=False,
+        prepopulated_prompt_len=0,
+        is_generation_only_request=lambda: False,
+        set_kv_cache_transfer_start=lambda _ts: None,
+        state=LlmRequestState.CONTEXT_INIT,
+    )
+
+    request.py_last_context_chunk = (0, 8)
+    request.context_remaining_length = 8
+    transceiver.respond_and_send_async(request)
+
+    request.py_last_context_chunk = (8, 16)
+    request.context_remaining_length = 0
+    transceiver.respond_and_send_async(request)
+
+    assert [task._slice.token_range for task in session.kv_tasks] == [
+        TokenRange(start=0, end=8),
+        TokenRange(start=8, end=16),
+    ]
+    assert [task._slice.block_ids_per_layer_groups[0].tolist() for task in session.kv_tasks] == [
+        [0, 1],
+        [2, 3],
+    ]
+    assert [task._slice.is_last_slice for task in session.kv_tasks] == [False, True]
+    assert transceiver._send_sessions == {rid: session}
+    assert transceiver._send_reqs == {rid: request}
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+    session.close()
+
+
 # ---------------------------------------------------------------------------
 # Retired send sessions
 # ---------------------------------------------------------------------------
@@ -904,6 +971,23 @@ def _make_retirable_request(retired: bool, rid: int = 42):
         py_kv_send_session_retired=retired,
         state=LlmRequestState.CONTEXT_INIT,
     )
+
+
+def test_close_failed_send_session_without_request():
+    """A failed session must be retired even before its request is registered."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    session = MagicMock()
+    sessions = {42: session}
+    reqs = {}
+
+    KvCacheTransceiverV2._close_failed_sessions(
+        MagicMock(), sessions, reqs, failed=[42], mark_retired=True
+    )
+
+    session.close.assert_called_once_with()
+    assert sessions == {}
+    assert reqs == {}
 
 
 def test_get_or_create_send_session_refuses_retired_request():
@@ -1024,6 +1108,25 @@ def _build_prefill_chunk_for(
     req.context_remaining_length = (_REUSE_TOTAL_BLOCKS - chunk_end_block) * _REUSE_TPB
 
     return KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+
+def test_build_prefill_chunk_rejects_unaligned_non_final_end():
+    """Reject a partial destination block that the next chunk would overlap."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
+    transceiver._send_reqs = {}
+
+    req = MagicMock()
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+    req.py_beam_width = 1
+    req.prepopulated_prompt_len = 0
+    req.py_last_context_chunk = (0, 6)
+    req.context_remaining_length = 10
+
+    with pytest.raises(AssertionError, match="non-final prefill chunk end 6 must be aligned"):
+        KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
 
 
 def test_first_chunk_covers_ctx_prefix_reuse():

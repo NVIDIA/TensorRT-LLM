@@ -1997,6 +1997,7 @@ def add_and_verify_pipelined_request(
         full_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=block_ids_per_groups,
+            token_range=TokenRange(start=0, end=request_len),
         )
         recv_session.receive(full_slice)
 
@@ -2013,6 +2014,8 @@ def add_and_verify_pipelined_request(
 PIPELINED_TEST_CONFIGS = [
     (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_pipelined"),
     (1, 1, False, 1, 1, False, False, False, "v1_tp1_pp1_pipelined"),
+    (2, 1, False, 2, 1, False, False, True, "v2_tp2_pp1_pipelined"),
+    (2, 1, False, 2, 1, False, False, False, "v1_tp2_pp1_pipelined"),
 ]
 
 

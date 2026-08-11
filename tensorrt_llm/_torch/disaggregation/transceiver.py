@@ -602,12 +602,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self, sessions: dict, reqs: dict, failed: list, mark_retired: bool = False
     ):
         for rid in failed:
-            reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
-            if mark_retired:
-                reqs[rid].py_kv_send_session_retired = True
-            sessions[rid].close()
-            del reqs[rid]
-            del sessions[rid]
+            req = reqs.pop(rid, None)
+            if req is not None:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                if mark_retired:
+                    req.py_kv_send_session_retired = True
+            session = sessions.pop(rid, None)
+            if session is not None:
+                session.close()
 
     def _retire_send_session(self, rid: int, req: Optional[LlmRequest] = None) -> None:
         """Close a send session and bar any later chunk from re-creating it.
@@ -732,6 +734,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_start_block = 0 if is_first_chunk else chunk_start_pos // tpb
         chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
         is_last_chunk = req.context_remaining_length == 0
+        assert is_last_chunk or chunk_end_pos % tpb == 0, (
+            f"non-final prefill chunk end {chunk_end_pos} must be aligned to tokens_per_block={tpb}"
+        )
 
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
         total_blocks = prompt_blocks

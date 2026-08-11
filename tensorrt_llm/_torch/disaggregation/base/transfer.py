@@ -59,7 +59,12 @@ def derive_chunk_block_coords(
     token_range: Optional[TokenRange],
     tokens_per_block: int,
 ) -> tuple[int, int]:
-    """Derive global chunk block offset and count from a block-aligned token_range."""
+    """Derive global chunk block offset and count from a block-aligned token_range.
+
+    Producers of pipelined slices must align every non-final chunk boundary to
+    ``tokens_per_block``. The final partial block is represented by an aligned
+    range ending at its enclosing block boundary.
+    """
     if token_range is None:
         return 0, 0
     if tokens_per_block <= 0:
