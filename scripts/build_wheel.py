@@ -53,29 +53,31 @@ def _parse_linux_physical_cpu_count(
     """Count physical CPU cores from Linux /proc/cpuinfo content."""
     physical_cores = set()
     current_cpu = {}
+    malformed_topology = False
 
-    def add_current_cpu() -> None:
+    def add_current_cpu() -> bool:
         processor = current_cpu.get("processor")
         physical_id = current_cpu.get("physical id")
         core_id = current_cpu.get("core id")
         if processor is None or physical_id is None or core_id is None:
-            return
+            return False
 
         try:
             processor_id = int(processor)
             physical_id = int(physical_id)
             core_id = int(core_id)
         except ValueError:
-            return
+            return True
 
         if available_cpus is not None and processor_id not in available_cpus:
-            return
+            return False
 
         physical_cores.add((physical_id, core_id))
+        return False
 
     for line in cpuinfo.splitlines():
         if not line.strip():
-            add_current_cpu()
+            malformed_topology |= add_current_cpu()
             current_cpu = {}
             continue
 
@@ -85,8 +87,19 @@ def _parse_linux_physical_cpu_count(
         key, value = line.split(":", 1)
         current_cpu[key.strip().lower()] = value.strip()
 
-    add_current_cpu()
-    return len(physical_cores) or None
+    malformed_topology |= add_current_cpu()
+    if malformed_topology:
+        return None
+
+    physical_cpu_count = len(physical_cores)
+    if not physical_cpu_count:
+        return None
+
+    if (available_cpus is not None
+            and physical_cpu_count * 8 < len(available_cpus)):
+        return None
+
+    return physical_cpu_count
 
 
 def _get_linux_physical_cpu_count(
@@ -693,6 +706,7 @@ def main(*,
 
     if job_count is None:
         job_count = get_available_cpu_count()
+        print(f"-- Using {job_count} parallel build jobs")
 
     if len(extra_cmake_vars):
         # Backwards compatibility, we also support semicolon expansion for each value.
