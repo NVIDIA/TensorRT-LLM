@@ -237,10 +237,13 @@ The tarball is downloaded (retried), the sqlite extracted, and `coverage_audit.p
 any failure in this whole path is caught and non-fatal — `coverageDb.path` stays empty, Tier 2
 never runs, and the PR gets a full run.
 
-The chosen build, its commit, its lag and its drift ride into `main.py`, which **gates on the
-drift**: past `--coverage-max-drift` (default 30) the tier declines and the PR runs in full, on
+The selection JSON is written to `cbts_coverage_db.json` verbatim and reaches `main.py` as
+`--coverage-db-meta`, so a new field needs no Groovy change. `main.py` records all of it and
+**gates on the drift**: past `--coverage-max-drift` (default 30) the tier declines and the PR runs
+in full, on
 the grounds that a DB that far from the PR's base no longer describes who touches what in the code
-under test. A drift that could not be measured at all is treated the same way.
+under test. A drift that could not be measured — including a meta file that is missing or
+unreadable — is treated the same way.
 
 All of it lands in the decision and in OpenSearch:
 

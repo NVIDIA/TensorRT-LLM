@@ -874,23 +874,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
         if (coverageDb.path) {
-            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-build ${coverageDb.build}"
-            if (coverageDb.commit) {
-                mainCmd += " --coverage-db-commit '${coverageDb.commit}'"
-            }
-            if (coverageDb.lag != null) {
-                mainCmd += " --coverage-db-lag ${coverageDb.lag}"
-            }
-            // Absent drift declines the tier.
-            if (coverageDb.drift != null) {
-                mainCmd += " --coverage-db-drift ${coverageDb.drift}"
-            }
-            if (coverageDb.baseCommit) {
-                mainCmd += " --coverage-db-base-commit '${coverageDb.baseCommit}'"
-            }
-            if (coverageDb.driftStatus) {
-                mainCmd += " --coverage-db-drift-status '${coverageDb.driftStatus}'"
-            }
+            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
         }
         def output = sh(script: mainCmd, returnStdout: true)
 
@@ -953,7 +937,7 @@ def _cbtsCoverageAudit(pipeline, globalVars)
         }
         if (!selJson) {
             pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
-            return [path: "", build: null, commit: "", lag: null, drift: null, baseCommit: "", driftStatus: ""]
+            return [path: "", meta: ""]
         }
         def sel = new groovy.json.JsonSlurper().parseText(selJson)
         def url = sel.url
@@ -967,15 +951,15 @@ def _cbtsCoverageAudit(pipeline, globalVars)
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
            "--db ${covDir}/cbts_touchmap.sqlite"
-        // build/commit/lag/drift ride along for main.py's record and drift gate.
-        return [path: "${covDir}/cbts_touchmap.sqlite", build: sel.build,
-                commit: sel.commit ?: "", lag: sel.lag, drift: sel.drift,
-                baseCommit: sel.base_commit ?: "", driftStatus: sel.drift_status ?: ""]
+        // The selection JSON rides along verbatim for main.py's record and drift gate.
+        def metaPath = "cbts_coverage_db.json"
+        writeFile file: "${LLM_ROOT}/${metaPath}", text: selJson
+        return [path: "${covDir}/cbts_touchmap.sqlite", meta: metaPath]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
-        return [path: "", build: null, commit: "", lag: null, drift: null, baseCommit: "", driftStatus: ""]
+        return [path: "", meta: ""]
     }
 }
 

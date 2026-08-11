@@ -151,20 +151,19 @@ def _run_cbts(
         "--groovy-file",
         str(groovy),
     ]
+    meta_path = None
     if coverage_db:
-        # A replay has no meaningful distance; 0 keeps the freshness gate out of it.
-        argv += [
-            "--coverage-db",
-            coverage_db,
-            "--coverage-db-lag",
-            "0",
-            "--coverage-db-drift",
-            "0",
-        ]
+        # A replay has no PR base; drift 0 keeps the freshness gate out of it.
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"drift": 0}, f)
+            meta_path = f.name
+        argv += ["--coverage-db", coverage_db, "--coverage-db-meta", meta_path]
     try:
         res = subprocess.run(argv, capture_output=True, text=True, check=False)
     finally:
         os.unlink(path)
+        if meta_path:
+            os.unlink(meta_path)
     if res.returncode != 0:
         return {"_error": res.stderr.strip(), "_returncode": res.returncode}
     try:

@@ -176,6 +176,18 @@ class SelectionResult:
 DEFAULT_COVERAGE_MAX_DRIFT = 30
 
 
+def _load_coverage_db_meta(path: Optional[str]) -> dict:
+    """artifact.py's selection JSON; empty when absent or unreadable, which declines."""
+    if not path:
+        return {}
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"coverage DB meta unreadable ({path}): {e}", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _coverage_freshness(drift: Optional[int], max_drift: int) -> tuple[str, str]:
     """Verdict on the consulted DB's drift, plus the decline note (empty when usable)."""
     if drift is None:
@@ -383,40 +395,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "runs on fallbacks and may drop fully-safe single-GPU stages.",
     )
     parser.add_argument(
-        "--coverage-db-build",
-        type=int,
+        "--coverage-db-meta",
         default=None,
-        help="Post-merge build the --coverage-db came from; recorded in the decision "
-        "so it can be traced back to its DB.",
-    )
-    parser.add_argument(
-        "--coverage-db-commit",
-        default=None,
-        help="Revision the --coverage-db was collected at (from the build's build_info.txt).",
-    )
-    parser.add_argument(
-        "--coverage-db-lag",
-        type=int,
-        default=None,
-        help="Commits main gained since --coverage-db-commit; recorded only, the "
-        "freshness gate uses --coverage-db-drift.",
-    )
-    parser.add_argument(
-        "--coverage-db-drift",
-        type=int,
-        default=None,
-        help="Commits between --coverage-db-commit and the PR's base; what the "
-        "freshness gate decides on (omitted means unmeasurable, which declines).",
-    )
-    parser.add_argument(
-        "--coverage-db-base-commit",
-        default=None,
-        help="The PR's base revision the drift was measured against.",
-    )
-    parser.add_argument(
-        "--coverage-db-drift-status",
-        default="",
-        help="Which side of the PR's base the DB sits on; recorded only, never weighted.",
+        help="Path to artifact.py's --print-selection JSON, describing which DB "
+        "--coverage-db is. Its `drift` is what the freshness gate decides on; the "
+        "rest is recorded. Absent or unreadable declines the tier.",
     )
     parser.add_argument(
         "--coverage-max-drift",
@@ -480,17 +463,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     selector = Selector(stages)
     result = selector.run(pr, rules)
 
-    result.coverage_db_build = args.coverage_db_build
-    result.coverage_db_commit = args.coverage_db_commit
-    result.coverage_db_lag = args.coverage_db_lag
-    result.coverage_db_drift = args.coverage_db_drift
-    result.coverage_db_base_commit = args.coverage_db_base_commit
-    result.coverage_db_drift_status = args.coverage_db_drift_status
+    meta = _load_coverage_db_meta(args.coverage_db_meta)
+    result.coverage_db_build = meta.get("build")
+    result.coverage_db_commit = meta.get("commit")
+    result.coverage_db_lag = meta.get("lag")
+    result.coverage_db_drift = meta.get("drift")
+    result.coverage_db_base_commit = meta.get("base_commit")
+    result.coverage_db_drift_status = meta.get("drift_status") or ""
 
     if args.coverage_db and result.scope is None:
         tier = None
         result.coverage_freshness, note = _coverage_freshness(
-            args.coverage_db_drift, args.coverage_max_drift
+            result.coverage_db_drift, args.coverage_max_drift
         )
         if not note:  # the gate passed; a note here means it did not
             try:
