@@ -188,6 +188,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``disable_index_value_layer_ids`` — subset whose index-V is
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
+      * ``num_one_model_draft_layers`` — how many one-model draft layers
+        the creation site appended after the target's (0 when the drafter
+        is separate or speculation is off).
     """
 
     # One-model speculative draft layers share this manager (unified KV
@@ -218,12 +221,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_layer_ids=None,
         disable_index_value_layer_ids=None,
         sparse_index_dim: Optional[int] = None,
+        num_one_model_draft_layers: int = 0,
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first,
         # then from ``sparse_attn_config``, then from the M3 checkpoint
         # convention (layers 0..2 dense, 3..N-1 sparse,
         # disable_index_value=True, sparse_index_dim=128).
+        # num_layers / num_kv_heads / sparse_attn_config belong to the base
+        # __init__: peeked here (get, not pop) so super() still receives them.
         sparse_attn_config = kwargs.get("sparse_attn_config") or kwargs.get(
             "sparse_attention_config"
         )
@@ -234,12 +240,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
         # One-model speculative decoding with shared draft layers appends the
-        # drafter's layers after the target's. They are dense (no MSA index
-        # cache); the creation site passes the appended count explicitly
-        # (``num_one_model_draft_layers`` in ``_create_kv_cache_manager``).
-        num_draft = int(kwargs.pop("num_one_model_draft_layers", 0) or 0)
+        # drafter's layers after the target's (dense, no MSA index cache);
+        # ``_create_kv_cache_manager`` passes the appended count explicitly.
         self._shared_draft_layer_ids, num_target_layers = derive_shared_draft_layout(
-            num_layers, kwargs.get("num_kv_heads"), num_draft
+            num_layers, kwargs.get("num_kv_heads"), num_one_model_draft_layers
         )
         if sparse_layer_ids is None:
             if num_target_layers is not None:
