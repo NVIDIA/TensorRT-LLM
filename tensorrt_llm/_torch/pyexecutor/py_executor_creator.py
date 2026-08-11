@@ -514,13 +514,9 @@ def create_py_executor(
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
         # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        #
-        # MiniMax-M3's earlier exemption (#17341) is retired: its cache
-        # manager now shares draft layers (supports_shared_draft_layers=True)
-        # by presenting the drafter's pool to the attention ops through a
-        # sub-page view, so the shared-manager fallback this WAR selects is
-        # exactly the path M3 wants — drafter KV rides prefix reuse and
-        # disaggregated KV transfer natively.
+        # (The shared-manager fallback is exactly what MiniMax-M3 wants here
+        # — its drafter shares the target manager and rides prefix reuse and
+        # KV transfer natively — so M3's earlier #17341 exemption is retired.)
         if cache_transceiver_config is not None:
             spec_config._allow_separate_draft_kv_cache = False
 

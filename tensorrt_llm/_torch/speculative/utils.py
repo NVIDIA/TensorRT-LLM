@@ -555,9 +555,10 @@ def resolve_draft_kv_cache_manager(resource_manager):
     # silently swallowed into "no view".
     get_view = getattr(target_manager, "get_draft_subpage_view", None)
     view = get_view() if get_view is not None else None
-    _log_draft_kv_mode(
-        "target manager's draft sub-page view" if view is not None else
-        "none (drafter attends the shared manager directly)")
+    if view is not None:
+        _log_draft_kv_mode("target manager's draft sub-page view")
+    else:
+        _log_draft_kv_mode("none (drafter attends the shared manager directly)")
     return view
 
 

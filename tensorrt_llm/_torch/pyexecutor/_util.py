@@ -1980,14 +1980,11 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
-        # One-model speculative decoding with shared draft layers appends the
-        # drafter's layers to this manager; tell the manager explicitly which
-        # tail of the layer range is draft (consumed by managers that expose a
-        # draft sub-page view, e.g. MiniMax-M3; the base __init__ ignores it).
-        # Baseline is the TARGET layer count from the pretrained config: the
-        # per-layer heads list may arrive pre-extended from the caller, in
-        # which case num_hidden_layers already includes the draft tail and
-        # cannot serve as the reference. Masked/cross managers yield a
+        # One-model spec with shared draft layers appends the drafter's
+        # layers to this manager; tell the manager how many. Anchor on the
+        # pretrained TARGET layer count — local num_hidden_layers may already
+        # include the draft tail. Consumed by managers with a draft sub-page
+        # view (MiniMax-M3); others ignore it. Masked/cross flows yield a
         # non-positive delta and correctly report 0.
         target_num_layers = getattr(config, "num_hidden_layers", None)
         num_appended_draft_layers = (len(per_layer_num_kv_heads) -
