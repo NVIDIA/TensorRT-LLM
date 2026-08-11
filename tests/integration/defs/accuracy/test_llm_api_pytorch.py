@@ -7876,7 +7876,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         speculative_config = {
             "decoding_type": "Eagle3",
             "max_draft_len": max_draft_len,
-            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
             "eagle3_one_model": True,
         }
         common_config = {
@@ -7981,8 +7981,15 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
             # Chat-format acceptance probe — the same workload and
             # thresholds as the aggregated arm's (200 GSM8K questions,
-            # chat template, greedy, 512 tokens; drafter card reference
-            # rate 0.839 / length 3.518). The disagg fixture has no
+            # chat template, greedy, 512 tokens; MHA card reference rate
+            # 0.839 / length 3.518). Calibration for the GQA head: this
+            # arm measures 3.369-3.395 / 0.790-0.798 across runs while
+            # the aggregated arm measures 3.515 / 0.838, so the floors
+            # sit below the disaggregated (lower) pair — length 3.3 stays
+            # tight enough to catch a drafter-KV transfer regression
+            # (which cost the MHA head 3.44 -> 3.33 on this workload)
+            # while the rate floor drops to 0.76 for headroom.
+            # The disagg fixture has no
             # get_stats, so the probe window comes from the generation
             # worker's /metrics buffer (enable_iter_perf_stats), drained
             # right before the probe; the dataset loads from the models
@@ -8026,9 +8033,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.78, \
+            assert chat_rate > 0.76, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: " \
-                f"{chat_rate:.3f} (threshold 0.78, reference 0.839 from " \
+                f"{chat_rate:.3f} (threshold 0.76, reference 0.839 from " \
                 f"the drafter card)"
             assert chat_length > 3.3, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
@@ -8064,7 +8071,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
         )
         # The runtime forces tokens_per_block per implementation (128 MSA / 32
         # reference).
@@ -8127,9 +8134,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task = GSM8K(model_name)
                 task.evaluate(llm)
 
-            # Chat-format acceptance — the drafter's training distribution
-            # (Inferact/MiniMax-M3-EAGLE3 card: 0.839 / 3.518). Reuses the
-            # live engine and the cached dataset; ~20 s under CUDA graphs.
+            # Chat-format acceptance — the drafter's training distribution.
+            # Reuses the live engine and the cached dataset; ~20 s under
+            # CUDA graphs.
             questions = [
                 r["question"]
                 for r in load_dataset("gsm8k", "main", split="test")
@@ -8150,17 +8157,23 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # Published reference (Inferact/MiniMax-M3-EAGLE3 drafter card):
-            # rate 0.839, length 3.518. Our testing thresholds: rate > 0.78,
-            # length > 3.3.
+            # The GQA drafter card publishes no GSM8K figure, so the
+            # reference stays the MHA card's (rate 0.839, length 3.518):
+            # the GQA head is retrained on the same data with only the
+            # attention changed (64 -> 4 KV heads), the cards agree on the
+            # benchmark they share (MT-Bench 2.698 vs 2.668), and this arm
+            # measures the GQA head at 0.838 / 3.515 — indistinguishable
+            # from the MHA reference. Floors: rate > 0.76, length > 3.3
+            # (see the disaggregated arm for how they are calibrated).
             ref_rate, ref_length = 0.839, 3.518
-            ref_source = "the Inferact/MiniMax-M3-EAGLE3 drafter model card"
+            ref_source = ("the Inferact/MiniMax-M3-EAGLE3 (MHA) drafter "
+                          "card, which the GQA head matches on GSM8K")
             print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.78, \
+            assert chat_rate > 0.76, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(threshold 0.78, reference {ref_rate} from {ref_source})"
+                f"(threshold 0.76, reference {ref_rate} from {ref_source})"
             assert chat_length > 3.3, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
                 f"{chat_length:.3f} (threshold 3.3, reference {ref_length} " \
