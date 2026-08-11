@@ -22,14 +22,14 @@ except ModuleNotFoundError:
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
-from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
-from ..sampling_params import LogprobParams, SamplingParams
+from .params.disaggregation import DisaggregatedParams
+from .params.sampling import LogprobParams, SamplingParams
 from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
 from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
                     is_llm_response)
@@ -117,7 +117,7 @@ class CompletionOutput:
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
         additional_context_outputs (Dict[str, torch.Tensor], optional): The additional context outputs. Defaults to None.
         additional_generation_outputs (Dict[str, torch.Tensor], optional): The additional generation outputs. Defaults to None.
-        disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
+        disaggregated_params (tensorrt_llm.executor.params.disaggregation.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
         request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
     Attributes:

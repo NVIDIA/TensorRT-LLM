@@ -5,7 +5,7 @@ from typing import Any, List, Optional
 
 import torch
 
-from tensorrt_llm.sampling_params import (
+from tensorrt_llm.executor.params.sampling import (
     LogitsProcessor,
     SamplingParams,
     validate_thinking_token_budget,

@@ -12,15 +12,15 @@ from typing import Optional
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
+from tensorrt_llm.executor.params.disaggregation import DisaggregatedParams
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
                                           SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
-from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from .lora_test_utils import (

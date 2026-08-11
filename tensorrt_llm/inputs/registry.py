@@ -29,8 +29,8 @@ from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
 from .._utils import nvtx_range_debug
+from ..executor.params.sampling import SamplingParams
 from ..logger import logger
-from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,

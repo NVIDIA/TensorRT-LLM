@@ -23,8 +23,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankState,
     _num_input_tokens,
 )
-from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.scheduling_params import SchedulingParams
+from tensorrt_llm.executor.params.conversation import ConversationParams
+from tensorrt_llm.executor.params.scheduling import SchedulingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -504,7 +504,7 @@ def test_schedule_attention_dp_requests_serve_default_relax_None_does_not_crash(
     Use the real ``SchedulingParams`` dataclass so the test tracks the actual
     production default — if it ever flips back to None this stays accurate.
     """
-    from tensorrt_llm.scheduling_params import SchedulingParams
+    from tensorrt_llm.executor.params.scheduling import SchedulingParams
 
     def _make_serve_shaped_request(req_id):
         mock_request = Mock()

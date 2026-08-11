@@ -7,7 +7,8 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from tensorrt_llm import LLM
-from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
+from tensorrt_llm.executor.params.sampling import (LogitsProcessor,
+                                                   SamplingParams)
 
 
 def text_to_token(tokenizer: PreTrainedTokenizer, text: str, last: bool):

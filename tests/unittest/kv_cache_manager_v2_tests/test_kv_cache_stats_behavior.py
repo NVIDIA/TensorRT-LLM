@@ -26,10 +26,10 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DEFAULT_BEAM_INDEX
-from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

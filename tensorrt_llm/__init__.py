@@ -43,13 +43,13 @@ from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch)
-from .disaggregated_params import DisaggregatedParams
+from .executor.params.disaggregation import DisaggregatedParams
+from .executor.params.sampling import SamplingParams
 from .llmapi import LLM, AsyncLLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs
 from .logger import logger
 from .mapping import Mapping
 from .models.automodel import AutoConfig, AutoModelForCausalLM
-from .sampling_params import SamplingParams
 from .version import __version__
 from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
                          VisualGenMetrics, VisualGenOutput, VisualGenParams,

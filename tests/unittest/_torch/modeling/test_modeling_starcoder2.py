@@ -19,10 +19,10 @@ from tensorrt_llm._torch.models.modeling_starcoder2 import Starcoder2ForCausalLM
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import SamplingParams
 
 # Base config for all StarCoder2 models (based on HuggingFace configs)
 _STARCODER2_BASE_CONFIG = {

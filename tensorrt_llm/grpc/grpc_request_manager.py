@@ -28,12 +28,12 @@ import traceback
 from collections.abc import AsyncGenerator
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.executor.params.disaggregation import DisaggregatedParams
+from tensorrt_llm.executor.params.sampling import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.executor.request import LoRARequest, PromptAdapterRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from . import trtllm_service_pb2 as pb2
 

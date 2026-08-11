@@ -56,9 +56,9 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm.llmapi.tokenizer", "tokenizer_factory"),
     ("tensorrt_llm.llmapi.disagg_utils", "get_global_disagg_request_id"),
     # -- sampling / scheduling --
-    ("tensorrt_llm.sampling_params", "LogitsProcessor"),
-    ("tensorrt_llm.sampling_params", "GuidedDecodingParams"),
-    ("tensorrt_llm.scheduling_params", "SchedulingParams"),
+    ("tensorrt_llm.executor.params.sampling", "LogitsProcessor"),
+    ("tensorrt_llm.executor.params.sampling", "GuidedDecodingParams"),
+    ("tensorrt_llm.executor.params.scheduling", "SchedulingParams"),
     # -- executor --
     ("tensorrt_llm.executor.result", "GenerationResult"),
     ("tensorrt_llm.executor.result", "Logprob"),

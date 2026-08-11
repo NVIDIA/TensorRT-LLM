@@ -168,7 +168,7 @@ class MCTSController(Controller):
                 reward_task.input_str = initial_state
                 completion_output = CompletionOutput(index=0, text=node.state)
 
-                from tensorrt_llm.sampling_params import SamplingParams
+                from tensorrt_llm.executor.params.sampling import SamplingParams
                 mock_sampling_params = SamplingParams()
                 reward_result = GenerationResult.__new__(GenerationResult)
                 reward_result._outputs = [completion_output]
@@ -364,7 +364,8 @@ class TOTController(Controller):
                 if self.reward_controller is not None:
                     # Build reward tasks for this node
                     reward_indices_for_node: List[int] = []
-                    from tensorrt_llm.sampling_params import SamplingParams
+                    from tensorrt_llm.executor.params.sampling import \
+                        SamplingParams
                     for thought in thoughts[:self.num_thoughts_per_step]:
                         reward_task = GenerationTask()
                         reward_task.input_str = root_state

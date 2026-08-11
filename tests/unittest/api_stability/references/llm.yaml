@@ -343,16 +343,16 @@ methods:
   generate:
     parameters:
       disaggregated_params:
-        annotation: Union[tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], NoneType]
+        annotation: Union[tensorrt_llm.executor.params.disaggregation.DisaggregatedParams, Sequence[tensorrt_llm.executor.params.disaggregation.DisaggregatedParams], NoneType]
         default: null
       kv_cache_retention_config:
         annotation: Union[tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], NoneType]
         default: null
       scheduling_params:
-        annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
+        annotation: Union[tensorrt_llm.executor.params.scheduling.SchedulingParams, List[tensorrt_llm.executor.params.scheduling.SchedulingParams], NoneType]
         default: null
       conversation_params:
-        annotation: Union[tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], NoneType]
+        annotation: Union[tensorrt_llm.executor.params.conversation.ConversationParams, List[tensorrt_llm.executor.params.conversation.ConversationParams], NoneType]
         default: null
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
@@ -365,17 +365,17 @@ methods:
   generate_async:
     parameters:
       disaggregated_params:
-        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        annotation: Optional[tensorrt_llm.executor.params.disaggregation.DisaggregatedParams]
         default: null
       kv_cache_retention_config:
         annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
         default: null
       scheduling_params:
-        annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
+        annotation: Optional[tensorrt_llm.executor.params.scheduling.SchedulingParams]
         default: null
         status: prototype
       conversation_params:
-        annotation: Optional[tensorrt_llm.conversation_params.ConversationParams]
+        annotation: Optional[tensorrt_llm.executor.params.conversation.ConversationParams]
         default: null
       cache_salt:
         annotation: Optional[str]
@@ -418,10 +418,10 @@ methods:
         annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
         default: inspect._empty
       sampling_params:
-        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
+        annotation: Optional[tensorrt_llm.executor.params.sampling.SamplingParams]
         default: null
       disaggregated_params:
-        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        annotation: Optional[tensorrt_llm.executor.params.disaggregation.DisaggregatedParams]
         default: null
     return_annotation: tensorrt_llm.llmapi.llm.PreprocessedInputs
     status: prototype

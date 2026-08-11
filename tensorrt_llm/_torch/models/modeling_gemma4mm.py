@@ -36,6 +36,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeight
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 
 from ..._utils import nvtx_range
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -48,7 +49,6 @@ from ...inputs import (
 )
 from ...inputs.multimodal import MultimodalParams
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM

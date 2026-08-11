@@ -30,6 +30,7 @@ from transformers.utils import TensorType
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ...executor.params.sampling import SamplingParams
 from ...executor.request import LoRARequest
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -38,7 +39,6 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        register_input_processor)
 from ...logger import logger
 from ...lora_helper import LoraConfig
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM

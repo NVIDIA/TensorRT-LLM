@@ -72,7 +72,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_me
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
-from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
+from tensorrt_llm.executor.params.disaggregation import DisaggregatedParams, DisaggScheduleStyle
 
 if TYPE_CHECKING:
     from .bounce import Config

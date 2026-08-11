@@ -13,14 +13,14 @@ import zmq
 
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.executor.params.disaggregation import DisaggregatedParams
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
-from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from utils.llm_data import llm_models_root

@@ -725,7 +725,7 @@ class SpecMetadata:
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
         from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         # Sentinel temperature for greedy / temperature-disabled rows. Must stay
         # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels

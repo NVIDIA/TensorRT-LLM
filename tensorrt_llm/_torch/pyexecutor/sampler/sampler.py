@@ -71,16 +71,16 @@ from tensorrt_llm.bindings.internal.runtime import (
     DecoderState,
     GptDecoderBatched,
 )
-from tensorrt_llm.executor.result import Logprob
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import (
+from tensorrt_llm.executor.params.sampling import (
     MAX_TOP_LOGPROBS,
     LogprobMode,
     SamplingParams,
     check_logprobs_limit,
 )
+from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ...speculative.interface import get_force_num_accepted_tokens
 from ...speculative.spec_tree_manager import SpecTreeManager

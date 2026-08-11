@@ -297,7 +297,7 @@ Logits processors allow you to modify the logits produced by the network before 
 
 To use a custom logits processor:
 
-1. Create a custom class that inherits from [`LogitsProcessor`](source:tensorrt_llm/sampling_params.py#L48) and implements the `__call__` method
+1. Create a custom class that inherits from [`LogitsProcessor`](source:tensorrt_llm/executor/params/sampling.py#L48) and implements the `__call__` method
 2. Pass an instance of this class to the `logits_processor` parameter of `SamplingParams`
 
 The following example demonstrates logits processing:
@@ -307,7 +307,7 @@ import torch
 from typing import List, Optional
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.sampling_params import LogitsProcessor
+from tensorrt_llm.executor.params.sampling import LogitsProcessor
 
 class MyCustomLogitsProcessor(LogitsProcessor):
     def __call__(self,

@@ -37,6 +37,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range, prefer_pinned
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (
     BaseMultimodalInputProcessor,
     ContentFormat,
@@ -46,7 +47,6 @@ from ...inputs import (
     register_input_processor,
 )
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..attention_backend.utils import get_attention_backend

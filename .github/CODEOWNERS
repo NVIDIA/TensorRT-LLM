@@ -125,8 +125,8 @@
 /tensorrt_llm/mapping.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/metrics @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/sampling_params.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/scheduling_params.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/executor/params/sampling.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/executor/params/scheduling.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/serve @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/tokenizer @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/usage @NVIDIA/trt-llm-runtime-devs
@@ -242,7 +242,7 @@
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/_torch/disaggregation @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/executor/params/disaggregation.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
 # Disagg tests: co-own with the owning team so disagg-devs review disagg-test changes.
 /tests/integration/defs/accuracy/*disagg* @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
@@ -415,7 +415,7 @@
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
-/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/executor/params/disaggregation.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.h @NVIDIA/trt-llm-disagg-devs

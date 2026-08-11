@@ -13,8 +13,8 @@ from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
-from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
+from .params.sampling import BatchedLogitsProcessor
 from .postproc_worker import PostprocWorkerConfig
 from .rpc import RPCServer
 from .rpc_worker_mixin import RpcWorkerMixin

@@ -42,7 +42,7 @@ from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
 
 # isort: off
 # isort: on
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams
 
 from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
 from ...logger import logger

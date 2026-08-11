@@ -12,13 +12,13 @@ from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
 from ..logger import logger
-from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
+from .params.sampling import SamplingParams
 from .postprocessor_hook import load_post_processor_hook
 from .utils import ErrorResponse, bucket_responses_by_frontend, is_llm_response
 
 if TYPE_CHECKING:
-    from ..disaggregated_params import DisaggregatedParams
+    from .params.disaggregation import DisaggregatedParams
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
                          GenerationResultBase, ResponseWrapper)
 

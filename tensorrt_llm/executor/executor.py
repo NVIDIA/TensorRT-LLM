@@ -22,8 +22,6 @@ from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
-from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
@@ -32,10 +30,12 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, logger_debug,
                             print_colored)
-from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
-                               SamplingParams)
-from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
+from .params.conversation import ConversationParams
+from .params.disaggregation import DisaggregatedParams
+from .params.sampling import (BatchedLogitsProcessor, LogprobParams,
+                              SamplingParams)
+from .params.scheduling import SchedulingParams
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)

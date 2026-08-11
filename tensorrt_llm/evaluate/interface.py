@@ -25,9 +25,9 @@ from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
 
+from ..executor.params.sampling import SamplingParams
 from ..llmapi import RequestOutput
 from ..logger import logger
-from ..sampling_params import SamplingParams
 
 
 def get_chat_template_kwargs(

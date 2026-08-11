@@ -1158,7 +1158,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
 
     def test_text_only_processing(self):
         """Text-only input returns input_ids without multimodal data."""
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         inputs = {"prompt": "Hello, how are you?"}
@@ -1174,7 +1174,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         import numpy as np
         from PIL import Image
 
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
@@ -1212,7 +1212,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         import numpy as np
         from PIL import Image
 
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
@@ -1245,7 +1245,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         import numpy as np
         from PIL import Image
 
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         img1 = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
@@ -1277,7 +1277,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
 
     def test_torch_tensor_image(self):
         """Torch tensor images disable rescaling."""
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         img_tensor = torch.randn(3, 224, 224)
@@ -1316,7 +1316,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         """Audio input returns input_ids + audio_features in multimodal data."""
         import numpy as np
 
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         audio = np.random.randn(16000).astype(np.float32)
@@ -1352,7 +1352,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         """Audio placeholder expands to audio soft-token positions."""
         import numpy as np
 
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         audio_token_id = getattr(self.config, "audio_token_id", None)
         if audio_token_id is None:
@@ -1413,7 +1413,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
 
     def test_unknown_mm_modality_rejected(self):
         """Passing an unknown modality key raises KeyError."""
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         inputs = {
@@ -1431,7 +1431,7 @@ class TestGemma4InputProcessor(unittest.TestCase):
         import numpy as np
         from PIL import Image
 
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm.executor.params.sampling import SamplingParams
 
         proc = self._make_processor()
         if not hasattr(proc._processor, "video_processor"):

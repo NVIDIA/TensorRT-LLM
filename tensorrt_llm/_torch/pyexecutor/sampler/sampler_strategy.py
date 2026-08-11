@@ -57,7 +57,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     top_k_top_p_sampling_batch,
 )
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams
 
 from ..llm_request import LlmRequest
 from .sampler_common import (

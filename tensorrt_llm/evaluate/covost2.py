@@ -29,9 +29,9 @@ import datasets
 import numpy as np
 
 from .. import LLM as PyTorchLLM
+from ..executor.params.sampling import SamplingParams
 from ..llmapi import RequestOutput
 from ..logger import logger
-from ..sampling_params import SamplingParams
 from .interface import Evaluator
 
 # Human-readable language names for the CoVoST 2 codes.  Used in the

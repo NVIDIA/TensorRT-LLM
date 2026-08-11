@@ -88,14 +88,14 @@ methods:
         default: null
       # Logits processor and guided decoding
       logits_processor:
-        annotation: Optional[Union[tensorrt_llm.sampling_params.LogitsProcessor,
-                             List[tensorrt_llm.sampling_params.LogitsProcessor]]]
+        annotation: Optional[Union[tensorrt_llm.executor.params.sampling.LogitsProcessor,
+                             List[tensorrt_llm.executor.params.sampling.LogitsProcessor]]]
         default: None
       apply_batched_logits_processor:
         annotation: bool
         default: false
       guided_decoding:
-        annotation: Optional[tensorrt_llm.sampling_params.GuidedDecodingParams]
+        annotation: Optional[tensorrt_llm.executor.params.sampling.GuidedDecodingParams]
         default: null
       embedding_bias:
         annotation: Optional[torch.Tensor]

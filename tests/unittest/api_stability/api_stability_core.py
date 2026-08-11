@@ -25,6 +25,7 @@ from tensorrt_llm import LLM, DisaggregatedParams
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm.executor import GenerationResult
+from tensorrt_llm.executor.params.sampling import LogprobMode
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
@@ -32,7 +33,6 @@ from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
 from tensorrt_llm.llmapi.llm_args import SamplerType
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import Singleton
-from tensorrt_llm.sampling_params import LogprobMode
 
 
 def repr_annotation(field_type: type) -> str:

@@ -52,7 +52,7 @@ methods:
         default: null
       # Logits processor and guided decoding
       batched_logits_processor:
-        annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
+        annotation: Optional[tensorrt_llm.executor.params.sampling.BatchedLogitsProcessor]
         default: null
       guided_decoding_backend:
         annotation: Optional[Literal["xgrammar", "llguidance"]]
@@ -102,7 +102,7 @@ methods:
           Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
         default: inspect._empty
       sampling_params:
-        annotation: Union[tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams],
+        annotation: Union[tensorrt_llm.executor.params.sampling.SamplingParams, List[tensorrt_llm.executor.params.sampling.SamplingParams],
           NoneType]
         default: null
       lora_request:
@@ -124,7 +124,7 @@ methods:
           tensorrt_llm.llmapi.llm.PreprocessedInputs]
         default: inspect._empty
       sampling_params:
-        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
+        annotation: Optional[tensorrt_llm.executor.params.sampling.SamplingParams]
         default: null
       lora_request:
         annotation: Optional[tensorrt_llm.executor.request.LoRARequest]

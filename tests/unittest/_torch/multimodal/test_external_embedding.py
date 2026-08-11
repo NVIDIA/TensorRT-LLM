@@ -10,8 +10,8 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import \
     Qwen2_5VLInputProcessorBase
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.inputs.data import TextPrompt
-from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 

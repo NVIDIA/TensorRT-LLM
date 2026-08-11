@@ -5,11 +5,11 @@ import time
 import pytest
 from test_base_worker import create_fake_executor_config
 
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import logger_debug
-from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")

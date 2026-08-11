@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.executor.params.disaggregation import DisaggregatedParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -38,7 +38,7 @@ def test_receiver_ctx_info_endpoint_required():
     )
 
 
-@patch("tensorrt_llm.disaggregated_params.tllme")
+@patch("tensorrt_llm.executor.params.disaggregation.tllme")
 def test_get_context_phase_params(mock_tllme):
     mock_ctx_params = MagicMock()
     mock_tllme.ContextPhaseParams.return_value = mock_ctx_params
@@ -158,7 +158,7 @@ def test_opaque_state_round_trips_through_openai_protocol():
     assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
 
 
-@patch("tensorrt_llm.disaggregated_params.tllme")
+@patch("tensorrt_llm.executor.params.disaggregation.tllme")
 def test_get_context_phase_params_disagg_wins(mock_tllme):
     """disagg_request_id takes priority over ctx_request_id."""
     mock_tllme.ContextPhaseParams.return_value = MagicMock()
@@ -176,7 +176,7 @@ def test_get_context_phase_params_disagg_wins(mock_tllme):
     assert call_args[0][1] == 100
 
 
-@patch("tensorrt_llm.disaggregated_params.tllme")
+@patch("tensorrt_llm.executor.params.disaggregation.tllme")
 def test_get_context_phase_params_falls_back_to_ctx(mock_tllme):
     """When disagg_request_id is None, ctx_request_id is used."""
     mock_tllme.ContextPhaseParams.return_value = MagicMock()
@@ -192,7 +192,7 @@ def test_get_context_phase_params_falls_back_to_ctx(mock_tllme):
     assert call_args[0][1] == 200
 
 
-@patch("tensorrt_llm.disaggregated_params.tllme")
+@patch("tensorrt_llm.executor.params.disaggregation.tllme")
 def test_get_request_type_valid(mock_tllme):
     """get_request_type returns the correct enum for all 3 valid strings."""
     mock_tllme.RequestType.REQUEST_TYPE_CONTEXT_ONLY = "CTX"

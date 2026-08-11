@@ -18,9 +18,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import Logprob, ScheduledRequests, TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _StrategyImpls
 from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm.executor.params.sampling import LogprobMode
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
-from tensorrt_llm.sampling_params import LogprobMode
 
 prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(

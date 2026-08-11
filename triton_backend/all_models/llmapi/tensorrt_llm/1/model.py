@@ -633,7 +633,7 @@ class TritonPythonModel:
                         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished.
                         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason.
                         generation_logits (torch.Tensor, optional): The logits on the generated output token ids.
-                        disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving.
+                        disaggregated_params (tensorrt_llm.executor.params.disaggregation.DisaggregatedParams, optional): Parameters needed for disaggregated serving.
                 context_logits (torch.Tensor, optional): The logits on the prompt token ids.
                 finished (bool): Whether the whole request is finished.
 

@@ -817,8 +817,8 @@ class TestStep3p7VLInputProcessorHooks(unittest.TestCase):
     def test_image_span_is_contiguous(self):
         """End-to-end: the hashing masks cover one contiguous image span whose
         length equals ``get_num_tokens_per_image``."""
+        from tensorrt_llm.executor.params.sampling import SamplingParams
         from tensorrt_llm.inputs.multimodal import _compute_mm_masks
-        from tensorrt_llm.sampling_params import SamplingParams
 
         img = Image.new("RGB", (800, 600))
         inputs = {"prompt": "<im_patch>", "multi_modal_data": {"image": [img]}}

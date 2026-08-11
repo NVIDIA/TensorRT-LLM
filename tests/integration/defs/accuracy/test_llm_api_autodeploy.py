@@ -24,9 +24,9 @@ from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
 from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.sampling_params import SamplingParams
 
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
                             LlmapiAccuracyTestHarness)

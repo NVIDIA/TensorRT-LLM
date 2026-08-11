@@ -40,9 +40,9 @@ from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
-from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
+from .params.sampling import BatchedLogitsProcessor, SamplingParams
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
@@ -54,7 +54,7 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
 
 if TYPE_CHECKING:
     from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
-    from ..disaggregated_params import DisaggregatedParams
+    from .params.disaggregation import DisaggregatedParams
 
 __all__ = [
     "BaseWorker",

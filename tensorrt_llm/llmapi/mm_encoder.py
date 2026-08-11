@@ -4,9 +4,9 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 
 from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.inputs import create_input_processor, prompt_inputs
 from tensorrt_llm.inputs.data import PromptInputs
-from tensorrt_llm.sampling_params import SamplingParams
 
 from .llm import BaseLLM, RequestOutput, _TorchLLM
 from .llm_args import TorchLlmArgs

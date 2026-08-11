@@ -23,8 +23,8 @@ from tensorrt_llm._torch.auto_deploy.utils._config import (
     deep_merge_dicts,
 )
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.sampling_params import SamplingParams
 
 # Registry paths
 _REGISTRY_DIR = Path(__file__).resolve().parent / "model_registry"

@@ -6,8 +6,8 @@ from typing import cast
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from utils.util import similar

@@ -812,9 +812,9 @@ def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
     from tensorrt_llm.bindings.internal.testing import (
         simulate_prefill_completion_only_use_for_testing,
     )
+    from tensorrt_llm.executor.params.sampling import SamplingParams
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.sampling_params import SamplingParams
 
     init_cuda_once()
     gc.collect()

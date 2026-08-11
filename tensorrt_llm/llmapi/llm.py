@@ -24,11 +24,13 @@ from tensorrt_llm.metrics.enums import MetricNames
 
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
-from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
+from ..executor.params.conversation import ConversationParams
+from ..executor.params.disaggregation import DisaggregatedParams
+from ..executor.params.sampling import LogitsProcessor, SamplingParams
+from ..executor.params.scheduling import SchedulingParams
 from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
@@ -39,8 +41,6 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
-from ..sampling_params import LogitsProcessor, SamplingParams
-from ..scheduling_params import SchedulingParams
 from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
@@ -573,7 +573,7 @@ class BaseLLM:
         Args:
             inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
                 It can be single prompt or batched prompts.
-            sampling_params (tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams], optional): The sampling params for the generation. Defaults to None.
+            sampling_params (tensorrt_llm.executor.params.sampling.SamplingParams, List[tensorrt_llm.executor.params.sampling.SamplingParams], optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             use_tqdm (bool): Whether to use tqdm to display the progress bar. Defaults to True.
             lora_request (tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest], optional):
@@ -582,11 +582,11 @@ class BaseLLM:
                 Prompt Adapter request to use for generation, if any. Defaults to None.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], optional):
                 Configuration for the request's retention in the KV Cache. Defaults to None.
-            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
+            disaggregated_params (tensorrt_llm.executor.params.disaggregation.DisaggregatedParams, Sequence[tensorrt_llm.executor.params.disaggregation.DisaggregatedParams], optional):
                 Disaggregated parameters. Defaults to None.
-            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
+            scheduling_params (tensorrt_llm.executor.params.scheduling.SchedulingParams, List[tensorrt_llm.executor.params.scheduling.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
-            conversation_params (tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], optional):
+            conversation_params (tensorrt_llm.executor.params.conversation.ConversationParams, List[tensorrt_llm.executor.params.conversation.ConversationParams], optional):
                 Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
@@ -672,16 +672,16 @@ class BaseLLM:
 
         Args:
             inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text or token ids, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
-            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
+            sampling_params (tensorrt_llm.executor.params.sampling.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
-            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            disaggregated_params (tensorrt_llm.executor.params.disaggregation.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
             trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
-            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
-            conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
+            scheduling_params (tensorrt_llm.executor.params.scheduling.SchedulingParams, optional): Scheduling parameters. Defaults to None.
+            conversation_params (tensorrt_llm.executor.params.conversation.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
@@ -1036,9 +1036,9 @@ class BaseLLM:
 
         Args:
             inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
-            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
+            sampling_params (tensorrt_llm.executor.params.sampling.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
-            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            disaggregated_params (tensorrt_llm.executor.params.disaggregation.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be

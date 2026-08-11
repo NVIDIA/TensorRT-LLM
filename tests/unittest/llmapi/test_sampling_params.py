@@ -19,12 +19,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm.executor.params.sampling import (
+    MAX_TOP_LOGPROBS,
+    SamplingParams,
+    check_logprobs_limit,
+)
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
 )
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,

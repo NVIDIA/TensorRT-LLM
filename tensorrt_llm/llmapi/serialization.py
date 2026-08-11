@@ -81,7 +81,7 @@ BASE_EXAMPLE_CLASSES = {
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
-    "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
+    "tensorrt_llm.executor.params.disaggregation": ["DisaggregatedParams"],
     "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],
     "tensorrt_llm.executor.postproc_worker": [
         "PostprocArgs", "PostprocParams", "PostprocWorkerConfig",
@@ -111,7 +111,7 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
     ["QuantConfig", "SpeculativeDecodingMode"],
-    "tensorrt_llm.sampling_params":
+    "tensorrt_llm.executor.params.sampling":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
     "tensorrt_llm.serve.postprocess_handlers": [
         "chat_response_post_processor", "chat_stream_post_processor",
@@ -121,6 +121,15 @@ BASE_EXAMPLE_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
+    # Legacy module keys, kept for the layout-migration compatibility window
+    # (Epic TRTLLM-14558).  A pickle written before the move carries the old
+    # module string, and find_class() matches the key exactly and rejects
+    # before the compatibility shim is ever imported -- so dropping these
+    # would silently disable the shims on the deserialization path.  They are
+    # removed together with the shims by the removal ticket T25 delivers.
+    "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
+    "tensorrt_llm.sampling_params":
+    ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
 }
 
 

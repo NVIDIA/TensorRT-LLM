@@ -1,9 +1,10 @@
 from .._torch.async_llm import AsyncLLM
-from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
-from ..sampling_params import GuidedDecodingParams, SamplingParams
-from ..scheduling_params import SchedulingParams
+from ..executor.params.conversation import ConversationParams
+from ..executor.params.disaggregation import (DisaggregatedParams,
+                                              DisaggScheduleStyle)
+from ..executor.params.sampling import GuidedDecodingParams, SamplingParams
+from ..executor.params.scheduling import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,

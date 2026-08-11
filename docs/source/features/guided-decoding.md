@@ -332,7 +332,7 @@ Create a `GuidedDecodingParams` with the `json` field specified with a JSON sche
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.sampling_params import SamplingParams, GuidedDecodingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")
@@ -384,7 +384,7 @@ Create a `GuidedDecodingParams` with the `regex` field specified with a regular 
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.sampling_params import SamplingParams, GuidedDecodingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")
@@ -419,7 +419,7 @@ Create a `GuidedDecodingParams` with the `grammar` field specified with an EBNF 
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.sampling_params import SamplingParams, GuidedDecodingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")
@@ -463,7 +463,7 @@ Structural tag is supported by `xgrammar` backend only. It is a powerful and fle
 ```python
 import json
 from tensorrt_llm import LLM
-from tensorrt_llm.sampling_params import SamplingParams, GuidedDecodingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")

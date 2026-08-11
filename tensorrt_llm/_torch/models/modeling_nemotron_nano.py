@@ -23,6 +23,7 @@ from tensorrt_llm.inputs.multimodal import (
     find_mm_token_lengths,
 )
 
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (
     AudioData,
     BaseMultimodalDummyInputsBuilder,
@@ -39,7 +40,6 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM

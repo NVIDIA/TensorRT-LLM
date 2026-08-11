@@ -35,13 +35,13 @@ from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
                           PretrainedConfig, PreTrainedModel)
 
 from ..._utils import nvtx_range
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM

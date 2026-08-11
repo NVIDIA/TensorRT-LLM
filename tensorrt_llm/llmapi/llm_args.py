@@ -67,12 +67,12 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
 # isort: on
-
 # yapf: enable
+
+from ..executor.params.sampling import BatchedLogitsProcessor
 from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
-from ..sampling_params import BatchedLogitsProcessor
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory

@@ -73,7 +73,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams
 
 
 class TestSetupSamplerStepRequestSelection:

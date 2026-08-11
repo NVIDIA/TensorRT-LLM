@@ -218,8 +218,8 @@ class TestClassicFrontendProxyEndToEnd:
         assert not proxy.dispatch_result_thread.is_alive()
 
     def test_submit_namespaces_and_shutdown_never_sends_sentinel(self):
+        from tensorrt_llm.executor.params.sampling import SamplingParams
         from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
-        from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
             proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
@@ -248,9 +248,9 @@ class TestClassicFrontendProxyEndToEnd:
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
 
     def test_check_health_and_submit_reflect_fatal_error(self):
+        from tensorrt_llm.executor.params.sampling import SamplingParams
         from tensorrt_llm.executor.request import GenerationRequest
         from tensorrt_llm.executor.utils import EngineDeadError
-        from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
             proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
@@ -271,9 +271,9 @@ class TestClassicFrontendProxyEndToEnd:
         import zmq
 
         from tensorrt_llm.executor.ipc import FusedIpcQueue
+        from tensorrt_llm.executor.params.sampling import SamplingParams
         from tensorrt_llm.executor.request import GenerationRequest
         from tensorrt_llm.executor.utils import ErrorResponse
-        from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
             proxy, _, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)

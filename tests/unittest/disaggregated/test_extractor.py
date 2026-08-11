@@ -832,7 +832,7 @@ def test_get_memory_pool_block_indices_vswa():
 
     import tensorrt_llm
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-    from tensorrt_llm.sampling_params import SamplingParams
+    from tensorrt_llm.executor.params.sampling import SamplingParams
 
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA")
@@ -940,7 +940,7 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
     from tensorrt_llm.bindings.internal.testing import (
         simulate_prefill_completion_only_use_for_testing,
     )
-    from tensorrt_llm.sampling_params import SamplingParams
+    from tensorrt_llm.executor.params.sampling import SamplingParams
 
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA")

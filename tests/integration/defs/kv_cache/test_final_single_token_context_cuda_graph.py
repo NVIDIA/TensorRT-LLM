@@ -32,12 +32,12 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor.params.sampling import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.executor.postproc_worker import PostprocWorkerConfig
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.worker import GenerationExecutorWorker
 from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig, RequestOutput
 from tensorrt_llm.llmapi.mpi_session import MpiSession
-from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from ..conftest import llm_models_root
 

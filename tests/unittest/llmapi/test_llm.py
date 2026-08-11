@@ -16,6 +16,8 @@ import transformers
 from tensorrt_llm import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
+from tensorrt_llm.executor.params.sampling import (LogitsProcessor,
+                                                   SamplingParams)
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, RequestOutput,
                                  SADecodingConfig)
@@ -23,7 +25,6 @@ from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
-from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
 from tensorrt_llm.serve.openai_protocol import CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,

@@ -23,6 +23,7 @@ import soundfile
 from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.inputs import (
     ConversationMessage,
     MultimodalData,
@@ -34,7 +35,6 @@ from tensorrt_llm.inputs.utils import _resolve_content_format, load_audio, resol
 from tensorrt_llm.inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from tensorrt_llm.llmapi import RequestOutput
 from tensorrt_llm.logger import logger
-from tensorrt_llm.sampling_params import SamplingParams
 
 from .interface import Evaluator, get_chat_template_kwargs, get_model_context
 

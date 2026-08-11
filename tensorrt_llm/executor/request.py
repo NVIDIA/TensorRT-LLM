@@ -8,11 +8,11 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
-from ..sampling_params import SamplingParams
-from ..scheduling_params import SchedulingParams
+from .params.conversation import ConversationParams
+from .params.disaggregation import DisaggregatedParams
+from .params.sampling import SamplingParams
+from .params.scheduling import SchedulingParams
 from .postproc_worker import PostprocParams
 
 __all__ = [

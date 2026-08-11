@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 import pytest
 
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser

@@ -12,6 +12,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeight
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.logger import logger
 
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (
     ContentFormat,
     ExtraProcessedInputs,
@@ -20,7 +21,6 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from .checkpoints.hf.exaone4_5_weight_mapper import Exaone4_5HfWeightMapper
 from .modeling_auto import AutoModelForCausalLM

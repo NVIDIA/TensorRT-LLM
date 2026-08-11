@@ -34,6 +34,7 @@ from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
@@ -41,7 +42,6 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        register_input_processor,
                        support_multimodal_disaggregated)
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend

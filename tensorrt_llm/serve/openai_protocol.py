@@ -36,6 +36,9 @@ from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
                       field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
+from tensorrt_llm.executor.params.sampling import (
+    check_logprobs_limit, validate_thinking_token_budget)
+from tensorrt_llm.executor.params.scheduling import AgentHierarchy
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
@@ -43,9 +46,6 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import (check_logprobs_limit,
-                                          validate_thinking_token_budget)
-from tensorrt_llm.scheduling_params import AgentHierarchy
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0

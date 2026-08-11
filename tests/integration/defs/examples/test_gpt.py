@@ -19,9 +19,9 @@ import pytest
 from defs.common import similar, similarity_score
 
 from tensorrt_llm import LLM
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
-from tensorrt_llm.sampling_params import SamplingParams
 
 
 @pytest.mark.skip_less_device_memory(

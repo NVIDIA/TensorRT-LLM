@@ -26,8 +26,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY, GenerationRequest
-from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 

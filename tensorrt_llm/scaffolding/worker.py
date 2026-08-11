@@ -31,8 +31,8 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import GenerationExecutor, GenerationResult
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
-from tensorrt_llm.sampling_params import SamplingParams
 
 from .result import ScaffoldingOutput
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,

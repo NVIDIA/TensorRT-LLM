@@ -18,13 +18,13 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
 
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        TextPrompt, TokensPrompt, register_input_processor,
                        support_multimodal_disaggregated)
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM

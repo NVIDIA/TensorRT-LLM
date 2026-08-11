@@ -35,6 +35,7 @@ except ImportError:
     TemplateLM = object
 
 from .. import LLM as PyTorchLLM
+from ..executor.params.sampling import SamplingParams
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
@@ -44,7 +45,6 @@ from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
-from ..sampling_params import SamplingParams
 from .interface import (Evaluator, dump_inference_results,
                         get_chat_template_kwargs)
 

@@ -53,6 +53,7 @@ from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, Multim
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -62,7 +63,6 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..attention_backend.utils import get_attention_backend

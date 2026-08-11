@@ -26,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.inputs import (
     AudioData,
     VideoData,
@@ -41,7 +42,6 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
 )
-from tensorrt_llm.sampling_params import SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
 

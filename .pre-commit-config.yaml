@@ -373,6 +373,7 @@ common-files: &common_files |
         tensorrt_llm/executor/base_worker.py |
         tensorrt_llm/executor/executor.py |
         tensorrt_llm/executor/ipc.py |
+        tensorrt_llm/executor/params/scheduling.py |
         tensorrt_llm/executor/postproc_worker.py |
         tensorrt_llm/executor/proxy.py |
         tensorrt_llm/executor/ray_executor.py |
@@ -455,7 +456,6 @@ common-files: &common_files |
         tensorrt_llm/scaffolding/task.py |
         tensorrt_llm/scaffolding/task_collection.py |
         tensorrt_llm/scaffolding/worker.py |
-        tensorrt_llm/scheduling_params.py |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
@@ -1147,6 +1147,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/executor/base_worker.py |
         tensorrt_llm/executor/executor.py |
         tensorrt_llm/executor/ipc.py |
+        tensorrt_llm/executor/params/scheduling.py |
         tensorrt_llm/executor/postproc_worker.py |
         tensorrt_llm/executor/proxy.py |
         tensorrt_llm/executor/ray_executor.py |
@@ -1229,7 +1230,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/scaffolding/task.py |
         tensorrt_llm/scaffolding/task_collection.py |
         tensorrt_llm/scaffolding/worker.py |
-        tensorrt_llm/scheduling_params.py |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |

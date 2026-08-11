@@ -47,6 +47,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoProcessor, WhisperConfig
 
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (
     ExtraProcessedInputs,
     InputProcessor,
@@ -55,7 +56,6 @@ from ...inputs import (
     register_input_processor,
 )
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig

@@ -15,13 +15,13 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ...executor.params.sampling import SamplingParams
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM

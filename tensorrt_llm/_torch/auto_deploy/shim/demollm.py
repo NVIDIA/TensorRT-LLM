@@ -27,10 +27,10 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     top_k_top_p_sampling_batch,
 )
 from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.sampling_params import SamplingParams
 
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger

@@ -20,8 +20,8 @@ from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import configure_cpu_affinity
-from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
+from .params.sampling import BatchedLogitsProcessor
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult

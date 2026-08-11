@@ -57,9 +57,9 @@ from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     remove_boxed,
     strip_string,
 )
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 

@@ -4,10 +4,10 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_fp8_pre_ada, skip_gpu_memory_less_than
 
 from tensorrt_llm import LLM
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, LoadFormat
-from tensorrt_llm.sampling_params import SamplingParams
 
 
 def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:

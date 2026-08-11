@@ -19,11 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.result import CompletionOutput
 from tensorrt_llm.inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
 from tensorrt_llm.llmapi.llm import RequestOutput, _TorchLLM
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
-from tensorrt_llm.sampling_params import SamplingParams
 
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs

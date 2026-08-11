@@ -24,7 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy,
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
-from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.executor.params.conversation import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (

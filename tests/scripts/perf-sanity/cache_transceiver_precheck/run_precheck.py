@@ -56,7 +56,7 @@ the work-dir addr file (filesystem permissions = the job's trust domain), so
 a network-only attacker can neither read it nor forge/tamper messages.
 ContextPhaseParams crosses the wire as its primitive fields (opaque_state
 base64-encoded), mirroring DisaggregatedParams <-> ContextPhaseParams in
-tensorrt_llm/disaggregated_params.py and executor/result.py.
+tensorrt_llm/executor/params/disaggregation.py and executor/result.py.
 """
 
 import argparse
@@ -211,6 +211,7 @@ def load_internal_apis():
         LlmRequestType,
     )
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.executor.params.sampling import SamplingParams
     from tensorrt_llm.llmapi.llm_args import (
         CacheTransceiverConfig,
         KvCacheConfig,
@@ -221,7 +222,6 @@ def load_internal_apis():
         _resolve_transceiver_runtime_auto,
     )
     from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.sampling_params import SamplingParams
 
     _INTERNAL_APIS = types.SimpleNamespace(
         tensorrt_llm=tensorrt_llm,

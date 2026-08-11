@@ -20,7 +20,9 @@ from unittest.mock import AsyncMock
 import pytest
 import torch
 
-from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
+from tensorrt_llm.executor.params.disaggregation import (
+    DisaggregatedParams as LlmDisaggregatedParams,
+)
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,

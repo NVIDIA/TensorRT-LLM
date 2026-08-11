@@ -12,18 +12,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import pytest
-
-from tensorrt_llm.executor.params.conversation import ConversationParams
-
-
-def test_conversation_params_normalizes_conversation_id():
-    params = ConversationParams(conversation_id=" body-id ")
-
-    assert params.conversation_id == "body-id"
-
-
-def test_conversation_params_rejects_empty_conversation_id():
-    with pytest.raises(ValueError):
-        ConversationParams(conversation_id=" ")

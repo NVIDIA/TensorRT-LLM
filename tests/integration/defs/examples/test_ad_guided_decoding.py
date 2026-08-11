@@ -19,7 +19,7 @@ import os
 from build_and_run_ad import ExperimentConfig, main
 from defs.conftest import llm_models_root
 
-from tensorrt_llm.sampling_params import GuidedDecodingParams
+from tensorrt_llm.executor.params.sampling import GuidedDecodingParams
 
 
 def test_autodeploy_guided_decoding_main_json():

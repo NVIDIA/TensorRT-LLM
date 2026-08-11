@@ -3,10 +3,10 @@ import os
 import sys
 import time
 
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc_worker import RpcWorker
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
-from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")

@@ -26,8 +26,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import SamplingParams
 
 # Convenient aliases for the two KV-cache types used by MHA and MLA tests.
 CACHE_TYPE_SELF = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
