@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import weakref
+
 import pytest
 import torch
 from torch import nn
@@ -73,11 +75,13 @@ def test_single_and_multiple_breakpoints():
 
 def test_eager_output_storage_survives_allocator_churn():
     eager_output_ptrs = []
+    eager_output_refs = []
 
     @eager_on_graph
     def add_one(value):
         output = value + 1
         eager_output_ptrs.append(output.data_ptr())
+        eager_output_refs.append(weakref.ref(output))
         return output
 
     stream = torch.cuda.Stream()
@@ -90,6 +94,7 @@ def test_eager_output_storage_survives_allocator_churn():
             output.copy_(add_one(x) * 2)
 
         captured_output_ptr = eager_output_ptrs[0]
+        assert eager_output_refs[0]() is not None
         churn = [torch.full_like(x, value) for value in range(4)]
         assert all(tensor.data_ptr() != captured_output_ptr for tensor in churn)
 
