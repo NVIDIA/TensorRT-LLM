@@ -32,7 +32,7 @@ def _tie_aware_check_impl(
     top_k: int,
     next_n: int,
     compress_ratio: int = 1,
-    ref_vals_cache: dict = None,
+    ref_vals_cache: dict | None = None,
 ) -> None:
     """Vectorized multi-row tie-aware correctness check with strict sort+allclose.
 
