@@ -815,6 +815,7 @@ class TestImageEdit:
         assert resp.status_code == 200
         assert (gen.last_params.width, gen.last_params.height) == expected_dimensions
 
+    @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
     def test_image_edit_default_url_returns_fetchable_output(self, tmp_path, monkeypatch):
         """The default edit response writes a fetchable image content URL."""
         client, gen = self._client(tmp_path, monkeypatch)
