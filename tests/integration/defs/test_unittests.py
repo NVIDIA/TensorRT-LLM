@@ -118,9 +118,12 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
                 if not nodeid:
                     continue
                 node_path = nodeid.split("::", 1)[0]
-                if not case_paths or any(
-                        node_path == p or node_path.startswith(p + "/")
-                        for p in case_paths):
+                # Real CI prefixes inner nodeids with the outer stage name.
+                # Compare complete path segments so both bare and prefixed
+                # nodeids match without confusing sibling paths.
+                bounded_node_path = f"/{node_path}/"
+                if not case_paths or any(f"/{p}/" in bounded_node_path
+                                         for p in case_paths):
                     culprits.append("IN-FLIGHT " + nodeid)
     except (OSError, UnicodeDecodeError):
         pass
@@ -345,9 +348,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         ]
         passed = run_command(parallel_command, num_workers)
 
-        assert os.path.exists(
-            parallel_output_xml
-        ), "no report generated, fatal failure happened in unittests (parallel phase)"
+        if not os.path.exists(parallel_output_xml):
+            _fail_unittests(
+                "no report generated, fatal failure in unittests (parallel phase)",
+                parallel_output_xml, output_dir, case)
 
         if dry_run or passed:
             os.rename(parallel_output_xml, output_xml)
