@@ -218,11 +218,21 @@ def _filter_piecewise_capture_num_tokens(
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
-                                   max_total_draft_tokens: int,
+                                   tokens_per_request: int,
                                    enable_padding: bool) -> list[int]:
-    # This is the largest possible batch size for a pure decoding batch.
+    """Drop the batch sizes that exceed the request or token budget.
+
+    `tokens_per_request` is what a single request costs against
+    `max_num_tokens`: `1 + max_total_draft_tokens` for a pure decoding batch,
+    or the fixed encoder output length for an encoder whose input is a
+    fixed-shape per-request feature tensor.
+    """
     max_cuda_graph_bs = min(max_batch_size,
-                            int(max_num_tokens / (1 + max_total_draft_tokens)))
+                            max_num_tokens // tokens_per_request)
+    if max_cuda_graph_bs < 1:
+        # Not even a single request fits the token budget, so there is no
+        # capturable batch size and padding has nothing to pad to.
+        return []
 
     result = []
     # This function assumes cuda_graph_batch_sizes is sorted
@@ -589,9 +599,10 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
+        decode_tokens_per_request = 1 + self.original_max_total_draft_tokens
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
-            self.original_max_total_draft_tokens,
+            decode_tokens_per_request,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
@@ -599,9 +610,18 @@ class PyTorchModelEngine(ModelEngine):
 
         self._encoder_cuda_graph_padding_enabled = (
             encoder_cuda_graph_padding_enabled)
+
+        # A feature-driven encoder (Whisper) declares a fixed-shape per-request
+        # contract instead of packed tokens: every request costs exactly
+        # `fixed_seq_len` of the encoder token budget, and the num_tokens /
+        # seq_lens buckets are derived from the model rather than configured.
+        # The model selects the mode; `encoder_cuda_graph_config` only opts in.
+        (self._encoder_feature_shape, self._encoder_feature_dtype,
+         self._encoder_fixed_seq_len) = self._encoder_graph_spec()
+
         self._encoder_cuda_graph_batch_sizes = (_filter_cuda_graph_batch_sizes(
             encoder_cuda_graph_batch_sizes, self.encoder_batch_size,
-            self.encoder_max_num_tokens, 0,
+            self.encoder_max_num_tokens, self._encoder_fixed_seq_len or 1,
             self._encoder_cuda_graph_padding_enabled) if
                                                 encoder_cuda_graph_batch_sizes
                                                 else [])
@@ -622,12 +642,41 @@ class PyTorchModelEngine(ModelEngine):
         self._max_cuda_graph_seq_len = (self._cuda_graph_seq_lens[-1]
                                         if self._cuda_graph_seq_lens else 0)
 
-        use_encoder_cuda_graph = (
-            (self._is_encoder_decoder_model() or self._is_encode_only)
-            and self.encoder_cuda_graph_config is not None
-            and (self._model_encoder_graph_spec() is not None or
-                 (bool(self._cuda_graph_num_tokens)
-                  and bool(self._cuda_graph_seq_lens))))
+        # Resolve which capture mode has usable shapes. In feature mode the
+        # batch sizes *are* the whole key space, so an empty list after budget
+        # filtering leaves nothing to capture. A model that declares a feature
+        # contract cannot consume the packed token inputs the token-shaped
+        # capture path synthesizes, so when feature mode is unavailable for it
+        # the encoder stays eager instead of falling through to token capture.
+        if self._encoder_feature_shape is not None:
+            encoder_graph_shapes_available = bool(
+                self._encoder_cuda_graph_batch_sizes)
+            if not encoder_graph_shapes_available:
+                logger.warning(
+                    "Feature-mode encoder CUDA graphs: no configured batch "
+                    "size fits within encoder max_num_tokens "
+                    f"({self.encoder_max_num_tokens}) // encoder output "
+                    f"length ({self._encoder_fixed_seq_len}); the encoder "
+                    "step stays eager.")
+                self._encoder_feature_shape = None
+                self._encoder_feature_dtype = None
+                self._encoder_fixed_seq_len = None
+        elif self._model_encoder_graph_spec() is not None:
+            encoder_graph_shapes_available = False
+            if self.encoder_cuda_graph_config is not None:
+                logger.warning(
+                    "This model's encoder consumes fixed-shape features and "
+                    "feature-mode encoder CUDA graphs are unavailable; the "
+                    "encoder step stays eager.")
+        else:
+            encoder_graph_shapes_available = (bool(self._cuda_graph_num_tokens)
+                                              and bool(
+                                                  self._cuda_graph_seq_lens))
+
+        use_encoder_cuda_graph = ((self._is_encoder_decoder_model()
+                                   or self._is_encode_only)
+                                  and self.encoder_cuda_graph_config is not None
+                                  and encoder_graph_shapes_available)
 
         self.torch_compile_config = self.llm_args.torch_compile_config
         torch_compile_enabled = bool(self.torch_compile_config is not None)
@@ -870,45 +919,16 @@ class PyTorchModelEngine(ModelEngine):
         encoder_graph_batch_sizes = self._encoder_cuda_graph_batch_sizes
         encoder_graph_max_batch_size = (encoder_graph_batch_sizes[-1]
                                         if encoder_graph_batch_sizes else 0)
-        encoder_graph_max_num_tokens = self._max_cuda_graph_num_tokens
-
-        # A feature-driven encoder (Whisper) declares a fixed-shape per-request
-        # contract instead of packed tokens, so its graph shapes follow from the
-        # batch sizes alone and `num_tokens` / `seq_lens` are ignored if set.
-        # Enablement is the same `encoder_cuda_graph_config` opt-in either way.
-        feature_shape, feature_dtype, fixed_seq_len = self._encoder_graph_spec()
-        if feature_shape is not None:
-            bs_cap = max(
-                1,
-                min(self.batch_size,
-                    self.encoder_max_num_tokens // fixed_seq_len))
-            encoder_graph_batch_sizes = sorted(
-                bs for bs in encoder_graph_batch_sizes if bs <= bs_cap)
-            if not encoder_graph_batch_sizes:
-                logger.warning(
-                    "Feature-mode encoder CUDA graphs: no configured batch "
-                    f"size fits within max_num_tokens // encoder_output_len = "
-                    f"{bs_cap}; the encoder step stays eager.")
-                feature_shape = feature_dtype = fixed_seq_len = None
-                # Without this the runner would be built in *token* mode with
-                # empty bucket lists: no capture keys, but `enabled` true and
-                # token-mode static buffers allocated for nothing.
-                use_encoder_cuda_graph = False
-            else:
-                encoder_graph_max_batch_size = encoder_graph_batch_sizes[-1]
-                encoder_graph_max_num_tokens = (encoder_graph_max_batch_size *
-                                                fixed_seq_len)
-        elif (use_encoder_cuda_graph
-              and self._model_encoder_graph_spec() is not None):
-            # Feature mode was declined above (TP > 1). This model's encoder
-            # cannot consume the packed token inputs the token-shaped capture
-            # path synthesizes, so keep it eager rather than let warmup drive
-            # tokens into it.
-            logger.warning(
-                "This model's encoder consumes fixed-shape features and "
-                "feature-mode encoder CUDA graphs are unavailable; the encoder "
-                "step stays eager.")
-            use_encoder_cuda_graph = False
+        # Feature mode's graph shapes follow from the batch sizes alone, so its
+        # token budget is one fixed-length encoder output per request; the
+        # token path uses the configured num_tokens buckets.
+        feature_shape = self._encoder_feature_shape
+        feature_dtype = self._encoder_feature_dtype
+        fixed_seq_len = self._encoder_fixed_seq_len
+        encoder_graph_max_num_tokens = (encoder_graph_max_batch_size *
+                                        fixed_seq_len
+                                        if feature_shape is not None else
+                                        self._max_cuda_graph_num_tokens)
 
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
             use_cuda_graph=use_encoder_cuda_graph,
@@ -3705,7 +3725,8 @@ class PyTorchModelEngine(ModelEngine):
             getattr(getattr(self.model, "model_config", None),
                     "is_encoder_decoder", False))
 
-    def _model_encoder_graph_spec(self):
+    def _model_encoder_graph_spec(
+            self) -> Optional[Tuple[Tuple[int, ...], torch.dtype, int]]:
         """The model's fixed-shape encoder contract, or None. Queried once."""
         if not hasattr(self, "_cached_model_encoder_graph_spec"):
             # torch.compile wraps the model; the spec is on the original.
@@ -3715,7 +3736,9 @@ class PyTorchModelEngine(ModelEngine):
                                                      is not None else None)
         return self._cached_model_encoder_graph_spec
 
-    def _encoder_graph_spec(self):
+    def _encoder_graph_spec(
+        self
+    ) -> Tuple[Optional[Tuple[int, ...]], Optional[torch.dtype], Optional[int]]:
         """Fixed-shape encoder contract, or (None, None, None) if unavailable.
 
         Returns ``(feature_shape, feature_dtype, fixed_seq_len)`` when the model
@@ -7662,6 +7685,10 @@ class PyTorchModelEngine(ModelEngine):
         if (staging is None or staging.dtype != first.dtype
                 or staging.shape[1:] != first.shape[1:]
                 or staging.shape[0] < rows):
+            # Retire the previous batch's H2D before dropping the last
+            # reference to the buffer it reads from.
+            if staging is not None:
+                self._encoder_feature_staging_event.synchronize()
             staging = torch.empty((rows, *first.shape[1:]),
                                   dtype=first.dtype,
                                   pin_memory=prefer_pinned())
@@ -7669,8 +7696,11 @@ class PyTorchModelEngine(ModelEngine):
             self._encoder_feature_staging_event = torch.cuda.Event()
             # Dedicated copy stream: enqueued on the encoder stream the H2D
             # would queue behind the previous encoder forward, and the next
-            # batch's staging reuse would host-block on that forward.
-            self._encoder_feature_copy_stream = torch.cuda.Stream()
+            # batch's staging reuse would host-block on that forward. One
+            # stream for the runner's lifetime, so a reallocation cannot
+            # strand work on a stream nothing waits on again.
+            if getattr(self, '_encoder_feature_copy_stream', None) is None:
+                self._encoder_feature_copy_stream = torch.cuda.Stream()
         else:
             # The previous batch's H2D from this buffer must be complete
             # before its rows are overwritten. It ran on the copy stream,
