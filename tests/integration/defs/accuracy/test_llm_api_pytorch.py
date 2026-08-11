@@ -8012,26 +8012,49 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                     if inferencemax else GSM8K(model_name))
             task.evaluate(llm)
 
-            # Acceptance through the generation worker's iteration stats:
-            # the disagg fixture is an OpenAI duck with no get_stats, so
-            # read the worker's /metrics buffer (populated by
-            # enable_iter_perf_stats) after the eval. The measured
-            # workload is the accuracy eval itself and every prompt
-            # format has its own acceptance level (MHA head): the
-            # InferenceMAX protocol (5-shot multiturn chat + format
-            # instruction) measures 3.08, plain chat-formatted prompts
-            # 3.44-3.48, and few-shot completion format 2.97. The
-            # inferencemax floor sits between its healthy 3.08 and a
-            # broken-transfer plateau estimated at ~2.95 (transferring
-            # the 0.11-0.15 healthy-to-broken delta measured on the chat
-            # workload; refine when a broken baseline is measured on
-            # this protocol). The default-eval floor is only a
-            # catastrophic-breakage guard (corrupted or missing drafter
-            # KV collapses acceptance toward 1.x).
+            # Chat-format acceptance probe — the same workload and
+            # thresholds as the aggregated arm's (200 GSM8K questions,
+            # chat template, greedy, 512 tokens; drafter card reference
+            # rate 0.839 / length 3.518). The disagg fixture has no
+            # get_stats, so the probe window comes from the generation
+            # worker's /metrics buffer (enable_iter_perf_stats), drained
+            # right before the probe; the dataset loads from the models
+            # root so the probe works offline like the eval does.
             import requests
+            from concurrent.futures import ThreadPoolExecutor
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
             gen_url = info["server_lists"]["generation"][0]
+            base = f"{llm.router_url}/v1"
+            served = requests.get(f"{base}/models",
+                                  timeout=30).json()["data"][0]["id"]
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            requests.get(f"http://{gen_url}/metrics", timeout=30)  # drain
+
+            def _complete(prompt):
+                requests.post(f"{base}/completions",
+                              json={
+                                  "model": served,
+                                  "prompt": prompt,
+                                  "max_tokens": 512,
+                                  "temperature": 0
+                              },
+                              timeout=900).raise_for_status()
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                list(pool.map(_complete, chat_prompts))
             records = requests.get(f"http://{gen_url}/metrics",
                                    timeout=30).json()
             drafted = accepted = steps = 0
@@ -8041,18 +8064,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 accepted += stats.get("numAcceptedTokens", 0)
                 steps += stats.get("numRequestsWithDraftTokens", 0)
             assert steps > 0, "no speculative iterations in /metrics"
-            rate = accepted / drafted
-            length = 1 + accepted / steps
-            min_length, min_rate = ((3.0, 0.65) if inferencemax else (2.5, 0.5))
-            print(f"MiniMax-M3 Eagle3 disagg GSM8K acceptance: "
-                  f"rate={rate:.3f}, mean acceptance length={length:.3f} "
-                  f"({steps} spec iterations)")
-            assert length > min_length, \
-                f"disagg acceptance length too low: {length:.3f} " \
-                f"(floor {min_length})"
-            assert rate > min_rate, \
-                f"disagg acceptance rate too low: {rate:.3f} " \
-                f"(floor {min_rate})"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.78, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: " \
+                f"{chat_rate:.3f} (threshold 0.78, reference 0.839 from " \
+                f"the drafter card)"
+            assert chat_length > 3.3, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.3, reference 3.518 from " \
+                f"the drafter card)"
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
