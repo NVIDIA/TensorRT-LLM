@@ -20,11 +20,16 @@
 namespace vllm
 {
 
+inline constexpr int kPerTokenQuantBlockSize = 256;
+
 template <typename scalar_t, typename fp8_type>
 __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type* __restrict__ out, float* __restrict__ scale,
     scalar_t const* __restrict__ input, float const* __restrict__ scale_ub, int hidden_size, int64_t in_row_stride,
     int64_t out_row_stride)
 {
+    static_assert(kPerTokenQuantBlockSize > 0, "block size must be positive");
+    assert(blockDim.x == kPerTokenQuantBlockSize);
+
     const int64_t token_idx = blockIdx.x;
     int const tid = threadIdx.x;
 
@@ -39,7 +44,7 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type* __re
     vectorize_read_with_alignment<16>(token_in, hidden_size, tid, blockDim.x,
         [&] __device__(scalar_t v) { absmax_val = fmaxf(absmax_val, fabsf(static_cast<float>(v))); });
 
-    using BlockReduce = cub::BlockReduce<float, 256>;
+    using BlockReduce = cub::BlockReduce<float, kPerTokenQuantBlockSize>;
     __shared__ typename BlockReduce::TempStorage tmp;
     float const block_max = BlockReduce(tmp).Reduce(absmax_val, CubMaxOp{}, blockDim.x);
 

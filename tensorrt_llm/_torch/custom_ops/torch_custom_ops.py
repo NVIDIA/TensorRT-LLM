@@ -2891,7 +2891,7 @@ class Fp8PerTokenQuantRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = Fp8PerTokenQuantTactic.TRTLLM,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = inputs[0]
         if tactic == Fp8PerTokenQuantTactic.VECTORIZED:
             return torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)

@@ -30,7 +30,7 @@ void invokeVectorizedPerTokenFP8Quant(
     void* output, float* scales, T_IN const* input, int hidden_size, int64_t num_tokens, cudaStream_t stream)
 {
     dim3 const grid(static_cast<unsigned>(num_tokens));
-    dim3 const block(256);
+    dim3 const block(vllm::kPerTokenQuantBlockSize);
     vllm::dynamic_per_token_scaled_fp8_quant_kernel_strided<T_IN, c10::Float8_e4m3fn>
         <<<grid, block, 0, stream>>>(static_cast<c10::Float8_e4m3fn*>(output), scales, input,
             /*scale_ub=*/nullptr, hidden_size,

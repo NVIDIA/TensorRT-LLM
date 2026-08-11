@@ -174,7 +174,7 @@ def test_qwen_pipeline_feature_args(args, expected):
             {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
             QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
             None,
-            False,
+            True,
             id="dynamic-fp8-rowwise",
         ),
     ],
