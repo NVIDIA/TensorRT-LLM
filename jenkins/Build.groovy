@@ -35,6 +35,9 @@ LLM_DOCKER_IMAGE = env.dockerImage
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
@@ -227,6 +230,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:

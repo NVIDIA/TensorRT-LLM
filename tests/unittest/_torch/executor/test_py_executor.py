@@ -16,10 +16,14 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from datetime import timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+import torch.distributed as torch_dist
+import torch.multiprocessing as torch_mp
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -28,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import (
+    ATTENTION_DP_DUMMY_REQUEST_ID,
     DisaggTransferAdmissionController,
     EncoderStepResult,
     PyExecutor,
@@ -38,8 +43,53 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+class _TorchCollectiveDist:
+    """Minimal distributed adapter for idle-progress collective tests."""
+
+    world_size = 2
+    tp_size = 2
+    cp_size = 1
+
+    def allreduce(self, value: int, op: ReduceOp | None = None) -> int:
+        tensor = torch.tensor(value)
+        torch_dist.all_reduce(tensor)
+        return int(tensor.item())
+
+
+def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: str) -> None:
+    torch_dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=1),
+    )
+    try:
+        if rank == 0:
+            # Model a rank blocked in request_and_receive_sync(). It cannot
+            # participate in an idle-progress collective on the peer rank.
+            time.sleep(2)
+            return
+
+        executor = object.__new__(PyExecutor)
+        executor.dist = _TorchCollectiveDist()
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+            is_idle=True,
+        )
+    finally:
+        torch_dist.destroy_process_group()
 
 
 class _InflightRequestIds:
@@ -965,11 +1015,14 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_sync_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    def test_gen_only_no_context_benchmark_polls_context_when_idle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.is_benchmark_disagg = True
+        executor.dist.allreduce.return_value = 0
+        executor.dist.tp_allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -979,18 +1032,20 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            is_idle=True,
         )
 
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor.dist.tp_allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
 
-    def test_sync_non_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
+    def test_sync_transfer_skips_idle_progress_collectives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.is_benchmark_disagg = False
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -1000,6 +1055,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            is_idle=True,
         )
 
         executor.dist.allreduce.assert_not_called()
@@ -1007,6 +1063,19 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_sync_multi_rank_does_not_wait_for_blocked_peer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        rendezvous_file = tmp_path / "sync-idle-progress-rendezvous"
+
+        torch_mp.spawn(
+            _run_sync_idle_progress_rank,
+            args=(2, str(rendezvous_file)),
+            nprocs=2,
+            join=True,
+        )
 
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1387,6 +1456,10 @@ class _ResponseStub:
         self.responses = {}
         self.is_shutdown = False
         self._event_loop_error = None
+        # Set when the stashed error is handed to a caller: that is what tells
+        # the rank-crash kill the crash was already reported and the world does
+        # not need tearing down.
+        self._event_loop_error_delivered = threading.Event()
 
     # Bind the real production method so the test exercises real code.
     _await_single_response = PyExecutor._await_single_response
@@ -1425,6 +1498,10 @@ class TestAwaitSingleResponseShutdown:
         with pytest.raises(RuntimeError, match="Event loop terminated"):
             stub._await_single_response(id=42, timeout=1.0)
 
+        # The caller now holds the original error, so the rank-crash kill must
+        # stand down: this is the signal it waits out its grace for.
+        assert stub._event_loop_error_delivered.is_set()
+
     def test_raises_on_shutdown_without_event_loop_error(self):
         """Shutdown without a stored error still raises rather than blocking
         — distinguishes "shutdown" from "timed out without shutdown"."""
@@ -1433,6 +1510,10 @@ class TestAwaitSingleResponseShutdown:
 
         with pytest.raises(RuntimeError, match="Event loop shut down"):
             stub._await_single_response(id=42, timeout=1.0)
+
+        # Nothing was delivered -- there was no error to deliver. Leaving the
+        # gate clear keeps the kill armed, which is correct here.
+        assert not stub._event_loop_error_delivered.is_set()
 
     def test_returns_empty_on_timeout(self):
         """Pre-fix behaviour: a bare timeout (no shutdown, no response) used
@@ -1566,6 +1647,7 @@ def _make_adp_request(
     )
     req.is_dummy_request = is_dummy_request
     req.is_attention_dp_dummy = False
+    req.py_skip_gen_alloc_revert = False
     req.llm_request_type = llm_request_type
     req.py_seq_slot = None
     return req
@@ -1592,6 +1674,7 @@ class _StubADPExecutor:
         self.num_fetch_requests = 0
         self.active_requests = []
         self.expected_num_active_requests = 1
+        self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
@@ -2036,6 +2119,179 @@ def test_pad_dummy_no_op_when_attention_dp_disabled():
 
 
 # ---------------------------------------------------------------------------
+# Empty *scheduled* batch padding: a rank whose only active request does not fit
+# the free KV cache is skipped by _pad_attention_dp_dummy_request, yet its empty
+# scheduled batch vetoes the fleet-wide forward pass in _can_queue.
+# ---------------------------------------------------------------------------
+def _run_pad_empty(stub, scheduled_batch):
+    for helper in (
+        "_count_schedulable_active_requests",
+        "_has_adp_dummy_kv_capacity",
+        "_should_skip_dummy_for_benchmark_disagg",
+    ):
+        setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
+    PyExecutor._pad_empty_attention_dp_batch(stub, scheduled_batch)
+
+
+def _unfittable_rank(**kwargs):
+    """A rank holding one active request the capacity scheduler could not fit."""
+    stub = _StubADPExecutor(**kwargs)
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+    stub.expected_num_active_requests = 1
+    return stub, ScheduledRequests()
+
+
+def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
+    stub, scheduled_batch = _unfittable_rank()
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert len(scheduled_batch.generation_requests) == 1
+    dummy = scheduled_batch.generation_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy in stub.active_requests
+    # A generation dummy, not the context dummy the pre-schedule path would
+    # pick: this rank is empty precisely because it is short of KV cache.
+    assert stub.add_dummy_calls[0]["is_gen"] is True
+    assert stub.add_dummy_calls[0]["token_nums"] is None
+
+
+def test_pad_empty_batch_no_op_when_batch_is_not_empty():
+    stub, scheduled_batch = _unfittable_rank()
+    scheduled_batch.context_requests_chunking = [
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=7)
+    ]
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.generation_requests == []
+
+
+def test_pad_empty_batch_no_op_when_attention_dp_disabled():
+    stub, scheduled_batch = _unfittable_rank(enable_attention_dp=False)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+
+
+def test_pad_empty_batch_no_op_when_rank_has_no_active_requests():
+    # The pre-schedule path already covers this case.
+    stub, scheduled_batch = _unfittable_rank()
+    stub.active_requests = []
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+
+
+def test_pad_empty_batch_respects_max_num_active_requests():
+    # expected_num_active_requests is capped at max_num_active_requests and
+    # _pad_attention_dp_dummy_request asserts it bounds len(active_requests),
+    # so padding a rank already at the cap would trip that assert next
+    # iteration.
+    stub, scheduled_batch = _unfittable_rank()
+    stub.max_num_active_requests = 1
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+
+
+def test_pad_empty_batch_skips_when_dummy_already_active():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.active_requests.append(
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=ATTENTION_DP_DUMMY_REQUEST_ID)
+    )
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+
+
+def test_pad_empty_batch_degrades_when_kv_cache_cannot_afford_dummy():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 0
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
+    assert scheduled_batch.batch_size == 0
+
+
+@pytest.mark.parametrize("error", [OutOfPagesError("no pages"), NoFreeSlotsError("no slots")])
+def test_pad_empty_batch_degrades_on_allocation_error(error):
+    # A rank-local raise would strand the peers in the collectives that follow.
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.add_dummy_requests.side_effect = error
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 0
+    assert len(stub.active_requests) == 1
+
+
+@pytest.mark.parametrize("enable_dsv4_adp_dummy_fixes", [False, True])
+def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
+    enable_dsv4_adp_dummy_fixes,
+):
+    # can_queue=False skips the forward, so the usual dummy teardown in
+    # _handle_responses is not reached. Rollback must not depend on the model.
+    stub, scheduled_batch = _unfittable_rank(
+        enable_dsv4_adp_dummy_fixes=enable_dsv4_adp_dummy_fixes
+    )
+    active_request = stub.active_requests[0]
+    spec_resource_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+
+    _run_pad_empty(stub, scheduled_batch)
+    dummy = stub._pending_adp_dummy_request
+    assert dummy is not None
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, False)
+
+    assert stub.active_requests == [active_request]
+    assert stub._pending_adp_dummy_request is None
+    spec_resource_manager.free_resources.assert_called_once_with(dummy)
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+
+
+def test_pad_empty_batch_dummy_kept_when_fleet_can_queue():
+    # Committed dummies are terminated after the forward by _handle_responses.
+    stub, scheduled_batch = _unfittable_rank(enable_dsv4_adp_dummy_fixes=False)
+
+    _run_pad_empty(stub, scheduled_batch)
+    dummy = stub._pending_adp_dummy_request
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, True)
+
+    assert dummy in stub.active_requests
+    assert stub._pending_adp_dummy_request is None
+    stub.kv_cache_manager.free_resources.assert_not_called()
+
+
+def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
+    # The dummy joins after scheduling, so its capacity was never grown.
+    stub, scheduled_batch = _unfittable_rank()
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    # A request the scheduler did grow, for contrast.
+    real_gen_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=9)
+    scheduled_batch.generation_requests.append(real_gen_request)
+
+    stub._is_kv_manager_v2 = True
+    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+
+    reverted = [c.args[0] for c in stub.kv_cache_manager.revert_allocate_generation.call_args_list]
+    assert reverted == [real_gen_request]
+
+
+# ---------------------------------------------------------------------------
 # ADP-safe disagg cache error handling (#13900): all TP ranks enter _handle_errors together.
 # ---------------------------------------------------------------------------
 def _err_req(request_id=1):
@@ -2270,6 +2526,8 @@ class TestOneModelMTPDraftTokenScheduling:
         model_engine.is_spec_decode is True, so _prepare_and_schedule_batch
         takes the elif draft-token normalization branch. kv_cache_transceiver
         is None to keep the test hermetic (skips the disagg blocks).
+        enable_attention_dp is False so _pad_empty_attention_dp_batch returns
+        immediately instead of padding a batch this test does not exercise.
         """
         ex = object.__new__(PyExecutor)
         ex.drafter = None
@@ -2278,6 +2536,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.kv_cache_transceiver = None
         ex.is_shutdown = False
         ex.enable_iter_perf_stats = False
+        ex.enable_attention_dp = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
 

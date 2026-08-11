@@ -555,7 +555,7 @@ def apply_model_defaults_to_llm_args(
 
     new_args = llm_args.__class__(**merged_state)
 
-    for field_name in llm_args.model_fields:
+    for field_name in type(llm_args).model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
 
     def _compute_applied(defaults: Dict[str, Any],
@@ -597,13 +597,12 @@ def _two_model_spec_dec_decoding_type(
     return getattr(spec_config, "decoding_type", "speculative decoding")
 
 
-def _resolve_kv_cache_manager_v2_auto(
-        llm_args: 'TorchLlmArgs',
-        model_defaults_dict: Dict[str, Any],
-        original_setting: Optional[Union[bool, str]] = None) -> bool:
-    """Resolve the KV cache manager auto setting after model defaults are applied.
+def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
+                                      model_cls: Optional[type] = None,
+                                      pretrained_config: Any = None) -> bool:
+    """Resolve the KV cache manager auto setting from the model preference.
 
-    A model default of V2 is demoted to V1 for routes V2 cannot serve; an
+    A model preference for V2 is demoted to V1 for routes V2 cannot serve; an
     explicit user value otherwise wins. The compatibility arms are:
 
     - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
@@ -613,16 +612,15 @@ def _resolve_kv_cache_manager_v2_auto(
       with its own KV cache manager. ``build_managers`` hands that manager the
       target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
       by ``max_gpu_total_bytes``, so both managers size their pools from the
-      full budget. The model default falls back to V1, and an explicit ``True``
-      is rejected rather than deferred to that allocation.
+      full budget. The model preference falls back to V1, and an explicit
+      ``True`` is rejected rather than deferred to that allocation.
 
     The fallback only reaches models whose manager class is selected by
     ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
     -- sparse attention picks its class from the algorithm alone -- keep a V2
     manager after the demotion, so the arm does not protect them.
     """
-    setting = (llm_args.kv_cache_config.use_kv_cache_manager_v2
-               if original_setting is None else original_setting)
+    setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     if setting != "auto":
         if setting is True:
             decoding_type = _two_model_spec_dec_decoding_type(llm_args)
@@ -637,40 +635,43 @@ def _resolve_kv_cache_manager_v2_auto(
                     "one-model variant of this decoding mode.")
         return setting
 
-    kv_cache_defaults = model_defaults_dict.get("kv_cache_config", {})
-    model_default = (kv_cache_defaults.get("use_kv_cache_manager_v2", False)
-                     if isinstance(kv_cache_defaults, dict) else False)
-    if model_default == "auto":
-        model_default = False
-    if not isinstance(model_default, bool):
+    preferred_version = None
+    if model_cls is not None:
+        get_preferred = getattr(model_cls,
+                                'get_preferred_kv_cache_manager_version', None)
+        if get_preferred is not None:
+            preferred_version = get_preferred(pretrained_config)
+    if preferred_version not in (None, "V1", "V2"):
         raise ValueError(
-            "Model default kv_cache_config.use_kv_cache_manager_v2 must be "
-            f"True, False, or 'auto', got {model_default!r}.")
+            f"{model_cls.__name__}.get_preferred_kv_cache_manager_version() "
+            f"must return 'V1', 'V2', or None, got {preferred_version!r}.")
+
+    use_v2 = preferred_version == "V2"
 
     transceiver_config = llm_args.cache_transceiver_config
-    if (model_default and transceiver_config is not None
+    if (use_v2 and transceiver_config is not None
             and transceiver_config.backend is not None):
         effective_backend, _ = transceiver_config._resolve_default_backend()
         runtime = transceiver_config.transceiver_runtime
         if effective_backend != "NIXL" or runtime != "PYTHON":
             logger.info(
-                "KV cache manager V2 is the model default, but disaggregated "
+                "KV cache manager V2 is the model preference, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "
                 "falling back to V1.", runtime, effective_backend)
-            model_default = False
+            use_v2 = False
 
-    if model_default:
+    if use_v2:
         decoding_type = _two_model_spec_dec_decoding_type(llm_args)
         if decoding_type is not None:
             logger.info(
-                "KV cache manager V2 is the model default, but %s runs the "
+                "KV cache manager V2 is the model preference, but %s runs the "
                 "draft model in a separate engine and V2 sizes both KV cache "
                 "managers from the full max_gpu_total_bytes budget; falling "
                 "back to V1.", decoding_type)
-            model_default = False
+            use_v2 = False
 
-    llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
-    return model_default
+    llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2
+    return use_v2
 
 
 def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',

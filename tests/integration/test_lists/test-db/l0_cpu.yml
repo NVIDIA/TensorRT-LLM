@@ -12,6 +12,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/auto_deploy
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
   - unittest/_torch/executor
@@ -25,6 +26,9 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/test_model_config.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_custom_ops.py
+  - unittest/auto_deploy/multigpu
+  - unittest/auto_deploy/singlegpu
+  - unittest/auto_deploy/standalone
   - unittest/bindings
   - unittest/disaggregated
   - unittest/executor/test_base_worker.py ISOLATION
@@ -61,3 +65,4 @@ l0_cpu:
   - unittest/scripts
   - unittest/tools
   - unittest/utils/test_logger.py
+  - unittest/utils/test_confidential_compute.py
