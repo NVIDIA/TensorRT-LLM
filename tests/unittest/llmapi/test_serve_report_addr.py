@@ -29,8 +29,10 @@ from typing import Optional
 
 import click
 import pytest
+import yaml
+from click.testing import CliRunner
 
-from tensorrt_llm.commands.serve import _publish_bound_address, launch_server
+from tensorrt_llm.commands.serve import _publish_bound_address, disaggregated, launch_server
 
 # The reader half lives with the integration helpers, so both halves of the
 # round trip are exercised together and a change to either side fails here.
@@ -115,6 +117,10 @@ def test_concurrent_reader_never_sees_a_partial_line(tmp_path: Path) -> None:
     published = {"localhost:8000\n"} | {f"localhost:{9000 + i}\n" for i in range(3)}
     seen = set()
     stop = threading.Event()
+    # Without this the publish loop can finish and set stop before the reader
+    # is ever scheduled, leaving seen empty and failing the test with no
+    # atomicity defect present.
+    reading = threading.Event()
 
     def read_loop() -> None:
         while not stop.is_set():
@@ -122,10 +128,12 @@ def test_concurrent_reader_never_sees_a_partial_line(tmp_path: Path) -> None:
                 seen.add(open(addr_path).read())
             except FileNotFoundError:
                 seen.add("<missing>")
+            reading.set()
 
     reader = threading.Thread(target=read_loop)
     reader.start()
     try:
+        assert reading.wait(timeout=30), "reader thread never ran"
         for i in range(300):
             _publish_bound_address(addr_path, "localhost", 9000 + (i % 3))
     finally:
@@ -177,3 +185,38 @@ def test_launch_server_requires_a_way_to_learn_the_port() -> None:
     llm_args = {"backend": "pytorch", "model": "dummy"}
     with pytest.raises(AssertionError, match="Port must be specified"):
         launch_server("localhost", 0, llm_args)
+
+
+@pytest.mark.parametrize(
+    "port,extra_args",
+    [
+        (0, []),
+        (0, ["--report_addr", "/tmp/a.addr"]),
+        (8000, ["--report_addr", "/tmp/a.addr"]),
+    ],
+)
+def test_disaggregated_rejects_a_worker_fleet(
+    tmp_path: Path, port: int, extra_args: list[str]
+) -> None:
+    """A fleet spreads the port over N workers, so one published address is wrong.
+
+    Only the rejected combinations are exercised: anything the guard lets
+    through goes on to bind a socket and serve.
+    """
+    config = tmp_path / "disagg.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "hostname": "localhost",
+                "port": port,
+                "num_workers": 2,
+                "context_servers": {},
+                "generation_servers": {},
+            }
+        )
+    )
+
+    result = CliRunner().invoke(disaggregated, ["-c", str(config)] + extra_args)
+
+    assert result.exit_code != 0
+    assert "single self-contained disaggregated server" in result.output
