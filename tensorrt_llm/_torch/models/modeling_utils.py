@@ -115,7 +115,10 @@ def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
 
     # bias
     if weight.ndim == 1:
-        return weight.repeat_interleave(reps)
+        assert weight.shape[0] % num_kv_heads == 0
+        size_per_kv_head = weight.shape[0] // num_kv_heads
+        return weight.reshape(num_kv_heads, size_per_kv_head).repeat_interleave(
+            reps, dim=0).reshape(-1)
 
     # weight and scale
     assert weight.shape[0] % num_kv_heads == 0
