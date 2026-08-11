@@ -93,6 +93,16 @@ class HangDetector:
     def __init__(
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
+        env_threshold = os.environ.get("TRTLLM_HANG_DETECTOR_THRESHOLD")
+        if env_threshold is not None:
+            try:
+                timeout = int(env_threshold)
+            except ValueError:
+                logger.warning(
+                    f"Invalid value for TLLM_HANG_DETECTOR_THRESHOLD: "
+                    f"{env_threshold} (must be an integer). "
+                    f"Using passed in value {timeout}."
+                )
         self._disabled = timeout is not None and timeout <= 0
         self.timeout = timeout if timeout is not None and timeout > 0 else 300
         self.on_detected = on_detected or (lambda: None)
