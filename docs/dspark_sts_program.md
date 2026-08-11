@@ -638,6 +638,19 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 `test_gsm8k_dep8_ragged_verify[moe_backend=TRTLLM]`(DEP8 + overlap + CUDA graph + ragged verify + 置信度调度),`TLLM_DSPARK_SPS_TABLE=postfix_pro_table.json` 注入修复后真实表(planner 主动裁剪而非退化均匀),**1 passed(27 分钟)——精度 ≥ 记录参考值,断言通过**。终局判决的精度一环闭合。注:MEGAMOE_DEEPGEMM 变体在该节点因 DeepGEMM JIT "NVCC compilation failed" 无法初始化(nvcc 在位、/tmp 空,原因未深究;TRTLLM 变体即吞吐判决所用后端,更具代表性)。
 
+### Disagg 战役:环境坑编年史(08-11 06:00,第 4 轮进行中)
+
+用户转向 disagg 形态(只测 gen server 吞吐;纯 gen 步 = 裁剪最有利形态,并绕开 agg 的 ctx 准入带宽上限)。协议:每 (臂,local bs) cell = 独立节点对 + 全新 ctx/gen/router,gen maxbs=当档,客户端超发 16×LBS 钉满,3×2 矩阵({32,64,128},256 搁置)。
+
+**环境坑矩阵(全部非本 PR 代码问题):**
+
+| 轮 | 配置 | 结局 | 教训 |
+|---|---|---|---|
+| 08-07(#29 时代)| NIXL+PYTHON,无 env | gen 死于 #23 修复前的 IMA,传输从未被行使 | 今日 gen 全程健康 → **#23 修复在 disagg 路径成立** |
+| R1/R2(今日)| NIXL+PYTHON,无 env | ①router 忘 `--mpi=pmix` 秒死;②修后 ctx 侧 NIXL `TransferState.FAILURE` → gen 等 KV 超时自杀 | 任何 trtllm CLI 经 srun 都要 pmix(已入记忆) |
+| R3 | DEFAULT + UCX 三件套(unset UCX_TLS/关 UCC/RNDV_RAILS=2,抄自同集群日跑 harness)| ctx 启动死于 **v2 KV 管理器 CUDA_ERROR_INVALID_CONTEXT** | DEFAULT(C++ 传输)与 v2 管理器不兼容;p25 时代选 NIXL+**PYTHON runtime** 正是 v2 兼容路径 |
+| **R4(进行中)** | **NIXL+PYTHON + UCX 三件套**(未试组合:NIXL 底层即 UCX,三件套正治 UCX 传输)| — | 若仍 FAILURE,下一杆:UCX_NET_DEVICES 按 GPU 就近 HCA 钉扎(同事 harness 的 CTX_LOCAL_HCA_PIN)|
+
 ### 对齐实验:zhaoyuanh 的 throughput_1k 负载 × 我们的栈(08-11 02:10,主矩阵完成)
 
 **协议**(与 roofline 报告对齐,按用户修正):throughput_1k parquet 前 1024 行 file 序(源 parquet,SHA 与其冻结 dump 不同,已标注)、greedy temp=0、max_tokens=64、**持续满并发**(完成即补位,计量段=256 个 ramp 完成后的 1024 个完成);**每 cell 独立重启且 maxbs=local bs**;max_seq_len=8192 显式;成本表与 STS **均在本负载重采**(表:burst 模式采纯 gen 段,bs32/64 实测、128/256 α 外推;STS:142k 样本,位置接受率 [0.70,0.46,0.30,0.20,0.15],温度 ~2 → 裸分数显著过自信,ECE 5/5 位置改善)。
