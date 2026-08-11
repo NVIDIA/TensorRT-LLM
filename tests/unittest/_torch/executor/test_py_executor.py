@@ -2384,14 +2384,15 @@ def test_pad_empty_batch_degrades_on_allocation_error(error):
     assert len(stub.active_requests) == 1
 
 
-@pytest.mark.parametrize("enable_dsv4_adp_dummy_fixes", [False, True])
+@pytest.mark.parametrize("enable_adp_dummy_fixes", [False, True])
 def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
-    enable_dsv4_adp_dummy_fixes,
+    enable_adp_dummy_fixes,
 ):
     # can_queue=False skips the forward, so the usual dummy teardown in
-    # _handle_responses is not reached. Rollback must not depend on the model.
+    # _handle_responses is not reached. Rollback must not depend on whether
+    # ADP dummy fixes are enabled.
     stub, scheduled_batch = _unfittable_rank(
-        enable_dsv4_adp_dummy_fixes=enable_dsv4_adp_dummy_fixes
+        enable_adp_dummy_fixes=enable_adp_dummy_fixes
     )
     active_request = stub.active_requests[0]
     spec_resource_manager = Mock()
@@ -2411,7 +2412,7 @@ def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
 
 def test_pad_empty_batch_dummy_kept_when_fleet_can_queue():
     # Committed dummies are terminated after the forward by _handle_responses.
-    stub, scheduled_batch = _unfittable_rank(enable_dsv4_adp_dummy_fixes=False)
+    stub, scheduled_batch = _unfittable_rank(enable_adp_dummy_fixes=False)
 
     _run_pad_empty(stub, scheduled_batch)
     dummy = stub._pending_adp_dummy_request
