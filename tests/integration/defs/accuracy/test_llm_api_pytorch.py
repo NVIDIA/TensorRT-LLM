@@ -7889,19 +7889,22 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         """Disaggregated arm of test_nvfp4_eagle3.
 
         CI coverage for Eagle3 + the unified (shared) draft KV cache
-        crossing the disaggregated transceiver: context TP2 -> attention-DP
-        generation TP2 on one 4-GPU node, NIXL transport, block reuse on
-        the context servers -- the InferenceMAX/AgentX serving shape. The
-        drafter's KV rides the shared logical blocks, so this arm guards
-        both sub-page addressing and native drafter-KV transfer end to end
-        (a corrupted or dropped drafter cache collapses accuracy or, more
-        silently, acceptance; accuracy is asserted here, acceptance stats
-        stay with the aggregated arm which exercises the same view code).
+        crossing the disaggregated transceiver on one 4-GPU node: context
+        TEP2 -> generation TEP2 over NIXL, block reuse on the context
+        server. ``attention_dp`` selects the generation flavor: True is
+        the AgentX-submission shape (attention-DP generation), False the
+        TEP production-candidate shape. Every path-gating knob mirrors
+        the production disaggregated configs (fix15a production-candidate
+        sweep, GB300); values that are workload-tuned (1M-context sizes)
+        or GPU-generation-tuned (memory fractions) are CI-adjusted and
+        called out inline. Accuracy is asserted through the router; the
+        drafter's KV rides the shared logical blocks, so a corrupted or
+        dropped drafter cache collapses accuracy. Acceptance stats stay
+        with the aggregated arm, which exercises the same view code.
         """
-        if not (attention_dp and overlap_scheduler and cuda_graph and use_msa):
-            pytest.skip("the disagg arm pins the AgentX serving shape "
-                        "(attention-DP gen + overlap scheduler + CUDA "
-                        "graphs + MSA)")
+        if not (overlap_scheduler and cuda_graph and use_msa):
+            pytest.skip("the disagg arm pins the production serving shape "
+                        "(overlap scheduler + CUDA graphs + MSA)")
         from .test_disaggregated_serving import launch_disaggregated_llm
         speculative_config = {
             "decoding_type": "Eagle3",
@@ -7922,43 +7925,67 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
+                "kv_cache_bounce_size_mb": 0,
+                "kv_transfer_timeout_ms": 600000,
             },
             "moe_config": {
-                "backend": "CUTLASS"
+                "backend": "TRTLLM"
             },
+            "scheduler_config": {
+                "capacity_scheduler_policy": "MAX_UTILIZATION"
+            },
+            "enable_autotuner": True,
+            "return_perf_metrics": True,
+            "perf_metrics_max_requests": 1000,
+            # The InferenceMAX protocol needs room for thinking output;
+            # production serves 1M-token contexts here.
             "max_seq_len": 16384 if inferencemax else 4096,
             "trust_remote_code": True,
         }
+        kv_cache_common = {
+            "dtype": "fp8",
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+            "event_buffer_max_size": 0,
+            # Production runs 0.7 (ctx) / 0.9 (gen) on GB300; one derated
+            # value keeps headroom on the B200 CI stage.
+            "free_gpu_memory_fraction": 0.7,
+        }
         ctx_server_config = {
             **common_config,
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": not overlap_scheduler,
             "enable_attention_dp": False,
             "enable_chunked_prefill": True,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": True,
-                "dtype": "fp8",
+            "attention_dp_config": {
+                "enable_kv_cache_aware_routing": False,
+                "kv_cache_routing_conversation_affinity": True,
+                "kv_cache_routing_max_sessions": 65536,
             },
-            "max_batch_size": 32,
-            "max_num_tokens": 8192,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": True
+            },
+            "max_batch_size": 4,
+            "max_num_tokens": 32768,
             "cuda_graph_config": None,
         }
         gen_server_config = {
             **common_config,
-            "disable_overlap_scheduler": False,
-            "enable_attention_dp": True,
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "enable_attention_dp": attention_dp,
+            "enable_lm_head_tp_in_adp": False,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": False,
-                "dtype": "fp8",
+                **kv_cache_common, "enable_block_reuse": False
             },
+            "max_batch_size": 16,
             # Decode-only token budget: (1 + draft_len) verify tokens per
-            # request x max_batch_size, as in the AgentX gen servers.
-            "max_batch_size": 64,
-            "max_num_tokens": 256,
+            # request x max_batch_size (the production sweep's value is
+            # its no-spec arm's).
+            "max_num_tokens": (1 + max_draft_len) * 16,
+            "num_postprocess_workers": 4,
+            "stream_interval": 100,
             "cuda_graph_config": {
                 "enable_padding": True,
-                "max_batch_size": 64,
+                "batch_sizes": [1, 2, 4, 8, 16],
             },
         }
         disaggregated_server_config = {
