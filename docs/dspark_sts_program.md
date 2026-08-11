@@ -597,6 +597,13 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 **余留**:Pro@DEP8 复测(依赖 #31 碎片化修复)= 产品线最终判决;#19(连续预算)在新表 θ 单调后价值上升;GSM8K 精度回归(新表只改窗口选择不改接受判定,风险低,例行补测)。
 
+### #34 破题:上限不是 spec 专属,是 V2 调度器/KV-v2 的按请求分配在 ~maxbs/2 处耗尽(08-10 20:10)
+
+**no-spec 对照的意外收获**:同配置去掉 DSpark(maxbs=128,poetry 1024 burst)——服务器**直接崩**:`scheduler/scheduler_v2.py:439 RuntimeError: V2 scheduler deadlock: 61 generation request(s) active but none could be scheduled or evicted. KV cache pool is likely exhausted…`(1018/1024 请求收到 400)。三个信息:
+1. **上限与投机解码无关**(no-spec 也卡 61)——"spec 槽 2× 记账"假设推翻;有 spec 时优雅降级到 ~60,无 spec 时死锁崩溃(本身是个产品级 bug:普通高并发 serving 会炸)。
+2. **`scheduler_v2.py` 是 use_python_scheduler 两档共走的路径**——解释当晚二分"python/C++ 调度器都一样"。
+3. 调度门 = `kv_cache_manager.try_allocate_generation(req)` → `kv_cache.resize(...)` 在第 ~62 个 gen 请求失败,而 kv_cache_util 仅 0.014、字节配额 35→60GiB 不敏感——**耗尽的是某个按 maxbs 定容、每 gen 请求消耗 ~2 份的结构**(嫌疑:SWA/压缩器窗口池的 scratch-reuse 定容与运行时逐请求分配不一致;首波满批因 ctx 阶段不走 gen 分配)。深挖 agent 与 no-spec@maxbs256 象限实验进行中。
+
 ### 产品线终局判决:Pro@DEP8 置信度调度全面转正(08-10 13:50)
 
 Flash 三臂翻案后,Pro@DEP8 终局(maxbs=256 解锁满批 + `postfix_pro_table.json` 新表,scheduled vs notrim,双节点臂序对调,每 cell n=10):
