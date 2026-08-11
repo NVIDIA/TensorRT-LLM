@@ -8020,8 +8020,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             # worker's /metrics buffer (enable_iter_perf_stats), drained
             # right before the probe; the dataset loads from the models
             # root so the probe works offline like the eval does.
-            import requests
             from concurrent.futures import ThreadPoolExecutor
+
+            import requests
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
             gen_url = info["server_lists"]["generation"][0]
