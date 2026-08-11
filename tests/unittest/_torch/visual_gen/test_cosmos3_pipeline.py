@@ -1114,7 +1114,8 @@ class TestCosmos3TextGuardrailBlocked:
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
         pipeline.default_use_system_prompt = False
-        pipeline.rank = 0
+        # ``rank`` and ``device`` are read-only properties: rank resolves to 0
+        # with no distributed init, device comes off the transformer stub.
         # The guardrail model is not under test, so a checker that reports
         # "unsafe" for any input drives the path without an unsafe prompt.
         pipeline.safety_checker = SimpleNamespace(check_text_safety=lambda _prompt: False)
