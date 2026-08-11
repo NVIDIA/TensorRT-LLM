@@ -599,6 +599,13 @@ class KVCacheManager(BaseResourceManager):
                 f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
 
+        # Cache the layer-to-window mapping now that window clamping is done:
+        # block-ID queries run on the executor's per-iteration path and must not
+        # rebuild it.  Note this is derived from max_attention_window_vec, which
+        # the non-SELF branch above leaves at its pre-rewrite value.
+        self._window_size_by_layer_offset = self._get_layer_offset_to_window_size(
+        )
+
         # Use the provided execution stream for proper synchronization with KVCacheTransferManager.
         # The execution stream is the stream where model forward kernels run, and KVCacheTransferManager
         # needs to synchronize with it for onboard/offload operations.
@@ -1443,6 +1450,15 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_memory_pool_block_indices(list(block_ids),
                                                        window_size)
 
+    def _resolve_cache_window_size(self, layer_idx: Optional[int],
+                                   window_size: Optional[int]) -> int:
+        if window_size is not None or layer_idx is None:
+            return self._resolve_window_size(
+                window_size,
+                "layer_idx or window_size must be provided for VSWA")
+        layer_offset = self.layer_offsets[layer_idx]
+        return self._window_size_by_layer_offset[layer_offset]
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -1452,17 +1468,7 @@ class KVCacheManager(BaseResourceManager):
         num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         beam_width = beam_width or 1
-        if window_size is None:
-            if layer_idx is None:
-                window_size = self._resolve_window_size(
-                    window_size,
-                    "layer_idx or window_size must be provided for VSWA")
-            else:
-                layer_offset = self.layer_offsets[layer_idx]
-                # Explicit layer_offset -> window_size mapping (no modulo
-                # masking length mismatches between pattern and num_local_layers).
-                window_size = self._get_layer_offset_to_window_size(
-                )[layer_offset]
+        window_size = self._resolve_cache_window_size(layer_idx, window_size)
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
@@ -1475,6 +1481,35 @@ class KVCacheManager(BaseResourceManager):
             if num_blocks_per_seq is not None:
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
+
+    def get_cache_indices_range(
+        self,
+        request_id: int,
+        block_begin: int,
+        block_end: int,
+        layer_idx: Optional[int] = None,
+        window_size: Optional[int] = None,
+    ) -> List[int]:
+        """Return resident cache indices in absolute range ``[block_begin, block_end)``.
+
+        The result is the contiguous run of resident blocks ending at
+        ``block_end``; front-detached SWA blocks are excluded.  See
+        ``BaseKVCacheManager::getCacheBlockIdsRange`` for the full contract.
+        """
+        # Mirror KVCacheManagerV2, which raises ValueError for these, so both
+        # backends of CacheReuseAdapter.get_block_ids_range agree.
+        if block_begin < 0 or block_end < 0:
+            raise ValueError("block range bounds must be non-negative")
+        if block_begin > block_end:
+            raise ValueError("block_begin must not exceed block_end")
+        window_size = self._resolve_cache_window_size(layer_idx, window_size)
+        per_beam = self.impl.get_cache_block_ids_range(request_id, window_size,
+                                                       block_begin, block_end)
+        if len(per_beam) != 1:
+            raise ValueError(
+                f"Chunked/pipelined KV transfer requires beam_width=1, got {len(per_beam)} beams"
+            )
+        return list(per_beam[0])
 
     def get_batch_cache_indices_flat(
         self,

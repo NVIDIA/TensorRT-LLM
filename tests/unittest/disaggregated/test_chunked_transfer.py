@@ -46,6 +46,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TxSession,
     WriteMeta,
 )
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -908,6 +909,9 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_block_ids=lambda _req, _idx, _lg: source_block_ids,
+        get_block_ids_range=(
+            lambda _req, _idx, _lg, block_begin, block_end: source_block_ids[block_begin:block_end]
+        ),
     )
     transceiver._page_table = SimpleNamespace(
         layer_groups=[SimpleNamespace(sliding_window_size=None)]
@@ -1080,21 +1084,27 @@ def _build_prefill_chunk_for(
 ):
     """Drive the real _build_prefill_chunk for one chunk of a prefilling request.
 
-    ``resident_blocks`` defaults to the chunk end, matching a source block list
-    that has only grown through the current chunk boundary.
+    The single full-attention layer group holds block ``i`` at ordinal ``i``.
+    ``resident_blocks`` bounds how far the cache manager has allocated and
+    defaults to the chunk end, matching a source list that has only grown
+    through the current chunk boundary.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     if resident_blocks is None:
         resident_blocks = chunk_end_block
-    base_slice = KVSlice(
-        block_ids_per_layer_groups=[np.arange(resident_blocks, dtype=np.int64)],
-    )
 
     transceiver = MagicMock()
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
-    transceiver._create_kv_slice.return_value = base_slice
+    transceiver._page_table.layer_groups = [AttentionLayerGroup(pool_group_idx=0)]
+    transceiver._get_mamba_state_index.return_value = None
     transceiver._send_reqs = {}
+
+    def get_block_ids_range(_req, _group_idx, _layer_group, block_begin, block_end):
+        assert block_end <= resident_blocks, "callers must not read past the allocated blocks"
+        return np.arange(block_begin, block_end, dtype=np.int64)
+
+    transceiver._reuse_adapter.get_block_ids_range.side_effect = get_block_ids_range
 
     req = MagicMock()
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)

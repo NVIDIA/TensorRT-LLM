@@ -32,7 +32,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
     get_unique_rid,
-    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
@@ -59,6 +58,9 @@ from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+
+_EMPTY_BLOCK_IDS = np.array([], dtype=np.int64)
+_EMPTY_BLOCK_IDS.flags.writeable = False
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -252,30 +254,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
-    def _create_kv_slice(
-        self,
-        req: LlmRequest,
-        resident_block_end: Optional[int] = None,
-    ) -> KVSlice:
-        """Create a KV slice from the source's currently resident blocks.
+    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
+        """Create a KV slice covering the whole prompt.
+
+        Pipelined prefill builds its per-chunk slices in ``_build_prefill_chunk``
+        instead, which bounds each layer group's block range directly.
 
         Args:
             req: Request whose KV blocks are being described.
-            resident_block_end: Exclusive logical block boundary to include.
-                Pipelined prefill passes the current chunk end to exclude
-                full-prompt blocks that V1 reserved but has not computed yet.
-                ``None`` includes the complete prompt.
         """
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
-        resident_blocks = (
-            prompt_blocks
-            if resident_block_end is None
-            else min(max(0, resident_block_end), prompt_blocks)
-        )
+        resident_blocks = (req.prompt_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request()
         cached_per_lg = (
@@ -331,21 +323,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
             groups.append(block_ids)
 
-        mamba_state_index = None
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
-            if self._kv_cache_manager.local_num_mamba_layers > 0:
-                mamba_state_index = self._kv_cache_manager._request_id_to_state_index[
-                    req.py_request_id
-                ]
-        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
-
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
-            mamba_state_index=mamba_state_index,
+            mamba_state_index=self._get_mamba_state_index(req),
             token_range=token_range,
         )
+
+    def _get_mamba_state_index(self, req: LlmRequest) -> Optional[int]:
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
+            if self._kv_cache_manager.local_num_mamba_layers > 0:
+                return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
+            return None
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
+        return None
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
         """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
@@ -738,26 +730,68 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"non-final prefill chunk end {chunk_end_pos} must be aligned to tokens_per_block={tpb}"
         )
 
+        # Keep the full prompt span for destination projection while requesting
+        # only the current absolute block range from each source layer group.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
         total_blocks = prompt_blocks
 
         chunk_start = min(chunk_start_block, total_blocks)
         chunk_end = min(chunk_end_block, total_blocks)
         chunk_block_count = max(0, chunk_end - chunk_start)
-        # V1 reserves the full prompt up front, while V2 grows its source list
-        # incrementally. Normalize both to the current chunk boundary before
-        # projecting so full-prompt SWA pages are never treated as current pages.
-        base_slice = self._create_kv_slice(req, resident_block_end=chunk_end)
-        all_block_ids = base_slice.block_ids_per_layer_groups
-        chunk_block_ids = [
-            project_blocks_to_global_chunk(
-                block_ids,
-                chunk_block_offset=chunk_start,
-                chunk_block_count=chunk_block_count,
-                resident_block_end=chunk_end,
-            )
-            for block_ids in all_block_ids
-        ]
+        assert self._page_table is not None
+        layer_groups = self._page_table.layer_groups
+        if chunk_block_count == 0:
+            chunk_block_ids = [_EMPTY_BLOCK_IDS] * len(layer_groups)
+        else:
+            chunk_block_ids = []
+            for group_idx, layer_group in enumerate(layer_groups):
+                block_ids = _EMPTY_BLOCK_IDS
+                if not isinstance(layer_group, MambaLayerGroup):
+                    range_begin = chunk_start
+                    if layer_group.sliding_window_size is not None:
+                        # The stale boundary is a property of the whole request,
+                        # so it uses prompt_len rather than this chunk's end. A
+                        # windowed group's run must not reach below it:
+                        # _build_kv_write_meta raises src_start to
+                        # stale_end * tpb without dropping the blocks under it,
+                        # which would pair this run's head with the window
+                        # tail's destination blocks. A chunk entirely below the
+                        # window contributes nothing, so the cache is not
+                        # queried at all — the common case for a short window
+                        # and a long prompt.
+                        stale_end = max(
+                            0, (req.prompt_len + 1 - layer_group.sliding_window_size) // tpb
+                        )
+                        range_begin = max(range_begin, stale_end)
+                    range_block_count = chunk_end - range_begin
+                    if range_block_count > 0:
+                        block_ids = self._reuse_adapter.get_block_ids_range(
+                            req,
+                            group_idx,
+                            layer_group,
+                            block_begin=range_begin,
+                            block_end=chunk_end,
+                        )
+                        # The receiver derives each group's starting token from
+                        # chunk_end minus the number of blocks it received, so a
+                        # group may only ever drop *leading* blocks. Anything
+                        # else writes KV to the wrong offsets, silently.
+                        if block_ids.size > range_block_count:
+                            raise ValueError(
+                                f"layer group {group_idx} returned {block_ids.size} blocks for "
+                                f"range [{range_begin}, {chunk_end}), which spans only "
+                                f"{range_block_count}"
+                            )
+                        if (
+                            layer_group.sliding_window_size is None
+                            and block_ids.size != chunk_block_count
+                        ):
+                            raise ValueError(
+                                f"chunk [{chunk_start}, {chunk_end}) of layer group {group_idx} "
+                                f"is not fully resident: got {block_ids.size} of "
+                                f"{chunk_block_count} blocks"
+                            )
+                chunk_block_ids.append(block_ids)
         chunk_token_range = None
         if chunk_block_count > 0:
             chunk_token_range = TokenRange(
@@ -768,7 +802,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return KVSlice(
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
-            mamba_state_index=base_slice.mamba_state_index,
+            mamba_state_index=self._get_mamba_state_index(req),
             token_range=chunk_token_range,
             total_blocks=total_blocks,
         )

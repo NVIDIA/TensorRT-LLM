@@ -9703,6 +9703,66 @@ TEST_F(KVCacheManagerTest, VSWABlockStoredDuringGeneration)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
 
+// getCacheBlockIdsRange must return the contiguous run of resident blocks ending at blockEnd.
+// detachFrontBlock leaves the recycled physical id of an out-of-window block in the raw block
+// table, so a range starting before the eviction count must skip it: the pipelined KV transceiver
+// would otherwise read KV out of a block that already belongs to another request.
+TEST_F(KVCacheManagerTest, VSWAGetCacheBlockIdsRangeExcludesDetachedFrontBlocks)
+{
+    auto constexpr blocksInPrimaryPool = 10;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+    auto kvCacheManager = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/true, stream);
+
+    // Seq 0: 11 input tokens covering B0=[1000..1003], B1=[1004..1007], B2=[1008..1010] (partial).
+    auto inputTokens0 = std::make_shared<VecTokens>(11);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    addSequenceForTest(*kvCacheManager, 0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    kvCacheManager->storeContextBlocks(*llmRequest0);
+
+    auto const& rawBlockIds = kvCacheManager->getCacheBlockIds(0, kVSWA_ATTENTION_WINDOW).at(kVSWA_BEAM_IDX);
+    ASSERT_EQ(rawBlockIds.size(), 3U);
+
+    // Before any eviction the range is exactly what was asked for.
+    EXPECT_EQ(kvCacheManager->getSequence(0).getNumFrontBlocksRemoved(kVSWA_ATTENTION_WINDOW), 0);
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, 3).at(kVSWA_BEAM_IDX),
+        ::testing::ElementsAre(rawBlockIds.at(0), rawBlockIds.at(1), rawBlockIds.at(2)));
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 1, 3).at(kVSWA_BEAM_IDX),
+        ::testing::ElementsAre(rawBlockIds.at(1), rawBlockIds.at(2)));
+    // One entry per beam, even when the range is empty.
+    EXPECT_EQ(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 2, 2).size(),
+        static_cast<size_t>(kVSWA_BEAM_WIDTH));
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 2, 2).at(kVSWA_BEAM_IDX),
+        ::testing::IsEmpty());
+
+    // Generation step: numTokens becomes 12; adjustBlocksIfNeeded detaches B0 (12-0*4 >= 8+4).
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
+    kvCacheManager->addToken(0);
+    ASSERT_EQ(kvCacheManager->getSequence(0).getNumFrontBlocksRemoved(kVSWA_ATTENTION_WINDOW), 1);
+    // B0's recycled id is still in the raw table, so the range query is the only thing standing
+    // between the transceiver and another request's data.
+    ASSERT_EQ(kvCacheManager->getCacheBlockIds(0, kVSWA_ATTENTION_WINDOW).at(kVSWA_BEAM_IDX).size(), 3U);
+
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, 1).at(kVSWA_BEAM_IDX),
+        ::testing::IsEmpty());
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, 3).at(kVSWA_BEAM_IDX),
+        ::testing::ElementsAre(rawBlockIds.at(1), rawBlockIds.at(2)));
+    EXPECT_THAT(kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 2, 3).at(kVSWA_BEAM_IDX),
+        ::testing::ElementsAre(rawBlockIds.at(2)));
+
+    // Bad bounds are programming errors, and so is reading past the allocated blocks: the result
+    // would no longer end at blockEnd, which is how callers recover each id's block ordinal.
+    EXPECT_THROW((void) kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, -1, 2), std::runtime_error);
+    EXPECT_THROW((void) kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, -1), std::runtime_error);
+    EXPECT_THROW((void) kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 2, 1), std::runtime_error);
+    EXPECT_THROW((void) kvCacheManager->getCacheBlockIdsRange(0, kVSWA_ATTENTION_WINDOW, 0, 4), std::runtime_error);
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
+}
+
 // Verify that when an OOW block is stolen by another sequence, storeBlocks does
 // not restore that missing anchor under the original sequence's key or corrupt
 // the acquiring sequence's trie, and all blocks are properly released.

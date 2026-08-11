@@ -22,6 +22,7 @@ import numpy as np
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from .page import AttentionLayerGroup
 from .utils import get_global_layer_ids
@@ -75,6 +76,35 @@ class CacheReuseAdapter(ABC):
         """
 
     @abstractmethod
+    def get_block_ids_range(
+        self,
+        req: LlmRequest,
+        group_idx: int,
+        lg: AttentionLayerGroup,
+        block_begin: int,
+        block_end: int,
+    ) -> np.ndarray:
+        """Resident block IDs for absolute request ordinals ``[block_begin, block_end)``.
+
+        The result is the *contiguous* run of resident blocks ending at
+        ``block_end``, i.e. ordinals ``[block_end - len(result), block_end)``.
+        It can be shorter than the requested range when leading blocks have been
+        evicted, as under sliding-window attention; blocks at or before any gap
+        are dropped rather than compacted.
+
+        Callers must not reorder or reinterpret the result positionally beyond
+        that rule: the receiver reconstructs each layer group's starting token
+        from ``block_end`` and the result length, so a result that is not a
+        contiguous run ending at ``block_end`` would be written to the wrong
+        offsets.
+
+        Empty ranges are valid. Negative or reversed bounds raise
+        ``ValueError``. A ``block_end`` past the request's allocated blocks also
+        raises, though the exception type is backend-specific (``ValueError``
+        from V2, ``RuntimeError`` out of the C++ manager for V1).
+        """
+
+    @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit KV blocks to radix tree for future prefix reuse.
 
@@ -123,6 +153,23 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         )
         return np.asarray(pool_indices, dtype=np.int64)
 
+    def get_block_ids_range(self, req, group_idx, lg, block_begin, block_end):  # noqa: ARG002
+        window_size = lg.sliding_window_size
+        # V1 layer groups always carry the manager's window key; see get_block_ids.
+        assert window_size is not None
+        raw_ids = self._mgr.get_cache_indices_range(
+            req.py_request_id,
+            block_begin=block_begin,
+            block_end=block_end,
+            window_size=window_size,
+        )
+        if not raw_ids:
+            return np.array([], dtype=np.int64)
+        # Same block_id -> primary-pool slot translation get_block_ids does; the
+        # two diverge once host offload is enabled.
+        pool_indices = self._mgr.get_memory_pool_block_indices(raw_ids, window_size=window_size)
+        return np.asarray(pool_indices, dtype=np.int64)
+
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
             return
@@ -164,6 +211,34 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
             ),
             dtype=np.int64,
         )
+
+    def get_block_ids_range(self, req, group_idx, lg, block_begin, block_end):  # noqa: ARG002
+        if block_begin < 0 or block_end < 0:
+            raise ValueError("block range bounds must be non-negative")
+        if block_begin > block_end:
+            raise ValueError("block_begin must not exceed block_end")
+        # Neither V2 backend has a bounded query, so read the whole aggregated
+        # list -- keeping the placeholders, which is what makes an entry's index
+        # its block ordinal -- and cut the range out of it here.
+        all_block_ids = np.fromiter(
+            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
+                group_idx, valid_only=False
+            ),
+            dtype=np.int64,
+        )
+        if block_end > all_block_ids.size:
+            raise ValueError(
+                f"block_end={block_end} exceeds the {all_block_ids.size} allocated blocks; "
+                "the result would not end at block_end, and callers recover block "
+                "ordinals from its length"
+            )
+        block_ids = all_block_ids[block_begin:block_end]
+        # Drop everything up to the last gap rather than compacting around it:
+        # a life cycle that keeps sink tokens resident has a sink prefix plus a
+        # window suffix, and returning both would misreport where the suffix
+        # starts.
+        gaps = np.flatnonzero(block_ids == BAD_PAGE_INDEX)
+        return block_ids[gaps[-1] + 1 :] if gaps.size else block_ids
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         self._mgr.try_commit_blocks(req)

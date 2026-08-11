@@ -25,10 +25,12 @@ from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV1,
+    _CacheReuseAdapterV2,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 pytestmark = pytest.mark.cpu_only
 
@@ -108,6 +110,139 @@ class TestAlignKvBlocks:
 # ---------------------------------------------------------------------------
 # Packed 1-D beam block layout.
 # ---------------------------------------------------------------------------
+
+
+class TestBlockRangeAdapters:
+    def test_v1_adapter_requests_only_block_range(self):
+        """Only the requested range is read, and its ids reach the pool translation."""
+        mgr = MagicMock()
+        mgr.get_cache_indices_range.return_value = [13, 14, 15]
+        mgr.get_memory_pool_block_indices.return_value = [113, 114, 115]
+        req = SimpleNamespace(py_request_id=1)
+
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids_range(
+            req, 0, _lg(window=128), block_begin=13, block_end=16
+        )
+
+        mgr.get_cache_indices_range.assert_called_once_with(
+            1, block_begin=13, block_end=16, window_size=128
+        )
+        mgr.get_memory_pool_block_indices.assert_called_once_with([13, 14, 15], window_size=128)
+        np.testing.assert_array_equal(block_ids, [113, 114, 115])
+
+    def test_v1_adapter_skips_translation_for_empty_range(self):
+        mgr = MagicMock()
+        mgr.get_cache_indices_range.return_value = []
+        req = SimpleNamespace(py_request_id=1)
+
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids_range(
+            req, 0, _lg(window=128), block_begin=16, block_end=16
+        )
+
+        assert block_ids.size == 0
+        mgr.get_memory_pool_block_indices.assert_not_called()
+
+    @staticmethod
+    def _v2_adapter(*slot_ids):
+        """Adapter over a cache whose aggregated list is ``slot_ids``.
+
+        ``BAD_PAGE_INDEX`` marks a block that is not resident, which is what
+        ``get_aggregated_page_indices`` yields with ``valid_only=False``.
+        """
+        kv_cache = MagicMock()
+        kv_cache.get_aggregated_page_indices.return_value = list(slot_ids)
+        mgr = MagicMock()
+        mgr.kv_cache_map = {1: kv_cache}
+        return _CacheReuseAdapterV2(mgr), kv_cache
+
+    def _v2_range(self, *slot_ids, block_begin, block_end):
+        adapter, kv_cache = self._v2_adapter(*slot_ids)
+        block_ids = adapter.get_block_ids_range(
+            SimpleNamespace(py_request_id=1),
+            2,
+            _lg(),
+            block_begin=block_begin,
+            block_end=block_end,
+        )
+        kv_cache.get_aggregated_page_indices.assert_called_once_with(2, valid_only=False)
+        return block_ids.tolist()
+
+    def test_v2_range_honors_block_begin(self):
+        assert self._v2_range(10, 11, 12, 13, block_begin=2, block_end=4) == [12, 13]
+
+    def test_v2_range_drops_leading_gap(self):
+        """A front-evicted prefix shortens the run without shifting the rest."""
+        BAD = BAD_PAGE_INDEX
+        assert self._v2_range(BAD, BAD, 12, 13, block_begin=0, block_end=4) == [12, 13]
+
+    def test_v2_range_drops_everything_before_an_interior_gap(self):
+        """Sink blocks before a stale hole must not be compacted onto the window suffix.
+
+        Returning [10, 12, 13] here would make the receiver read the run as
+        ordinals 1..3 and write block 10's KV over ordinal 1.
+        """
+        assert self._v2_range(10, BAD_PAGE_INDEX, 12, 13, block_begin=0, block_end=4) == [12, 13]
+
+    def test_v2_range_is_empty_when_the_last_block_is_absent(self):
+        assert self._v2_range(10, 11, BAD_PAGE_INDEX, block_begin=0, block_end=3) == []
+
+    def test_v2_range_ignores_gaps_outside_the_range(self):
+        """A block past block_end cannot shorten the run."""
+        assert self._v2_range(10, 11, BAD_PAGE_INDEX, block_begin=0, block_end=2) == [10, 11]
+
+    @pytest.mark.parametrize("block_begin,block_end", [(-1, 1), (0, -1), (2, 1)])
+    def test_v2_range_rejects_invalid_bounds(self, block_begin, block_end):
+        adapter, kv_cache = self._v2_adapter()
+
+        with pytest.raises(ValueError):
+            adapter.get_block_ids_range(
+                SimpleNamespace(py_request_id=1),
+                0,
+                _lg(),
+                block_begin=block_begin,
+                block_end=block_end,
+            )
+
+        kv_cache.get_aggregated_page_indices.assert_not_called()
+
+    def test_v2_range_rejects_block_end_past_allocation(self):
+        with pytest.raises(ValueError, match="exceeds the 2 allocated blocks"):
+            self._v2_range(10, 11, block_begin=0, block_end=3)
+
+    @pytest.mark.parametrize("block_begin,block_end", [(-1, 1), (0, -1), (2, 1)])
+    def test_v1_manager_rejects_invalid_bounds(self, block_begin, block_end):
+        """V1 must reject the same bounds as V2, with the same exception type."""
+        manager = object.__new__(KVCacheManager)
+        manager.layer_offsets = [0]
+        manager._window_size_by_layer_offset = {0: 128}
+        manager.impl = MagicMock()
+
+        with pytest.raises(ValueError):
+            manager.get_cache_indices_range(1, block_begin, block_end, layer_idx=0)
+
+        manager.impl.get_cache_block_ids_range.assert_not_called()
+
+    def test_v1_manager_resolves_layer_window_once_and_forwards_range(self):
+        manager = object.__new__(KVCacheManager)
+        manager.layer_offsets = [7]
+        manager._window_size_by_layer_offset = {7: 128}
+        manager.impl = MagicMock()
+        manager.impl.get_cache_block_ids_range.return_value = [[20, 21]]
+
+        result = manager.get_cache_indices_range(1, 4, 6, layer_idx=0)
+
+        assert result == [20, 21]
+        manager.impl.get_cache_block_ids_range.assert_called_once_with(1, 128, 4, 6)
+
+    def test_v1_manager_rejects_multiple_beams(self):
+        manager = object.__new__(KVCacheManager)
+        manager.layer_offsets = [0]
+        manager._window_size_by_layer_offset = {0: 128}
+        manager.impl = MagicMock()
+        manager.impl.get_cache_block_ids_range.return_value = [[20], [21]]
+
+        with pytest.raises(ValueError, match="Chunked/pipelined KV transfer requires beam_width=1"):
+            manager.get_cache_indices_range(1, 0, 1, layer_idx=0)
 
 
 class TestPackedBeamBlockLayout:
@@ -483,6 +618,9 @@ class _StubAdapter(CacheReuseAdapter):
         return self._scalar
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+        return np.array([], dtype=np.int64)
+
+    def get_block_ids_range(self, req, group_idx, lg, block_begin, block_end):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
     def commit_blocks_for_reuse(self, req):  # noqa: ARG002

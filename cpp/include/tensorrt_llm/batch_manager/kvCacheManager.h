@@ -2170,6 +2170,15 @@ public:
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
         = 0;
 
+    //! \brief Get resident block ids in the absolute request block range [blockBegin, blockEnd), per beam.
+    //! \details This non-virtual convenience wrapper copies only the requested range out of the sequence's persistent
+    //! block table, dropping front-detached SWA blocks (which keep their recycled ids in the raw table). The result is
+    //! always the *contiguous* run ending at blockEnd, i.e. ordinals [blockEnd - result.size(), blockEnd), so a caller
+    //! can recover each id's block ordinal from blockEnd and the result size alone. Requesting a blockEnd past the
+    //! sequence's allocated blocks would break that guarantee and is rejected.
+    [[nodiscard]] std::vector<std::vector<SizeType32>> getCacheBlockIdsRange(
+        LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockBegin, SizeType32 blockEnd) const;
+
     /// @brief Get the last block id (beam 0) for a given sequence and window size
     [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
         = 0;

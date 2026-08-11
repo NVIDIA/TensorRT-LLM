@@ -48,6 +48,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -211,19 +212,44 @@ def _send_prefill_chunks(
     """
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
-    base_slice = KVSlice(
-        block_ids_per_layer_groups=all_block_ids,
-        mamba_state_index=mamba_state_index,
-    )
     session = sender_session if sender_session is not None else MagicMock()
     session.kv_tasks = []
     transceiver = MagicMock()
     transceiver._get_or_create_send_session.return_value = session
-    transceiver._create_kv_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._send_reqs = {}
+    # A layer group holding fewer blocks than the prompt is a sliding-window
+    # group whose leading blocks have been evicted, so its IDs are the resident
+    # *suffix* [total_blocks - len(ids), total_blocks) of the block table.
+    resident_begins = [total_blocks - len(block_ids) for block_ids in all_block_ids]
+    transceiver._page_table.layer_groups = [
+        AttentionLayerGroup(
+            pool_group_idx=group_idx,
+            sliding_window_size=(
+                len(block_ids) * tokens_per_block if len(block_ids) < total_blocks else None
+            ),
+        )
+        for group_idx, block_ids in enumerate(all_block_ids)
+    ]
+    if mamba_state_index is not None and transceiver._page_table.layer_groups:
+        transceiver._page_table.layer_groups[-1] = MambaLayerGroup(
+            pool_group_idx=len(all_block_ids) - 1
+        )
+    transceiver._get_mamba_state_index.return_value = mamba_state_index
+
+    def get_block_ids_range(_req, group_idx, _layer_group, block_begin, block_end):
+        """Contiguous resident run ending at ``block_end`` — the adapter contract."""
+        block_ids = all_block_ids[group_idx]
+        resident_begin = resident_begins[group_idx]
+        assert block_end <= total_blocks, "callers must not read past the allocated blocks"
+        begin = max(block_begin, resident_begin)
+        if begin >= block_end:
+            return block_ids[:0]
+        return block_ids[begin - resident_begin : block_end - resident_begin]
+
+    transceiver._reuse_adapter.get_block_ids_range.side_effect = get_block_ids_range
 
     prompt_len = total_blocks * tokens_per_block
     req = MagicMock()
@@ -276,6 +302,8 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
     transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [AttentionLayerGroup(pool_group_idx=0)]
+    transceiver._get_mamba_state_index.return_value = None
 
     req = MagicMock()
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
@@ -288,9 +316,7 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
         chunk_start = chunk_idx * chunk_blocks
         chunk_end = chunk_start + chunk_blocks
         resident_ids = np.arange(chunk_end, dtype=np.int64)
-        transceiver._create_kv_slice.return_value = KVSlice(
-            block_ids_per_layer_groups=[resident_ids]
-        )
+        transceiver._reuse_adapter.get_block_ids_range.return_value = resident_ids[-chunk_blocks:]
         req.py_last_context_chunk = (
             chunk_start * tokens_per_block,
             chunk_end * tokens_per_block,
@@ -305,27 +331,174 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
         )
         assert kv_slice.total_blocks == prompt_blocks
 
+    transceiver._create_kv_slice.assert_not_called()
+    assert transceiver._reuse_adapter.get_block_ids_range.call_count == 2
+    assert all(
+        call.kwargs
+        == {
+            "block_begin": idx * chunk_blocks,
+            "block_end": (idx + 1) * chunk_blocks,
+        }
+        for idx, call in enumerate(transceiver._reuse_adapter.get_block_ids_range.call_args_list)
+    )
+
+
+def test_build_prefill_chunk_rejects_short_full_attention_range():
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = 1
+    transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [AttentionLayerGroup(pool_group_idx=0)]
+    transceiver._reuse_adapter.get_block_ids_range.return_value = np.array([1], dtype=np.int64)
+    req = MagicMock(
+        py_beam_width=1,
+        prompt_len=4,
+        py_last_context_chunk=(0, 4),
+        context_remaining_length=0,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+
+    with pytest.raises(ValueError, match="is not fully resident"):
+        KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+
+def test_build_prefill_chunk_rejects_overlong_range():
+    """More blocks than the range spans means the group is not a run ending at chunk_end."""
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = 1
+    transceiver._send_reqs = {}
+    # A window wider than the prompt keeps the stale boundary at block 0, so the
+    # requested range is the whole chunk.
+    transceiver._page_table.layer_groups = [
+        AttentionLayerGroup(pool_group_idx=0, sliding_window_size=8)
+    ]
+    transceiver._reuse_adapter.get_block_ids_range.return_value = np.array(
+        [1, 2, 3], dtype=np.int64
+    )
+    req = MagicMock(
+        py_beam_width=1,
+        prompt_len=4,
+        py_last_context_chunk=(0, 2),
+        context_remaining_length=2,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+
+    with pytest.raises(ValueError, match="which spans only 2"):
+        KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+
+def test_build_prefill_chunk_accepts_short_swa_range():
+    """A windowed group may return fewer blocks than its range spans."""
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = 1
+    transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [
+        AttentionLayerGroup(pool_group_idx=0, sliding_window_size=4)
+    ]
+    transceiver._reuse_adapter.get_block_ids_range.return_value = np.array([2, 3], dtype=np.int64)
+    transceiver._get_mamba_state_index.return_value = None
+    req = MagicMock(
+        py_beam_width=1,
+        prompt_len=4,
+        py_last_context_chunk=(0, 4),
+        context_remaining_length=0,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+
+    kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+    # Range [1, 4): the window covers the prompt plus the first generated token.
+    assert transceiver._reuse_adapter.get_block_ids_range.call_args.kwargs == {
+        "block_begin": 1,
+        "block_end": 4,
+    }
+    np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [2, 3])
+
+
+def test_build_prefill_chunk_skips_windowed_group_before_final_window():
+    """A chunk entirely below the final window contributes nothing for that group."""
+    tokens_per_block = 4
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
+    transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [
+        AttentionLayerGroup(pool_group_idx=0, sliding_window_size=3 * tokens_per_block)
+    ]
+    transceiver._get_mamba_state_index.return_value = None
+
+    req = MagicMock(
+        py_beam_width=1,
+        prompt_len=16 * tokens_per_block,
+        prepopulated_prompt_len=0,
+        py_last_context_chunk=(4 * tokens_per_block, 8 * tokens_per_block),
+        context_remaining_length=8 * tokens_per_block,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+
+    kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+    transceiver._reuse_adapter.get_block_ids_range.assert_not_called()
+    assert kv_slice.block_ids_per_layer_groups[0].size == 0
+
+
+def test_build_prefill_chunk_empty_range_skips_cache_queries():
+    transceiver = MagicMock()
+    transceiver._kv_cache_manager.tokens_per_block = 1
+    transceiver._send_reqs = {}
+    transceiver._page_table.layer_groups = [
+        AttentionLayerGroup(pool_group_idx=0),
+        MambaLayerGroup(pool_group_idx=1),
+    ]
+    transceiver._get_mamba_state_index.return_value = 7
+    req = MagicMock(
+        py_beam_width=1,
+        prompt_len=0,
+        py_last_context_chunk=(0, 0),
+        context_remaining_length=0,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+
+    kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+
+    transceiver._reuse_adapter.get_block_ids_range.assert_not_called()
+    assert all(block_ids.size == 0 for block_ids in kv_slice.block_ids_per_layer_groups)
+    assert kv_slice.mamba_state_index == 7
+
 
 @pytest.mark.parametrize(
-    "source_block_ids",
+    "source_block_ids,resident_begin",
     [
-        np.arange(16, dtype=np.int64),
-        np.arange(9, 13, dtype=np.int64),
+        (np.arange(16, dtype=np.int64), 0),
+        (np.arange(9, 13, dtype=np.int64), 9),
     ],
     ids=["v1_full_prompt_allocation", "v2_incremental_allocation"],
 )
-def test_build_prefill_chunk_normalizes_swa_source_to_computed_prefix(source_block_ids):
-    """A partial SWA chunk must not select full-prompt pages beyond its computed end."""
+def test_build_prefill_chunk_normalizes_swa_source_to_computed_prefix(
+    source_block_ids, resident_begin
+):
+    """A partial SWA chunk must select only the block its final window shares with it.
+
+    V1 reserves the whole prompt up front while V2 grows incrementally, so the two
+    hold different ordinal ranges; both must yield block 12 for chunk [11, 13).
+    """
     tokens_per_block = 8
     prompt_blocks = 16
     window_blocks = 4
+
+    requested_ranges = []
+
+    def get_block_ids_range(_req, _idx, _lg, block_begin, block_end):
+        """Resident run ending at ``block_end``, holding ordinal i at value i."""
+        requested_ranges.append((block_begin, block_end))
+        begin = max(block_begin, resident_begin)
+        if begin >= block_end:
+            return source_block_ids[:0]
+        return source_block_ids[begin - resident_begin : block_end - resident_begin]
 
     layer_group = SimpleNamespace(sliding_window_size=window_blocks * tokens_per_block)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
-        get_block_ids=lambda req, idx, lg: source_block_ids,
+        get_block_ids_range=get_block_ids_range,
     )
     transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
     transceiver._kv_cache_manager = SimpleNamespace(
@@ -346,6 +519,10 @@ def test_build_prefill_chunk_normalizes_swa_source_to_computed_prefix(source_blo
 
     kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
 
+    # The final window of a 16-block prompt plus its first generated token is
+    # [12, 16), so only block 12 is asked for -- reaching back to the chunk start
+    # would hand the sender worker a run it silently reinterprets as [12, 14).
+    assert requested_ranges == [(12, 13)]
     np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [12])
 
 
@@ -391,14 +568,19 @@ def test_send_prefill_chunks_integrity_check(prepopulated_blocks):
 
 
 def test_send_prefill_chunks_multiple_layer_groups():
-    """Each source layer group is a resident suffix ending at the current chunk."""
+    """A sliding-window group contributes only the part of its resident suffix in the chunk."""
     all_block_ids = [list(range(8)), list(range(3))]
     slices = _send_prefill_chunks(all_block_ids, chunk_size_blocks=4)
     assert len(slices) == 2
     assert np.array_equal(slices[0].block_ids_per_layer_groups[0], np.array([0, 1, 2, 3]))
     assert np.array_equal(slices[1].block_ids_per_layer_groups[0], np.array([4, 5, 6, 7]))
-    assert np.array_equal(slices[0].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
-    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([0, 1, 2]))
+    # The short group holds ordinals [5, 8), so chunk [0, 4) misses it entirely.
+    # Chunk [4, 8) carries only ordinals [6, 8): the final window also has to
+    # cover the first generated token, which puts its stale boundary one block
+    # past the currently resident head. Sending block 5 as well would make the
+    # sender worker pair it with destination block 6.
+    assert slices[0].block_ids_per_layer_groups[1].size == 0
+    assert np.array_equal(slices[1].block_ids_per_layer_groups[1], np.array([1, 2]))
     assert slices[0].token_range == TokenRange(start=0, end=4)
     assert slices[1].token_range == TokenRange(start=4, end=8)
 

@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <limits>
 #include <map>
 #include <optional>
@@ -4627,6 +4628,34 @@ std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     RequestIdType requestId, SizeType32 windowSize) const
 {
     return getSequence(requestId).getCacheBlockIds(windowSize);
+}
+
+std::vector<std::vector<SizeType32>> BaseKVCacheManager::getCacheBlockIdsRange(
+    LlmRequest::RequestIdType requestId, SizeType32 windowSize, SizeType32 blockBegin, SizeType32 blockEnd) const
+{
+    TLLM_CHECK_WITH_INFO(blockBegin >= 0, "blockBegin must be non-negative");
+    TLLM_CHECK_WITH_INFO(blockEnd >= 0, "blockEnd must be non-negative");
+    TLLM_CHECK_WITH_INFO(blockBegin <= blockEnd, "blockBegin must not exceed blockEnd");
+    // Read the block table and the eviction count off the same sequence, so a manager that overrides one but not the
+    // other cannot hand back a block table and a front-eviction count that disagree.
+    auto const& sequence = getSequence(requestId);
+    auto const& blockIdsPerBeam = sequence.getCacheBlockIds(windowSize);
+    auto const firstResidentBlock = static_cast<size_t>(sequence.getNumFrontBlocksRemoved(windowSize));
+    auto const end = static_cast<size_t>(blockEnd);
+    std::vector<std::vector<SizeType32>> result;
+    result.reserve(blockIdsPerBeam.size());
+    for (auto const& blockIds : blockIdsPerBeam)
+    {
+        TLLM_CHECK_WITH_INFO(end <= blockIds.size(),
+            "blockEnd=%d exceeds the %zu blocks allocated for request %lu at windowSize=%d; the result would not end "
+            "at blockEnd, and callers recover block ordinals from its size",
+            blockEnd, blockIds.size(), static_cast<unsigned long>(requestId), windowSize);
+        auto const begin = std::min(end, std::max(firstResidentBlock, static_cast<size_t>(blockBegin)));
+        auto const beginOffset = static_cast<std::ptrdiff_t>(begin);
+        auto const endOffset = static_cast<std::ptrdiff_t>(end);
+        result.emplace_back(blockIds.begin() + beginOffset, blockIds.begin() + endOffset);
+    }
+    return result;
 }
 
 std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(

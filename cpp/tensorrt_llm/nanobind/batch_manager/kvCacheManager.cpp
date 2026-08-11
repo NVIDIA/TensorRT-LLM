@@ -649,6 +649,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("request_id"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
+        // Deliberately keeps the GIL, unlike its neighbours: it reaches the virtual getSequence, whose trampoline can
+        // call back into a Python subclass.  The copy it makes is bounded by the requested range, so there is little
+        // to gain from releasing.
+        .def("get_cache_block_ids_range", &BaseKVCacheManager::getCacheBlockIdsRange, nb::arg("request_id"),
+            nb::arg("window_size"), nb::arg("block_begin"), nb::arg("block_end"))
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())
         .def("sync_transfer_manager_with_buffer_manager", &BaseKVCacheManager::syncTransferManagerWithBufferManager,
