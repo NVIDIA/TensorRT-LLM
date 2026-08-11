@@ -1045,25 +1045,22 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_feature_encoder_capture_keys_are_all_reachable(self) -> None:
         # Every request contributes exactly fixed_seq_len positions, so the
-        # only reachable key per batch size is (bs, bs * fixed, fixed). The
-        # token path's cross product would also emit keys whose token count no
-        # batch can produce, and capture_keys drives mixed encoder/decoder
+        # only reachable key per batch size is (bs, bs * fixed, fixed), and
+        # every slot in that layout is a full fixed_seq_len sequence. The token
+        # path's cross product would also emit keys whose token count no batch
+        # can produce, and capture_keys drives mixed encoder/decoder
         # decoder-graph warmup.
         fixed = 1500
         batch_sizes = [1, 2, 4, 8]
         runner = self._feature_encoder_runner(batch_sizes, fixed)
 
         self.assertEqual(
-            sorted(runner.capture_keys),
-            [(bs, bs * fixed, fixed) for bs in batch_sizes],
+            runner._capture_sequence_lengths,
+            {(bs, bs * fixed, fixed): [fixed] * bs
+             for bs in batch_sizes},
         )
-
-    def test_feature_encoder_capture_layout_is_uniform(self) -> None:
-        fixed = 1500
-        runner = self._feature_encoder_runner([2], fixed)
-        self.assertEqual(
-            runner._capture_sequence_lengths[(2, 2 * fixed, fixed)],
-            [fixed, fixed])
+        self.assertEqual(runner.capture_keys,
+                         frozenset(runner._capture_sequence_lengths))
 
     @staticmethod
     def _encoder_spec_engine(encoder_cuda_graph_config,
@@ -1087,29 +1084,29 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine.mapping = SimpleNamespace(tp_size=tp_size)
         return engine, spec
 
-    def test_encoder_graph_spec_returns_spec_for_feature_model(self) -> None:
+    def test_encoder_graph_spec_selection(self) -> None:
         # The model selects feature mode, not the config: an encoder either
-        # takes fixed-shape features or it does not.
-        engine, spec = self._encoder_spec_engine(
-            EncodeCudaGraphConfig(batch_sizes=[1, 2]), declares_spec=True)
-        self.assertEqual(engine._encoder_graph_spec(), spec)
+        # takes fixed-shape features or it does not. TP > 1 is gated off
+        # because allreduce inside encoder capture is unverified.
+        declined = (None, None, None)
+        cases = [
+            ("feature model", EncodeCudaGraphConfig(batch_sizes=[1, 2]), True,
+             1, None),
+            ("token model",
+             EncodeCudaGraphConfig(batch_sizes=[1],
+                                   num_tokens=[1500],
+                                   seq_lens=[1500]), False, 1, declined),
+            ("no config", None, True, 1, declined),
+            ("tensor parallel", EncodeCudaGraphConfig(batch_sizes=[1]), True, 2,
+             declined),
+        ]
 
-    def test_encoder_graph_spec_declines_token_model(self) -> None:
-        engine, _ = self._encoder_spec_engine(EncodeCudaGraphConfig(
-            batch_sizes=[1], num_tokens=[1500], seq_lens=[1500]),
-                                              declares_spec=False)
-        self.assertEqual(engine._encoder_graph_spec(), (None, None, None))
-
-    def test_encoder_graph_spec_declines_without_config(self) -> None:
-        engine, _ = self._encoder_spec_engine(None, declares_spec=True)
-        self.assertEqual(engine._encoder_graph_spec(), (None, None, None))
-
-    def test_encoder_graph_spec_declines_tensor_parallel(self) -> None:
-        engine, _ = self._encoder_spec_engine(
-            EncodeCudaGraphConfig(batch_sizes=[1]),
-            declares_spec=True,
-            tp_size=2)
-        self.assertEqual(engine._encoder_graph_spec(), (None, None, None))
+        for name, config, declares_spec, tp_size, expected in cases:
+            with self.subTest(name):
+                engine, spec = self._encoder_spec_engine(
+                    config, declares_spec=declares_spec, tp_size=tp_size)
+                self.assertEqual(engine._encoder_graph_spec(),
+                                 expected if expected is not None else spec)
 
     def test_encoder_cuda_graph_stages_and_restores_fixed_sequence_slots(
             self) -> None:

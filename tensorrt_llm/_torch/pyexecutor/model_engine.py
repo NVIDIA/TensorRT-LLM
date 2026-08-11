@@ -890,6 +890,10 @@ class PyTorchModelEngine(ModelEngine):
                     f"size fits within max_num_tokens // encoder_output_len = "
                     f"{bs_cap}; the encoder step stays eager.")
                 feature_shape = feature_dtype = fixed_seq_len = None
+                # Without this the runner would be built in *token* mode with
+                # empty bucket lists: no capture keys, but `enabled` true and
+                # token-mode static buffers allocated for nothing.
+                use_encoder_cuda_graph = False
             else:
                 encoder_graph_max_batch_size = encoder_graph_batch_sizes[-1]
                 encoder_graph_max_num_tokens = (encoder_graph_max_batch_size *
@@ -1405,11 +1409,6 @@ class PyTorchModelEngine(ModelEngine):
         log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
         self._warmup_cute_dsl_radix_topk()
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
-        if self.encoder_cuda_graph_runner.feature_mode:
-            # After decoder-graph capture, so the decoder pool's high-water
-            # mark is set before the encoder runner allocates its own pool.
-            self._capture_enc_dec_encoder_graphs()
-            log_mem_snapshot("warmup/after_enc_dec_encoder_graph_capture")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
@@ -2121,11 +2120,6 @@ class PyTorchModelEngine(ModelEngine):
         runner = self.encoder_cuda_graph_runner
         if not runner.is_encoder_decoder:
             return
-        if runner.feature_mode:
-            # This driver synthesizes packed token inputs, which a feature
-            # encoder cannot consume. Feature mode captures from
-            # `_capture_enc_dec_encoder_graphs` during engine warmup instead.
-            return
 
         capture = functools.partial(
             self._capture_encoder_cuda_graphs_enc_dec,
@@ -2164,23 +2158,36 @@ class PyTorchModelEngine(ModelEngine):
             if sequence_lengths is None:
                 continue
 
-            encoder_input_ids = [0] * sum(sequence_lengths)
-            encoder_position_ids = []
-            for sequence_length in sequence_lengths:
-                encoder_position_ids.extend(
-                    self._apply_position_id_offset(list(
-                        range(sequence_length))))
-            inputs = self._prepare_encoder_decoder_encoder_inputs(
-                encoder_input_ids=encoder_input_ids,
-                encoder_position_ids=encoder_position_ids,
-                sequence_lengths=sequence_lengths,
-                request_ids=list(range(len(sequence_lengths))),
-                resource_manager=resource_manager,
-            )
-
             logger.info("Encoder-decoder encoder CUDA graph "
                         f"{operation}: key={key}")
-            self._encoder_forward_enc_dec(inputs)
+            if runner.feature_mode:
+                # A zero waveform is a valid fixed-shape feature, and the
+                # encoder step writes no KV cache, so no LlmRequests and no
+                # KV/cross-pool resources are involved.
+                self._feature_encoder_graph_forward(
+                    features=[
+                        torch.zeros((1, *runner.config.feature_shape),
+                                    dtype=runner.config.feature_dtype)
+                        for _ in sequence_lengths
+                    ],
+                    seq_lens=list(sequence_lengths),
+                    request_ids=list(range(len(sequence_lengths))),
+                )
+            else:
+                encoder_input_ids = [0] * sum(sequence_lengths)
+                encoder_position_ids = []
+                for sequence_length in sequence_lengths:
+                    encoder_position_ids.extend(
+                        self._apply_position_id_offset(
+                            list(range(sequence_length))))
+                inputs = self._prepare_encoder_decoder_encoder_inputs(
+                    encoder_input_ids=encoder_input_ids,
+                    encoder_position_ids=encoder_position_ids,
+                    sequence_lengths=sequence_lengths,
+                    request_ids=list(range(len(sequence_lengths))),
+                    resource_manager=resource_manager,
+                )
+                self._encoder_forward_enc_dec(inputs)
             torch.cuda.synchronize()
             num_processed += 1
 
@@ -7928,7 +7935,7 @@ class PyTorchModelEngine(ModelEngine):
         fall back to the eager path.
         """
         runner = self.encoder_cuda_graph_runner
-        if runner is None or not runner.enabled or not runner.feature_mode:
+        if not runner.enabled or not runner.feature_mode:
             return None
 
         fixed = runner.config.fixed_seq_len
@@ -7942,42 +7949,65 @@ class PyTorchModelEngine(ModelEngine):
             features.append(f)
 
         seq_lens = [fixed] * len(encoder_requests)
-        graph_inputs = {
-            'seq_lens': seq_lens,
-            'input_features': features,
-        }
-        with runner.pad_batch(graph_inputs,
-                              len(encoder_requests)) as padded_inputs:
+        output = self._feature_encoder_graph_forward(
+            features=features,
+            seq_lens=seq_lens,
+            request_ids=[r.py_request_id for r in encoder_requests],
+        )
+        if output is None:
+            return None
+
+        real_tokens = fixed * len(encoder_requests)
+        return output[:real_tokens].clone(), seq_lens
+
+    def _feature_encoder_graph_forward(
+        self,
+        features: List[torch.Tensor],
+        seq_lens: List[int],
+        request_ids: List[int],
+    ) -> Optional[torch.Tensor]:
+        """Run one feature encoder batch through its CUDA graph.
+
+        Shared by the runtime path and by warmup/capture. Returns the packed
+        hidden states for the *padded* batch (the caller slices back to the
+        real rows), or None when no captured graph fits and the caller must
+        fall back to eager.
+        """
+        runner = self.encoder_cuda_graph_runner
+        fixed = runner.config.fixed_seq_len
+        graph_inputs = {'seq_lens': seq_lens, 'input_features': features}
+
+        with runner.pad_batch(graph_inputs, len(seq_lens)) as padded_inputs:
             # `pad_batch` extends seq_lens to the captured bucket, and the
             # metadata takes one request id per sequence. Pad slots carry no
             # request; the encoder pass runs without a KV cache, so their ids
             # are never looked up and only have to exist and stay distinct.
-            request_ids = [r.py_request_id for r in encoder_requests]
-            request_ids += [
-                -(i + 1) for i in range(
-                    len(padded_inputs['seq_lens']) - len(request_ids))
+            padded_seq_lens = padded_inputs['seq_lens']
+            padded_request_ids = list(request_ids) + [
+                -(i + 1)
+                for i in range(len(padded_seq_lens) - len(request_ids))
             ]
             eager_attn_metadata = self._make_encoder_attn_metadata(
-                padded_inputs['seq_lens'], request_ids)
+                padded_seq_lens, padded_request_ids)
             graph_attn_metadata, key = runner.maybe_get_cuda_graph(
                 padded_inputs, eager_attn_metadata)
             if key is None:
                 return None
             padded_inputs['attn_metadata'] = graph_attn_metadata
 
+            capture_output = None
             if runner.needs_capture(key):
                 padded_batch_size, padded_num_tokens, _ = key
                 # Feature-mode seq_lens are constant per bucket: initialize
                 # the graph-resident metadata once at capture.
                 graph_attn_metadata.prepare_encoder_cuda_graph_replay(
                     [fixed] * padded_batch_size, padded_num_tokens)
-                runner.capture(key, self._enc_dec_encoder_graph_forward_fn,
-                               padded_inputs)
+                capture_output = runner.capture(
+                    key, self._enc_dec_encoder_graph_forward_fn, padded_inputs)
 
-            output = runner.replay(key, padded_inputs)
-
-        real_tokens = fixed * len(encoder_requests)
-        return output[:real_tokens].clone(), seq_lens
+            if runner.is_warmup_only:
+                return capture_output
+            return runner.replay(key, padded_inputs)
 
     def _enc_dec_encoder_graph_forward_fn(
             self, capture_inputs: Dict[str, Any]) -> torch.Tensor:
@@ -7989,59 +8019,6 @@ class PyTorchModelEngine(ModelEngine):
             'encoder_seq_lens':
             capture_inputs['seq_lens'],
         })
-
-    def _capture_enc_dec_encoder_graphs(self) -> None:
-        """Capture enc-dec encoder graphs for every configured batch size.
-
-        Runs at engine warmup, and goes through the shared two-pass helper:
-        every shape must be warmed before any graph is captured, because a
-        smaller batch can select a different attention kernel and grow the
-        shared workspace, which would move a buffer a larger batch's graph
-        had already captured the address of.
-        """
-        with torch.inference_mode():
-            self._warmup_and_capture_encoder_cuda_graphs(
-                self._capture_feature_encoder_graphs_once)
-
-    def _capture_feature_encoder_graphs_once(self) -> None:
-        """One pass over every feature encoder batch size.
-
-        Called twice by `_warmup_and_capture_encoder_cuda_graphs`: once with
-        the runner in warmup-only mode, then once to capture. Largest bucket
-        first so the runner's graph pool high-water mark is set on the first
-        capture. Inputs are synthesized without LlmRequests — a zero waveform
-        is a valid fixed-shape feature — and no KV/cross-pool resources are
-        involved (the encoder step writes no KV cache).
-        """
-        runner = self.encoder_cuda_graph_runner
-        fixed = runner.config.fixed_seq_len
-        for bs in sorted(runner.supported_batch_sizes, reverse=True):
-            seq_lens = [fixed] * bs
-            features = [
-                torch.zeros((1, *runner.config.feature_shape),
-                            dtype=runner.config.feature_dtype)
-                for _ in range(bs)
-            ]
-            graph_inputs = {
-                'seq_lens': seq_lens,
-                'input_features': features,
-            }
-            eager_md = self._make_encoder_attn_metadata(seq_lens,
-                                                        list(range(bs)))
-            graph_md, key = runner.maybe_get_cuda_graph(graph_inputs, eager_md)
-            if key is None:
-                logger.warning(
-                    "Enc-dec encoder CUDA graph capture skipped for "
-                    f"batch size {bs} (unsupported metadata/backend).")
-                continue
-            if not runner.needs_capture(key):
-                continue
-            logger.info(
-                f"Capturing enc-dec encoder CUDA graph for batch size {bs}.")
-            graph_inputs['attn_metadata'] = graph_md
-            graph_md.prepare_encoder_cuda_graph_replay(seq_lens, key[1])
-            runner.capture(key, self._enc_dec_encoder_graph_forward_fn,
-                           graph_inputs)
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:

@@ -320,40 +320,6 @@ class TestEncoderRuntimeSizes:
 
 
 @pytest.mark.cpu_only
-class TestEncoderCudaGraphConfigValidation:
-    """`encoder_cuda_graph_config` accepts batch sizes on their own.
-
-    An encoder whose input is a fixed-shape per-request feature tensor
-    (Whisper) derives `num_tokens` / `seq_lens` from the model, and only the
-    model engine knows which kind of encoder a model has, so those buckets are
-    checked there rather than at config validation.
-    """
-
-    def test_accepts_batch_sizes_without_token_buckets(self):
-        llm_args = TorchLlmArgs(model=llama_model_path,
-                                encoder_max_batch_size=8,
-                                encoder_cuda_graph_config=EncodeCudaGraphConfig(
-                                    batch_sizes=[1, 2], enable_padding=True))
-        assert llm_args.encoder_cuda_graph_config.batch_sizes == [1, 2]
-        assert not llm_args.encoder_cuda_graph_config.num_tokens
-        assert not llm_args.encoder_cuda_graph_config.seq_lens
-
-    def test_still_requires_encoder_max_batch_size(self):
-        with pytest.raises(ValueError):
-            TorchLlmArgs(model=llama_model_path,
-                         encoder_cuda_graph_config=EncodeCudaGraphConfig(
-                             batch_sizes=[1, 2]))
-
-    def test_still_rejects_encode_only(self):
-        with pytest.raises(ValueError):
-            TorchLlmArgs(model=llama_model_path,
-                         encode_only=True,
-                         encoder_max_batch_size=8,
-                         encoder_cuda_graph_config=EncodeCudaGraphConfig(
-                             batch_sizes=[1, 2]))
-
-
-@pytest.mark.cpu_only
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(
@@ -1890,28 +1856,37 @@ class TestTorchLlmArgsCudaGraphSettings:
 
         assert not disabled_args.enable_encoder_decoder_mixed_cuda_graph
 
-    def test_encoder_cuda_graph_config_validation(self):
-        invalid_cases = [
-            (
-                {
-                    "encoder_cuda_graph_config":
-                    EncodeCudaGraphConfig(
-                        batch_sizes=[1, 4],
-                        num_tokens=[16, 64],
-                        seq_lens=[8, 32],
-                        enable_padding=True,
-                    ),
-                },
-                "encoder_cuda_graph_config requires encoder_max_batch_size",
+        # Batch sizes alone are valid. An encoder whose input is a fixed-shape
+        # per-request feature tensor (Whisper) derives num_tokens / seq_lens
+        # from the model, and only the model engine knows which kind of encoder
+        # a model has, so those buckets are checked there, not here.
+        feature_args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
             ),
-        ]
+        )
 
-        for kwargs, error_match in invalid_cases:
-            with pytest.raises(ValidationError, match=error_match):
-                TorchLlmArgs(
-                    model=llama_model_path,
-                    **kwargs,
-                )
+        assert feature_args.encoder_cuda_graph_config.batch_sizes == [1, 4]
+        assert not feature_args.encoder_cuda_graph_config.num_tokens
+        assert not feature_args.encoder_cuda_graph_config.seq_lens
+
+    def test_encoder_cuda_graph_config_validation(self):
+        with pytest.raises(
+                ValidationError,
+                match="encoder_cuda_graph_config requires encoder_max_batch_size"
+        ):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                    batch_sizes=[1, 4],
+                    num_tokens=[16, 64],
+                    seq_lens=[8, 32],
+                    enable_padding=True,
+                ),
+            )
 
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(

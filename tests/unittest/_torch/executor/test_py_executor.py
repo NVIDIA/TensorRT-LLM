@@ -247,11 +247,25 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
     )
 
 
-def test_encoder_microbatch_admission_supports_feature_encoder_config():
-    # A feature encoder leaves num_tokens / seq_lens unset, so gating this
-    # path on them would skip microbatch admission entirely.
-    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 8])
-    encoder_requests = [object() for _ in range(12)]
+@pytest.mark.parametrize(
+    "runner_batch_sizes,config_batch_sizes,num_requests,expected",
+    [
+        # A feature encoder leaves num_tokens / seq_lens unset, so gating this
+        # path on them would skip microbatch admission entirely.
+        ([1, 2, 4, 8], None, 12, 8),
+        # The runner's list is authoritative: the engine filters the configured
+        # sizes by the scheduler's encoder-batch bound, so the config alone can
+        # name sizes that were never captured.
+        ([1, 2, 3, 4], [1, 2, 3, 4, 8], 6, 4),
+    ],
+)
+def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
+    runner_batch_sizes, config_batch_sizes, num_requests, expected
+):
+    executor = _make_feature_encoder_batch_wait_executor(runner_batch_sizes)
+    if config_batch_sizes is not None:
+        executor.llm_args.encoder_cuda_graph_config.batch_sizes = config_batch_sizes
+    encoder_requests = [object() for _ in range(num_requests)]
 
     scheduled = executor._waiting_encoder_requests(
         encoder_requests,
@@ -259,25 +273,8 @@ def test_encoder_microbatch_admission_supports_feature_encoder_config():
         [object()] * 20,
     )
 
-    assert scheduled == encoder_requests[:8]
+    assert scheduled == encoder_requests[:expected]
     assert executor.encoder_batch_wait_iters_count == 0
-
-
-def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes():
-    # The runner's list is authoritative: the engine filters the configured
-    # sizes by the scheduler's encoder-batch bound, so the config alone can
-    # name sizes that were never captured.
-    executor = _make_feature_encoder_batch_wait_executor([1, 2, 3, 4])
-    executor.llm_args.encoder_cuda_graph_config.batch_sizes = [1, 2, 3, 4, 8]
-    encoder_requests = [object() for _ in range(6)]
-
-    scheduled = executor._waiting_encoder_requests(
-        encoder_requests,
-        [],
-        [object()] * 20,
-    )
-
-    assert scheduled == encoder_requests[:4]
 
 
 def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
