@@ -538,3 +538,92 @@ def test_pool_session_shutdown_never_blocks_after_release():
     session.shutdown()  # owner asks for the default blocking shutdown
 
     pool.shutdown.assert_called_once_with(wait=False)
+
+
+def _proxy_awaiting_worker_init(owns_session: bool):
+    """Proxy parked in _start_executor_workers' init-status wait loop.
+
+    Seeds only what that loop touches: a status queue that never reports
+    ready, one already-finished worker future (the death), and the session.
+    The spawn itself is stubbed -- the contract under test is what the wait
+    loop does once a worker future is already done.
+    """
+    proxy = _bare_proxy()
+    proxy._error_queue = _queue.Queue()
+    proxy._owns_mpi_session = owns_session
+    proxy.worker_cls = object
+    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
+    # time is live: keep it out of pre_shutdown(), whose attributes (the
+    # worker-process monitor, the request queue) this fixture does not seed.
+    proxy.doing_shutdown = True
+
+    dead_future = _Future()
+    dead_future.set_result(None)
+
+    proxy.mpi_session = _Mock()
+    proxy.mpi_session.submit.return_value = [dead_future]
+
+    status_queue = _Mock()
+    status_queue.poll.return_value = False  # worker never signals ready
+    proxy.worker_init_status_queue = status_queue
+    return proxy
+
+
+def test_worker_death_during_init_aborts_the_wedged_world():
+    """A rank dying during init must not leave its peers wedged.
+
+    A non-leader rank that fails setup returns without notifying anyone, so
+    the survivors stay blocked in the init collective still holding their
+    share of the weights. Raising alone leaks them until job end and makes
+    the next blocking shutdown() hang instead of reporting the failure.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    # The world is recorded dead and forcibly torn down, not merely abandoned.
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    # Exit joins are released, so a later join cannot block on the dead pool.
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+    # Pending work fails fast rather than waiting on a gone producer.
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_worker_death_during_init_does_not_abort_borrowed_session():
+    """An externally owned session is marked dead but never torn down.
+
+    Its owner (the LLM API, or the test session-reuse pool) tears it down;
+    aborting it here would kill a session this proxy did not create.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=False)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    # The non-destructive part still has to happen for the borrowed session.
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_worker_death_during_init_aborts_before_marking_dead():
+    """The abort must precede the engine-dead bookkeeping.
+
+    shutdown_abort() escalates to MPI_Abort only when its own blocking
+    shutdown() overruns the grace period, but release_exit_joins() (reached
+    via _mark_engine_dead) marks the pool dead, which forces that shutdown()
+    non-blocking. Marking first would therefore silently defang the abort and
+    leave wedged ranks holding their weights.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    # Mock records child calls in order, so read the ordering off the session.
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")

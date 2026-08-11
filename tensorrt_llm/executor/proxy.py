@@ -603,6 +603,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self._handle_background_error()
 
+    def _abort_owned_session(self, reason: BaseException) -> None:
+        """Force the worker world down, but only if this proxy created it.
+
+        An externally owned (shared) session must stay alive for its owner to
+        tear down.
+        """
+        if self._owns_mpi_session:
+            self.mpi_session.shutdown_abort(reason=reason)
+
     def _start_executor_workers(self, worker_kwargs):
 
         self_ref = weakref.ref(self)
@@ -656,16 +665,28 @@ class GenerationExecutorProxy(GenerationExecutor):
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
-                raise RuntimeError("Executor worker died during initialization")
+                death = RuntimeError(
+                    "Executor worker died during initialization")
+                # A non-leader rank that fails here returns without notifying
+                # anyone, so its peers stay blocked in the init collective
+                # still holding their share of the weights. Raising alone
+                # leaks them until job end and makes the next blocking
+                # shutdown() hang instead of reporting this failure.
+                #
+                # Abort before marking: shutdown_abort() escalates to
+                # MPI_Abort only if its own blocking shutdown() overruns the
+                # grace period, and _mark_engine_dead() -> release_exit_joins()
+                # marks the pool dead, which forces that shutdown()
+                # non-blocking. Marking first would defang the abort.
+                self._abort_owned_session(death)
+                self._mark_engine_dead(death)
+                raise death
             self._handle_background_error()
 
         ready_signal, error_trace = status[:2]
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
-            # Only abort a session this proxy created; an externally owned
-            # (shared) session must stay alive for its owner to tear down.
-            if self._owns_mpi_session:
-                self.mpi_session.shutdown_abort(reason=ready_signal)
+            self._abort_owned_session(ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
