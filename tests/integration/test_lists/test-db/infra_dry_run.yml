@@ -6,4 +6,4 @@ infra_dry_run:
         gte: 0
         lte: 1024
   tests:
-  - infra_dry_run_benchmark.py::test_infra_dry_run_benchmark
+  - test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark

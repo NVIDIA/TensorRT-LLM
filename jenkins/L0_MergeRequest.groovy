@@ -2291,7 +2291,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    parallelJobs.failFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
+    parallelJobs.failFast = enableFailFast
     pipeline.parallel parallelJobs
 }
 
