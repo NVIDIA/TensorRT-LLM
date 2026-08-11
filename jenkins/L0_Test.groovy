@@ -3258,9 +3258,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         if (hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
-            memorySize = "${gpuCount * 150}" + "Gi"
-            storageSize = "${gpuCount * 150}" + "Gi"
-            cpuCount = "${gpuCount * 12}"
+            // Keep ModelExpress services inside the existing pod resource envelope;
+            // otherwise their requests can make an otherwise valid GPU pod unschedulable.
+            def serviceCpuReserve = modelExpress ? 2 : 0
+            def serviceMemoryReserveGi = modelExpress ? 8 : 0
+            def serviceStorageReserveGi = modelExpress ? 8 : 0
+            memorySize = "${gpuCount * 150 - serviceMemoryReserveGi}" + "Gi"
+            storageSize = "${gpuCount * 150 - serviceStorageReserveGi}" + "Gi"
+            cpuCount = "${gpuCount * 12 - serviceCpuReserve}"
         }
 
         def gpuType = KubernetesManager.selectGPU(type)
