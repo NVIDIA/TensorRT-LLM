@@ -1162,6 +1162,13 @@ class EncoderCUDAGraphRunner:
         # H2D copies must be issued before graph replay instead of captured.
         self._capture_h2d_copy = prefer_pinned()
 
+        # Replays served from a captured feature graph. A populated `graphs`
+        # only proves capture happened; both `pad_batch` and the shape checks
+        # in `_maybe_forward_encoder_graph` can route every request to the
+        # eager encoder without emptying it, so tests need this to tell a
+        # working graph path from a silent eager fallback.
+        self.num_feature_replays = 0
+
     def _get_capture_stream(self) -> torch.cuda.Stream:
         """Return this runner's dedicated capture stream, creating it lazily."""
         if self._capture_stream is None:
@@ -1509,6 +1516,15 @@ class EncoderCUDAGraphRunner:
             # the 1-token pads of the token path. Fall back to eager across
             # large bucket gaps so graph replay cannot add more than 12.5%
             # encoder work.
+            #
+            # 12.5% is tight enough that consecutive power-of-two buckets never
+            # clear it: the next bucket is always >= 1.33x the current batch
+            # size. With the default generated bucket list, and with the
+            # [1, 2] the Whisper integration test configures, `enable_padding`
+            # is therefore inert and only exact batch sizes replay - which is
+            # what `_waiting_encoder_requests` forms microbatches to hit.
+            # Padding only becomes reachable with a dense list such as
+            # [1, 2, 3, 4].
             if (batch_size == 0 or padded_batch_size
                     > batch_size * self.MAX_FEATURE_PADDING_RATIO):
                 yield inputs
@@ -2007,6 +2023,7 @@ class EncoderCUDAGraphRunner:
         self._feature_h2d_events[slot].record()
 
         self.graphs[key].replay()
+        self.num_feature_replays += 1
         return self.graph_outputs[key]
 
     def replay(

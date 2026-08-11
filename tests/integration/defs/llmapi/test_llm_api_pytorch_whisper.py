@@ -288,12 +288,15 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
         assert not encoder_runner.enabled
         assert not encoder_runner.graphs
         return
-    # Capture must actually have happened: a silent fallback to the eager
-    # encoder path would otherwise pass every output assertion above.
     assert encoder_runner.enabled
     assert encoder_runner.graphs
     assert encoder_runner.feature_mode
     assert encoder_runner.is_encoder_decoder
+    # Capture alone is not enough: `pad_batch` and the shape checks in
+    # `_maybe_forward_encoder_graph` can route every request to the eager
+    # encoder while `graphs` stays populated, and that silent fallback would
+    # pass every output assertion above. Only the replay counter rules it out.
+    assert encoder_runner.num_feature_replays > 0
 
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:

@@ -891,7 +891,7 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     def config(self):
         return self.model_config.pretrained_config
 
-    def encoder_graph_spec(self):
+    def encoder_graph_spec(self) -> Tuple[Tuple[int, ...], torch.dtype, int]:
         """Fixed-shape encoder contract for enc-dec encoder CUDA graphs.
 
         Every Whisper encoder request is an fp32 waveform zero-padded by
