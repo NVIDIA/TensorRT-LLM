@@ -1628,7 +1628,7 @@ class ImageGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport (OpenAI-standard, always honored)
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     format: Literal["png", "webp", "jpeg", "safetensors", "pt"] = Field(
         default="png",
         description=(
@@ -1762,6 +1762,7 @@ class ImageObject(OpenAIBaseModel):
     """Generated image object in the response."""
     b64_json: Optional[str] = None
     url: Optional[str] = None
+    path: Optional[str] = None
     revised_prompt: Optional[str] = None
 
 
@@ -1792,7 +1793,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
 
     # Prompt + transport
     prompt: str
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["file", "path"] = "file"
     format: Literal["mp4", "avi", "auto", "safetensors", "pt"] = Field(
         default="auto",
         description=(
@@ -1900,17 +1901,26 @@ class VideoJob(OpenAIBaseModel):
     )
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    # exclude=True: internal file-location for /content resolution + delete;
+    # never on the wire (the path payload is the hand-built {id, output_path}
+    # envelope in /content), so status/list model_dump() stays status-only.
     output_path: Optional[str] = Field(
-        default=None, description="Actual path where the video file was saved")
+        default=None,
+        exclude=True,
+        description="Server-side saved path (internal; excluded from the wire)."
+    )
     output_paths: Optional[List[str]] = Field(
-        default=None, description="Paths for all generated videos when n > 1")
-    response_format: Optional[Literal["url", "b64_json"]] = Field(
+        default=None,
+        exclude=True,
+        description=
+        "Server-side paths for n>1 (internal; excluded from the wire).")
+    response_format: Optional[Literal["file", "path"]] = Field(
         default=None,
         description=(
             "Transport the client requested. ``GET /v1/videos/{id}/content`` "
-            "honors this: ``b64_json`` returns the encoded payload as a "
-            "base64 string inside a JSON envelope; ``url`` (or unset) "
-            "returns the file as a ``FileResponse`` download."),
+            "honors this: ``path`` returns the server-side output path(s) in a "
+            "JSON envelope; ``file`` (or unset) returns the file as a "
+            "``FileResponse`` download."),
     )
 
 

@@ -1258,9 +1258,15 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.openai_video_generation_async,
                                methods=["POST"])
         # Synchronous video generation (waits for completion, extended API)
-        self.app.add_api_route("/v1/videos/generations",
+        self.app.add_api_route("/v1/videos/sync",
                                self.openai_video_generation_sync,
                                methods=["POST"])
+        # Deprecated alias of /v1/videos/sync, retained for upstream
+        # back-compat after the rename; both hit the same sync handler.
+        self.app.add_api_route("/v1/videos/generations",
+                               self.openai_video_generation_sync,
+                               methods=["POST"],
+                               deprecated=True)
         # Video management endpoints
         self.app.add_api_route("/v1/videos", self.list_videos, methods=["GET"])
         self.app.add_api_route("/v1/videos/{video_id}",
@@ -2573,13 +2579,21 @@ class OpenAIServer(_VideoRoutesMixin):
                         for i in range(batch_size)
                     ]
                     output.save(paths_in, format=request.format)
-                    data = [
-                        ImageObject(
-                            url=self._build_image_content_url(
-                                raw_request, image_id, i),
-                            revised_prompt=request.prompt,
-                        ) for i in range(batch_size)
-                    ]
+                    if request.response_format == "path":
+                        data = [
+                            ImageObject(
+                                path=str(paths_in[i]),
+                                revised_prompt=request.prompt,
+                            ) for i in range(batch_size)
+                        ]
+                    else:
+                        data = [
+                            ImageObject(
+                                url=self._build_image_content_url(
+                                    raw_request, image_id, i),
+                                revised_prompt=request.prompt,
+                            ) for i in range(batch_size)
+                        ]
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
@@ -2609,12 +2623,19 @@ class OpenAIServer(_VideoRoutesMixin):
                         path = self.media_storage_path / f"{image_id}_{i}{ext}"
                         path.write_bytes(
                             image_to_bytes(image, format=pil_format))
-                        data.append(
-                            ImageObject(
-                                url=self._build_image_content_url(
-                                    raw_request, image_id, i),
-                                revised_prompt=request.prompt,
-                            ))
+                        if request.response_format == "path":
+                            data.append(
+                                ImageObject(
+                                    path=str(path),
+                                    revised_prompt=request.prompt,
+                                ))
+                        else:
+                            data.append(
+                                ImageObject(
+                                    url=self._build_image_content_url(
+                                        raw_request, image_id, i),
+                                    revised_prompt=request.prompt,
+                                ))
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,

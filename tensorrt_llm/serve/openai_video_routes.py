@@ -13,7 +13,6 @@ is strictly unchanged from the inlined version.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import time
@@ -72,18 +71,13 @@ def _preflight_encoder_format(fmt):
         raise ValueError(str(exc)) from exc
 
 
-def _b64_json_video_response(video_id: str, fmt: str, path: Path) -> JSONResponse:
-    """Build the OpenAI-style ``{id, format, b64_json}`` envelope.
+def _path_json_video_response(video_id: str, path) -> JSONResponse:
+    """Build the ``{id, output_path}`` path-transport envelope.
 
-    Reads bytes from a saved video file on disk and base64-inlines them.
+    Returns the single server-side output path so a co-located client reads
+    the file directly. Multi-file (n>1) is deferred (TRTLLM-11579 residual).
     """
-    return JSONResponse(
-        content={
-            "id": video_id,
-            "format": fmt,
-            "b64_json": base64.b64encode(path.read_bytes()).decode("utf-8"),
-        }
-    )
+    return JSONResponse(content={"id": video_id, "output_path": str(path)})
 
 
 class _VideoRoutesMixin:
@@ -166,8 +160,8 @@ class _VideoRoutesMixin:
                     f"Video {video_id} serialized as tensor: latency={latency:.3f}s "
                     f"generation={getattr(output.metrics, 'generation', 0.0):.3f}s"
                 )
-                if request.response_format == "b64_json":
-                    return _b64_json_video_response(video_id, request.format, target)
+                if request.response_format == "path":
+                    return _path_json_video_response(video_id, target)
                 return FileResponse(str(target), media_type=media_type, filename=target.name)
 
             # Encoder formats: one file per item; ship the first item as
@@ -205,10 +199,8 @@ class _VideoRoutesMixin:
             # multi-file response, so we return only the first video as a file
             # download while persisting all of them to disk.
             actual_path = saved_paths[0]
-            if request.response_format == "b64_json":
-                return _b64_json_video_response(
-                    video_id, actual_path.suffix.lstrip("."), actual_path
-                )
+            if request.response_format == "path":
+                return _path_json_video_response(video_id, actual_path)
             return FileResponse(
                 str(actual_path),
                 media_type=_video_content_type(actual_path.suffix),
@@ -473,6 +465,8 @@ class _VideoRoutesMixin:
             response = VideoJobList(
                 data=video_jobs,
             )
+            # output_path/output_paths are Field(exclude=True) on VideoJob, so
+            # model_dump() drops them from every listed job automatically.
             return JSONResponse(content=response.model_dump())
 
         except Exception as e:
@@ -508,6 +502,9 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
 
+            # Status-only: output_path/output_paths are Field(exclude=True) on
+            # VideoJob, so model_dump() drops them automatically (no path leak);
+            # the fields stay on the job for /content resolution + delete.
             return JSONResponse(content=job.model_dump())
 
         except Exception as e:
@@ -569,12 +566,11 @@ class _VideoRoutesMixin:
             if video_path and os.path.exists(video_path):
                 suffix = video_path.suffix.lstrip(".")
                 # When the original ``POST /v1/videos`` requested
-                # ``response_format="b64_json"``, return the bytes
-                # as a base64 envelope so the async transport
-                # matches what the sync route does for the same
-                # ``response_format``.
-                if job.response_format == "b64_json":
-                    return _b64_json_video_response(video_id, suffix, video_path)
+                # ``response_format="path"``, return the server-side output
+                # path as JSON instead of the bytes; the sync route honors
+                # the same ``response_format`` value.
+                if job.response_format == "path":
+                    return _path_json_video_response(video_id, video_path)
                 if is_tensor_format(suffix):
                     media_type = "application/octet-stream"
                 else:

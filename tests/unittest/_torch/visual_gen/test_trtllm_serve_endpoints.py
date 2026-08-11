@@ -5,7 +5,7 @@ in OpenAIServer.register_visual_gen_routes():
 
     POST /v1/images/generations
     POST /v1/images/edits
-    POST /v1/videos/generations   (sync)
+    POST /v1/videos/sync   (sync)
     POST /v1/videos               (async)
     GET  /v1/videos               (list)
     GET  /v1/videos/{video_id}    (metadata)
@@ -543,6 +543,47 @@ class TestImageGeneration:
         assert content.status_code == 200
         assert content.headers["content-type"] == "application/octet-stream"
         loaded = torch.load(BytesIO(content.content), weights_only=True)
+        assert "image" in loaded
+
+    def test_image_generation_path_returns_output_path(self, image_client):
+        """``response_format='path'`` writes each image to media storage and
+        surfaces its on-disk path per ``data[]`` item; ``n>1`` fans out to one
+        object per image (distinct path); ``url``/``b64_json`` stay unset."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A dog",
+                "response_format": "path",
+                "n": 2,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert len(data) == 2
+        assert len({obj["path"] for obj in data}) == 2  # one distinct path per image
+        for obj in data:
+            assert obj["url"] is None and obj["b64_json"] is None
+            assert obj["path"] is not None and os.path.exists(obj["path"])
+        with open(data[0]["path"], "rb") as fh:
+            assert fh.read().startswith(b"\x89PNG\r\n\x1a\n")
+
+    def test_image_generation_pt_path(self, image_client):
+        """Tensor formats under ``response_format='path'`` persist each
+        per-item payload and return its on-disk path."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Tensor dog",
+                "response_format": "path",
+                "format": "pt",
+            },
+        )
+        assert resp.status_code == 200
+        obj = resp.json()["data"][0]
+        assert obj["path"] is not None and obj["url"] is None and obj["b64_json"] is None
+        assert os.path.exists(obj["path"])
+        with open(obj["path"], "rb") as fh:
+            loaded = torch.load(BytesIO(fh.read()), weights_only=True)
         assert "image" in loaded
 
     def test_image_generation_auto_size(self, image_client):
@@ -1130,7 +1171,7 @@ class TestNormalizeImageOutput:
 
 
 # =========================================================================
-# POST /v1/videos/generations  (synchronous)
+# POST /v1/videos/sync  (synchronous)
 # =========================================================================
 
 
@@ -1138,7 +1179,7 @@ class TestNormalizeImageOutput:
 class TestVideoGenerationSync:
     def test_basic_sync_video_generation(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "A rocket launching",
                 "size": "64x64",
@@ -1152,9 +1193,27 @@ class TestVideoGenerationSync:
         _assert_visual_gen_server_timing(resp.headers)
         assert len(resp.content) > 0
 
-    def test_sync_video_generation_with_params(self, video_client):
+    def test_deprecated_generations_alias_routes_to_sync(self, video_client):
+        """The pre-rename /v1/videos/generations route is kept as a deprecated
+        alias of /v1/videos/sync (upstream back-compat) — same handler, so it
+        returns the video bytes rather than 404/405."""
         resp = video_client.post(
             "/v1/videos/generations",
+            json={
+                "prompt": "A rocket launching",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "video/mp4"
+        assert len(resp.content) > 0
+
+    def test_sync_video_generation_with_params(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/sync",
             json={
                 "prompt": "Ocean waves",
                 "size": "64x64",
@@ -1187,7 +1246,7 @@ class TestVideoGenerationSync:
         Image.new("RGB", (4, 4), (64, 64, 64)).save(str(ref_path))
         with open(ref_path, "rb") as f:
             resp = video_client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 data={
                     "prompt": "Mountain sunrise",
                     "size": "64x64",
@@ -1206,7 +1265,7 @@ class TestVideoGenerationSync:
 
         with open(ref_path, "rb") as f:
             resp = video_client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 data={
                     "prompt": "Animate this image",
                     "size": "64x64",
@@ -1236,7 +1295,7 @@ class TestVideoGenerationSync:
         payload = _V2V_FIXTURE_MP4.read_bytes()
         with open(_V2V_FIXTURE_MP4, "rb") as f:
             resp = video_client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 data={
                     "prompt": "Continue the same scene",
                     "size": "64x64",
@@ -1259,7 +1318,7 @@ class TestVideoGenerationSync:
         """Content matching no image or video container signature is rejected
         at the boundary."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             data={"prompt": "x"},
             files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
         )
@@ -1268,7 +1327,7 @@ class TestVideoGenerationSync:
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "Should fail",
                 "size": "64x64",
@@ -1285,7 +1344,7 @@ class TestVideoGenerationSync:
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)
         resp = client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"prompt": "null video", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
@@ -1305,7 +1364,7 @@ class TestVideoGenerationSync:
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         client = _create_server(gen)
         resp = client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"prompt": "big", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
@@ -1322,7 +1381,7 @@ class TestVideoGenerationSync:
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         client = _create_server(gen)
         resp = client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"prompt": "bad ref", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
         )
@@ -1331,7 +1390,7 @@ class TestVideoGenerationSync:
 
     def test_sync_video_unsupported_content_type(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             content=b"some raw bytes",
             headers={"content-type": "text/plain"},
         )
@@ -1340,7 +1399,7 @@ class TestVideoGenerationSync:
     def test_sync_video_missing_prompt_json(self, video_client):
         """Missing required ``prompt`` surfaces the visual-gen 422 envelope."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={"size": "64x64"},
             headers={"content-type": "application/json"},
         )
@@ -1352,7 +1411,7 @@ class TestVideoGenerationSync:
         same LLM envelope as JSON so the wire contract is identical."""
         dummy_file = BytesIO(b"")
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             data={"size": "64x64"},
             files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
         )
@@ -1365,7 +1424,7 @@ class TestVideoGenerationSync:
         the JSON path."""
         dummy_file = BytesIO(b"")
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             data={
                 "prompt": "Strict multipart",
                 "size": "64x64",
@@ -1381,7 +1440,7 @@ class TestVideoGenerationSync:
     def test_sync_video_rejects_top_level_n(self, video_client):
         """Sync video has no top-level ``n``; it's rejected with 422."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "Batch rockets",
                 "size": "64x64",
@@ -1580,6 +1639,9 @@ class TestListVideos:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["data"]) == 2
+        # Status-only listing: the internal path fields never appear on the wire.
+        for item in data["data"]:
+            assert "output_path" not in item and "output_paths" not in item
 
 
 # =========================================================================
@@ -1596,12 +1658,28 @@ class TestGetVideoMetadata:
         )
         video_id = create_resp.json()["id"]
 
+        # Drive to completion so output_path/output_paths are populated on the
+        # job, then confirm the status endpoint returns status only (no leak).
+        import time as _time
+
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            if video_client.get(f"/v1/videos/{video_id}").json()["status"] in (
+                "completed",
+                "failed",
+            ):
+                break
+            _time.sleep(0.05)
+
         resp = video_client.get(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == video_id
         assert data["object"] == "video"
         assert data["prompt"] == "Space walk"
+        assert data["status"] == "completed"
+        # Status-only: the internal server path(s) are not leaked here.
+        assert "output_path" not in data and "output_paths" not in data
 
     def test_get_video_metadata_not_found(self, video_client):
         resp = video_client.get("/v1/videos/video_nonexistent")
@@ -1839,7 +1917,7 @@ class TestRouteEngineValidationError:
             )
             client = _create_server(gen)
             resp = client.post(
-                "/v1/videos/generations",
+                "/v1/videos/sync",
                 json={
                     "prompt": "trigger validation error",
                     "size": "64x64",
@@ -2017,14 +2095,14 @@ class TestNonVisualGenValidationResponse:
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
 class TestVideoTensorResponse:
     """The sync route emits tensor payloads as a single file under
-    ``response_format='url'`` and as base64-encoded bytes under
-    ``response_format='b64_json'``. The async route persists the
+    ``response_format='file'`` and as a server-side path JSON under
+    ``response_format='path'``. The async route persists the
     payload to media storage; ``GET /v1/videos/{id}/content`` serves
     the file with ``application/octet-stream``."""
 
     def _post_sync(self, video_client, fmt: str, response_format: str):
         return video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": f"tensor video {fmt}",
                 "size": "32x32",
@@ -2037,8 +2115,8 @@ class TestVideoTensorResponse:
         )
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
-    def test_sync_tensor_url_returns_file_with_correct_suffix(self, video_audio_client, fmt):
-        resp = self._post_sync(video_audio_client, fmt, "url")
+    def test_sync_tensor_file_returns_file_with_correct_suffix(self, video_audio_client, fmt):
+        resp = self._post_sync(video_audio_client, fmt, "file")
         assert resp.status_code == 200
         ext = f".{fmt}"
         # The content-disposition header carries the on-disk filename.
@@ -2054,13 +2132,15 @@ class TestVideoTensorResponse:
         assert "video" in loaded
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
-    def test_sync_tensor_b64_returns_decodable_payload(self, video_audio_client, fmt):
-        resp = self._post_sync(video_audio_client, fmt, "b64_json")
+    def test_sync_tensor_path_returns_readable_output_path(self, video_audio_client, fmt):
+        resp = self._post_sync(video_audio_client, fmt, "path")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["format"] == fmt
-        assert "b64_json" in data
-        raw = base64.b64decode(data["b64_json"])
+        assert set(data) >= {"id", "output_path"}
+        # Co-located client reads the returned server-side path directly.
+        assert os.path.exists(data["output_path"])
+        with open(data["output_path"], "rb") as fh:
+            raw = fh.read()
         if fmt == "safetensors":
             from safetensors.torch import load as load_safetensors
 
@@ -2110,44 +2190,42 @@ class TestVideoTensorResponse:
 
 
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
-class TestVideoEncoderB64Response:
+class TestVideoEncoderResponse:
     """The sync video route's encoder branch (``mp4``/``avi``/``auto``)
-    honors ``response_format='b64_json'`` by base64-encoding the
-    encoded video bytes; ``response_format='url'`` keeps the
+    honors ``response_format='path'`` by returning the server-side output
+    path(s) as JSON; ``response_format='file'`` keeps the
     ``FileResponse`` download."""
 
-    def test_sync_encoder_b64_json_returns_base64_payload(self, video_client):
+    def test_sync_encoder_path_returns_output_path(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
-                "prompt": "encoded b64",
+                "prompt": "encoded path",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "b64_json",
+                "response_format": "path",
             },
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["format"] in {"mp4", "avi"}
-        assert "b64_json" in body
-        raw = base64.b64decode(body["b64_json"])
-        # Non-empty encoded bytes — exact format verification is the
-        # encoder layer's domain.
-        assert len(raw) > 0
+        assert set(body) >= {"id", "output_path"}
+        # The returned server-side path points at non-empty encoded bytes.
+        assert os.path.exists(body["output_path"])
+        assert os.path.getsize(body["output_path"]) > 0
 
-    def test_sync_encoder_url_keeps_file_response(self, video_client):
+    def test_sync_encoder_file_keeps_file_response(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
-                "prompt": "encoded url",
+                "prompt": "encoded file",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "url",
+                "response_format": "file",
             },
             headers={"content-type": "application/json"},
         )
@@ -2174,7 +2252,7 @@ class TestVideoTimingValidation:
     )
     def test_non_positive_timing_field_rejected(self, video_client, field, value):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "bad timing",
                 "size": "32x32",
@@ -2217,7 +2295,7 @@ class TestVideoZeroFrameDerivationRejected:
 
     def test_subsecond_seconds_below_one_frame_returns_400(self, video_client):
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "way too short",
                 "size": "32x32",
@@ -2241,7 +2319,7 @@ class TestVideoZeroFrameDerivationRejected:
         pipeline's default ``num_frames``."""
         video_client.mock_gen.executor.default_generation_params.pop("frame_rate", None)
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "duration without fps",
                 "size": "32x32",
@@ -2260,7 +2338,7 @@ class TestVideoZeroFrameDerivationRejected:
         """The caller can bypass the derivation by passing ``num_frames``
         directly; the request must succeed."""
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "explicit single frame",
                 "size": "32x32",
@@ -2337,7 +2415,7 @@ class TestVideoFrameBudgetCap:
             payload.update({"seconds": 1.0, "fps": 8})
         payload[field] = value
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json=payload,
             headers={"content-type": "application/json"},
         )
@@ -2444,7 +2522,7 @@ class TestVideoEncoderFailsFast:
         # locks in the fail-fast contract.
         video_client.mock_gen.last_inputs = None
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "mp4 without ffmpeg",
                 "size": "32x32",
@@ -2490,7 +2568,7 @@ class TestVideoEncoderFailsFast:
 
         monkeypatch.setattr(routes, "resolve_video_format", _raise_value_error)
         resp = video_client.post(
-            "/v1/videos/generations",
+            "/v1/videos/sync",
             json={
                 "prompt": "tensor unaffected",
                 "size": "32x32",
@@ -2504,12 +2582,11 @@ class TestVideoEncoderFailsFast:
 
 
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
-class TestAsyncVideoB64JsonTransport:
+class TestAsyncVideoTransport:
     """``POST /v1/videos`` persists the requested ``response_format`` on
     the queued job. ``GET /v1/videos/{id}/content`` honors it:
-    ``url`` (or unset) returns a ``FileResponse`` download;
-    ``b64_json`` returns a JSON envelope with the encoded bytes
-    base64-inlined."""
+    ``file`` (or unset) returns a ``FileResponse`` download;
+    ``path`` returns a JSON envelope with the server-side output path(s)."""
 
     def _drive_job_to_completion(self, client, video_id):
         import time as _time
@@ -2522,22 +2599,22 @@ class TestAsyncVideoB64JsonTransport:
             _time.sleep(0.05)
         return None
 
-    def test_async_b64_json_returned_at_get_content(self, video_client):
+    def test_async_path_returned_at_get_content(self, video_client):
         resp = video_client.post(
             "/v1/videos",
             json={
-                "prompt": "async base64",
+                "prompt": "async path",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "b64_json",
+                "response_format": "path",
             },
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 202
         job = resp.json()
-        assert job["response_format"] == "b64_json"
+        assert job["response_format"] == "path"
 
         status = self._drive_job_to_completion(video_client, job["id"])
         assert status == "completed"
@@ -2545,34 +2622,34 @@ class TestAsyncVideoB64JsonTransport:
         content = video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
         body = content.json()
-        assert set(body) >= {"id", "format", "b64_json"}
+        assert set(body) >= {"id", "output_path"}
         assert body["id"] == job["id"]
-        # The encoded payload decodes to non-empty bytes.
-        raw = base64.b64decode(body["b64_json"])
-        assert len(raw) > 0
+        # The returned server-side path points at non-empty bytes.
+        assert os.path.exists(body["output_path"])
+        assert os.path.getsize(body["output_path"]) > 0
 
-    def test_async_url_still_returns_file_response(self, video_client):
-        """Default and explicit ``response_format='url'`` keep the
+    def test_async_file_still_returns_file_response(self, video_client):
+        """Default and explicit ``response_format='file'`` keep the
         existing ``FileResponse`` behavior."""
         resp = video_client.post(
             "/v1/videos",
             json={
-                "prompt": "async url",
+                "prompt": "async file",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
                 "format": "avi",
-                "response_format": "url",
+                "response_format": "file",
             },
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 202
         job = resp.json()
-        assert job["response_format"] == "url"
+        assert job["response_format"] == "file"
 
         self._drive_job_to_completion(video_client, job["id"])
         content = video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
-        # AVI FileResponse carries ``video/x-msvideo``; the b64_json
+        # AVI FileResponse carries ``video/x-msvideo``; the path
         # branch would have set ``application/json``.
         assert content.headers["content-type"] == "video/x-msvideo"

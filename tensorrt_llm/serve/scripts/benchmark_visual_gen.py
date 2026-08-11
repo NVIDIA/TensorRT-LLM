@@ -217,7 +217,7 @@ async def async_request_video_generation(
     pbar: Optional[tqdm] = None,
     session: Optional[aiohttp.ClientSession] = None,
 ) -> VisualGenRequestOutput:
-    """POST /v1/videos/generations (sync endpoint) and measure E2E latency."""
+    """POST /v1/videos/sync (sync endpoint) and measure E2E latency."""
     payload = _build_payload_common(request_input)
     payload["seconds"] = request_input.seconds
     payload["fps"] = request_input.fps
@@ -391,7 +391,7 @@ def main(args: argparse.Namespace):
 
     endpoint_map = {
         "openai-images": "/v1/images/generations",
-        "openai-videos": "/v1/videos/generations",
+        "openai-videos": "/v1/videos/sync",
     }
     endpoint = args.endpoint or endpoint_map.get(backend)
     if endpoint is None:

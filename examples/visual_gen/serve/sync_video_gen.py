@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Test script for synchronous video generation endpoint.
 
-Tests POST /v1/videos/generations endpoint which waits for completion and returns video data.
+Tests POST /v1/videos/sync endpoint which waits for completion and returns video data.
 The video is generated synchronously and the response contains the video file.
 
 Supports two modes:
@@ -65,7 +65,7 @@ def test_sync_video_generation(
     print(f"   Size: {size}")
 
     try:
-        endpoint = f"{base_url}/videos/generations"
+        endpoint = f"{base_url}/videos/sync"
 
         if input_reference:
             # TI2V mode - Use multipart/form-data with file upload
