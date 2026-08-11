@@ -3260,8 +3260,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
             // Not a hard requirement, but based on empirical values.
             // Keep ModelExpress services inside the existing pod resource envelope;
             // otherwise their requests can make an otherwise valid GPU pod unschedulable.
-            def serviceCpuReserve = modelExpress ? 2 : 0
-            def serviceMemoryReserveGi = modelExpress ? 8 : 0
+            def serviceCpuReserve = modelExpress ? 6 : 0
+            def serviceMemoryReserveGi = modelExpress ? 16 : 0
             def serviceStorageReserveGi = modelExpress ? 8 : 0
             memorySize = "${gpuCount * 150 - serviceMemoryReserveGi}" + "Gi"
             storageSize = "${gpuCount * 150 - serviceStorageReserveGi}" + "Gi"
@@ -3380,12 +3380,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - containerPort: 6379
                     resources:
                       requests:
-                        cpu: 500m
-                        memory: 1Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 2Gi
                       limits:
-                        cpu: 500m
-                        memory: 1Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 2Gi
                     imagePullPolicy: Always
                   - name: wait-for-redis
@@ -3412,6 +3412,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         ephemeral-storage: 1Gi
                     imagePullPolicy: Always
         """
+        // The E2E preflight waits for port 8001. A readiness probe here would keep
+        // Jenkins from attaching and hide startup errors behind a pod timeout.
         serviceContainerConfig = """
                   - name: model-express-server
                     image: ${MODEL_EXPRESS_SERVER_IMAGE}
@@ -3424,12 +3426,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                       value: "redis://127.0.0.1:6379"
                     ports:
                     - containerPort: 8001
-                    readinessProbe:
-                      tcpSocket:
-                        port: 8001
-                      initialDelaySeconds: 2
-                      periodSeconds: 2
-                      failureThreshold: 30
                     livenessProbe:
                       tcpSocket:
                         port: 8001
@@ -3437,12 +3433,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                       periodSeconds: 10
                     resources:
                       requests:
-                        cpu: '1'
-                        memory: 4Gi
+                        cpu: '4'
+                        memory: 8Gi
                         ephemeral-storage: 4Gi
                       limits:
-                        cpu: '1'
-                        memory: 4Gi
+                        cpu: '4'
+                        memory: 8Gi
                         ephemeral-storage: 4Gi
                     imagePullPolicy: Always
         """
