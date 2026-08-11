@@ -465,7 +465,7 @@ def test_kimi_k3_moe_split_selection(monkeypatch):
     assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM"])
+@pytest.mark.parametrize("backend", ["TRTLLM", "MEGAMOE_DEEPGEMM"])
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -476,6 +476,18 @@ def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
 
     assert routed_model_config.moe_backend == backend
     assert model_config.moe_backend == backend
+
+
+def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        moe_backend="CUTLASS",
+    )
+
+    with pytest.raises(ValueError, match="SiTU routed experts only support"):
+        KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+    assert model_config.moe_backend == "CUTLASS"
 
 
 @pytest.mark.parametrize(
