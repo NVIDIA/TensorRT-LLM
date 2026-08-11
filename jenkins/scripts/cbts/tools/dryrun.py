@@ -152,8 +152,15 @@ def _run_cbts(
         str(groovy),
     ]
     if coverage_db:
-        # A replay has no meaningful lag; report 0 so the freshness gate is not the thing measured.
-        argv += ["--coverage-db", coverage_db, "--coverage-db-lag", "0"]
+        # A replay has no meaningful distance; 0 keeps the freshness gate out of it.
+        argv += [
+            "--coverage-db",
+            coverage_db,
+            "--coverage-db-lag",
+            "0",
+            "--coverage-db-drift",
+            "0",
+        ]
     try:
         res = subprocess.run(argv, capture_output=True, text=True, check=False)
     finally:

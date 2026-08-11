@@ -319,9 +319,9 @@ CBTS defers to the existing filter chain when:
   decorator line), has no usable patch, has unparsable source, or has a closure
   change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
 - No touch DB artifact could be resolved — Tier 2 never runs
-- The resolved DB trails main by more than `--coverage-max-lag` commits, or by
-  an unmeasurable amount — Tier 2 declines (`coverage_freshness` = `stale` /
-  `unknown`)
+- The resolved DB sits more than `--coverage-max-drift` commits from the PR's
+  base commit, on either side, or an unmeasurable distance from it — Tier 2
+  declines (`coverage_freshness` = `stale` / `unknown`)
 - Layer 3 narrowing would empty a block — block keeps original tests
 - `cbts_test_db` tarball upload or download/extraction fails — renderTestDB falls back to source
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back

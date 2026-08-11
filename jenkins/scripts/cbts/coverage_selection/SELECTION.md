@@ -169,12 +169,10 @@ commit, so the highest build number is not necessarily the newest code. The buil
 the tie-break, and when no candidate's lag can be measured the ranking degenerates to exactly that
 tie-break — which is the pre-existing behaviour, not a regression.
 
-### 8.2 Measuring the lag
+### 8.2 Measuring the lag (ranking)
 
-The lag is `ahead_by` from GitHub's compare API on `<sha>...main` — always against the **tip of
-`main`**, never against the PR's own base commit: every candidate is scored on the same scale, and
-a PR whose base predates all the candidates would otherwise score them all identically and collapse
-the ranking back to the build number. `ahead_by` covers the full range; only the response's
+The lag is `ahead_by` from GitHub's compare API on `<sha>...main` — against the **tip of `main`**,
+so every candidate is scored on one scale. `ahead_by` covers the full range; only the response's
 `commits` array is truncated at 250.
 
 Since every candidate revision is a commit that already merged to `main`, it can only ever be
@@ -196,24 +194,64 @@ The token comes from the `github-cred-trtllm-ci` credential — the one `getGith
 already uses — bound around the `--print-selection` call in `_cbtsCoverageAudit` and read from
 `GITHUB_API_TOKEN`.
 
+This number ranks candidates and reports overall freshness. It is **not** what the gate decides on.
+
+### 8.2b Measuring the drift (gating)
+
+Ranking and gating ask different questions. "Which DB is freshest" is answered against the tip of
+`main`; "does this DB still describe the code under test" is not — the code under test is the PR
+head, which CI checks out directly (`env.gitlabMergeRequestLastCommit`), so the revision the DB has
+to match is the PR's **merge base**. A DB sitting one commit off the tip says nothing useful about
+a PR branched three hundred commits back, and the lag scores that case as fresh.
+
+The drift is `merge_base_commit.sha` from `main...<pr head>`, then `ahead_by + behind_by` from
+`<db sha>...<merge base>` — two extra calls per run, and only for the candidate ranking already
+picked. Both revisions sit on the same linear history, so exactly one term is non-zero and the sum
+is their plain distance.
+
+Summing rather than picking a side is deliberate. The one dangerous failure is an edge `(F → T)`
+that the code under test really has and the DB never recorded, and **both directions produce it**:
+
+| DB is | relative to the PR base | how the edge goes missing |
+|---|---|---|
+| older | `ahead` | a caller added since, so `T` now reaches `F` and the DB never saw it |
+| newer | `behind` | a call path deleted since, so the DB reflects a graph the PR base still has intact |
+
+The fail-closed bound is symmetric too — a function absent from the DB force-runs either way — and
+it only catches whole-function absence, never a row set that is merely too narrow. So there is no
+principled basis for weighting one side, and the sum is also the only form that handles a genuinely
+diverged base: a PR targeting a release branch, which a `main`-collected DB does not describe at
+all, scores as the large number it is instead of slipping through on one small term.
+
+`drift_status` (`ahead` / `behind` / `diverged` / `identical`) rides along in the same response and
+is recorded, never weighted — it is there to answer empirically, later, whether one direction
+actually correlates with misses.
+
+Any step that cannot be answered leaves the drift null, which the gate reads as `unknown` and
+declines: freshness that cannot be shown is not assumed.
+
+
 ### 8.3 What happens with the result
 
 The tarball is downloaded (retried), the sqlite extracted, and `coverage_audit.py` run over it;
 any failure in this whole path is caught and non-fatal — `coverageDb.path` stays empty, Tier 2
 never runs, and the PR gets a full run.
 
-The chosen build, its commit and its lag ride into `main.py`, which **gates on the lag**: past
-`--coverage-max-lag` (default 100) the tier declines and the PR runs in full, on the grounds that a
-DB that far behind no longer describes who touches what in the code under test. A lag that could
-not be measured at all is treated the same way — freshness that cannot be shown is not assumed.
+The chosen build, its commit, its lag and its drift ride into `main.py`, which **gates on the
+drift**: past `--coverage-max-drift` (default 30) the tier declines and the PR runs in full, on
+the grounds that a DB that far from the PR's base no longer describes who touches what in the code
+under test. A drift that could not be measured at all is treated the same way.
 
-All four land in the decision and in OpenSearch:
+All of it lands in the decision and in OpenSearch:
 
 | Decision field | OpenSearch | Note |
 |---|---|---|
 | `coverage_db_build` | `l_coverage_db_build` | 0 when no DB was consulted |
 | `coverage_db_commit` | `s_coverage_db_commit` | |
-| `coverage_db_lag` | `l_coverage_db_lag` | `null` / `-1` when unmeasurable |
+| `coverage_db_lag` | `l_coverage_db_lag` | ranking / overall freshness; `null` / `-1` when unmeasurable |
+| `coverage_db_base_commit` | `s_coverage_db_base_commit` | the PR's merge base |
+| `coverage_db_drift` | `l_coverage_db_drift` | **the gated number**; `null` / `-1` when unmeasurable |
+| `coverage_db_drift_status` | `s_coverage_db_drift_status` | recorded, never weighted |
 | `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
 
 so the decline rate is queryable per verdict rather than only readable in `s_reason`.
@@ -232,6 +270,9 @@ so the decline rate is queryable per verdict rather than only readable in `s_rea
   "coverage_db_build": 2887,
   "coverage_db_commit": "50edd738...",
   "coverage_db_lag": 11,
+  "coverage_db_base_commit": "9f0da65d...",
+  "coverage_db_drift": 47,
+  "coverage_db_drift_status": "behind",
   "coverage_no_diff_files": 0,
   "reasons": [{"source": "coverage", "impacted": 118, "untrusted": 104, ...}]
 }

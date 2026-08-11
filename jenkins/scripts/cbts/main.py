@@ -58,6 +58,7 @@ from coverage_tier import (  # noqa: E402
     open_db,
     write_coverage_test_db,
 )
+
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
@@ -134,10 +135,14 @@ class SelectionResult:
     coverage_dropped_stages: list[str] = field(default_factory=list)
     # Post-merge build the consulted touch DB came from; makes a decision replayable.
     coverage_db_build: Optional[int] = None
-    # Revision the DB was collected at and HEAD's distance from it; None when unknown.
+    # Revision the DB was collected at and main's distance from it; ranking, not the gate.
     coverage_db_commit: Optional[str] = None
     coverage_db_lag: Optional[int] = None
-    # Freshness verdict on that lag: ok / stale / unknown; empty when no DB was consulted.
+    # The PR's base and the DB's distance from it — what the freshness gate decides on.
+    coverage_db_base_commit: Optional[str] = None
+    coverage_db_drift: Optional[int] = None
+    coverage_db_drift_status: str = ""
+    # Freshness verdict on that drift: ok / stale / unknown; empty when no DB was consulted.
     coverage_freshness: str = ""
     # Residual files the forge API returned no patch for; they fall back to file level.
     coverage_no_diff_files: int = 0
@@ -158,23 +163,28 @@ class SelectionResult:
             "coverage_db_build": self.coverage_db_build,
             "coverage_db_commit": self.coverage_db_commit,
             "coverage_db_lag": self.coverage_db_lag,
+            "coverage_db_base_commit": self.coverage_db_base_commit,
+            "coverage_db_drift": self.coverage_db_drift,
+            "coverage_db_drift_status": self.coverage_db_drift_status,
             "coverage_freshness": self.coverage_freshness,
             "coverage_no_diff_files": self.coverage_no_diff_files,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-# Tier 2 stands down past this many commits: what the DB says about who touches what
-# stops describing the code under test. Tune with --coverage-max-lag.
-DEFAULT_COVERAGE_MAX_LAG = 100
+# Tier 2 stands down past this many commits between the DB's revision and the PR's base.
+DEFAULT_COVERAGE_MAX_DRIFT = 30
 
 
-def _coverage_freshness(lag: Optional[int], max_lag: int) -> tuple[str, str]:
-    """Verdict on the consulted DB's lag, plus the decline note (empty when usable)."""
-    if lag is None:
-        return "unknown", "coverage DB freshness unknown: its lag could not be measured"
-    if lag > max_lag:
-        return "stale", f"coverage DB is {lag} commit(s) behind main, over the {max_lag} limit"
+def _coverage_freshness(drift: Optional[int], max_drift: int) -> tuple[str, str]:
+    """Verdict on the consulted DB's drift, plus the decline note (empty when usable)."""
+    if drift is None:
+        return "unknown", "coverage DB freshness unknown: its drift could not be measured"
+    if drift > max_drift:
+        return (
+            "stale",
+            f"coverage DB is {drift} commit(s) from the PR's base, over the {max_drift} limit",
+        )
     return "ok", ""
 
 
@@ -388,13 +398,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--coverage-db-lag",
         type=int,
         default=None,
-        help="Commits main gained since --coverage-db-commit; recorded in the decision.",
+        help="Commits main gained since --coverage-db-commit; recorded only, the "
+        "freshness gate uses --coverage-db-drift.",
     )
     parser.add_argument(
-        "--coverage-max-lag",
+        "--coverage-db-drift",
         type=int,
-        default=DEFAULT_COVERAGE_MAX_LAG,
-        help="Decline the coverage tier when the DB trails main by more than this many commits.",
+        default=None,
+        help="Commits between --coverage-db-commit and the PR's base; what the "
+        "freshness gate decides on (omitted means unmeasurable, which declines).",
+    )
+    parser.add_argument(
+        "--coverage-db-base-commit",
+        default=None,
+        help="The PR's base revision the drift was measured against.",
+    )
+    parser.add_argument(
+        "--coverage-db-drift-status",
+        default="",
+        help="Which side of the PR's base the DB sits on; recorded only, never weighted.",
+    )
+    parser.add_argument(
+        "--coverage-max-drift",
+        type=int,
+        default=DEFAULT_COVERAGE_MAX_DRIFT,
+        help="Decline the coverage tier when the DB is more than this many commits "
+        "from the PR's base.",
     )
     parser.add_argument(
         "--no-data-policy",
@@ -454,11 +483,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     result.coverage_db_build = args.coverage_db_build
     result.coverage_db_commit = args.coverage_db_commit
     result.coverage_db_lag = args.coverage_db_lag
+    result.coverage_db_drift = args.coverage_db_drift
+    result.coverage_db_base_commit = args.coverage_db_base_commit
+    result.coverage_db_drift_status = args.coverage_db_drift_status
 
     if args.coverage_db and result.scope is None:
         tier = None
         result.coverage_freshness, note = _coverage_freshness(
-            args.coverage_db_lag, args.coverage_max_lag
+            args.coverage_db_drift, args.coverage_max_drift
         )
         if not note:  # the gate passed; a note here means it did not
             try:

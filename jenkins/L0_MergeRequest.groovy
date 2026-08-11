@@ -847,7 +847,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
         // Download the touch DB for audit + Tier 2 coverage-based narrowing.
-        def coverageDb = _cbtsCoverageAudit(pipeline)
+        def coverageDb = _cbtsCoverageAudit(pipeline, globalVars)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -880,6 +880,16 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             }
             if (coverageDb.lag != null) {
                 mainCmd += " --coverage-db-lag ${coverageDb.lag}"
+            }
+            // Absent drift declines the tier.
+            if (coverageDb.drift != null) {
+                mainCmd += " --coverage-db-drift ${coverageDb.drift}"
+            }
+            if (coverageDb.baseCommit) {
+                mainCmd += " --coverage-db-base-commit '${coverageDb.baseCommit}'"
+            }
+            if (coverageDb.driftStatus) {
+                mainCmd += " --coverage-db-drift-status '${coverageDb.driftStatus}'"
             }
         }
         def output = sh(script: mainCmd, returnStdout: true)
@@ -925,28 +935,31 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 }
 
 // Download the touch DB, audit it, and return the sqlite path (or "" on failure).
-def _cbtsCoverageAudit(pipeline)
+def _cbtsCoverageAudit(pipeline, globalVars)
 {
     try {
         // All commands run from ${LLM_ROOT}; covDir and the returned path are
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         def covDir = "cbts_cov"
+        // The checked-out revision is the PR head; its merge base is what drift is measured against.
+        def prHeadArg = env.gitlabMergeRequestLastCommit ? " --pr-head ${env.gitlabMergeRequestLastCommit}" : ""
         // Ranked by collected revision, not build number; the token is what measures it (depth-1 checkout cannot).
         def selJson = ""
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
             selJson = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-selection || true",
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-selection${prHeadArg} || true",
                 returnStdout: true,
             ).trim()
         }
         if (!selJson) {
             pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
-            return [path: "", build: null, commit: "", lag: null]
+            return [path: "", build: null, commit: "", lag: null, drift: null, baseCommit: "", driftStatus: ""]
         }
         def sel = new groovy.json.JsonSlurper().parseText(selJson)
         def url = sel.url
         pipeline.echo("CBTS audit: coverage DB from build ${sel.build}, " +
-                      "commit ${sel.commit ?: 'unknown'}, ${sel.lag == null ? 'lag unknown' : sel.lag + ' commit(s) behind main'}")
+                      "commit ${sel.commit ?: 'unknown'}, ${sel.lag == null ? 'lag unknown' : sel.lag + ' commit(s) behind main'}, " +
+                      "${sel.drift == null ? 'drift unmeasured' : sel.drift + ' commit(s) ' + (sel.drift_status ?: '') + ' the PR base ' + (sel.base_commit ?: '')}")
         sh "cd ${LLM_ROOT} && mkdir -p ${covDir}"
         // wget the tarball (retrying) and extract the sqlite.
         trtllm_utils.llmExecStepWithRetry(pipeline, script:
@@ -954,15 +967,15 @@ def _cbtsCoverageAudit(pipeline)
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
            "--db ${covDir}/cbts_touchmap.sqlite"
-        // build/commit/lag ride along so main.py can record which DB the decision
-        // used (resolved here, once, per run).
+        // build/commit/lag/drift ride along for main.py's record and drift gate.
         return [path: "${covDir}/cbts_touchmap.sqlite", build: sel.build,
-                commit: sel.commit ?: "", lag: sel.lag]
+                commit: sel.commit ?: "", lag: sel.lag, drift: sel.drift,
+                baseCommit: sel.base_commit ?: "", driftStatus: sel.drift_status ?: ""]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
-        return [path: "", build: null, commit: "", lag: null]
+        return [path: "", build: null, commit: "", lag: null, drift: null, baseCommit: "", driftStatus: ""]
     }
 }
 

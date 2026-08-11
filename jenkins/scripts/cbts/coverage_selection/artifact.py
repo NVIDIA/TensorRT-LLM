@@ -21,8 +21,12 @@ distance is `ahead_by` from the forge compare API — the CI checkout is depth-1
 so git cannot answer it — and needs `GITHUB_API_TOKEN`, the anonymous quota
 being per-IP and exhausted by shared CI egress.
 
-`--print-selection` prints `{url, build, commit, lag}` as JSON for the Groovy
-wiring, which downloads and extracts the tarball itself.
+Ranking scores candidates against the tip of `COVERAGE_BRANCH`; gating scores the
+winner against the PR's merge base, which `--pr-head` supplies.
+
+`--print-selection` prints `{url, build, commit, lag, base_commit, drift,
+drift_status}` as JSON for the Groovy wiring, which downloads and extracts the
+tarball itself.
 """
 
 from __future__ import annotations
@@ -114,27 +118,67 @@ def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str
 
 
 @lru_cache(maxsize=None)
-def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int]:
-    """Commits `branch` gained since `commit`, from the forge compare API, or None."""
+def _compare(base: str, head: str) -> Optional[dict]:
+    """The forge's `base...head` compare payload, or None when it cannot be had."""
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get(GITHUB_TOKEN_ENV)
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    status, data = _get(f"{_GITHUB_COMPARE}/{commit}...{branch}", headers)
+    status, data = _get(f"{_GITHUB_COMPARE}/{base}...{head}", headers)
     if status != 200 or not data:
         # 403 without a token means the shared egress IP burned the 60/h anonymous quota.
         hint = " (no token: anonymous quota)" if status == 403 and not token else ""
         print(
-            f"[artifact] compare {commit[:10]}...{branch} failed: HTTP {status}{hint}",
+            f"[artifact] compare {base[:10]}...{head[:10]} failed: HTTP {status}{hint}",
             file=sys.stderr,
         )
         return None
     try:
-        # `ahead_by` counts the full range; only the `commits` array is truncated at 250.
-        return int(json.loads(data)["ahead_by"])
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-        print(f"[artifact] compare {commit[:10]}...{branch}: bad response: {e}", file=sys.stderr)
+        return json.loads(data)
+    except json.JSONDecodeError as e:
+        print(f"[artifact] compare {base[:10]}...{head[:10]}: bad response: {e}", file=sys.stderr)
         return None
+
+
+def compare_distance(commit: str, branch: str = COVERAGE_BRANCH) -> Optional[int]:
+    """Commits `branch` gained since `commit` — ranking only; never negative."""
+    payload = _compare(commit, branch)
+    if payload is None:
+        return None
+    try:
+        # `ahead_by` counts the full range; only the `commits` array is truncated at 250.
+        return int(payload["ahead_by"])
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"[artifact] compare {commit[:10]}...{branch}: no ahead_by: {e}", file=sys.stderr)
+        return None
+
+
+def merge_base(head: str, branch: str = COVERAGE_BRANCH) -> Optional[str]:
+    """The commit `head` forked from `branch` — the revision the PR's diff is against."""
+    payload = _compare(branch, head)
+    if payload is None:
+        return None
+    sha = (payload.get("merge_base_commit") or {}).get("sha")
+    if not sha:
+        print(f"[artifact] compare {branch}...{head[:10]}: no merge_base_commit", file=sys.stderr)
+        return None
+    return sha
+
+
+def drift(db_commit: str, base_commit: str) -> tuple[Optional[int], str]:
+    """Distance from the DB's revision to the PR's base; direction is recorded, not weighted."""
+    payload = _compare(db_commit, base_commit)
+    if payload is None:
+        return None, "unknown"
+    try:
+        distance = int(payload["ahead_by"]) + int(payload["behind_by"])
+        return distance, str(payload.get("status") or "")
+    except (KeyError, TypeError, ValueError) as e:
+        print(
+            f"[artifact] compare {db_commit[:10]}...{base_commit[:10]}: no ahead/behind: {e}",
+            file=sys.stderr,
+        )
+        return None, "unknown"
 
 
 def select_tarball(
@@ -174,6 +218,21 @@ def select_tarball(
     return best
 
 
+def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
+    """Add `base_commit` / `drift` / `drift_status` to the ranked winner, in place."""
+    sel.setdefault("base_commit", None)
+    sel.setdefault("drift", None)
+    sel.setdefault("drift_status", "unknown")
+    if not pr_head or not sel.get("commit"):
+        return sel
+    base = merge_base(pr_head)
+    if not base:
+        return sel
+    sel["base_commit"] = base
+    sel["drift"], sel["drift_status"] = drift(sel["commit"], base)
+    return sel
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -181,10 +240,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--print-selection",
         action="store_true",
-        help="resolve and print {url, build, commit, lag} as JSON",
+        help="resolve and print {url, build, commit, lag, base_commit, drift, drift_status} as JSON",
     )
     ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
+    )
+    ap.add_argument(
+        "--pr-head",
+        default=None,
+        help="PR head revision; its merge base is what drift is measured against "
+        "(omitted leaves drift null, which the selector declines on).",
     )
     args = ap.parse_args(argv)
 
@@ -203,7 +268,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         best = select_tarball()
     if best is None:
         return 1
-    print(json.dumps(best))
+    print(json.dumps(measure_drift(best, args.pr_head)))
     return 0
 
 

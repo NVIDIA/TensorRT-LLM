@@ -122,7 +122,13 @@ def build_document(
         "l_coverage_db_lag": int(
             decision["coverage_db_lag"] if decision.get("coverage_db_lag") is not None else -1
         ),
-        # Freshness-gate verdict on that lag: ok / stale / unknown; empty when no DB was consulted.
+        # Commits between that DB and the PR's base — what the gate decides on; -1 when unmeasurable.
+        "s_coverage_db_base_commit": decision.get("coverage_db_base_commit") or "",
+        "l_coverage_db_drift": int(
+            decision["coverage_db_drift"] if decision.get("coverage_db_drift") is not None else -1
+        ),
+        "s_coverage_db_drift_status": decision.get("coverage_db_drift_status") or "",
+        # Freshness-gate verdict on that drift: ok / stale / unknown; empty when no DB was consulted.
         "s_coverage_freshness": decision.get("coverage_freshness") or "",
         "d_case_skip_rate": round(case_skip_rate, 4),
         "flat_detail": {
