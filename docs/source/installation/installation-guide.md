@@ -4,6 +4,8 @@
 # Installation Guide
 
 There are multiple ways to install and run TensorRT LLM. The options below are ordered from simplest to most involved. Before installing, check the [Supported Hardware](../supported-hardware) page to ensure your GPU is compatible.
+For a first-time setup or a quick sanity check, use the pre-built release container.
+The `pip` and source-build options are intended for environments where you need to manage the CUDA, PyTorch, MPI, and system dependencies yourself.
 
 **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
@@ -12,7 +14,8 @@ the latest changes, but their quality is not guaranteed and they may contain bug
 
 ## Option 1: Pre-built Release Container
 
-Pre-built TensorRT LLM releases are available as [container images on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release). This is the simplest way to obtain TensorRT LLM.
+Pre-built TensorRT LLM releases are available as [container images on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release).
+This is the recommended and simplest way to obtain TensorRT LLM for a first run because the container includes a validated runtime environment.
 
 Replace `x.y.z` with the desired version tag. The [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)
 include both regular and `.dev` nightly releases.
@@ -43,7 +46,8 @@ python3 -c "import tensorrt_llm"
 > **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build.
 > If you are using the NGC PyTorch container, install the wheel built specifically for that container. The pre-built NGC PyTorch container-specific wheel is located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
 
-Tested on Ubuntu 24.04.
+Tested on Ubuntu 24.04. Use this path when you need to install TensorRT LLM into an existing Linux environment.
+Otherwise, prefer the pre-built release container above.
 
 ### Install prerequisites
 
