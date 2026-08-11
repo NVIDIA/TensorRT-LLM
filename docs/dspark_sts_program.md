@@ -902,3 +902,10 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **机理坐实**:t32 门控命中 399/736 步(54%,恰为混合步密度),trim 30.5%→5.7%,accept_len 1.38→1.54,吞吐损失 −8.0%→−1.0% ——**损失几乎全部来自混合步上的裁剪**(纯 gen 步的裁剪在本负载 ≈ 中性);
 - 产品方向确认:agg 形态需要混合步自保(默认门控或成本表加 ctx 维度);disagg(纯 gen)天然免疫;
 - **bs 配方对照(用户质疑成立)**:t128 的 maxbs=2×+mnt=16384 协议没把 bs 钉到 128(gen 步中位 ~89),且 notrim 吞吐比旧协议(maxbs=128/mnt=8192,4,336)低 ~12%——mnt 抬升让准入步更重,纯亏。两旋钮处方已从 feature doc 撤下。
+
+## 【08-11 10:30】混合步判决同节点确认 + disagg 传输终局 + gen 饥饿物理(主线)
+
+- **混合步判决锁定**(同节点背靠背、双节点臂序对调):748120 sched 1721 vs skipmixed 1859(+8.0%);748121 反序 1739 vs 1855(+6.7%);skipmixed ≈ notrim(1858)打平。t32 的损失全部来自混合步裁剪,`TLLM_DSPARK_SKIP_MIXED_TRIM` 完全回收。
+- **disagg 传输六轮终局(R6 全绿,fails=0)**:最后一刀是 **`UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp`**(去 IB verbs;v2 manager 的 VMM/fabric 显存走 IB RDMA 注册有问题,MNNVL=n 必要但不充分——金丝雀"零失败"是提前杀进程的假阴性,R5b 同配置 40-80s 断开雪崩)。CI 对 GB300 的 UCX_TLS 处方与此完全一致(test_disaggregated.py)。完整配方五件套:pmix + NIXL/PYTHON + MNNVL=n + UCX_TLS 去 IB + 600s/900s 超时。
+- **gen 饥饿物理**:throughput_1k(ISL:OSL≈17:1)下 1 ctx 喂不饱 1 gen——gen 实测 bs 仅 1-5/rank,1:1 矩阵测的是 ctx 管道(lbs128 仅 ~1.1k tok/s)。QA 8k1k 用 ctx8:gen1;17:1 需要更高配比。**解法:客户端 OSL 旋钮**(`SPEEDBENCH_MAX_TOKENS`)拉长请求寿命——OSL=1024 时 gen bs 90 秒即爬到 22-25/rank 并继续上行,S/N 128 对的配对补测(同调用 3 稳态 reps)在收。
+- 副产品:OSL 旋钮同样解锁了 **agg 上实测 bs=128 的表采集**(v3 当年 128 档采不到的"早完成者"问题源于 OSL=64 寿命太短)——v4 采集(OSL 512、client 1024、pin 5/4/3/2)已在 mixab 空闲节点上跑。
