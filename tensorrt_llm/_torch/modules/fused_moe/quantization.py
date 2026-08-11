@@ -2092,10 +2092,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         device = module.fc31_weight_scale.data.device
-        first_expert_id = module.initial_local_expert_ids[0]
-        weight_scale_name = ("weight_scale"
-                             if f"{first_expert_id}.w1.weight_scale" in weights
-                             else "weight_scale_inv")
 
         # fc31 scales
         assert (len(module.interleave) == 2)
@@ -2104,13 +2100,13 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         all_w1_scales = []
         for expert_id in module.initial_local_expert_ids:
             w3_scale_shard = load_weight_shard(
-                weights[f"{expert_id}.w3.{weight_scale_name}"],
+                weights[f"{expert_id}.w3.weight_scale_inv"],
                 module.tp_size,
                 module.tp_rank,
                 TensorParallelMode.COLUMN,
                 device=device)
             w1_scale_shard = load_weight_shard(
-                weights[f"{expert_id}.w1.{weight_scale_name}"],
+                weights[f"{expert_id}.w1.weight_scale_inv"],
                 module.tp_size,
                 module.tp_rank,
                 TensorParallelMode.COLUMN,
@@ -2148,7 +2144,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         all_w2_scales = []
         for expert_id in module.initial_local_expert_ids:
             w2_scales_shard = load_weight_shard(
-                weights[f"{expert_id}.w2.{weight_scale_name}"],
+                weights[f"{expert_id}.w2.weight_scale_inv"],
                 module.tp_size,
                 module.tp_rank,
                 TensorParallelMode.ROW,
