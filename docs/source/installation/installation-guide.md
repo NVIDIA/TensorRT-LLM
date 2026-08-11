@@ -7,7 +7,7 @@ There are multiple ways to install and run TensorRT LLM. The options below are o
 For a first-time setup or a quick sanity check, use the pre-built release container.
 The `pip` and source-build options are intended for environments where you need to manage the CUDA, PyTorch, MPI, and system dependencies yourself.
 
-**This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
+**This project will download and install additional third-party open-source software projects. Review the license terms of these open source projects before use.**
 
 Nightly releases are development builds identified by a `.dev` segment in the version. They provide early access to
 the latest changes, but their quality is not guaranteed and they may contain bugs or regressions.
