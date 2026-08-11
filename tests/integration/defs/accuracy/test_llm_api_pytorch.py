@@ -2095,7 +2095,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile,
                                     sampler_async_worker):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
