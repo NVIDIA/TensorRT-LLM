@@ -717,7 +717,6 @@ class MiniMaxM3DraftSubpageView:
             (manager.num_pools, 1, 2, 1), dtype=torch.int32, pin_memory=prefer_pinned()
         )
         self._slots_host: Optional[np.ndarray] = None
-        self._out_host: Optional[torch.Tensor] = None
         self._arange: Optional[torch.Tensor] = None
 
     def __getattr__(self, name):
@@ -733,6 +732,56 @@ class MiniMaxM3DraftSubpageView:
     def free_resources(self, request) -> None:
         """No-op: block lifecycle belongs to the shared manager."""
 
+    def _host_block_table(
+        self,
+        slot_rows: Sequence[Sequence[int]],
+        num_seqs: int,
+        max_slots: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Expand this batch's slot ids into a freshly allocated pinned table.
+
+        The buffer is allocated per call on purpose: it is the source of an
+        asynchronous H2D copy, whose source is read at copy execution time
+        rather than enqueue time. A persistent buffer refilled in place would
+        let the next iteration's refill clobber a still-pending copy — the
+        drafter would then index another batch's blocks (nvbug 6293536, whose
+        rationale the V1 manager spells out on
+        ``KVCacheManager._stage_block_offsets_for_copy``). The caching host
+        allocator keeps this block alive until the copy retires. The numpy
+        scratch below stays persistent: it is only ever read synchronously.
+        """
+        sub = self._subdiv
+        if (
+            self._slots_host is None
+            or self._slots_host.shape[0] < num_seqs
+            or self._slots_host.shape[1] != max_slots
+        ):
+            self._slots_host = np.zeros((num_seqs, max_slots), dtype=np.int32)
+            self._arange = torch.arange(sub, dtype=dtype)
+        slots_np = self._slots_host[:num_seqs]
+        slots_np.fill(0)
+        # Ragged fill is the only per-row work (numpy parses each row's list at
+        # C speed); the arithmetic below is one fused expansion across the
+        # batch. Pad/BAD_PAGE_INDEX entries clamp to slot 0 (safe pages:
+        # kernels never read past kv_lens).
+        for i, row in enumerate(slot_rows[:num_seqs]):
+            n = min(len(row), max_slots)
+            if n > 0:
+                slots_np[i, :n] = row[:n]
+        np.clip(slots_np, 0, None, out=slots_np)
+        slots = torch.from_numpy(slots_np).to(dtype)
+        host = torch.empty(
+            (num_seqs, 2, max_slots * sub),
+            dtype=dtype,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+        out = host.view(num_seqs, 2, max_slots, sub)
+        torch.add(slots.unsqueeze(-1) * self._slot_units, self._arange, out=out[:, 0])
+        torch.add(out[:, 0], sub, out=out[:, 1])
+        return host
+
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,
@@ -742,39 +791,12 @@ class MiniMaxM3DraftSubpageView:
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
-        sub = self._subdiv
-        max_units = dst_tensor.shape[-1]
-        max_slots = max_units // sub
         # Raw mega-pool slot ids per request (M3's bypass semantics).
         slot_rows = self._manager._get_batch_cache_indices_by_pool_id(request_ids, pool_id=0)
-        if (
-            self._slots_host is None
-            or self._slots_host.shape[0] < num_seqs
-            or self._slots_host.shape[1] != max_slots
-        ):
-            cap = max(num_seqs, dst_tensor.shape[1])
-            self._slots_host = np.zeros((cap, max_slots), dtype=np.int32)
-            self._out_host = torch.empty(
-                (cap, 2, max_slots * sub), dtype=dst_tensor.dtype, pin_memory=prefer_pinned()
-            )
-            self._arange = torch.arange(sub, dtype=dst_tensor.dtype)
-        slots_np = self._slots_host[:num_seqs]
-        slots_np.fill(0)
-        # Ragged fill is the only per-row work (numpy parses each row's list
-        # at C speed); all arithmetic below is one fused expansion across the
-        # batch, written into a persistent pinned staging buffer so the H2D
-        # copy is genuinely asynchronous. Pad/BAD_PAGE_INDEX entries clamp to
-        # slot 0 (safe pages: kernels never read past kv_lens).
-        for i, row in enumerate(slot_rows[:num_seqs]):
-            n = min(len(row), max_slots)
-            if n > 0:
-                slots_np[i, :n] = row[:n]
-        np.clip(slots_np, 0, None, out=slots_np)
-        slots = torch.from_numpy(slots_np).to(dst_tensor.dtype)
-        out = self._out_host[:num_seqs].view(num_seqs, 2, max_slots, sub)
-        torch.add(slots.unsqueeze(-1) * self._slot_units, self._arange, out=out[:, 0])
-        torch.add(out[:, 0], sub, out=out[:, 1])
-        dst_tensor[0, :num_seqs].copy_(self._out_host[:num_seqs], non_blocking=True)
+        host = self._host_block_table(
+            slot_rows, num_seqs, dst_tensor.shape[-1] // self._subdiv, dst_tensor.dtype
+        )
+        dst_tensor[0, :num_seqs].copy_(host, non_blocking=True)
 
 
 def get_minimax_m3_kv_cache_manager_cls():

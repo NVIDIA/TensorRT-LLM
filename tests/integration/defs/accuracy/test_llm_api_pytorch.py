@@ -8023,7 +8023,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             import requests
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
-            gen_url = info["server_lists"]["generation"][0]
+            gen_worker = info["current_workers"]["generation_servers"][0]
+            gen_url = f'{gen_worker["host"]}:{gen_worker["port"]}'
             questions = [
                 r["question"]
                 for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")

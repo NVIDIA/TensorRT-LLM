@@ -89,6 +89,21 @@ def test_block_table_expansion():
     assert dst[0, 0, 1, 8:].tolist() == [4, 5, 6, 7] * ((max_units - 8) // 4)
 
 
+def test_block_table_source_is_private_per_call():
+    # The H2D copy reads its source at execution time, so every call must get
+    # its own staging buffer: a persistent one refilled in place would let the
+    # next iteration clobber a still-pending copy and the drafter would index
+    # another batch's blocks (nvbug 6293536).
+    view = _make_view()
+    first = view._host_block_table([[5, 7]], 1, 2, torch.int32)
+    second = view._host_block_table([[9, 11]], 1, 2, torch.int32)
+    assert first.data_ptr() != second.data_ptr()
+    unit = SCALE * 4
+    # The first table still holds its own batch after the second call.
+    assert first[0, 0, :4].tolist() == [5 * unit + j for j in range(4)]
+    assert second[0, 0, :4].tolist() == [9 * unit + j for j in range(4)]
+
+
 def test_bad_page_index_padding_is_safe():
     view = _make_view()
     view._manager.slot_rows = [[5, -1]]
