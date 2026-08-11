@@ -41,7 +41,7 @@ Inference systems are conventionally compared with token-level Pareto curves (to
 - **Job-level interactivity — jobs/h/user**: 3600 s divided by the mean end-to-end job latency in seconds.
 - **Job-level throughput — jobs/h/GPU**: completed jobs per hour, normalized by GPU count.
 
-Industry efforts are converging on the same trace-replay idea from different directions: [AA-AgentPerf](https://artificialanalysis.ai/methodology/agentperf) replays recorded coding sessions to report the concurrent agents a deployment sustains under an SLO, and SemiAnalysis's [InferenceX AgentX](https://inferencex.semianalysis.com/datasets) replays coding traces with per-turn token counts and KV-block hashes to reproduce prefix reuse. Ours differs in scope rather than in kind: it covers agent architectures beyond a coding ReAct thread, replays their execution graph concurrently, and reports job-level throughput instead of SLO-conditioned concurrency.
+Industry efforts are converging on the same trace-replay idea from different directions: [AgentPerf](https://artificialanalysis.ai/methodology/agentperf) from Artificial Analysis replays recorded coding sessions to report the concurrent agents a deployment sustains under an SLO, and [AgentX](https://inferencex.semianalysis.com/datasets) from SemiAnalysis replays coding traces with per-turn token counts and KV-block hashes to reproduce prefix reuse. Ours differs in scope rather than in kind: it covers agent architectures beyond a coding ReAct thread, replays their execution graph concurrently, and reports job-level throughput instead of SLO-conditioned concurrency.
 
 ## Implementation
 
