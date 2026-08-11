@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -36,6 +36,9 @@ add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(common_src
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+add_dependencies(common_src ${TRTLLM_FMHA_PARAMS_GENERATED_TARGET})
 target_link_libraries(common_src PUBLIC trtllm_gen_fmha_interface)
 
 if(ENABLE_CUBLASLT_FP4_GEMM)

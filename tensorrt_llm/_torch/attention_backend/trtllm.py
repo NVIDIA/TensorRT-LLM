@@ -1366,6 +1366,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
+        self._fmha_scheduler_counter: Optional[torch.Tensor] = None
         self.fmha_libs: List[Fmha] = []
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
@@ -1573,6 +1574,50 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
 
+    def _ensure_fmha_scheduler_counter(
+        self,
+        q: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        needs_generation_counter = (forward_args.attention_input_type
+                                    != AttentionInputType.context_only
+                                    and metadata.num_generations > 0)
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        sparse_attn_indices = sparse_runtime_params.sparse_attn_indices
+        needs_sparse_context_counter = (
+            sparse_attn_indices is not None
+            and sparse_runtime_params.sparse_attn_offsets is None
+            and sparse_attn_indices.numel() > 0
+            and forward_args.attention_input_type
+            != AttentionInputType.generation_only and metadata.num_contexts > 0)
+        if not needs_generation_counter and not needs_sparse_context_counter:
+            return
+
+        multi_processor_count = torch.cuda.get_device_properties(
+            q.device).multi_processor_count
+        required_elements = max(
+            self.num_heads * metadata.max_num_requests,
+            multi_processor_count,
+        )
+
+        counter = forward_args.fmha_scheduler_counter
+        if (counter is not None and counter.device == q.device
+                and counter.element_size() == 4
+                and counter.numel() >= required_elements):
+            counter.zero_()
+            return
+
+        cached = self._fmha_scheduler_counter
+        if (cached is None or cached.device != q.device
+                or cached.numel() < required_elements):
+            cached = torch.empty(required_elements,
+                                 dtype=torch.int32,
+                                 device=q.device)
+            self._fmha_scheduler_counter = cached
+        cached.zero_()
+        forward_args.fmha_scheduler_counter = cached
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1645,7 +1690,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
         # new latent to the paged cache, and fills the trtllm-gen scheduler
-        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
+        # sequence buffers (cumulative q/kv seqlens). When the
         # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
         # so we skip only the RoPE and do the append + scheduler init here: the
         # generation FMHA only reads the cache, and the fallback path needs the
@@ -1668,11 +1713,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
             forward_args.cu_q_seqlens = cu_q
             forward_args.cu_kv_seqlens = cu_kv
-            if forward_args.fmha_scheduler_counter is None:
-                forward_args.fmha_scheduler_counter = torch.zeros(
-                    1, dtype=torch.uint32, device=q.device)
-            else:
-                forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
             from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 
@@ -1722,6 +1762,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
             self, q, k, metadata, forward_args)
+
+        self._ensure_fmha_scheduler_counter(q, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata

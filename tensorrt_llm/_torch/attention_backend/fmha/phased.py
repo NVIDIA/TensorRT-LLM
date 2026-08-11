@@ -35,10 +35,9 @@ class FmhaParams:
     meta: "TrtllmAttentionMetadata"
     fwd: AttentionForwardArgs
     workspace: torch.Tensor
-    attention_input: Optional[torch.Tensor] = None
-    qkv_input: Optional[torch.Tensor] = None
-    context_buf: Optional[torch.Tensor] = None
-    sequence_lengths: Optional[torch.Tensor] = None
+    qkv_or_q: Optional[torch.Tensor] = None
+    output: Optional[torch.Tensor] = None
+    sequence_length: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
     input_seq_length: int = 0
     max_past_kv_length: int = 0
@@ -46,16 +45,19 @@ class FmhaParams:
     cyclic_attention_window_size: int = 0
     num_tokens: int = 0
     seq_offset: int = 0
+    k: Optional[torch.Tensor] = None
+    v: Optional[torch.Tensor] = None
+    token_offset: int = 0
     tokens_per_block: int = 64
     fp8_context_fmha: bool = False
     kv_factor: int = 0
     total_num_blocks: int = 0
     # Context-only fields
-    batch_size: int = 0
+    num_seqs: int = 0
     # Generation-only fields
     num_requests: int = 0
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
-    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_for_cpp: Optional[torch.Tensor] = None
     is_cross: bool = False
 
 
@@ -203,16 +205,18 @@ class PhasedFmha(Fmha):
                 host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
             )
 
-            params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
-            params.qkv_input = params.attention_input
-            params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
-            params.sequence_lengths = sequence_length[seq_offset:]
+            params.qkv_or_q = q[token_offset : token_offset + num_ctx_tokens]
+            params.k = None if k is None else k[token_offset : token_offset + num_ctx_tokens]
+            params.v = None if v is None else v[token_offset : token_offset + num_ctx_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_ctx_tokens]
+            params.sequence_length = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_ctx_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = max_context_q_len
-            params.batch_size = num_seqs
+            params.num_seqs = num_seqs
             if attn.is_mla_enable:
                 self.run_mla_context(params)
             else:
@@ -240,17 +244,19 @@ class PhasedFmha(Fmha):
                     )
                 spec_pos_offsets = position_offsets_for_cpp
 
-            params.attention_input = q[token_offset : token_offset + num_gen_tokens]
-            params.qkv_input = params.attention_input
-            params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
-            params.sequence_lengths = sequence_length[seq_offset:]
+            params.qkv_or_q = q[token_offset : token_offset + num_gen_tokens]
+            params.k = None if k is None else k[token_offset : token_offset + num_gen_tokens]
+            params.v = None if v is None else v[token_offset : token_offset + num_gen_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_gen_tokens]
+            params.sequence_length = sequence_length[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_gen_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = input_seq_length
             params.num_requests = num_seqs // metadata.beam_width
             params.spec_decoding_generation_lengths = spec_gen_lengths
-            params.spec_decoding_position_offsets = spec_pos_offsets
+            params.spec_decoding_position_offsets_for_cpp = spec_pos_offsets
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:
