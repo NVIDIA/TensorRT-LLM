@@ -32,7 +32,23 @@ other GPU architectures may be added in a future release.
   from the Hugging Face Hub (the example scripts take a local filesystem
   path).
 - A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
-  image.
+  image. The image passed as `--image` below must already provide
+  TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
+  container; a build or devel image without them does not work. The Slurm
+  scripts start a fresh container from that image. They mount the
+  repository, including `.venv-3.12`, and the checkpoint, so packages installed in
+  that virtual environment are available. Packages installed only in the preparation
+  container's base environment are not:
+  repository-root `.venv-3.12` is the build environment created by `build_wheel.py`
+  (it contains Conan and pip, not PyTorch or Transformers), and `pip install
+  --no-deps -e .` installs `tensorrt_llm` alone. With an image that lacks the dependencies, every rank
+  fails with a `ModuleNotFoundError` that does not name the image, such as
+  `No module named 'transformers'`.
+
+  The scripts also export `PYTHONPATH="$REPO"` before launching the example.
+  Keep that export when adapting them: `python3 <script>` puts the script's
+  directory on `sys.path`, not the repository root, so without it the job
+  fails with `No module named 'tensorrt_llm'` even when the image is correct.
 - The `fla-core` and `einops` packages, installed into the same in-place
   environment. Note: these dependencies might be removed in a future
   release, replaced by other kernels.
