@@ -1,9 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from typing import Callable, List, Union
 
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 
@@ -166,6 +171,8 @@ class BaseWeightMapper(ABC):
                    for skip_module in self._skip_modules)
 
     def filter_weights(self, prefix: str, weights: dict) -> dict:
+        if isinstance(weights, ConsumableWeightsDict):
+            return weights.filter_prefix(prefix)
         result = {}
         for k, v in weights.items():
             if k.startswith(prefix):

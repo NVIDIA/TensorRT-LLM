@@ -1155,19 +1155,63 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
         if key not in matched_keys:
             renamed_weights[key] = weights[key]
 
-    # Preserve ConsumableWeightsDict type if that's what was passed in
+    # The renamed mapping aliases every tensor in the input. Transfer
+    # ownership so mark_consumed() can actually release the last source-side
+    # reference while modules are loaded.
     if is_consumable:
+        weights.clear()
         return ConsumableWeightsDict(renamed_weights)
     return renamed_weights
 
 
 def filter_weights(prefix, weights: Dict):
+    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+        ConsumableWeightsDict
+
+    if isinstance(weights, ConsumableWeightsDict):
+        return weights.filter_prefix(prefix)
     result = {}
     for k, v in weights.items():
         if k.startswith(prefix):
             new_k = k[len(prefix) + 1:]
             result[new_k] = v
     return result
+
+
+def _pageout_safetensors_after_moe_load() -> None:
+    """Bound safetensors file-cache growth after loading each MoE layer.
+
+    Do not gate this on CUDA's ``is_integrated`` property: GB300 reports false
+    even though four ranks share a host-memory cgroup and can exhaust it with
+    resident file pages. ``MADV_DONTNEED`` only discards pages already faulted
+    in, so untouched future weights do not incur extra I/O.
+    """
+    from tensorrt_llm._torch.mmap_utils import pageout_file_backed_regions
+
+    logger.info_once(
+        "Releasing resident safetensors pages after each MoE layer load",
+        key="weight_load_safetensors_pageout",
+    )
+    torch.cuda.synchronize()
+    pageout_file_backed_regions(".safetensors", mode="dontneed")
+
+
+def _get_load_weights_num_workers() -> Optional[int]:
+    """Return the configured bound for concurrent module weight loading."""
+    env_name = "TRT_LLM_LOAD_WEIGHTS_NUM_WORKERS"
+    value = os.environ.get(env_name)
+    if value is None or not value.strip():
+        return None
+
+    try:
+        num_workers = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}") from error
+    if num_workers <= 0:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}")
+    return num_workers
 
 
 def run_concurrently(func,
@@ -1267,7 +1311,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             # and weights loading is done in the backend, so module name includes '.backend'.
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
+            is_moe_backend = names[-1] == "backend" and isinstance(module, MoE)
+            if is_moe_backend:
                 name = '.'.join(names[:-1])
                 names = name.split('.')
 
@@ -1337,6 +1382,9 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             weights.mark_consumed_keys(
                                 f'{name}.{n}' for n in loaded_own_params)
 
+            if is_moe_backend:
+                _pageout_safetensors_after_moe_load()
+
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
         for name, module in tqdm(list(
@@ -1368,7 +1416,15 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        num_workers = _get_load_weights_num_workers()
+        if num_workers is not None:
+            logger.info(
+                f"Limiting concurrent module weight loading to {num_workers} workers"
+            )
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=num_workers)
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
@@ -1400,7 +1456,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             # and weights loading is done in the backend, so module name includes '.backend'.
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
+            is_moe_backend = names[-1] == "backend" and isinstance(module, MoE)
+            if is_moe_backend:
                 name = '.'.join(names[:-1])
                 names = name.split('.')
 
@@ -1462,6 +1519,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             weights.mark_consumed_keys(
                                 f'{name}.{n}' for n in loaded_own_params)
 
+            if is_moe_backend:
+                _pageout_safetensors_after_moe_load()
+
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
         for name, module in tqdm(list(
@@ -1493,4 +1553,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        num_workers = _get_load_weights_num_workers()
+        if num_workers is not None:
+            logger.info(
+                f"Limiting concurrent module weight loading to {num_workers} workers"
+            )
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=num_workers)
