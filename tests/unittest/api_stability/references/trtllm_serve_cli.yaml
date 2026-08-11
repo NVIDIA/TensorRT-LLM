@@ -58,7 +58,7 @@ commands:
       backend:
         type: Choice(['_autodeploy', 'pytorch'])
         default: pytorch
-        status: beta
+        status: deprecated
         required: false
         multiple: false
         is_flag: false
