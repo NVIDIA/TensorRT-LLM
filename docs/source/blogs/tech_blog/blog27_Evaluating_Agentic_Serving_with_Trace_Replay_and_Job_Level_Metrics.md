@@ -133,14 +133,6 @@ Fan-out also makes the serving behavior harder to reason about in general. A sin
 </div>
 <p align="center"><sub><em>Figure 7. Job-level Pareto frontier over a full (B, C) sweep for the Open Deep Research trace, by parallel strategy. Subagent fan-out pushes the frontier to B = 2C and B = 4C.</em></sub></p>
 
-## Key Takeaways
-
-- **Trace-and-replay makes agentic serving measurable.** Recording each agent run once and replaying it structure-faithfully preserves the behaviors fixed-shape benchmarks miss — prefix reuse, tool-call gaps, and parallel branching — and job-level Pareto metrics report serving performance as completed work: jobs per hour per user and per GPU.
-- **Token-level and job-level metrics can disagree** on both the best parallel strategy and the best batch size; only the job-level view follows the end-to-end latency a user actually experiences.
-- **Prefix caching sets the ceiling for multi-turn serving.** The hit rate holds at its optimum until the cache overflows, then job-level throughput drops in lockstep with it; host offloading (`kv_cache_config.host_cache_size`) pushes the cliff back.
-- **Configure batch size by branching structure**: near B = C for single-branch agents, B several times C for fan-out agents.
-- **Fan-out makes serving performance harder to reason about.** A session no longer maps to one in-flight request, so the load the server sees swings with how many branches are open; the best configuration leaves the B = C diagonal and moves with the branching structure, widening the search space and making a good setting hard to find by intuition. This is precisely where reproducible replay pays off.
-
 ## Future Work
 
 Agent workloads keep changing, and with them the shapes that reach the serving system: agent architectures evolve, context-management strategies such as compaction alter how much prefix survives across turns, and tool usage shifts the balance between waiting and computing. Any of these can move where the bottleneck sits, and a configuration tuned for today's traces may not hold for tomorrow's.
