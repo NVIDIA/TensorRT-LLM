@@ -146,6 +146,7 @@ class ModelLoader:
         kv_cache_dtype = self.llm_args.kv_cache_config.dtype
         explicit_kv_cache_quant_algo = {
             "fp8": QuantAlgo.FP8,
+            "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False

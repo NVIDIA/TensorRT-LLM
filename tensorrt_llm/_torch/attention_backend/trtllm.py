@@ -1406,6 +1406,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        kv_cache_dtype: str = "auto",
         **kwargs,
     ):
         """
@@ -1425,6 +1426,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.kv_cache_dtype = kv_cache_dtype
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
@@ -1817,6 +1820,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # generation FMHA only reads the cache, and the fallback path needs the
         # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and not getattr(self, "use_fp8_ds_mla", False)
                 and forward_args.attention_input_type
                 == AttentionInputType.generation_only):
             num_ctx = metadata.num_contexts

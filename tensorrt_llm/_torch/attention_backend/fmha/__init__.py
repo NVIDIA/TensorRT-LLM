@@ -15,6 +15,7 @@
 
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
+from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
 from .msa_sparse_gqa import MsaSparseGqaFmha
@@ -26,6 +27,7 @@ __all__ = [
     "FMHA_LIBS",
     "CuteDslMlaFmha",
     "FallbackFmha",
+    "FlashInferSparseMlaFmha",
     "FlashInferTrtllmGenFmha",
     "Fmha",
     "FmhaCls",

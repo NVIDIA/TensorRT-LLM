@@ -3955,11 +3955,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
-        "is inherited as-is); 'fp8' or 'nvfp4' override it explicitly. Resolved at "
+        "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120. Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
-                                             "float32", "fp8", "nvfp4"))
+                                             "float32", "fp8", "fp8_ds_mla",
+                                             "nvfp4"))
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -4141,13 +4143,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_dtype(cls, v: str):
         v = v.lower()
-        if v in ("auto", "fp8",
+        if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
 
         raise ValueError(
-            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
-        )
+            'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
+            '"nvfp4", or valid torch.dtype string')
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
@@ -6229,7 +6231,7 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype == 'fp8':
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4

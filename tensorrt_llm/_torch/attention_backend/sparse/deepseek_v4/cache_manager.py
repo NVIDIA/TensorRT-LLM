@@ -123,6 +123,7 @@ def _estimate_non_sliding_attn_size_per_token(
     compress_ratios: List[int],
     has_fp8_kv_cache,
     indexer_k_dtype: str = "fp8",
+    use_fp8_ds_mla: bool = False,
 ) -> int:
     total_bytes = 0
     for compress_ratio in compress_ratios:
@@ -135,6 +136,7 @@ def _estimate_non_sliding_attn_size_per_token(
                     attn_type,
                     has_fp8_kv_cache,
                     indexer_k_dtype=indexer_k_dtype,
+                    use_fp8_ds_mla=use_fp8_ds_mla,
                 )
     return total_bytes
 
@@ -150,6 +152,7 @@ def _estimate_swa_cache_size(
     context: bool,
     scratch: bool,
     indexer_k_dtype: str = "fp8",
+    use_fp8_ds_mla: bool = False,
 ) -> Tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
@@ -178,6 +181,7 @@ def _estimate_swa_cache_size(
                 attn_type,
                 has_fp8_kv_cache,
                 indexer_k_dtype=indexer_k_dtype,
+                use_fp8_ds_mla=use_fp8_ds_mla,
             )
             if not context:
                 size_per_request += window_tokens * token_bytes
@@ -200,6 +204,7 @@ def _get_attn_bytes_per_token(
     attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
+    use_fp8_ds_mla: bool = False,
 ) -> int:
     token_bytes = get_token_bytes(
         head_dim,
@@ -208,6 +213,7 @@ def _get_attn_bytes_per_token(
         attn_type,
         has_fp8_kv_cache,
         indexer_k_dtype=indexer_k_dtype,
+        use_fp8_ds_mla=use_fp8_ds_mla,
     )
     if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
         token_bytes //= compress_ratio
@@ -289,6 +295,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             f"DeepseekV4CacheManager requires tokens_per_block in [128, 256], got {tokens_per_block}. "
             f"Set kv_cache_config.tokens_per_block to 128 or 256."
         )
+
+        self.use_fp8_ds_mla = kv_cache_config.dtype == "fp8_ds_mla"
+        if self.use_fp8_ds_mla:
+            assert tokens_per_block == 256, (
+                f"FlashInfer DSv4 FMHA requires tokens_per_block=256, got {tokens_per_block}."
+            )
 
         self.index_head_dim = sparse_attn_config.index_head_dim
         self._compress_ratios = sparse_attn_config.compress_ratios
@@ -406,9 +418,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         attn_dim = get_attn_dim(
             self.head_dim, self.index_head_dim, self._compress_ratios[layer_idx], attn_type
         )
+        footer_scale = self.use_fp8_ds_mla and attn_type in (
+            DeepseekV4AttentionType.SWA,
+            DeepseekV4AttentionType.COMPRESS,
+        )
         if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             # Indexer always pack data + per-block scales into the same row.
             dim_per_token = self._indexer_data_size + self._indexer_scale_size
+        elif footer_scale:
+            # Footer-scale pages are byte-packed rather than token-major.
+            from . import footer_scale_kv
+
+            dim_per_token = footer_scale_kv.TOKEN_BYTES
         else:
             dim_per_token = attn_dim
 
@@ -431,6 +452,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             dtype = self._compressor_dtype
         elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             dtype = self._indexer_dtype
+        elif footer_scale:
+            dtype = DataType.UINT8
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
@@ -732,6 +755,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         (
             context_swa_size_per_token,
@@ -746,6 +770,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             context=True,
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         (
             generation_swa_size_per_token,
@@ -760,6 +785,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             context=False,
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
@@ -784,6 +810,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         context_swa_size_per_token, _ = _estimate_swa_cache_size(
             self.head_dim,
@@ -795,6 +822,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             context=True,
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         (
             generation_swa_size_per_token,
@@ -809,6 +837,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             context=False,
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
@@ -1040,6 +1069,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             attn_type,
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
 
         block_size = self.tokens_per_block
@@ -1061,6 +1091,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
 
     def get_max_resource_count(self) -> int:
@@ -1104,6 +1135,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             self.head_dim,
@@ -1115,6 +1147,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             context=context,
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
         return int(
             total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
@@ -1373,12 +1406,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         else:
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
+        use_fp8_ds_mla = kwargs["kv_cache_config"].dtype == "fp8_ds_mla"
         non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
             head_dim,
             index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=indexer_k_dtype,
+            use_fp8_ds_mla=use_fp8_ds_mla,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             head_dim,
@@ -1390,6 +1425,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             context=False,
             scratch=False,
             indexer_k_dtype=indexer_k_dtype,
+            use_fp8_ds_mla=use_fp8_ds_mla,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
         return (

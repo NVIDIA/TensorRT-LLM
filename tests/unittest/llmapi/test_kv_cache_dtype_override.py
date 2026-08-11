@@ -57,6 +57,9 @@ def test_kv_cache_config_dtype_validation():
     cfg = KvCacheConfig(dtype="float16")
     assert cfg.dtype == "float16"
 
+    cfg = KvCacheConfig(dtype="FP8_DS_MLA")
+    assert cfg.dtype == "fp8_ds_mla"
+
     with pytest.raises(ValueError, match="kv_cache_config.dtype must be one of"):
         KvCacheConfig(dtype="invalid_dtype")
 
