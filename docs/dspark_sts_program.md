@@ -909,3 +909,10 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **disagg 传输六轮终局(R6 全绿,fails=0)**:最后一刀是 **`UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp`**(去 IB verbs;v2 manager 的 VMM/fabric 显存走 IB RDMA 注册有问题,MNNVL=n 必要但不充分——金丝雀"零失败"是提前杀进程的假阴性,R5b 同配置 40-80s 断开雪崩)。CI 对 GB300 的 UCX_TLS 处方与此完全一致(test_disaggregated.py)。完整配方五件套:pmix + NIXL/PYTHON + MNNVL=n + UCX_TLS 去 IB + 600s/900s 超时。
 - **gen 饥饿物理**:throughput_1k(ISL:OSL≈17:1)下 1 ctx 喂不饱 1 gen——gen 实测 bs 仅 1-5/rank,1:1 矩阵测的是 ctx 管道(lbs128 仅 ~1.1k tok/s)。QA 8k1k 用 ctx8:gen1;17:1 需要更高配比。**解法:客户端 OSL 旋钮**(`SPEEDBENCH_MAX_TOKENS`)拉长请求寿命——OSL=1024 时 gen bs 90 秒即爬到 22-25/rank 并继续上行,S/N 128 对的配对补测(同调用 3 稳态 reps)在收。
 - 副产品:OSL 旋钮同样解锁了 **agg 上实测 bs=128 的表采集**(v3 当年 128 档采不到的"早完成者"问题源于 OSL=64 寿命太短)——v4 采集(OSL 512、client 1024、pin 5/4/3/2)已在 mixab 空闲节点上跑。
+
+## 【08-11 10:50】disagg 首个有效数据格(OSL1024,128 对配对稳态):纯 gen 浅 bs 仍 −8.8%;统一律成形
+
+- **数字**(饱和管道 3 稳态 reps,0 fails):notrim 中位 17,294 vs sched 15,770 tok/s = **−8.8%**,三 rep 全序一致(跨对比较,各自全新 setup)。
+- **机理对齐**:bench 窗口 gen 实际 bs 仅 **29-49/rank**(1 ctx 喂 1 gen 的上限,即使 OSL=1024);这落在 B300 θ 平坦区(#28 的负转平边界 32-64/rank)。sched 裁了 12.3% token(32% 步选低档),regret 18.9%,accept 2.27(书文续写高接受,被裁 token 更贵)——**纯 gen 步不是充分条件,bs 深度才是**。
+- **统一律**:裁剪收益 = f(纯 gen 步密度 × bs 深度)。agg×本负载:混合步吃掉收益(门控可回收到 0);disagg×本负载:纯 gen 但浅 bs,照亏;poetry/arena×agg burst:纯 gen 且深 bs(128-256/rank 满批),+5.9~+24.7%。三个 regime 一张图。
+- **下一步(节点已到期,明日执行)**:disagg 要进"顺风局"需 **ctx≥2:gen1 + OSL 1024**(把 gen bs 喂到 128/rank)+ **v4 实测表**(OSL 杠杆解锁的 agg bs=128 采集在跑);那一格才是"disagg 能否翻正"的真判决。
