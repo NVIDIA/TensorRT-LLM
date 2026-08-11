@@ -208,10 +208,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # dense draft layers have no page-size constraint, so the drafter
     # runs at 32: this value sizes the separate draft manager (read by
     # ``_create_one_model_draft_kv_cache_manager``) and the sub-pages of
-    # ``draft_subpage_view``. Retirement path: once the kernels are
-    # fixed, set TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128 (the view
-    # degenerates to subdiv=1, i.e. the identity block-table expansion)
-    # and drop this attribute after validation.
+    # ``draft_subpage_view``. Retirement plan once the kernels are fixed
+    # (single source of truth; WAR sites below point here):
+    #   1. Set TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128 and validate: the
+    #      view degenerates to subdiv=1 (the identity block-table
+    #      expansion, unit-tested).
+    #   2. Then delete the WAR surface entirely: MiniMaxM3DraftSubpageView,
+    #      the ``draft_subpage_view`` property, the ``add_dummy_requests``
+    #      override, and this attribute. The resolver falls back to "no
+    #      view" and the drafter attends the shared manager directly — a
+    #      control run at P128 with fixed kernels and the view disabled
+    #      showed acceptance parity (PR #17457 validation).
     draft_manager_tokens_per_block = 32
     _main_kv_layout = "NHD"
 
@@ -318,6 +325,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         Only meaningful on a target manager that carries appended one-model
         draft layers; a separate draft manager (``is_draft``) never exposes
         one. Built lazily so the manager's page-table tensors exist.
+
+        Retires with the P128 Eagle kernel fixes; see the retirement plan
+        on ``draft_manager_tokens_per_block``.
         """
         if self.is_draft or not self._shared_draft_layer_ids:
             return None
@@ -341,6 +351,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def add_dummy_requests(self, *args, **kwargs):
         """Drop the draft sub-page view before delegating.
+
+        Retires with the P128 Eagle kernel fixes; see the retirement plan
+        on ``draft_manager_tokens_per_block``.
 
         The base method mirrors dummy KV caches into a *separate* draft
         manager. With shared draft layers the dummy request's blocks in THIS
@@ -665,6 +678,9 @@ class MiniMaxM3DraftSubpageView:
     K sub-pages ``2s*subdiv..`` and V sub-pages ``(2s+1)*subdiv..`` with no
     pointer arithmetic changes. The view owns no blocks: lifecycle stays
     entirely with the shared manager.
+
+    Retires with the P128 Eagle kernel fixes; see the retirement plan on
+    ``MiniMaxM3KVCacheManagerV2.draft_manager_tokens_per_block``.
     """
 
     def __init__(self, manager, draft_layer_ids: Sequence[int], subpage_tokens: int):
