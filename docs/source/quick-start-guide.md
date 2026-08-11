@@ -19,6 +19,13 @@ To start the server, you can run a command like the following example inside a D
 trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
+If the server reports `MPI_ERR_SPAWN` or hangs after logging that rank 0 is using
+`MpiPoolSession` to spawn MPI processes, launch it through `mpirun`:
+
+```bash
+mpirun -n 1 --oversubscribe --allow-run-as-root trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+```
+
 You may also deploy pre-quantized models to improve performance.
 Ensure your GPU supports FP8 quantization before running the following:
 
