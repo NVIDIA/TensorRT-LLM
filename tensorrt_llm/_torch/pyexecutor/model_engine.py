@@ -7199,7 +7199,8 @@ class PyTorchModelEngine(ModelEngine):
                     if self.cuda_graph_runner.is_warmup_only:
                         outputs = capture_outputs
                     elif needs_capture:
-                        # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
+                        # Refresh attention metadata for the current batch's
+                        # draft cache before replaying the captured graph.
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
                         try:
