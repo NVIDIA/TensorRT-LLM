@@ -365,7 +365,7 @@ def _compare_logits_parity(base, spec, prompt, failures, tol=None, tie_tol=None)
     while shared < min(len(b_ids), len(s_ids)) and b_ids[shared] == s_ids[shared]:
         shared += 1
     # One-engine spec samplers (SA/MTP/Eagle3) do not emit per-token
-    # logprobs (SpecSamplerBase stores tokens only); the spec run's
+    # logprobs (SpecSampler stores tokens only); the spec run's
     # logprobs list is then shorter than its token_ids and NOT
     # position-aligned. Fall back to one-sided certification: the
     # divergence near-tie classification below (baseline-side logprobs)

@@ -153,7 +153,7 @@ class TopPDecayHandler:
         # tokens and produces multiple tokens per step (req_num_steps =
         # 1 + draft_token_length). One-model speculation (vanilla MTP, one-model
         # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
-        # SpecSamplerBase-derived sampler and never reaches TorchSampler; the
+        # SpecSampler and never reaches TorchSampler; the
         # drafter-based modes that DO flow draft tokens through TorchSampler
         # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
         # MTP-Eagle) are what can make this length non-zero. top-p decay does not

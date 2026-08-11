@@ -6404,8 +6404,11 @@ class PyTorchModelEngine(ModelEngine):
                     peft_cache_manager)
             peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
             ) if peft_cache_manager is not None else None
-            return peft_table and self._get_eager_lora_params_from_requests(
+            lora_params = peft_table and self._get_eager_lora_params_from_requests(
                 scheduled_requests, attn_metadata, peft_table)
+            if lora_params:
+                lora_params["data_type"] = peft_cache_manager.data_type
+            return lora_params
 
     def _get_eager_lora_params_from_requests(
             self, scheduled_requests: ScheduledRequests,
@@ -7105,6 +7108,12 @@ class PyTorchModelEngine(ModelEngine):
                     padded_graph_requests.all_requests())
                 self._sync_group_all_greedy_sample(spec_metadata)
 
+            peft_cache_data_type = None
+            if getattr(self, "cuda_graph_lora_manager", None) is not None:
+                peft_cache_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.PEFT_CACHE_MANAGER)
+                peft_cache_data_type = peft_cache_manager.data_type
+
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_graph_requests,
                 enable_spec_decode=self.enable_spec_decode,
@@ -7115,6 +7124,7 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device=new_tensors_device,
                 spec_resource_manager=spec_resource_manager,
                 promoted_context_request_ids=promoted_context_request_ids,
+                peft_cache_data_type=peft_cache_data_type,
             )
 
             can_run_graph = key is not None
