@@ -213,8 +213,10 @@ def _slurm_node_count():
 
 
 def _multinode_subprocess_timeout():
-    # Leave headroom for the outer 3600-second pytest timeout.
-    return int(os.environ.get("TRTLLM_VISUAL_GEN_MULTINODE_TIMEOUT", "3300"))
+    # Headroom under the test-db TIMEOUT (90) enrollment, i.e. 5400 seconds:
+    # the subprocess must lose the race so the failure is reported with the
+    # child's output rather than as an outer pytest timeout.
+    return int(os.environ.get("TRTLLM_VISUAL_GEN_MULTINODE_TIMEOUT", "5100"))
 
 
 def _resolve_slurm_master_addr():
@@ -385,6 +387,9 @@ def _run_wan22_multinode_slurm_parent():
         "srun",
         "-l",
         "--overlap",
+        # Tear the step down on the first non-zero rank instead of leaving the
+        # survivors blocked in the NCCL rendezvous until the timeout above.
+        "--kill-on-bad-exit=1",
         f"--nodes={WAN22_LPIPS_MULTINODE_NODES}",
         f"--ntasks={WAN22_LPIPS_MULTINODE_WORLD_SIZE}",
         f"--ntasks-per-node={WAN22_LPIPS_MULTINODE_GPUS_PER_NODE}",
