@@ -158,9 +158,20 @@ else()
   message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
+# Where the configured executor/version.h is written. Hermetic builds point this
+# at the build tree so the source tree is never written (it may be mounted
+# read-only); the default keeps the in-source location.
+set(TRTLLM_VERSION_H_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    CACHE PATH "Include root for the configured executor/version.h")
 configure_file(
   cmake/templates/version.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+  "${TRTLLM_VERSION_H_INCLUDE_DIR}/tensorrt_llm/executor/version.h")
+if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
+   "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  # BEFORE: the configured header must win over a stale in-source copy.
+  include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
+endif()
 
 setup_cuda_compiler()
 

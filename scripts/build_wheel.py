@@ -306,12 +306,38 @@ def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
     return fmha_v2_cu_dir / ".generation_complete"
 
 
-def generate_fmha_cu(project_dir, venv_python):
-    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+def get_fmha_gen_dirs(project_dir, gen_root=None):
+    """Return (fmha_v2_cu_dir, cubin_dir) for generated FMHA sources.
+
+    gen_root=None keeps the historical in-source locations; otherwise both
+    live under gen_root (consumed by CMake via TRTLLM_FMHA_GEN_DIR).
+    """
+    base = (project_dir /
+            "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+            if gen_root is None else gen_root)
+    return base / "fmha_v2_cu", base / "cubin"
+
+
+def generate_fmha_cu(project_dir, venv_python, gen_root=None):
+    fmha_v2_cu_dir, cubin_dir = get_fmha_gen_dirs(project_dir, gen_root)
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+    cubin_dir.mkdir(parents=True, exist_ok=True)
     _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    if gen_root is not None:
+        # The generator writes ./generated, ./temp and ./obj relative to its
+        # own directory; run it from a scratch copy so a (possibly read-only)
+        # checkout is never written.
+        work_dir = gen_root / "fmha_v2-work"
+        if work_dir.exists():
+            rmtree(work_dir)
+        copytree(fmha_v2_dir,
+                 work_dir,
+                 symlinks=False,
+                 ignore=shutil.ignore_patterns("generated", "temp", "obj",
+                                               "__pycache__"))
+        fmha_v2_dir = work_dir
 
     env = os.environ.copy()
     env.update({
@@ -344,7 +370,6 @@ def generate_fmha_cu(project_dir, venv_python):
             shutil.move(src, dst)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
     move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
                     cubin_dir / "fmha_cubin.h")
 
@@ -545,6 +570,34 @@ def build_kv_cache_manager_v2(project_dir,
     print("-- Done building kv_cache_manager_v2.")
 
 
+def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
+    """Copy the sources setup.py packages into an out-of-tree staging project.
+
+    Hermetic builds install compiled artifacts into this staging tree and
+    build the wheel from it, so nothing is ever written into the checkout.
+    """
+    print(f"-- Staging python package sources into {staging_dir} ...")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for tree in ("tensorrt_llm", "triton_kernels",
+                 "3rdparty/MSA/python/fmha_sm100"):
+        dst = staging_dir / tree
+        if dst.exists():
+            rmtree(dst)
+        copytree(project_dir / tree, dst, symlinks=False, ignore=ignore)
+    top_level_files = [
+        "setup.py", "pyproject.toml", "requirements.txt",
+        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+    ]
+    top_level_files += [
+        f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
+    ]
+    for name in top_level_files:
+        src = project_dir / name
+        if src.exists():
+            copy(src, staging_dir / name)
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -564,6 +617,7 @@ def main(*,
          configure_cmake: bool = False,
          configure_only: bool = False,
          use_ccache: bool = False,
+         hermetic: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -586,7 +640,6 @@ def main(*,
         clean_wheel = True
 
     project_dir = get_project_dir()
-    apply_version_override(project_dir, version_override)
 
     # Out-of-tree build state: everything metadata-heavy (venv, wheel
     # staging, ccache, intermediate objects) goes under build_root, keeping
@@ -604,6 +657,26 @@ def main(*,
         os.environ.setdefault("TRTLLM_WHEEL_STAGING_DIR",
                               str(build_root / "wheel-staging"))
 
+    if hermetic:
+        # Hermetic: never write into the checkout; the wheel is assembled in
+        # an out-of-tree staging project. Validated by building with the
+        # checkout mounted read-only.
+        if build_root is None:
+            raise RuntimeError("--hermetic requires --build_root")
+        if platform.system() == "Windows":
+            raise RuntimeError("--hermetic is not supported on Windows")
+        if skip_building_wheel or linking_install_binary or install:
+            raise RuntimeError(
+                "--hermetic is incompatible with --skip_building_wheel, "
+                "--linking_install_binary and --install: editable installs "
+                "import compiled artifacts from the checkout, which a "
+                "hermetic build never writes.")
+        if version_override:
+            raise RuntimeError(
+                "--hermetic does not support --version-override (it would "
+                "modify tensorrt_llm/version.py in the checkout)")
+
+    apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
     # Get all submodules and check their folder exists. If not,
@@ -613,8 +686,16 @@ def main(*,
             l.split("=")[1].strip() for l in submodules_f.readlines()
             if "path = " in l
         ]
-    if any(not (project_dir / submodule / ".git").exists()
-           for submodule in submodules):
+    missing_submodules = [
+        s for s in submodules if not (project_dir / s / ".git").exists()
+    ]
+    if missing_submodules:
+        if hermetic:
+            raise RuntimeError(
+                "Missing submodules: " + ", ".join(missing_submodules) +
+                ". Run 'git submodule update --init --recursive' before a "
+                "hermetic build; the checkout is not modified during the "
+                "build.")
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
@@ -771,10 +852,18 @@ def main(*,
 
     source_dir = get_source_dir()
 
-    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    fmha_gen_root = build_root / "fmha-gen" if hermetic else None
+    fmha_v2_cu_dir, _ = get_fmha_gen_dirs(project_dir, fmha_gen_root)
     if (clean or generate_fmha
             or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
-        generate_fmha_cu(project_dir, venv_python)
+        generate_fmha_cu(project_dir, venv_python, fmha_gen_root)
+
+    if hermetic:
+        cmake_def_args.append(f"-DTRTLLM_FMHA_GEN_DIR={fmha_gen_root}")
+        # Write the configured executor/version.h into the build tree
+        # instead of cpp/include (the checkout may be read-only).
+        cmake_def_args.append(
+            f"-DTRTLLM_VERSION_H_INCLUDE_DIR={build_dir}/generated-include")
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
@@ -823,7 +912,15 @@ def main(*,
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
-    pkg_dir = project_dir / "tensorrt_llm"
+    if hermetic:
+        # Assemble the wheel in an out-of-tree staging project; the checkout
+        # is only read from this point on.
+        wheel_project_dir = build_root / "package"
+        stage_python_package(project_dir, wheel_project_dir)
+    else:
+        wheel_project_dir = project_dir
+
+    pkg_dir = wheel_project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
@@ -832,7 +929,7 @@ def main(*,
     if include_dir.exists():
         clear_folder(include_dir)
     # Remove auto-generated attributions file from previous builds
-    auto_attr_file = project_dir / "ATTRIBUTIONS.md"
+    auto_attr_file = wheel_project_dir / "ATTRIBUTIONS.md"
     if auto_attr_file.exists():
         os.remove(auto_attr_file)
 
@@ -1072,9 +1169,8 @@ def main(*,
         agent_binding_so = list(
             nixl_utils_dir.glob("tensorrt_llm_transfer_agent_binding*.so"))
         if agent_binding_so:
-            trtllm_dir = project_dir / "tensorrt_llm"
             install_file(agent_binding_so[0],
-                         trtllm_dir / agent_binding_so[0].name)
+                         pkg_dir / agent_binding_so[0].name)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
@@ -1183,14 +1279,14 @@ def main(*,
                         nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
-    build_kv_cache_manager_v2(project_dir,
+    build_kv_cache_manager_v2(wheel_project_dir,
                               venv_python,
                               use_mypyc=mypyc,
                               build_root=build_root)
 
     if not skip_building_wheel:
         if dist_dir is None:
-            dist_dir = project_dir / "build"
+            dist_dir = build_root / "dist" if hermetic else project_dir / "build"
         else:
             dist_dir = Path(dist_dir)
 
@@ -1249,13 +1345,13 @@ def main(*,
 
         # Copy auto-generated ATTRIBUTIONS.md to project root for wheel packaging
         if auto_attr.exists():
-            install_file(auto_attr, project_dir / "ATTRIBUTIONS.md")
+            install_file(auto_attr, wheel_project_dir / "ATTRIBUTIONS.md")
             print(
-                f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
+                f"Copied auto-generated attributions to {wheel_project_dir / 'ATTRIBUTIONS.md'}"
             )
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
+            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
         env = os.environ.copy()
         if mypyc:
@@ -1264,7 +1360,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
@@ -1378,6 +1474,16 @@ def add_arguments(parser: ArgumentParser):
         "directory instead of the checkout. Point it at fast local storage (e.g. "
         "/tmp) when the checkout lives on a network filesystem. Individual "
         "options like --build_dir and CCACHE_DIR still override their piece.")
+    parser.add_argument(
+        "--hermetic",
+        action="store_true",
+        help=
+        "Never write into the checkout: generated FMHA sources and version.h "
+        "go to the build tree, and the wheel is assembled from an out-of-tree "
+        "staging copy of the Python package (default wheel output: "
+        "<build_root>/dist). Requires --build_root; the checkout may be "
+        "mounted read-only. Incompatible with editable-install workflows "
+        "(--skip_building_wheel, --linking_install_binary, --install).")
     parser.add_argument(
         "--build_dir",
         type=Path,
