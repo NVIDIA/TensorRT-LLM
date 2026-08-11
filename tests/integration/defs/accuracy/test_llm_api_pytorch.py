@@ -7523,10 +7523,9 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_nvfp4_marlin_8gpus(self):
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            mamba_ssm_cache_dtype="float16",
-        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="float16",
+                                        free_gpu_memory_fraction=0.5)
 
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=8,
