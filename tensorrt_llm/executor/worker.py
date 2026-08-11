@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 import threading
 import time
 import traceback
@@ -133,6 +134,16 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 ) and self._executor_config.checkpoint_loader is not None:
                     self._executor_config.checkpoint_loader.cleanup()
                     self._executor_config.checkpoint_loader = None
+
+        # MegaMoE's NVLink symmetric-memory activation workspaces are
+        # rendezvoused over the EP group, so they must go before the
+        # destroy_process_group() below. Probed via sys.modules so a
+        # non-MegaMoE run does not import the MoE stack to release an
+        # empty cache.
+        mega_moe = sys.modules.get(
+            "tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm")
+        if mega_moe is not None:
+            mega_moe.release_symm_buffer_cache()
 
         # Destroy torch distributed process groups so that NCCL communicators
         # are torn down cleanly before MPI session shutdown and process exit.
