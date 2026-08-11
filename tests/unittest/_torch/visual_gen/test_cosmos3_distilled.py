@@ -831,7 +831,7 @@ class TestDistilledConditioningAnchor:
         latents = torch.zeros(1, 4, 3, 2, 2, dtype=torch.float32)
 
         with pytest.raises(RuntimeError, match="must match the denoised latents"):
-            post_step_fn(latents)
+            post_step_fn(latents, None)
 
     def test_anchor_accepts_matching_dtype(self):
         pipeline = _bare_pipeline(sampling=_distilled_policy())
@@ -840,7 +840,7 @@ class TestDistilledConditioningAnchor:
         )
         latents = torch.zeros(1, 4, 3, 2, 2, dtype=torch.bfloat16)
 
-        post_step_fn(latents)
+        post_step_fn(latents, None)
         assert torch.all(latents[:, :, 0:1] == self.CLEAN)
 
     def _run_denoise(self, with_anchor: bool):
