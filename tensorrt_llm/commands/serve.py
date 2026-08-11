@@ -362,9 +362,17 @@ def _publish_bound_address(report_addr: Optional[str], host: str,
     The caller is responsible for making the path unique per run: a stale file
     from an earlier run points at a dead server, which fails far less obviously
     than a port conflict.
+
+    A wildcard bind host is replaced by this machine's hostname, since readers
+    use the published value as a URL authority and cannot dial 0.0.0.0 or ::.
     """
     if not report_addr:
         return
+    if host in ("0.0.0.0", "::", ""):  # nosec B104 - reporting, not binding
+        resolved = socket.gethostname()
+        logger.info(f"Reporting hostname {resolved} instead of wildcard bind "
+                    f"address {host!r}, which a reader cannot dial")
+        host = resolved
     report_addr = os.path.abspath(report_addr)
     parent = os.path.dirname(report_addr)
     if parent:
@@ -381,10 +389,11 @@ def _publish_bound_address(report_addr: Optional[str], host: str,
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, report_addr)
-    except BaseException:
+    finally:
+        # A successful replace already consumed tmp_path; this only cleans up
+        # after a failed write so a partial file is not left behind.
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
-        raise
     logger.info(f"Reported bound address {host}:{port} to {report_addr}")
 
 
@@ -592,6 +601,16 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
+    # re-execs this command line verbatim, so with port 0 every frontend binds
+    # its own kernel-assigned port instead of sharing one, and every frontend
+    # also re-runs _publish_bound_address, leaving the reader with whichever
+    # child wrote last.
+    if (port == 0 or report_addr) and multi_frontend.num_frontends > 1:
+        raise click.BadParameter(
+            "port 0 and --report_addr are only supported with a single serving "
+            f"frontend, but num_serve_frontends={multi_frontend.num_frontends}."
+        )
     if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
         # The Responses API store is per-process in-memory: with several
         # frontends behind one SO_REUSEPORT port, a follow-up request may

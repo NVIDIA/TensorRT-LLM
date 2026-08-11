@@ -21,7 +21,7 @@ import socket
 import tempfile
 import time
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 from packaging import version
@@ -671,7 +671,9 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
-def wait_for_reported_addr(addr_path, timeout, process=None):
+def wait_for_reported_addr(addr_path: str,
+                           timeout: float,
+                           process=None) -> tuple[str, int]:
     """Read the address a server reported to its --report_addr file.
 
     The file only appears once trtllm-serve has bound its socket, and that
@@ -713,7 +715,7 @@ PORTS_IN_USE = set()
 STATIC_PORT_RANGE_SIZE = 4096
 
 
-def get_ephemeral_port_range():
+def get_ephemeral_port_range() -> Optional[tuple[int, int]]:
     """Return the kernel's ephemeral port range as (low, high), or None.
 
     These are the ports bind(('', 0)) hands out. None means the range could
@@ -736,15 +738,15 @@ def get_ephemeral_port_range():
     return low, high
 
 
-def get_static_port_range():
+def get_static_port_range() -> Optional[tuple[int, int]]:
     """Return a (low, high) window just below the kernel's ephemeral range.
 
     None is returned if the ephemeral range cannot be determined.
 
     Ports here are never handed out by bind(('', 0)), so a port reserved from
     this window cannot be stolen by a sibling process launched with --port 0 --
-    which is exactly how a reserved disagg server port was lost to the test's
-    own worker in https://nvbugs/6567057 and https://nvbugs/6435121.
+    which is how a reserved disaggregated server port was lost to the test's
+    own worker.
     """
     ephemeral_range = get_ephemeral_port_range()
     if ephemeral_range is None:
@@ -756,7 +758,8 @@ def get_static_port_range():
     return low, high
 
 
-def reserve_port_from_range(port_range, source):
+def reserve_port_from_range(port_range: tuple[int, int],
+                            source: str) -> Optional[int]:
     """Probe-bind random ports from an inclusive (low, high) window.
 
     The first port found free is recorded in PORTS_IN_USE and returned;
@@ -801,7 +804,7 @@ def reserve_port_from_range(port_range, source):
     return None
 
 
-def get_free_port_in_ci(max_attempts=100):
+def get_free_port_in_ci(max_attempts: int = 100) -> int:
     """Get a free port from the CI-assigned container port range.
 
     The range is [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1].

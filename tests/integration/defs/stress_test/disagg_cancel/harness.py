@@ -422,6 +422,30 @@ def _parse_injection_schedule(raw_injections: list[Any]) -> list[_InjectionSpec]
     return specs
 
 
+def _worker_id_pid(worker_id: str) -> Optional[int]:
+    """Extract the pid a cluster worker embedded in its worker id.
+
+    DisaggClusterWorker builds the id as
+    ``{role}-{host}:{port}-{time_ms}-{pid}-{rand}``. Only the last two fields
+    are fixed-width in structure, so the pid is read from the tail: a substring
+    search for ``-{pid}-`` would also match inside a host name that contains a
+    dash-delimited digit run, such as ``node-1234-a``.
+
+    Args:
+        worker_id: The ``worker_id`` reported by ``/cluster_info``.
+
+    Returns:
+        The pid, or None if the id does not have the expected shape.
+    """
+    fields = worker_id.rsplit("-", 2)
+    if len(fields) != 3:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
 def _resolve_injection_target(target: str, tracked: list[_TrackedWorker]) -> _TrackedWorker:
     """Map a YAML target string to a tracked worker.
 
@@ -1958,7 +1982,8 @@ class DisaggCancellationStressHarness:
         so the cluster registry is the sole authoritative source. Entries are
         matched on the worker's pid, which ``WorkerInfo.worker_id`` embeds --
         matching on "a port we have not seen before" would be ambiguous while
-        the SIGKILLed worker's stale registration is still being reaped.
+        the SIGKILLed worker's stale registration is still being reaped. See
+        ``_worker_id_pid`` for why the pid is parsed rather than substring-matched.
 
         Args:
             role_key: ``"ctx"`` or ``"gen"``.
@@ -1973,7 +1998,6 @@ class DisaggCancellationStressHarness:
             return None
 
         info_key = "context_servers" if role_key == "ctx" else "generation_servers"
-        pid_marker = f"-{pid}-"
         seen_worker_ids: list[str] = []
         while time.monotonic() < deadline:
             if self.stop_event.is_set() or self.failed_event.is_set():
@@ -1990,7 +2014,7 @@ class DisaggCancellationStressHarness:
                         continue
                     worker_id = str(worker_info.get("worker_id", ""))
                     seen_worker_ids.append(worker_id)
-                    if pid_marker not in worker_id:
+                    if _worker_id_pid(worker_id) != pid:
                         continue
                     try:
                         return int(worker_info["port"])

@@ -1278,7 +1278,7 @@ class DisaggTestCmds(NamedTuple):
 
         # port 0: the disagg server binds a kernel-assigned port and reports it
         # back via --report_addr, so there is no window between choosing a port
-        # here and the server binding it. See https://nvbugs/6526529.
+        # here and the server binding it.
         server_config = {
             "hostname": self.hostname,
             "port": 0,
@@ -1513,13 +1513,18 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
+                # _hostnames_dir is scoped by job, so a new job never sees an
+                # older one's files, but a retry within the same job and the
+                # same server_idx would. Drop the previous attempt's address
+                # first, or the BENCHMARK task connects to a dead port. This
+                # task owns the file exclusively, so removing it here is safe.
+                disagg_addr_path = self._disagg_server_addr_file(server_idx)
+                if os.path.exists(disagg_addr_path):
+                    os.remove(disagg_addr_path)
                 self._generate_disagg_server_config(server_idx)
                 # The config carries port 0; publish the resolved address so
                 # the BENCHMARK task can find the server.
-                disagg_cmd = disagg_cmd + [
-                    "--report_addr",
-                    self._disagg_server_addr_file(server_idx),
-                ]
+                disagg_cmd = disagg_cmd + ["--report_addr", disagg_addr_path]
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,

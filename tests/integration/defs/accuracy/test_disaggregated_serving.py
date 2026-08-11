@@ -199,7 +199,7 @@ def launch_disaggregated_llm(
 
     # Let the kernel assign the port inside trtllm-serve and report it back,
     # rather than reserving one here and racing whoever takes it before the
-    # server binds. See https://nvbugs/6567057 and https://nvbugs/6435121.
+    # server binds.
     disaggregated_server_config["port"] = 0
     disagg_addr_path = os.path.join(temp_dir.name, "disagg_server.addr")
 

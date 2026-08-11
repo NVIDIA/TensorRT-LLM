@@ -323,7 +323,7 @@ async def wait_for_port_released(port):
         return False
 
 
-def get_registered_worker_urls(port):
+def get_registered_worker_urls(port: int) -> tuple[list[str], list[str]]:
     """Return ``(ctx_urls, gen_urls)`` as registered with the disagg server.
 
     Workers launched with ``port=0`` pick their listening port inside the child
@@ -343,7 +343,7 @@ def get_registered_worker_urls(port):
     assert info_resp.status_code == 200, f"cluster_info returned {info_resp.status_code}"
     workers = info_resp.json().get("current_workers", {})
 
-    def _urls(role_key):
+    def _urls(role_key: str) -> list[str]:
         return sorted(f"http://{w['host']}:{w['port']}" for w in workers.get(role_key, []))
 
     return _urls("context_servers"), _urls("generation_servers")
