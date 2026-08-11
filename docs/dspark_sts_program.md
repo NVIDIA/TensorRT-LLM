@@ -604,6 +604,12 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 2. **`scheduler_v2.py` 是 use_python_scheduler 两档共走的路径**——解释当晚二分"python/C++ 调度器都一样"。
 3. 调度门 = `kv_cache_manager.try_allocate_generation(req)` → `kv_cache.resize(...)` 在第 ~62 个 gen 请求失败,而 kv_cache_util 仅 0.014、字节配额 35→60GiB 不敏感——**耗尽的是某个按 maxbs 定容、每 gen 请求消耗 ~2 份的结构**(嫌疑:SWA/压缩器窗口池的 scratch-reuse 定容与运行时逐请求分配不一致;首波满批因 ctx 阶段不走 gen 分配)。深挖 agent 与 no-spec@maxbs256 象限实验进行中。
 
+### #34 定案:窗口池槽数按"每请求 1 块"定容,运行时每请求锁 2 块(08-10 20:50)
+
+**机制(算术闭合)**:DSv4 的窗口池组(SWA+COMPRESSOR_KV+COMPRESSOR_SCORE,窗口=128+max_draft_len=133 token)是固定槽分配器,槽数被钉在下限 `min_slots≈1.05×maxbs`——①比例定容用 `typical_seq_len=max_seq_len`(serve 推断 1M)把配额喂给全注意力池,窗口池饿到下限(kv_cache_manager_v2.py:1775-1779);②下限按 history=0 的"刚起步 decode"建模 → 每请求 1 块(kv_cache_manager_v2.py:1803-1812 → _storage_manager.py:909-1001)。运行时窗口 133>块 128 → 每 gen 请求锁 2(偶 3)块(_life_cycle_registry.py:38-51)。**容量 = 1.05·maxbs/2.07 ≈ 0.51·maxbs**:maxbs=128 预测 63-65/实测 61-63;maxbs=256 预测 131-135/实测 131-136。配额不敏感(下限无配额项)、kv_util 0.014 是 token 口径(窗口池实为 100% 锁死)、首波满批(短 prompt 1 块,h>128 才要第二块)、spec 降级 vs no-spec 死锁(接受方差去相位 vs +1/步全队锁相集体撞边界)——全部观测闭合。字节估算器还漏了 +draft 窗口放大(cache_manager.py:1316-1326),但字节不是绑定资源。
+
+**修复**:A(首选)min-slots 按稳态 decode(2-3 块/请求)建模;B 估算器补 draft(须配 A);C `typical_seq_len` 不默认 max_seq_len / 部署侧显式设 max_seq_len 解钉(判别实验在跑)。上游三报:下限建模、估算器漏项、no-spec 高并发死锁崩溃(报错信息误导)。附:python-scheduler 旗标在 v2 下是 no-op(_util.py:2618),DSv4 强制 v2 管理器——当晚两条二分腿均为无效对照,已修订。
+
 ### 产品线终局判决:Pro@DEP8 置信度调度全面转正(08-10 13:50)
 
 Flash 三臂翻案后,Pro@DEP8 终局(maxbs=256 解锁满批 + `postfix_pro_table.json` 新表,scheduled vs notrim,双节点臂序对调,每 cell n=10):
