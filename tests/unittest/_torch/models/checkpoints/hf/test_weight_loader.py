@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import mmap
 import os
 from unittest import mock
 
@@ -309,16 +310,16 @@ def test_prefetch_one_file_reports_full_file_in_bounded_windows(tmp_path, monkey
     # once, including a trailing partial window.
     from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
-    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     file = tmp_path / "model.safetensors"
-    payload = os.urandom(3 * 1024 + 137)  # not a multiple of the window size
+    payload = os.urandom(3 * mmap.PAGESIZE + 137)  # not a multiple of the window size
     file.write_bytes(payload)
 
     reported: list[int] = []
     HfWeightLoader()._prefetch_one_file(str(file), report_progress=reported.append)
 
     assert sum(reported) == len(payload)
-    assert max(reported) <= 1024
+    assert max(reported) <= mmap.PAGESIZE
 
 
 def test_prefetch_one_file_chunked_fallback_when_populate_unsupported(tmp_path, monkeypatch):
@@ -326,17 +327,17 @@ def test_prefetch_one_file_chunked_fallback_when_populate_unsupported(tmp_path, 
     # readinto fallback is exercised even on kernels that support population.
     from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
-    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "populate_file_pages", lambda *args, **kwargs: 0)
     file = tmp_path / "model.safetensors"
-    payload = os.urandom(2 * 1024 + 57)
+    payload = os.urandom(2 * mmap.PAGESIZE + 57)
     file.write_bytes(payload)
 
     reported: list[int] = []
     HfWeightLoader()._prefetch_one_file(str(file), report_progress=reported.append)
 
     assert sum(reported) == len(payload)
-    assert max(reported) <= 1024
+    assert max(reported) <= mmap.PAGESIZE
 
 
 def test_prefetch_one_file_resumes_reads_after_partial_populate(tmp_path, monkeypatch):
@@ -345,16 +346,16 @@ def test_prefetch_one_file_resumes_reads_after_partial_populate(tmp_path, monkey
     # reported exactly once, none twice.
     from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
-    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
 
     def partial_populate(file_name, window_bytes, on_window=None):
         if on_window is not None:
-            on_window(1024)
-        return 1024
+            on_window(mmap.PAGESIZE)
+        return mmap.PAGESIZE
 
     monkeypatch.setattr(wl, "populate_file_pages", partial_populate)
     file = tmp_path / "model.safetensors"
-    payload = os.urandom(3 * 1024 + 137)
+    payload = os.urandom(3 * mmap.PAGESIZE + 137)
     file.write_bytes(payload)
 
     reported: list[int] = []
@@ -374,7 +375,7 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     # fire for every chunk.
     from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
-    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "_PREFETCH_LOG_INTERVAL_SEC", 0.0)
     # prefetch_files shards its input across local MPI ranks; pin to a single
     # rank so the asserted file set does not depend on how tests are launched.
@@ -383,7 +384,7 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     files = []
     for i in range(3):
         file = tmp_path / f"model-0000{i}-of-00003.safetensors"
-        file.write_bytes(os.urandom(4 * 1024))
+        file.write_bytes(os.urandom(4 * mmap.PAGESIZE))
         files.append(str(file))
 
     with mock.patch.object(wl.logger, "info") as info:
