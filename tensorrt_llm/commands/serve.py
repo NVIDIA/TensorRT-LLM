@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -51,8 +51,11 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.visual_gen import VisualGen
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+if TYPE_CHECKING:
+    # Type-only: the visual_gen tree is imported lazily inside the VisualGen
+    # code paths so plain LLM serving never pays its import cost.
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -883,7 +886,7 @@ def launch_visual_gen_server(
         host: str,
         port: int,
         model: str,
-        visual_gen_args: Optional[VisualGenArgs] = None,
+        visual_gen_args: Optional["VisualGenArgs"] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
 ):
@@ -901,6 +904,7 @@ def launch_visual_gen_server(
     # races the same port and all but one die EADDRINUSE. VisualGen() on a
     # worker rank never returns (sys.exit in __init__).
     from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    from tensorrt_llm.visual_gen import VisualGen
     ext = _detect_external_launch()
     if ext is not None and ext[0] != 0:
         VisualGen(model=model, args=visual_gen_args)
@@ -1523,6 +1527,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
+        from tensorrt_llm.visual_gen.args import VisualGenArgs
+
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
                                   if visual_gen_args is not None else None)
 

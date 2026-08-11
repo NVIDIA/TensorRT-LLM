@@ -65,9 +65,11 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadin
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
+    NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
@@ -352,6 +354,11 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert result == "loaded"
     backend.load_weights.assert_called_once_with(weights, True)
     assert configurable_moe._weights_transformed is False
+
+
+def test_moe_nvfp4_activation_quantization_capability():
+    assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
+    assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations
 
 
 def test_marlin_moe_repack_is_transform_stage():
@@ -820,13 +827,16 @@ def generate_element_wise_test_params() -> List:
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
-            [None, QuantAlgo.NVFP4],
+            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
         ):
             if skip_reason:
                 continue
             if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
                 continue
             if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
+                continue
+            # INT8 weight-only per-channel non-gated MoE is CUTLASS-path only.
+            if quant_algo == QuantAlgo.W8A16 and backend_type != MoeBackendType.CUTLASS:
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (

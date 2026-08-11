@@ -74,10 +74,14 @@ is validated only without block reuse (Mixed cache manager).
 from __future__ import annotations
 
 import copy
+import gc
+import json
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from contextlib import ExitStack
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from ..._utils import is_sm_100f
@@ -95,7 +99,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model
+from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
@@ -135,7 +139,9 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # an FP8 (e4m3) weight with 128x128 block scales roughly halves those bytes.
 # The MLA projections and the routed MXFP4 experts are left untouched (the KDA
 # q/k/v/g/o projections have their own switch below). The FP8 weight read is
-# lossy relative to BF16; set this to "0" to keep BF16.
+# lossy relative to BF16, so it is opt-in: set this to "1" to trade accuracy
+# for decode bandwidth. Default "0" keeps BF16, which is what the published
+# accuracy numbers are measured against.
 _KIMI_K3_FP8_WEIGHT_READ_ENV = "KIMI_K3_FP8_WEIGHT_READ"
 
 # Also read the KDA linear-attention q/k/v/g/o projections at FP8 block-scale.
@@ -176,6 +182,23 @@ _KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
 # parallel layout (on under attention DP, off under TP — see the conversion
 # helper's comment); set 0/1 to force either.
 _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
+
+
+def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
+    """Resolve the FP8 weight-read switches into (master, kda, kda_glue).
+
+    The master switch is opt-in: FP8 weight reads are lossy relative to BF16,
+    so a default run keeps BF16 and matches the published accuracy numbers.
+    The KDA and KDA-glue switches only narrow an already-enabled master, so
+    they stay default-on and are inert while the master is off.
+    """
+    fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "0") not in (
+        "",
+        "0",
+    )
+    kda_fp8 = fp8_weight_read and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
+    kda_glue_fp8 = kda_fp8 and os.environ.get(_KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
+    return fp8_weight_read, kda_fp8, kda_glue_fp8
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +403,28 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         return out.reshape(out_shape)
 
 
+def _swap_linear_to_fp8_weight_read(
+    parent: nn.Module,
+    attr: str,
+    linear_types: Tuple[type, ...] = (nn.Linear,),
+) -> int:
+    """Replace ``parent.<attr>`` with an FP8 weight-read module if it is a
+    plain linear of one of ``linear_types``; return the number of modules
+    converted (0 or 1), so callers can accumulate a conversion count.
+
+    Frees the original BF16 weight storage immediately: the loader holds a
+    transient name->Parameter map that keeps it alive until load returns, so
+    without this the FP8 copy is purely additive and fragments the pool the
+    FP8 GEMM autotuner and KV-cache init need.
+    """
+    child = getattr(parent, attr, None)
+    if not isinstance(child, linear_types):
+        return 0
+    setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
+    child.weight.data = child.weight.data.new_empty(0)
+    return 1
+
+
 def _convert_moe_mlps_to_fp8_weight_read(
     model: nn.Module, include_fused_gate_up: bool = True
 ) -> int:
@@ -391,21 +436,7 @@ def _convert_moe_mlps_to_fp8_weight_read(
     (MLA/KDA), the routed MXFP4 experts and the dense layer-0 MLP are left in
     BF16. Returns the number of projections converted.
     """
-    import gc
-
     count = 0
-
-    def _swap(parent: nn.Module, attr: str) -> None:
-        nonlocal count
-        child = getattr(parent, attr, None)
-        if isinstance(child, nn.Linear):
-            setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
-            # Release the original BF16 weight storage now. The loader holds a
-            # transient name->Parameter map that keeps it alive until load
-            # returns, so without this the FP8 copy is purely additive and
-            # fragments the pool the FP8 GEMM autotuner and KV-cache init need.
-            child.weight.data = child.weight.data.new_empty(0)
-            count += 1
 
     for layer in model.layers:
         moe = getattr(layer, "block_sparse_moe", None)
@@ -424,9 +455,9 @@ def _convert_moe_mlps_to_fp8_weight_read(
                 else ("gate_proj", "up_proj", "down_proj")
             )
             for attr in shared_attrs:
-                _swap(shared, attr)
+                count += _swap_linear_to_fp8_weight_read(shared, attr)
         for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
-            _swap(moe, attr)
+            count += _swap_linear_to_fp8_weight_read(moe, attr)
 
     # Return the freed BF16 blocks to the driver so the raw (non-caching-
     # allocator) allocations made during executor creation succeed on the
@@ -462,8 +493,6 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
     ``o_proj`` reads the decode-kernel output (not the shared hidden) and is
     converted on its own. Returns the number of projections converted.
     """
-    import gc
-
     count = 0
 
     for layer in model.layers:
@@ -509,11 +538,7 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
 
         # o_proj reads the decode-kernel output, so it is not part of the fused
         # hidden-reading group; convert it on its own.
-        o_proj = getattr(mixer, "o_proj", None)
-        if isinstance(o_proj, nn.Linear):
-            setattr(mixer, "o_proj", _Fp8BlockScaleWeightReadLinear.from_linear(o_proj))
-            o_proj.weight.data = o_proj.weight.data.new_empty(0)
-            count += 1
+        count += _swap_linear_to_fp8_weight_read(mixer, "o_proj")
 
     if count:
         gc.collect()
@@ -608,21 +633,7 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     ``forward``), with no FP8 dequant path. Returns the number of projections
     converted.
     """
-    import gc
-
     count = 0
-
-    def _swap(parent: nn.Module, attr: str) -> None:
-        nonlocal count
-        child = getattr(parent, attr, None)
-        if isinstance(child, (nn.Linear, TrtllmLinear)):
-            setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
-            # Free the original BF16 storage now (as in the MLP/KDA conversions
-            # above): the loader's transient name->Parameter map would otherwise
-            # keep it alive until load returns, making the FP8 copy purely
-            # additive on the tight DEP16 pool.
-            child.weight.data = child.weight.data.new_empty(0)
-            count += 1
 
     for layer in model.layers:
         # MLA layers are the non-KDA layers (each layer is exactly one of the
@@ -635,7 +646,9 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
         # g_proj exists only when the MLA output gate is enabled; a missing
         # attr is a safe no-op.
         for attr in ("q_a_proj", "q_b_proj", "o_proj", "g_proj"):
-            _swap(mixer, attr)
+            count += _swap_linear_to_fp8_weight_read(
+                mixer, attr, linear_types=(nn.Linear, TrtllmLinear)
+            )
 
     if count:
         gc.collect()
@@ -664,9 +677,12 @@ class KimiK3MoERuntime(nn.Module):
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
         self.moe_hidden_size = cfg.routed_expert_hidden_size
-        assert self.moe_hidden_size is not None, (
-            "Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)"
-        )
+        # ValueError (not assert): these guard unsupported checkpoint
+        # configurations and must stay active under ``python -O``.
+        if self.moe_hidden_size is None:
+            raise ValueError("Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)")
+        if not getattr(cfg, "latent_moe_use_norm", False):
+            raise ValueError("Kimi K3 runtime expects latent_moe_use_norm=True")
 
         situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
         situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
@@ -762,9 +778,6 @@ class KimiK3MoERuntime(nn.Module):
         )
         self.routed_expert_up_proj = nn.Linear(
             self.moe_hidden_size, cfg.hidden_size, bias=False, dtype=dtype
-        )
-        assert getattr(cfg, "latent_moe_use_norm", False), (
-            "Kimi K3 runtime expects latent_moe_use_norm=True"
         )
         # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
         # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
@@ -986,8 +999,13 @@ class KimiKDARuntime(nn.Module):
         self._w_q_t = self._w_k_t = self._w_v_t = None
         self._A_log_f32 = self._dt_bias_f32 = self._onorm_w_f32 = None
         # Persistent batch-row-dense staging for the fused decode kernel's
-        # per-section conv windows (lazily sized to the pool slot count).
+        # per-section conv windows. Sized once, on the first decode call,
+        # to the conv pool's slot count and never reallocated (see
+        # ``_forward_decode``).
         self._cs_dense: Optional[torch.Tensor] = None
+        # fp32 [dim, W] conv weights for the fused verify kernel, prebuilt
+        # by ``_build_mtp_conv_weights()`` at weight-load finalize time.
+        self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
     def finalize_decode_weights(self) -> None:
         """Build the decode fast-path constants (once, after weight load).
@@ -1056,7 +1074,7 @@ class KimiKDARuntime(nn.Module):
         self._onorm_w_f32 = mixer.o_norm.weight.detach().float().contiguous()
         # Build the fused-verify conv constants eagerly too, so the first
         # verify call never allocates (a capture-unsafe lazy allocation).
-        self._get_mtp_conv_weights()
+        self._build_mtp_conv_weights()
 
     def finalize_decode_weights_fp8(self) -> None:
         """FP8 counterpart of ``finalize_decode_weights()``.
@@ -1343,12 +1361,13 @@ class KimiKDARuntime(nn.Module):
         W = mixer.conv_size
 
         # Allocated ONCE at the pool slot count (== per-rank max batch on
-        # the Mixed manager) and never reallocated: captured CUDA graphs
-        # hold this pointer, so a later realloc would leave earlier graphs
-        # writing into freed memory. Footprint: slots x ~9(H=6)..222(H=96)
-        # KB per layer.
+        # the Mixed manager; ``slot_indices`` are distinct pool rows and
+        # this is the plain one-token-per-request path, so B never exceeds
+        # it) and never reallocated: captured CUDA graphs hold this
+        # pointer, so a realloc would leave earlier graphs writing into
+        # freed memory. Footprint: slots x ~9(H=6)..222(H=96) KB per layer.
         buf = self._cs_dense
-        if buf is None or buf.shape[1] < B:
+        if buf is None:
             if torch.cuda.is_current_stream_capturing():
                 # Never allocate inside CUDA graph capture; the reference
                 # path is capture-safe (just slower).
@@ -1359,6 +1378,15 @@ class KimiKDARuntime(nn.Module):
                 3, max(conv_pool.shape[0], B), d, W - 1, dtype=torch.bfloat16, device=x2d.device
             )
             self._cs_dense = buf
+        else:
+            # Fail loudly if the sizing invariant ever breaks: silently
+            # reallocating here would hand previously captured CUDA graphs
+            # a dangling pointer.
+            assert buf.shape[1] >= B, (
+                f"KDA decode staging buffer holds {buf.shape[1]} rows but the "
+                f"decode batch is {B}; reallocating would corrupt previously "
+                f"captured CUDA graphs"
+            )
 
         if self._in_proj_weight is not None:
             # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
@@ -1600,26 +1628,28 @@ class KimiKDARuntime(nn.Module):
         o = out.view(num_decodes, num_steps, H, mixer.head_dim)
         return self._output_gate_and_proj(x, o)
 
-    def _get_mtp_conv_weights(self):
+    def _build_mtp_conv_weights(self) -> None:
+        """Prebuild the fp32 ``[dim, W]`` conv weights for the fused verify
+        kernel (once, at weight-load finalize time). Building them lazily
+        at first use would allocate at runtime; under CUDA graph capture
+        that bakes capture-pool pointers into the cached tuple."""
+        mixer = self.mixer
+        self._mtp_conv_weights = tuple(
+            conv.weight.detach().squeeze(1).float().contiguous()
+            for conv in (mixer.q_conv1d, mixer.k_conv1d, mixer.v_conv1d)
+        )
+
+    def _get_mtp_conv_weights(self) -> Tuple[torch.Tensor, ...]:
         """fp32 ``[dim, W]`` conv weights for the fused verify kernel,
-        computed once per runtime instance."""
-        cached = getattr(self, "_mtp_conv_weights", None)
+        prebuilt by ``_build_mtp_conv_weights()``."""
+        cached = self._mtp_conv_weights
         if cached is None:
-            if torch.cuda.is_current_stream_capturing():
-                # Allocating inside CUDA graph capture would bake
-                # capture-pool pointers into the cached tuple; the constants
-                # are normally prebuilt by _build_decode_kernel_constants().
-                raise RuntimeError(
-                    "Kimi K3 fused-verify conv weights were not prebuilt "
-                    "before CUDA graph capture; call finalize_decode_weights"
-                    "() / finalize_decode_weights_fp8() after weight load."
-                )
-            mixer = self.mixer
-            cached = tuple(
-                conv.weight.detach().squeeze(1).float().contiguous()
-                for conv in (mixer.q_conv1d, mixer.k_conv1d, mixer.v_conv1d)
+            raise RuntimeError(
+                "Kimi K3 fused-verify conv weights were not prebuilt; call "
+                "_build_mtp_conv_weights() (done by load_weights() and by "
+                "finalize_decode_weights() / finalize_decode_weights_fp8()) "
+                "after weight load and before the first verify step."
             )
-            self._mtp_conv_weights = cached
         return cached
 
     def _forward_verify_sequential(
@@ -2118,7 +2148,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     # correspondingly longer load).
     # ------------------------------------------------------------------
 
-    def _trunk_parameters(self):
+    def _trunk_parameters(self) -> Dict[str, torch.nn.Parameter]:
         """Named parameters of the trunk only. Spec-dec draft modules
         (e.g. the DFlash drafter attached by SpecDecOneEngineForCausalLM)
         live in a separate checkpoint loaded by
@@ -2132,7 +2162,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             and not name.endswith(_KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES)
         }
 
-    def checkpoint_name_plan(self, prefix: str):
+    def checkpoint_name_plan(
+        self, prefix: str
+    ) -> Tuple[Dict[str, str], Set[str], List[Tuple[int, KimiK3MoERuntime, str]]]:
         """Return ``(name_map, expected_keys, expert_jobs)``.
 
         ``name_map`` maps every model parameter name to its checkpoint key
@@ -2182,26 +2214,22 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             expert_jobs.append((layer_idx, moe, base))
         return name_map, expected_keys, expert_jobs
 
-    def load_weights(self, weights: Dict):
-        from .modeling_utils import run_concurrently
-
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
-
-        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
-        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
-        # instead, so context can project directly into the FMHA layout and
-        # absorbed decode can take zero-copy K/V views.
-        mla_mixers = [
-            layer.self_attn.mixer
-            for layer in self.model.layers
-            if not getattr(layer, "is_kda", True)
-        ]
-        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
-
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
-        # ---- key-set validation (both directions) ----
+        self._validate_checkpoint_keys(weights, expected_keys, prefix)
+        num_params = self._load_trunk_params(weights, params, name_map)
+        self._load_expert_slices(weights, expert_jobs)
+        self._finalize_weight_load(num_params, len(expert_jobs))
+
+    def _validate_checkpoint_keys(
+        self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
+    ) -> None:
+        """Key-set validation (both directions): every expected key must be
+        present; unmatched checkpoint keys (beyond the expected leftovers)
+        only warn."""
         ckpt_keys = set(weights.keys())
         relevant_ckpt_keys = {
             k
@@ -2227,6 +2255,26 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"Kimi K3 load_weights: {len(surprising)} unmatched "
                 f"checkpoint keys, e.g. {surprising[:10]}"
             )
+
+    def _load_trunk_params(
+        self,
+        weights: Dict[str, torch.Tensor],
+        params: Dict[str, torch.nn.Parameter],
+        name_map: Dict[str, str],
+    ) -> int:
+        """Load every non-expert trunk parameter concurrently (with the
+        per-parameter TP-shard / pad / fuse conversions) and return the
+        number of parameters loaded."""
+        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
+        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
+        # instead, so context can project directly into the FMHA layout and
+        # absorbed decode can take zero-copy K/V views.
+        mla_mixers = [
+            layer.self_attn.mixer
+            for layer in self.model.layers
+            if not getattr(layer, "is_kda", True)
+        ]
+        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
 
         device = next(self.parameters()).device
 
@@ -2428,6 +2476,23 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             param.data.copy_(src.to(param.dtype))
 
+        param_jobs = [(name, params[name]) for name in name_map]
+        run_concurrently(load_param, param_jobs, num_workers=8)
+
+        logger.info(
+            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
+        )
+        return len(param_jobs)
+
+    def _load_expert_slices(
+        self,
+        weights: Dict[str, torch.Tensor],
+        expert_jobs: List[Tuple[int, KimiK3MoERuntime, str]],
+    ) -> None:
+        """Load the rank-local MXFP4 expert slices of every MoE layer into
+        the backend expert slots, then verify every slot was filled."""
+        device = next(self.parameters()).device
+
         def load_expert(
             moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
         ):
@@ -2457,13 +2522,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     lambda key: _materialize(weights[key]),
                 )
 
-        param_jobs = [(name, params[name]) for name in name_map]
-        run_concurrently(load_param, param_jobs, num_workers=8)
-
-        logger.info(
-            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
-        )
-
         # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the
         # whole load, so pages it touches cannot be dropped until the load
@@ -2476,13 +2534,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         ckpt_dir = getattr(self.model_config.pretrained_config, "_name_or_path", None)
         index_path = os.path.join(ckpt_dir or "", "model.safetensors.index.json")
         if expert_jobs and ckpt_dir and os.path.isfile(index_path):
-            import json as _json
-            from contextlib import ExitStack
-
-            from safetensors import safe_open
-
             with open(index_path) as f:
-                weight_map = _json.load(f)["weight_map"]
+                weight_map = json.load(f)["weight_map"]
             per_file: Dict[str, list] = {}
             split_file_jobs = []
             for layer_idx, moe, base in expert_jobs:
@@ -2558,6 +2611,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             backend._weights_transformed = False
 
+    def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
+        """Post-load finalization: build the KDA decode fast-path constants
+        and apply the FP8 weight-read conversions (all behind their env
+        switches)."""
         # FP8 weight-read master switch (see the conversion block below).
         # The KDA conversion replaces the decode in-projection GEMV with a
         # fused FP8 qkvg GEMM in the mixer decode path, so when it is enabled
@@ -2568,9 +2625,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # the bf16 wrapper fast path; KIMI_K3_KDA_GLUE_FP8=1 instead rebuilds
         # the wrapper fast path on top of the FP8 modules after the
         # conversion (finalize_decode_weights_fp8), so neither is traded away.
-        fp8_weight_read = is_sm_100f() and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "1") != "0"
-        kda_fp8 = fp8_weight_read and os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_KDA_ENV, "1") != "0"
-        kda_glue_fp8 = kda_fp8 and os.environ.get(_KIMI_K3_KDA_GLUE_FP8_ENV, "1") != "0"
+        fp8_weight_read, kda_fp8, kda_glue_fp8 = _resolve_fp8_weight_read_gates()
 
         # Build the KDA decode fast-path constants (fused in-projection
         # weight views + kernel-layout conv weights + fp32 params). Must
@@ -2581,9 +2636,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 if not kda_fp8:
                     layer.self_attn.finalize_decode_weights()
                 num_kda_fused += int(layer.self_attn._in_proj_weight is not None)
+                # The fused-verify conv constants are needed on every
+                # configuration that can reach _forward_verify_fused,
+                # including ones where neither finalize variant runs (e.g.
+                # FP8 KDA weight read with the fused decode glue disabled),
+                # and are never computed lazily (a first verify under CUDA
+                # graph capture must not allocate). Build them
+                # unconditionally; three small fp32 tensors per layer.
+                layer.self_attn._build_mtp_conv_weights()
         logger.info(
-            f"Kimi K3: loaded {len(param_jobs)} parameters and the expert "
-            f"slices of {len(expert_jobs)} MoE layers; fused decode "
+            f"Kimi K3: loaded {num_params} parameters and the expert "
+            f"slices of {num_moe_layers} MoE layers; fused decode "
             f"in-projections on {num_kda_fused} KDA layers"
         )
 
