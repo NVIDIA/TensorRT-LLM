@@ -78,8 +78,7 @@ import gc
 import json
 import os
 from contextlib import ExitStack
-from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set,
-                    Tuple)
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple
 
 import torch
 from safetensors import safe_open
