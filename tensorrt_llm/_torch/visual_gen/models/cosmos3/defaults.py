@@ -17,9 +17,10 @@
 Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 """
 
-from typing import Dict
+from typing import Dict, Iterable
 
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm.inputs.media_io import sniff_media_kind
 
 # ---------------------------------------------------------------------------
 # Constant tables
@@ -35,6 +36,71 @@ COSMOS3_720P_PARAMS = {
     "frame_rate": 24.0,
 }
 
+COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES = (0, 1)
+COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
+
+
+# ---------------------------------------------------------------------------
+# Conditioning-value normalizers / validators. Declared as the ``validator``
+# of the matching extra-param specs below, so invalid values 400 at preflight;
+# the pipeline reuses them at run time to normalize the same inputs.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_condition_video_latent_indexes(
+    indexes: Iterable[int] | None,
+) -> tuple[int, ...]:
+    if indexes is None:
+        return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
+    values = []
+    for index in indexes:
+        # Strict: reject non-integers instead of silently truncating (1.9 -> 1)
+        # or TypeError-ing on None. Integral floats (JSON emitters) coerce.
+        if isinstance(index, bool) or not isinstance(index, (int, float)):
+            raise ValueError(
+                f"Cosmos3 condition_video_latent_indexes must be integers, got {index!r}."
+            )
+        if isinstance(index, float):
+            if not index.is_integer():
+                raise ValueError(
+                    f"Cosmos3 condition_video_latent_indexes must be integers, got {index!r}."
+                )
+            index = int(index)
+        values.append(index)
+    normalized = tuple(values)
+
+    if not normalized:
+        raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
+    if any(index < 0 for index in normalized):
+        raise ValueError(
+            f"Cosmos3 condition_video_latent_indexes must be non-negative, got {normalized}."
+        )
+    return normalized
+
+
+def _normalize_condition_video_keep(keep: str | None) -> str:
+    normalized = str(keep or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+    if normalized not in {"first", "last"}:
+        raise ValueError("Cosmos3 condition_video_keep must be either first or last.")
+    return normalized
+
+
+def _validate_output_type(output_type: str) -> None:
+    if output_type not in ("video", "image"):
+        raise ValueError(f"Cosmos3 output_type must be 'video' or 'image', got {output_type!r}.")
+
+
+def _validate_video_reference(video) -> None:
+    """Preflight for the ``video`` extra param: encoded MP4/AVI bytes."""
+    if not video:
+        raise ValueError("Cosmos3 video reference bytes are empty.")
+    if sniff_media_kind(video) != "video":
+        raise ValueError(
+            "Cosmos3 video reference bytes are not a recognized video "
+            "container (supported: MP4/AVI)."
+        )
+
+
 # Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
@@ -45,15 +111,67 @@ COSMOS3_T2I_PARAMS = {
     "guidance_interval": (400.0, 1000.0),
 }
 
-# Fields merged by the executor into every request. Mode-dependent values
-# remain None until infer() selects the request mode; key membership also
-# declares these fields supported during request validation.
-COSMOS3_PIPELINE_DEFAULTS = {
-    **COSMOS3_720P_PARAMS,
-    "height": None,
-    "width": None,
-    "num_inference_steps": None,
-    "guidance_scale": None,
+# Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
+# model-card I2V command (T2V mirrors it — the model card documents I2V only);
+# ``flow_shift`` rides the checkpoint-declared native flow schedule. T2I values
+# are the cosmos-framework t2i mode defaults at Edge's native resolution
+# (480p at 1:1 aspect), with full-range CFG.
+COSMOS3_EDGE_VIDEO_PARAMS = {
+    "height": 480,
+    "width": 832,
+    "num_inference_steps": 50,
+    "guidance_scale": 5.0,
+    "max_sequence_length": 4096,
+    "num_frames": 121,
+    "frame_rate": 24.0,
+    "flow_shift": 3.0,
+}
+
+COSMOS3_EDGE_T2I_PARAMS = {
+    "height": 640,
+    "width": 640,
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "guidance_interval": None,
+}
+
+# Model-card validated envelope for Edge; advisory only (the reference
+# runtime accepts a wider range), surfaced as a log line per request.
+COSMOS3_EDGE_ENVELOPE = {
+    "num_frames": (50, 150),
+    "frame_rate": (12.0, 30.0),
+    "max_sequence_length": 4096,
+    "resolutions": frozenset(
+        {
+            (640, 640),
+            (544, 736),
+            (736, 544),
+            (480, 832),
+            (832, 480),
+            (256, 256),
+            (256, 320),
+            (320, 256),
+            (192, 320),
+            (320, 192),
+        }
+    ),
+}
+
+# (family, mode) → generation defaults. Family is the architecture recipe
+# name resolved from the transformer config; mode is the request's output
+# type — never inferred from the checkpoint name (a task-specialized
+# checkpoint can still be asked to run any mode).
+COSMOS3_GENERATION_DEFAULTS: Dict = {
+    ("qwen3", "video"): COSMOS3_720P_PARAMS,
+    ("qwen3", "image"): COSMOS3_T2I_PARAMS,
+    ("nemotron_dense", "video"): COSMOS3_EDGE_VIDEO_PARAMS,
+    ("nemotron_dense", "image"): COSMOS3_EDGE_T2I_PARAMS,
+}
+
+# Families without an entry get no envelope advisory.
+COSMOS3_ENVELOPES: Dict = {
+    "nemotron_dense": COSMOS3_EDGE_ENVELOPE,
 }
 
 
@@ -70,8 +188,12 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     ),
     "use_system_prompt": ExtraParamSchema(
         type="bool",
-        default=False,
-        description="Whether to use the system prompt.",
+        default=None,
+        description=(
+            "Whether to prepend the system prompt. Unset means the model "
+            "decides: V2V uses it, other modes take the checkpoint's "
+            "declared default."
+        ),
     ),
     "use_guardrails": ExtraParamSchema(
         type="bool",
@@ -84,8 +206,43 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Whether to enable audio generation.",
     ),
     "output_type": ExtraParamSchema(
-        type="Literal['video', 'image']",
+        type="str",
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
+        validator=_validate_output_type,
+    ),
+    "condition_video_latent_indexes": ExtraParamSchema(
+        type="list",
+        default=list(COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES),
+        description=(
+            "Latent frame indexes OF THE OUTPUT video to pin to the encoded "
+            "reference (not source-frame selection). Each latent frame spans 4 "
+            "pixel frames, so the worker consumes the first (or last, per "
+            "condition_video_keep) max(indexes)*4+1 reference frames."
+        ),
+        validator=_normalize_condition_video_latent_indexes,
+    ),
+    "condition_video_keep": ExtraParamSchema(
+        type="str",
+        default=COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+        description="Which side of the input video to use for conditioning: first or last.",
+        validator=_normalize_condition_video_keep,
+    ),
+    "flow_shift": ExtraParamSchema(
+        type="float",
+        default=None,
+        description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
+    ),
+    "video": ExtraParamSchema(
+        type="bytes",
+        default=None,
+        description=(
+            "V2V reference: encoded MP4/AVI bytes (e.g. "
+            "Path(video).read_bytes()). Each worker rank demuxes them from "
+            "memory and NVDEC-decodes only the conditioning window per "
+            "condition_video_latent_indexes / condition_video_keep, resized "
+            "to the output resolution, then VAE-encodes it."
+        ),
+        validator=_validate_video_reference,
     ),
 }

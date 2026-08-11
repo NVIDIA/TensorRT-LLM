@@ -15,7 +15,7 @@ import soundfile
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
-from transformers import AutoProcessor, ProcessorMixin
+from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
@@ -586,6 +586,15 @@ def interleave_mm_placeholders(
     return separator.join(parts)
 
 
+def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
+    """Return whether a tokenizer overrides Hugging Face's Jinja renderer."""
+    apply_chat_template_method = getattr(type(tokenizer), "apply_chat_template",
+                                         None)
+    return (apply_chat_template_method is not None
+            and apply_chat_template_method
+            is not PreTrainedTokenizerBase.apply_chat_template)
+
+
 def resolve_hf_chat_template(
     tokenizer: TokenizerBase,
     processor: ProcessorMixin,
@@ -691,6 +700,7 @@ def apply_chat_template(
 
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
+    - PYTHON: use a tokenizer-native renderer when no Jinja template is declared
     - OPENAI: reconstructs content as list of dicts for the template to handle
     - STRING: keeps flattened text with pre-inserted placeholders
     """
@@ -715,6 +725,21 @@ def apply_chat_template(
 
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
+
+    if (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer)):
+        native_kwargs = dict(chat_template_kwargs or {})
+        if documents is not None:
+            native_kwargs["documents"] = documents
+        return tokenizer.apply_chat_template(
+            conversation,
+            tools=tools,
+            tokenize=enable_tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **native_kwargs,
+        )
 
     hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
                                                 chat_template, tools)

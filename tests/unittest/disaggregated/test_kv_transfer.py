@@ -18,7 +18,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # progress thread is enough here: these tests verify transfer logic, not
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -29,7 +29,13 @@ import tensorrt_llm
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
+
+try:
+    import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
+except ImportError as e:
+    TRANSFER_AGENT_BINDING_IMPORT_ERROR = e
+else:
+    TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
@@ -47,7 +53,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -83,18 +89,20 @@ class KvCacheConfigV2:
     disk_prefetch_num_reqs: int = 4
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
 
 
+@pytest.mark.cpu_only
 def test_token_range_valid():
     tr = TokenRange(start=0, end=10)
     assert tr.start == 0
     assert tr.end == 10
 
 
+@pytest.mark.cpu_only
 def test_token_range_invalid_negative():
     with pytest.raises(ValueError, match="non-negative"):
         TokenRange(start=-1, end=5)
@@ -102,6 +110,7 @@ def test_token_range_invalid_negative():
         TokenRange(start=0, end=-1)
 
 
+@pytest.mark.cpu_only
 def test_token_range_invalid_start_ge_end():
     with pytest.raises(ValueError, match="Invalid range"):
         TokenRange(start=5, end=5)
@@ -109,12 +118,14 @@ def test_token_range_invalid_start_ge_end():
         TokenRange(start=10, end=3)
 
 
+@pytest.mark.cpu_only
 def test_layer_range_valid():
     lr = LayerRange(start=0, end=32)
     assert lr.start == 0
     assert lr.end == 32
 
 
+@pytest.mark.cpu_only
 def test_layer_range_invalid_negative():
     with pytest.raises(ValueError, match="non-negative"):
         LayerRange(start=-1, end=5)
@@ -122,6 +133,7 @@ def test_layer_range_invalid_negative():
         LayerRange(start=0, end=-1)
 
 
+@pytest.mark.cpu_only
 def test_layer_range_invalid_start_ge_end():
     with pytest.raises(ValueError, match="Invalid range"):
         LayerRange(start=5, end=5)
@@ -129,6 +141,7 @@ def test_layer_range_invalid_start_ge_end():
         LayerRange(start=10, end=3)
 
 
+@pytest.mark.cpu_only
 def test_kv_slice_construction():
     tr = TokenRange(0, 128)
     lr = LayerRange(0, 32)
@@ -151,6 +164,7 @@ def test_kv_slice_construction():
     assert s2.is_last_slice is False
 
 
+@pytest.mark.cpu_only
 def test_session_status_enum():
     expected = [
         "INIT",

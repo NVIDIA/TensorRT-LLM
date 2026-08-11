@@ -6,6 +6,8 @@ from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm.mapping import Mapping
 
+pytestmark = pytest.mark.cpu_only
+
 
 class MyError(Exception):
     pass

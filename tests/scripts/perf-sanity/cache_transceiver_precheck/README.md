@@ -16,7 +16,7 @@ starts.
 | Same UCX env vars (incl. the `unset UCX_TLS` cases) | `jenkins/scripts/perf/submit.py` builds the precheck commands from the **same** `ucx_tls_cmd` + `$CTX/GEN_WORKER_ENV_VARS` strings as the worker steps; `slurm_precheck_run.sh` sources the same `slurm_env_setup.sh` (the `UCX_TLS=tcp` fixup) as `slurm_run.sh`. |
 | Same instance count / parallelism | One precheck `srun` per ctx/gen server with the same `-N/--ntasks/--ntasks-per-node/--mpi=pmix` and the same node slices (`-w`) as the real server steps (`slurm_launch_draft.sh`). TP/PP/CP/attention-DP come from the same `worker_config`. |
 | Same transceiver config | `CacheTransceiverConfig(**yaml["worker_config"][role]["cache_transceiver_config"])` — the yaml block is passed through verbatim (backend, `max_tokens_in_buffer`, timeouts, ...). |
-| Same KV cache manager version + transceiver runtime | Explicit per-side `kv_cache_config.use_kv_cache_manager_v2` wins; absent means "auto" and resolves against the model class's `get_model_defaults()`, and `transceiver_runtime: auto` resolves via `get_preferred_transceiver_runtime()` (NIXL-gated) — both through the same llm_utils code serving uses. V2 requires the Python transceiver (the C++ one only supports V1); a V2+CPP combination fails fast with INIT_ERROR. |
+| Same KV cache manager version + transceiver runtime | Explicit per-side `kv_cache_config.use_kv_cache_manager_v2` wins; absent means "auto" and resolves via `get_preferred_kv_cache_manager_version()`, and `transceiver_runtime: auto` resolves via `get_preferred_transceiver_runtime()` (NIXL-gated) — both through the same llm_utils code serving uses. V2 requires the Python transceiver (the C++ one only supports V1); a V2+CPP combination fails fast with INIT_ERROR. |
 
 Asymmetric layouts (ctx dep4 → gen dep16, ctx pp8 → gen tp32, ...) are
 supported: data is seeded per (request, **global** layer) and constant along
@@ -26,13 +26,15 @@ layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`.
 
 ## Enabling / disabling
 
-**On by default** for every disaggregated perf-sanity test. To opt out:
+**Off by default** until the gate is validated on the post-merge stages
+(the precheck is a launch-script gate, not a pytest case, so it cannot be
+waived in `waives.txt` — this default is the waive). To opt in:
 
 - per test yaml:
 
   ```yaml
   cache_transceiver_precheck:
-    enabled: false
+    enabled: true
     # optional overrides (defaults in precheck_config.PRECHECK_DEFAULTS):
     # request_lengths: [1024, 8192]
     # num_requests: 2

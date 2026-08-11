@@ -1,0 +1,67 @@
+# Kimi K3 disaggregated serving - CONTEXT (prefill) server extra LLM-API
+# options (`trtllm-serve <model> --config ctx_config.yaml`).
+#
+# Sizing: DEP16 (attention data-parallel, experts sharded across the
+# 16-rank EP group). K3 is EP-only (ep_size == tp_size, no PP, no TP on
+# linears), so the ctx server must also be a DEP-N deployment. DEP16 is
+# the smallest deployment verified to fit (~193 GiB weights/rank on
+# GB300); a DEP8 ctx would need ~273 GiB/rank for weights alone
+# (extrapolated from the 1.5 TB checkpoint), which does not leave
+# activation headroom on GB300 (288 GiB) and cannot fit GB200 (186 GiB).
+# Ctx/gen parallelism must match: heterogeneous ctx/gen TP is rejected
+# for K3's replicated KDA recurrent state.
+#
+# Hard K3 constraints baked in: no chunked prefill, no KV block reuse
+# (KDA state), tokens_per_block=64 (MLA latent layout), and
+# disable_overlap_scheduler=true (mandatory for any disagg ctx server).
+# K3 ships a custom (trust-remote-code) tokenizer; without this the
+# server starts tokenizer-less and 400s every string prompt with
+# "tokenizer is required to tokenize string prompt".
+trust_remote_code: true
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+pipeline_parallel_size: 1
+disable_overlap_scheduler: true
+enable_chunked_prefill: false
+cuda_graph_config: null
+# Prefill-shaped limits: one 8k-ISL request per attention-DP rank.
+# max_num_tokens must cover the full ISL (no chunked prefill for K3).
+max_batch_size: 1
+max_num_tokens: 8448
+max_seq_len: 8212
+kv_cache_config:
+  # Mandatory for K3 (per-request KDA recurrent state).
+  enable_block_reuse: false
+  # Mandatory for K3 MLA (576, 512) trtllm-gen kernels.
+  tokens_per_block: 64
+  # Conservative starting point proven by the aggregated DEP16 evals; the
+  # ctx server only holds in-flight prefills (MLA latent KV is small:
+  # ~27 KB/token/request), so keep this low to leave prefill activation
+  # headroom. Tune upward only if KV allocation fails.
+  free_gpu_memory_fraction: 0.25
+cache_transceiver_config:
+  backend: NIXL
+  # K3 requires the Python V2 transceiver: `auto` resolves to the C++
+  # runtime, which throws at construction for K3's
+  # MixedMambaHybridCacheManager (LinearAttentionMetadata not found).
+  transceiver_runtime: PYTHON
+  # Must be >= the target max ISL (8192 here).
+  max_tokens_in_buffer: 8448
+  # Fabric-VMM bounce buffer, needed for cross-node transfers on NVLink
+  # domains: V2 sends pool-to-pool by default, but the KV pool is a
+  # plain (non-fabric) allocation, so inter-node cuda_ipc/MNNVL is
+  # impossible and UCX falls back to ~0.4 GB/s host-staged tcp. 512 MiB
+  # measured at ~455 GB/s/GPU. Engages automatically for payloads above
+  # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES (default 2 MiB) — always true for
+  # K3's ~433 MiB per-request recurrent state; no env override needed.
+  #
+  # Sizing: the region must fit ONE request's full payload = fixed KDA
+  # state (433 MiB) + MLA latent for the ISL (~27 KB/token, ~216 MiB at
+  # 8k). At 512 every 8k request is 649 MiB and silently falls back to
+  # the per-fragment tcp path ("[kv-bounce] in-place: transfer 649MiB
+  # exceeds the 512MiB bounce region"). 1024
+  # covers the 8448-token max ISL with headroom.
+  kv_cache_bounce_size_mb: 1024
+# No speculative_config on the ctx server: SA drafting runs on the
+# generation side only (ctx produces the prompt KV + first token).

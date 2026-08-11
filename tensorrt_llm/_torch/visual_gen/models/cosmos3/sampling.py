@@ -18,7 +18,8 @@ Exactly two recipes are supported, read from the checkpoint's
 ``scheduler/scheduler_config.json``:
 
 * ``UniPCMultistepScheduler`` without fixed sigmas — base checkpoints:
-  request tables drive steps/guidance; T2I rebuilds with ``flow_shift=3.0``.
+  request tables drive steps/guidance, and the flow shift comes from the mode
+  table unless the request overrides it.
 * ``FlowMatchEulerDiscreteScheduler`` with ``stochastic_sampling`` enabled
   and a nonempty ``fixed_step_sampler_config.t_list`` — distilled
   checkpoints: the step count is locked to the schedule, classifier-free
@@ -36,6 +37,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
 from tensorrt_llm.logger import logger
@@ -105,9 +107,14 @@ class Cosmos3SamplingPolicy:
     fixed_sigmas: "tuple[float, ...] | None" = None
     # Checkpoint scheduler config, kept for flow-shift rebuilds (UniPC only).
     unipc_base_config: Optional[Any] = None
+    # Checkpoint-declared (model_index): UniPC runs on explicit linear flow
+    # sigmas with a runtime shift instead of the config's karras grid.
+    native_flow_schedule: bool = False
 
     @classmethod
-    def from_scheduler(cls, scheduler: Any) -> "Cosmos3SamplingPolicy":
+    def from_scheduler(
+        cls, scheduler: Any, native_flow_schedule: bool = False
+    ) -> "Cosmos3SamplingPolicy":
         """Derive the policy from a loaded scheduler's config.
 
         Valid recipes: UniPC without fixed sigmas (base) and stochastic
@@ -129,7 +136,11 @@ class Cosmos3SamplingPolicy:
             )
 
         if is_unipc and fixed_sigmas is None:
-            return cls(fixed_sigmas=None, unipc_base_config=scheduler.config)
+            return cls(
+                fixed_sigmas=None,
+                unipc_base_config=scheduler.config,
+                native_flow_schedule=native_flow_schedule,
+            )
 
         if is_flow_match and fixed_sigmas is not None:
             if not _config_get(scheduler.config, "stochastic_sampling", False):
@@ -167,7 +178,7 @@ class Cosmos3SamplingPolicy:
     def generation_default_overrides(self) -> dict:
         """Checkpoint-mandated overrides of the table generation defaults.
 
-        Merged over ``COSMOS3_720P_PARAMS`` by the pipeline's
+        Merged over the checkpoint family's video table by the pipeline's
         ``default_generation_params``, so executor-merged requests arrive
         carrying the checkpoint's true defaults.
         """
@@ -207,6 +218,13 @@ class Cosmos3SamplingPolicy:
         """Program a scheduler for one generation: fixed sigmas or a step count."""
         if self.is_distilled:
             scheduler.set_timesteps(sigmas=list(self.fixed_sigmas), device=device)
+        elif self.native_flow_schedule:
+            # The PyTorch-backend base grid: linear flow sigmas over
+            # (1 - 1/T, 0]. UniPC applies its flow_shift to provided sigmas;
+            # a numpy array is required (a list breaks diffusers 0.39).
+            num_train = int(_config_get(scheduler.config, "num_train_timesteps", 1000))
+            sigmas = np.linspace(1.0 - 1.0 / num_train, 0.0, num_inference_steps + 1)[:-1]
+            scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
         else:
             scheduler.set_timesteps(num_inference_steps, device=device)
 
@@ -232,17 +250,43 @@ class Cosmos3SamplingPolicy:
             return 1.0
         return float(_config_get(self.unipc_base_config, "flow_shift", 1.0) or 1.0)
 
-    def set_flow_shift(self, scheduler: Any, target_shift: Optional[float]) -> Any:
-        """Return ``scheduler`` rebuilt with ``flow_shift=target_shift`` if needed.
+    def set_flow_shift(
+        self,
+        scheduler: Any,
+        target_shift: Optional[float],
+        *,
+        use_karras_sigmas: Optional[bool] = None,
+    ) -> Any:
+        """Return ``scheduler`` rebuilt for the requested sampling knobs.
 
-        The current shift is read from the supplied scheduler's own config, so
-        no tracking state exists to diverge. Structural no-op for distilled
-        checkpoints (no UniPC base config) and for ``target_shift=None``.
+        Current values are read from the supplied scheduler's own config, so
+        no tracking state exists to diverge. ``None`` means "whatever the
+        checkpoint shipped" for either knob: V2V passes
+        ``use_karras_sigmas=False`` to force the uniform sigma schedule, and a
+        checkpoint on the native flow schedule needs the same for the same
+        reason. Structural no-op for distilled checkpoints (no UniPC base
+        config) and when neither knob is requested.
         """
-        if target_shift is None or self.unipc_base_config is None:
+        if self.unipc_base_config is None:
             return scheduler
-        target_shift = float(target_shift)
+        if target_shift is None and use_karras_sigmas is None:
+            return scheduler
+
         current_shift = float(_config_get(scheduler.config, "flow_shift", 1.0) or 1.0)
-        if current_shift == target_shift:
+        target_shift = self.checkpoint_flow_shift if target_shift is None else float(target_shift)
+        current_karras = bool(_config_get(scheduler.config, "use_karras_sigmas", False))
+        base_karras = bool(_config_get(self.unipc_base_config, "use_karras_sigmas", False))
+        # The native flow schedule is defined on explicit linear sigmas, which
+        # UniPC's karras branch discards; treat it as an implicit request for
+        # the uniform grid rather than a separate code path.
+        if use_karras_sigmas is None and self.native_flow_schedule:
+            use_karras_sigmas = False
+        target_karras = base_karras if use_karras_sigmas is None else bool(use_karras_sigmas)
+
+        if current_shift == target_shift and current_karras == target_karras:
             return scheduler
-        return UniPCMultistepScheduler.from_config(self.unipc_base_config, flow_shift=target_shift)
+        return UniPCMultistepScheduler.from_config(
+            self.unipc_base_config,
+            flow_shift=target_shift,
+            use_karras_sigmas=target_karras,
+        )

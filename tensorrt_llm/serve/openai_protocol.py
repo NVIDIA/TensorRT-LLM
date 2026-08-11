@@ -212,6 +212,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
+    # Context worker -> generation worker: the reasoning mode the context
+    # worker read off the prompt it rendered. The generation worker only sees
+    # prompt_token_ids, so it cannot resolve this for itself.
+    resolved_thinking: Optional[bool] = None
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -492,6 +496,14 @@ def _response_format_text_config_to_guided_decoding_params(
         resp_format, reasoning_parser=reasoning_parser)
 
 
+def _record_sampling_params_request_fields(
+        request: OpenAIBaseModel, sampling_params: SamplingParams) -> None:
+    """Preserve explicitly supplied fields across protocol defaulting."""
+    sampling_params._set_request_provided_fields(
+        field_name for field_name in request.model_fields_set
+        if getattr(request, field_name, None) is not None)
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -631,6 +643,7 @@ class CompletionRequest(OpenAIBaseModel):
         )
         if return_log_probs:
             sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode="before")
@@ -1044,6 +1057,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         if return_log_probs:
             sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode='before')
@@ -1221,7 +1235,7 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
                 self.text.format, reasoning_parser=reasoning_parser)
 
-        return SamplingParams(
+        sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -1230,6 +1244,8 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding=guided_decoding,
             thinking_token_budget=self.thinking_token_budget,
         )
+        _record_sampling_params_request_fields(self, sampling_params)
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -1686,7 +1702,12 @@ class VideoGenerationRequest(OpenAIBaseModel):
                                 description="Random seed for reproducibility.")
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description="Optional image reference that guides generation.",
+        description=(
+            "Optional image or video reference that guides generation. PNG or "
+            "JPEG images condition image-to-video; MP4 or AVI video conditions "
+            "video-to-video, with H.264 the tested codec and others "
+            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
+            "base64 bytes; multipart requests upload the file."),
     )
 
     # Resolution

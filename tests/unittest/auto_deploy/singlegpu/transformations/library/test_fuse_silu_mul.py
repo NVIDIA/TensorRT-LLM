@@ -15,11 +15,15 @@
 
 import operator
 
+import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops.linear.silu_mul  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+pytestmark = pytest.mark.cpu_only
+
 
 _HALF = 256
 

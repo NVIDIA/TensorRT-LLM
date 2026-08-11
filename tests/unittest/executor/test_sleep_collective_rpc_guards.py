@@ -23,6 +23,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 # Sentinel used as the default sleep_config value in _make_worker so that
 # callers who omit sleep_config get a truthy non-None object (simulating a
 # configured SleepConfig), while callers who pass sleep_config=None test the
