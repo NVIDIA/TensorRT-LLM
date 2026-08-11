@@ -717,6 +717,157 @@ Flash 三臂翻案后,Pro@DEP8 终局(maxbs=256 解锁满批 + `postfix_pro_tabl
 
 **修复后 Pro 表(08-10 10:55,maxbs=256 满批 + #32 修复,--from-iter-log,4 pin × 3 burst 双节点)**:`postfix_pro_table.json`,bs128 实测 L2/3/4/5 = **80.8/90.3/102.7/110.3ms**(n=47-81/cell)——**完美单调,w4 异常消失,GB300"平台+悬崖"楼梯消失**(确证均为 #32 prep 串行化 + #31 半批的伪影);固定 39.3ms + α(128)=9.1ms,θ(768)=61.9ms = **步时 56% 可裁**(Flash 为 54%,但 Pro 绝对杠杆 2.4×)。w5→w2 省 26.7% 步时。下一步:Pro@DEP8 三臂终局(scheduled-新表 vs notrim,maxbs=256),节点已排。
 
+## 【08-08 10:30】协查 agent(laliao 侧)独立复现成立;变体理论证伪;地址拓扑测绘沉淀
+
+独立环境(laliao,agg DEP8 2 节点,自家 gsm8k 表 + tiers[1..5],64 并发 percreq census)四轮实验:
+
+- **独立复现成立**:`FORCE_BUDGET_FRAC=0.25 + DEVICE_WINDOWS + steep` → **64/64 腐蚀**(median 0.13 chars/tok),与主线症状逐位一致。两个复现前置坑沉淀:
+  1. **steep 顶格空转陷阱**:窗口全在 ceiling 时 `give=min(a-lo,hi-b)≡0`,序幕恒等,census 假干净(两轮上当)。**空转哨兵必须随行**:`forced_budget_steps` 计数 + `verify_len_hist` 从 {5:...} 转 {2:...};
+  2. **`FORCE_VERIFY_LEN` 在 device 模式被静默忽略**(`decide_verify_budget` 只消费 `_forced_budget_frac`;pin 只在 `decide_verify_lens` 被读)。device 模式钉工况只能用 frac(p25 之名即 frac 0.25)。
+- **变体理论证伪(census 级)**:`FORCE_GREEDY_KEY=1`(0.7 流量强路由 greedy 图 + FORCE_ARGMAX)照样 **64/64 腐蚀** → greedy 图在真 w≠S 下同病。早前"greedy 净 / advanced 脏"的二分是复现条件不齐(temp0 轮次没凑出 w≠S)的伪信号。
+- **共享 metadata 修复证伪**:`TLLM_DSPARK_SHARE_VARIANT_META=1`(advanced key 复用 greedy key 的 metadata 对象,两图烘焙地址全同)机械上成立(840 对 key `n_addr_diffs=0`、健康路径无损)但 **64/64 仍腐蚀** → 变体地址分叉不是病根。
+- **地址拓扑测绘沉淀**(`TLLM_DSPARK_ADDR_DUMP=1`,warmup 末对每对同形状变体图逐名 diff 全部 metadata tensor 的 data_ptr):48+13 个 tensor 中恰 4 个分叉——`_seq_lens_cuda`、`gen_indexer_kv_lens_cuda_runtime`(on_update 每次重绑新 tensor)、`batch_indices_cuda`、`captured_hidden_states`;外加 advanced 副本 `_force_non_greedy_for_capture` 永久卡 True(引擎对象清了、per-key 副本没清;已加清理)。均降级为卫生项。
+- **进行中(S1 判别)**:`TLLM_DSPARK_HOSTLEN_BOUND=1`——`attn_row_kv_lens_host`(→`TokenMajorGenView.host_past_key_value_lengths`,dsa.py:2123 直喂 trtllm-gen C++ op)在 device 模式下持有 SHAPE split 的 S 布局行长,而"host 读都是 bound"契约对 token-major 行不成立(w 布局下行 extent 可超 S extent)。判别:H2D 拷贝后把该 host 数组覆写为全批真上界(设备侧精确值不动)。净 → host 长度契约面定罪;脏 → 该面排除,与主线"跨行分歧检测器"的首个分歧行窗口类别交叉定位。
+- 与"1-2 个幸存请求"吻合的先验:扁平布局前缀和污染模型——首个规模错误行之后全污染,之前的行幸存。若分歧检测器显示分歧总从固定低行号开始,该模型坐实。
+- 复现资产(laliao 侧,可复用):`tmp/dspark_build/devwin/`(devwin_repro.slurm 多臂 + percreq_census.py + agg_config_dev.yaml),overlay=`overlay_mounts_dev.txt`(28 文件全量覆盖 faf2c60935)。
+
+## 【08-08 11:40】独立验证判决(laliao 侧):compressor 根因与修复 D2D 双向确认
+
+同一独立 harness(agg DEP8 2 节点、自家表、FRAC=0.25+steep、64 并发 @0.7 census)三角闭合:
+
+- **pre-fix**:64/64 腐蚀(median 0.13);
+- **pre-fix + S1 猜想**(`HOSTLEN_BOUND=1`,token-major host 长度覆写真上界):**仍 64/64 腐蚀**(0.094)——负对照通过,`attn_row_kv_lens_host` 契约面排除,"gen_new_tokens 唯一嫌疑"的排他性在独立环境成立;
+- **post-fix(57e9d56e8c)**:**0/64 腐蚀**(61 净,median 3.90),序幕 32 次 apply、w≠S 全程在场(hist {2:1708, 3:366, 4:52, 5:2})。
+
+代码级四项核查亦过:单位等价(`gen_token_repeat_list` ≡ staging 时 `_seq_lens_cuda[nc:nc+n]`)、捕获区位置(on_update_kv_lens:932)、序幕写集确无此缓冲(apply_device_ragged_layout 写集核对)、D2D 源为捕获期稳定地址且被序幕改写为 w。
+
+**代价审计(修复可发布性)**:向量件零成本(删 pinned 缓冲 + 免每步 host 构造);标量件 NEXT_N→全局 6 进了尺寸计算(`num_total_compressed_tokens`、`kv_comp = torch.empty(...)`、compressed_mask arange),但瞬态/图池水位均 ≤ notrim 满块步已付水位(uniform 步本来就按 6 跑),掩蔽靠逐请求精确向量、正确性自洽;净代价 = 裁剪步的压缩器阶段按满块元数据宽度跑,二阶小头,精确定量归 Step 3 三臂。
+
+补充验证在跑:dev@temp0 census、host+HOST_STEEP+frac 回归 census。方案 C(kernel 内导出 nn,消灭冗余输入)同意作为 PR 收尾清理候选。
+
+## 【08-08 14:30】跨节点四轮复证(laliao 侧,独立环境):#30 "无收益"结论坐实
+
+独立复刻 Step 3 规格(4 个独立 node pair × 三臂冷启动 notrim→host→device;poetry(生成)+arena(500 题循环)× bs{512,1024} global × 3 reps × out768 × temp0.7;**本地重拟表**:frac 扫描 7 断点 + 重建 sts_v1;tiers[2,3,4,5],max_batch 128):
+
+| cell | h/n 四轮 | d/n 三~四轮 |
+|---|---|---|
+| poetry bs512 | −3.5/−10.2/−3.5/+0.9 | −0.2/−1.0/−2.2/+2.0 |
+| poetry bs1024 | −4.7/−5.5/−1.7/−0.9 | +0.5/−1.8/−1.4 |
+| arena bs512 | −13.1/−10.2/−6.7/−9.1 | −8.8/−7.4/−6.6 |
+| arena bs1024 | −6.3/−11.1/−4.9/−4.8 | (4h 墙截尾,补充轮在跑) |
+
+- **d/n:poetry ≈ 0±2%(噪声),arena bs512 ≈ −7.6%(三轮方向一致)——无任何正收益**,与主线终局(device/host −6.6%~+0.3%)方向吻合;
+- **h/n 在本环境系统性偏负(−3~−10%)**,比主线的 0±4% 更差——可能因素:本地表拟合质量(7 断点 vs 16)、arena 500 题循环的重复前缀结构、节点差异。方向上仍支持同一结论;
+- **判决:B300 agg DEP8 + 校准配置下,host/device 动态裁剪无可复现吞吐收益——跨环境(两套表、两套 harness、两组节点)复证成立。**Step 4 门禁(device>host 复现)正式失效;Step 5 门禁同亦失效。
+- **勘误 + 新 bug(Bug #4?):device 臂 arena bs1024 缺格不是 4h 墙(elapsed 均 ~2.5h),是 5/5 可复现的崩溃**——补充轮(2630554,device 先行)在同一 cell 现场抓获:torch `IndexKernel.cu:111` 设备端断言 "index out of bounds"(index 类算子越界)→ `CUDA_ERROR_ASSERT 710` 全 rank SIGABRT。发生在 cell 爬坡段(混合 ctx+gen 步窗口,iter 日志 num_ctx_requests 2→54;注意设备断言浮出有延迟,故不能据此断定肇事步是混合步还是其前的 gen-only 步)。**判别面:host/notrim 同 cell 四轮全过,poetry bs1024(同 128/rank)device 也过,arena bs512 device 也过——特异组合 = DEVICE_WINDOWS × arena 长 prompt 流量 × bs128/rank**。现场:laliao 侧 `tmp/dspark_build/step3/logs/s3device_2630554_serve.log:55198`(断言首现)。吞吐判决不受影响(该 cell 有主线 device/host −2.1% 佐证);但 device 路径在长 prompt 高 bs 下仍有未清的越界索引,建议与"潜伏 bug ①②"并案(候选:混合步/context 加入步与 device budget 单发状态的交互、_seed_context_windows 与 chunked prefill 的槽位索引)。
+
+## 【08-09 02:30】bs 曲线补全(laliao 侧):32→256/rank 四点,d/n 谷型、h/n 单调恶化;崩溃 7/7 复现
+
+用户加点指令下把 Step 3 网格扩到两端(同配置,256/rank 端重采表 sps_frac_local_2632577 = bs 轴 [64,128,256] 指纹 256):
+
+| per-rank bs | poetry h/n | poetry d/n | arena h/n | arena d/n |
+|---|---|---|---|---|
+| 32(256 global) | **+1.4%** | +0.5% | −1.5% | −0.4% |
+| 64 | −4.1% | ≈0 | −9.8% | −7.6% |
+| 128 | −3.2% | ≈0 | −6.8% | (崩) |
+| 256(2048 global,同节点) | −6.0% | **−1.8%** | −1.1% | (崩) |
+
+- **h/n 随并发加深单调恶化,32/rank 附近归零/转正**——与 #28 SGLang 原生 B300 曲线(bs1 +17.8% / 8-64 平 / 128 −21% / 256 −4~−8%)同形;B300 的"由负转平"边界在 32-64/rank 之间;
+- **深水区 device 亏损显著小于 host**(poetry −1.8% vs −6.0%):lag-0 新鲜排序换回的 accept 在深批下开始盖过序幕固定开销的摊薄——机制方向正确,只是在 B300 上翻不了正;
+- **IndexKernel 越界崩溃 7/7 复现**(device × arena × {128,256}/rank;poetry 同 bs 全过):与 bs 无关、与 arena 长 prompt/chunked prefill 工况强绑定;2048 global 下 device arena r1 中途崩(部分吞吐 16.2k 无效)。
+- 工程沉淀:并行单臂(跨节点)与同节点配对的 arena h/n 差了 3.8pp——**arena 的节点噪声远大于 poetry**,该数据集的臂间对比必须同节点。
+- 进行中:cap-accept 测量臂(执行满块、窗口记账,cap_trim_tokens 逐 token 回答"被裁 token 真实存活率")。
+
+## 【08-09 03:10】cap-accept 直接测量:被裁 token 真实存活率 11.5%(laliao 侧)
+
+cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完整收官,回答"被裁的 token 实际有多少会被接受":
+
+- **计划裁剪 1.89M token,其中 219,990 个(11.5%)在满块执行下实际被接受**——零反事实的逐 token 直数;
+- 每请求步平均损失 **0.216 token**;算术闭环:封顶 accept 1.66 + 0.216 = 1.88 ≡ notrim 臂实测(1.80-1.88);
+- 损失集中:仅 12% 请求步丢 token(丢者均值 1.8,单步 max 4);删失链自洽:31% 被裁请求前缀活到刀口 → 其中 ~55% 下一 token 真被接受 → 全体 11.5%;
+- 与跨臂 A/B 估计(~9%)方向一致、A/B 略偏低。
+- **判词**:调度器 ~89% 的刀砍在死草稿上(排序质量好);无收益的根源是那 11.5% 的 accept 换不回 B300 的 kernel 时间(θ 平台),不是调度器裁错了人——给"成本结构论"补上最后一块直接证据。
+
+## 【08-09 04:40】IndexKernel 崩溃根因定案(Bug #4):anchor 停车位在满窗满批步越界一格;"arena 特异"定性作废
+
+- **判别链**:devfee 臂(DEVICE_WINDOWS + FORCE_BUDGET_FRAC=1.0,poetry,w≡S 恒等)在首个满批 gen-only 步**秒崩**,同一 IndexKernel index-OOB——推翻"device×arena×高bs"表征(poetry 也崩、w≠S 不必要、非爬坡累积)。
+- **根因(一行公式)**:序幕把 anchor token 停在 `dst = real_draft = real_tokens − n_real`(model_engine 序幕 scatter);`draft_tokens_cuda` 容量 = `max_draft_loop_tokens × batch_size`,**当 padded_bs = max_batch 且所有真实行窗口全满时 real_draft 恰等于容量,越界一格**。八次崩溃全解释:arena 高接受 → planner 常发全满窗口 → 满批步必踩;poetry 真实窗口碎(accept~1.2)几乎从不全满 → 幸存;devfee 恒全满 → 秒崩;128/rank 配置缓冲 640、满 bucket 768 同式。协查报告 S4 曾摸到该停车位但只审了语义撞位(判良性),漏审分配边界。
+- **修复(laliao 本地,一行)**:`draft_tokens_cuda` 容量 +1(停车位合法化为 scratch 尾格;bs×K 步进布局不扰、capture 安全)。验证轮(fee2b)在跑:devfee 转净 = 定案。
+- **教训**:①"数据集特异"表征是接受率经由调度器的间接投影,真正的触发几何要用受控恒等臂(frac=1.0)剥离;② 边界审计要同时问"语义对不对"和"分配够不够"。
+
+## 【08-09 04:40】verify-len 评估装置入场费(256/rank,poetry,同节点配对,laliao 侧)
+
+- **头计算费(nohead→static)**:22747 → 22730 tok/s = **−0.07% ≈ 0**(fused 头前向在图内免费);
+- **总入场费(nohead→notrim,frac=1.0 全机器零裁剪)**:22459 → 21859 = **−2.7%**;
+- **host 机器组件帐单**(sched-timing,3500 稳态步,256/rank):decide ~450-510μs + allgather ~210μs + fit ~140μs + attach ~240-270μs + token-major 行装配 ~400-440μs ≈ **1.4-1.5ms/步 ≈ 5.7μs/请求**;而 host_step≈device_step(120-290ms,KV 深度双峰)——**host 份额被 overlap 完全遮蔽(<1%)**;
+- 推论:2.7% 入场费的大头**不在 host 机器也不在头计算**,在 ragged 图的 token-major kernel 呈现差异(uniform 图 vs token-major 视图的 MLA/索引器路径)+ 图内每 token 机构;device 序幕费(notrim→devfee)待 fee2b 修复验证轮补上。
+
+## 【08-09 12:30】序幕 Triton 融合(方案 C)落地:60 发射 → 4 kernel,enqueue 8.8×,parity bit-exact(laliao 侧)
+
+- **实现**:`dspark_device_select_fused.py`(env 门控 `TLLM_DSPARK_FUSED_PROLOGUE=1`,fallback 原路保留):Kernel A(单 CTA:slot gather→stamp fail-open→温度校准→存活→radix-select 预算 topk→cumsum-cycle fill→行映射,radix 复合键复刻 host tie-breaking 到 bit 级)+ Kernel B(bucket 网格:全部 token 级重写,A 写新窗口独立缓冲、B 读旧 split+新窗口,消除 read-before-write)+ 两个块表 gather。停车位 +1 scratch 不变量保留。
+- **两轮真卡教训**:①容器 Triton 拒收 jit 体内模块级全局/降序 static_range/constexpr 上的 not——全部参数化;②首版 e2e 反降 9%:**Triton 隐式整型值类特化**(每个 int 参数的 ==1/÷16 值类进编译缓存键)+ 形状派生 constexpr,ramp 每个 (padded_bs,bucket) 组合都触发数百 ms JIT 且落在流量中——`do_not_specialize` 全覆盖 + 形状参数改 runtime+mask + warmup 预热钩子(生产路径收敛到 4-5 次编译)。
+- **判决(同节点 A/B,256/rank poetry)**:enqueue mean 2052→**243μs**(尾巴消失,mean≈p50),e2e 22548→22556(打平),r1 无编译坑,parity 15/15,越界 0。
+- **综合口径**:序幕 e2e 代价 = 0~3%(取决于 host 压力:serve 口径曾现形 −3.1%,bench 口径 ≈0,本轮 overlap 藏住)——融合拔掉 host 分量后**对 host 压力不再敏感**。若 device 路径未来在低并发/延迟场景复活,这块砖已备好。
+
+## 【08-09 15:10】观测开销排污判决:enable_iter_perf_stats 无罪(≤0.2%)(laliao 侧)
+
+- **设计**:同配方两次真实流量采集(18 phase:frac{0.2-1.0}×conc{512/1024/2048},poetry,新增 `/dspark/budget_frac` 运行时端点免六次冷启动),唯一变量 = `enable_iter_perf_stats`;判决用**同 phase 步时中位数直比**(深度分布天然配对,免分解、免建表)。
+- **判决**:stats-ON vs OFF 步时 **+0.18%**(18 格,散布 −0.5~+1.6%)——stats 机器(含每步 allgather/D2H)代价在噪声内,**此前全部阶梯/曲线结论无需修正**。客户端吞吐 +2.45% 偏 ON 为短 phase span 噪声(方向反于污染假设)。
+- **方法论坑(已沉淀)**:被动 iter-log 样本直接喂分解拟合器必炸——同 (bs,M) 格步时随 KV 深度 120→290ms 漂移,深度方差全进固定项(签名:fixed=258.8ms、θ(179)=0.7ms)。钉接受的本质是控深度;被动样本要么按 kv_cache_util 分箱,要么只做配对比较。
+
+## 【08-09 19:30】短窗病灶三方会师 + pin 阶梯直测复现 + H4 候选机理(laliao 侧)
+
+- **pin 阶梯直测**(`/dspark/verify_len_pin` 运行时端点逐档钉,真实 poetry serving,~250 稳态步 median/格):64/rank 上 **pin4=59.1ms > pin5=56.9ms**(验更少 token 慢 2.2ms),w3→w4 悬崖 +10.3ms;256/rank 恢复单调(111.5<119.4)——**病灶咬中低 bs,深 bs 消退**。与 θ 表倒挂(62.7>60.8)、真实流量 frac0.65>frac1.0(57.7 vs 54.4ms)三方一致。
+- **H4 候选机理(代码级)**:`_pick_dsl_expand`(dsa.py:211)要求 `expand×atom==next_n` 精确因式分解(atom∈FP8{1,2,3,4});**w4→5 token=质数→唯一解 (5,1)→atom=1、5× 行展开=索引器 5× KV 重读,烘焙进该 bucket 捕获图**。w2/3/5(3=1×3, 4=2×2, 6=2×3)全部可摊销。暗合:此前"表自荐 tiers[1,2,5]={2,3,6} token"恰好全避质数——拟合器已从数据学会绕行。与协作 agent 的 H1/H2/H3 并列待 nsys 点名(pin4/pin5 各 100 稳态 iter 的 cuda_gpu_kern_sum 对拍在采,2025.5.1+cudaProfilerApi 配方)。
+- **修法②(tiers 避质数)首验证伪一半**:host[1,2,5] vs host[2,3,4,5] @poetry 64/rank = **−3.2%**——floor 降到 w1 裁得更深,accept 损失盖过避档收益;正确菜单可能是 [2,3,5](保 floor 只删 w4),推荐器需把 accept 损失定价进去(当前只看步时)。
+- **收益区首个正 cell**:GSM8K × 16/rank × devreal(真实 device 窗口+融合序幕)= **+1.8%**(两 rep 一致,甩开 host 3.4pp)——"高接受负载 × 中低 bs × 新鲜排序"的理论收益区实测点亮;加密扫描(8-64/rank × devreal/devalt)在跑。
+
+## 【08-09 21:30】✅ 分歧和解:主线 = DEP4×DSv4-Flash,laliao = DEP8×DSv4-Pro(用户确认)
+
+- 绝对步时 1.5× 差(满窗 79.8 vs 119.4ms @256 行)与病灶档位差(Flash/DEP4 咬 3-4 token 档、Pro/DEP8 咬 5 token 档)全部由 **模型 × 并行度 → GEMM 形状 → tile/tactic 悬崖换位** 解释;两侧数据各自三源自洽,无人测错。
+- **通用律**:verify-len 阶梯的 kernel 成本地形不可跨 (模型×并行度) 迁移——梯子/表/绕档策略必须逐配置 profile,且在代表性 KV 深度下采。laliao 侧 nsys(pin4/pin5,Pro/DEP8)与主线 nsys v3(Flash/DEP4)各自点名各自真凶,并排即完整故事。
+- Pro/DEP8 侧 H4 候选(w4=5token 质数 → `_pick_dsl_expand` atom=1、5× 行展开)待 nsys 证实;Flash/DEP4 侧真凶待主线 v3。
+
+## 【08-09 20:10】⚠️ 短窗病灶的跨 agent 分歧,请求 provenance(laliao → 主线)
+
+双方一致:非单调、w4 最糟。**分歧:w2/w3 的符号**——laliao 侧两份独立数据(pin 阶梯直测:w2/w3 = 46.4/48.8ms 均快于 w5 的 56.9;真实流量 frac 0.2/0.35/0.5 = 46.3/48.1/48.2 均快于 frac1.0 的 54.4)都显示**只有 w4 档为负**;主线判决 4 称"窗口 4/3 的桶比满窗慢 12-34%"。和解假说:① 均匀钉窗 vs topk **混合窗口组成**(同 bucket key 行组成不同,病灶或在混合行为上);② host pin vs **device 序幕重排后**布局;③ 负载/KV 深度/bs 差异。**请主线补 12-34% 的出处(bs、host/device、数据集、窗口组成、量法)**。在钉死前,交集结论可行动:w4(5 token)档在中低 bs 确定为负,梯子应绕开;分歧决定深裁档(w2/w3)是否可用,直接影响最优梯形。laliao 侧 nsys pin4/pin5(均匀)在采;若假说①成立将补 frac0.65(混合)对拍。
+
+## 【08-09 23:30】SGLang 字面复现立项(laliao 侧);请主线共享 #28 环境
+
+- 用户指令:按 blog reproduction 章节**用 SGLang 本体**复现(此前只做了设计复刻)。章节要点已抓取:镜像 `lmsysorg/sglang:dev-dspark`(PR #30261 @692c5f7d);frontier 臂 = Flash-DSpark×H200×DP4,one_batch_server bs {1..256}×out1024×temp0.7×frontier_prompt(16 拼接 GSM8K);零开销图 = **Pro-DSpark×B300×TP8×cuda-graph-max-bs 4**;动态/固定切换 = `SGLANG_RAGGED_VERIFY_MODE=compact|static`。
+- 进行中:enroot import dev-dspark 镜像(需验 aarch64);checkpoint `deepseek-ai/DeepSeek-V4-{Flash,Pro}-DSpark` HF 公开未 gated(Flash 74 文件 / Pro 92 文件,login 下载带宽 13MB/s 是瓶颈,将用 HF_TOKEN+分段配方)。
+- **请主线共享 #28 的 SGLang 环境**(镜像/venv 路径、checkpoint 位置、launch 参数)——你们已在 B300 跑通 SGLang 原生 DSpark,复用可省一天;也顺带补 #28 的 provenance。
+
+## 【08-10 00:40】nsys 点名(Pro/DEP8 w4 真凶 = H1 GEMM tactic);devalt 复证失败;吞吐收益区关闭(laliao 侧)
+
+- **nsys pin4 vs pin5**(各 100 稳态 iter,cuda_gpu_kern_sum 对拍):①同批 GEMM tactic 换名——pin5 的 `64x64_2cta_TNT`(3245 次)/`256x128` 在 pin4 消失,被 **splitK 变体族**顶替(`tss_64x32_splitK` 4769 次等,净 +~130ms);②`gate_forward_kernel`(MoE 路由门)同 6100 次变贵 48%(56→83ms)——更小 M 落在更差 tile 点;③pin4 GPU kernel 总时长反而更少(3792 vs 3930ms,MoE 省 85ms)但占空比更低(64% vs 69%)——**"省了活、亏了排程"**:更碎的 splitK kernel 拉高发射/间隙。**判决:H1(tactic 选择)为主犯;H4(索引器质数 atom)未现身 top 差异,降级**。与主线 Flash/DEP4 的 H1 首要嫌疑吻合——两模型同类真凶、不同形状表现。
+- **devalt 复证失败**:两轮四格全负(32/rank:−3.0/−1.8;64/rank:−5.2/−1.7),D1c 首轮 +2.3/+1.0 为基线噪声(nohead 轮间 ±3%)。**B300 吞吐口径的收益区搜索正式关闭**:poetry/GSM8K × 1-256/rank × host/device/梯子变体,无任何跨轮稳健的正收益。存活方向:D2b 深上下文(在跑)与延迟口径(blog 的 B300 Pro 配置 cuda-graph-max-bs 4 本质是 latency 场景,SGLang 字面复现 #32 将验证)。
+
+## 【08-10 01:30】收益区搜索终局(laliao 侧):B300 吞吐口径全维度关闭;唯余延迟口径待 #32
+
+- **D2b 深上下文(ISL8k,chunked prefill)收官**:32/rank h/n −4.6%、d/n +0.3%;128/rank h/n −4.8%、d/n −5.5%——"θ 份额随 KV 深度涨 → 深上下文是主场"假说**证伪**(裁剪省下的照旧换不回 accept+税)。
+- **搜索矩阵全景(全部同节点差分,<5% 信号均经复证纪律)**:负载 {poetry, GSM8K, arena, mixed, ISL8k} × 并发 {1..256}/rank × 配置 {host, device+融合序幕, tiers[1,2,5]} —— **无任何跨轮稳健正收益**;单轮 +1~2% 信号(GSM8K 16/rank devreal、devalt 32-64/rank)复证全部还原为 ±3-5% 基线噪声。
+- **成因四件套(全部实测定价)**:H1 GEMM tactic 病灶(裁剪后 M 形状触发 splitK 碎战术 + gate kernel +48%,nsys 点名)+ accept 损失(cap-accept:被裁 token 11.5% 存活)+ 桶量化税(请求级 13-16% 落地仅 5.8-7.6%)+ token-major 呈现税(−1.6~−2.7%),叠加 B300 >50% 不可裁地板。
+- **唯一未决口子:延迟口径**(blog 的 B300×Pro cuda-graph-max-bs 4 配置、SGLang 原生 bs1 iter +17.8%)——#32 SGLang 字面复现进行中(镜像导入中,checkpoint 公开)。若延迟口径亦无,"DSpark 动态裁剪在 B300 无收益"即全口径终局。
+
+## 【08-10 03:30】SGLang 字面复现收官(#32):blog 原版命令 @GB300,动态几乎全线为负——全口径闭卷(laliao 侧)
+
+- **配方**:`lmsysorg/sglang:dev-dspark` arm64(63 层 overlay 超内核限,计算节点手工压平 + docker ENV 50 条重注入;镜像/权重下载配方沉淀于 sglang_repro/)+ `deepseek-ai/DeepSeek-V4-Flash-DSpark` 180GB(计算节点 HF 出口 370MB/s,5 分钟)+ blog reproduction 章节逐字命令(DP4、flashinfer_mxfp4、one_batch_server bs{1..256}×out1024×temp0.7×frontier_prompt)。
+- **判决(static vs compact,输出吞吐)**:bs1 **+1.8%**(ITL 2.35→2.31ms,唯一正格);bs8 −12.8%、bs32 −9.4%、bs64 −5.2%、bs128 −6.1%、bs256 −1.6%。acc_length 双臂 4.7-4.9 一致(接受率形态复现)。
+- **结论**:同代码、同命令、同权重、同接受率,只换硬件(H200→GB300),blog 的 +10-20% 收益消失——**硬件地形是第一性原因的最干净证据**;与 TRT-LLM 侧全部结论跨栈闭环。#28 的 bs1 +17.8% 未在字面复现中重现(其 checkpoint/commit provenance 存疑)。
+- **DSpark 动态裁剪 @GB300 全口径闭卷**:吞吐(TRT-LLM,五负载×1-256/rank)与延迟(SGLang 字面,bs1-256)、两套实现——无收益;收益属于 θ 陡峭的 H200/H100 地形。
+- 【08-11 追记】上条"闭卷"已被 #31/#32 修复整体翻案(见主线终局判决);SGLang@GB300 compact 为负仍是其栈自身的事实,但"硬件地形第一性"解读降级为负载/实现因素之后的第三位。
+
+## 【08-11 09:00】disagg 独立复现战役立项(laliao 侧):自有 harness 跑通路 + 三负载矩阵;请主线提供 poetry 原文
+
+用户令 laliao 侧在 disagg 形态独立复现置信度调度收益,与主线 disagg 战役(R5)并行互证。设计与进展:
+
+- **通路**:不走主线的手搓 ctx/gen/router 脚本,用我自己 08-10 已跑通的 `bench-trtllm-disagg` harness(agentx gen-only 配方,**NIXL+PYTHON 本来就在用**,单 slurm job 3 节点带 `--segment` 同 NVL 机架分配——按 R4 收网的机理,IMEX 就位,`UCX_CUDA_IPC_ENABLE_MNNVL` 坑对单 job 同 segment 可能天然免疫;bring-up 正在验证)。新模型目录 `deepseek-V4-Pro-nvfp4-dsparkconf`(DSPARKCONF_* 提交时环境变量参数化全臂矩阵:SCHED/TABLE/STS/TIERS/GRAPH_MAX/GEN_ENV),harness 的 CONTAINER_MOUNTS 已修成支持 src:dst 文件绑定(python overlay 28 文件,含 b87ea28bf3)。
+- **协议吸收**:feature doc 的 B' 四坑全部落实——PYTHON+NIXL ✓、MNNVL(视 bring-up 判决)、kv_transfer 600s ✓、**ctx/gen spec parity 已修**(ctx 镜像基础 spec 块,confidence 开关 gen-only);max_seq_len 显式(harness 按 isl+osl 渲染)✓;bs 钉法改用主线定稿(maxbs=目标并发 + 客户端 2-4× 适度超发 + iter log 实测中位为准)。
+- **矩阵**:三负载 {poetry, arena, throughput_1k} × lbs {32,64,128,256} × 臂 {notrim, frac04, scheduled};**SPS 与 STS 分负载重采**(A:KV 深度 ~100-800 vs B:~1110,跨用错价;STS 是数据语义×采样温度的函数,A temp0.7 / B greedy);对表纪律:A 主臂裸 sigmoid(与主线 +5.9~+24.7% 同协议),STS 为 A 的消融格、B 的必挂项。**B 在 disagg 翻正与否 = "混合步成本表 ctx 盲"机理的直接检验**——这是本战役最有信息量的一格。
+- **➡️ 请主线**:提供 poetry 的 **verbatim prompt 原文**(provenance 只有描述:memory/rivers/glass/time、≥8 场景、不复用意象;我 step3 自造的 caravan/steppe 不是同一首,接受率分布不可比,对表 A 必须同文)。最好直接把数据集构造脚本或 jsonl 推上来;arena(arena-hard-v0.1 取 prompt 字段)与 throughput_1k(iputterman/speed parquet)provenance 已够我自建。
+
+# 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
 
