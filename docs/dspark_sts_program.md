@@ -649,7 +649,13 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 | 08-07(#29 时代)| NIXL+PYTHON,无 env | gen 死于 #23 修复前的 IMA,传输从未被行使 | 今日 gen 全程健康 → **#23 修复在 disagg 路径成立** |
 | R1/R2(今日)| NIXL+PYTHON,无 env | ①router 忘 `--mpi=pmix` 秒死;②修后 ctx 侧 NIXL `TransferState.FAILURE` → gen 等 KV 超时自杀 | 任何 trtllm CLI 经 srun 都要 pmix(已入记忆) |
 | R3 | DEFAULT + UCX 三件套(unset UCX_TLS/关 UCC/RNDV_RAILS=2,抄自同集群日跑 harness)| ctx 启动死于 **v2 KV 管理器 CUDA_ERROR_INVALID_CONTEXT** | DEFAULT(C++ 传输)与 v2 管理器不兼容;p25 时代选 NIXL+**PYTHON runtime** 正是 v2 兼容路径 |
-| **R4(进行中)** | **NIXL+PYTHON + UCX 三件套**(未试组合:NIXL 底层即 UCX,三件套正治 UCX 传输)| — | 若仍 FAILURE,下一杆:UCX_NET_DEVICES 按 GPU 就近 HCA 钉扎(同事 harness 的 CTX_LOCAL_HCA_PIN)|
+| R4 | **NIXL+PYTHON + UCX 三件套**(未试组合:NIXL 底层即 UCX,三件套正治 UCX 传输)| 六 cell 全过 bringup(证 pmix/PYTHON 组合成立),但传输仍全灭:ctx 首笔 **等 336s 才 FAILURE**(非 0 秒即拒),此后 agent 元数据被 invalidate → 后续全部秒拒 `metadata for remote agent not found`;gen 60s KV 超时先于 336s → 1024 全灭;gen 侧 v2 IMA 为下游殉爆(page 释放撞未完成 NIXL op)| UCX 三件套治不了它——根因在更上层(见 R4 收网)|
+
+**R4 收网(08-11 08:20,代码取证 + 双实证)——根因:UCX MNNVL 误判 v2 fabric-handle 显存**:
+- **机理**:v2 管理器用 `CU_MEM_HANDLE_TYPE_FABRIC` 分配 KV 物理内存(`kv_cache_manager_v2/_cuda_virt_mem.py`);B300 上 UCX 的 cuda_ipc-MNNVL 路径声称此类显存跨节点可达,但两个独立 slurm job 间无 IMEX 通道 → RDMA WRITE 卡死至 UCX 判 ep 死(~336s,恰为观测值)→ NIXL invalidate 对端 → 雪崩。修法即官方文档旋钮:**`UCX_CUDA_IPC_ENABLE_MNNVL=n`**(disagg-serving.md;v1/C++ 栈用普通 cudaMalloc 无此病,故同集群他人 disagg 正常)。
+- **实证互洽**:跨节点 `ucx_perftest`(host 与 cuda 内存、4MB 消息)默认 env 下 90 GB/s 全绿——因 perftest 用普通 cudaMalloc,**对本 bug 是假阴性**;1/1024 偶发成功与 stall(非不可达)一致。
+- **伴随修正**:ctx yaml 原来没给 speculative_config → ctx/gen 窗口池几何不一致(128/8 vs 133/13)且 draft KV 无人 prefill;已镜像 DSpark spec 块到 ctx(MTP disagg 同款做法)。取证副产品:两次 transceiver init/侧 = KV 估算临时 executor(正常);`kv_transfer_timeout_ms` 默认 60s 且**传输无重试**;PYTHON runtime 为 v2 唯一兼容路径(官方注释坐实)。R4 现场已归档 `dspark-runs/r4_archive/`。
+- **R5(进行中)**:MNNVL=n + ctx spec parity,金丝雀 S:128 先行,通过后其余五 cell 并行重跑。
 
 ### 对齐实验:zhaoyuanh 的 throughput_1k 负载 × 我们的栈(08-11 02:10,主矩阵完成)
 

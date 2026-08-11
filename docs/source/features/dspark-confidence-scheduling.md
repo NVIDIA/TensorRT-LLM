@@ -23,6 +23,8 @@ DSpark 每个 decode step 都会 draft 出一整个 block，并把它全部送�
 - [退化路径](#退化路径)
 - [配置](#配置)
 - [性能天花板与已知局限](#性能天花板与已知局限)
+- [部署要求：DSv4 必须显式设 max_seq_len](#部署要求dsv4-必须显式设-max_seq_len否则并发被钉在-maxbs2)
+- [基准配置（可复现）](#基准配置可复现)
 
 ## 问题与核心洞察
 
@@ -504,6 +506,93 @@ speculative_config:
 | 快照是 2 步之前的 | 纯吞吐启发式（I2 保证正确性与它无关），但在剧烈抖动的负载下决策质量会下降 |
 | ragged 模式的端到端数字仅在一个平台上取得 | DeepSeek-V4-Pro-DSpark，8×B300 DEP8，overlap + CUDA graph（GSM8K 96.44，基线 96.21）；仍默认关闭，跨硬件需重测 |
 | 逐 token 采样参数路径只有非全贪心 batch 才会触发 | `temperature=0` 的精度跑覆盖不到它 |
+
+## 部署要求：DSv4 必须显式设 `max_seq_len`（否则并发被钉在 ~maxbs/2）
+
+DSv4 的窗口池组（SWA + compressor KV/score，窗口 = 128 + `max_draft_len`，DL=5 时 133
+token）在 v2 KV manager 里是固定槽分配器。不显式设 `max_seq_len` 时，serve 会从模型推断
+出 1M 并把它当 `typical_seq_len` 喂给比例定容——全注意力池吃掉全部配额，窗口池被饿到下限
+`min_slots ≈ 1.05 × max_batch_size` 块（`kv_cache_manager_v2.py:1775-1779`），而下限按
+history=0 建模成每请求 1 块（`:1803-1812`）。运行时窗口 133 > tokens_per_block 128，每个
+生成请求实际锁 2（偶 3）块（`_life_cycle_registry.py:38-51`），于是可调度并发
+= 1.05·maxbs / 2.07 ≈ **0.51 × max_batch_size**（实测：maxbs=128 → 61-63 行；maxbs=256
+→ 131-136 行），伴随 ~2.7× 的步时惩罚。关闭 spec 时同一机制不降级而是**调度器死锁**
+（`scheduler_v2.py:439` 处崩溃，报错信息有误导性）。
+
+**修法：serving 配置里显式写 `max_seq_len`（按真实负载，比如 8k1k 场景写 9216）。**
+`typical_seq_len` 随之落地，比例定容给窗口池的份额远高于下限，满 maxbs 可调度。判别实验
+证明只动这一项即解钉；只调 KV fraction / max_num_tokens 均无效。历史工作绕法
+`max_batch_size = 2 × 目标并发` 是同一算术的另一侧（把下限抬高一倍），在显式
+`max_seq_len` 之后不再必要，但对 ctx 准入 headroom 仍有独立价值（见下）。
+
+代码侧的根治（`typical_seq_len` 不应默认推断的 max_seq_len、下限按稳态 2 块建模、
+no-spec 应降级而非死锁、字节估算器补 draft 窗口放大）待报 upstream，不阻塞部署规约。
+
+## 基准配置（可复现）
+
+完整实验记录与逐轮数据见 `docs/dspark_sts_program.md`。以下为两类负载的精确配置。
+
+### 负载 A：poetry / arena（agg，burst-drain；收益 +5.9~+24.7% 的来源）
+
+- 硬件/形态：DeepSeek-V4-Pro-DSpark，8×B300 单节点，`--tp_size 8 --ep_size 8`（DEP8，
+  `enable_attention_dp: true`），`--max_batch_size 256 --max_num_tokens 4096`。
+- 负载：poetry = 固定短 prompt（写诗，输出 ~760 tok/req）；arena = arena 真实问题集。
+  客户端 burst-drain：一次性下发全部 N（512/1024）个请求，计时到全部完成，n=10 轮取中位。
+  **注意：该协议下 99% 的步是纯 gen 步**（prefill 波在头几十步内结束）——这是收益成立的
+  regime 前提。
+- S 臂 spec 配置（`pro_sched_arm.yaml`）：tiers `[2,3,4,5]`，
+  `confidence_sps_table_path: postfix_pro_table.json`（修复 #31/#32 后在 maxbs=256 满批
+  重采：bs128 实测 θ(L2/3/4/5)=80.8/90.3/102.7/110.3ms），**未挂 STS**（裸 sigmoid）。
+  N 臂同配置去掉两个 confidence 开关。kv 0.5，block reuse 关，graphs [1,8,32,64,128] 带
+  padding，overlap on。
+
+### 负载 B：throughput_1k（roofline 对齐负载，agg 持续饱和）
+
+- 负载：throughput_1k parquet 前 1024 条（ISL≈1110），greedy，`max_tokens=64`；客户端
+  持续饱和（固定在飞数，完成即补位，ramp 256 后计量 1024 个完成）。
+- 关键物理：OSL=64 + 长 prompt + 持续补位 → **~50% 的步是 ctx+gen 混合步**，纯 gen 采的
+  成本表在混合步高估节省（成本模型 ctx 盲），裁剪收益不成立（sched −1.2~−6.3%）。收益是
+  **负载 regime 的函数**，不是普适常数。
+- **把 gen bs 打到目标值的配方**（实测绑定约束是准入带宽：mnt=8192 时有准入的步 token 顶
+  死预算,到达率 3.76/步 × 寿命 24.6 步 = 均衡 bs 92）：
+  1. `max_num_tokens: 16384` —— 解除准入带宽上限；
+  2. `max_batch_size = 2 × 目标` —— ctx 准入槽位 headroom；
+  3. 客户端在飞 = 目标并发 —— 让 client 成为干净的绑定约束。
+- 成本表与 STS 均须在本负载重采（表按 `--from-iter-log` 纯 gen 段拟合）。
+
+### 负载 B'：disagg（gen-only 吞吐；裁剪的顺风 regime）
+
+ctx/gen 分离后 gen server 每步纯 gen，成本表全程在域内。两台 B300 独立 slurm 作业,
+NIXL 传输。**四个必踩的坑与解法**：
+
+1. v2 KV manager 只支持 `transceiver_runtime: PYTHON` + `backend: NIXL`（C++/DEFAULT
+   传输在启动时 `CUDA_ERROR_INVALID_CONTEXT`）。
+2. **必须 `export UCX_CUDA_IPC_ENABLE_MNNVL=n`（两侧）**：v2 用
+   `CU_MEM_HANDLE_TYPE_FABRIC` 分配 KV,无 NVLink 互联的独立作业间 UCX 会误判 cuda_ipc
+   可达 → RDMA 卡死 ~336s → NIXL 元数据雪崩（全请求失败）。`ucx_perftest` 用普通
+   cudaMalloc,对此 bug 是假阴性。NVL72 机架内（IMEX 就位）不需要。
+3. 超时三层都要抬：`cache_transceiver_config.kv_transfer_timeout_ms: 600000`（默认 60s,
+   超发排队下成批误杀）;router `trtllm-serve disaggregated --request_timeout 900`（默认
+   180s）;（传输层由 2 解决）。
+4. **ctx 与 gen 必须共用同一个 `speculative_config`**（YAML anchor）——否则窗口池几何不
+   一致（128/8 vs 133/13）且 draft KV 无人 prefill。
+
+```yaml
+# ctx 与 gen 共同的骨架（两侧一致的部分）
+max_seq_len: 8192            # 见"部署要求"
+speculative_config: &spec
+  decoding_type: DSpark
+  max_draft_len: 5
+  speculative_model: <model_path>
+kv_cache_config: {enable_block_reuse: false, free_gpu_memory_fraction: 0.5}  # gen 侧 0.7
+enable_attention_dp: true
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  max_tokens_in_buffer: 8192
+  kv_transfer_timeout_ms: 600000
+# ctx 侧另加 disable_overlap_scheduler: true;gen 侧在 *spec 上打开 confidence 开关。
+```
 
 ## 参考
 
