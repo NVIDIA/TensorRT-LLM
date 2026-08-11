@@ -389,13 +389,33 @@ class TestInternalApiContract:
     def test_serving_resolvers(self, api):
         import inspect
 
-        # The driver calls resolve_kv_cache_manager_v2_auto(shim, defaults):
-        # the first two params are fixed, anything added later must default.
+        # The driver calls the serving resolver with a shim, model class, and
+        # pretrained config. Only the shim is required.
         v2 = inspect.signature(api.resolve_kv_cache_manager_v2_auto).parameters
-        assert list(v2)[:2] == ["llm_args", "model_defaults_dict"]
-        assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[2:])
+        assert list(v2)[:3] == ["llm_args", "model_cls", "pretrained_config"]
+        assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[1:])
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
+
+    def test_model_preference_resolver_shim_supports_v2(self, api, monkeypatch):
+        class _PreferV2:
+            @classmethod
+            def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+                return "V2"
+
+        monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+        monkeypatch.setattr(
+            rp,
+            "_lookup_model_cls",
+            lambda model_dir: (_PreferV2, types.SimpleNamespace()),
+        )
+        cache_cfg = api.CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+
+        assert rp.resolve_model_prefs(
+            "/tmp/dummy_model",
+            {"use_kv_cache_manager_v2": "auto"},
+            cache_cfg,
+        )
 
     def test_enum_members(self, api):
         for enum, members in (

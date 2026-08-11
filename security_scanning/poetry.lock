@@ -2523,14 +2523,14 @@ files = [
 
 [[package]]
 name = "meson"
-version = "1.11.2"
+version = "1.12.0"
 description = "A high performance build system"
 optional = false
-python-versions = ">=3.7"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "meson-1.11.2-py3-none-any.whl", hash = "sha256:7e4f6e83fec83e3eaac928e058b073c7557b282c35b6a2024cea143a39926a39"},
-    {file = "meson-1.11.2.tar.gz", hash = "sha256:698feae069cef3ecd4d7aaf281d7df359bdfcf555a9a1564383d3b913fa8a736"},
+    {file = "meson-1.12.0-py3-none-any.whl", hash = "sha256:71f133147fa0fcfe8f4df49fa1045771064947834538409e5d97b3613aac8b4e"},
+    {file = "meson-1.12.0.tar.gz", hash = "sha256:88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c"},
 ]
 
 [package.extras]
@@ -3292,12 +3292,15 @@ files = [
     {file = "nvidia_cudnn_frontend-1.27.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aa1caac464663202f8cc83fdeca02b0fd99cc43a538025758e6444ed16e312b5"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1da45d4de55394cce12a596776d6250cf8f98c14481d241444e881b1760adb83"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp313-cp313-win_amd64.whl", hash = "sha256:f8f2e96b040d1c8d6c9df43fc72037a7bb79d1e1ad8a1bee202e31cb611bfc46"},
+    {file = "nvidia_cudnn_frontend-1.27.0-cp313-cp313-win_arm64.whl", hash = "sha256:162877aeaa97ce22f22c305ea00e827c8758506a26348c2f4cce165489fccc22"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ac516233e99f28e48d467c5d9f29b8af10eeed8531143458b858dab241d47114"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c8011f768284d6a115e2f6a4b62a30500f2b3fa4330ec54cf5c9e58719b04aaf"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314-win_amd64.whl", hash = "sha256:4ccb7f7561cf57c196b1db0f2d0e1942757c8e726a6585ec70be139040f401aa"},
+    {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314-win_arm64.whl", hash = "sha256:97a57ed8a8a446e01081e5ab616974cdbf30454dc9fb1bc19666d8ae6437cbbb"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:835771ecd230fbd2e390a255255dd5989d179882cc7aecfc583877619bc7e8c0"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4bc5fdde1ffb2a88e9cfc85c997c7dfa2e557755edfa31d0607adc7a450b822d"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314t-win_amd64.whl", hash = "sha256:59e155b3be7ca2506bf94f7199a1ebbda5cc1fa284a432eccfd7239a3c610c7e"},
+    {file = "nvidia_cudnn_frontend-1.27.0-cp314-cp314t-win_arm64.whl", hash = "sha256:657ad9c9fd5d984d9b3c655c41b4963f0d3863bb518514545f1f047a8f135486"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp39-cp39-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d2c61c29a087ae78723cf355857bd2ebfd0cfbc2f151c385e6749d60ba10b005"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:61a5ac352b014c02a149268dc7dbda4f52282b9deed7464d3977c8c24a441b4c"},
     {file = "nvidia_cudnn_frontend-1.27.0-cp39-cp39-win_amd64.whl", hash = "sha256:5cdc1eeebecc9bcde84ddfd6e9aba34b0ad1b7abf076b1310018bf0843b5f814"},
@@ -7191,4 +7194,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "8c37e4fd32a94a13c6c51139d625f8d3a60e7d9430da2df879893952cd885f2e"
+content-hash = "4c15bc2ad0d987f546f836df7f585289c3ca2e562a86ec70de0634c40d0ed408"
