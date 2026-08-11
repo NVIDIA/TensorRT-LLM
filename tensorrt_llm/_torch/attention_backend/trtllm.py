@@ -565,14 +565,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # batch, not from here.
             #
             # The attention workspace is sized from the same number, so it
-            # grows with the row ceiling. An earlier version of this comment
-            # quoted 68 MiB -> 604 MiB per rank as the cost; that figure came
-            # from a single ragged log with no uniform control, and the one
-            # memory claim that WAS controlled -- CUDA graph pool size -- came
-            # out at parity (8.746 vs 8.740 GiB at max_batch_size 128), so the
-            # uncontrolled figure should not be relied on. The op resizes
-            # itself, so whatever the true delta is, it costs GPU memory that
-            # would otherwise hold KV cache rather than correctness.
+            # grows with the row ceiling; that memory would otherwise hold
+            # KV cache.
             self.max_num_requests = view.max_num_rows
             # Every runtime view has to agree on batch_size with
             # kv_lens_cuda_runtime, and the op reads request_types over all of
@@ -1839,7 +1833,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.fmha_libs:
             self.create_fmha_libs()
 
-        # goal doc K2. On a ragged generation step the attention op is handed
+        # On a ragged generation step the attention op is handed
         # one row per query token so its `num_tokens % num_seqs == 0` check
         # passes with seq_len == 1. Wrapping the dispatch rather than the
         # library keeps every fmha implementation, and its tests, untouched.
@@ -2112,7 +2106,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
-        # goal doc K1. Same presentation as the attention dispatch above: the
+        # Same presentation as the attention dispatch above: the
         # rope kernel derives batch_idx = tok / seq_len and the KV write offset
         # from a single scalar seq_len, which only describes a batch where every
         # request contributes the same number of tokens.

@@ -25,7 +25,7 @@ flat cost model the budget degenerates to verify-all.
 import os
 from collections import Counter
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from ...logger import logger
 
@@ -398,8 +398,3 @@ class DSparkRaggedStats:
     def log_summary(self, *, prefix: str = "DSpark ragged verify") -> None:
         summary = self.summary()
         logger.info(f"{prefix}: {summary}")
-
-def format_verify_len_histogram(lens: List[int]) -> str:
-    """One-line ``len:count`` rendering, for per-step debug logging."""
-    hist = Counter(int(v) for v in lens)
-    return " ".join(f"{k}:{v}" for k, v in sorted(hist.items()))

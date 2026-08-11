@@ -126,9 +126,6 @@ def test_head_resolves_across_both_layouts_and_absence_is_none():
     from tensorrt_llm._torch.speculative.dspark_sts import resolve_confidence_head
     h = _Head()
     assert resolve_confidence_head(_Bare(h)) is h
-    # The wrapper layout is the one the chained getattr missed: resolving to
-    # None here silently disabled calibration for every confidence-scheduled
-    # run of the first campaign.
     assert resolve_confidence_head(_Wrapper(h)) is h
     assert resolve_confidence_head(_Bare(None)) is None
     assert resolve_confidence_head(_Wrapper(None)) is None

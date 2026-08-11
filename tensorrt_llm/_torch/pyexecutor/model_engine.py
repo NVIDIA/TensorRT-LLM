@@ -2027,8 +2027,6 @@ class PyTorchModelEngine(ModelEngine):
                 # right after an advanced one would otherwise key on the stale
                 # False before populate corrects it.
                 spec_metadata.is_all_greedy_sample = True
-            _graph_mem_before = (torch.cuda.memory_reserved(),
-                                 torch.cuda.memory_allocated())
             _graph_count = 0
             try:
                 for entry in (graphs_to_capture
@@ -2103,32 +2101,9 @@ class PyTorchModelEngine(ModelEngine):
         # the LAST shape's draft length; restore it after the passes, before
         # the generic token warmup builds requests at the full draft length.
         saved_runtime_draft_len = self.runtime_draft_len
-        needs_non_greedy_precheck = (
-            self.spec_config is not None
-            and self.spec_config.spec_dec_mode.use_one_engine()
-            and os.environ.get("TLLM_DSPARK_SKIP_ADVANCED_CAPTURE") != "1")
-        if (needs_non_greedy_precheck and os.environ.get(
-                "TLLM_DSPARK_INTERLEAVED_CAPTURE") == "1"):
-            # Debug/fix candidate: capture both sampling variants of each
-            # shape back-to-back, so the two graphs bind under identical
-            # pool/workspace/persistent-buffer conditions instead of a whole
-            # sweep apart.
-            for _entry in graphs_to_capture:
-                _run_capture_pass(force_non_greedy=False,
-                                  label="greedy",
-                                  entries=[_entry])
-                _run_capture_pass(force_non_greedy=True,
-                                  label="advanced sampling",
-                                  entries=[_entry])
-            self.enable_spec_decode = self.is_spec_decode
-            self.runtime_draft_len = saved_runtime_draft_len
-            if self.spec_metadata is not None:
-                self.spec_metadata.is_all_greedy_sample = True
-            return
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
-        if os.environ.get("TLLM_DSPARK_SKIP_GREEDY_CAPTURE") != "1":
-            _run_capture_pass(force_non_greedy=False, label="greedy")
+        _run_capture_pass(force_non_greedy=False, label="greedy")
         # Pass 2: advanced sampling variant. Required because on-the-fly capture
         # is disabled outside warmup, so any inference batch that contains a
         # non-greedy request would otherwise fall back to eager. Only meaningful
@@ -2137,8 +2112,7 @@ class PyTorchModelEngine(ModelEngine):
         # this variant.
         needs_non_greedy_capture = (
             self.spec_config is not None
-            and self.spec_config.spec_dec_mode.use_one_engine()
-            and os.environ.get("TLLM_DSPARK_SKIP_ADVANCED_CAPTURE") != "1")
+            and self.spec_config.spec_dec_mode.use_one_engine())
         if needs_non_greedy_capture:
             _run_capture_pass(force_non_greedy=True, label="advanced sampling")
         # Set the value back to the original value after cuda graph warmups are complete
@@ -3861,10 +3835,9 @@ class PyTorchModelEngine(ModelEngine):
 
         # Published only now, past the last way this fit can fail: a stale
         # published bucket on a fallback step is the state behind the ragged
-        # IMA. `_dspark_last_total_tokens`/`_dspark_last_padded_bs` feed the
+        # IMA. `_dspark_last_padded_bs` feeds the
         # stats; `ragged_pad_verify_len` is stamped on the shared dummy by
         # _get_padded_batch.
-        self._dspark_last_total_tokens = int(bucket)
         self._dspark_last_padded_bs = int(padded_bs)
         self._dspark_last_num_real = int(n_real)
         runner.agreed_ragged_bucket = int(bucket)
@@ -3953,9 +3926,6 @@ class PyTorchModelEngine(ModelEngine):
         split_lens = lens_buf[:padded_bs].clone()
         split_qo = qo_buf[:padded_bs + 1].to(torch.long)
         past_seen = self.position_ids_cuda[split_qo[:-1]].clone()
-        if os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":
-            self._dbg_pre_kv = attn_metadata.kv_lens_cuda[:padded_bs].clone()
-            self._dbg_split = split_lens.clone()
 
         expected_stamp = worker.verified_draft_seq_cuda()
         stamps = worker.confidence_stamp_buffer(
@@ -3972,33 +3942,6 @@ class PyTorchModelEngine(ModelEngine):
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
         )
-        debug_mode = os.environ.get("TLLM_DSPARK_DEVICE_IDENTITY", "")
-        if debug_mode in ("1", "steep"):
-            # Debug bisectors. "1": exercise every prologue write with the
-            # shape split itself (w := S) -- corruption surviving this is in
-            # the rewrite mechanics, not the window semantics. "steep":
-            # deterministic max-amplitude ragged windows (adjacent real rows
-            # trade tokens pairwise, conserving the total) -- forces w != S
-            # while staying independent of the confidence-gather chain.
-            from ..speculative.dspark_ragged import (build_qo_indptr,
-                                                     build_row_maps_device)
-            id_lens = split_lens.clone()
-            if debug_mode == "steep" and n_real > 1:
-                lo = cfg.min_verify_len + 1
-                hi = cfg.resolved_max_verify_len + 1
-                pairs = (n_real // 2) * 2
-                a = id_lens[0:pairs:2]
-                b = id_lens[1:pairs:2]
-                give = torch.minimum(a - lo, hi - b).clamp_min(0)
-                a -= give
-                b += give
-            id_req, id_corr = build_row_maps_device(id_lens,
-                                                    graph_num_tokens=bucket)
-            result = type(result)(verify_lens=id_lens,
-                                  qo_indptr=build_qo_indptr(id_lens).to(
-                                      result.qo_indptr.dtype),
-                                  req_idx=id_req,
-                                  kv_correction=id_corr)
 
         lens_buf[:padded_bs].copy_(result.verify_lens)
         qo_buf[:padded_bs + 1].copy_(result.qo_indptr)
@@ -4056,180 +3999,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.apply_device_ragged_layout(result.verify_lens, req_idx,
                                                  result.kv_correction)
-        if os.environ.get("TLLM_DSPARK_RIDE_LOG") == "1":
-            self._ride_log_ctr = getattr(self, "_ride_log_ctr", 0) + 1
-            if self._ride_log_ctr % 64 == 0:
-                logger.info(
-                    f"[ride-log] prologue #{self._ride_log_ctr} "
-                    f"S={split_lens[:4].tolist()} w={result.verify_lens[:4].tolist()}")
-        if (os.environ.get("TLLM_DSPARK_INVARIANT_LOG") == "1"
-                and getattr(self, "_dspark_inv_prints", 0) < 40):
-            # Read-only invariant audit against host-with-w formulas: no
-            # restage, no request mutation, no collectives -- safe at scale.
-            torch.cuda.synchronize()
-            gen_requests = [
-                r for r in (self._dspark_inv_requests or [])
-            ] if getattr(self, "_dspark_inv_requests", None) else []
-            w = result.verify_lens[:n_real].tolist()
-            qo = result.qo_indptr[:n_real + 1].tolist()
-            kv = attn_metadata.kv_lens_cuda[:n_real].tolist()
-            kvoff = self.previous_kv_lens_offsets_cuda[:n_real].tolist()
-            slots_l = prev_slots.tolist()
-            ids = self.input_ids_cuda[:bucket].tolist()
-            drafts_l = self.draft_tokens_cuda[:bucket].tolist()
-            ppi = self.previous_pos_indices_cuda[:bucket].tolist()
-            ppo = self.previous_pos_id_offsets_cuda[:bucket].tolist()
-            anchors = new_tokens_device[0].squeeze(-1).tolist()
-            nlens = new_tokens_lens_device.tolist()
-            ndraft = next_draft_tokens_device.tolist()
-            self._dspark_inv_step = getattr(self, "_dspark_inv_step", 0) + 1
-
-            def _viol(i, msg):
-                self._dspark_inv_prints = getattr(self, "_dspark_inv_prints",
-                                                  0) + 1
-                logger.warning(
-                    f"[invariant] step#{self._dspark_inv_step} row {i}: {msg} "
-                    f"(w={w[i]} S={split_lens[i].item()} n_real={n_real} "
-                    f"padded_bs={padded_bs} bucket={bucket})")
-
-            # Batch 3: layout-derived tensors recomputed analytically from w.
-            from ..speculative.dspark_ragged import build_row_maps_device
-            want_req, want_corr = build_row_maps_device(
-                result.verify_lens[:padded_bs], graph_num_tokens=bucket)
-            if not torch.equal(attn_metadata.row_req_idx_cuda[:bucket],
-                               want_req):
-                _viol(-1, "row_req_idx mismatch vs analytic recompute")
-            if not torch.equal(attn_metadata.row_kv_correction_cuda[:bucket],
-                               want_corr):
-                _viol(-1, "row_kv_correction mismatch vs analytic recompute")
-            seq_l = attn_metadata.seq_lens_cuda[:n_real].tolist()
-            reps_l = attn_metadata.gen_token_repeats_cuda[:n_real].tolist()
-            pos = self.position_ids_cuda[:bucket].tolist()
-            for i, req in enumerate(gen_requests[:n_real]):
-                past = int(req.max_beam_num_tokens) - 1
-                s = slots_l[i]
-                if seq_l[i] != w[i]:
-                    _viol(i, f"seq_lens={seq_l[i]} want w={w[i]}")
-                if reps_l[i] != w[i]:
-                    _viol(i, f"repeats={reps_l[i]} want w={w[i]}")
-                if pos[qo[i] + w[i] - 1] - pos[qo[i]] != w[i] - 1:
-                    _viol(i, f"position packing: pos[last]-pos[first]="
-                          f"{pos[qo[i]+w[i]-1]-pos[qo[i]]} want {w[i]-1}")
-                if kv[i] != past + 2 * w[i]:
-                    _viol(i, f"kv={kv[i]} want past+2w={past + 2 * w[i]}")
-                if kvoff[i] != nlens[s] - w[i]:
-                    _viol(i, f"kvoff={kvoff[i]} want nlens-w={nlens[s]-w[i]}")
-                if ids[qo[i]] != anchors[s]:
-                    _viol(i, f"anchor ids[{qo[i]}]={ids[qo[i]]} "
-                          f"want new_tokens[0,{s}]={anchors[s]}")
-                if w[i] > 1 and drafts_l[qo[i] - i] != ndraft[s][0]:
-                    _viol(i, f"draft0 {drafts_l[qo[i]-i]} want {ndraft[s][0]}")
-                for o in (0, w[i] - 1):
-                    if ppi[qo[i] + o] != s:
-                        _viol(i, f"prev_pos_idx[{qo[i]+o}]={ppi[qo[i]+o]} "
-                              f"want slot {s}")
-                    if ppo[qo[i] + o] != nlens[s]:
-                        _viol(i, f"prev_pos_off[{qo[i]+o}]={ppo[qo[i]+o]} "
-                              f"want nlens={nlens[s]}")
-            if self._dspark_inv_step % 100 == 0:
-                logger.info(
-                    f"[invariant] step#{self._dspark_inv_step} checkpoint: "
-                    f"{getattr(self, '_dspark_inv_prints', 0)} violations")
         return True
-
-    def _dspark_ab_diff(self, padded_requests, kv_cache_manager, attn_metadata,
-                        spec_metadata, new_tensors_device,
-                        cache_indirection_buffer, num_accepted_tokens_device,
-                        req_id_to_old_request, resource_manager,
-                        can_run_graph) -> None:
-        """Debug: diff the prologue's rewritten staging against a host restage.
-
-        Runs once, eager-only. Snapshot every tensor the forward reads after
-        the prologue rewrote the layout to the device windows w; then stamp w
-        onto each request's py_verify_len and rerun the full host staging (the
-        reference implementation, proven correct for non-uniform windows);
-        diff. Any mismatch names the artifact the prologue fails to mirror.
-        """
-        torch.cuda.synchronize()
-        bucket = int(self.cuda_graph_runner.agreed_ragged_bucket or 0)
-        padded_bs = int(self._dspark_last_padded_bs)
-        gen_requests = padded_requests.generation_requests
-        n_real = int(self._dspark_last_num_real)
-        w_tokens = self.ragged_verify_lens_cuda[:padded_bs].tolist()
-
-        def snap():
-            fields = {
-                "input_ids": self.input_ids_cuda[:bucket],
-                "position_ids": self.position_ids_cuda[:bucket],
-                "draft_tokens": self.draft_tokens_cuda[:bucket],
-                "prev_pos_indices": self.previous_pos_indices_cuda[:bucket],
-                "prev_pos_offsets": self.previous_pos_id_offsets_cuda[:bucket],
-                "prev_kv_offsets": self.previous_kv_lens_offsets_cuda[:padded_bs],
-                "kv_lens": attn_metadata.kv_lens_cuda[:padded_bs],
-                "seq_lens_cuda": attn_metadata.seq_lens_cuda[:padded_bs],
-                "verify_lens": self.ragged_verify_lens_cuda[:padded_bs],
-                "qo_indptr": self.ragged_qo_indptr_cuda[:padded_bs + 1],
-            }
-            for name in ("gen_token_repeats_cuda", "row_req_idx_cuda",
-                         "row_kv_correction_cuda", "attn_row_req_idx_cuda",
-                         "attn_row_kv_correction_cuda", "req_idx_per_token",
-                         "kv_lens_expanded_cuda", "block_table_expanded",
-                         "slot_mapping_fp8", "gen_kv_indptr",
-                         "gen_cached_token_indptr"):
-                t = getattr(attn_metadata, name, None)
-                if isinstance(t, torch.Tensor):
-                    n = bucket if t.shape[0] >= bucket else t.shape[0]
-                    fields[name] = t[:n]
-            for name in ("temperatures", "top_ks", "top_ps", "batch_slot_ids"):
-                t = getattr(spec_metadata, name, None)
-                if isinstance(t, torch.Tensor):
-                    n = min(bucket, t.shape[0])
-                    fields["spec." + name] = t[:n]
-            return {k: v.detach().clone() for k, v in fields.items()}
-
-        snap_a = snap()
-        prev_idx = getattr(self, "_dspark_ab_prev_idx", {})
-        for request, tokens in zip(gen_requests, w_tokens):
-            request.py_verify_len = int(tokens) - 1
-            if request.py_request_id in prev_idx:
-                request.py_batch_idx = prev_idx[request.py_request_id]
-        try:
-            self._prepare_inputs(padded_requests, kv_cache_manager,
-                                 attn_metadata, spec_metadata,
-                                 new_tensors_device, cache_indirection_buffer,
-                                 num_accepted_tokens_device,
-                                 req_id_to_old_request, resource_manager,
-                                 can_run_graph)
-        except Exception as exc:
-            logger.warning(f"[ab-diff] restage failed, disabling: {exc}")
-            self._dspark_ab_prints = 999
-            return
-        torch.cuda.synchronize()
-        snap_b = snap()
-        self._dspark_ab_step = getattr(self, "_dspark_ab_step", 0) + 1
-        # Expected-divergent names: staged from the shape split at prepare
-        # and rebuilt in-graph from the corrected kv_lens before any read.
-        benign = {"kv_lens_expanded_cuda", "slot_mapping_fp8"}
-        for name, a in snap_a.items():
-            b = snap_b[name]
-            if name in benign or a.shape != b.shape:
-                continue
-            neq = (a != b)
-            cnt = int(neq.sum())
-            if cnt:
-                idx = int(neq.reshape(-1).nonzero()[0])
-                self._dspark_ab_prints = getattr(self, "_dspark_ab_prints",
-                                                 0) + 1
-                logger.info(
-                    f"[ab-diff] step#{self._dspark_ab_step} {name}: "
-                    f"{cnt}/{a.numel()} MISMATCH first@{idx} "
-                    f"prologue={a.reshape(-1)[idx].item()} "
-                    f"host={b.reshape(-1)[idx].item()} "
-                    f"(bs={padded_bs} n_real={n_real} bucket={bucket})")
-        if self._dspark_ab_step % 200 == 0:
-            logger.info(f"[ab-diff] step#{self._dspark_ab_step} checkpoint: "
-                        f"{getattr(self, '_dspark_ab_prints', 0)} mismatch "
-                        f"lines so far")
 
     @staticmethod
     def _ragged_token_lens(generation_requests) -> Optional[List[int]]:
@@ -7332,13 +7102,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager=spec_resource_manager,
             )
 
-            if (key is not None and not self.is_warmup and os.environ.get(
-                    "TLLM_DSPARK_FORCE_EAGER") == "1"):
-                # Debug bisector: capture normally (the ragged fit needs the
-                # captured bucket set) but veto every replay, so the exact
-                # same staged step runs eagerly. Splits capture-interaction
-                # bugs from layout-semantics bugs.
-                key = None
             can_run_graph = key is not None
             # A ragged step that misses its captured shape quietly runs eager;
             # count it. Only generation-only steps count: a batch with context
@@ -7368,15 +7131,6 @@ class PyTorchModelEngine(ModelEngine):
                     padded_requests.generation_requests,
                 )
 
-            if os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":
-                # The staging loop overwrites py_batch_idx (prev-batch index
-                # -> seq slot); the A/B restage must see the original or its
-                # reference staging reads the wrong new_tokens rows on any
-                # slot-churn step.
-                self._dspark_ab_prev_idx = {
-                    r.py_request_id: r.py_batch_idx
-                    for r in padded_requests.generation_requests
-                }
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
@@ -7390,31 +7144,10 @@ class PyTorchModelEngine(ModelEngine):
             # replay (stream-ordered, no host sync). Graph steps only: eager
             # and capture steps run the host shape split, which is a valid
             # window assignment.
-            if ((can_run_graph or os.environ.get(
-                    "TLLM_DSPARK_DEVICE_EAGER_OK") == "1")
-                    and not self.is_warmup
+            if (can_run_graph and not self.is_warmup
                     and getattr(self, "_dspark_device_budget", None)
                     is not None):
-                if os.environ.get("TLLM_DSPARK_INVARIANT_LOG") == "1":
-                    # Read-only reference for the prologue's invariant audit.
-                    self._dspark_inv_requests = list(
-                        padded_requests.generation_requests)
-                applied = self._apply_device_window_prologue(
-                    inputs, new_tensors_device)
-                if applied and os.environ.get("TLLM_DSPARK_AB_DUMP") == "1":
-                    self._dspark_ab_applied = getattr(
-                        self, "_dspark_ab_applied", 0) + 1
-                if (applied and os.environ.get("TLLM_DSPARK_AB_DUMP") == "1"
-                        and getattr(self, "_dspark_ab_applied", 0) >= int(
-                            os.environ.get("TLLM_DSPARK_AB_AFTER", "0"))
-                        and getattr(self, "_dspark_ab_prints", 0) < 40):
-                    self._dspark_ab_diff(padded_requests, kv_cache_manager,
-                                         attn_metadata, spec_metadata,
-                                         new_tensors_device,
-                                         cache_indirection_buffer,
-                                         num_accepted_tokens_device,
-                                         req_id_to_old_request,
-                                         resource_manager, can_run_graph)
+                self._apply_device_window_prologue(inputs, new_tensors_device)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:

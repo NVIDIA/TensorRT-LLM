@@ -1233,13 +1233,6 @@ class SweepConfig:
             raise SweepGeometryError("both --batch-sizes and --verify-lens must be non-empty")
         if min(self.verify_lens) < 1:
             raise SweepGeometryError("verify lengths must be >= 1 (the planner's floor)")
-        # Constant-block with a pinned window below the block used to die on a
-        # device-side assert (Repeat.cu output_size vs sum(repeats)); a guard
-        # here refused that geometry. The assert was another symptom of the
-        # graph key describing a different token width than the batch carried,
-        # fixed by publishing the fit's bucket into the key; verified gone
-        # 2026-08-06 by pinned L=3 runs under both real and synthetic
-        # acceptance (64+ steps each, no assert).
         # A request that hits max_seq_len is evicted mid-cell, so the batch
         # drains and the steady window shrinks -- which surfaces much later as a
         # confusing "not enough steady samples".
@@ -1338,20 +1331,6 @@ def _build_llm(config: SweepConfig, verify_len: int, *,
     # pinned -- a rank-divergent shape under attention-DP. With one verify
     # length per sweep process the pin always equals the ladder rung below, so
     # it can never be rejected either.
-    #
-    # (An earlier revision popped it and relied on the one-rung ladder alone,
-    # citing a "pin skips the padding reservation" theory for the Repeat.cu
-    # assert. That theory was wrong -- the assert reproduced with no pin at
-    # all; the actual cause was the CUDA-graph key describing a
-    # different token width than the batch carried. The key publishes the
-    # fit's bucket (so attention-DP ranks agree by construction) and the
-    # layout assert cross-checks it against the batch walk; a divergence now
-    # has to show up there rather than inside a replayed graph. And the one-rung ladder was
-    # never one rung anyway: the llm_args validator appends max_draft_len, so
-    # under a constant block [L] is really [L, block]. With a seed table
-    # present the planner argmax'd its way to the block on 93-95% of steps
-    # while the samples file recorded M = bs*(L+1) as if L had run -- twelve
-    # cells, eight mislabelled, and the fit dutifully concluded q ~ 0.)
     from tensorrt_llm._torch.speculative.dspark_verify import FORCE_VERIFY_LEN_ENV
 
     # LAUNCH-MODE CAVEAT: this mutation reaches ranks 1..N-1 only when the
@@ -1373,18 +1352,14 @@ def _build_llm(config: SweepConfig, verify_len: int, *,
     #
     # constant block (default): the block stays at the checkpoint's trained
     # length for every cell and only the verify window moves, which is exactly
-    # what the deployment does. The all-short-window regime this creates used
-    # to trip the Repeat.cu output_size assert; that was the graph-key/batch
-    # width divergence, fixed with the published-bucket key and verified gone
-    # 2026-08-06.
+    # what the deployment does.
     #
     # block follows verify_len: the original design. Never produces
     # max(lens) < block, so it runs today, at the price of shrinking the DRAFT
     # pass along with the window -- theta(M) then absorbs a per-L draft term.
     # That term is recoverable rather than fatal: with several batch sizes the
     # same M is reached at different L (M=192 from bs=32/L=5 and bs=64/L=2), and
-    # those shared points separate a token cost from an L cost. See
-    # tmp/dspark_build/verdict_theta.py.
+    # those shared points separate a token cost from an L cost.
     block = int(verify_len) if config.block_follows_verify_len else int(config.max_draft_len)
     spec_config = DSparkDecodingConfig(
         max_draft_len=block,
@@ -1509,8 +1484,7 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int,
     # and the cell reports "kept nothing" while the plateau it was measuring
     # scrolled out of the buffer unseen (jobs 2561986, 2563525).
     #
-    # The hazard this replaces is real but narrower than the old comment
-    # claimed: `IterationResult` latches done when its queue runs dry, so an
+    # `IterationResult` latches done when its queue runs dry, so an
     # empty read ends collection. Polling only while requests are still
     # outstanding keeps the queue fed; the count of empty reads is reported so a
     # cell that lost its tail this way is visible rather than merely short.
@@ -2263,7 +2237,7 @@ def samples_from_server(
                       f"({exc}); skipping the rung", file=sys.stderr)
                 continue
             for batch_size in sorted(batch_sizes):
-                # H2: the load must outlive the measurement window, or the
+                # The load must outlive the measurement window, or the
                 # cell measures ramp-down rows filed under smaller batch
                 # sizes. Budget the output by the window at a conservative
                 # 30 ms/step lower bound.

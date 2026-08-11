@@ -24,7 +24,6 @@ path: it reads the confidence buffer back to the host once per decode step.
 
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -35,7 +34,6 @@ from ...logger import logger
 
 __all__ = [
     "STS_COLLECT_ENV",
-    "DSparkStsCalibration",
     "DSparkStsRecorder",
     "load_sts_temperatures_from_path",
     "make_recorder_from_env",
@@ -47,29 +45,6 @@ STS_COLLECT_ENV = "TLLM_DSPARK_STS_COLLECT_PATH"
 
 #: Flush after this many recorded steps, so a killed run still leaves data.
 _DEFAULT_FLUSH_EVERY = 64
-
-
-@dataclass
-class DSparkStsCalibration:
-    """A fitted per-position temperature vector, plus how well it did."""
-
-    temperatures: List[float]
-    ece_before: List[float] = field(default_factory=list)
-    ece_after: List[float] = field(default_factory=list)
-    dataset: str = ""
-    num_samples: int = 0
-
-    def to_json(self) -> dict:
-        # Both key spellings on purpose: this repo reads ``sts_temperatures``,
-        # SGLang uses ``temperatures``; tables stay interchangeable.
-        return {
-            "sts_temperatures": list(self.temperatures),
-            "temperatures": list(self.temperatures),
-            "ece_before": list(self.ece_before),
-            "ece_after": list(self.ece_after),
-            "dataset": self.dataset,
-            "num_samples": int(self.num_samples),
-        }
 
 
 def load_sts_temperatures_from_path(path: str) -> List[float]:

@@ -201,8 +201,6 @@ def main() -> int:
               "have the real planner check the table before you spend a run "
               "on it", file=sys.stderr)
         any_trim = True
-        print(f"  bs={bs:<5} -> K={best_k}"
-              f"{'  TRIM' if trims else '   (full window)'}")
     if not any_trim:
         print()
         print("WARNING: this table induces no trimming at any previewed batch "

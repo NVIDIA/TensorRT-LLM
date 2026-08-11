@@ -14,11 +14,10 @@ DSpark's ragged verification a request appends only as many tokens as it was
 given to verify, so ``next_n`` was demoted to a compile-time *upper bound* and
 the true per-request counts now arrive in an optional ``new_tokens_per_seq``.
 
-The property that matters is the one the goal doc calls out as missing
-(§6.3): a ragged call whose ``new_tokens_per_seq`` is filled with the uniform
-value must be **bitwise identical** to passing ``None``. That is what makes the
-optional argument safe to add -- it says the ragged code path did not perturb
-the uniform one, which every non-DSpark model still uses.
+The property that matters: a ragged call whose ``new_tokens_per_seq`` is filled
+with the uniform value must be **bitwise identical** to passing ``None``. That
+is what makes the optional argument safe to add -- it says the ragged code path
+did not perturb the uniform one, which every non-DSpark model still uses.
 
 The second test covers the case the first cannot: genuinely differing counts.
 It checks the ragged call against per-request uniform calls, which is the only
@@ -189,7 +188,7 @@ class _CompressorCase:
 )
 def test_uniform_new_tokens_matches_none(kv_lens: List[int], next_n: int,
                                          dtype: torch.dtype):
-    """goal doc §6.3: filling ``new_tokens_per_seq`` uniformly == passing None.
+    """Filling ``new_tokens_per_seq`` uniformly must equal passing None.
 
     This is the differential that licenses the optional argument. If it fails,
     the ragged plumbing changed the uniform path -- which every non-DSpark model

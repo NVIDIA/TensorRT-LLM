@@ -984,11 +984,6 @@ class SpecMetadata:
         # read. Skip the heavier H->D copies.
         if self.is_all_greedy_sample:
             return
-        if os.environ.get("TLLM_DSPARK_SKIP_SAMPLING_H2D") == "1":
-            # Debug bisector (pair with TLLM_DSPARK_FORCE_ARGMAX, which stops
-            # anything reading these buffers): isolates whether the per-step
-            # non-greedy H2D staging itself is the corruption channel.
-            return
 
         # Phase 2: build per-token / per-request lists and copy to GPU.
         temperatures: list[float] = []
@@ -2353,8 +2348,7 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
-        if not spec_metadata.is_all_greedy_sample and os.environ.get(
-                "TLLM_DSPARK_FORCE_ARGMAX") != "1":
+        if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
             # graph was built for a shorter draft_len, causing a shape mismatch

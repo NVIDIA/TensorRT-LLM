@@ -24,8 +24,6 @@ from typing import Optional
 
 import torch
 
-import os
-
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -291,55 +289,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
-        if os.environ.get("TLLM_DSPARK_ROWDIV_LOG") == "1":
-            # Identical-request divergence detector: under a census load all
-            # requests share one prompt, so at temp 0 every row's accepted
-            # tokens must match its peers each step (windows change how MUCH
-            # is verified, never WHAT is accepted). The first divergent step
-            # names the corrupted rows and their window class.
-            sigs = {}
-            for _req in state.requests:
-                if _req.state == LlmRequestState.GENERATION_COMPLETE:
-                    continue
-                _s = _req.py_seq_slot
-                _n = new_tokens_lens_list[_s]
-                _toks = tuple(new_tokens[i][_s][0] for i in range(_n))
-                _w = (ridden_verify_lens[_s]
-                      if ridden_verify_lens is not None else -1)
-                sigs.setdefault(_toks, []).append((_s, _w))
-            self._rowdiv_step = getattr(self, "_rowdiv_step", 0) + 1
-            if len(sigs) > 1 and getattr(self, "_rowdiv_prints", 0) < 30:
-                self._rowdiv_prints = getattr(self, "_rowdiv_prints", 0) + 1
-                desc = "; ".join(
-                    f"{len(v)}rows(w={sorted(set(x[1] for x in v))})"
-                    f"toks={k[:3]}" for k, v in list(sigs.items())[:4])
-                logger.warning(
-                    f"[rowdiv] step#{self._rowdiv_step} {len(sigs)} distinct "
-                    f"token-tuples across identical requests: {desc}")
-            if self._rowdiv_step % 100 == 0:
-                logger.info(f"[rowdiv] step#{self._rowdiv_step} checkpoint: "
-                            f"{getattr(self, '_rowdiv_prints', 0)} "
-                            f"divergent steps")
-
         caps = state.verify_caps_snapshot
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            if os.environ.get("TLLM_DSPARK_RIDE_LOG") == "1" and (
-                    ridden_verify_lens is not None):
-                _win = ridden_verify_lens[req.py_seq_slot]
-                if _win > 0 and num_new_tokens > _win:
-                    logger.warning(
-                        f"[accept-bound] slot={req.py_seq_slot} accepted+1="
-                        f"{num_new_tokens} > token window {_win} -- in-graph "
-                        f"acceptance ran past this row's layout window")
-                elif _win == 0:
-                    logger.warning(
-                        f"[accept-bound] slot={req.py_seq_slot} ride window=0 "
-                        f"on a live request -- rewind falling back to the "
-                        f"S snapshot (py_verify_len="
-                        f"{getattr(req, 'py_verify_len', None)})")
             # cap-accept: `num_new_tokens` has ALREADY been capped, on device,
             # inside acceptance (`interface.apply_accept_caps`) -- it has to be,
             # because the drafter reads the same count later in that forward to
@@ -465,8 +419,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # cap-accept: absent on every other path, and written as ZEROS then
         # rather than skipped. The buffer is persistent and slot-indexed, so a
         # slot left untouched would keep whatever the previous occupant lost
-        # and hand it to the current one -- the stale-buffer bug this branch
-        # has already paid for twice.
+        # and hand it to the current one.
         o_cap_trim = outputs.get("cap_trim_lens")
         if o_cap_trim is None:
             o_cap_trim = torch.zeros_like(o_new_tokens_lens)
@@ -486,13 +439,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                                           num_sampling_requests]
         self.store.verify_lens.index_copy_(
             0, slots, o_verify_lens.to(self.store.verify_lens.dtype))
-        if os.environ.get("TLLM_DSPARK_RIDE_LOG") == "1":
-            self._ride_log_ctr = getattr(self, "_ride_log_ctr", 0) + 1
-            if self._ride_log_ctr % 64 == 0:
-                logger.info(
-                    f"[ride-log] sampler #{self._ride_log_ctr} "
-                    f"lens_buf[:4]={o_verify_lens[:4].tolist()} "
-                    f"slots[:4]={slots[:4].tolist()}")
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(

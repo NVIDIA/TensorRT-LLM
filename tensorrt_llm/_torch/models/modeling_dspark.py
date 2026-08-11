@@ -146,15 +146,6 @@ def remap_dspark_draft_keys(weights: Dict, num_stages: int) -> Dict:
     return out
 
 
-# The checkpoint stores
-# ``mtp.{s}.attn.wo_a`` as fp8_e4m3 + a UE8M0 128x128 block scale (verified), and
-# the reference (`inference/model.py`, ``self.wo_a`` is a bf16 ColumnParallelLinear
-# loaded from the fp8 ckpt) uses the DEQUANTIZED bf16 ``wo_a`` (== ``wo_a_fp8 *
-# scale`` ~ absmean 0.065). The bf16 captured-context path historically skipped
-# this dequant (raw fp8-cast-to-bf16, ~993x too large); the correct behavior is to
-# dequantize ``wo_a`` (cos 1.0 vs ``wo_a_fp8 * scale``). Always dequantize now.
-
-
 class DSparkBlock(DeepseekV4DecoderLayer):
     """One DSpark draft stage = a DeepSeek-V4 decoder block + DSpark extras.
 
@@ -833,10 +824,7 @@ class DSparkDraftModel(nn.Module):
         # distinct set of requests) and needs no cross-rank reduction; but under
         # plain tensor parallelism (attention_dp off, tp_size > 1) the expert-sharded
         # MoE output must be all-reduced across ranks -- exactly what the target MoE
-        # does (enable_allreduce = not (POST_MOE_FUSION or tp_size == 1)). Previously
-        # this was hard-coded to False, which dropped the reduction on the non-ADP
-        # path, corrupting the draft block proposals and roughly halving DSpark
-        # acceptance length whenever attention_dp was disabled.
+        # does (enable_allreduce = not (POST_MOE_FUSION or tp_size == 1)).
         moe_enable_allreduce = (
             not self.model_config.mapping.enable_attention_dp
             and self.model_config.mapping.tp_size > 1
@@ -1036,7 +1024,7 @@ class DSparkDraftModel(nn.Module):
 
         ``block_hidden`` is the last stage's mHC residual ``[*, block, hc_mult, hidden]``.
         Returns (draft_tokens [*, block], confidence [*, block] or None); with ``return_logits``
-        also returns the per-position draft logits [*, block, vocab] (§7.9 1-TV).
+        also returns the per-position draft logits [*, block, vocab].
         """
         last = self.mtp_layers[-1]
         h = last.hc_head(block_hidden)

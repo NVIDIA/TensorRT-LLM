@@ -2893,11 +2893,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 and not self.confidence_sts_path):
             # Without a profiled cost table the planner's budget degenerates to
             # verify-all -- correctly, since a flat model makes every extra
-            # token look free -- so the ragged path silently never runs. That
-            # used to be a runtime warning, which means a 27-minute run
-            # "succeeds" having done nothing and the only evidence is a counter
-            # nobody reads. Fail at construction instead.
-            #
+            # token look free -- so the ragged path silently never runs.
             raise ValueError(
                 "enable_ragged_verify=True requires a profiled cost table: pass "
                 "confidence_sps_table_path (produced by "

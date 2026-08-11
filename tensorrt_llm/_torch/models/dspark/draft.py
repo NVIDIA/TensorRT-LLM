@@ -87,8 +87,8 @@ def dspark_propose(
     """
     # ``draft_logits`` are the per-position distributions the draft token is drawn
     # from (markov-corrected when a head is present, else the raw base logits).
-    # Surfaced under ``return_logits`` for the §7.9 probabilistic-acceptance
-    # (1-TV) measurement; the normal path ignores them.
+    # Surfaced under ``return_logits`` to feed the rejection-sampling verifier;
+    # the normal path ignores them.
     draft_logits = base_logits
     if markov_head is not None:
         draft_tokens, corrected = markov_head.sample_block_tokens(
