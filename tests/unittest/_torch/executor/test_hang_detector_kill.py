@@ -16,6 +16,7 @@
 
 import asyncio
 import contextlib
+import math
 import os
 import shutil
 import signal
@@ -66,6 +67,106 @@ def test_checkpoint_resets_timer():
         assert hd.detected() is False
 
 
+def test_checkpoint_reuses_one_watcher_task():
+    """One watcher task serves every checkpoint, pause and resume.
+
+    The executor loop checkpoints several times per iteration, and each
+    schedule/cancel of a task wakes the detector's event-loop thread, so the
+    single-task design is what keeps checkpoint() off that thread entirely.
+    """
+    hd = HangDetector(timeout=30)
+    with hd:
+        task = hd.task
+        assert task is not None
+        for _ in range(10):
+            hd.checkpoint()
+        with hd.pause():
+            hd.checkpoint()
+        hd.checkpoint()
+        assert hd.task is task
+        assert not task.done()
+
+
+def test_detector_is_disarmed_until_the_first_checkpoint():
+    """start() enables detection; the first checkpoint arms the deadline.
+
+    Callers separate lifecycle start from arming, so the start-to-first-
+    checkpoint window must not be attributed to the loop as a hang.
+    """
+    fired = []
+    hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
+    with hd:
+        time.sleep(2.0)  # would fire if start() armed the deadline itself
+        assert fired == []
+        assert hd.detected() is False
+
+
+def test_watcher_survives_a_raising_callback():
+    """on_detected is the cross-rank hard kill and can fail on a broken job."""
+    fired = []
+
+    def boom():
+        fired.append(1)
+        raise RuntimeError("hard kill failed")
+
+    hd = HangDetector(timeout=1, on_detected=boom)
+    with hd:
+        hd.checkpoint()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(fired) < 1:
+            time.sleep(0.05)
+        assert len(fired) == 1
+
+        # The watcher is still live and still able to report.
+        assert not hd.task.done()
+        hd.checkpoint()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(fired) < 2:
+            time.sleep(0.05)
+        assert len(fired) == 2
+
+
+def test_a_checkpoint_racing_the_disarm_is_not_erased(monkeypatch):
+    """A checkpoint landing as the watcher disarms must survive.
+
+    The watcher reads the lapsed deadline, then clears it. A checkpoint in
+    between installs a newer deadline; clearing that would leave the watcher
+    running but permanently disarmed, so the work it just armed could hang
+    undetected.
+    """
+    hd = HangDetector(timeout=1, on_detected=lambda: None)
+    real_monotonic = hang_detector_module.time.monotonic
+    state = {"injected": False, "busy": False}
+
+    def racing_monotonic():
+        now = real_monotonic()
+        if state["injected"] or state["busy"]:
+            return now
+        # Only inject from `_watch`'s own lapse computation. asyncio's event
+        # loop also reads the clock, and injecting from there would land
+        # outside the window and silently make this test vacuous.
+        caller = sys._getframe(1)
+        if caller.f_code.co_name != "_watch" or hd._deadline > now:
+            return now
+        # `_watch` has already read `self._deadline` into a local by now, so
+        # this checkpoint lands exactly between that read and the disarm.
+        state["busy"] = True
+        state["injected"] = True
+        hd.checkpoint()
+        state["busy"] = False
+        return now
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", racing_monotonic)
+    with hd:
+        hd.checkpoint()
+        deadline = real_monotonic() + 5.0
+        while real_monotonic() < deadline and not state["injected"]:
+            time.sleep(0.05)
+        assert state["injected"], "the racing checkpoint never landed"
+        time.sleep(0.2)  # let the watcher finish its disarm/report pass
+        assert hd._deadline != math.inf, "the racing checkpoint's arm was erased"
+
+
 def test_pause_suppresses_detection():
     fired = []
     hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
@@ -102,7 +203,7 @@ def test_status_provider_errors_are_logged(monkeypatch):
     detector.register_status_provider(failing_provider)
     detector.register_status_provider(lambda: "transceiver status")
 
-    asyncio.run(detector._detect_hang())
+    asyncio.run(detector._report_hang())
 
     messages = "\n".join(message for kind, message in events if kind == "log")
     assert "provider failed" in messages

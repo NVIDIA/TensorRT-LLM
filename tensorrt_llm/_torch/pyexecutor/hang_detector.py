@@ -346,6 +346,9 @@ class HangDetector:
         self.active = False
         self._detected = False
         self._status_providers: list[Callable[[], str]] = []
+        # Monotonic stamp the watcher compares against; ``inf`` means disarmed.
+        # A plain float store is the entire cost of ``checkpoint()``.
+        self._deadline = math.inf
 
     def start(self):
         """Enable hang detection."""
@@ -354,18 +357,67 @@ class HangDetector:
             asyncio.set_event_loop(self.loop)
             self.loop.run_forever()
 
-        self.active = True
+        with self.lock:
+            # Locked, not a bare check: concurrent callers could both observe
+            # ``active`` false and schedule a watcher, and watchers share
+            # ``_deadline``, so a second one reports the same lapse twice and
+            # propagates two hard kills.
+            if self.active:
+                _best_effort_log_error(
+                    "HangDetector.start() called while already active; ignoring."
+                )
+                return
+            self.active = True
+
+        # Disarmed until the first checkpoint so startup does not lapse.
+        self._deadline = math.inf
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=run_loop, daemon=True, name="hang_detector_loop")
         self.loop_thread.start()
+        # One long-lived watcher, scheduled once. The hot path never cancels or
+        # re-arms it; it only moves ``_deadline``.
+        self.task = asyncio.run_coroutine_threadsafe(self._watch(), self.loop)
 
     def register_status_provider(self, provider: Callable[[], str]) -> None:
         """Register a nonblocking callable that returns status to dump on hang detection."""
         with self.lock:
             self._status_providers.append(provider)
 
-    async def _detect_hang(self) -> None:
-        await asyncio.sleep(self.timeout)
+    async def _watch(self) -> None:
+        """Sleep until the deadline lapses, report, and keep watching.
+
+        Waking early is normal: ``checkpoint()`` pushes ``_deadline`` forward
+        without touching this task, so each wake-up either finds time left and
+        sleeps again, or finds the deadline passed and reports. While disarmed
+        the deadline is ``inf``; the sleep is clamped to ``timeout`` because
+        ``checkpoint()`` only stores a float and never wakes this loop, so an
+        unclamped sleep would not notice a later arm.
+
+        This task outlives a report, and outlives a report that raises. A
+        watchdog that quietly stopped watching would be the exact failure it
+        exists to catch, and ``on_detected`` is the cross-rank hard kill, which
+        can itself fail on an already-degraded job.
+        """
+        while self.active:
+            deadline = self._deadline
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(remaining, self.timeout))
+                continue
+            # Disarm only the deadline observed to lapse, so one lapse reports
+            # once. A checkpoint racing this branch installs a newer deadline;
+            # clearing that would leave the watcher alive but permanently
+            # disarmed, which is the failure this watchdog exists to catch.
+            if self._deadline == deadline:
+                self._deadline = math.inf
+            try:
+                await self._report_hang()
+            except Exception as error:  # noqa: BLE001 - the watcher must survive
+                _best_effort_log_error(
+                    f"HangDetector: reporting failed with {type(error).__name__}: {error}"
+                )
+
+    async def _report_hang(self) -> None:
         with self.lock:
             status_providers = tuple(self._status_providers)
 
@@ -399,21 +451,18 @@ class HangDetector:
 
     def checkpoint(self):
         """Reset hang detection timer."""
-        self.cancel_task()
         if self.active:
-            self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
+            self._deadline = time.monotonic() + self.timeout
 
     def cancel_task(self):
-        """Cancel the hang detection task."""
-        if self.task is not None and not self.task.done():
-            self.task.cancel()
-            self.task = None
+        """Disarm hang detection until the next checkpoint."""
+        self._deadline = math.inf
 
     @contextmanager
     def pause(self):
         """Pause hang detection in scope."""
+        self._deadline = math.inf
         try:
-            self.cancel_task()
             yield
         finally:
             self.checkpoint()
