@@ -2479,6 +2479,95 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestMiniMaxM3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/MiniMax-M3-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+
+    @pytest.mark.parametrize("ctx_tp,gen_tp", [
+        pytest.param(
+            2, 2, marks=pytest.mark.skip_less_device(4), id="head_matched"),
+        pytest.param(
+            2, 4, marks=pytest.mark.skip_less_device(8), id="head_mismatched"),
+    ])
+    def test_nvfp4_msa_nixl_python(self, ctx_tp, gen_tp):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.6,
+            "enable_block_reuse": False,
+            "dtype": "fp8",
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 8192,
+        }
+        sparse_attention_config = {
+            "algorithm": "minimax_m3",
+            "implementation": "msa",
+            "indexer_kv_dtype": "fp8",
+            "fuse_qkv_index_projection": True,
+        }
+        moe_config = {"backend": "CUTLASS"}
+        ctx_server_config = {
+            "tensor_parallel_size": ctx_tp,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": ctx_tp,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "max_num_tokens": 8192,
+            "max_seq_len": 4096,
+            "max_batch_size": 32,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "sparse_attention_config": sparse_attention_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": gen_tp,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": gen_tp,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "max_num_tokens": 8192,
+            "max_seq_len": 4096,
+            "max_batch_size": 32,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "sparse_attention_config": sparse_attention_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=32,
+                                      server_waiting_timeout=1200) as llm:
+            # launch_disaggregated_llm uses a lightweight LlmArgs only for
+            # accuracy-reference selection; mirror the checkpoint's effective
+            # mixed-precision weights and FP8 KV cache there.
+            llm.args.quant_config.quant_algo = "MIXED_PRECISION"
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
 class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
