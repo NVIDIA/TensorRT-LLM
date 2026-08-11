@@ -1,7 +1,8 @@
 hostname: localhost
 model: DeepSeek-V3-Lite/fp8
-free_gpu_memory_fraction: 0.25
+free_gpu_memory_fraction: 0.1
 backend: pytorch
+cuda_graph_config: null
 disable_overlap_scheduler: true
 context_servers:
   num_instances: 1
