@@ -54,7 +54,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+    AuxBuffer,
+    build_aux_transfer_layout,
+    get_non_empty_aux_indices,
+)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -763,6 +767,34 @@ class Sender(SenderBase):
             return block_ids.size
         return max(0, block_ids.size - (beam_width - 1))
 
+    @staticmethod
+    def _trim_receiver_window_head(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        peer_window_size: Optional[int],
+        beam_width: int,
+    ) -> np.ndarray:
+        """Drop the receiver's extra leading blocks for a windowed layer group.
+
+        A windowed receiver keeps a larger window when only it runs speculative
+        decoding, so its suffix starts earlier and the extra blocks are at the
+        head. Both starts are derived from list length, so trimming the tail
+        instead would shift every block one position early.
+
+        Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
+        _create_kv_slice, so there dst must not exceed src. A smaller dst
+        (generation prefix-cache reuse) is handled via dst_start.
+        """
+        block_diff = dst_block_ids.size - src_block_ids.size
+        if block_diff <= 0:
+            return dst_block_ids
+        if peer_window_size is None or beam_width > 1:
+            raise ValueError(
+                f"src/dst block count mismatch: {src_block_ids.size} vs "
+                f"{dst_block_ids.size} (dst must not exceed src)"
+            )
+        return dst_block_ids[block_diff:]
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -800,19 +832,18 @@ class Sender(SenderBase):
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Both sides trim block lists to ceil(prompt_len / tpb) in
-            # _create_kv_slice, so dst must never exceed src. A smaller dst
-            # (generation prefix-cache reuse) is handled via dst_start below.
-            block_diff = dst_block_ids.size - src_block_ids.size
-            if block_diff > 0:
-                raise ValueError(
-                    f"src/dst block count mismatch: {src_block_ids.size} vs "
-                    f"{dst_block_ids.size} (dst must not exceed src)"
-                )
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
+
+            peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
+            dst_block_ids = Sender._trim_receiver_window_head(
+                src_block_ids,
+                dst_block_ids,
+                peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
+                beam_width=task._beam_width,
+            )
 
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
@@ -934,9 +965,17 @@ class Sender(SenderBase):
             peer_slot = req_info.aux_slot
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
-            src_ptrs = src_aux_meta.ptrs + src_aux_meta.item_sizes * task._slot
-            dst_ptrs = peer_aux_meta.ptrs + peer_aux_meta.item_sizes * peer_slot
-            sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
+            layout = self._registrar.get_aux_transfer_layout(
+                peer_ri.instance_name, peer_ri.instance_rank
+            )
+            if layout is None:
+                layout = build_aux_transfer_layout(src_aux_meta, peer_aux_meta)
+                self._registrar.cache_aux_transfer_layout(
+                    peer_ri.instance_name, peer_ri.instance_rank, layout
+                )
+            src_ptrs = layout.src_base_ptrs + layout.src_item_sizes * task._slot
+            dst_ptrs = layout.dst_base_ptrs + layout.dst_item_sizes * peer_slot
+            sizes = layout.src_item_sizes
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -1620,7 +1659,24 @@ class Receiver(ReceiverBase):
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
         )
-        bounced = allow_bounce and self._bounce.reserve(receiver_req, task.expected_transfers)
+        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks (the sender
+        # appends its MambaPolicy fragments in _build_kv_write_meta), so the bounce region must be
+        # sized for those bytes too or the write would overrun into the neighboring slot.
+        extra_bytes = 0
+        if receiver_req.mamba_state_index is not None:
+            if peer_infos.page_table is None:
+                allow_bounce = False  # cannot size the sender's recurrent-state payload
+            else:
+                extra_bytes = MambaPolicy.payload_bytes(
+                    sender_page_table=peer_infos.page_table,
+                    receiver_page_table=self._registrar.self_extractor.page_table,
+                    dst_slot=receiver_req.mamba_state_index,
+                    sender_ri=peer_infos,
+                    receiver_ri=self._registrar.self_rank_info,
+                )
+        bounced = allow_bounce and self._bounce.reserve(
+            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+        )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1676,6 +1732,19 @@ class Receiver(ReceiverBase):
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
+
+            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # The sender-side check (PeerRegistrar.register) runs in the
+            # sender's listener thread, where exceptions are only logged, so
+            # reject here — before REGISTER_RANK_INFO is even sent — to fail
+            # the first gen request loudly instead of hanging on a transfer
+            # the sender will never serve.
+            MambaPolicy.validate_peer_compatible(
+                self._registrar.self_rank_info,
+                sender_info,
+                self._registrar.self_extractor.page_table,
+                sender_info.page_table,
+            )
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
@@ -2353,10 +2422,14 @@ class TransferWorker:
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None
         aux_meta = self._aux_buffer.meta
-        ptr_num = len(aux_meta.ptrs)
+        non_empty = get_non_empty_aux_indices(
+            aux_meta.ptrs, aux_meta.size, "auxiliary registration"
+        )
         ptr_descs = []
-        for i in range(ptr_num):
+        for i in non_empty:
             ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
+        if not ptr_descs:
+            return
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self._agent.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")

@@ -24,8 +24,8 @@ _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
 if _BACKEND == "python":
     from . import rawref  # noqa: F401
-    from ._block_radix_tree import ReuseScope  # noqa: F401
-    from ._cache_key import (  # noqa: F401
+    from ._block_radix_tree import (  # noqa: F401
+        ReuseScope,
         gen_multimodal_cache_key_tokens,
         sequence_to_blockchain_keys,
     )
@@ -194,6 +194,7 @@ else:
         swa_scratch_reuse: object = None
         commit_min_snapshot: bool = False
         enable_stats: bool = True
+        text_only: bool = False
 
     KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
     del _KVCacheManagerConfigFieldSpec, _dataclasses
@@ -215,11 +216,11 @@ else:
     _cpp_introspection = getattr(_cpp, "_introspection", None)
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
     PlannedDropHandle = _cpp.PlannedDropHandle
+    CuError = _cpp.CuError
 
     # Symbols added on main that are not yet ported to the C++ backend.
     # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
     AttnLifeCycle = getattr(_cpp, "AttnLifeCycle", None)
-    CuError = getattr(_cpp, "CuError", RuntimeError)
     OutOfMemoryError = getattr(_cpp, "OutOfMemoryError", MemoryError)
     PageIndexConverter = getattr(_cpp, "PageIndexConverter", None)
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
@@ -275,10 +276,8 @@ else:
         SHARED = 0
         PER_LAYER = 1
 
-    from ._cache_key import (  # noqa: F401
-        gen_multimodal_cache_key_tokens,
-        sequence_to_blockchain_keys,
-    )
+    gen_multimodal_cache_key_tokens = _cpp.gen_multimodal_cache_key_tokens
+    sequence_to_blockchain_keys = _cpp.sequence_to_blockchain_keys
 
     def exact_div(x: int, y: int) -> int:
         assert x % y == 0

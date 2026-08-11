@@ -797,7 +797,7 @@ def trtllm_mha_with_cache(
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
         0,  # num_sparse_topk
-        None,  # sparse_mla_topk_lens
+        None,  # sparse_attn_kv_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat

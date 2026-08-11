@@ -58,7 +58,8 @@ void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel sr
 // ---------------------------------------------------------------------------
 
 KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-    std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength)
+    std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
+    std::optional<bool> textOnly)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
@@ -91,6 +92,10 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
     mScratchSlots.resize(manager.storage().numLifeCycles());
+
+    TLLM_CHECK_WITH_INFO(!(manager.textOnly() && textOnly == std::optional<bool>{false}),
+        "text_only=false is not allowed when the manager is configured text_only=true");
+    mTextOnly = textOnly.value_or(manager.textOnly());
 
     if (reuseMatch.has_value())
     {
@@ -873,7 +878,6 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     int const numTokens = static_cast<int>(tokens.size());
     TLLM_CHECK_DEBUG(0 < numTokens && numTokens < mTokensPerBlock);
 
-    LifeCycleId numLc = mManager->storage().numLifeCycles();
     NodeBase* prevNode = nullptr;
     RootBlock& root = mManager->radixTree().addOrGetExisting(mReuseScope);
     if (ordinal == BlockOrdinal{0})
@@ -889,7 +893,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     SharedPtr<Block> treeBlock;
     try
     {
-        treeBlock = addOrGetExistingBlock(prevNode, numLc, tokens, &isNew);
+        treeBlock = addOrGetExistingBlock(prevNode, tokens, textOnly(), &isNew);
     }
     catch (UselessBlockError const& e)
     {
@@ -1535,7 +1539,7 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     SharedPtr<Block> newBlock;
     try
     {
-        newBlock = addOrGetExistingBlock(prevNode, numLc, tokenBlock, &blockIsNew);
+        newBlock = addOrGetExistingBlock(prevNode, tokenBlock, textOnly(), &blockIsNew);
     }
     catch (UselessBlockError const& e)
     {
@@ -1713,12 +1717,12 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 // commit
 // ---------------------------------------------------------------------------
 
-void KvCache::commit(std::vector<TokenIdExt> const& tokens, bool isEnd)
+void KvCache::commit(TokenSpan tokens, bool isEnd)
 {
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     if (mBeamWidth != BeamIndex{1})
         throw LogicError("Not implemented yet for beam search");
-    if (tokens.empty())
+    if (tokens.size() == 0)
     {
         if (isEnd)
             stopCommitting();
@@ -1726,6 +1730,10 @@ void KvCache::commit(std::vector<TokenIdExt> const& tokens, bool isEnd)
     }
     if (mCommitState == CommitState::USER_STOP)
         throw LogicError("Cannot commit tokens after stop_committing()");
+
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        !mTextOnly || std::none_of(tokens.begin(), tokens.end(), [](TokenIdExt const& t) { return t.isDigest(); }),
+        "Cannot commit digest tokens to a text-only KV cache");
 
     bool const commitMinSnapshot = mManager->commitMinSnapshot();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
@@ -1902,7 +1910,7 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
     if (numCommittedTokens() == 0)
         return nullptr;
 
-    auto const match = mManager->matchReuse(mReuseScope, mCommittedTokens);
+    auto const match = mManager->matchReuse(mReuseScope, toSpan(mCommittedTokens), textOnly());
     if (match.numTokens != numCommittedTokens() || match.blocks.empty())
         return nullptr;
 
@@ -2517,6 +2525,32 @@ void KvCache::setEnableSwaScratchReuse(bool enable)
         throw std::invalid_argument("Cannot disable SWA scratch reuse while scratch blocks are needed");
     TLLM_CHECK_DEBUG(!hasScratchSlots());
     mEnableSwaScratchReuse = false;
+}
+
+bool KvCache::textOnly() const noexcept
+{
+    return mTextOnly;
+}
+
+void KvCache::setTextOnly(bool textOnly)
+{
+    // A text-only deployment is a hard guarantee: a request may not opt out.
+    if (!textOnly && mManager->textOnly())
+    {
+        throw std::invalid_argument(
+            "Cannot set text_only=false for a request when the KV cache manager is configured text_only=true");
+    }
+    // Claiming text-only is a fast-path claim; verify the committed tokens are digest-free.
+    if (textOnly)
+    {
+        bool const hasDigest = std::any_of(
+            mCommittedTokens.begin(), mCommittedTokens.end(), [](TokenIdExt const& t) { return t.isDigest(); });
+        if (hasDigest)
+        {
+            throw std::invalid_argument("Cannot set text_only=true: this sequence has already committed digest tokens");
+        }
+    }
+    mTextOnly = textOnly;
 }
 
 KvCache::DeltaScratchSlots KvCache::_takeExcessScratchSlots(int capacity, int historyLength)

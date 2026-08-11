@@ -31,7 +31,7 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -52,7 +52,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -1364,9 +1364,6 @@ class DeepseekV4Attention(MLA):
             reduce_output=reduce_output,
         )
 
-        self.indexer = getattr(self.mqa, "indexer", None)
-        self.compressor = getattr(self.mqa, "compressor", None)
-
 
 class DeepseekV4Gate(nn.Module):
     def __init__(
@@ -1515,7 +1512,6 @@ class DeepseekV4MoE(nn.Module):
                 CutlassFusedMoE,
                 TritonFusedMoE,
                 TRTLLMGenFusedMoE,
-                WideEPMoE,
                 DeepGemmFusedMoE,
             )
             # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
@@ -1523,8 +1519,7 @@ class DeepseekV4MoE(nn.Module):
             # swiglu_limit is supplied; drop the limit there until the cubin
             # gains a no-bias clamp variant. MXFP4 variants are unaffected.
             kernel_requires_bias_for_swiglu_limit = (
-                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
-                and experts_quant_config.quant_mode.has_nvfp4()
+                moe_cls is TRTLLMGenFusedMoE and experts_quant_config.quant_mode.has_nvfp4()
             )
             # DeepSeek-V4 supplies a uniform scalar limit. The TRTLLM-Gen FP8
             # path consumes it directly and rejects the redundant tensor.
@@ -2542,10 +2537,16 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         return {
             "kv_cache_config": {
                 "tokens_per_block": 128,
-                "use_kv_cache_manager_v2": True,
                 "enable_swa_scratch_reuse": True,
             }
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for DeepSeek-V4."""
+        return "V2"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)
