@@ -8,7 +8,7 @@ Agentic applications — coding assistants, deep-research pipelines, tree-struct
 
 Conventional benchmarks issue independent requests with fixed input and output lengths (ISL/OSL). A real agent task instead unfolds as a long-lived *job*: a shared system prompt is reused across many turns, the conversation grows as the agent reasons and invokes tools, and sub-agents may run in parallel before synchronizing. Prefix reuse, tool-call gaps, and parallel branching govern serving efficiency, yet none is visible to a fixed-shape benchmark — nor can one answer the question practitioners actually ask: how many agent tasks does a GPU complete per hour?
 
-We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate with **job-level metrics** that complement conventional token-level ones. The framework lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with runnable examples under [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay). What follows is what we learned building and using this pipeline, offered as one set of concrete choices others can reuse or argue with.
+We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate with **job-level metrics** that complement conventional token-level ones. What follows is what we learned building and using this pipeline, offered as one set of concrete choices others can reuse or argue with.
 
 ## Methodology
 
@@ -90,7 +90,7 @@ The pieces, one by one:
 - **Scaffolding agents.** The traced agents are built on [Scaffolding](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding), TensorRT-LLM's inference-time-compute framework introduced in [Tech Blog 13](blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md), whose controller/worker structure makes an agent's execution graph explicit and therefore traceable.
 - **Trace hooks.** Two decorators attach tracing to an existing agent with no change to its logic, so collecting a trace is one CLI switch.
 - **Trace files.** Each run is serialized as one `ExecutionTrace` JSON file in the format above; a directory of them forms a replayable dataset.
-- **`ReplayEngine`.** It applies the replay rules and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serialized.
+- **Replay engine.** It applies the replay rules and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serialized.
 - **Replay backend.** Any OpenAI-compatible endpoint, typically `trtllm-serve`, and not necessarily the system that served the agents during tracing.
 - **Metrics collector.** It aggregates the run into job- and token-level Pareto points over the steady-state window, alongside the engine-reported KV-cache hit rate.
 - **Offline analyzer.** A no-GPU pass that walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**.
