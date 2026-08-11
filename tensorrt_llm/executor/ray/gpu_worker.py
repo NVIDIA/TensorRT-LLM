@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import gc
 import importlib
 import os
@@ -10,22 +24,22 @@ from typing import Any, List, Optional, Type
 import ray
 import torch
 
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                 release_with_tag)
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 
-from .. import TorchLlmArgs
-from ..bindings import executor as tllm
-from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
-from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.utils import configure_cpu_affinity
-from ..sampling_params import BatchedLogitsProcessor
-from .base_worker import BaseWorker
-from .postproc_worker import PostprocWorkerConfig
-from .request import GenerationRequest
-from .result import GenerationResult
-from .rpc_worker_mixin import RpcWorkerMixin
+from ... import TorchLlmArgs
+from ...bindings import executor as tllm
+from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
+from ...llmapi.tokenizer import TokenizerBase
+from ...llmapi.utils import configure_cpu_affinity
+from ...sampling_params import BatchedLogitsProcessor
+from ..base_worker import BaseWorker
+from ..postproc_worker import PostprocWorkerConfig
+from ..request import GenerationRequest
+from ..result import GenerationResult
+from ..rpc_worker_mixin import RpcWorkerMixin
 
 __all__ = [
     "RayGPUWorker",

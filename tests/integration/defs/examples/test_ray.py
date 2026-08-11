@@ -4,7 +4,7 @@ import subprocess
 try:
     import ray
 except ImportError:
-    import tensorrt_llm.ray_stub as ray
+    import tensorrt_llm.executor.ray.stub as ray
 
 import pytest
 from defs.common import venv_check_call, wait_for_server
