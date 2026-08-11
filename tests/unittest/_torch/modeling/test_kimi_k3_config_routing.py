@@ -10,11 +10,17 @@ a released ``config.json`` fails loudly here instead of silently rerouting
 the checkpoint.
 """
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
-from tensorrt_llm._torch.pyexecutor.config_utils import is_kimi_k3_multimodal_config
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    is_kimi_k3_multimodal_config,
+    load_pretrained_config,
+)
 
 
 def _composite_config():
@@ -98,6 +104,44 @@ class TestVisionRequiresReplication(unittest.TestCase):
 
     def test_attention_dp_always_replicates(self):
         self.assertTrue(_vision_requires_replication(_vision_model_config(16, True), num_heads=16))
+
+
+def _load_config_from_dict(cfg):
+    """Round-trip a raw config dict through load_pretrained_config."""
+    with tempfile.TemporaryDirectory() as model_dir:
+        (Path(model_dir) / "config.json").write_text(json.dumps(cfg))
+        return load_pretrained_config(model_dir)
+
+
+class TestKimiK3LoaderRouting(unittest.TestCase):
+    """End-to-end config.json -> load_pretrained_config routing.
+
+    Complements the pure-predicate tests above: these exercise the loader
+    branch itself — composite KimiK3Config construction, the architecture
+    assignment, and the text-only flatten — so a change to the branch (not
+    just the predicate) fails in unit CI.
+    """
+
+    def test_composite_checkpoint_loads_as_vlm(self):
+        config = _load_config_from_dict(_composite_config())
+        self.assertEqual(config.architectures, ["KimiK3ForConditionalGeneration"])
+        self.assertEqual(config.model_type, "kimi_k3")
+        self.assertEqual(config.text_config.model_type, "kimi_linear")
+        self.assertIsNotNone(config.vision_config)
+        self.assertEqual(config.vision_config.vt_num_attention_heads, 12)
+
+    def test_language_model_only_checkpoint_flattens_to_text(self):
+        cfg = _composite_config()
+        cfg["language_model_only"] = True
+        config = _load_config_from_dict(cfg)
+        self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
+        self.assertEqual(config.model_type, "kimi_linear")
+
+    def test_text_only_kimi_linear_checkpoint_flattens(self):
+        config = _load_config_from_dict({"model_type": "kimi_linear", "hidden_size": 7168})
+        self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
+        self.assertEqual(config.model_type, "kimi_linear")
+        self.assertEqual(config.hidden_size, 7168)
 
 
 if __name__ == "__main__":

@@ -175,6 +175,9 @@ case "$PARALLEL" in
 esac
 
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
+# Virtual environment created by build_wheel.py; export TRTLLM_VENV to point
+# at .venv-<major>.<minor> when the container ships another Python version.
+VENV=${TRTLLM_VENV:-$REPO/.venv-3.12}
 
 # Per-mode LLM options.
 # - sa: SA speculative decoding needs its own LLM options (eager, plain-EP;
@@ -230,7 +233,7 @@ case "$TASK" in
         ;;
     mmmu)
         MAX_SEQ_LEN=24576
-        TASK_CMD="mmmu --post_process_fn kimi_k3_mmmu --max_input_length 8192 --max_output_length 16384 --preserve_caller_max_tokens --output_path '$REPO/kimi-k3-mmmu-results-$SLURM_JOB_ID.json'"
+        TASK_CMD="mmmu --post_process_fn kimi_k3_mmmu --max_input_length 8192 --max_output_length 16384 --preserve_caller_max_tokens --output_path '$REPO/kimi-k3-mmmu-results-$SLURM_JOB_ID'"
         ;;
 esac
 
@@ -314,7 +317,7 @@ srun --mpi=pmix \
 
         # Run trtllm-eval from the in-place installation created in the
         # README Prerequisites section (build_wheel.py creates .venv-3.12).
-        export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
+        export PATH=\"$VENV/bin:\$PATH\"
 
         # Log a running partial score every N completed responses (0 = off).
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
@@ -330,7 +333,7 @@ srun --mpi=pmix \
         export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
 
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
-            '$REPO/.venv-3.12/bin/trtllm-eval' \
+            '$VENV/bin/trtllm-eval' \
             --model \"$MODEL\" \
             --backend pytorch \
             --tp_size 16 \

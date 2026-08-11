@@ -83,6 +83,9 @@ done
 [[ -e "$CONTAINER_IMAGE" ]] || { echo "error: image path does not exist: $CONTAINER_IMAGE" >&2; exit 2; }
 
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
+# Virtual environment created by build_wheel.py; export TRTLLM_VENV to point
+# at .venv-<major>.<minor> when the container ships another Python version.
+VENV=${TRTLLM_VENV:-$REPO/.venv-3.12}
 OUTDIR=${OUTDIR:-$REPO/dspark-accept-$SLURM_JOB_ID}
 mkdir -p "$OUTDIR"
 
@@ -121,6 +124,11 @@ HF_CACHE_HOST="$CACHE_HOST/huggingface"
 
 run_leg() {
     local leg=$1; shift
+    # %q-quote every forwarded argument: they are spliced into the nested
+    # bash -c string, where a bare $* would re-split values containing
+    # whitespace (e.g. a drafter path with spaces).
+    local escaped_args
+    printf -v escaped_args ' %q' "$@"
     srun --mpi=pmix \
         --container-image="$CONTAINER_IMAGE" \
         --container-mount-home \
@@ -140,7 +148,7 @@ run_leg() {
             # workers where DFlashWorker lives (symptom: no accept-stats
             # files). Empty for the spec-off leg (recorder off = clean TPOT).
             ${LEG_ENV_EXPORT:-true}
-            export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
+            export PATH=\"$VENV/bin:\$PATH\"
             # Import tensorrt_llm from \$REPO, not from wherever the venv's
             # in-place install points (worktree submits differ).
             export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
@@ -148,7 +156,7 @@ run_leg() {
                 '$REPO/examples/kimi_k3/measure_dspark_acceptance.py' \
                 --model '$MODEL' --tp-size 16 \
                 --num-prompts $NUM_PROMPTS --max-tokens $MAX_TOKENS \
-                $*
+                $escaped_args
         " 2>&1 | tee "$OUTDIR/$leg.log"
 }
 

@@ -24,7 +24,9 @@ other GPU architectures may be added in a future release.
   `build_wheel.py` creates the `.venv-3.12` virtual environment at the
   repository root (named after the container's Python version). If your
   container ships a different Python, substitute `.venv-<major>.<minor>`
-  for `.venv-3.12` in every command below. Adjust
+  for `.venv-3.12` in every command below and export
+  `TRTLLM_VENV=/path/to/repo/.venv-<major>.<minor>` when submitting the
+  Slurm jobs (they default to the repository-root `.venv-3.12`). Adjust
   `--cuda_architectures` to the target GPUs (`103-real` for GB300).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
