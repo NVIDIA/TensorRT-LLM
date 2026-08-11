@@ -122,17 +122,121 @@ class TestConditionerOffloadKnob:
         # With no accelerator in play there is nothing to swap.
         assert self._pipeline("auto")._resolve_conditioner_offload(torch.device("cpu")) is False
 
-    def test_no_conditioner_device_by_default(self):
+
+class TestConditionerDeviceKnob:
+    """`conditioner_device` is the 2-GPU placement; unset must change nothing."""
+
+    @staticmethod
+    def _pipeline(knob=None, **extra):
+        return TestConditionerOffloadKnob._pipeline(knob, **extra)
+
+    # --- single-card: the default path stays exactly as it was -------------
+
+    def test_unset_leaves_no_placement(self):
         assert self._pipeline()._conditioner_device is None
 
+    def test_registry_default_empty_string_is_unset(self):
+        # The registry declares `conditioner_device: ""`, which must read as
+        # "no placement" rather than reaching torch.device("").
+        assert self._pipeline(conditioner_device="")._conditioner_device is None
+
+    def test_unset_still_defers_to_conditioner_offload(self):
+        for knob, expected in (("always", True), ("never", False)):
+            pipeline = self._pipeline(knob)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            assert pipeline._resolve_conditioner_offload(device) is expected
+
+    # --- dual-card --------------------------------------------------------
+
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs a second GPU")
-    def test_conditioner_device_is_parsed(self):
+    def test_second_card_is_parsed(self):
         pipeline = self._pipeline("never", conditioner_device="cuda:1")
         assert pipeline._conditioner_device == torch.device("cuda:1")
 
-    def test_conditioner_device_rejects_an_invisible_card(self):
-        with pytest.raises(ValueError, match="conditioner_device"):
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs a second GPU")
+    def test_conditioner_device_reports_through_the_property(self):
+        pipeline = self._pipeline("never", conditioner_device="cuda:1")
+        assert pipeline.conditioner_device == torch.device("cuda:1")
+
+    # --- rejections -------------------------------------------------------
+
+    def test_rejects_an_invisible_card(self):
+        with pytest.raises(ValueError, match="out of range"):
             self._pipeline("never", conditioner_device=f"cuda:{torch.cuda.device_count() + 8}")
+
+    def test_rejects_the_host(self):
+        with pytest.raises(ValueError, match="must name a CUDA device"):
+            self._pipeline("never", conditioner_device="cpu")
+
+    def test_rejects_a_card_without_an_index(self):
+        # Bare "cuda" is ambiguous: it would follow whatever the current device
+        # happens to be, which is not a placement.
+        with pytest.raises(ValueError, match="specific card"):
+            self._pipeline("never", conditioner_device="cuda")
+
+    def test_rejects_garbage(self):
+        with pytest.raises(ValueError, match="conditioner_device"):
+            self._pipeline("never", conditioner_device="gpu7")
+
+    def test_rejects_contradicting_always_offload(self):
+        # "always" swaps through the host, a second card means no swap at all.
+        with pytest.raises(ValueError, match="contradict"):
+            self._pipeline("always", conditioner_device="cuda:0")
+
+    def test_never_offload_with_a_card_is_the_supported_pairing(self):
+        pipeline = self._pipeline("never", conditioner_device="cuda:0")
+        assert pipeline._conditioner_offload_mode == "never"
+        assert pipeline._conditioner_device == torch.device("cuda:0")
+
+    # --- the same-card trap -----------------------------------------------
+
+    def test_naming_the_transformers_own_card_places_nothing(self):
+        """Placing the conditioner on the transformer's card places nothing.
+
+        Both models would contend for that one card exactly as before, so the
+        knob has to be dropped and `conditioner_offload` left in charge --
+        otherwise the OOM safety net is silently disabled.
+        """
+        pipeline = self._pipeline("never", conditioner_device="cuda:0")
+        target, offload = pipeline._resolve_conditioner_placement(torch.device("cuda:0"))
+        # Dropped, so `conditioner_offload` decides again.
+        assert pipeline._conditioner_device is None
+        assert pipeline._conditioner_offload_mode == "never"
+        assert target == torch.device("cuda:0")
+        assert offload is False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs a GPU")
+    def test_bare_cuda_names_the_same_card(self):
+        """`cuda` and `cuda:N` name one card, so the trap still has to trip."""
+        current = torch.cuda.current_device()
+        pipeline = self._pipeline("never", conditioner_device=f"cuda:{current}")
+        pipeline._resolve_conditioner_placement(torch.device("cuda"))
+        assert pipeline._conditioner_device is None
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs a second GPU")
+    def test_a_second_card_reports_no_swap(self):
+        pipeline = self._pipeline("never", conditioner_device="cuda:1")
+        target, offload = pipeline._resolve_conditioner_placement(torch.device("cuda:0"))
+        assert target == torch.device("cuda:1")
+        assert offload is False
+        assert pipeline._conditioner_device == torch.device("cuda:1")
+
+    def test_unset_placement_lands_on_the_transformers_card(self):
+        pipeline = self._pipeline("never")
+        target, offload = pipeline._resolve_conditioner_placement(torch.device("cuda:0"))
+        assert target == torch.device("cuda:0")
+        assert offload is False
+
+    def test_resolve_card_normalizes_a_bare_cuda(self):
+        from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+            _resolve_card,
+        )
+
+        assert _resolve_card(torch.device("cpu")) == torch.device("cpu")
+        if torch.cuda.is_available():
+            current = torch.cuda.current_device()
+            assert _resolve_card("cuda") == torch.device("cuda", current)
+            assert _resolve_card("cuda:0") == torch.device("cuda:0")
 
 
 class TestGeometry:

@@ -134,6 +134,14 @@ def resolve_canvas_size(
     )
 
 
+def _resolve_card(device) -> torch.device:
+    """Normalize a device to a specific card, so `cuda` and `cuda:0` compare equal."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def fit_keyframe_to_canvas(
     keyframe: Image.Image, width: int, height: int, stretch: bool
 ) -> Image.Image:
@@ -423,16 +431,29 @@ class MiniMaxH3Pipeline(BasePipeline):
         # A second accelerator holds the conditioner outright, which retires
         # the swap: the two models never contend for one card's memory, at the
         # cost of one cross-card copy of the prompt embeddings per request.
-        conditioner_device = extra_attrs.get("conditioner_device")
+        # Unset is the empty string as well as None, because that is the
+        # registry default.
+        conditioner_device = extra_attrs.get("conditioner_device") or None
         self._conditioner_device = (
             self._parse_conditioner_device(conditioner_device)
             if conditioner_device is not None
             else None
         )
+        if self._conditioner_device is not None and knob == "always":
+            # "always" asks for the host swap, a second card asks for no swap.
+            raise ValueError(
+                "`conditioner_offload='always'` and `conditioner_device` contradict each other: "
+                "the first swaps the conditioner through the host, the second keeps it resident on "
+                f"{self._conditioner_device}. Use `conditioner_offload='never'` with "
+                "`conditioner_device`."
+            )
 
     @staticmethod
     def _parse_conditioner_device(spec) -> torch.device:
-        device = torch.device(spec)
+        try:
+            device = torch.device(spec)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError(f"`conditioner_device`={spec!r} is not a device: {exc}") from exc
         if device.type != "cuda":
             raise ValueError(f"`conditioner_device` must name a CUDA device, got {spec!r}.")
         if device.index is None:
@@ -564,13 +585,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             ).to(device)
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
-            # A conditioner with its own card never needs the swap.
-            offload = (
-                False
-                if self._conditioner_device is not None
-                else self._resolve_conditioner_offload(device)
-            )
-            target = self._conditioner_device if self._conditioner_device is not None else device
+            target, offload = self._resolve_conditioner_placement(device)
             where = "host (swapped in per request)" if offload else str(target)
             logger.info(f"Loading Qwen3-VL text encoder onto {where}...")
             self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -598,6 +613,32 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.audio_scheduler = MiniMaxH3Scheduler.from_pretrained(
                 checkpoint_dir, subfolder="audio_scheduler"
             )
+
+    def _resolve_conditioner_placement(self, device: torch.device) -> Tuple[torch.device, bool]:
+        """Resolve where the conditioner lives and whether it is swapped.
+
+        Returns `(target, offload)`: the device the conditioner's weights are
+        moved to when resident, and whether it is instead kept on the host and
+        swapped in around each encode call.
+
+        A second card means no swap. Naming the transformer's own card places
+        nothing -- both models would contend for it exactly as before -- so the
+        knob is dropped and `conditioner_offload` stays in charge rather than
+        silently disabling the OOM safety net.
+        """
+        if self._conditioner_device is not None and self._conditioner_device == _resolve_card(
+            device
+        ):
+            logger.warning(
+                f"conditioner_device={self._conditioner_device} is the transformer's own card; "
+                "ignoring it and falling back to conditioner_offload="
+                f"{self._conditioner_offload_mode}."
+            )
+            self._conditioner_device = None
+
+        if self._conditioner_device is not None:
+            return self._conditioner_device, False
+        return device, self._resolve_conditioner_offload(device)
 
     def _resolve_conditioner_offload(self, device: torch.device) -> bool:
         """Decide whether the conditioner has to be swapped in per request.

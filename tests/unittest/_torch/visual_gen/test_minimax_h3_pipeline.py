@@ -123,6 +123,157 @@ class TestKeyframeVaeEncode:
         torch.testing.assert_close(conditions[0], torch.full_like(conditions[0], -0.5))
 
 
+class _StubTokenizer:
+    """Maps every word to a distinct id and names the vision specials."""
+
+    _SPECIALS = {"<|vision_start|>": 1001, "<|image_pad|>": 1002, "<|vision_end|>": 1003}
+
+    def __call__(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        return {"input_ids": [hash(token) % 997 for token in text.split()]}
+
+    def convert_tokens_to_ids(self, token):
+        return self._SPECIALS[token]
+
+
+class _StubImageProcessor:
+    merge_size = 2
+
+    def __call__(self, images, return_tensors="pt"):
+        assert return_tensors == "pt"
+        # One 1x8x8 grid per image: 64 patches, 16 tokens after the 2x2 merge.
+        grid = torch.tensor([[1, 8, 8]] * len(images))
+        return {"pixel_values": torch.zeros(len(images) * 64, 3), "image_grid_thw": grid}
+
+
+class TestConditionerSwap:
+    """The single-card path: one encode call between two host<->device moves.
+
+    Only one of the transformer and the ~62 GB conditioner fits on a <128 GB
+    card, so the swap order is load-bearing -- the transformer has to leave
+    before the conditioner arrives, and it has to come back even if the encode
+    raises. Recorded against stubs so the ordering is checked without 124 GB.
+    """
+
+    @staticmethod
+    def _pipeline(offloaded):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        moves = []
+        pipeline._conditioner_offloaded = offloaded
+        pipeline._conditioner_device = None
+        pipeline.text_encoder = SimpleNamespace(
+            to=lambda target, *_a, **_k: moves.append(("conditioner", str(target)))
+        )
+        pipeline.transformer = SimpleNamespace(
+            parameters=lambda: iter([torch.zeros(1, device="cuda:0")]),
+            to=lambda target, *_a, **_k: moves.append(("transformer", str(target))),
+        )
+        return pipeline, moves
+
+    def test_resident_conditioner_moves_nothing(self):
+        pipeline, moves = self._pipeline(offloaded=False)
+
+        with pipeline._conditioner_on_device(torch.device("cuda:0")):
+            pass
+
+        assert moves == []
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs a GPU")
+    def test_transformer_leaves_before_the_conditioner_arrives(self):
+        pipeline, moves = self._pipeline(offloaded=True)
+
+        with pipeline._conditioner_on_device(torch.device("cuda:0")):
+            # Mid-swap: the transformer is on the host, the conditioner on card.
+            assert moves == [("transformer", "cpu"), ("conditioner", "cuda:0")]
+
+        # And back, so the next request finds the transformer where it was.
+        assert moves == [
+            ("transformer", "cpu"),
+            ("conditioner", "cuda:0"),
+            ("conditioner", "cpu"),
+            ("transformer", "cuda:0"),
+        ]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs a GPU")
+    def test_the_transformer_returns_even_when_the_encode_raises(self):
+        """A failed encode must not leave the transformer stranded on the host."""
+        pipeline, moves = self._pipeline(offloaded=True)
+
+        with pytest.raises(RuntimeError, match="encode blew up"):
+            with pipeline._conditioner_on_device(torch.device("cuda:0")):
+                raise RuntimeError("encode blew up")
+
+        assert moves[-2:] == [("conditioner", "cpu"), ("transformer", "cuda:0")]
+
+
+class TestCrossCardEncode:
+    """With the conditioner on its own card, `_encode_prompt` has to bridge them."""
+
+    @staticmethod
+    def _pipeline(transformer_device, conditioner_device):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline.tokenizer = _StubTokenizer()
+        pipeline.processor = SimpleNamespace(
+            image_processor=_StubImageProcessor(),
+            create_mm_token_type_ids=lambda batch: [[0] * len(batch[0])],
+        )
+        seen = {}
+
+        def _model(input_ids, **kwargs):
+            # Everything the conditioner is handed must already be on its card.
+            seen["input_ids"] = input_ids.device
+            seen["mm_token_type_ids"] = kwargs["mm_token_type_ids"].device
+            seen["attention_mask"] = kwargs["attention_mask"].device
+            for name in ("pixel_values", "image_grid_thw"):
+                if name in kwargs:
+                    seen[name] = kwargs[name].device
+            hidden = torch.zeros(1, input_ids.shape[1], 8, device=input_ids.device)
+            return SimpleNamespace(hidden_states=[hidden] * 51)
+
+        pipeline.text_encoder = SimpleNamespace(
+            config=SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=64)),
+            dtype=torch.float32,
+            model=_model,
+            to=lambda *_a, **_k: None,
+        )
+        pipeline._conditioner_offloaded = False
+        pipeline._conditioner_device = conditioner_device
+        pipeline.transformer = SimpleNamespace(
+            parameters=lambda: iter([torch.zeros(1, device=transformer_device)])
+        )
+        return pipeline, seen
+
+    def test_single_card_keeps_everything_on_one_device(self):
+        pipeline, seen = self._pipeline(torch.device("cpu"), None)
+
+        embeds, _ = pipeline._encode_prompt("a cat")
+
+        assert seen["input_ids"] == torch.device("cpu")
+        assert embeds.device == torch.device("cpu")
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs a second GPU")
+    def test_inputs_land_on_the_conditioners_card(self):
+        pipeline, seen = self._pipeline(torch.device("cuda:0"), torch.device("cuda:1"))
+
+        embeds, tags = pipeline._encode_prompt("a cat", [_gradient_image(64, 64)])
+
+        # Inputs on card 1, embeddings handed back on card 0. A tensor left on
+        # the wrong card raises inside the conditioner rather than degrading.
+        for name, device in seen.items():
+            assert device == torch.device("cuda:1"), f"{name} was on {device}"
+        assert embeds.device == torch.device("cuda:0")
+        assert tags.shape[0] == embeds.shape[1]
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs a second GPU")
+    def test_text_only_request_also_crosses_back(self):
+        pipeline, seen = self._pipeline(torch.device("cuda:0"), torch.device("cuda:1"))
+
+        embeds, _ = pipeline._encode_prompt("a cat")
+
+        assert seen["input_ids"] == torch.device("cuda:1")
+        assert embeds.device == torch.device("cuda:0")
+
+
 class TestConditionerDevice:
     """`conditioner_device` parks the conditioner on a second card."""
 
@@ -150,29 +301,6 @@ class TestConditionerDevice:
         visible = torch.cuda.device_count()
         with pytest.raises(ValueError, match="out of range"):
             MiniMaxH3Pipeline._parse_conditioner_device(f"cuda:{visible + 8}")
-
-
-class _StubTokenizer:
-    """Maps every word to a distinct id and names the vision specials."""
-
-    _SPECIALS = {"<|vision_start|>": 1001, "<|image_pad|>": 1002, "<|vision_end|>": 1003}
-
-    def __call__(self, text, add_special_tokens=False):
-        assert add_special_tokens is False
-        return {"input_ids": [hash(token) % 997 for token in text.split()]}
-
-    def convert_tokens_to_ids(self, token):
-        return self._SPECIALS[token]
-
-
-class _StubImageProcessor:
-    merge_size = 2
-
-    def __call__(self, images, return_tensors="pt"):
-        assert return_tensors == "pt"
-        # One 1x8x8 grid per image: 64 patches, 16 tokens after the 2x2 merge.
-        grid = torch.tensor([[1, 8, 8]] * len(images))
-        return {"pixel_values": torch.zeros(len(images) * 64, 3), "image_grid_thw": grid}
 
 
 class TestKeyframePromptTags:
