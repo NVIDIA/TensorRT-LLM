@@ -191,6 +191,7 @@ class KVCacheManagerConfig:
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     commit_min_snapshot: bool = False
     enable_stats: bool = True
+    text_only: bool = False
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -287,7 +288,7 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# From _cache_key.py
+# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
@@ -318,6 +319,8 @@ class _KVCache:
         reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
+        expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -381,6 +384,10 @@ class _KVCache:
     def enable_swa_scratch_reuse(self) -> bool: ...
     @enable_swa_scratch_reuse.setter
     def enable_swa_scratch_reuse(self, enable: bool) -> None: ...
+    @property
+    def text_only(self) -> bool: ...
+    @text_only.setter
+    def text_only(self, text_only: bool) -> None: ...
     def supports_index_mode(self, mode: PageIndexMode) -> bool: ...
     @property
     def status(self) -> _Status: ...
@@ -492,6 +499,7 @@ class KVCacheManager:
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
         expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,

@@ -67,7 +67,8 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import HangDetector, propagate_hard_kill
+from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
+                            propagate_hard_kill, start_rank_crash_kill_watchdog)
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
@@ -652,6 +653,21 @@ class PyExecutor:
         #     broadcast an ErrorResponse to every pending request, waking
         #     callers parked in queue.get() / aqueue.get().
         self._event_loop_error: Optional[BaseException] = None
+        # Set once the stashed error has been surfaced to a client. Gates the
+        # rank-crash hard kill: if the failure is already reportable, killing
+        # the world only replaces a traceback with exit 137. threading.Event
+        # because the kill runs on a daemon thread.
+        #
+        # Only rank 0 can ever set this: both delivery sites need a client
+        # consumer (_await_single_response, and AwaitResponseHelper on the
+        # single-process path), and subordinate ranks block in wait_shutdown()
+        # with no response thread. So in a SYMMETRIC crash the subordinates'
+        # kills still fire at crash+grace, and the "N clean tracebacks instead
+        # of exit 137" outcome only holds if every subordinate finishes cleanup
+        # and exits within the grace -- destroy_process_group() on a wedged
+        # NCCL communicator can exceed it. That is the intended tradeoff: the
+        # timer doubles as protection against wedged teardown.
+        self._event_loop_error_delivered = threading.Event()
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -860,6 +876,15 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        # Set at the executor loops' normal-exit `break` sites, and ONLY
+        # there. It answers exactly one question for _event_loop_wrapper:
+        # "did event_loop() reach its own termination?" -- which decides
+        # whether an escaping exception stranded this rank's peers.
+        # is_shutdown cannot answer it: _handle_errors sets is_shutdown
+        # rank-locally on a fatal error (e.g. a CUDA illegal address on this
+        # rank alone) while peers are told nothing and the loop keeps running
+        # collectives, so a crash after that point still strands them.
+        self._event_loop_completed = False
         self._fatal_error: Optional[BaseException] = None
         self._error_budget = ErrorBudget()
         self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
@@ -1217,6 +1242,8 @@ class PyExecutor:
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):
+        crashed = False
+        self._event_loop_completed = False
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -1226,6 +1253,20 @@ class PyExecutor:
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
+            # A raise AFTER the loop reached its own normal-exit `break` (from
+            # the profiler's or hang detector's __exit__, or from the enclosing
+            # context managers) is a teardown error: this rank finished its
+            # work and no peer is waiting on it, so log it but never escalate
+            # to SIGKILLing the job. Anything else -- including a raise before
+            # the loop ever started -- leaves peers blocked in their next
+            # collective, which is what the kill exists to cut short.
+            #
+            # Deliberately NOT is_shutdown: _handle_errors flips that flag
+            # rank-locally on a fatal error (a CUDA illegal address on one rank
+            # is classified immediate_fatal and bypasses the error budget) and
+            # tells peers nothing, so a crash after that point -- the single
+            # most common trigger for this kill -- still strands them.
+            crashed = not self._event_loop_completed
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -1237,8 +1278,51 @@ class PyExecutor:
             # _executor_loop_cleanup is enough to wake local waiters.
             self._event_loop_error = e
             raise e
+        except BaseException:
+            # SystemExit / KeyboardInterrupt are NOT Exception, so they reach
+            # here rather than the handler above. Peers are just as stranded,
+            # but these are deliberate teardown signals -- the launcher is
+            # already tearing the job down -- and arming an MPI_Abort on top
+            # would turn a clean Ctrl-C into exit 137. Left unarmed on
+            # purpose; `crashed` stays False. Stated explicitly because the
+            # comment above describes the invariant the *Exception* path
+            # enforces, not this one.
+            raise
         finally:
-            self._executor_loop_cleanup()
+            # Armed BEFORE cleanup: cleanup can block without bound on a
+            # send handle wedged by the crash, and a kill placed only after
+            # it would never fire.
+            watchdog = start_rank_crash_kill_watchdog(
+                self.dist.world_size,
+                error_delivered=self._event_loop_error_delivered,
+            ) if crashed else None
+            try:
+                self._executor_loop_cleanup()
+            finally:
+                if crashed:
+                    # Peers cannot make progress without this rank's loop:
+                    # they would block in their next collective until their
+                    # own HangDetectors fire 300s later. Kill the world now
+                    # instead; the grace inside lets the stashed error reach
+                    # rank-local waiters and the ready handshake first, so
+                    # the client sees the original exception rather than a
+                    # bare worker death. Nested finally: the kill must fire
+                    # even when cleanup itself raises.
+                    #
+                    # Cleanup returned, so the watchdog's only job (covering
+                    # a cleanup that never returns) is done: hand the timer
+                    # over rather than leave two running. This is bookkeeping,
+                    # not protection -- the kill still fires, on the SAME
+                    # deadline, one line below. Whether a rank is killed at
+                    # all is decided solely by `crashed` above.
+                    deadline = None
+                    if watchdog is not None:
+                        watchdog.cancel()
+                        deadline = watchdog.deadline
+                    hard_kill_on_rank_crash(
+                        self.dist.world_size,
+                        deadline=deadline,
+                        error_delivered=self._event_loop_error_delivered)
 
     @property
     def is_warmup(self) -> bool:
@@ -2583,6 +2667,7 @@ class PyExecutor:
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
+                    self._event_loop_completed = True
                     break
 
                 self._handle_control_request()
@@ -2887,6 +2972,12 @@ class PyExecutor:
                 self.iter_counter += 1
 
             # Stage 5: Handle remaining executed batches in the queue.
+            # Note: _event_loop_completed was already set at the break above,
+            # so a raise in this drain is classified as benign teardown rather
+            # than a peer-stranding crash. That is deliberate: reaching here
+            # means every rank observed should_stop_processing, so no peer is
+            # parked in a collective waiting on this one -- this drain only
+            # consumes from a rank-local queue.
             while self.unhandled_batch_counter > 0:
                 with nvtx_range("get_executed_batch"):
                     executed_batch = self.executed_batch_response_queue.get()
@@ -4082,6 +4173,7 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    self._event_loop_completed = True
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -4556,6 +4648,7 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    self._event_loop_completed = True
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -7457,6 +7550,9 @@ class PyExecutor:
                 # instead of hanging here or hitting a KeyError below.
                 error = self._event_loop_error
                 if error is not None:
+                    # The caller is about to see the original exception, so
+                    # the crash is reportable without killing the world.
+                    self._event_loop_error_delivered.set()
                     raise RuntimeError(
                         f"Event loop terminated with error: {error}") from error
                 raise RuntimeError(

@@ -3913,8 +3913,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "Whether to use the KV cache manager v2 (experimental). 'auto' uses "
-        "the model-specific default and falls back to False when the model "
-        "does not specify one.")
+        "the model-specific preference and falls back to False when the model "
+        "does not declare one.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     enable_swa_scratch_reuse: bool = Field(

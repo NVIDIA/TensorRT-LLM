@@ -413,6 +413,7 @@ class ModelLoader:
             # No config to resolve a model class from; still resolve the
             # "auto" sentinel so it never leaks past config loading.
             _resolve_transceiver_runtime_auto(llm_args)
+            _resolve_kv_cache_manager_v2_auto(llm_args)
             return llm_args
 
         config_kwargs = {
@@ -428,8 +429,18 @@ class ModelLoader:
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
-        use_kv_cache_manager_v2 = (
+        original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
+
+        # Preferences follow the checkpoint's original architecture:
+        # _resolve_class may rewrite it to an execution class (e.g.
+        # MTPDraftModelForCausalLM), which must not drop the target model's
+        # preferences.
+        preference_cls = model_cls
+        architectures = getattr(config.pretrained_config, 'architectures', None)
+        if architectures:
+            preference_cls = get_registered_model_class(
+                architectures[0]) or model_cls
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -452,23 +463,13 @@ class ModelLoader:
             update_spec_config_from_model_config(llm_args.speculative_config,
                                                  config.pretrained_config)
 
-        # The transceiver preference follows the checkpoint's original
-        # architecture: _resolve_class may rewrite it to an execution class
-        # (e.g. MTPDraftModelForCausalLM), which must not drop the target
-        # model's preference.
-        preference_cls = model_cls
-        architectures = getattr(config.pretrained_config, 'architectures', None)
-        if architectures:
-            preference_cls = get_registered_model_class(
-                architectures[0]) or model_cls
-
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
-        _resolve_kv_cache_manager_v2_auto(
-            llm_args, model_defaults, original_setting=use_kv_cache_manager_v2)
+        _resolve_kv_cache_manager_v2_auto(llm_args, preference_cls,
+                                          config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
-        if use_kv_cache_manager_v2 == "auto":
+        if original_kv_cache_manager_setting == "auto":
             logger.info(
                 "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
                 llm_args.kv_cache_config.use_kv_cache_manager_v2,
