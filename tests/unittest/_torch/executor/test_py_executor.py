@@ -16,10 +16,14 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from datetime import timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+import torch.distributed as torch_dist
+import torch.multiprocessing as torch_mp
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -40,6 +44,50 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+class _TorchCollectiveDist:
+    """Minimal distributed adapter for idle-progress collective tests."""
+
+    world_size = 2
+    tp_size = 2
+    cp_size = 1
+
+    def allreduce(self, value: int, op: ReduceOp | None = None) -> int:
+        tensor = torch.tensor(value)
+        torch_dist.all_reduce(tensor)
+        return int(tensor.item())
+
+
+def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: str) -> None:
+    torch_dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=1),
+    )
+    try:
+        if rank == 0:
+            # Model a rank blocked in request_and_receive_sync(). It cannot
+            # participate in an idle-progress collective on the peer rank.
+            time.sleep(2)
+            return
+
+        executor = object.__new__(PyExecutor)
+        executor.dist = _TorchCollectiveDist()
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+            is_idle=True,
+        )
+    finally:
+        torch_dist.destroy_process_group()
 
 
 class _InflightRequestIds:
@@ -965,11 +1013,14 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_sync_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    def test_gen_only_no_context_benchmark_polls_context_when_idle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.is_benchmark_disagg = True
+        executor.dist.allreduce.return_value = 0
+        executor.dist.tp_allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -979,18 +1030,20 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            is_idle=True,
         )
 
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor.dist.tp_allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
 
-    def test_sync_non_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
+    def test_sync_transfer_skips_idle_progress_collectives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.is_benchmark_disagg = False
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -1000,6 +1053,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            is_idle=True,
         )
 
         executor.dist.allreduce.assert_not_called()
@@ -1007,6 +1061,19 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_sync_multi_rank_does_not_wait_for_blocked_peer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        rendezvous_file = tmp_path / "sync-idle-progress-rendezvous"
+
+        torch_mp.spawn(
+            _run_sync_idle_progress_rank,
+            args=(2, str(rendezvous_file)),
+            nprocs=2,
+            join=True,
+        )
 
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1387,6 +1454,10 @@ class _ResponseStub:
         self.responses = {}
         self.is_shutdown = False
         self._event_loop_error = None
+        # Set when the stashed error is handed to a caller: that is what tells
+        # the rank-crash kill the crash was already reported and the world does
+        # not need tearing down.
+        self._event_loop_error_delivered = threading.Event()
 
     # Bind the real production method so the test exercises real code.
     _await_single_response = PyExecutor._await_single_response
@@ -1425,6 +1496,10 @@ class TestAwaitSingleResponseShutdown:
         with pytest.raises(RuntimeError, match="Event loop terminated"):
             stub._await_single_response(id=42, timeout=1.0)
 
+        # The caller now holds the original error, so the rank-crash kill must
+        # stand down: this is the signal it waits out its grace for.
+        assert stub._event_loop_error_delivered.is_set()
+
     def test_raises_on_shutdown_without_event_loop_error(self):
         """Shutdown without a stored error still raises rather than blocking
         — distinguishes "shutdown" from "timed out without shutdown"."""
@@ -1433,6 +1508,10 @@ class TestAwaitSingleResponseShutdown:
 
         with pytest.raises(RuntimeError, match="Event loop shut down"):
             stub._await_single_response(id=42, timeout=1.0)
+
+        # Nothing was delivered -- there was no error to deliver. Leaving the
+        # gate clear keeps the kill armed, which is correct here.
+        assert not stub._event_loop_error_delivered.is_set()
 
     def test_returns_empty_on_timeout(self):
         """Pre-fix behaviour: a bare timeout (no shutdown, no response) used

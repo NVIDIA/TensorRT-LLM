@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -219,6 +220,9 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
         context_current_position=10,
         context_remaining_length=0,
         get_tokens=lambda beam_id: list(range(10)),
+        # The C++ backend takes get_tokens_view on this path; it yields a contiguous
+        # 1-D int32 view, so commit() sees an ndarray slice rather than a list.
+        get_tokens_view=lambda beam_id: np.arange(10, dtype=np.int32),
     )
     kv_cache = _FakeKVCache(num_committed_tokens=4)
     manager = object.__new__(KVCacheManagerV2)
@@ -229,7 +233,9 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
 
     manager.try_commit_blocks(request)
 
-    assert kv_cache.committed_tokens == [4, 5, 6, 7, 8, 9]
+    # list() so the assertion holds whichever token source the active backend used:
+    # a plain list (Python backend) or an int32 ndarray slice (C++ backend).
+    assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
     assert kv_cache.stopped_committing
 
@@ -279,6 +285,15 @@ class _ContextRequest:
     def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
         assert beam_id == DEFAULT_BEAM_INDEX
         return self.tokens
+
+    def get_tokens_view(self, beam_id: int = DEFAULT_BEAM_INDEX) -> np.ndarray:
+        """Mirror LlmRequest.get_tokens_view, which the C++ backend takes on the reuse path.
+
+        The real binding returns a zero-copy contiguous 1-D int32 view of the token buffer;
+        the dtype matters because it selects the C++ int32 ingest fast path.
+        """
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return np.asarray(self.tokens, dtype=np.int32)
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
