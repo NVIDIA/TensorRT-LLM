@@ -622,6 +622,18 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 **修复**:A(首选)min-slots 按稳态 decode(2-3 块/请求)建模;B 估算器补 draft(须配 A);C `typical_seq_len` 不默认 max_seq_len / 部署侧显式设 max_seq_len 解钉(判别实验在跑)。上游三报:下限建模、估算器漏项、no-spec 高并发死锁崩溃(报错信息误导)。附:python-scheduler 旗标在 v2 下是 no-op(_util.py:2618),DSv4 强制 v2 管理器——当晚两条二分腿均为无效对照,已修订。
 
+### #34 实验环闭合:2×2 象限 + C 方案判决(08-10 21:05)
+
+| 象限(Pro,poetry 1024 burst) | 结果 |
+|---|---|
+| spec, maxbs=128 | 稳态 ~60-63(优雅降级) |
+| spec, maxbs=256 | 满批 115-128 |
+| **no-spec, maxbs=128** | **61 处死锁崩溃**(scheduler_v2.py:439) |
+| **no-spec, maxbs=256** | **满批 128,零死锁**(254 iter) |
+| **no-spec, maxbs=128 + `max_seq_len: 8192`** | **满批 127-128,零死锁(254 iter)——C 方案判决命中** |
+
+结论:上限=窗口池按 min_slots 下限定容(比例定容被推断的 max_seq_len=1M 饿死)+ 运行时每请求锁 2 块;**显式设 max_seq_len 即解钉**(用户已拍板 C 方向)。部署规约:DSv4 serving 必须显式设 `max_seq_len`(或 `avg_seq_len`),否则窗口池被钉死在 ~maxbs/2 并发,no-spec 高并发直接死锁。代码侧 C 修复(typical_seq_len 不默认 max_seq_len)+ 上游三报(下限建模、估算器漏 draft、死锁而非降级)待落。
+
 ### 产品线终局判决:Pro@DEP8 置信度调度全面转正(08-10 13:50)
 
 Flash 三臂翻案后,Pro@DEP8 终局(maxbs=256 解锁满批 + `postfix_pro_table.json` 新表,scheduled vs notrim,双节点臂序对调,每 cell n=10):
