@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -34,6 +35,19 @@ DRY_RUN_DB_PATH = (
 def _function_body(source, name, next_name):
     start = source.index(f"def {name}")
     return source[start : source.index(f"def {next_name}", start + len(name))]
+
+
+def _conditional_workflow_properties(function_body):
+    conditions = re.findall(r"\bif\s*\(([^)]*)\)", function_body)
+    return {
+        identifier
+        for condition in conditions
+        for identifier in re.findall(r"\b[A-Z][A-Z0-9_]+\b", condition)
+    }
+
+
+def _top_level_workflow_properties(source):
+    return set(re.findall(r"(?m)^(?:def\s+)?([A-Z][A-Z0-9_]*)\s*=", source))
 
 
 class InfraDryRunPipelineTest(unittest.TestCase):
@@ -74,6 +88,12 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn('withEnv(["stageName=${stageName}"])', prepared)
         self.assertNotIn("test_infra_dry_run_benchmark.py", prepared)
         self.assertLess(docs.index("if (isInfraDryRun())"), docs.index("make html"))
+        conditional_properties = _conditional_workflow_properties(prepared)
+        self.assertTrue(conditional_properties)
+        self.assertLessEqual(
+            conditional_properties,
+            _top_level_workflow_properties(L0_TEST),
+        )
 
     def test_slurm_keeps_only_dry_gates_needed_by_the_standard_runner(self):
         body = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "runLLMTestlistOnSlurm")

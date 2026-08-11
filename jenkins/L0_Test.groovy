@@ -3759,12 +3759,6 @@ def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
             "-s",
             "--s3-upload-path=${uploadPath}/${stageName}",
         ]
-        if (ENABLE_S3_ECHO_STDOUT) {
-            extraArgs += [
-                "--s3-echo-stdout",
-                "--s3-capture-mode=timestamped",
-            ]
-        }
     }
     def pytestCommand = getPytestBaseCommandLine(
         llmSrc,
