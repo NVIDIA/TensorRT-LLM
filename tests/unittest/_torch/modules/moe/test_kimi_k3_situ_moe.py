@@ -498,6 +498,33 @@ def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     assert model_config.moe_backend == backend
 
 
+@pytest.mark.parametrize(
+    "backend,expected_moe_max_num_tokens",
+    [
+        pytest.param("TRTLLM", 33024, id="trtllm"),
+        pytest.param("MEGAMOE_DEEPGEMM", 131072, id="megamoe"),
+    ],
+)
+def test_kimi_k3_routed_config_scopes_megamoe_capacity(backend, expected_moe_max_num_tokens):
+    model_config = ModelConfig(
+        mapping=Mapping(
+            world_size=16,
+            rank=0,
+            tp_size=16,
+            moe_ep_size=16,
+            enable_attention_dp=True,
+        ),
+        max_num_tokens=8192,
+        moe_max_num_tokens=33024,
+        moe_backend=backend,
+    )
+
+    routed_model_config = KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+    assert routed_model_config.moe_max_num_tokens == expected_moe_max_num_tokens
+    assert model_config.moe_max_num_tokens == 33024
+
+
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),

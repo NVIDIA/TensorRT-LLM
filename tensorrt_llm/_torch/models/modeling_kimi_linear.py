@@ -942,6 +942,16 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         routed_model_config.mapping = routed_mapping
         routed_model_config.moe_backend = model_config.moe_backend
+        # MegaMoE uses this value as global DP SymmBuffer capacity, then
+        # divides it by EP size for the per-rank allocation. Other backends
+        # keep the user-configured value as their MoE chunking bound.
+        # Preserve an explicitly larger capacity.
+        if routed_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+            default_moe_max_num_tokens = routed_model_config.max_num_tokens * routed_mapping.dp_size
+            routed_model_config.moe_max_num_tokens = max(
+                int(routed_model_config.moe_max_num_tokens or 0),
+                default_moe_max_num_tokens,
+            )
         routed_model_config._frozen = True
         return routed_model_config
 
