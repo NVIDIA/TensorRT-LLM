@@ -85,10 +85,13 @@ def populate_file_pages(
     """Fault a file's pages into the OS page cache without copying to user space.
 
     Maps the file read-only and issues ``madvise(MADV_POPULATE_READ)`` over it in
-    ``window_bytes`` windows (``window_bytes`` must be a multiple of the page size).
-    Windowing keeps per-call ``mmap_lock`` hold times short, so concurrent
-    ``mmap``/``munmap`` callers in the process are not stalled behind one long
-    populate, and gives callers progress granularity via ``on_window(num_bytes)``.
+    ``window_bytes`` windows. Windowing keeps per-call ``mmap_lock`` hold times
+    short, so concurrent ``mmap``/``munmap`` callers in the process are not stalled
+    behind one long populate, and gives callers progress granularity via
+    ``on_window(num_bytes)``. ``window_bytes`` must be a positive multiple of the
+    page size (raises ``ValueError`` otherwise): a zero window would never advance,
+    and an unaligned one would fail from the second window on with an error that is
+    indistinguishable from an unsupported kernel.
 
     The advice is issued through ``ctypes`` rather than ``mmap.mmap.madvise``
     deliberately: population blocks for the duration of the underlying file read,
@@ -100,6 +103,8 @@ def populate_file_pages(
     failure) population stops early -- typically returning 0 -- and the caller is
     expected to warm the remaining bytes by other means.
     """
+    if window_bytes <= 0 or window_bytes % mmap.PAGESIZE != 0:
+        raise ValueError("window_bytes must be a positive multiple of the page size.")
     try:
         fd = os.open(file_name, os.O_RDONLY)
     except OSError:
@@ -121,6 +126,10 @@ def populate_file_pages(
         addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
         if addr in (None, _MMAP_FAILED):
             return 0
+    except OSError:
+        # Same contract as an unsupported kernel/filesystem: stop early and
+        # let the caller warm the file by other means.
+        return 0
     finally:
         os.close(fd)  # The mapping keeps its own reference to the file.
     populated = 0

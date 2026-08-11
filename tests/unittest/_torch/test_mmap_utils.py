@@ -23,10 +23,12 @@ from tensorrt_llm._torch.mmap_utils import populate_file_pages
 pytestmark = pytest.mark.cpu_only
 
 
-def test_populate_file_pages_full_or_unsupported(tmp_path):
-    # MADV_POPULATE_READ requires Linux >= 5.14: population either warms the
-    # whole file (reporting every window, including the trailing partial one)
-    # or signals "unsupported" by stopping at 0 bytes.
+def test_populate_file_pages_reports_exact_bounded_progress(tmp_path):
+    # MADV_POPULATE_READ requires Linux >= 5.14: population warms the whole
+    # file on capable kernels (reporting every window, including the trailing
+    # partial one), returns 0 where unsupported, and the documented contract
+    # also admits a partial count on a transient mid-file failure. The
+    # invariants are exact per-window accounting and boundedness.
     payload = os.urandom(2 * mmap.PAGESIZE + 123)
     file = tmp_path / "blob.bin"
     file.write_bytes(payload)
@@ -34,10 +36,21 @@ def test_populate_file_pages_full_or_unsupported(tmp_path):
     windows: list[int] = []
     populated = populate_file_pages(str(file), mmap.PAGESIZE, windows.append)
 
-    assert populated in (0, len(payload))
+    assert 0 <= populated <= len(payload)
     assert sum(windows) == populated
     if windows:
         assert max(windows) <= mmap.PAGESIZE
+
+
+def test_populate_file_pages_rejects_bad_window_sizes(tmp_path):
+    # A zero window would never advance the populate loop and an unaligned one
+    # would fail from the second window on; both are programming errors.
+    file = tmp_path / "blob.bin"
+    file.write_bytes(b"x" * mmap.PAGESIZE)
+
+    for bad_window in (0, -mmap.PAGESIZE, mmap.PAGESIZE + 1):
+        with pytest.raises(ValueError):
+            populate_file_pages(str(file), bad_window)
 
 
 def test_populate_file_pages_empty_and_missing_files(tmp_path):
