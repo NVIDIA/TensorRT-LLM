@@ -533,7 +533,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ):
+    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
