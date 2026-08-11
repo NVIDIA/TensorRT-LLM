@@ -33,6 +33,7 @@ from typing import Optional
 import torch
 
 from ...cute_dsl_kernels.blackwell.top_k.gvr_routing import (
+    LIST_EMIT_MAX_B,
     LIST_EMIT_MIN_N,
     TopkRoute,
     pick_config,
@@ -90,10 +91,16 @@ class GvrEmissionState:
         self.cand_ctl: Optional[torch.Tensor] = None
         self.cand_cur: Optional[torch.Tensor] = None
         if enable_list_tier:
-            self.cand_vals = torch.zeros((max_rows, LIST_WIDTH), dtype=torch.float32, device=device)
-            self.cand_idx = torch.zeros((max_rows, LIST_WIDTH), dtype=torch.int32, device=device)
-            self.cand_ctl = torch.zeros((max_rows, 4), dtype=torch.int32, device=device)
-            self.cand_cur = torch.zeros((max_rows, 4), dtype=torch.int32, device=device)
+            # the routing only ever picks the list tier at
+            # batch <= LIST_EMIT_MAX_B, so the wide candidate buffers
+            # need that many rows, not max_rows (~0.33 MB/row/layer)
+            cand_rows = min(max_rows, LIST_EMIT_MAX_B)
+            self.cand_vals = torch.zeros(
+                (cand_rows, LIST_WIDTH), dtype=torch.float32, device=device
+            )
+            self.cand_idx = torch.zeros((cand_rows, LIST_WIDTH), dtype=torch.int32, device=device)
+            self.cand_ctl = torch.zeros((cand_rows, 4), dtype=torch.int32, device=device)
+            self.cand_cur = torch.zeros((cand_rows, 4), dtype=torch.int32, device=device)
         # previous-step top-k feedback (address-stable; zero-init ->
         # first step's pre_idx points at index 0, a benign candidate)
         self.prev_topk = torch.zeros((max_rows, top_k), dtype=torch.int32, device=device)
@@ -204,8 +211,9 @@ class GvrEmissionState:
         rungs[:, 1] = new1
         rungs[:, 2] = new2
         if self.cand_ctl is not None:
-            self.cand_ctl[:num_rows].zero_()
-            self.cand_cur[:num_rows].zero_()
+            nc = min(num_rows, self.cand_ctl.shape[0])
+            self.cand_ctl[:nc].zero_()
+            self.cand_cur[:nc].zero_()
 
     def indexer_emit_kwargs(self, emit_tier: str, num_rows: int) -> dict:
         """kwargs for CuteDSLFP4PagedMQALogitsRunner.forward covering the

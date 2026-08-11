@@ -1761,6 +1761,11 @@ class Indexer(nn.Module):
                         st = self._ensure_gvr_emission(metadata, q_fp8.device)
                         # indexer_max_seq_len is already the compressed length
                         # (get_indexer_max_seq_len divides); do not divide again.
+                        # routing N is the ENGINE-STATIC max (graph capture
+                        # bakes the tier in); short live rows in a long-max
+                        # engine run assist machinery the planner would refuse
+                        # at their true length - exactness holds via the
+                        # in-kernel guards, the tax is routed pessimistically
                         emit_tier, self._gvr_route = st.plan(
                             batch_size,
                             indexer_max_seq_len,
