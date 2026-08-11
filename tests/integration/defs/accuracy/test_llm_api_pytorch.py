@@ -7909,7 +7909,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         speculative_config = {
             "decoding_type": "Eagle3",
             "max_draft_len": max_draft_len,
-            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3",
             "eagle3_one_model": True,
         }
         common_config = {
@@ -8015,13 +8015,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             # Acceptance through the generation worker's iteration stats:
             # the disagg fixture is an OpenAI duck with no get_stats, so
             # read the worker's /metrics buffer (populated by
-            # enable_iter_perf_stats) after the eval. Calibration: the
-            # GQA head's first disagg run measured length 2.773 / rate
-            # 0.591 on this workload (consistent with its card's MT-Bench
-            # 2.668; the MHA head measures 3.44-3.48 here and its
-            # broken-transfer plateau was ~3.33). The floors sit ~0.1
-            # under the healthy GQA measurement; tighten once a GQA
-            # broken-transfer plateau is measured.
+            # enable_iter_perf_stats) after the eval. Calibration (PR
+            # #17457 validation, MHA head): healthy disagg GSM8K measures
+            # 3.44-3.48 while broken drafter-KV transfer plateaus at
+            # ~3.33, so the acceptance floor sits between the two to
+            # catch a transfer regression.
             import requests
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
@@ -8037,12 +8035,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations in /metrics"
             rate = accepted / drafted
             length = 1 + accepted / steps
-            print(f"MiniMax-M3 Eagle3-GQA disagg GSM8K acceptance: "
+            print(f"MiniMax-M3 Eagle3 disagg GSM8K acceptance: "
                   f"rate={rate:.3f}, mean acceptance length={length:.3f} "
                   f"({steps} spec iterations)")
-            assert length > 2.65, \
+            assert length > 3.38, \
                 f"disagg acceptance length too low: {length:.3f}"
-            assert rate > 0.55, \
+            assert rate > 0.76, \
                 f"disagg acceptance rate too low: {rate:.3f}"
 
     @pytest.mark.skip_less_device(4)
@@ -8074,7 +8072,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
         )
         # The runtime forces tokens_per_block per implementation (128 MSA / 32
         # reference).
@@ -8138,8 +8136,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
             # Chat-format acceptance — the drafter's training distribution
-            # (Inferact/MiniMax-M3-EAGLE3-GQA). Reuses the live engine and
-            # the cached dataset; ~20 s under CUDA graphs.
+            # (Inferact/MiniMax-M3-EAGLE3 card: 0.839 / 3.518). Reuses the
+            # live engine and the cached dataset; ~20 s under CUDA graphs.
             questions = [
                 r["question"]
                 for r in load_dataset("gsm8k", "main", split="test")
@@ -8160,28 +8158,20 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # The GQA drafter card (Inferact/MiniMax-M3-EAGLE3-GQA) publishes
-            # MT-Bench 2.668 / 55.62% and SPEED-Bench 2.561 / 52.04% (vLLM,
-            # MXFP8 target, draft_len=3) but no chat-GSM8K figures. The head
-            # is retrained on the same data as the MHA head with only the
-            # attention changed (64 -> 4 KV heads), so the MHA-derived
-            # references (its card: rate 0.839, length 3.518) do not carry
-            # over; the thresholds are provisional floors set from the
-            # first GQA measurement (disagg chat-GSM8K length 2.773 / rate
-            # 0.591 in this suite) — tighten after the first aggregated
-            # GQA CI run prints its figure below.
+            # Published reference (Inferact/MiniMax-M3-EAGLE3 drafter card):
+            # rate 0.839, length 3.518. Our testing thresholds: rate > 0.78,
+            # length > 3.3.
             ref_rate, ref_length = 0.839, 3.518
-            ref_source = ("the Inferact/MiniMax-M3-EAGLE3 (MHA) drafter "
-                          "card; provisional for the GQA head")
-            print(f"MiniMax-M3 Eagle3-GQA chat-GSM8K acceptance: rate="
+            ref_source = "the Inferact/MiniMax-M3-EAGLE3 drafter model card"
+            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
-            assert chat_rate > 0.5, \
+            assert chat_rate > 0.78, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(threshold 0.5, reference {ref_rate} from {ref_source})"
-            assert chat_length > 2.5, \
+                f"(threshold 0.78, reference {ref_rate} from {ref_source})"
+            assert chat_length > 3.3, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (threshold 2.5, reference {ref_length} " \
+                f"{chat_length:.3f} (threshold 3.3, reference {ref_length} " \
                 f"from {ref_source})"
             print(f"Eagle3 acceptance references: rate {ref_rate}, length "
                   f"{ref_length} — from {ref_source}.")
