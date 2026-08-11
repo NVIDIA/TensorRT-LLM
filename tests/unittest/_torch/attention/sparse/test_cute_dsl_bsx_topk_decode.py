@@ -23,10 +23,12 @@ broken), quantized-tie inputs, degenerate rows, pre_idx hardening,
 host-only route-table asserts, a dispatcher-fallback check (bf16 routes to
 the in-tree kernel), and the MTP axis: next_n in {2, 3, 4} x cr in {1, 4}
 x all three tiers, each case checked against BOTH the torch.topk host
-N_eff/offset simulation (``_tie_aware_check``) and a differential in-tree
-arm (same inputs through the in-tree kernel via ``order_row``, per-row
-value-multiset equality).
+N_eff/offset simulation (the shared ``tie_aware_check`` conftest fixture)
+and a differential in-tree arm (same inputs through the in-tree kernel via
+the ``TRTLLM_BSX_DISABLE`` kill switch, per-row value-multiset equality).
 """
+
+import os
 
 import pytest
 import torch
@@ -64,7 +66,7 @@ def _bsx_bands_off(monkeypatch):
 
 @skip_not_sm100
 @pytest.mark.parametrize("bands", ["on", "off"])
-def test_bsx_cuda_graph_capture_replay(monkeypatch, bands):
+def test_bsx_cuda_graph_capture_replay(monkeypatch, bands, tie_aware_check):
     """The op must be CUDA-graph capturable and replay-consistent on both
     sides of the fallback band table. Shape (npad=32768, bs=64) sits inside
     a fallback bucket: bands=on captures the in-tree branch, bands=off the
@@ -98,7 +100,7 @@ def test_bsx_cuda_graph_capture_replay(monkeypatch, bands):
         call()
     g.replay()
     torch.cuda.synchronize()
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
     # replay over in-place rewritten inputs (fresh logits + fresh hints)
     logits2, pre_idx2, seq_lens2 = _make_bsx_inputs(bs, npad, top_k, seed=4321)
@@ -107,7 +109,7 @@ def test_bsx_cuda_graph_capture_replay(monkeypatch, bands):
     seq_lens.copy_(seq_lens2)
     g.replay()
     torch.cuda.synchronize()
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 def test_bsx_fallback_band_table(monkeypatch):
@@ -140,84 +142,6 @@ def test_bsx_fallback_band_table(monkeypatch):
     assert not inb(64, 32768)
     monkeypatch.delenv("TRTLLM_BSX_FALLBACK_BANDS", raising=False)
     bsx_dispatch._reset_env_cache()
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers. ``_tie_aware_check`` is a local copy of the one in
-# test_cute_dsl_gvr_topk_decode.py (same directory): the sibling test module
-# is not reliably importable across the repo's pytest invocation styles
-# (rootdir-dependent package resolution), so the checker is duplicated here
-# verbatim-in-spirit with the same semantics. Keep the two in sync.
-# ---------------------------------------------------------------------------
-def _tie_aware_check(
-    out_indices: torch.Tensor,
-    logits: torch.Tensor,
-    seq_lens: torch.Tensor,
-    top_k: int,
-    next_n: int = NEXT_N,
-    compress_ratio: int = CR,
-) -> None:
-    """Vectorized multi-row tie-aware correctness check (strict sort+allclose).
-
-    Per row r the scan range is ``logits[r, :N_eff(r)]`` where
-    ``N_eff = (seq_lens[r // next_n] - next_n + r % next_n + 1) // cr``
-    (the kernels' exact formula). Checks: in-range indices, no duplicates,
-    no selected value below the K-th reference value, and sorted-value
-    multiset equality against torch.topk.
-    """
-    num_rows, top_k_out = out_indices.shape
-    assert top_k_out == top_k
-    device = logits.device
-    logits_f32 = logits.to(torch.float32)
-    N = logits.shape[1]
-
-    row_idx = torch.arange(num_rows, device=device)
-    group_idx = row_idx // next_n
-    ofs = row_idx % next_n
-    seq_lens_per_row = seq_lens.to(device=device, dtype=torch.long)[group_idx]
-    actual_kv_len = seq_lens_per_row - next_n + ofs + 1
-    N_eff = actual_kv_len // compress_ratio  # [num_rows]
-
-    col_idx = torch.arange(N, device=device)
-    in_range_mask = col_idx[None, :] < N_eff[:, None]
-    masked_logits = torch.where(in_range_mask, logits_f32, float("-inf"))
-    ref_vals, _ = torch.topk(masked_logits, k=top_k, largest=True, sorted=True, dim=-1)
-
-    out_of_range = (out_indices < 0) | (out_indices >= N_eff[:, None])
-    if bool(out_of_range.any().item()):
-        bad_row = int(out_of_range.any(dim=1).int().argmax().item())
-        raise AssertionError(
-            f"row={bad_row}: out-of-range index "
-            f"(N_eff={int(N_eff[bad_row].item())}, "
-            f"indices={out_indices[bad_row].cpu().tolist()})"
-        )
-
-    sorted_idx, _ = out_indices.sort(dim=-1)
-    has_dup = (sorted_idx[:, 1:] == sorted_idx[:, :-1]).any(dim=-1)
-    if bool(has_dup.any().item()):
-        bad_row = int(has_dup.int().argmax().item())
-        raise AssertionError(
-            f"row={bad_row}: duplicate indices: {out_indices[bad_row].cpu().tolist()}"
-        )
-
-    sel_vals = torch.gather(logits_f32, dim=-1, index=out_indices.long())
-    kth_vals = ref_vals[:, -1:]
-    n_below_per_row = (sel_vals < kth_vals).sum(dim=-1)
-    if bool((n_below_per_row > 0).any().item()):
-        bad_row = int(n_below_per_row.argmax().item())
-        raise AssertionError(
-            f"row={bad_row}: {int(n_below_per_row[bad_row].item())} selected "
-            f"values < Kth-rank value ({float(kth_vals[bad_row, 0].item()):.6f})"
-        )
-
-    sel_sorted, _ = sel_vals.sort(dim=-1, descending=True)
-    if not bool(torch.allclose(sel_sorted, ref_vals, rtol=1e-5, atol=1e-5)):
-        per_row_max = (sel_sorted - ref_vals).abs().max(dim=-1).values
-        bad_row = int(per_row_max.argmax().item())
-        raise AssertionError(
-            f"row={bad_row}: sorted-value mismatch — max diff "
-            f"{float(per_row_max[bad_row].item()):.4e}"
-        )
 
 
 def _make_bsx_inputs(
@@ -400,7 +324,9 @@ _REG_INSTANCES = [
     ids=[t[4] + f"_n{t[0]}_bs{t[1]}_k{t[2]}" for t in _REG_INSTANCES],
 )
 @pytest.mark.parametrize("kind", ["randn", "ties"])
-def test_bsx_reg_launch_table(npad, bs, top_k, dense_env, expected, launch, kind, monkeypatch):
+def test_bsx_reg_launch_table(
+    npad, bs, top_k, dense_env, expected, launch, kind, monkeypatch, tie_aware_check
+):
     if not launch and kind == "ties":
         pytest.skip("route-assert-only instance (single kind suffices)")
     _skip_if_cluster_capped(bs, npad, top_k)
@@ -414,7 +340,7 @@ def test_bsx_reg_launch_table(npad, bs, top_k, dense_env, expected, launch, kind
         _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, expected)
         if launch:
             out = _run_op(logits, pre_idx, seq_lens, top_k)
-            _tie_aware_check(out, logits, seq_lens, top_k)
+            tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
     finally:
         if dense_env is not None:
             monkeypatch.delenv("TRTLLM_BSX_DENSE_BS", raising=False)
@@ -435,13 +361,13 @@ def test_bsx_reg_launch_table(npad, bs, top_k, dense_env, expected, launch, kind
         (4096, 8, 512, "randn", False),  # uniform N_eff == npad (no tail)
     ],
 )
-def test_bsx_direct(npad, bs, top_k, kind, varlen):
+def test_bsx_direct(npad, bs, top_k, kind, varlen, tie_aware_check):
     logits, pre_idx, seq_lens = _make_bsx_inputs(
         bs, npad, top_k, seed=npad * 3 + bs, kind=kind, varlen=varlen
     )
     _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "direct")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 # ---------------------------------------------------------------------------
@@ -457,14 +383,14 @@ def test_bsx_direct(npad, bs, top_k, kind, varlen):
         (262144, 128, 2048, "randn"),  # cs=1, uf=8 streaming path
     ],
 )
-def test_bsx_tp(npad, bs, top_k, kind):
+def test_bsx_tp(npad, bs, top_k, kind, tie_aware_check):
     _skip_if_cluster_capped(bs, npad, top_k)
     logits, pre_idx, seq_lens = _make_bsx_inputs(
         bs, npad, top_k, seed=npad + 7 * bs, kind=kind, varlen=True
     )
     _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +406,7 @@ def test_bsx_tp(npad, bs, top_k, kind):
         (65536, 16, 1024, "tp"),
     ],
 )
-def test_bsx_degenerate_rows(npad, bs, top_k, expected_kind):
+def test_bsx_degenerate_rows(npad, bs, top_k, expected_kind, tie_aware_check):
     _skip_if_cluster_capped(bs, npad, top_k)
     logits, pre_idx, seq_lens = _make_bsx_inputs(
         bs, npad, top_k, seed=11, kind="randn", varlen=True
@@ -508,7 +434,14 @@ def test_bsx_degenerate_rows(npad, bs, top_k, expected_kind):
                 f"{out[i, : max(ne + 2, 8)].cpu().tolist()}..."
             )
         else:
-            _tie_aware_check(out[i : i + 1], logits[i : i + 1], seq_lens[i : i + 1], top_k)
+            tie_aware_check(
+                out[i : i + 1],
+                logits[i : i + 1],
+                seq_lens[i : i + 1],
+                top_k,
+                next_n=NEXT_N,
+                compress_ratio=CR,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -524,13 +457,13 @@ def test_bsx_degenerate_rows(npad, bs, top_k, expected_kind):
         (65536, 16, 1024),  # tp tier
     ],
 )
-def test_bsx_preidx_hardening(npad, bs, top_k, preidx):
+def test_bsx_preidx_hardening(npad, bs, top_k, preidx, tie_aware_check):
     _skip_if_cluster_capped(bs, npad, top_k)
     logits, pre_idx, seq_lens = _make_bsx_inputs(
         bs, npad, top_k, seed=13, kind="randn", varlen=True, preidx=preidx
     )
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +489,7 @@ def test_bsx_preidx_hardening(npad, bs, top_k, preidx):
         (131136, 128, 512),  # cs=1 streaming tp (flash 512k production shape)
     ],
 )
-def test_bsx_tp_admission_hitrate(npad, bs, top_k, hit_rate):
+def test_bsx_tp_admission_hitrate(npad, bs, top_k, hit_rate, tie_aware_check):
     """High-hr rows must admit (1-pass) and low-hr rows must stay exact via
     the pivot/secant fallback; both paths must produce exact top-K."""
     _skip_if_cluster_capped(bs, npad, top_k)
@@ -565,11 +498,11 @@ def test_bsx_tp_admission_hitrate(npad, bs, top_k, hit_rate):
     )
     _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 @skip_not_sm100
-def test_bsx_tp_admission_tie_plateau():
+def test_bsx_tp_admission_tie_plateau(tie_aware_check):
     """Tie plateau AT the admission threshold: K/2 distinct high values +
     a 3K-wide exact-tie plateau straddling the K-th rank. The hint set is
     the true top-K, so the ladder rungs land ON the plateau value and the
@@ -590,12 +523,12 @@ def test_bsx_tp_admission_tie_plateau():
     pre_idx = logits.topk(top_k, dim=-1).indices.int().contiguous()
     _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 @skip_not_sm100
 @pytest.mark.parametrize("top_k,n_plateau", [(1024, 8000), (2048, 12000)])
-def test_bsx_tp_admission_overflow_fallback(top_k, n_plateau):
+def test_bsx_tp_admission_overflow_fallback(top_k, n_plateau, tie_aware_check):
     """count(>= any admissible threshold) > kC: K-1 distinct high values,
     then an n_plateau-wide exact-tie plateau (n_plateau > kC = 6144/8192).
     Every threshold at or below the plateau overflows the candidate buffer
@@ -618,11 +551,11 @@ def test_bsx_tp_admission_overflow_fallback(top_k, n_plateau):
     pre_idx = logits.topk(top_k, dim=-1).indices.int().contiguous()
     _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 @skip_not_sm100
-def test_bsx_tp_admission_mixed_batch():
+def test_bsx_tp_admission_mixed_batch(tie_aware_check):
     """Ragged batch mixing rows that admit (true-top-K hints) with rows
     that must fall back (all-zero cold-start hints): per-row admission
     escape is independent, so every row must stay exact regardless of
@@ -635,7 +568,7 @@ def test_bsx_tp_admission_mixed_batch():
     pre_idx[1::2] = 0  # odd rows: cold-start (degenerate ladder -> fallback)
     _assert_bsx_routes(logits, pre_idx, seq_lens, top_k, "tp")
     out = _run_op(logits, pre_idx, seq_lens, top_k)
-    _tie_aware_check(out, logits, seq_lens, top_k)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +620,94 @@ def test_bsx_dispatcher_fallback_bad_shapes():
     assert not ok(logits, pre_idx, sl_row, out, top_k, 2, 4, None, None)
 
 
+@skip_not_sm100
+def test_bsx_accepts_order_row(tie_aware_check):
+    """``order_row`` (the LJF hint dsa.py computes for every batch with
+    num_rows >= 2 * num_sms) must NOT turn bsx off: the guard accepts it and
+    the tiers ignore it, so the per-row index SET is identical with and
+    without the permutation (emission order is unordered by contract).
+    Reuses the (4096, 256, 512) tp cell compiled by ``test_bsx_tp`` (no
+    extra JIT)."""
+    npad, bs, top_k = 4096, 256, 512
+    _skip_if_cluster_capped(bs, npad, top_k)
+    logits, pre_idx, seq_lens = _make_bsx_inputs(
+        bs, npad, top_k, seed=npad + 7 * bs, kind="randn", varlen=True
+    )
+    order_row = torch.argsort(seq_lens.long(), descending=True).int().contiguous()
+    out_dummy = torch.empty(bs, top_k, dtype=torch.int32, device="cuda")
+    assert bsx_dispatch.is_bsx_supported(
+        logits, pre_idx, seq_lens, out_dummy, top_k, NEXT_N, CR, order_row, None
+    ), "guard must accept order_row (scheduling hint, ignored by the tiers)"
+    out_plain = _run_op(logits, pre_idx, seq_lens, top_k)
+    out_ordered = torch.empty_like(out_plain)
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_ordered,
+        top_k=top_k,
+        next_n=NEXT_N,
+        compress_ratio=CR,
+        order_row=order_row,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_plain.sort(-1).values, out_ordered.sort(-1).values), (
+        "bsx per-row index set must be independent of the ignored order_row permutation"
+    )
+    tie_aware_check(out_ordered, logits, seq_lens, top_k, next_n=NEXT_N, compress_ratio=CR)
+    # Production shape sanity (guard-only, no launch): num_rows >= 2*num_sms
+    # — the batch band where dsa.py always sends order_row — stays accepted.
+    big_bs = 2 * torch.cuda.get_device_properties().multi_processor_count + 8
+    logits_b = torch.randn(big_bs, npad, dtype=torch.float32, device="cuda")
+    pre_b = torch.zeros(big_bs, top_k, dtype=torch.int32, device="cuda")
+    sl_b = torch.full((big_bs,), npad * CR, dtype=torch.int32, device="cuda")
+    out_b = torch.empty(big_bs, top_k, dtype=torch.int32, device="cuda")
+    order_b = torch.argsort(sl_b.long(), descending=True).int().contiguous()
+    assert bsx_dispatch.is_bsx_supported(
+        logits_b, pre_b, sl_b, out_b, top_k, NEXT_N, CR, order_b, None
+    ), "large-batch (num_rows >= 2*num_sms) calls with order_row must stay on bsx"
+
+
+@skip_not_sm100
+def test_bsx_disable_kill_switch(monkeypatch):
+    """TRTLLM_BSX_DISABLE rejects everything at the guard (host-only)."""
+    bs, npad, top_k = 4, 65536, 512
+    logits = torch.randn(bs, npad, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((bs,), npad * CR, dtype=torch.int32, device="cuda")
+    pre_idx = torch.zeros(bs, top_k, dtype=torch.int32, device="cuda")
+    out = torch.empty(bs, top_k, dtype=torch.int32, device="cuda")
+    ok = bsx_dispatch.is_bsx_supported
+    assert ok(logits, pre_idx, seq_lens, out, top_k, NEXT_N, CR, None, None)
+    monkeypatch.setenv("TRTLLM_BSX_DISABLE", "1")
+    bsx_dispatch._reset_env_cache()
+    assert not ok(logits, pre_idx, seq_lens, out, top_k, NEXT_N, CR, None, None)
+    monkeypatch.delenv("TRTLLM_BSX_DISABLE", raising=False)
+    bsx_dispatch._reset_env_cache()
+    assert ok(logits, pre_idx, seq_lens, out, top_k, NEXT_N, CR, None, None)
+
+
+def test_bsx_env_malformed_soft_fail(monkeypatch):
+    """Malformed tuning-knob values fail soft (warn + baked default), never
+    raise on the decode path."""
+    baseline = bsx_dispatch.route(256, 20480, 512)
+    for bad in ("true", " 16x", "8.5"):
+        monkeypatch.setenv("TRTLLM_BSX_TP_BS", bad)
+        bsx_dispatch._reset_env_cache()
+        assert bsx_dispatch.route(256, 20480, 512) == baseline
+    # whitespace-padded but valid values still parse.
+    monkeypatch.setenv("TRTLLM_BSX_TP_BS", " 0 ")
+    bsx_dispatch._reset_env_cache()
+    assert bsx_dispatch.route(256, 20480, 512).startswith(("reg", "direct"))
+    monkeypatch.delenv("TRTLLM_BSX_TP_BS", raising=False)
+    bsx_dispatch._reset_env_cache()
+
+
 # ---------------------------------------------------------------------------
 # MTP (next_n > 1) + cr in {1, 4}: exactness on all three tiers, checked
 # against BOTH the torch.topk host N_eff/offset simulation
-# (``_tie_aware_check``) and a differential in-tree arm — the SAME inputs
-# through the in-tree kernel (forced via ``order_row``, which the bsx guard
-# rejects), per-row value-multiset equality. Ragged: per-request varlen
+# (``tie_aware_check``) and a differential in-tree arm — the SAME inputs
+# through the in-tree kernel (forced via ``TRTLLM_BSX_DISABLE``; the guard
+# accepts+ignores order_row), per-row value-multiset equality. Ragged:
 # seq_lens make N_eff differ across requests AND (via row % next_n) across
 # the MTP rows of one request; tails are poisoned with +1e30.
 # ---------------------------------------------------------------------------
@@ -751,8 +766,10 @@ def _make_mtp_inputs(
 
 
 def _run_mtp_both_arms(logits, pre_idx, seq_lens, top_k, next_n, cr):
-    """bsx arm + in-tree differential arm (order_row forces the in-tree
-    sort path; the bsx guard rejects order_row). Returns (out_bsx, out_ref)."""
+    """bsx arm + in-tree differential arm (the ``TRTLLM_BSX_DISABLE`` kill
+    switch forces the in-tree path; ``order_row`` no longer does — the guard
+    accepts and ignores it). The ref call still passes ``order_row`` so the
+    in-tree sort-indirect path stays exercised. Returns (out_bsx, out_ref)."""
     num_rows = logits.shape[0]
     out = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
     assert bsx_dispatch.is_bsx_supported(
@@ -763,16 +780,22 @@ def _run_mtp_both_arms(logits, pre_idx, seq_lens, top_k, next_n, cr):
     )
     order_row = torch.argsort(seq_lens.long(), descending=True).int().contiguous()
     out_ref = torch.empty_like(out)
-    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
-        logits,
-        pre_idx,
-        seq_lens,
-        out_ref,
-        top_k=top_k,
-        next_n=next_n,
-        compress_ratio=cr,
-        order_row=order_row,
-    )
+    os.environ["TRTLLM_BSX_DISABLE"] = "1"
+    bsx_dispatch._reset_env_cache()
+    try:
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits,
+            pre_idx,
+            seq_lens,
+            out_ref,
+            top_k=top_k,
+            next_n=next_n,
+            compress_ratio=cr,
+            order_row=order_row,
+        )
+    finally:
+        del os.environ["TRTLLM_BSX_DISABLE"]
+        bsx_dispatch._reset_env_cache()
     torch.cuda.synchronize()
     return out, out_ref
 
@@ -817,7 +840,7 @@ _MTP_KINDS = [
     "tier,next_n,cr", _MTP_COMBOS, ids=[f"{t}-{n}-{c}" for t, n, c in _MTP_COMBOS]
 )
 @pytest.mark.parametrize("kind,preidx", _MTP_KINDS, ids=[f"{k}-{p}" for k, p in _MTP_KINDS])
-def test_bsx_mtp_exactness(tier, next_n, cr, kind, preidx):
+def test_bsx_mtp_exactness(tier, next_n, cr, kind, preidx, tie_aware_check):
     npad, bs_req, top_k = _MTP_TIER_CELLS[tier]
     num_rows = bs_req * next_n
     if tier == "tp" and num_rows < 16:
@@ -830,7 +853,7 @@ def test_bsx_mtp_exactness(tier, next_n, cr, kind, preidx):
     )
     out, out_ref = _run_mtp_both_arms(logits, pre_idx, seq_lens, top_k, next_n, cr)
     # Independent torch.topk + host N_eff/offset simulation reference.
-    _tie_aware_check(out, logits, seq_lens, top_k, next_n=next_n, compress_ratio=cr)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=next_n, compress_ratio=cr)
     # Differential oracle: per-row value multiset equal to the in-tree arm.
     sel = torch.gather(logits, -1, out.long()).sort(-1, descending=True).values
     sel_ref = torch.gather(logits, -1, out_ref.long()).sort(-1, descending=True).values
@@ -842,7 +865,7 @@ def test_bsx_mtp_exactness(tier, next_n, cr, kind, preidx):
 @skip_not_sm100
 @pytest.mark.parametrize("next_n,cr", [(2, 1), (3, 4)])
 @pytest.mark.parametrize("preidx", ["zeros", "random"])
-def test_bsx_mtp_preidx_hardening(next_n, cr, preidx):
+def test_bsx_mtp_preidx_hardening(next_n, cr, preidx, tie_aware_check):
     """bsx-only MTP robustness: hint sets that VIOLATE the op's argmax-
     slot-0 contract (pure zeros / out-of-range garbage) must neither fault
     nor break exactness on the bsx tiers. No differential arm here: the
@@ -872,13 +895,13 @@ def test_bsx_mtp_preidx_hardening(next_n, cr, preidx):
         logits, pre_idx, seq_lens, out, top_k=top_k, next_n=next_n, compress_ratio=cr
     )
     torch.cuda.synchronize()
-    _tie_aware_check(out, logits, seq_lens, top_k, next_n=next_n, compress_ratio=cr)
+    tie_aware_check(out, logits, seq_lens, top_k, next_n=next_n, compress_ratio=cr)
 
 
 @skip_not_sm100
 @pytest.mark.parametrize("next_n", [2, 3])
 @pytest.mark.parametrize("cr", [1, 4])
-def test_bsx_mtp_degenerate_rows(next_n, cr):
+def test_bsx_mtp_degenerate_rows(next_n, cr, tie_aware_check):
     """Degenerate MTP requests (N_eff <= K for some or all of the next_n
     rows): identity emit [0..N_eff-1] + -1 pad must hold per ROW, with the
     per-row N_eff = (seq_lens[req] - next_n + row % next_n + 1) // cr."""
@@ -912,7 +935,7 @@ def test_bsx_mtp_degenerate_rows(next_n, cr):
             # into an equivalent next_n=1 seq_lens so the shared checker
             # scans exactly N_eff(r) columns.
             sl_row = seq_lens[r // next_n : r // next_n + 1] - next_n + (r % next_n) + 1
-            _tie_aware_check(
+            tie_aware_check(
                 out[r : r + 1], logits[r : r + 1], sl_row, top_k, next_n=1, compress_ratio=cr
             )
     nd = (n_eff > top_k).nonzero().flatten()

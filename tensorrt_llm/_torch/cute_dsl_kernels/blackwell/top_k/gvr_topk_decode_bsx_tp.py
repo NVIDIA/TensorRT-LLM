@@ -1831,6 +1831,21 @@ def _p2floor(x: int) -> int:
     return p
 
 
+def _two_waves_rows() -> int:
+    """2 * SM count of the current device (cached): the co-residency row
+    budget behind the CS selection below (min_blocks_per_mp=2). Mirrors
+    ``_get_num_sms`` in ``cute_dsl_custom_ops.py`` (not importable from
+    here — the import runs the other way). NOTE: only this term scales
+    with the device; every other constant in ``tp_cluster_size`` and the
+    dispatch band tables is frozen B200 calibration (the kernel family
+    measured HW-invariant across B200/B300 in the op9/op17 cross-arch
+    A/Bs, so the bands are kept device-independent on purpose).
+    """
+    if not hasattr(_two_waves_rows, "_value"):
+        _two_waves_rows._value = 2 * torch.cuda.get_device_properties().multi_processor_count
+    return _two_waves_rows._value
+
+
 def _get_compiled(K: int, CS: int, AR: int, UF: int, TB: int, next_n: int = 1, cr: int = 4):
     key = (K, CS, AR, UF, TB, next_n, cr)
     compiled = _LAUNCH_CACHE.get(key)
@@ -1888,7 +1903,8 @@ def tp_cluster_size(bs: int, npad: int) -> int:
         return 1
     cs = 1
     if bs < 128:
-        cs = _p2floor(296 // bs) if bs <= 296 else 1
+        two_waves = _two_waves_rows()  # 296 on B200 (2 x 148 SMs)
+        cs = _p2floor(two_waves // bs) if bs <= two_waves else 1
         capn = _p2floor(npad // 8192 if npad // 8192 > 0 else 1)
         if cs > capn:
             cs = capn

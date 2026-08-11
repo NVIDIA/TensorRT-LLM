@@ -7536,10 +7536,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # BSX tier fast path: fp32 / next_n >= 1 (MTP) /
             # cr in {1, 4} / npad <= 262144 decode rows route to the
             # direct/reg/tp CuTe DSL tiers; everything else (half-prec, LB,
-            # sort-indirect, oversize npad, hw cluster cap) falls through
-            # to the in-tree kernel below. Host-only guard — no device
-            # sync. The op signature and output contract are unchanged
-            # (unordered int32 indices, -1 pad only for degenerate rows).
+            # oversize npad, hw cluster cap) falls through to the in-tree
+            # kernel below. ``order_row`` (the LJF hint dsa.py computes for
+            # num_rows >= 2 * num_sms) is accepted and ignored: the bsx
+            # tiers launch per-row CTAs and do not consume the permutation.
+            # Host-only guard — no device sync. The op signature and output
+            # contract are unchanged (unordered int32 indices, -1 pad only
+            # for degenerate rows).
             if _is_bsx_supported(logits, pre_idx, seq_lens, output_indices,
                                  top_k, next_n, compress_ratio, order_row,
                                  counters):

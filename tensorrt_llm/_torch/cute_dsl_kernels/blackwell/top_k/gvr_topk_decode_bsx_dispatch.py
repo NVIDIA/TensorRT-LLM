@@ -25,10 +25,18 @@ NOT ported: it is unreachable inside the deployment envelope
 Dispatcher guard (anything else falls back to the in-tree
 ``GvrTopKKernel`` path in ``CuteDSLGvrTopKDecodeRunner.forward``):
   dtype == fp32, next_n >= 1 (MTP; num_rows divisible by next_n),
-  compress_ratio in {1, 4}, order_row is None, counters is None,
+  compress_ratio in {1, 4}, counters is None,
   K in {512, 1024, 2048}, npad <= 262144, npad % 64 == 0, contiguous
   16B-aligned tensors, and the routed tier's cluster size within the
   queried hardware max (never silently degrade the cluster shape).
+``order_row`` is accepted and IGNORED: it is the LJF scheduling hint the
+caller (``dsa.py``) computes for the in-tree persistent kernel whenever
+num_rows >= 2 * num_sms, and the bsx tiers launch per-row CTAs that the
+hardware schedules directly — the permutation affects neither their
+correctness nor their measured performance (the tier mesh was benched in
+natural row order). Rejecting it would silently turn bsx off for every
+large batch in production. ``counters`` (LB mode) still falls back: the
+LB partition contract belongs to the in-tree kernel.
 pre_idx / seq_lens are request-level ([num_rows // next_n, K] /
 [num_rows // next_n]) — the in-tree contract. Per-row degeneracy
 (N_eff <= K) and ragged N are handled INSIDE the tiers, so the guard
@@ -40,11 +48,18 @@ locals; :func:`_reset_env_cache` re-reads for tests):
   TRTLLM_BSX_TP_BS    unset/-1 -> baked per-npad bands; 0 -> disable (2^30);
                       else the bs threshold at which the tp tier takes over.
   TRTLLM_BSX_DENSE_BS same, for the dense (tb=1024) reg tiers.
+  TRTLLM_BSX_DISABLE  any value other than unset/""/"0" -> the guard
+                      rejects everything (kill switch: every call takes the
+                      in-tree kernel path).
+Malformed numeric values fail soft: a warning is logged once and the knob
+falls back to unset (-1) instead of raising on the decode path.
 """
 
 import os
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from .gvr_topk_decode_bsx_direct import DKCMAX, direct_topk
 from .gvr_topk_decode_bsx_reg import reg_topk
@@ -60,9 +75,29 @@ def _env_threshold(name):
     t = _ENV.get(name)
     if t is None:
         e = os.environ.get(name)
-        t = int(e) if e not in (None, "") else -1
+        if e is None or e.strip() == "":
+            t = -1
+        else:
+            try:
+                t = int(e.strip())
+            except ValueError:
+                # Tuning override with a safe baked default: fail soft
+                # (treat as unset) instead of killing the decode path.
+                logger.warning(
+                    f"{name}={e!r} is not an integer; ignoring the override "
+                    f"and using the baked default."
+                )
+                t = -1
         if t == 0:
             t = _BIG
+        _ENV[name] = t
+    return t
+
+
+def _env_flag(name):
+    t = _ENV.get(name)
+    if t is None:
+        t = os.environ.get(name, "").strip() not in ("", "0")
         _ENV[name] = t
     return t
 
@@ -241,11 +276,15 @@ def is_bsx_supported(
 ) -> bool:
     """Host-only guard for the bsx tiers (no device sync; see module
     docstring). Returns False -> caller uses the in-tree kernel."""
+    if _env_flag("TRTLLM_BSX_DISABLE"):
+        return False
     if logits.dtype != torch.float32:
         return False
     if next_n < 1 or compress_ratio not in (1, 4):
         return False
-    if order_row is not None or counters is not None:
+    # order_row is accepted and ignored (in-tree scheduling hint; see the
+    # module docstring). counters (LB mode) keeps the in-tree path.
+    if counters is not None:
         return False
     if top_k not in (512, 1024, 2048):
         return False

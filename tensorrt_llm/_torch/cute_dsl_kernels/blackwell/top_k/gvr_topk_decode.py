@@ -556,13 +556,22 @@ class GvrTopKKernel:
         # boundary-local ULP (e.g. fp16 1.0 vs 1.25 under a [0, 65504]
         # bracket); values straddling the kK boundary inside one fine bin
         # were previously picked in arrival order (observed as |miss|=1
-        # with |dv| ~ 3e-6 on real captures). The tail radix re-ranks on
-        # the full fp32 order key — candidate keys are ALWAYS fp32 (16-bit
-        # inputs are upcast injectively at collect), so the repair is exact
-        # for every supported dtype. Default ON for rank-scatter-exact
-        # kernels of all dtypes.
+        # with |dv| ~ 3e-6 on real fp32 captures). The tail radix re-ranks
+        # on the full fp32 order key — candidate keys are ALWAYS fp32
+        # (16-bit inputs are upcast injectively at collect), so the repair
+        # is exact for every supported dtype WHEN ENABLED. Default ON for
+        # fp32 only: on fp32 the gate fires rarely and the fix is ~free,
+        # but 16-bit quantization puts value plateaus at the boundary on
+        # virtually every input, so the gate fires constantly — measured
+        # B200 envelope cost (bf16, K512/K1024 x 16k-262k x BS 1-256,
+        # same-process paired) is gm 1.29-1.36x, worst 2.27x, while typical
+        # bf16 inputs (randn and quantized-tie, 48 paired runs) are already
+        # value-exact without it: 16-bit misses need an adversarially wide
+        # Phase-2 bracket (distinct 16-bit values inside one fine bin).
+        # 16-bit callers that need the guarantee opt in via the knob (see
+        # test_cute_dsl_gvr_topk_decode_p4_exact_tail_16bit).
         if p4_exact_tail is None:
-            p4_exact_tail = self.enable_p4_rank_scatter_exact
+            p4_exact_tail = self.enable_p4_rank_scatter_exact and dtype == cutlass.Float32
         self.p4_exact_tail = bool(p4_exact_tail) and self.enable_p4_rank_scatter_exact
         # [p4tt] p4_tail_fast: tiny-tie COLLECT+SELECT fast path inside the
         # exact-tail fire branch. When the (b*, sb*) tie class holds <= 128
