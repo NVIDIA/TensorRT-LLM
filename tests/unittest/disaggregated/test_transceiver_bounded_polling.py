@@ -255,7 +255,7 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
     session = _FakeSession(rid=16, wait_result=WaitResult.TIMEOUT)
     req = _FakeRequest()
     transceiver = _make_transceiver({16: session}, {16: req})
-    transceiver.kv_transfer_timeout_ms = None
+    transceiver.kv_transfer_timeout_ms = 60_000
     warning = Mock()
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.logger.warning",
@@ -278,7 +278,7 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
     assert warning.call_count == 2
     messages = [args[0] for args, _kwargs in warning.call_args_list]
     assert all("rid=16" in message for message in messages)
-    assert all("finite block-all fallback" in message for message in messages)
+    assert all("kv_transfer_timeout_ms=60000ms" in message for message in messages)
     assert all("keeping it in progress" in message for message in messages)
 
 

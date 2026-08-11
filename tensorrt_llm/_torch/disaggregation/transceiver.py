@@ -743,13 +743,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif result is None:
                 continue
             elif result == WaitResult.TIMEOUT:
-                deadline = (
-                    f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms"
-                    if self.kv_transfer_timeout_ms is not None
-                    else "the finite block-all fallback"
-                )
                 logger.warning(
-                    f"TxSession rid={session.disagg_request_id} exceeded {deadline}; "
+                    f"TxSession rid={session.disagg_request_id} exceeded "
+                    f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms; "
                     "keeping it in progress"
                 )
             else:

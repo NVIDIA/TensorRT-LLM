@@ -4230,7 +4230,9 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         description=
         "KV cache transfer timeout in milliseconds. Blocking sender waits use "
         "it as an absolute deadline; blocking receive task waits use it per "
-        "task. It is distinct from the sender future wait slice.")
+        "task. The Python V2 transceiver requires a finite value; None remains "
+        "available to other runtimes. It is distinct from the sender future "
+        "wait slice.")
 
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,

@@ -379,8 +379,8 @@ def test_timeout_budgets():
 # --------------------------------------------------------------------------- #
 # Model preference resolution
 # --------------------------------------------------------------------------- #
-def test_resolve_model_prefs_allows_registered_class_without_defaults_hook(monkeypatch):
-    model_cls = type("ModelWithoutDefaultsHook", (), {})
+def test_resolve_model_prefs_allows_registered_class_without_preference_hook(monkeypatch):
+    model_cls = type("ModelWithoutPreferenceHook", (), {})
     cache_cfg = types.SimpleNamespace(transceiver_runtime="CPP")
     calls = []
 
@@ -393,11 +393,19 @@ def test_resolve_model_prefs_allows_registered_class_without_defaults_hook(monke
     monkeypatch.setattr(
         rp,
         "load_internal_apis",
-        lambda: types.SimpleNamespace(resolve_kv_cache_manager_v2_auto=resolve_v2),
+        lambda: types.SimpleNamespace(
+            TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            resolve_kv_cache_manager_v2_auto=resolve_v2,
+        ),
     )
 
     use_v2 = rp.resolve_model_prefs(
-        "/models/example", {"use_kv_cache_manager_v2": "auto"}, cache_cfg
+        "/models/example",
+        {
+            "use_kv_cache_manager_v2": "auto",
+            "parallel": {"tp": 1, "pp": 1, "cp": 1},
+        },
+        cache_cfg,
     )
 
     assert use_v2 is False
@@ -1003,15 +1011,15 @@ class TestInternalApiContract:
     def test_serving_resolvers(self, api):
         import inspect
 
-        # The driver calls the serving resolver with a shim, model class, and
-        # pretrained config. Only the shim is required.
+        # The driver calls the serving resolver with real LLM args, the model
+        # class, and its pretrained config.
         v2 = inspect.signature(api.resolve_kv_cache_manager_v2_auto).parameters
         assert list(v2)[:3] == ["llm_args", "model_cls", "pretrained_config"]
         assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[1:])
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
 
-    def test_model_preference_resolver_shim_supports_v2(self, api, monkeypatch):
+    def test_model_preference_resolver_supports_v2(self, api, monkeypatch):
         class _PreferV2:
             @classmethod
             def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
@@ -1027,7 +1035,10 @@ class TestInternalApiContract:
 
         assert rp.resolve_model_prefs(
             "/tmp/dummy_model",
-            {"use_kv_cache_manager_v2": "auto"},
+            {
+                "use_kv_cache_manager_v2": "auto",
+                "parallel": {"tp": 1, "pp": 1, "cp": 1},
+            },
             cache_cfg,
         )
 

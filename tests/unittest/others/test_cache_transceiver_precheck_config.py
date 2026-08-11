@@ -309,13 +309,19 @@ def test_resolve_model_prefs_auto_requires_registered_model(monkeypatch):
         rp.resolve_model_prefs(None, {"use_kv_cache_manager_v2": "auto"}, cache_cfg)
 
 
-def test_resolve_model_prefs_auto_propagates_model_default_failure(monkeypatch):
+def test_resolve_model_prefs_auto_propagates_model_preference_failure(monkeypatch):
     class FailingModel:
         @classmethod
-        def get_model_defaults(cls, _llm_args):
+        def get_preferred_kv_cache_manager_version(cls, _pretrained_config):
             raise RuntimeError("model hook failed")
 
-    api = types.SimpleNamespace(TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs))
+    def resolve_v2(_shim, model_cls, pretrained_config):
+        return model_cls.get_preferred_kv_cache_manager_version(pretrained_config)
+
+    api = types.SimpleNamespace(
+        TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        resolve_kv_cache_manager_v2_auto=resolve_v2,
+    )
     monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
     monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (FailingModel, object()))
     cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
@@ -324,52 +330,53 @@ def test_resolve_model_prefs_auto_propagates_model_default_failure(monkeypatch):
         "parallel": {"tp": 2, "pp": 1, "cp": 1},
     }
 
-    with pytest.raises(RuntimeError, match="get_model_defaults failed.*refusing to assume V1"):
+    with pytest.raises(RuntimeError, match="V2 'auto' resolution failed.*refusing to assume V1"):
         rp.resolve_model_prefs("/model", side, cache_cfg)
 
 
-def test_resolve_model_prefs_passes_real_parallelism_to_model_defaults(monkeypatch):
+def test_resolve_model_prefs_passes_model_metadata_to_resolver(monkeypatch):
     captured = []
 
     class Model:
-        @classmethod
-        def get_model_defaults(cls, llm_args):
-            captured.append(llm_args)
-            return {"use_kv_cache_manager_v2": True}
+        pass
+
+    def resolve_v2(shim, model_cls, pretrained_config):
+        captured.append((shim, model_cls, pretrained_config))
+        return True
 
     api = types.SimpleNamespace(
         TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
-        resolve_kv_cache_manager_v2_auto=lambda _shim, defaults: defaults[
-            "use_kv_cache_manager_v2"
-        ],
+        MTPDecodingConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        resolve_kv_cache_manager_v2_auto=resolve_v2,
     )
+    hf_view = object()
     monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
-    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (Model, object()))
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (Model, hf_view))
     cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
     side = {
         "use_kv_cache_manager_v2": "auto",
         "parallel": {"tp": 4, "pp": 2, "cp": 3},
+        "num_nextn_predict_layers": 3,
     }
 
     assert rp.resolve_model_prefs("/model", side, cache_cfg)
-    assert len(captured) == 1
-    assert vars(captured[0]) == {
-        "model": "/model",
-        "tensor_parallel_size": 4,
-        "pipeline_parallel_size": 2,
-        "context_parallel_size": 3,
-        "kv_cache_config": {"use_kv_cache_manager_v2": "auto"},
-        "cache_transceiver_config": cache_cfg,
-    }
+    resolver_args, model_cls, pretrained_config = captured.pop()
+    assert resolver_args.model == "/model"
+    assert resolver_args.tensor_parallel_size == 4
+    assert resolver_args.pipeline_parallel_size == 2
+    assert resolver_args.context_parallel_size == 3
+    assert resolver_args.kv_cache_config == {"use_kv_cache_manager_v2": "auto"}
+    assert resolver_args.cache_transceiver_config is cache_cfg
+    assert resolver_args.speculative_config.num_nextn_predict_layers == 3
+    assert model_cls is Model
+    assert pretrained_config is hf_view
 
 
 def test_resolve_model_prefs_auto_propagates_resolver_failure(monkeypatch):
     class Model:
-        @classmethod
-        def get_model_defaults(cls, _llm_args):
-            return {"use_kv_cache_manager_v2": True}
+        pass
 
-    def fail_resolver(_shim, _defaults):
+    def fail_resolver(_shim, _model_cls, _pretrained_config):
         raise RuntimeError("resolver failed")
 
     api = types.SimpleNamespace(

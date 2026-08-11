@@ -395,16 +395,24 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     if setting == "auto":
         try:
-            # The REAL serving resolver, via the same shim pattern as the
-            # runtime resolution below -- one owner for the 'auto' semantics.
-            # cache_transceiver_config feeds the resolver's disagg gating
-            # (a V2 model preference requires the NIXL Python transceiver).
-            shim = types.SimpleNamespace(
-                kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto"),
-                cache_transceiver_config=cache_cfg,
-                speculative_config=None,
-            )
-            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, model_cls, hf_view))
+            parallel = side["parallel"]
+            llm_args_kwargs = {
+                "model": model_dir,
+                "tensor_parallel_size": parallel["tp"],
+                "pipeline_parallel_size": parallel["pp"],
+                "context_parallel_size": parallel["cp"],
+                "kv_cache_config": {"use_kv_cache_manager_v2": setting},
+                "cache_transceiver_config": cache_cfg,
+            }
+            num_nextn = int(side.get("num_nextn_predict_layers", 0) or 0)
+            if num_nextn > 0:
+                llm_args_kwargs["speculative_config"] = api.MTPDecodingConfig(
+                    num_nextn_predict_layers=num_nextn
+                )
+            resolver_args = api.TorchLlmArgs(**llm_args_kwargs)
+            # Use the real serving arguments so the resolver sees the same
+            # disaggregation, parallelism, and speculative-decoding inputs.
+            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(resolver_args, model_cls, hf_view))
         except Exception as e:  # noqa: BLE001 - resolver spans model extension hooks
             raise RuntimeError("V2 'auto' resolution failed; refusing to assume V1") from e
     else:

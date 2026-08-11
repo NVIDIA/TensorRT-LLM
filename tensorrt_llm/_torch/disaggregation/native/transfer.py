@@ -86,10 +86,9 @@ KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
 _FALLBACK_TX_WAIT_SLICE_S = 1.0
-# ``kv_transfer_timeout_ms=None`` disables request cancellation, but block-all
-# callers still need a finite ownership-proof deadline instead of waiting
-# forever on a wedged peer. Non-blocking serving polls do not consult this
-# deadline, so the fallback is intentionally local to TxSession.
+# Keep direct/standalone TxSession block-all waits finite when the caller omits
+# an overall deadline. KvCacheTransceiverV2 requires a configured transfer
+# timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
