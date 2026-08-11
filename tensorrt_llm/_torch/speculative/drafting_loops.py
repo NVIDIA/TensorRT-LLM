@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """
 This module contains capturable drafting loops for speculative decoding.
 
@@ -9,6 +11,7 @@ for speculation can be launched as a single CUDA graph.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Optional, final
 
@@ -59,8 +62,9 @@ class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
 
 @contextmanager
 def save_metadata_state(attn_metadata: AttentionMetadata,
-                        spec_metadata: SpecMetadata) -> None:
+                        spec_metadata: SpecMetadata) -> Iterator[None]:
     attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+    num_contexts = attn_metadata.num_contexts
     batch_size = attn_metadata.num_seqs
     # Do not use prepare_for_spec_dec for this special field.
     # TRTLLM attention uses views of this tensor internally and prepare_for_spec_dec
@@ -81,6 +85,7 @@ def save_metadata_state(attn_metadata: AttentionMetadata,
     try:
         yield
     finally:
+        attn_metadata.num_contexts = num_contexts
         attn_metadata.restore_from_spec_dec()
         attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens)
         attn_metadata.on_update()

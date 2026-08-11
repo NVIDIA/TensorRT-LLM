@@ -1032,6 +1032,7 @@ class SpecWorkerBase(nn.Module, ABC):
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
+        self._saved_num_contexts: Optional[int] = None
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
         self._d2t: Optional[torch.Tensor] = None
@@ -1089,7 +1090,14 @@ class SpecWorkerBase(nn.Module, ABC):
             logger.warning(
                 "Spec-dec worker forward failed between prepare_for_spec_dec "
                 "and restore_from_spec_dec; restoring attn metadata state.")
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
+            if self._saved_num_contexts is None:
+                # A partial prepare or a legacy direct metadata save has no
+                # worker-side context state. Cleanup must still restore tensor
+                # ownership without masking the original forward exception.
+                attn_metadata.restore_from_spec_dec()
+                attn_metadata.on_update()
+            else:
+                self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
     @property
     @abstractmethod
@@ -1198,18 +1206,39 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+    def _prepare_attn_metadata_for_spec_dec(self,
+                                            attn_metadata: AttentionMetadata,
+                                            *extra_fields: str) -> None:
         """
         Prepare attention metadata before speculative decoding draft token generation.
         Saves current state for later restoration.
-        """
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        Args:
+            attn_metadata: Attention metadata modified by the draft loop.
+            *extra_fields: Additional tensor fields to save and restore.
+        """
+        if self._saved_num_contexts is not None:
+            raise AssertionError(
+                "Speculative attention metadata already has a saved "
+                "num_contexts; prepare and restore calls must be paired.")
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda",
+                                           *extra_fields)
+        self._saved_num_contexts = attn_metadata.num_contexts
+
+    def _restore_attn_metadata_from_spec_dec(
+            self, attn_metadata: AttentionMetadata) -> None:
         """
         Restore attention metadata after speculative decoding draft token generation.
         """
-        attn_metadata.restore_from_spec_dec()
+        if self._saved_num_contexts is None:
+            raise AssertionError(
+                "Speculative attention metadata restore requires a paired "
+                "prepare.")
+        try:
+            attn_metadata.num_contexts = self._saved_num_contexts
+            attn_metadata.restore_from_spec_dec()
+        finally:
+            self._saved_num_contexts = None
         attn_metadata.on_update()
 
     def _ensure_force_accept_rng_state(self, device: torch.device) -> None:
