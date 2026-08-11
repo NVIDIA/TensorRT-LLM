@@ -1901,7 +1901,6 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1921,12 +1920,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     ) -> Optional[Literal["CPP", "PYTHON"]]:
         """Preferred KV-cache transceiver runtime.
 
-        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` / ``GlmMoeDsaForCausalLM``
-        (GLM 5.2) use MLA attention, which transfers a large latent KV that the Python
-        (v2) transceiver handles better in disaggregated serving. The Python transceiver
-        also supports GLM 5.2's per-layer masked DSA indexer k-cache pool (cross-layer
-        indexer sharing), so every checkpoint sharing this implementation prefers the
-        Python transceiver. Applied only when
+        ``DeepseekV3ForCausalLM`` and ``DeepseekV32ForCausalLM`` use MLA
+        attention, which transfers a large latent KV that the Python (v2)
+        transceiver handles better in disaggregated serving. Applied only when
         ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
         is always respected.
         """
@@ -2095,3 +2091,16 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                         layer.mlp.experts.fuse_shared_expert(
                             layer.mlp.shared_experts)
                         layer.mlp.shared_experts = None
+
+
+@register_auto_model("GlmMoeDsaForCausalLM")
+class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
+    """GLM 5.2 model flavor with an independent transceiver preference."""
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer Python for GLM 5.2's masked DSA indexer K-cache transfer."""
+        return "PYTHON"

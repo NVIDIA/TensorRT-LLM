@@ -4060,11 +4060,25 @@ class TestDeepseekRuntimePreferences:
     ])
     def test_preference_per_architecture(self, architectures: list[str],
                                          model_type: str) -> None:
-        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
-            DeepseekV3ForCausalLM
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
         cfg = self._pretrained_config(architectures, model_type)
-        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
-            cfg) == "PYTHON"
+        model_cls = get_registered_model_class(architectures[0])
+        assert model_cls is not None
+        assert model_cls.get_preferred_transceiver_runtime(cfg) == "PYTHON"
+
+    def test_glm_uses_independent_model_flavor(self) -> None:
+        """GLM can evolve independently from its DeepSeek implementation base."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+            DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM)
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        assert get_registered_model_class(
+            "DeepseekV3ForCausalLM") is DeepseekV3ForCausalLM
+        assert get_registered_model_class(
+            "GlmMoeDsaForCausalLM") is GlmMoeDsaForCausalLM
+        assert issubclass(GlmMoeDsaForCausalLM, DeepseekV3ForCausalLM)
 
     def test_prefers_python_without_config(self) -> None:
         """Preference is unconditional without a pretrained config."""
