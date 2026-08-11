@@ -276,7 +276,9 @@ def pulseScanSourceCode(llmRepo, ref) {
             "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
             "PULSE_SCAN_OVERRIDE=false"
         ]) {
-            sh 'pulse scan --no-fail --exclude-detectors PIP,SETUPTOOLS --sbom .'
+            trtllm_utils.llmRetry(3, "pulse scan source code", {
+                sh 'pulse scan --no-fail --exclude-detectors PIP,SETUPTOOLS --sbom .'
+            })
         }
     }
     container("cpu") {
@@ -329,10 +331,12 @@ def pulseScanContainer(llmRepo, ref) {
                 def outputDir = "scan_report/${key}"
                 sh "mkdir -p ${outputDir}"
                 echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
-                sh(
-                    script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
-                    label: "Scan ${entry.image}"
-                )
+                trtllm_utils.llmRetry(3, "pulse-cli scan ${entry.image}", {
+                    sh(
+                        script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
+                        label: "Scan ${entry.image}"
+                    )
+                })
             }
         }
     }
