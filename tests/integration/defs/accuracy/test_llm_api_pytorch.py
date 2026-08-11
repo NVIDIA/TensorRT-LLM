@@ -5229,7 +5229,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
                   max_batch_size=512,
-                  max_seq_len=GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN,
+                  max_seq_len=GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN + 128,
                   **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
 
