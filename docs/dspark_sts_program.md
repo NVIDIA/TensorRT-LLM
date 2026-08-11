@@ -873,6 +873,21 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - bring-up R1 尸检:非传输非代码——**gen DEP8 每 rank 85GB 权重装载撞 harness 1800s 健康等待超时**(ctx 健康、gen 差几分钟;DEP32 每 rank 21GB 所以旧 agentx 跑通)。wait_server 已抬 3600s。R2(poetry lbs64,ctx-spec-parity + 主线钉法 maxbs=lbs + 2× 超发)已在队。
 - **➡️ 请主线**:`iputterman/speed` 是私有 gated,我侧 401,贵区 dspark-runs 路径在本文件系统亦不可达。请把 throughput_1k 的 **前 1024 条抽取件**(file 序,turns[0],建议直接 trtllm_custom jsonl,~5MB)推到 `docs/dspark_bench_assets/`,负载 B 线即可开工——B 在 disagg 翻正与否是"混合步成本表 ctx 盲"机理的直接检验,是三负载矩阵里信息量最大的一格。
 
+## 【08-11 11:30】agg 独立复证判决(laliao 侧):frac04 机械裁在 Pro@DEP8 全线为负;Pro 翻案的承重臂只能是 scheduled
+
+修复后代码(b87ea28bf3 已 overlay)、maxbs=256+显式 max_seq_len、到达性验证干净(iter-log mode=64/128 满档)、双独立节点对 × n=5:
+
+| 负载 | 全局 bs | 对A frac04 vs notrim | 对B |
+|---|---|---|---|
+| poetry | 1024 | −5.0% | −2.6% |
+| poetry | 512 | −4.8% | −3.3% |
+| arena | 1024 | **−16.9%** | **−14.9%** |
+| arena | 512 | **−18.8%** | −15.6% |
+
+- 与主线不矛盾:frac04 转正(+5.3/+7.6%)是 **Flash DEP4** 的数据;Pro 终局从未报 frac04。本判决补上缺格:**Pro 上机械 40% 裁剪稳定亏钱**(accept 损失定价高),Pro 的收益只能靠"按请求该裁才裁"的 scheduled+修复后表。arena 亏得最狠(−15~19%)与 Flash 侧 arena≈0 的方向一致放大——多样负载对机械裁最不友好。
+- 复证下一步已在跑:我环境重采 postfix Pro 表(pin{2,3,4,5} × conc{512,1024,2048} poetry,--from-iter-log),然后 scheduled vs notrim 终局对表主线 +9.9~+24.7%。
+- disagg 进展:R2 死因=ctx 挂 spec 后 host OOM(tp4 单节点 4 rank 双份权重 staging 撑爆 host RAM;slurm oom_kill 实锤)——**ctx 已改 tp8×2 节点**(与 gen 同规格),R3 在队。坑登记:Pro 这个体量,disagg ctx 至少 tp8(或关 TRTLLM_PINNED_WEIGHT_STAGING 试 tp4,未验)。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
