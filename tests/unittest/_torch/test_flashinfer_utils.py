@@ -55,24 +55,34 @@ def test_is_pdl_enabled_hardware_gate(
     assert flashinfer_utils.is_pdl_enabled() is expected
 
 
-@pytest.mark.parametrize("sm_version", [-1, 89])
-def test_is_pdl_enabled_rejects_unsupported_explicit_enable(
+@pytest.mark.parametrize(
+    ("sm_version", "detected_device"),
+    [
+        (-1, "no CUDA GPU"),
+        (89, "SM89"),
+    ],
+)
+def test_is_pdl_enabled_warns_and_disables_unsupported_explicit_enable(
     monkeypatch: pytest.MonkeyPatch,
     sm_version: int,
+    detected_device: str,
 ) -> None:
     monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
     monkeypatch.setattr(flashinfer_utils, "get_sm_version", lambda: sm_version)
 
-    with mock.patch.object(flashinfer_utils.logger, "info") as log_info:
-        with pytest.raises(ValueError, match="TRTLLM_ENABLE_PDL=1 requires SM90 or newer") as error:
-            flashinfer_utils.is_pdl_enabled()
+    with (
+        mock.patch.object(flashinfer_utils.logger, "info") as log_info,
+        mock.patch.object(flashinfer_utils.logger, "warning") as log_warning,
+    ):
+        assert flashinfer_utils.is_pdl_enabled() is False
+        assert flashinfer_utils.is_pdl_enabled() is False
 
     log_info.assert_not_called()
-    message = str(error.value)
-    if sm_version < 0:
-        assert "no CUDA GPU" in message
-    else:
-        assert f"SM{sm_version}" in message
+    log_warning.assert_called_once()
+    message = log_warning.call_args.args[0]
+    assert "TRTLLM_ENABLE_PDL=1 requires SM90 or newer" in message
+    assert detected_device in message
+    assert "PDL will be disabled" in message
     assert "Unset TRTLLM_ENABLE_PDL" in message
     assert "set it to 0" in message
 
@@ -86,11 +96,15 @@ def test_is_pdl_enabled_explicit_disable_skips_hardware_probe(
     monkeypatch.setenv("TRTLLM_ENABLE_PDL", env_value)
     monkeypatch.setattr(flashinfer_utils, "get_sm_version", get_sm_version)
 
-    with mock.patch.object(flashinfer_utils.logger, "info") as log_info:
+    with (
+        mock.patch.object(flashinfer_utils.logger, "info") as log_info,
+        mock.patch.object(flashinfer_utils.logger, "warning") as log_warning,
+    ):
         assert flashinfer_utils.is_pdl_enabled() is False
 
     get_sm_version.assert_not_called()
     log_info.assert_not_called()
+    log_warning.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -110,8 +124,12 @@ def test_is_pdl_enabled_logs_once(
     monkeypatch.delenv("TRTLLM_ENABLE_PDL", raising=False)
     monkeypatch.setattr(flashinfer_utils, "get_sm_version", lambda: sm_version)
 
-    with mock.patch.object(flashinfer_utils.logger, "info") as log_info:
+    with (
+        mock.patch.object(flashinfer_utils.logger, "info") as log_info,
+        mock.patch.object(flashinfer_utils.logger, "warning") as log_warning,
+    ):
         assert flashinfer_utils.is_pdl_enabled() is expected
         assert flashinfer_utils.is_pdl_enabled() is expected
 
     log_info.assert_called_once_with(expected_log)
+    log_warning.assert_not_called()

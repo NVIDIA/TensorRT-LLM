@@ -151,36 +151,71 @@ class TestStandaloneImport:
                 get_device_properties.assert_not_called()
             _compat.get_sm_version.cache_clear()
 
+            def reset_pdl_log_state() -> None:
+                setattr(_compat.is_pdl_enabled, "_printed", False)
+
             os.environ.pop("TRTLLM_ENABLE_PDL", None)
-            for sm_version, expected in [(-1, False), (89, False), (90, True)]:
-                with mock.patch.object(_compat, "get_sm_version", return_value=sm_version):
+            for sm_version, expected, expected_log in [
+                (-1, False, "PDL disabled: no CUDA GPU is available"),
+                (89, False, "PDL disabled on SM89: requires SM90 or newer"),
+                (90, True, "PDL enabled"),
+            ]:
+                reset_pdl_log_state()
+                with (
+                    mock.patch.object(_compat, "get_sm_version", return_value=sm_version),
+                    mock.patch.object(_compat.ad_logger, "info") as log_info,
+                    mock.patch.object(_compat.ad_logger, "warning") as log_warning,
+                ):
                     assert _compat.is_pdl_enabled() is expected
+                    assert _compat.is_pdl_enabled() is expected
+                log_info.assert_called_once_with(expected_log)
+                log_warning.assert_not_called()
 
             os.environ["TRTLLM_ENABLE_PDL"] = "1"
-            with mock.patch.object(_compat, "get_sm_version", return_value=90):
+            reset_pdl_log_state()
+            with (
+                mock.patch.object(_compat, "get_sm_version", return_value=90),
+                mock.patch.object(_compat.ad_logger, "info") as log_info,
+                mock.patch.object(_compat.ad_logger, "warning") as log_warning,
+            ):
                 assert _compat.is_pdl_enabled() is True
+                assert _compat.is_pdl_enabled() is True
+            log_info.assert_called_once_with("PDL enabled")
+            log_warning.assert_not_called()
 
             for sm_version, detected_device in [(-1, "no CUDA GPU"), (89, "SM89")]:
-                with mock.patch.object(_compat, "get_sm_version", return_value=sm_version):
-                    try:
-                        _compat.is_pdl_enabled()
-                    except ValueError as error:
-                        message = str(error)
-                    else:
-                        raise AssertionError("explicit PDL enable should fail")
+                reset_pdl_log_state()
+                with (
+                    mock.patch.object(_compat, "get_sm_version", return_value=sm_version),
+                    mock.patch.object(_compat.ad_logger, "info") as log_info,
+                    mock.patch.object(_compat.ad_logger, "warning") as log_warning,
+                ):
+                    assert _compat.is_pdl_enabled() is False
+                    assert _compat.is_pdl_enabled() is False
+                log_info.assert_not_called()
+                log_warning.assert_called_once()
+                message = log_warning.call_args.args[0]
                 assert "TRTLLM_ENABLE_PDL=1 requires SM90 or newer" in message
                 assert detected_device in message
+                assert "PDL will be disabled" in message
                 assert "Unset TRTLLM_ENABLE_PDL" in message
                 assert "set it to 0" in message
 
             os.environ["TRTLLM_ENABLE_PDL"] = "0"
-            with mock.patch.object(
-                _compat,
-                "get_sm_version",
-                side_effect=AssertionError("unexpected hardware probe"),
-            ) as get_sm_version:
+            reset_pdl_log_state()
+            with (
+                mock.patch.object(
+                    _compat,
+                    "get_sm_version",
+                    side_effect=AssertionError("unexpected hardware probe"),
+                ) as get_sm_version,
+                mock.patch.object(_compat.ad_logger, "info") as log_info,
+                mock.patch.object(_compat.ad_logger, "warning") as log_warning,
+            ):
                 assert _compat.is_pdl_enabled() is False
                 get_sm_version.assert_not_called()
+            log_info.assert_not_called()
+            log_warning.assert_not_called()
 
             from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (
                 flashinfer_attention,

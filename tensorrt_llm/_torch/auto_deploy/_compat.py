@@ -233,6 +233,8 @@ if TRTLLM_AVAILABLE:
         str_dtype_to_torch,
     )
 else:
+    from .utils.logger import ad_logger
+
     # -- get_free_port --
     def get_free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -255,16 +257,24 @@ else:
             return False
 
         sm_version = get_sm_version()
-        if sm_version >= 90:
-            return True
-        if env_value == "1":
-            detected_device = "no CUDA GPU" if sm_version < 0 else f"SM{sm_version}"
-            raise ValueError(
-                "TRTLLM_ENABLE_PDL=1 requires SM90 or newer, "
-                f"but detected {detected_device}. Unset TRTLLM_ENABLE_PDL to use "
-                "the architecture-aware default, or set it to 0."
-            )
-        return False
+        enabled = sm_version >= 90
+        if not getattr(is_pdl_enabled, "_printed", False):
+            if enabled:
+                ad_logger.info("PDL enabled")
+            elif env_value == "1":
+                detected_device = "no CUDA GPU" if sm_version < 0 else f"SM{sm_version}"
+                ad_logger.warning(
+                    "TRTLLM_ENABLE_PDL=1 requires SM90 or newer, "
+                    f"but detected {detected_device}. PDL will be disabled. "
+                    "Unset TRTLLM_ENABLE_PDL to use the architecture-aware "
+                    "default, or set it to 0."
+                )
+            elif sm_version < 0:
+                ad_logger.info("PDL disabled: no CUDA GPU is available")
+            else:
+                ad_logger.info(f"PDL disabled on SM{sm_version}: requires SM90 or newer")
+            setattr(is_pdl_enabled, "_printed", True)
+        return enabled
 
     # -- is_sm_100f --
     @lru_cache(maxsize=1)

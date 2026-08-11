@@ -31,16 +31,16 @@ def is_pdl_enabled() -> bool:
 
     sm_version = get_sm_version()
     enabled = sm_version >= 90
-    if not enabled and env_value == "1":
-        detected_device = "no CUDA GPU" if sm_version < 0 else f"SM{sm_version}"
-        raise ValueError(
-            "TRTLLM_ENABLE_PDL=1 requires SM90 or newer, "
-            f"but detected {detected_device}. Unset TRTLLM_ENABLE_PDL to use "
-            "the architecture-aware default, or set it to 0.")
-
     if not getattr(is_pdl_enabled, "_printed", False):
         if enabled:
             logger.info("PDL enabled")
+        elif env_value == "1":
+            detected_device = "no CUDA GPU" if sm_version < 0 else f"SM{sm_version}"
+            logger.warning(
+                "TRTLLM_ENABLE_PDL=1 requires SM90 or newer, "
+                f"but detected {detected_device}. PDL will be disabled. "
+                "Unset TRTLLM_ENABLE_PDL to use the architecture-aware "
+                "default, or set it to 0.")
         elif sm_version < 0:
             logger.info("PDL disabled: no CUDA GPU is available")
         else:
