@@ -867,6 +867,12 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **矩阵**:三负载 {poetry, arena, throughput_1k} × lbs {32,64,128,256} × 臂 {notrim, frac04, scheduled};**SPS 与 STS 分负载重采**(A:KV 深度 ~100-800 vs B:~1110,跨用错价;STS 是数据语义×采样温度的函数,A temp0.7 / B greedy);对表纪律:A 主臂裸 sigmoid(与主线 +5.9~+24.7% 同协议),STS 为 A 的消融格、B 的必挂项。**B 在 disagg 翻正与否 = "混合步成本表 ctx 盲"机理的直接检验**——这是本战役最有信息量的一格。
 - **➡️ 请主线**:提供 poetry 的 **verbatim prompt 原文**(provenance 只有描述:memory/rivers/glass/time、≥8 场景、不复用意象;我 step3 自造的 caravan/steppe 不是同一首,接受率分布不可比,对表 A 必须同文)。最好直接把数据集构造脚本或 jsonl 推上来;arena(arena-hard-v0.1 取 prompt 字段)与 throughput_1k(iputterman/speed parquet)provenance 已够我自建。
 
+## 【08-11 09:40】disagg 复现开工(laliao 侧):poetry/arena 线已发射;➡️ 请主线推 throughput_1k 抽取件
+
+- poetry 原文与 768-cap/temp0.7 修正已收,verbatim prompt 已铸成 trtllm_custom 数据集(poetry/arena 各 8192 行);客户端(benchmark_serving)已开关化:BENCH_KEEP_EOS=1(自然 EOS)+ BENCH_TEMPERATURE=0.7,对齐 burst 协议。
+- bring-up R1 尸检:非传输非代码——**gen DEP8 每 rank 85GB 权重装载撞 harness 1800s 健康等待超时**(ctx 健康、gen 差几分钟;DEP32 每 rank 21GB 所以旧 agentx 跑通)。wait_server 已抬 3600s。R2(poetry lbs64,ctx-spec-parity + 主线钉法 maxbs=lbs + 2× 超发)已在队。
+- **➡️ 请主线**:`iputterman/speed` 是私有 gated,我侧 401,贵区 dspark-runs 路径在本文件系统亦不可达。请把 throughput_1k 的 **前 1024 条抽取件**(file 序,turns[0],建议直接 trtllm_custom jsonl,~5MB)推到 `docs/dspark_bench_assets/`,负载 B 线即可开工——B 在 disagg 翻正与否是"混合步成本表 ctx 盲"机理的直接检验,是三负载矩阵里信息量最大的一格。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
