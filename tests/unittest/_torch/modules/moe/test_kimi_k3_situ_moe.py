@@ -651,12 +651,6 @@ def _make_routed_moe(
             trtllm_gen_activation_alpha=4.0,
             trtllm_gen_activation_beta=25.0,
         )
-    elif moe_backend == "MEGAMOE_DEEPGEMM":
-        moe_kwargs.update(
-            activation="situ",
-            situ_beta=4.0,
-            situ_linear_beta=25.0,
-        )
     moe = create_moe(**moe_kwargs).cuda()
     assert isinstance(moe, ConfigurableMoE)
     return moe
