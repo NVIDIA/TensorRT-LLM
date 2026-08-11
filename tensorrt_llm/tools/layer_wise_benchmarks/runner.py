@@ -791,9 +791,31 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
+        # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
+        # request a second time, to capacity + 1; without the extra token the last block
+        # rounds down and the resize fails.
+        #
+        # POOL_SPLIT_HEADROOM is empirical. A scalar max_tokens is divided across the
+        # manager's pools, and this workload does not look like the typical serving step
+        # the solver sizes them for -- it registers max_batch_size requests all at context
+        # length. Measured on DeepSeek-V4 (which reports num_pools=3): without headroom
+        # registration runs out at request 90 of 128; at 3x it completes. The factor is
+        # not derived, and a model whose pool layout differs may need a different one.
+        POOL_SPLIT_HEADROOM = 3
         kv_cache_config = KvCacheConfig(
-            max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
+            max_tokens=POOL_SPLIT_HEADROOM
+            * max_batch_size
+            * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
+            # Every dummy request below is registered at full max_seq_len and then
+            # actually written by the prefill pass, so on a sliding-window pool the
+            # benchmark needs the blocks its writes land on to exist. Without scratch
+            # reuse the solver sizes those pools for a typical serving step -- one
+            # context request plus max_batch_size-1 generation requests -- which this
+            # workload is not: it prefills every request before decoding any. On
+            # DeepSeek-V4, where params.py gives every layer a sliding-window pool,
+            # that shortfall is what makes create_kv_cache_manager fail.
+            enable_swa_scratch_reuse=True,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
@@ -896,9 +918,31 @@ class Runner:
             )
         else:
             raise NotImplementedError("Unsupported config")
-        kv_cache_manager.add_dummy_requests(
-            list(range(max_batch_size)), token_nums=[max_seq_len] * max_batch_size
-        )
+        # is_gen because the replay measures a decode step, so the requests have to be in
+        # generation state with their history behind them. materialize_history because the
+        # benchmark then writes that history itself in the prefill pass below -- without it
+        # the sliding-window pools keep only the last window_size blocks and the prefill
+        # writes land on block-table entries that were never assigned.
+        #
+        # Checked rather than discarded: on failure add_dummy_requests returns None AFTER
+        # release_resources() has freed every request registered so far, so the next lookup
+        # fails as "Request ID not found in IndexMapper" from deep inside
+        # compute_sliding_block_tables -- pointing nowhere near the cause. NVBug 6567554 was
+        # filed on that symptom.
+        if (
+            kv_cache_manager.add_dummy_requests(
+                list(range(max_batch_size)),
+                token_nums=[max_seq_len] * max_batch_size,
+                is_gen=True,
+                materialize_history=True,
+            )
+            is None
+        ):
+            raise RuntimeError(
+                f"add_dummy_requests could not allocate KV cache for {max_batch_size} "
+                f"dummy requests of {max_seq_len} tokens. Raise KvCacheConfig.max_tokens "
+                f"above {kv_cache_config.max_tokens}, or lower max_batch_size / max_seq_len."
+            )
         return kv_cache_manager
 
     @staticmethod
