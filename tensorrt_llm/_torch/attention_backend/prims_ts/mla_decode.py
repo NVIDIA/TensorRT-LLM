@@ -15,9 +15,9 @@
 
 """Task-scheduled paged MLA decode with a plan/run lifecycle."""
 
-import functools
 from collections.abc import Callable
 from dataclasses import dataclass
+import functools
 from typing import Any, Literal, Optional, cast
 
 import torch
@@ -28,6 +28,7 @@ from ._tensor_aliasing import (
     _validate_tensor_does_not_overlap_inputs,
 )
 from .decode import (
+    _WorkspaceSection,
     _align_up,
     _append_workspace_section,
     _dtype_key,
@@ -40,8 +41,8 @@ from .decode import (
     _validate_scale,
     _validate_workspace_buffer,
     _workspace_section_view,
-    _WorkspaceSection,
 )
+
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _MLA_LATENT_DIM = 512
@@ -99,7 +100,9 @@ def _make_mla_workspace_layout(
     num_heads: int,
     max_seq_len_q: int = 1,
 ) -> _MLAWorkspaceLayout:
-    kernel_workspace, byte_end = _append_workspace_section(0, (kernel_workspace_bytes,), torch.int8)
+    kernel_workspace, byte_end = _append_workspace_section(
+        0, (kernel_workspace_bytes,), torch.int8
+    )
     lse, byte_end = _append_workspace_section(
         byte_end, (batch_size, max_seq_len_q, num_heads), torch.float32
     )
@@ -115,7 +118,9 @@ def _bind_mla_workspace(
 ) -> _MLAWorkspaceViews:
     kernel_workspace = None
     if layout.kernel_workspace.byte_size > 0:
-        kernel_workspace = _workspace_section_view(workspace_buffer, layout.kernel_workspace)
+        kernel_workspace = _workspace_section_view(
+            workspace_buffer, layout.kernel_workspace
+        )
     return _MLAWorkspaceViews(
         kernel_workspace=kernel_workspace,
         lse=_workspace_section_view(workspace_buffer, layout.lse),
@@ -209,7 +214,8 @@ def _validate_mla_dtype_pair(
         )
     if output_dtype not in _SUPPORTED_OUTPUT_DTYPES:
         raise NotImplementedError(
-            f"attention-ts MLA decode currently supports BF16 output only; got {output_dtype}"
+            "attention-ts MLA decode currently supports BF16 output only; "
+            f"got {output_dtype}"
         )
 
 
@@ -298,7 +304,9 @@ def _derive_max_seq_len_q(
         raise ValueError("qo_indptr must contain batch_size + 1 offsets")
     if offsets[0] != 0:
         raise ValueError("qo_indptr must start at 0")
-    q_lengths = tuple(end - start for start, end in zip(offsets[:-1], offsets[1:], strict=True))
+    q_lengths = tuple(
+        end - start for start, end in zip(offsets[:-1], offsets[1:], strict=True)
+    )
     if any(length <= 0 for length in q_lengths):
         raise ValueError("qo_indptr must be strictly increasing")
     return max(q_lengths), offsets[-1], q_lengths
@@ -312,13 +320,21 @@ def _resolve_max_seq_len_q_alias(
 ) -> Optional[int]:
     """Resolve the legacy fixed-Q name and the explicit static-bound name."""
 
-    legacy_bound = _validate_positive_int(seq_len_q, "seq_len_q") if seq_len_q is not None else None
+    legacy_bound = (
+        _validate_positive_int(seq_len_q, "seq_len_q")
+        if seq_len_q is not None
+        else None
+    )
     explicit_bound = (
         _validate_positive_int(max_seq_len_q, "max_seq_len_q")
         if max_seq_len_q is not None
         else None
     )
-    if legacy_bound is not None and explicit_bound is not None and legacy_bound != explicit_bound:
+    if (
+        legacy_bound is not None
+        and explicit_bound is not None
+        and legacy_bound != explicit_bound
+    ):
         raise ValueError(
             "seq_len_q and max_seq_len_q must agree when both are provided: "
             f"got {legacy_bound} and {explicit_bound}"
@@ -349,13 +365,19 @@ def _validate_query(
     if any(int(extent) <= 0 for extent in query.shape[:-1]):
         raise ValueError("query row and head extents must be positive")
     if query.shape[-1] != _MLA_QUERY_DIM:
-        raise ValueError(f"query last dimension must be {_MLA_QUERY_DIM}, got {query.shape[-1]}")
+        raise ValueError(
+            f"query last dimension must be {_MLA_QUERY_DIM}, got {query.shape[-1]}"
+        )
     if query.dtype not in _SUPPORTED_INPUT_DTYPES:
-        raise NotImplementedError(f"unsupported attention-ts MLA query dtype {query.dtype}")
+        raise NotImplementedError(
+            f"unsupported attention-ts MLA query dtype {query.dtype}"
+        )
     if query.device.type != "cuda":
         raise ValueError("query must be a CUDA tensor")
     if device is not None and query.device != device:
-        raise ValueError(f"query must be on the planned device {device}, got {query.device}")
+        raise ValueError(
+            f"query must be on the planned device {device}, got {query.device}"
+        )
     if not packed_query and batch_size is not None and query.shape[0] != batch_size:
         raise ValueError(
             f"query batch size must match the plan ({batch_size}), got {query.shape[0]}"
@@ -363,7 +385,8 @@ def _validate_query(
     head_axis = 1 if packed_query else 2
     if num_heads is not None and query.shape[head_axis] != num_heads:
         raise ValueError(
-            f"query head count must match the plan ({num_heads}), got {query.shape[head_axis]}"
+            "query head count must match the plan "
+            f"({num_heads}), got {query.shape[head_axis]}"
         )
     if max_seq_len_q is not None:
         if packed_query:
@@ -388,7 +411,9 @@ def _validate_query(
                 total_q=int(query.shape[0]) if packed_query else None,
             )
     if q_dtype is not None and query.dtype != q_dtype:
-        raise ValueError(f"query dtype must match the plan ({q_dtype}), got {query.dtype}")
+        raise ValueError(
+            f"query dtype must match the plan ({q_dtype}), got {query.dtype}"
+        )
     if not query.is_contiguous():
         layout = "[total_q, H, 576]" if packed_query else "[B, SQ, H, 576]"
         raise ValueError(f"query must be compact in {layout} layout")
@@ -404,7 +429,9 @@ def _normalize_mla_kv_cache(
         raise TypeError("kv_cache must be a torch.Tensor")
     if kv_cache.ndim == 4:
         if kv_cache.shape[1] != 1:
-            raise ValueError("rank-4 kv_cache must have shape [num_pages, 1, page_size, 576]")
+            raise ValueError(
+                "rank-4 kv_cache must have shape [num_pages, 1, page_size, 576]"
+            )
         if not kv_cache.is_contiguous():
             raise ValueError("rank-4 kv_cache must be compact")
         normalized = kv_cache[:, 0]
@@ -414,18 +441,21 @@ def _normalize_mla_kv_cache(
         normalized = kv_cache
     else:
         raise ValueError(
-            "kv_cache must have shape [num_pages, page_size, 576] or [num_pages, 1, page_size, 576]"
+            "kv_cache must have shape [num_pages, page_size, 576] or "
+            "[num_pages, 1, page_size, 576]"
         )
     if normalized.device != expected_device:
         raise ValueError(
-            f"kv_cache must be on the planned device {expected_device}, got {normalized.device}"
+            f"kv_cache must be on the planned device {expected_device}, "
+            f"got {normalized.device}"
         )
     if normalized.shape[0] <= 0 or normalized.shape[1] <= 0:
         raise ValueError("kv_cache page count and page size must be positive")
     _validate_mla_int32_extent(int(normalized.shape[0]), "kv_cache physical pages")
     if normalized.shape[2] != _MLA_QUERY_DIM:
         raise ValueError(
-            f"kv_cache last dimension must be {_MLA_QUERY_DIM}, got {normalized.shape[2]}"
+            f"kv_cache last dimension must be {_MLA_QUERY_DIM}, "
+            f"got {normalized.shape[2]}"
         )
     _validate_16byte_alignment(normalized, "kv_cache")
     return normalized, int(normalized.shape[0]), int(normalized.shape[1])
@@ -452,7 +482,9 @@ def _validate_out(
     else:
         expected_shape = (batch_size, max_seq_len_q, num_heads, _MLA_LATENT_DIM)
     if out.shape != expected_shape:
-        raise ValueError(f"out must have shape {expected_shape}, got {tuple(out.shape)}")
+        raise ValueError(
+            f"out must have shape {expected_shape}, got {tuple(out.shape)}"
+        )
     if out.dtype != output_dtype:
         raise ValueError(f"out must have dtype {output_dtype}, got {out.dtype}")
     if out.device != device:
@@ -521,8 +553,14 @@ def _resolve_mla_decode_launch_spec(
     import cutlass.utils as cutlass_utils
     from cuda.bindings import driver as cuda_drv
 
-    from .kernels.mla_decode.kernel_policy import resolve_mla_kernel_policy, select_mla_ts_kernel
-    from .kernels.mla_decode.throughput_2cta.config import compute_split_kv, compute_workspace_size
+    from .kernels.mla_decode.kernel_policy import (
+        resolve_mla_kernel_policy,
+        select_mla_ts_kernel,
+    )
+    from .kernels.mla_decode.throughput_2cta.config import (
+        compute_split_kv,
+        compute_workspace_size,
+    )
     from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
     from .kernels.mla_decode.throughput_latency_1cta.config import (
         GroupsTokensHeadsLaunchShape,
@@ -532,7 +570,9 @@ def _resolve_mla_decode_launch_spec(
         resolve_runtime_cluster_reduction_mode,
         wave_fill_split_kv,
     )
-    from .kernels.mla_decode.throughput_latency_1cta.kernel import ThroughputLatencyMlaDecodeTs
+    from .kernels.mla_decode.throughput_latency_1cta.kernel import (
+        ThroughputLatencyMlaDecodeTs,
+    )
 
     if q_dtype_key != kv_dtype_key:
         raise ValueError("the cached TS MLA compiler requires one QKV dtype")
@@ -553,12 +593,20 @@ def _resolve_mla_decode_launch_spec(
     output_dtype = dtype_map[output_dtype_name]
 
     with torch.cuda.device(device_index):
-        plan_stream = cuda_drv.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
+        plan_stream = cuda_drv.CUstream(
+            torch.cuda.current_stream(device_index).cuda_stream
+        )
         hardware_info = cutlass_utils.HardwareInfo(device_index)
-        max_active_one_cta_clusters = hardware_info.get_max_active_clusters(1, plan_stream)
-        max_active_two_cta_clusters = hardware_info.get_max_active_clusters(2, plan_stream)
+        max_active_one_cta_clusters = hardware_info.get_max_active_clusters(
+            1, plan_stream
+        )
+        max_active_two_cta_clusters = hardware_info.get_max_active_clusters(
+            2, plan_stream
+        )
 
-        two_cta_launch_shape = GroupsTokensHeadsLaunchShape.for_tile(num_heads, seq_len_q, 128)
+        two_cta_launch_shape = GroupsTokensHeadsLaunchShape.for_tile(
+            num_heads, seq_len_q, 128
+        )
         two_cta_split_kv = compute_split_kv(
             batch_size=batch_size,
             seq_len_q=two_cta_launch_shape.seq_len_q,
@@ -584,7 +632,8 @@ def _resolve_mla_decode_launch_spec(
         family_probe_is_extended_fp8_swaps = False
         one_cta_work = None
         use_established_family_probe = (
-            num_heads * seq_len_q > 64 and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
+            num_heads * seq_len_q > 64
+            and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
         )
         if use_established_family_probe:
             family_probe_launch_shape = one_cta_launch_shape
@@ -627,7 +676,9 @@ def _resolve_mla_decode_launch_spec(
                     dtype=qkv_dtype_name,
                     out_dtype=output_dtype_name,
                     throughput_latency_profile=None,
-                    throughput_latency_tile_size_q=(family_probe_launch_shape.tile_size_q),
+                    throughput_latency_tile_size_q=(
+                        family_probe_launch_shape.tile_size_q
+                    ),
                     max_active_clusters=max_active_one_cta_clusters,
                     throughput_latency_split_kv=family_probe_split_kv,
                     throughput_latency_persistent=None,
@@ -714,8 +765,12 @@ def _resolve_mla_decode_launch_spec(
             num_heads,
             seq_len_q,
             one_cta_work=one_cta_work,
-            one_cta_capacity=(max_active_one_cta_clusters if one_cta_work is not None else None),
-            two_cta_cluster_work=(two_cta_cluster_work if one_cta_work is not None else None),
+            one_cta_capacity=(
+                max_active_one_cta_clusters if one_cta_work is not None else None
+            ),
+            two_cta_cluster_work=(
+                two_cta_cluster_work if one_cta_work is not None else None
+            ),
             two_cta_cluster_capacity=(
                 max_active_two_cta_clusters if one_cta_work is not None else None
             ),
@@ -1227,7 +1282,8 @@ def _prepare_mla_runtime(
         )
     if normalized_cache.dtype != kv_dtype:
         raise ValueError(
-            f"kv_cache dtype must match the launch ({kv_dtype}), got {normalized_cache.dtype}"
+            f"kv_cache dtype must match the launch ({kv_dtype}), "
+            f"got {normalized_cache.dtype}"
         )
     effective_bmm1_scale = _validate_scale(bmm1_scale, "bmm1_scale")
     effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
@@ -1299,7 +1355,9 @@ def _launch_mla_decode(
         q_rope = runtime.query[..., kv_lora_rank:].permute(1, 2, 0)
         out_kernel = runtime.out.permute(1, 2, 0)
         total_q = int(runtime.query.shape[0])
-        lse_kernel = workspace.lse.view(-1, workspace.lse.shape[-1])[:total_q].transpose(0, 1)
+        lse_kernel = workspace.lse.view(-1, workspace.lse.shape[-1])[
+            :total_q
+        ].transpose(0, 1)
     else:
         q_latent = runtime.query[..., :kv_lora_rank].permute(2, 3, 1, 0)
         q_rope = runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
@@ -1378,10 +1436,16 @@ def prims_ts_batch_decode_with_kv_cache_mla(
 
     packed_query = qo_indptr is not None
     _validate_query(query, packed_query=packed_query)
-    metadata_device, batch_size, max_num_pages = _validate_mla_metadata(block_tables, seq_lens)
+    metadata_device, batch_size, max_num_pages = _validate_mla_metadata(
+        block_tables, seq_lens
+    )
     if metadata_device != query.device:
-        raise ValueError(f"MLA metadata must be on {query.device}, got {metadata_device}")
-    normalized_cache, _, page_size = _normalize_mla_kv_cache(kv_cache, expected_device=query.device)
+        raise ValueError(
+            f"MLA metadata must be on {query.device}, got {metadata_device}"
+        )
+    normalized_cache, _, page_size = _normalize_mla_kv_cache(
+        kv_cache, expected_device=query.device
+    )
     if packed_query:
         _validate_qo_indptr(
             qo_indptr,
@@ -1389,7 +1453,9 @@ def prims_ts_batch_decode_with_kv_cache_mla(
             batch_size=batch_size,
         )
         if max_seq_len_q is None:
-            raise ValueError("max_seq_len_q is required when qo_indptr selects packed query")
+            raise ValueError(
+                "max_seq_len_q is required when qo_indptr selects packed query"
+            )
         max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")
         num_heads = int(query.shape[1])
     else:
@@ -1474,7 +1540,9 @@ def prims_ts_batch_decode_with_kv_cache_mla(
             qo_indptr=qo_indptr,
             workspace_buffer=workspace_buffer,
         )
-    compiled, policy, kernel_workspace_bytes = _get_compiled_mla_decode(*spec_key, packed_query)
+    compiled, policy, kernel_workspace_bytes = _get_compiled_mla_decode(
+        *spec_key, packed_query
+    )
     if kernel_workspace_bytes != spec.kernel_workspace_bytes or policy != spec.policy:
         raise RuntimeError("MLA workspace policy changed during compilation")
     workspace = _bind_mla_workspace(workspace_buffer, layout)
@@ -1540,7 +1608,9 @@ class BatchMLADecodePagedTSWrapper:
         num_heads = _validate_positive_int(num_heads, "num_heads")
         _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
         page_size = _validate_page_size(page_size)
-        device, batch_size, max_num_pages = _validate_mla_metadata(block_tables, seq_lens)
+        device, batch_size, max_num_pages = _validate_mla_metadata(
+            block_tables, seq_lens
+        )
         device_index = _validate_runtime_device(device)
         packed_query = qo_indptr is not None
         planned_total_q = None
@@ -1685,7 +1755,10 @@ class BatchMLADecodePagedTSWrapper:
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
-        if self._planned_total_q is not None and int(query.shape[0]) != self._planned_total_q:
+        if (
+            self._planned_total_q is not None
+            and int(query.shape[0]) != self._planned_total_q
+        ):
             raise ValueError(
                 "packed query rows must match the final planned qo_indptr "
                 f"offset ({self._planned_total_q}), got {query.shape[0]}"
@@ -1751,8 +1824,12 @@ def batch_decode_mla_with_paged_kv_cache(
     _validate_query(query, packed_query=packed_query)
     metadata_device, batch_size, _ = _validate_mla_metadata(block_tables, seq_lens)
     if metadata_device != query.device:
-        raise ValueError(f"MLA metadata must be on {query.device}, got {metadata_device}")
-    normalized_cache, _, page_size = _normalize_mla_kv_cache(kv_cache, expected_device=query.device)
+        raise ValueError(
+            f"MLA metadata must be on {query.device}, got {metadata_device}"
+        )
+    normalized_cache, _, page_size = _normalize_mla_kv_cache(
+        kv_cache, expected_device=query.device
+    )
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     _validate_page_size(page_size)
     _validate_mla_dtype_pair(query.dtype, normalized_cache.dtype, out_dtype)

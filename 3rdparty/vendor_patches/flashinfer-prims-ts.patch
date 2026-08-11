@@ -1,0 +1,178 @@
+diff --git a/_api.py b/_api.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..59238dbc477df3b8068a9e56559ad1c531be5aee
+--- /dev/null
++++ b/_api.py
+@@ -0,0 +1,51 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) 2026 by FlashInfer team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Local compatibility for FlashInfer's optional API instrumentation."""
++
++from collections.abc import Callable
++from typing import TypeVar, overload
++
++_CallableT = TypeVar("_CallableT", bound=Callable[..., object])
++
++
++@overload
++def flashinfer_api(func: _CallableT, *, trace: object | None = None) -> _CallableT: ...
++
++
++@overload
++def flashinfer_api(
++    func: None = None, *, trace: object | None = None
++) -> Callable[[_CallableT], _CallableT]: ...
++
++
++def flashinfer_api(
++    func: _CallableT | None = None, *, trace: object | None = None
++) -> _CallableT | Callable[[_CallableT], _CallableT]:
++    """Preserve the upstream decorator ABI without FlashInfer instrumentation.
++
++    TensorRT-LLM does not vendor FlashInfer's API logging and trace-template
++    framework. Returning the original callable preserves the zero-overhead
++    behavior used by FlashInfer when instrumentation is disabled.
++    """
++
++    del trace
++    if func is not None:
++        return func
++
++    def decorator(wrapped: _CallableT) -> _CallableT:
++        return wrapped
++
++    return decorator
+diff --git a/context.py b/context.py
+index 85ff8ff4ba943254455ed1cdf809e0c5aa568a51..ca3b4e2df9f3fd3774d538487a0887de2854249e 100644
+--- a/context.py
++++ b/context.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -38,8 +39,7 @@ from typing import TYPE_CHECKING, Literal, Optional
+ 
+ import torch
+ 
+-from flashinfer.api_logging import flashinfer_api
+-
++from ._api import flashinfer_api
+ from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
+ 
+ 
+diff --git a/decode.py b/decode.py
+index a39364d26860462b316271f8ed6e8cb3083d9dee..3a3d54f0aebb2b3578711c9d225714745791e9dd 100644
+--- a/decode.py
++++ b/decode.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -24,13 +25,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
+ 
+ import torch
+ 
+-from flashinfer.api_logging import flashinfer_api
+-from flashinfer.trace.templates.attention import (
+-    attention_ts_decode_trace_dispatch,
+-    prims_ts_decode_trace_dispatch,
+-    prims_ts_decode_wrapper_trace_dispatch,
+-)
+-
++from ._api import flashinfer_api
+ from ._tensor_aliasing import (
+     _validate_out_does_not_overlap_inputs,
+     _validate_tensor_does_not_overlap_inputs,
+@@ -1771,7 +1766,7 @@ def _launch_decode(
+     return runtime.out
+ 
+ 
+-@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
++@flashinfer_api
+ def prims_ts_batch_decode_with_kv_cache(
+     query: torch.Tensor,
+     kv_cache: PagedKVCache,
+@@ -2216,7 +2211,7 @@ class BatchDecodePagedTSWrapper:
+         self._policy = policy
+         self._planned = True
+ 
+-    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         q: torch.Tensor,
+@@ -2290,7 +2285,7 @@ class BatchDecodePagedTSWrapper:
+         )
+ 
+ 
+-@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
++@flashinfer_api
+ def batch_decode_with_paged_kv_cache(
+     q: torch.Tensor,
+     paged_kv_cache: PagedKVCache,
+diff --git a/mla_decode.py b/mla_decode.py
+index 38ed8fbd9e0499150588b9f90babe3d890d14a9f..4969316707df2af7e5d4ce2f76fccc6962151ca1 100644
+--- a/mla_decode.py
++++ b/mla_decode.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -21,13 +22,7 @@ from typing import Any, Literal, Optional, cast
+ 
+ import torch
+ 
+-from flashinfer.api_logging import flashinfer_api
+-from flashinfer.trace.templates.attention import (
+-    prims_ts_decode_mla_one_shot_trace_dispatch,
+-    prims_ts_decode_mla_trace_dispatch,
+-    prims_ts_decode_mla_wrapper_trace_dispatch,
+-)
+-
++from ._api import flashinfer_api
+ from ._tensor_aliasing import (
+     _validate_out_does_not_overlap_inputs,
+     _validate_tensor_does_not_overlap_inputs,
+@@ -1390,7 +1385,7 @@ def _launch_mla_decode(
+     return runtime.out
+ 
+ 
+-@flashinfer_api(trace=prims_ts_decode_mla_trace_dispatch)
++@flashinfer_api
+ def prims_ts_batch_decode_with_kv_cache_mla(
+     query: torch.Tensor,
+     kv_cache: torch.Tensor,
+@@ -1746,7 +1741,7 @@ class BatchMLADecodePagedTSWrapper:
+         self._split_kv = int(dict(policy)["split_kv"])
+         self._planned = True
+ 
+-    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
++    @flashinfer_api
+     def run(
+         self,
+         query: torch.Tensor,
+@@ -1805,7 +1800,7 @@ class BatchMLADecodePagedTSWrapper:
+         )
+ 
+ 
+-@flashinfer_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
++@flashinfer_api
+ def batch_decode_mla_with_paged_kv_cache(
+     query: torch.Tensor,
+     kv_cache: torch.Tensor,

@@ -30,17 +30,18 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
 position.
 """
 
+from dataclasses import dataclass
 import functools
 import math
 import numbers
 import struct
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
 from ._api import flashinfer_api
 from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
+
 
 if TYPE_CHECKING:
     from .kernels.fmha_context.fmha_resources import FmhaConfig
@@ -153,7 +154,8 @@ def _validate_compact(tensor: torch.Tensor, name: str, layout: str) -> None:
     expected = _compact_strides(tuple(tensor.shape))
     if tensor.stride() != expected:
         raise ValueError(
-            f"{name} must have compact {layout} strides {expected}, but has {tensor.stride()}"
+            f"{name} must have compact {layout} strides {expected}, "
+            f"but has {tensor.stride()}"
         )
 
 
@@ -214,7 +216,9 @@ def _validate_mask(mask_type: str) -> None:
     if not isinstance(mask_type, str):
         raise TypeError("mask_type must be a string")
     if mask_type not in ("dense", "causal"):
-        raise ValueError(f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}")
+        raise ValueError(
+            f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}"
+        )
 
 
 def _validate_window_left(window_left: int, mask_type: str) -> int:
@@ -243,7 +247,9 @@ def _validate_scale(value: object, name: str) -> float:
     try:
         as_float32 = struct.unpack("=f", struct.pack("=f", as_float))[0]
     except (OverflowError, struct.error) as error:
-        raise ValueError(f"{name} must be representable as a positive float32") from error
+        raise ValueError(
+            f"{name} must be representable as a positive float32"
+        ) from error
     if not math.isfinite(as_float32) or as_float32 <= 0.0:
         raise ValueError(f"{name} must be representable as a positive float32")
     return as_float32
@@ -313,7 +319,9 @@ def _read_indptr(
             f"the final {name} offset must equal the packed tensor extent; "
             f"expected {expected_total}, got {values[-1]}"
         )
-    lengths = tuple(curr - prev for prev, curr in zip(values[:-1], values[1:], strict=True))
+    lengths = tuple(
+        curr - prev for prev, curr in zip(values[:-1], values[1:], strict=True)
+    )
     if any(length <= 0 for length in lengths):
         raise ValueError(f"{name} offsets must be strictly increasing")
     return values, lengths
@@ -328,7 +336,9 @@ def _read_int32_values(
     """Copy one plan-time metadata vector after validating its extent."""
 
     if tensor.numel() != expected_count:
-        raise ValueError(f"{name} must contain {expected_count} elements, got {tensor.numel()}")
+        raise ValueError(
+            f"{name} must contain {expected_count} elements, got {tensor.numel()}"
+        )
     return tuple(int(value) for value in tensor.tolist())
 
 
@@ -379,7 +389,8 @@ def _validate_base_tensors(
         _validate_alignment(tensor, name, 16)
     if k.device != q.device or v.device != q.device:
         raise ValueError(
-            f"Q, K, and V must be on one CUDA device; got {q.device}, {k.device}, and {v.device}"
+            "Q, K, and V must be on one CUDA device; "
+            f"got {q.device}, {k.device}, and {v.device}"
         )
     _validate_qkv_dtype(q, k, v)
     if tuple(v.shape) != tuple(k.shape):
@@ -402,11 +413,13 @@ def _validate_head_geometry(num_qo_heads: int, num_kv_heads: int) -> int:
 def _validate_head_dim(q_head_dim: int, kv_head_dim: int) -> int:
     if q_head_dim != kv_head_dim:
         raise ValueError(
-            f"Q and K/V head dimensions must match; got Q {q_head_dim} and K/V {kv_head_dim}"
+            "Q and K/V head dimensions must match; "
+            f"got Q {q_head_dim} and K/V {kv_head_dim}"
         )
     if q_head_dim not in _SUPPORTED_HEAD_DIMS:
         raise NotImplementedError(
-            f"attention-ts context supports head_dim in {_SUPPORTED_HEAD_DIMS}; got {q_head_dim}"
+            "attention-ts context supports head_dim in "
+            f"{_SUPPORTED_HEAD_DIMS}; got {q_head_dim}"
         )
     return q_head_dim
 
@@ -421,7 +434,8 @@ def _derive_has_q_offset(
     if mask_type != "causal":
         return False
     return any(
-        k_length != q_length for q_length, k_length in zip(q_lengths, k_lengths, strict=True)
+        k_length != q_length
+        for q_length, k_length in zip(q_lengths, k_lengths, strict=True)
     )
 
 
@@ -452,7 +466,9 @@ def _paged_context_uses_clc_scheduler(
 ) -> bool:
     """Return whether a persistent paged plan needs the dynamic CLC queue."""
 
-    return is_persistent and (not single_qkv_instance or (is_causal and not uniform_packed_lengths))
+    return is_persistent and (
+        not single_qkv_instance or (is_causal and not uniform_packed_lengths)
+    )
 
 
 def _contiguous_context_uses_clc_scheduler(
@@ -630,7 +646,9 @@ def _resolve_geometry(
         batch_size, max_seq_len_q, num_qo_heads, q_head_dim = map(int, q.shape)
         k_batch, max_seq_len_k, num_kv_heads, kv_head_dim = map(int, k.shape)
         if batch_size != k_batch:
-            raise ValueError(f"q and k batch dimensions must match; got {batch_size} and {k_batch}")
+            raise ValueError(
+                f"q and k batch dimensions must match; got {batch_size} and {k_batch}"
+            )
         _validate_extent(batch_size, "batch_size")
         _validate_extent(max_seq_len_q, "seq_len_q")
         _validate_extent(max_seq_len_k, "seq_len_k")
@@ -649,7 +667,9 @@ def _resolve_geometry(
     _validate_head_dim(q_head_dim, kv_head_dim)
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
     if mask_type == "causal":
-        for batch_idx, (q_length, k_length) in enumerate(zip(q_lengths, k_lengths, strict=True)):
+        for batch_idx, (q_length, k_length) in enumerate(
+            zip(q_lengths, k_lengths, strict=True)
+        ):
             if q_length > k_length:
                 raise ValueError(
                     "bottom-right causal context requires Sq <= Sk for each "
@@ -732,7 +752,8 @@ def _resolve_paged_geometry(
 
     if q.ndim != 3:
         raise ValueError(
-            f"paged context Q must use packed [total_q, Hq, D] storage; got rank {q.ndim}"
+            "paged context Q must use packed [total_q, Hq, D] storage; "
+            f"got rank {q.ndim}"
         )
     if k_cache.ndim != 4:
         raise ValueError(
@@ -740,12 +761,15 @@ def _resolve_paged_geometry(
             f"storage; got rank {k_cache.ndim}"
         )
     total_q, num_qo_heads, q_head_dim = map(int, q.shape)
-    num_physical_pages, num_kv_heads, cache_page_size, kv_head_dim = map(int, k_cache.shape)
+    num_physical_pages, num_kv_heads, cache_page_size, kv_head_dim = map(
+        int, k_cache.shape
+    )
     _validate_padded_data_extent(total_q, "total_q")
     _validate_extent(num_physical_pages, "num_physical_pages")
     if cache_page_size != page_size:
         raise ValueError(
-            f"K/V cache page extent must equal page_size={page_size}; got {cache_page_size}"
+            f"K/V cache page extent must equal page_size={page_size}; "
+            f"got {cache_page_size}"
         )
     _validate_head_dim(q_head_dim, kv_head_dim)
     _validate_compact(q, "q", "[total_q, Hq, D]")
@@ -820,7 +844,9 @@ def _resolve_paged_geometry(
 
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
     if mask_type == "causal":
-        for batch_idx, (q_length, k_length) in enumerate(zip(q_lengths, k_lengths, strict=True)):
+        for batch_idx, (q_length, k_length) in enumerate(
+            zip(q_lengths, k_lengths, strict=True)
+        ):
             if q_length > k_length:
                 raise ValueError(
                     "bottom-right causal context requires Sq <= Sk for each "
@@ -968,8 +994,8 @@ def _get_compiled_context(
 
     import cutlass
     import cutlass.cute as cute
-    import cutlass.utils as utils
     from cuda.bindings import driver as cuda_drv
+    import cutlass.utils as utils
 
     from .kernels.fmha_context.fmha_kernel import FmhaTs
 
@@ -1212,8 +1238,8 @@ def _get_compiled_paged_context(
 
     import cutlass
     import cutlass.cute as cute
-    import cutlass.utils as utils
     from cuda.bindings import driver as cuda_drv
+    import cutlass.utils as utils
 
     from .kernels.fmha_context.fmha_kernel import FmhaTs
 
@@ -1479,7 +1505,9 @@ def _validate_paged_runtime_inputs(
     if tuple(q.shape) != geometry.q_shape:
         raise ValueError(f"q must have shape {geometry.q_shape}, got {tuple(q.shape)}")
     if tuple(k_cache.shape) != geometry.kv_shape:
-        raise ValueError(f"k_cache must have shape {geometry.kv_shape}, got {tuple(k_cache.shape)}")
+        raise ValueError(
+            f"k_cache must have shape {geometry.kv_shape}, got {tuple(k_cache.shape)}"
+        )
     _validate_compact(q, "q", "[total_q, Hq, D]")
     _validate_compact(k_cache, "k_cache", "[num_pages, Hkv, page_size, D]")
     _validate_compact(v_cache, "v_cache", "[num_pages, Hkv, page_size, D]")
@@ -1495,7 +1523,9 @@ def _prepare_out(
         return torch.empty(tuple(q.shape), dtype=output_dtype, device=q.device)
     _validate_tensor(out, "out")
     if tuple(out.shape) != tuple(q.shape):
-        raise ValueError(f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}")
+        raise ValueError(
+            f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}"
+        )
     if out.dtype != output_dtype:
         raise ValueError(f"out must have dtype {output_dtype}, got {out.dtype}")
     if out.device != q.device:
@@ -1578,7 +1608,9 @@ class BatchPrefillTSWrapper:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
         output_scale = _validate_scale(output_scale, "output_scale")
-        scale_softmax_log2 = _validate_scale(sm_scale * math.log2(math.e), "sm_scale * log2(e)")
+        scale_softmax_log2 = _validate_scale(
+            sm_scale * math.log2(math.e), "sm_scale * log2(e)"
+        )
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
@@ -1592,8 +1624,12 @@ class BatchPrefillTSWrapper:
         else:
             # Uniform TVM-FFI signature; fixed specializations compile these
             # arguments away but still keep stable runtime placeholders.
-            planned_qo_indptr = torch.empty(1, dtype=torch.int32, device=geometry.device)
-            planned_kv_indptr = torch.empty(1, dtype=torch.int32, device=geometry.device)
+            planned_qo_indptr = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_kv_indptr = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
         # Keep all runtime tensor allocation ahead of CUTLASS JIT. Besides
         # making plan publication atomic, this lets compute-sanitizer patch the
         # generated attention kernel without interleaving later PyTorch setup
@@ -1732,7 +1768,9 @@ class BatchPrefillPagedTSWrapper:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
         output_scale = _validate_scale(output_scale, "output_scale")
-        scale_softmax_log2 = _validate_scale(sm_scale * math.log2(math.e), "sm_scale * log2(e)")
+        scale_softmax_log2 = _validate_scale(
+            sm_scale * math.log2(math.e), "sm_scale * log2(e)"
+        )
         compiled, policy = _get_compiled_paged_context(*_paged_semantic_key(geometry))
 
         scale_tensor = torch.tensor(
@@ -1744,7 +1782,9 @@ class BatchPrefillPagedTSWrapper:
         logical_kv_indptr = torch.tensor(
             metadata.kv_indptr, dtype=torch.int32, device=geometry.device
         )
-        seq_lens_kv = torch.tensor(metadata.seq_lens, dtype=torch.int32, device=geometry.device)
+        seq_lens_kv = torch.tensor(
+            metadata.seq_lens, dtype=torch.int32, device=geometry.device
+        )
         dense_page_idx_kv = torch.tensor(
             metadata.dense_page_indices,
             dtype=torch.int32,

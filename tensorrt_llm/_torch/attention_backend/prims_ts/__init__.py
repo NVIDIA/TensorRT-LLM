@@ -1,4 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,17 +14,17 @@
 
 """Experimental task-scheduled attention entry points."""
 
-from .context import (
-    BatchPrefillPagedTSWrapper,
-    BatchPrefillTSWrapper,
-    batch_prefill,
-    batch_prefill_with_paged_kv_cache,
-)
 from .decode import (
     BatchDecodePagedTSWrapper,
     batch_decode_with_paged_kv_cache,
     get_prims_ts_batch_decode_workspace_size,
     prims_ts_batch_decode_with_kv_cache,
+)
+from .context import (
+    BatchPrefillPagedTSWrapper,
+    BatchPrefillTSWrapper,
+    batch_prefill,
+    batch_prefill_with_paged_kv_cache,
 )
 from .mla_decode import (
     BatchMLADecodePagedTSWrapper,

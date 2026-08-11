@@ -276,10 +276,14 @@ The FMHA package is split by role:
   unquantized FP16/BF16 HND paged full attention and BF16 MLA generation;
   cyclic/sliding-window caches, speculative decoding, and MLA context fall
   through to the next library.
-  The Python sources under `prims_ts/kernels` are copied byte-for-byte from
+  The complete `prims_ts` Python source tree is managed as the
+  `flashinfer-prims-ts` vendor. Its lock selects
   [FlashInfer PR #4357](https://github.com/flashinfer-ai/flashinfer/pull/4357) at
-  commit `74790b32b55f6c45a4fee78007b4d2b2109497e3` and retain FlashInfer's headers;
-  its README files are not vendored.
+  commit `74790b32b55f6c45a4fee78007b4d2b2109497e3`, excludes the upstream README
+  files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
+  files retain FlashInfer's headers. Do not edit this tree outside the
+  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md); use the
+  vendoring tool to refresh the patch or record a temporary divergence.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
