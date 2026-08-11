@@ -54,6 +54,7 @@ jobs:
             const MERGEABILITY_RETRY_DELAY_MS = 2000;
             const WRITE_RETRY_DELAY_MS = 2000;
             const EXEMPT_LABEL = 'no-stale';
+            const BOT_LOGIN = 'github-actions[bot]';
             const DAY_IN_MS = 24 * 60 * 60 * 1000;
             const dryRun =
               context.eventName === 'workflow_dispatch' &&
@@ -230,6 +231,76 @@ jobs:
               }
             }
 
+            async function createCommentWithRetry(
+              description,
+              pullRequestNumber,
+              body,
+              action
+            ) {
+              const marker =
+                `<!-- stale-pr-cleanup:${context.runId}:` +
+                `${pullRequestNumber}:${action} -->`;
+              const markedBody = `${body}\n\n${marker}`;
+
+              for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pullRequestNumber,
+                    body: markedBody,
+                  });
+                  return true;
+                } catch (error) {
+                  await wait(WRITE_RETRY_DELAY_MS);
+                  let comments;
+                  try {
+                    comments = await github.paginate(
+                      github.rest.issues.listComments,
+                      {
+                        owner,
+                        repo,
+                        issue_number: pullRequestNumber,
+                        per_page: 100,
+                      }
+                    );
+                  } catch (reconcileError) {
+                    core.warning(
+                      `${description} failed and could not be reconciled: ` +
+                        `${reconcileError.message}. Continuing with the next ` +
+                        'pull request without retrying the comment.'
+                    );
+                    return false;
+                  }
+
+                  const persisted = comments.some(
+                    (comment) =>
+                      comment.user?.login === BOT_LOGIN &&
+                      comment.body?.includes(marker)
+                  );
+                  if (persisted) {
+                    console.log(
+                      `${description} returned an error, but the comment was ` +
+                        'found during reconciliation.'
+                    );
+                    return true;
+                  }
+                  if (attempt === MAX_WRITE_ATTEMPTS) {
+                    core.warning(
+                      `${description} failed after ${MAX_WRITE_ATTEMPTS} attempts: ` +
+                        `${error.message}. Continuing with the next pull request.`
+                    );
+                    return false;
+                  }
+                  core.warning(
+                    `${description} failed: ${error.message}; ` +
+                      `retrying (${attempt}/${MAX_WRITE_ATTEMPTS}).`
+                  );
+                }
+              }
+              return false;
+            }
+
             let actionCount = 0;
             let closeCount = 0;
             let exemptCount = 0;
@@ -360,13 +431,11 @@ jobs:
                   }
                   actionCount += 1;
                   closeCount += 1;
-                  await tryWrite(`Commenting on ${pullRequest.url}`, () =>
-                    github.rest.issues.createComment({
-                      owner,
-                      repo,
-                      issue_number: pullRequest.number,
-                      body,
-                    })
+                  await createCommentWithRetry(
+                    `Commenting on ${pullRequest.url}`,
+                    pullRequest.number,
+                    body,
+                    'close'
                   );
                 } else {
                   actionCount += 1;
@@ -395,15 +464,11 @@ jobs:
                     `${pullRequest.url} (${idleDays.toFixed(1)} idle days, ${status}).`
                 );
                 if (!dryRun) {
-                  const commented = await tryWrite(
+                  const commented = await createCommentWithRetry(
                     `Commenting on ${pullRequest.url}`,
-                    () =>
-                      github.rest.issues.createComment({
-                        owner,
-                        repo,
-                        issue_number: pullRequest.number,
-                        body,
-                      })
+                    pullRequest.number,
+                    body,
+                    'ping'
                   );
                   if (!commented) {
                     skipCount += 1;

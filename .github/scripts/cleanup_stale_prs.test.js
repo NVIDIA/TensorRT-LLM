@@ -76,6 +76,7 @@ async function run({
   dryRun = false,
   closeFailures = 0,
   commentFailures = {},
+  ambiguousCommentFailures = {},
   stateFailures = {},
   requireCompleteListingBeforeWrites = false,
   eventLog = [],
@@ -84,6 +85,7 @@ async function run({
   const events = eventLog;
   const warnings = [];
   const summaries = [];
+  const persistedComments = [];
   const states = new Map(
     Object.entries(pullRequests).map(([number, value]) => [
       Number(number),
@@ -101,6 +103,12 @@ async function run({
       count,
     ])
   );
+  const remainingAmbiguousCommentFailures = new Map(
+    Object.entries(ambiguousCommentFailures).map(([number, count]) => [
+      Number(number),
+      count,
+    ])
+  );
   const remainingStateFailures = new Map(
     Object.entries(stateFailures).map(([number, count]) => [
       Number(number),
@@ -109,6 +117,13 @@ async function run({
   );
 
   const github = {
+    paginate: async (operation, { issue_number }) => {
+      assert.equal(operation, github.rest.issues.listComments);
+      events.push(`list-comments:${issue_number}`);
+      return persistedComments
+        .filter((comment) => comment.issue_number === issue_number)
+        .map(({ body, user }) => ({ body, user }));
+    },
     graphql: async (query, variables) => {
       if (query.includes('pullRequests(')) {
         const pageIndex = variables.cursor === null ? 0 : Number(variables.cursor);
@@ -163,12 +178,32 @@ async function run({
             assert.equal(listedPages, pages.length);
           }
           events.push(`comment:${issue_number}:${body}`);
+          const ambiguousFailures =
+            remainingAmbiguousCommentFailures.get(issue_number) || 0;
+          if (ambiguousFailures > 0) {
+            remainingAmbiguousCommentFailures.set(
+              issue_number,
+              ambiguousFailures - 1
+            );
+            persistedComments.push({
+              issue_number,
+              body,
+              user: { login: 'github-actions[bot]' },
+            });
+            throw new Error('simulated lost comment response');
+          }
           const failures = remainingCommentFailures.get(issue_number) || 0;
           if (failures > 0) {
             remainingCommentFailures.set(issue_number, failures - 1);
             throw new Error('simulated comment failure');
           }
+          persistedComments.push({
+            issue_number,
+            body,
+            user: { login: 'github-actions[bot]' },
+          });
         },
+        listComments: async () => {},
       },
       pulls: {
         update: async ({ pull_number }) => {
@@ -217,14 +252,18 @@ async function run({
 
   await execute(
     github,
-    { eventName: dryRun ? 'workflow_dispatch' : 'schedule', repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' } },
+    {
+      eventName: dryRun ? 'workflow_dispatch' : 'schedule',
+      repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' },
+      runId: 123456,
+    },
     core,
     quietConsole,
     { env: { DRY_RUN: String(dryRun) } },
     immediateTimeout,
     fakeDate
   );
-  return { events, reads, summaries, warnings };
+  return { events, persistedComments, reads, summaries, warnings };
 }
 
 async function main() {
@@ -437,6 +476,26 @@ async function main() {
     assert.equal(summaryCounts(summaries).Pinged, '1');
     assert.equal(summaryCounts(summaries).Skipped, '1');
     assert(warnings.some((warning) => warning.includes('simulated state read failure')));
+  }
+
+  {
+    const pr = pullRequest(96);
+    const { events, persistedComments, summaries } = await run({
+      pullRequests: { 96: pr },
+      ambiguousCommentFailures: { 96: 1 },
+    });
+    assert.equal(
+      events.filter((event) => event.startsWith('comment:96:')).length,
+      1
+    );
+    assert(events.includes('list-comments:96'));
+    assert.equal(persistedComments.length, 1);
+    assert(
+      persistedComments[0].body.includes(
+        '<!-- stale-pr-cleanup:123456:96:ping -->'
+      )
+    );
+    assert.equal(summaryCounts(summaries).Pinged, '1');
   }
 
   console.log('cleanup_stale_prs tests passed');
