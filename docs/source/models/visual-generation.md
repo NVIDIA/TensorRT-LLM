@@ -107,7 +107,7 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/images/generations` | POST | Synchronous image generation |
 | `/v1/images/edits` | POST | Image editing |
 | `/v1/videos` | POST | Asynchronous video generation |
-| `/v1/videos/generations` | POST | Synchronous video generation |
+| `/v1/videos/sync` | POST | Synchronous video generation |
 | `/v1/videos/{id}` | GET | Video status / metadata |
 | `/v1/videos/{id}/content` | GET | Download generated video |
 | `/v1/videos/{id}` | DELETE | Delete generated video |

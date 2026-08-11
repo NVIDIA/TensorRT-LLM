@@ -146,7 +146,7 @@ python sync_video_gen.py --mode ti2v \
 - `--size` - Video resolution in WxH format (default: 256x256)
 - `--output` - Output video file path (default: output_sync.mp4)
 
-**API Endpoint:** `POST /v1/videos/generations`
+**API Endpoint:** `POST /v1/videos/sync`
 
 **API Details:**
 - T2V uses JSON `Content-Type: application/json`
@@ -275,7 +275,7 @@ You can customize these by:
 - `seed`: Random seed; `null` / omitted means the engine draws a fresh seed
 - `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls (override pipeline defaults when sent)
 - `extra_params`: model-specific overflow as a JSON object (see "Model-Specific `extra_params`" below). Unknown keys are rejected by the executor.
-- `response_format`: `"b64_json"` or `"url"`
+- `response_format`: `"url"` (default; HTTP URL to `/content`), `"b64_json"` (inline base64), or `"path"` (server-side on-disk path, for co-located clients)
 - `format`: Generation content encoding. Image encoders: `"png"`, `"webp"`, `"jpeg"`. Tensor formats: `"safetensors"`, `"pt"`.
 - Accept-and-warn OpenAI-shape fields (no engine semantic): `model`, `quality`, `style`, `user`. Sending `quality`/`style` logs a server-side WARNING; sending `model` warns on mismatch. None of these change generation behavior.
 
@@ -289,7 +289,7 @@ You can customize these by:
 - `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
   - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
 - `extra_params`: model-specific overflow (see below)
-- `response_format`: `"b64_json"` or `"url"`
+- `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
 
 #### Tensor-format consumer contract
@@ -396,14 +396,14 @@ curl -X DELETE "http://localhost:8000/v1/videos/{video_id}"
 | Endpoint | Method | Mode | Content-Type | Purpose |
 |----------|--------|------|--------------|---------|
 | `/v1/videos` | POST | Async | JSON or Multipart | Create video job (T2V/TI2V) |
-| `/v1/videos/generations` | POST | Sync | JSON or Multipart | Generate video sync (T2V/TI2V) |
+| `/v1/videos/sync` | POST | Sync | JSON or Multipart | Generate video sync (T2V/TI2V) |
 | `/v1/videos/{id}` | GET | - | - | Get video status/metadata |
 | `/v1/videos/{id}/content` | GET | - | - | Download video file |
 | `/v1/videos/{id}` | DELETE | - | - | Delete video |
 | `/v1/videos` | GET | - | - | List all videos |
 | `/v1/images/generations` | POST | - | JSON | Generate images (T2I) |
 
-**Note:** Both `/v1/videos` (async) and `/v1/videos/generations` (sync) support:
+**Note:** Both `/v1/videos` (async) and `/v1/videos/sync` (sync) support:
 - **JSON**: Standard text-to-video (T2V)
 - **Multipart/Form-Data**: Text+image-to-video (TI2V) with file upload
 
