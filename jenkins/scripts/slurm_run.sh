@@ -81,6 +81,7 @@ if [[ "${TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT:-0}" == "1" ]]; then
             echo "Waiting for VisualGen multi-node install markers in $install_done_dir (${marker_count}/${expected_nodes})"
             sleep 10
         done
+        # Rank0 must reach pytest without these: the test keys on them to tell a launching parent from a launched rank.
         pytestCommand="env -u SLURM_PROCID -u SLURM_NTASKS -u SLURM_LOCALID -u SLURM_NODEID -u SLURM_GTIDS ${pytestCommand}"
     else
         echo "Rank${SLURM_PROCID} finished setup; rank0 will run the VisualGen SLURM parent pytest"
