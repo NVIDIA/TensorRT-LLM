@@ -371,18 +371,20 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
-- `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
-  vendored PrimTS kernels. Before changing the managed source under
-  `attention_backend/prims_ts`, read the
-  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
-  upstream-worthy changes in FlashInfer and update the vendor lock; keep only
-  TRT-LLM-specific adaptations in the persistent patch.
-- `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
-  MLA FMHA library.
-  The Python sources under `prims_ts/kernels` are copied byte-for-byte from
+- `fmha/prims_ts.py` adapts TRT-LLM QKV preprocessing and paged-cache metadata
+  to the vendored PrimTS kernels. PrimTS is imported lazily and requires
+  CUTLASS DSL 4.7 or newer on SM100/SM103. The initial adapter admits
+  unquantized FP16/BF16 HND paged full attention and BF16 MLA generation;
+  cyclic/sliding-window caches, speculative decoding, and MLA context fall
+  through to the next library.
+  The complete `prims_ts` Python source tree is managed as the
+  `flashinfer-prims-ts` vendor. Its lock selects
   [FlashInfer PR #4357](https://github.com/flashinfer-ai/flashinfer/pull/4357) at
-  commit `74790b32b55f6c45a4fee78007b4d2b2109497e3` and retain FlashInfer's headers;
-  its README files are not vendored.
+  commit `74790b32b55f6c45a4fee78007b4d2b2109497e3`, excludes the upstream README
+  files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
+  files retain FlashInfer's headers. Do not edit this tree outside the
+  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md); use the
+  vendoring tool to refresh the patch or record a temporary divergence.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA

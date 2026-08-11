@@ -1,4 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +15,7 @@
 """Shared split-KV reduction-mode policy for FMHA and MLA decode."""
 
 from collections.abc import Iterable
+
 
 DIRECT_MODES = frozenset({"direct", "disabled"})
 SEPARATE_MODES = frozenset({"gmem_separate", "gmem_reduction_with_separate_kernel"})
@@ -87,6 +87,8 @@ def select_split_kv_modes(
         # shape values out of this ordering avoids a second, narrower support
         # matrix that can disagree with those authoritative checks.
         use_cluster = topology == "1cta"
-        mode_order = ("cluster_smem", "gmem_separate") if use_cluster else ("gmem_separate",)
+        mode_order = (
+            ("cluster_smem", "gmem_separate") if use_cluster else ("gmem_separate",)
+        )
 
     return tuple(modes_by_name[mode] for mode in mode_order if mode in modes_by_name)
