@@ -87,7 +87,7 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceStrategy
 from ..model_config import ModelConfig
-from ..modules.fused_moe import ConfigurableMoE, create_moe
+from ..modules.fused_moe import ConfigurableMoE, TRTLLMGenFusedMoE, create_moe
 from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from ..modules.linear import Linear as TrtllmLinear
@@ -813,7 +813,7 @@ class KimiK3MoERuntime(nn.Module):
             not _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
             and not _K3_DISABLE_FUSED_LATENT_DOWN_MXFP8
             and routed_comm is None
-            and hasattr(self.routed_experts.backend, "op_backend")
+            and isinstance(self.routed_experts.backend, TRTLLMGenFusedMoE)
         )
 
         # Shared experts stay replicated (DeepSeek's attention-DP
