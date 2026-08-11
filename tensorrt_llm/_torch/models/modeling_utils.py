@@ -21,8 +21,8 @@ from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...logger import logger
 from ...models.modeling_utils import QuantConfig
+from ...observability.logging import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig

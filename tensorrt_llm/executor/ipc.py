@@ -12,7 +12,7 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,

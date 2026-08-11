@@ -43,8 +43,8 @@ from tensorrt_llm._torch.utils import (
     EventType,
     Fp4QuantizedTensor,
 )
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.observability.logging import logger
 
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler

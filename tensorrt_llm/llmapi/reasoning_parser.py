@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Optional, Type
 
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 
 
 @dataclass

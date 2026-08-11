@@ -22,14 +22,18 @@ Two phases, in this order, both driven from ``tensorrt_llm/__init__.py``:
 2. :func:`_init` -- custom-op library loading and MPI initialization.  It runs
    after the package's own imports have completed.
 
+:func:`_pin_shadowed_reexports` sits between the two: it runs once the
+re-exports are bound and protects those of them that a same-named submodule
+would otherwise overwrite.
+
 Module scope here is deliberately limited to the standard library.  ``__init__``
 imports this module ahead of ``import torch``, so anything imported at module
 scope would be pulled in before phase 1 has run -- including ``torch`` itself,
 which is exactly what phase 1 exists to prepare for.  Phase 2's imports are
 therefore inside :func:`_init`; by the time it is called ``torch``,
-``tensorrt_llm.bindings``, ``tensorrt_llm._utils`` and ``tensorrt_llm.logger``
-are already in ``sys.modules``, so this defers the *statement* and not the first
-import of any module.
+``tensorrt_llm.bindings``, ``tensorrt_llm._utils`` and
+``tensorrt_llm.observability.logging`` are already in ``sys.modules``, so this
+defers the *statement* and not the first import of any module.
 """
 
 import os
@@ -38,6 +42,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import ModuleType
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
@@ -117,6 +122,39 @@ def _prepare_environment() -> None:
     _setup_vendored_triton_kernels()
 
 
+#: Re-exports in ``__init__`` that share their name with a module at the package
+#: root.  Only ``logger`` does today: the ``Logger`` singleton and the
+#: deprecated ``logger.py`` shim.
+_SHADOWED_REEXPORTS = frozenset({"logger"})
+
+
+class _PinnedReexportPackage(ModuleType):
+    """Package type that keeps a re-export from being replaced by a submodule.
+
+    The two compete for one attribute slot on the package, and the import
+    machinery writes the submodule into it *after* the module body has run.
+    Refusing that write keeps ``from tensorrt_llm import logger`` handing out
+    the singleton rather than a module, whichever path is imported first.
+    Only module objects are refused, so assigning a test double still works and
+    the submodule stays reachable through ``sys.modules`` and ``from ...
+    import ...``.
+    """
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in _SHADOWED_REEXPORTS and isinstance(value, ModuleType):
+            return
+        super().__setattr__(name, value)
+
+
+def _pin_shadowed_reexports() -> None:
+    """Protect the re-exports a same-named submodule would overwrite.
+
+    Called from ``__init__`` once its re-exports are bound.  Retire this
+    together with the last shim whose name collides with a re-export.
+    """
+    sys.modules[__package__].__class__ = _PinnedReexportPackage
+
+
 def _init(log_level: object = None) -> None:
     """Phase 2: custom-op registration and MPI initialization, after imports."""
     global _inited
@@ -128,7 +166,7 @@ def _init(log_level: object = None) -> None:
 
     from ._utils import print_all_stacks
     from .bindings import MpiComm
-    from .logger import logger
+    from .observability.logging import logger
 
     if log_level is not None:
         logger.set_level(log_level)

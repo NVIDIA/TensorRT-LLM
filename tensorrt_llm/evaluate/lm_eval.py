@@ -25,7 +25,7 @@ import click
 import numpy as np
 from tqdm import tqdm
 
-import tensorrt_llm.profiler as profiler
+import tensorrt_llm.observability.profiling as profiler
 from tensorrt_llm.inputs import prompt_inputs
 
 try:
@@ -43,7 +43,7 @@ from ..inputs.utils import _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
 from ..llmapi import RequestOutput
-from ..logger import logger
+from ..observability.logging import logger
 from ..sampling_params import SamplingParams
 from .interface import (Evaluator, dump_inference_results,
                         get_chat_template_kwargs)

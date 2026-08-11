@@ -50,7 +50,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class MistralAttention(Attention):

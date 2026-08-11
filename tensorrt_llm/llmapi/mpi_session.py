@@ -18,7 +18,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
 from .utils import logger_debug, print_colored

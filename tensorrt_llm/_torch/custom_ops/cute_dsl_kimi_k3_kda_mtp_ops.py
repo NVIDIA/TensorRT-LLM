@@ -57,7 +57,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 

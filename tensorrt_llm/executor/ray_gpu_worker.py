@@ -49,7 +49,7 @@ class RayWorkerWrapper:
         self.rank = rank
         # Ray can't pickle TensorRT logger
         global logger
-        from tensorrt_llm.logger import logger
+        from tensorrt_llm.observability.logging import logger
 
         # Expect to see global counts w/ RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
         # unless CUDA_VISIBLE_DEVICES is set.
@@ -225,7 +225,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         hmac_key: bytes = b"",
     ) -> None:
         global logger
-        from tensorrt_llm.logger import logger
+        from tensorrt_llm.observability.logging import logger
 
         super().__init__(
             engine=engine,

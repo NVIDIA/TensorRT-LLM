@@ -19,7 +19,7 @@ from cache_dit import (
     TaylorSeerCalibratorConfig,
 )
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..config import CacheDiTConfig
 

@@ -46,7 +46,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .specs import LayerWeightSpecs, PeerRanges, WeightSpec, lookup_owner
 from .transport import DWDPTransport

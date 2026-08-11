@@ -41,7 +41,7 @@ from packaging.version import Version
 from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 def rgba_to_rgb(

@@ -27,7 +27,6 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     MemoryDescs,
     MemoryType,
@@ -35,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferRequest,
 )
 from tensorrt_llm._utils import CUASSERT
+from tensorrt_llm.observability.logging import logger
 
 from .buffer import SlotAllocator
 from .config import DEFAULT_MIN_BYTES, SizingContext, fit_within_free

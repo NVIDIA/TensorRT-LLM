@@ -36,7 +36,7 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
-from ...logger import logger
+from ...observability.logging import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend

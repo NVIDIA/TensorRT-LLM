@@ -151,7 +151,7 @@ def ctx_gen_kv_cache_dtype(request):
 def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                                              attention_type, backend_runtime):
     backend, transceiver_runtime = backend_runtime
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
     ctx_kv_cache_dtype, gen_kv_cache_dtype = ctx_gen_kv_cache_dtype

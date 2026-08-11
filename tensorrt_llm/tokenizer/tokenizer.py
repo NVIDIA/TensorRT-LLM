@@ -23,7 +23,7 @@ from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
 from .._utils import nvtx_range_debug
-from ..logger import logger
+from ..observability.logging import logger
 
 # Transformers 5.x moved ``bytes_to_unicode`` out of
 # ``transformers.models.gpt2.tokenization_gpt2`` into

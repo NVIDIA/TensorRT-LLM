@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from .._utils import torch_dtype_to_str
-from ..logger import logger
+from ..observability.logging import logger
 from ..quantization import QuantAlgo
 
 

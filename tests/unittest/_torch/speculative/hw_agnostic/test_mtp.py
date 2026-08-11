@@ -35,7 +35,7 @@ def unittest_name_func(testcase_func, param_num, param):
 
 class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
     def setUp(self):
-        tensorrt_llm.logger.set_level("warning")
+        tensorrt_llm.observability.logging.set_level("warning")
 
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []
@@ -412,7 +412,7 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
 
 class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
     def setUp(self):
-        tensorrt_llm.logger.set_level("warning")
+        tensorrt_llm.observability.logging.set_level("warning")
 
     def load_update_mtp_hidden_states_test_cases():
         def gen_data(batch_size, num_nextn_predict_layers, hidden_size):
@@ -1158,7 +1158,7 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
 
 class TestMTPPrepareDrafterInputs(unittest.TestCase):
     def setUp(self):
-        tensorrt_llm.logger.set_level("warning")
+        tensorrt_llm.observability.logging.set_level("warning")
 
     def load_prepare_drafter_inputs_test_cases():
         def gen_data(batch_size, num_nextn_predict_layers, hidden_size):

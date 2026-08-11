@@ -36,8 +36,8 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
-from ...logger import logger
 from ...lora_helper import LoraConfig
+from ...observability.logging import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig

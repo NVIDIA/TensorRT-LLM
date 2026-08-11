@@ -23,10 +23,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-import tensorrt_llm.profiler as profiler
+import tensorrt_llm.observability.profiling as profiler
 
 from ..llmapi import RequestOutput
-from ..logger import logger
+from ..observability.logging import logger
 from ..sampling_params import SamplingParams
 
 

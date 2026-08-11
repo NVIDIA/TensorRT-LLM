@@ -19,7 +19,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 
 _MIB = 1024 * 1024
 

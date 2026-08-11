@@ -4,8 +4,8 @@ from typing import Callable, Optional
 
 import zmq
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
+from tensorrt_llm.observability.logging import logger
 
 
 class MessengerInterface(ABC):

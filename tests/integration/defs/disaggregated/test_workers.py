@@ -33,7 +33,7 @@ from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
                                wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
 
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.serve.disagg_auth import build_internal_disagg_auth_headers
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,

@@ -17,7 +17,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_torch_compiling
 from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from .metadata import DSAtrtllmAttentionMetadata

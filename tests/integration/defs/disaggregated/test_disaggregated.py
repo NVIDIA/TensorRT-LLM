@@ -45,7 +45,7 @@ from test_common.perf_metrics_utils import (get_timing_metrics,
                                             wait_for_perf_metrics_jsonl)
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
 

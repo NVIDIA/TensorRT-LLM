@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Supported Wan I2V 14B models:
 # - Wan2.1-I2V-14B-480P: Single-stage image-to-video

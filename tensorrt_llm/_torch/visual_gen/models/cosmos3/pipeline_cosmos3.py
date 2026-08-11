@@ -37,8 +37,8 @@ from tensorrt_llm._torch.visual_gen.utils import (
 )
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
-from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window
+from tensorrt_llm.observability.logging import logger
 
 from .defaults import (
     COSMOS3_ENVELOPES,

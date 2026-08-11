@@ -1,7 +1,7 @@
 from collections import deque
 from typing import Deque, Optional, Tuple
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class SpeculationGate:

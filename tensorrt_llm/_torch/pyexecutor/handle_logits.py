@@ -6,7 +6,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class HandleLogits:

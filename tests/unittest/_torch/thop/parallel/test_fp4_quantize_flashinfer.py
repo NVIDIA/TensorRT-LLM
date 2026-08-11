@@ -36,7 +36,7 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
     """Test tunable FP4 quantization across TRTLLM and FlashInfer backends."""
 
     def setUp(self):
-        tensorrt_llm.logger.set_level("warning")
+        tensorrt_llm.observability.logging.set_level("warning")
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 

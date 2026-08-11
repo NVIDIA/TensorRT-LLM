@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 import zmq
 
 from ...llmapi.utils import logger_debug
-from ...logger import logger
+from ...observability.logging import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCError, RPCRequest, RPCResponse,
                          RPCStreamingError, RPCTimeout)

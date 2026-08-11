@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization import QuantAlgo
 
 from ...inputs import (

@@ -47,7 +47,7 @@ from ...inputs import (
     register_input_processor,
 )
 from ...inputs.multimodal import MultimodalParams
-from ...logger import logger
+from ...observability.logging import logger
 from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear

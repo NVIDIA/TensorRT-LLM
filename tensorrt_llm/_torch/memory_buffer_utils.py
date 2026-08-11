@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 def get_size_in_byte(target_shape: list[int], target_dtype: torch.dtype):

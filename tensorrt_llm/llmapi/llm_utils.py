@@ -16,11 +16,11 @@ from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
                                  KvCacheRetentionConfig)
-# yapf: enable
-from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
+# yapf: enable
+from ..observability.logging import logger
 from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             read_modelopt_quant_config,
                                             warn_if_inline_diverges)

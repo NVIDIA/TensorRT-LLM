@@ -20,8 +20,8 @@ from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+from tensorrt_llm.observability.logging import Logger
 
 
 class PerfItemTuple(NamedTuple):

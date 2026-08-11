@@ -10,7 +10,7 @@ from tensorrt_llm.bench.tuning.dataclasses import (
     Qwen3HybridConfig,
 )
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .utils import get_device_memory

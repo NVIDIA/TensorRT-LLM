@@ -17,7 +17,7 @@ from typing import Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import run_once
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/tracing.py#L11
 TRACE_HEADERS = ["traceparent", "tracestate"]

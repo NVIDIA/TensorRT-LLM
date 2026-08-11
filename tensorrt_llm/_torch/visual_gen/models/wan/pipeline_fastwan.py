@@ -28,7 +28,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .defaults import get_fastwan_default_params
 from .pipeline_wan import WanPipeline

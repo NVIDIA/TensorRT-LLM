@@ -10,7 +10,7 @@ from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Assuming these imports exist in your environment
 from ..llm_request import LlmRequest, LlmRequestState

@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc

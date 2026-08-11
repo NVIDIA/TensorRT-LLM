@@ -32,8 +32,8 @@ from tensorrt_llm.deep_gemm import (
     fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata,
 )
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.observability.logging import logger
 
 from .params import DSAParams
 

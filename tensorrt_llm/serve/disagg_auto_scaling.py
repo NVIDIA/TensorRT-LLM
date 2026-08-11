@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .cluster_storage import (ClusterStorage, StorageItem, WatchEvent,
                               WatchEventType, key_time)

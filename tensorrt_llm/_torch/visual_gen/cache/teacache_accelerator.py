@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 import torch.nn as nn
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..config import TeaCacheConfig
 from .base import CacheAccelerator

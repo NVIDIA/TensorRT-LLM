@@ -10,7 +10,7 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ...inputs import (
     ContentFormat,

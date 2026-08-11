@@ -41,7 +41,7 @@ __all__ = [
     "VisualGenResult",
 ]
 from tensorrt_llm.llmapi.utils import set_api_status
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 @set_api_status("prototype")

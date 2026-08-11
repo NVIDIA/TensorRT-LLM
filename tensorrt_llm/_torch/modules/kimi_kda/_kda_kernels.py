@@ -199,7 +199,7 @@ class KDAKernelDispatch:
         if not KDAKernelDispatch._selection_logged:
             KDAKernelDispatch._selection_logged = True
             try:
-                from tensorrt_llm.logger import logger
+                from tensorrt_llm.observability.logging import logger
             except ImportError:  # pragma: no cover — source-loader stub path
                 pass
             else:

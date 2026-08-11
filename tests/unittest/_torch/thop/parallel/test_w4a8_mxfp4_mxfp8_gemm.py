@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +26,7 @@ import tensorrt_llm
 class TestFunctional(unittest.TestCase):
 
     def setUp(self):
-        tensorrt_llm.logger.set_level("warning")
+        tensorrt_llm.observability.logging.set_level("warning")
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 

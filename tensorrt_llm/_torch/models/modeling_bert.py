@@ -5,7 +5,7 @@ from torch import nn
 from transformers import BertConfig
 
 from tensorrt_llm.llmapi.utils import logger_debug
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask

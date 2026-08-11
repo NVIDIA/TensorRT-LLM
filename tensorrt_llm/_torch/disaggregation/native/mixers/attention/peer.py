@@ -17,7 +17,6 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
     RegionMapperBase,
@@ -27,6 +26,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.observability.logging import logger
 
 
 class IntactMapper(RegionMapperBase):

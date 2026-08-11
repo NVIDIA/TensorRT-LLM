@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 
 # CSV header for performance log files
 _PERF_CSV_HEADER = (

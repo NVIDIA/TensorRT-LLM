@@ -25,7 +25,7 @@ import torch
 from packaging.version import Version
 from torch import nn
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..._utils import get_sm_version, prefer_pinned
 from ..attention_backend.interface import AttentionMetadata

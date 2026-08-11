@@ -26,7 +26,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
-from tensorrt_llm.logger import logger as trtllm_logger
+from tensorrt_llm.observability.logging import logger as trtllm_logger
 
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager

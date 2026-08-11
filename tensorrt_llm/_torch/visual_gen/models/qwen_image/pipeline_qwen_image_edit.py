@@ -20,7 +20,7 @@ import torch.distributed as dist
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.inputs.utils import load_image
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .pipeline_qwen_image import QwenImagePipeline, _calculate_shift
 

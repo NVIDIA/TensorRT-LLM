@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 MAX_TOP_LOGPROBS = 100
 

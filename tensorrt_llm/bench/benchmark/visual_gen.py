@@ -39,7 +39,7 @@ from tensorrt_llm.bench.benchmark.visual_gen_utils import (
     print_visual_gen_results,
 )
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:

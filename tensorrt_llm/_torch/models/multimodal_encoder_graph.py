@@ -38,7 +38,7 @@ from typing import (
 
 import torch
 
-from ...logger import logger
+from ...observability.logging import logger
 from ..utils import make_weak_ref
 
 if TYPE_CHECKING:

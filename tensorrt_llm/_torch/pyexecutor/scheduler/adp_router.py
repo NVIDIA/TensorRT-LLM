@@ -25,7 +25,7 @@ from collections import OrderedDict, namedtuple
 from dataclasses import MISSING, astuple, dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed

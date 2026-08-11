@@ -22,8 +22,8 @@ from typing import Dict, List, Optional, Tuple, Union, final
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.observability.logging import logger
 
 from ...distributed.ops import reducescatter
 from .impl_contract import (MoEInputRequirement, MoERunContext,
@@ -627,7 +627,7 @@ class MoE(nn.Module):
             self.layer_load_balancer.set_initial_weight_assignments(
                 self.initial_global_assignments)
 
-            from tensorrt_llm.logger import logger
+            from tensorrt_llm.observability.logging import logger
             logger.info(
                 f"MoE load balancer enabled. num_experts = {self.num_experts}, "
                 f"num_slots = {self.num_slots}, ep_size = {self.ep_size}")

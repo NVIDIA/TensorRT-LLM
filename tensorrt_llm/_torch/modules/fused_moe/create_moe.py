@@ -4,8 +4,8 @@ from typing import Dict, Optional, Type
 
 import torch
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.observability.logging import logger
 
 from ...model_config import ModelConfig
 from ...peft.lora.validation import check_moe_lora_supported

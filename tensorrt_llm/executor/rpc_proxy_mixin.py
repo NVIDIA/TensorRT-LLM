@@ -7,7 +7,7 @@ from typing import Callable, List, Optional
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
-from ..logger import logger
+from ..observability.logging import logger
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient

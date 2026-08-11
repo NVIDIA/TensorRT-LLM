@@ -31,7 +31,7 @@ from transformers.models.parakeet.modeling_parakeet import (
     ParakeetEncoderSubsamplingConv2D as HFParakeetEncoderSubsamplingConv2D,
 )
 
-from ...logger import logger
+from ...observability.logging import logger
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.layer_norm import LayerNorm

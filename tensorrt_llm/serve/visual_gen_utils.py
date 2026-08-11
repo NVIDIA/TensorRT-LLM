@@ -6,7 +6,7 @@ import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 
 if TYPE_CHECKING:

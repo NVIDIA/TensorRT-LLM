@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.serve._perf_metrics_schema import (
     DisaggPerfMetricsRecord,
     PerfMetrics,

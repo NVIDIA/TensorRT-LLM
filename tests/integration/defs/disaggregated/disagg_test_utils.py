@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +32,7 @@ import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Service discovery constants
 HEARTBEAT_INTERVAL = 1

@@ -4,7 +4,7 @@ import os
 from functools import wraps
 from typing import Callable, Optional
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 _enable_llm_tracer_ = None
 

@@ -21,8 +21,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager

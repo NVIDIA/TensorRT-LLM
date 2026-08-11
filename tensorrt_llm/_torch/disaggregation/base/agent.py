@@ -5,7 +5,7 @@ from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 
 
 # We deliberately use a non-enum data structure here. This choice ensures that

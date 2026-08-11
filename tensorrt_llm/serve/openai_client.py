@@ -23,7 +23,7 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tup
 import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     request_requires_internal_disagg_auth,

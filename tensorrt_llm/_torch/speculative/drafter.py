@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from bisect import bisect_right
 from typing import Dict, List, Optional, final
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from ..pyexecutor.resource_manager import ResourceManager, ResourceManagerType

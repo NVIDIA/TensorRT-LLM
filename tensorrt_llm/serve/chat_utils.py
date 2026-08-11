@@ -23,7 +23,7 @@ from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import interleave_mm_placeholders
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class VideoURL(TypedDict):

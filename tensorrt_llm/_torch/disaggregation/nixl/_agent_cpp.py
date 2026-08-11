@@ -2,7 +2,7 @@ import os
 import time
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
     AgentDesc,
     BaseAgentConfig,

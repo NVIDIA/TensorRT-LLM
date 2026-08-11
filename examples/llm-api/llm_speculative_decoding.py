@@ -5,10 +5,11 @@ from typing import Optional
 
 import click
 
-from tensorrt_llm import LLM, SamplingParams, logger
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import (Eagle3DecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig, NGramDecodingConfig)
+from tensorrt_llm.observability.logging import logger
 
 prompts = [
     "What is the capital of France?",

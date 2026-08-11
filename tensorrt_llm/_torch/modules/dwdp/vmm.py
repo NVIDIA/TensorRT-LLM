@@ -31,7 +31,7 @@ from typing import Tuple
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 try:
     from cuda.bindings import driver as cuda

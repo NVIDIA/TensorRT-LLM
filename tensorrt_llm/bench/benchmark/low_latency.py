@@ -44,7 +44,7 @@ from tensorrt_llm.bench.utils.data import (DatasetFormatError,
                                            create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 

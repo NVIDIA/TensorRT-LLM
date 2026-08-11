@@ -23,7 +23,7 @@ from torch import Tensor, nn
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .modules import SConvTranspose1d, SnakeBeta, WNConv1d, WNConvTranspose1d
 

@@ -34,7 +34,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ...distributed import allgather
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2

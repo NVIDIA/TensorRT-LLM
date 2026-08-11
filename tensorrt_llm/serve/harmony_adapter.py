@@ -15,7 +15,7 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             load_harmony_encoding)
 
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # yapf: disable
 from .openai_protocol import (ChatCompletionMessageParam,

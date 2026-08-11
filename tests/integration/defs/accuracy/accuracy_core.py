@@ -31,8 +31,8 @@ from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..common import venv_check_call, venv_mpi_check_call

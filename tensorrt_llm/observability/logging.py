@@ -44,15 +44,30 @@ _TAG_TO_LEVEL_NAME = {
 }
 
 
+# Labels kept across a module move.  The label is normally the first
+# sub-package, so moving a module would retag the records it emits itself and
+# silently invalidate a ``TLLM_LOG_LEVEL_BY_MODULE`` filter naming the old one.
+_MODULE_LABEL_OVERRIDES = {
+    "tensorrt_llm.observability.profiling": "profiler",
+}
+
+
 def _extract_module(qualname: str) -> str:
     """Extract the first sub-package after ``tensorrt_llm`` from a dotted module name.
 
+    Modules listed in ``_MODULE_LABEL_OVERRIDES`` report their pinned label
+    instead.
+
     Examples:
-        ``tensorrt_llm.runtime.generation``    -> ``runtime``
-        ``tensorrt_llm._torch.pyexecutor.foo`` -> ``_torch``
-        ``tensorrt_llm.logger``                -> ``logger``
-        ``__main__``                           -> ``""``
+        ``tensorrt_llm.runtime.generation``      -> ``runtime``
+        ``tensorrt_llm._torch.pyexecutor.foo``   -> ``_torch``
+        ``tensorrt_llm.observability.logging``   -> ``observability``
+        ``tensorrt_llm.observability.profiling`` -> ``profiler`` (pinned)
+        ``__main__``                             -> ``""``
     """
+    pinned = _MODULE_LABEL_OVERRIDES.get(qualname)
+    if pinned is not None:
+        return pinned
     parts = qualname.split(".")
     # Find the last occurrence of "tensorrt_llm" (mirrors the C++ rfind approach).
     idx = -1

@@ -28,7 +28,7 @@ from typing import Any, Iterable, Iterator, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_VISUAL_GEN_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"

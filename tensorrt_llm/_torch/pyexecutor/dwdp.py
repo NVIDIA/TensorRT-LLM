@@ -40,8 +40,8 @@ from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp import DWDPWeightManager, setup_dwdp
 from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 _global_dwdp_manager: Optional["DwdpManager"] = None
 

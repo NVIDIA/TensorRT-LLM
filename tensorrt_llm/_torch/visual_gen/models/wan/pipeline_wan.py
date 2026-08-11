@@ -43,7 +43,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .transformer_wan import WanTransformer3DModel
 from .vae_loader import load_wan_vae

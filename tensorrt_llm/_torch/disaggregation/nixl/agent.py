@@ -1,4 +1,4 @@
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..base.agent import use_pure_python_transfer_agent
 

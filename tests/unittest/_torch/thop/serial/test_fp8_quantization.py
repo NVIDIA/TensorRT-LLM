@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +26,7 @@ FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 class TestDynamicFP8QuantDequant(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
-        tensorrt_llm.logger.set_level("error")
+        tensorrt_llm.observability.logging.set_level("error")
 
     def _ref_quant(self, x_, x_scale_):
         x_ = x_.float()

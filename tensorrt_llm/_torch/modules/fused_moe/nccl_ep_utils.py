@@ -24,8 +24,8 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 _MIN_NCCL_RUNTIME_VERSION = "2.30.4"
 _MIN_NCCL_EP_INT32_TOPK_VERSION = "0.2"

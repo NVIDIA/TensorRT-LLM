@@ -17,7 +17,7 @@ consumes.
 
 from typing import Any, Dict, Optional
 
-from ..logger import logger
+from ..observability.logging import logger
 
 
 def is_modelopt_quant_config(raw: Any) -> bool:

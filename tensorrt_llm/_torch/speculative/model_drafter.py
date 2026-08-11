@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder

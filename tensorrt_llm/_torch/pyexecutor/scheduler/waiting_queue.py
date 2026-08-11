@@ -21,7 +21,7 @@ from collections.abc import Iterable, Iterator
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..executor_request_queue import RequestQueueItem
 

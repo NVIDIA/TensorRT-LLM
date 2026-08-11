@@ -14,7 +14,7 @@ from tensorrt_llm._utils import (customized_gc_thresholds, nvtx_mark_debug,
 
 from ...llmapi.utils import (AsyncQueue, _SyncQueue, enable_llmapi_debug,
                              logger_debug)
-from ...logger import logger
+from ...observability.logging import logger
 from ..ipc import ZeroMqQueue
 from .rpc_common import (RPCCancelled, RPCParams, RPCRequest, RPCResponse,
                          RPCStreamingError, RPCTimeout)

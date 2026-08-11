@@ -16,7 +16,7 @@ from tensorrt_llm.bench.tuning.dataclasses import (
 from tensorrt_llm.bench.tuning.heuristics import calc_engine_setting
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 TUNED_QUANTS = {

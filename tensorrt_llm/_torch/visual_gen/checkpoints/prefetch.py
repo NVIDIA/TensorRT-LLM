@@ -22,7 +22,7 @@ from typing import Iterable, Optional, Set
 import psutil
 import torch.distributed as dist
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 _PREFETCH_CHUNK_SIZE = 16 * 1024 * 1024
 

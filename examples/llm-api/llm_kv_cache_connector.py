@@ -90,11 +90,12 @@ from typing import Optional
 import click
 import torch
 
-from tensorrt_llm import LLM, SamplingParams, logger
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
+from tensorrt_llm.observability.logging import logger
 
 CONNECTOR_CACHE_FOLDER_KEY = "CONNECTOR_CACHE_FOLDER"
 

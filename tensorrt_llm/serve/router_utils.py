@@ -23,7 +23,7 @@ from typing import Iterable, List, Optional, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Block as V2Block
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope

@@ -21,7 +21,7 @@ except ImportError:
 
 from tensorrt_llm._ray_utils import unwrap_ray_errors
 from tensorrt_llm._utils import nvtx_range_debug
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..llmapi.utils import logger_debug
 from .executor import GenerationExecutor

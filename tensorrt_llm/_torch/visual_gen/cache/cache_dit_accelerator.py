@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import cache_dit
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..config import CacheDiTConfig
 from .base import CacheAccelerator

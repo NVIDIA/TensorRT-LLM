@@ -437,7 +437,7 @@ NUM_REGS_WG2 = 232
 MAX_REGS = 168
 
 try:
-    from tensorrt_llm.logger import logger as _logger
+    from tensorrt_llm.observability.logging import logger as _logger
 except ImportError:  # standalone kernel use outside the full package
     import logging as _logging
 

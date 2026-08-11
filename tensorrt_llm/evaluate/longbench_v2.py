@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +31,7 @@ from datasets import load_dataset
 
 from .. import LLM as PyTorchLLM
 from ..llmapi import RequestOutput
-from ..logger import logger
+from ..observability.logging import logger
 from ..sampling_params import SamplingParams
 from .interface import Evaluator
 

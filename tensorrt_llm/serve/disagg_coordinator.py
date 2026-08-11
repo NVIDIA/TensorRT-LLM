@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     get_global_disagg_request_id,
     worker_local_process_id,  # noqa: F401
 )
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.serve.cluster_storage import (
     ClusterStorage,
     WatchEventType,

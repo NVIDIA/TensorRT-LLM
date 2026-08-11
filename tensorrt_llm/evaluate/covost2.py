@@ -30,7 +30,7 @@ import numpy as np
 
 from .. import LLM as PyTorchLLM
 from ..llmapi import RequestOutput
-from ..logger import logger
+from ..observability.logging import logger
 from ..sampling_params import SamplingParams
 from .interface import Evaluator
 

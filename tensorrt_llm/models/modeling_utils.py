@@ -30,8 +30,8 @@ from .._utils import QuantModeWrapper
 from ..bindings.executor import RuntimeDefaults
 from ..functional import PositionEmbeddingType
 from ..llmapi.utils import StrictBaseModel
-from ..logger import logger
 from ..mapping import Mapping
+from ..observability.logging import logger
 from ..quantization.mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
                                  W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode)
 

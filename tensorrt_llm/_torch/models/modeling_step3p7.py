@@ -1649,7 +1649,7 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         4. Split stacked routed-expert tensors into per-expert keys.
         5. Capture 2D bf16/NVFP4 expert weights for Python-clamp layers.
         """
-        from tensorrt_llm.logger import logger as _logger
+        from tensorrt_llm.observability.logging import logger as _logger
 
         skip_modules = list(skip_modules) if skip_modules else []
         rewrite_language_model_keys(weights)

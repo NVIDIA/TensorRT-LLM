@@ -65,7 +65,7 @@ except ImportError:
 
 from tensorrt_llm.bindings import DataType, LayerType, steady_clock_now
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})

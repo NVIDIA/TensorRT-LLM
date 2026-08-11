@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # =============================================================================
 # Core Data Structures

@@ -1,4 +1,4 @@
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 
 
 def get_local_ip() -> str:

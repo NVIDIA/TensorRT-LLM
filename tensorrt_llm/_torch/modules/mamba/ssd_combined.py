@@ -1,7 +1,7 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,8 +25,8 @@ from einops import rearrange
 from flashinfer.mamba import SSDCombined
 
 from tensorrt_llm._utils import is_sm_100f
-from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm.observability.logging import logger
 
 from .fuse_elementwise_ops import ssd_output_transpose
 from .mamba2_metadata import cu_seqlens_to_chunk_indices_offsets_triton
