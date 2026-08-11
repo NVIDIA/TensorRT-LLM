@@ -367,6 +367,7 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
 
 def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+        _deepseek_v4_q_b_layernorm_fused_fp8,
         forward_sparse_attn,
         initialize_sparse_attn,
     )
@@ -391,7 +392,6 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert helper_src is not None
     assert fused_helper_src is not None
     init_src_no_ws = "".join(init_src.split())
-    fused_helper_src_no_ws = "".join(fused_helper_src.split())
 
     assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws
     assert "has_weights=False" in init_src
@@ -408,10 +408,14 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "total_rows" not in helper_src
     assert "self.q_b_layernorm(" not in helper_src
     assert "_q_b_layernorm(q_proj)" in _source_calls(forward_src)
-    assert "q_pe=q_proj.new_empty((num_q_tokens,self.num_heads_tp,rope_dim))" in (
-        fused_helper_src_no_ws
+    # The closure delegates; the buffers and the op call live in the module function.
+    assert "_deepseek_v4_q_b_layernorm_fused_fp8(" in fused_helper_src
+    fused_impl_src = inspect.getsource(_deepseek_v4_q_b_layernorm_fused_fp8)
+    fused_impl_src_no_ws = "".join(fused_impl_src.split())
+    assert "q_pe=q_proj.new_empty((num_tokens,self.num_heads_tp,rope_dim))" in (
+        fused_impl_src_no_ws
     )
-    assert "torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(" in fused_helper_src
+    assert "torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(" in fused_impl_src
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
