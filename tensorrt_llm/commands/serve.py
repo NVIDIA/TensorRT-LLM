@@ -749,7 +749,18 @@ def launch_server(
                 # BaseException, not Exception: a KeyboardInterrupt or a
                 # CancelledError landing here leaks the engine just as surely
                 # as a TypeError would.
-                llm.shutdown()
+                try:
+                    llm.shutdown()
+                except Exception as shutdown_error:
+                    # Never let the cleanup failure become the headline. This
+                    # is the teardown this PR elsewhere treats as capable of
+                    # wedging, so it can plausibly raise; if it replaced the
+                    # original error the real cause would survive only as
+                    # __context__. Same masking-avoidance discipline as
+                    # serve_with_lifecycle's abort path.
+                    logger.error(
+                        "Engine shutdown after a failed frontend build did "
+                        f"not complete cleanly: {shutdown_error!r}")
                 raise
 
             # Optionally disable GC (default: not disabled)
