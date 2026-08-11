@@ -69,6 +69,17 @@ function pullRequest(number, overrides = {}) {
   };
 }
 
+function conflictWarning(number, createdAt) {
+  return {
+    issue_number: number,
+    body:
+      `Conflict warning\n\n<!-- stale-pr-cleanup:111:${number}:` +
+      'conflict-warning -->',
+    created_at: createdAt,
+    user: { login: 'github-actions[bot]' },
+  };
+}
+
 async function run({
   pullRequests,
   listingPages,
@@ -77,6 +88,7 @@ async function run({
   closeFailures = 0,
   commentFailures = {},
   ambiguousCommentFailures = {},
+  initialComments = [],
   stateFailures = {},
   requireCompleteListingBeforeWrites = false,
   eventLog = [],
@@ -85,7 +97,7 @@ async function run({
   const events = eventLog;
   const warnings = [];
   const summaries = [];
-  const persistedComments = [];
+  const persistedComments = [...initialComments];
   const states = new Map(
     Object.entries(pullRequests).map(([number, value]) => [
       Number(number),
@@ -122,7 +134,7 @@ async function run({
       events.push(`list-comments:${issue_number}`);
       return persistedComments
         .filter((comment) => comment.issue_number === issue_number)
-        .map(({ body, user }) => ({ body, user }));
+        .map(({ body, created_at, user }) => ({ body, created_at, user }));
     },
     graphql: async (query, variables) => {
       if (query.includes('pullRequests(')) {
@@ -188,6 +200,7 @@ async function run({
             persistedComments.push({
               issue_number,
               body,
+              created_at: new Date(defaultNow).toISOString(),
               user: { login: 'github-actions[bot]' },
             });
             throw new Error('simulated lost comment response');
@@ -200,6 +213,7 @@ async function run({
           persistedComments.push({
             issue_number,
             body,
+            created_at: new Date(defaultNow).toISOString(),
             user: { login: 'github-actions[bot]' },
           });
         },
@@ -273,16 +287,20 @@ async function main() {
       updatedAt: oldDate(181),
     });
     const { events, summaries } = await run({ pullRequests: { 1: pr } });
-    assert.deepEqual(
-      events.filter((event) => event.startsWith('close:') || event.startsWith('comment:')).map((event) => event.split(':')[0]),
-      ['close', 'comment'],
-      'an old conflicting PR must close before it is commented on'
+    assert(!events.some((event) => event.startsWith('close:')));
+    assert(
+      events.some(
+        (event) =>
+          event.startsWith('comment:1:') &&
+          event.includes('closed after another 60 days of inactivity') &&
+          event.includes(':conflict-warning -->')
+      )
     );
     assert.deepEqual(summaryCounts(summaries), {
       Mode: 'Run',
-      Closed: '1',
+      Closed: '0',
       Exempt: '0',
-      Pinged: '0',
+      Pinged: '1',
       Scanned: '1',
       Skipped: '0',
     });
@@ -298,14 +316,10 @@ async function main() {
     const { events } = await run({ pullRequests: cases });
     const comments = events.filter((event) => event.startsWith('comment:'));
     assert(comments.some((event) => event.startsWith('comment:2:')));
-    assert(!comments.some((event) => event.startsWith('comment:3:')));
+    assert(comments.some((event) => event.startsWith('comment:3:')));
     assert(comments.some((event) => event.startsWith('comment:4:')));
-    assert(
-      comments.find((event) => event.startsWith('comment:4:')).includes(
-        'free of merge conflicts'
-      )
-    );
-    assert(!events.some((event) => event.startsWith('state:5:')));
+    assert(events.some((event) => event.startsWith('state:5:')));
+    assert(!comments.some((event) => event.startsWith('comment:5:')));
   }
 
   {
@@ -329,14 +343,13 @@ async function main() {
     assert.equal(reads.get(7), 3);
     assert.equal(events.filter((event) => event === 'labels:6:1').length, 1);
     assert(events.some((event) => event.startsWith('comment:6:')));
-    assert(!events.some((event) => event.startsWith('comment:7:')));
-    assert(warnings.some((warning) => warning.includes('did not compute mergeability')));
+    assert(events.some((event) => event.startsWith('comment:7:')));
     assert.deepEqual(
       {
         Pinged: summaryCounts(summaries).Pinged,
         Skipped: summaryCounts(summaries).Skipped,
       },
-      { Pinged: '1', Skipped: '1' }
+      { Pinged: '2', Skipped: '0' }
     );
   }
 
@@ -389,13 +402,20 @@ async function main() {
 
   {
     const pr = pullRequest(80, { mergeable: 'CONFLICTING', updatedAt: oldDate(181) });
-    const { events } = await run({ pullRequests: { 80: pr }, dryRun: true });
+    const { events, summaries } = await run({ pullRequests: { 80: pr }, dryRun: true });
     assert(!events.some((event) => event.startsWith('close:') || event.startsWith('comment:')));
+    assert.equal(summaryCounts(summaries).Pinged, '1');
   }
 
   {
-    const pr = pullRequest(81, { mergeable: 'CONFLICTING', updatedAt: oldDate(181) });
-    const { events } = await run({ pullRequests: { 81: pr }, closeFailures: 2 });
+    const warningTime = oldDate(61);
+    const pr = pullRequest(81, { mergeable: 'CONFLICTING', updatedAt: warningTime });
+    const warning = conflictWarning(81, warningTime);
+    const { events } = await run({
+      pullRequests: { 81: pr },
+      closeFailures: 2,
+      initialComments: [warning],
+    });
     assert.equal(events.filter((event) => event === 'close:81').length, 3);
     assert(events.findIndex((event) => event.startsWith('comment:81:')) > events.lastIndexOf('close:81'));
     const failedEvents = [];
@@ -404,6 +424,7 @@ async function main() {
       pullRequests: { 81: pr, 82: next },
       closeFailures: 3,
       eventLog: failedEvents,
+      initialComments: [warning],
     });
     assert(!failedEvents.some((event) => event.startsWith('comment:81:')));
     assert(failedEvents.some((event) => event.startsWith('comment:82:')));
@@ -412,14 +433,66 @@ async function main() {
   }
 
   {
+    const warningTime = oldDate(59);
+    const pr = pullRequest(85, {
+      mergeable: 'CONFLICTING',
+      updatedAt: warningTime,
+    });
+    const { events, summaries } = await run({
+      pullRequests: { 85: pr },
+      initialComments: [conflictWarning(85, warningTime)],
+    });
+    assert(!events.some((event) => event.startsWith('state:85:')));
+    assert.equal(summaryCounts(summaries).Scanned, '0');
+  }
+
+  {
+    const warningTime = oldDate(181);
+    const pr = pullRequest(86, {
+      mergeable: 'CONFLICTING',
+      updatedAt: oldDate(121),
+    });
+    const { events, summaries } = await run({
+      pullRequests: { 86: pr },
+      initialComments: [conflictWarning(86, warningTime)],
+    });
+    assert(!events.some((event) => event.startsWith('close:86')));
+    assert(
+      events.some(
+        (event) =>
+          event.startsWith('comment:86:') &&
+          event.includes(':conflict-warning -->')
+      )
+    );
+    assert.equal(summaryCounts(summaries).Pinged, '1');
+  }
+
+  {
+    const warningTime = oldDate(61);
+    const pr = pullRequest(87, {
+      mergeable: 'MERGEABLE',
+      updatedAt: warningTime,
+    });
+    const { events, summaries } = await run({
+      pullRequests: { 87: pr },
+      initialComments: [conflictWarning(87, warningTime)],
+    });
+    assert(!events.some((event) => event.startsWith('close:87')));
+    assert(!events.some((event) => event.startsWith('comment:87:')));
+    assert.equal(summaryCounts(summaries).Skipped, '1');
+  }
+
+  {
+    const warningTime = oldDate(61);
     const closing = pullRequest(83, {
       mergeable: 'CONFLICTING',
-      updatedAt: oldDate(181),
+      updatedAt: warningTime,
     });
     const next = pullRequest(84);
     const { events, summaries, warnings } = await run({
       pullRequests: { 83: closing, 84: next },
       commentFailures: { 83: 3 },
+      initialComments: [conflictWarning(83, warningTime)],
     });
     assert.equal(events.filter((event) => event === 'close:83').length, 1);
     assert.equal(

@@ -123,12 +123,12 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 TensorRT-LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
 ready-for-review pull requests:
 
-* After more than 120 days without activity, the workflow reminds the author when the pull request does not have
-  merge conflicts.
-* Pull requests with merge conflicts remain on the closure track without a reminder, because an automated reminder
-  would reset their inactivity period.
-* After more than 180 days without activity, a pull request with merge conflicts is closed with an explanatory
-  comment. Age alone does not cause a pull request to be closed.
+* After more than 120 days without activity, the workflow reminds the author. Pull requests without merge conflicts
+  remain open and receive another reminder after each subsequent 120-day period without activity.
+* For a pull request with merge conflicts, the reminder warns that the pull request will close after another 60 days
+  without activity unless its conflicts are resolved.
+* A pull request is closed only when it still has merge conflicts and the warning remains its latest activity for more
+  than 60 days. Any subsequent activity resets the closure process.
 
 Maintainers can apply the `no-stale` label to exempt an intentionally parked pull request from reminders and
 automatic closure. If an inactive pull request is closed and the work is still relevant, open a new pull request.

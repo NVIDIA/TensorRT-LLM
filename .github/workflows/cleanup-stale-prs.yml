@@ -46,7 +46,7 @@ jobs:
         with:
           script: |
             const PING_AFTER_DAYS = 120;
-            const CLOSE_AFTER_DAYS = 180;
+            const CLOSE_AFTER_WARNING_DAYS = 60;
             const MAX_ACTIONS_PER_RUN = 50;
             const MAX_RUNTIME_MS = 12 * 60 * 1000;
             const MAX_MERGEABILITY_ATTEMPTS = 3;
@@ -55,6 +55,7 @@ jobs:
             const WRITE_RETRY_DELAY_MS = 2000;
             const EXEMPT_LABEL = 'no-stale';
             const BOT_LOGIN = 'github-actions[bot]';
+            const CONFLICT_WARNING_ACTION = 'conflict-warning';
             const DAY_IN_MS = 24 * 60 * 60 * 1000;
             const dryRun =
               context.eventName === 'workflow_dispatch' &&
@@ -174,7 +175,7 @@ jobs:
                 const isFresh =
                   pullRequest &&
                   (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS <=
-                    PING_AFTER_DAYS;
+                    CLOSE_AFTER_WARNING_DAYS;
                 if (!pullRequest) {
                   return null;
                 }
@@ -301,6 +302,42 @@ jobs:
               return false;
             }
 
+            async function getLatestConflictWarning(pullRequestNumber) {
+              let comments;
+              try {
+                comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pullRequestNumber,
+                    per_page: 100,
+                  }
+                );
+              } catch (error) {
+                core.warning(
+                  `Reading comments for pull request #${pullRequestNumber} ` +
+                    `failed: ${error.message}. Continuing with the next pull ` +
+                    'request.'
+                );
+                return undefined;
+              }
+
+              const markerSuffix =
+                `:${pullRequestNumber}:${CONFLICT_WARNING_ACTION} -->`;
+              return comments
+                .filter(
+                  (comment) =>
+                    comment.user?.login === BOT_LOGIN &&
+                    comment.body?.includes('<!-- stale-pr-cleanup:') &&
+                    comment.body.includes(markerSuffix)
+                )
+                .sort(
+                  (left, right) =>
+                    Date.parse(right.created_at) - Date.parse(left.created_at)
+                )[0] || null;
+            }
+
             let actionCount = 0;
             let closeCount = 0;
             let exemptCount = 0;
@@ -340,7 +377,7 @@ jobs:
               for (const candidate of connection.nodes) {
                 const candidateIdleDays =
                   (now - Date.parse(candidate.updatedAt)) / DAY_IN_MS;
-                if (candidateIdleDays <= PING_AFTER_DAYS) {
+                if (candidateIdleDays <= CLOSE_AFTER_WARNING_DAYS) {
                   reachedFreshPullRequest = true;
                   break;
                 }
@@ -381,7 +418,7 @@ jobs:
 
               const idleDays =
                 (now - Date.parse(pullRequest.updatedAt)) / DAY_IN_MS;
-              if (idleDays <= PING_AFTER_DAYS) {
+              if (idleDays <= CLOSE_AFTER_WARNING_DAYS) {
                 skipCount += 1;
                 continue;
               }
@@ -392,76 +429,116 @@ jobs:
                 continue;
               }
 
-              if (pullRequest.mergeable === 'UNKNOWN') {
-                core.warning(
-                  `Skipping ${pullRequest.url}: GitHub did not compute mergeability ` +
-                    `after ${MAX_MERGEABILITY_ATTEMPTS} attempts.`
-                );
-                skipCount += 1;
-                continue;
-              }
-
               const hasConflicts = pullRequest.mergeable === 'CONFLICTING';
-              const isClean = pullRequest.mergeable === 'MERGEABLE';
 
-              if (idleDays > CLOSE_AFTER_DAYS && hasConflicts) {
-                const body =
-                  'This pull request has been automatically closed because it ' +
-                  `has had no activity for more than ${CLOSE_AFTER_DAYS} days ` +
-                  'and currently has merge conflicts. If the work is still ' +
-                  'relevant, please open a new pull request. You may also reopen ' +
-                  'this PR after resolving the conflicts if its source branch is ' +
-                  'still available.';
-                console.log(
-                  `${dryRun ? '[dry run] Would close' : 'Closing'} ` +
-                    `${pullRequest.url} (${idleDays.toFixed(1)} idle days).`
+              if (hasConflicts) {
+                const warning = await getLatestConflictWarning(
+                  pullRequest.number
                 );
-                if (!dryRun) {
-                  const closed = await tryWrite(`Closing ${pullRequest.url}`, () =>
-                    github.rest.pulls.update({
-                      owner,
-                      repo,
-                      pull_number: pullRequest.number,
-                      state: 'closed',
-                    })
-                  );
-                  if (!closed) {
+                if (warning === undefined) {
+                  skipCount += 1;
+                  continue;
+                }
+                if (warning) {
+                  const warningTime = Date.parse(warning.created_at);
+                  const warningAgeDays = (now - warningTime) / DAY_IN_MS;
+                  const hasActivitySinceWarning =
+                    Date.parse(pullRequest.updatedAt) > warningTime;
+                  if (
+                    warningAgeDays > CLOSE_AFTER_WARNING_DAYS &&
+                    !hasActivitySinceWarning
+                  ) {
+                    const body =
+                      'This pull request has been automatically closed because ' +
+                      'its merge conflicts were not resolved and it had no ' +
+                      `activity for ${CLOSE_AFTER_WARNING_DAYS} days after the ` +
+                      'stale warning. If the work is still relevant, please open ' +
+                      'a new pull request. You may also reopen this PR after ' +
+                      'resolving the conflicts if its source branch is still ' +
+                      'available.';
+                    console.log(
+                      `${dryRun ? '[dry run] Would close' : 'Closing'} ` +
+                        `${pullRequest.url} (${warningAgeDays.toFixed(1)} days ` +
+                        'since the conflict warning).'
+                    );
+                    if (!dryRun) {
+                      const closed = await tryWrite(
+                        `Closing ${pullRequest.url}`,
+                        () =>
+                          github.rest.pulls.update({
+                            owner,
+                            repo,
+                            pull_number: pullRequest.number,
+                            state: 'closed',
+                          })
+                      );
+                      if (!closed) {
+                        skipCount += 1;
+                        continue;
+                      }
+                      actionCount += 1;
+                      closeCount += 1;
+                      await createCommentWithRetry(
+                        `Commenting on ${pullRequest.url}`,
+                        pullRequest.number,
+                        body,
+                        'close'
+                      );
+                    } else {
+                      actionCount += 1;
+                      closeCount += 1;
+                    }
+                    continue;
+                  }
+                  if (!hasActivitySinceWarning || idleDays <= PING_AFTER_DAYS) {
                     skipCount += 1;
                     continue;
                   }
-                  actionCount += 1;
-                  closeCount += 1;
-                  await createCommentWithRetry(
+                } else if (idleDays <= PING_AFTER_DAYS) {
+                  skipCount += 1;
+                  continue;
+                }
+
+                if (!pullRequest.author?.login) {
+                  skipCount += 1;
+                  continue;
+                }
+                const body =
+                  `@${pullRequest.author.login} this pull request has had no ` +
+                  `activity for more than ${PING_AFTER_DAYS} days and currently ` +
+                  'has merge conflicts. Is it still active? Please resolve the ' +
+                  `conflicts or post an update. Otherwise, it will be closed ` +
+                  `after another ${CLOSE_AFTER_WARNING_DAYS} days of inactivity.`;
+                console.log(
+                  `${dryRun ? '[dry run] Would ping' : 'Pinging'} ` +
+                    `${pullRequest.url} (${idleDays.toFixed(1)} idle days, ` +
+                    'has merge conflicts).'
+                );
+                if (!dryRun) {
+                  const commented = await createCommentWithRetry(
                     `Commenting on ${pullRequest.url}`,
                     pullRequest.number,
                     body,
-                    'close'
+                    CONFLICT_WARNING_ACTION
                   );
-                } else {
-                  actionCount += 1;
-                  closeCount += 1;
+                  if (!commented) {
+                    skipCount += 1;
+                    continue;
+                  }
                 }
+                actionCount += 1;
+                pingCount += 1;
                 continue;
               }
 
-              // Conflicting PRs stay on the close track. Pinging them would update
-              // updatedAt and prevent them from reaching the close threshold.
-              if (
-                idleDays > PING_AFTER_DAYS &&
-                isClean &&
-                pullRequest.author?.login
-              ) {
-                const status = pullRequest.isDraft
-                  ? 'free of merge conflicts'
-                  : 'mergeable';
+              if (idleDays > PING_AFTER_DAYS && pullRequest.author?.login) {
                 const body =
                   `@${pullRequest.author.login} this pull request has had no ` +
-                  `activity for more than ${PING_AFTER_DAYS} days and is ` +
-                  `currently ${status}. Is it still active? Please post an ` +
-                  'update when you can.';
+                  `activity for more than ${PING_AFTER_DAYS} days. Is it still ` +
+                  'active? Please post an update when you can.';
                 console.log(
                   `${dryRun ? '[dry run] Would ping' : 'Pinging'} ` +
-                    `${pullRequest.url} (${idleDays.toFixed(1)} idle days, ${status}).`
+                    `${pullRequest.url} (${idleDays.toFixed(1)} idle days).`
                 );
                 if (!dryRun) {
                   const commented = await createCommentWithRetry(
