@@ -37,11 +37,15 @@ from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
 
 
 @contextlib.contextmanager
-def timing(message: str) -> Iterator[None]:
-    start = time.time()
-    yield
-    end = time.time()
-    print(f"{message} -- {(end-start):.2f}s")
+def timing_metric(metric_name: str, metric_dict: dict[str,
+                                                      float]) -> Iterator[None]:
+    """Accumulate elapsed time under ``metric_name`` across invocations."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
+                                    time.perf_counter() - start)
 
 
 @dataclass
