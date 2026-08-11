@@ -3956,7 +3956,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
-        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120. Resolved at "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
@@ -4049,7 +4049,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "When False (default) the rebalance hook is skipped entirely and "
         "pool ratios remain at their warmup-derived values. Beta: enable at "
         "your own risk. Only used when using KV cache manager v2 "
-        "(experimental).")
+        "(experimental). This option is incompatible with dtype='fp8_ds_mla'.")
 
     disk_prefetch_num_reqs: int = Field(
         default=0,
@@ -4150,6 +4150,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
             '"nvfp4", or valid torch.dtype string')
+
+    @model_validator(mode='after')
+    def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
+        """Reject resizing while packed sparse-MLA pool views are fixed."""
+        if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
+            raise ValueError(
+                "kv_cache_config.dtype='fp8_ds_mla' is incompatible with "
+                "kv_cache_config.enable_kv_pool_rebalance=True because packed "
+                "sparse-MLA pool views are fixed at cache-manager construction time."
+            )
+        return self
 
     @field_validator('max_gpu_total_bytes')
     @classmethod

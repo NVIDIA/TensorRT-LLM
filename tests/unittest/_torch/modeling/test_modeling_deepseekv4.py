@@ -168,7 +168,7 @@ def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
-def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks():
+def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks() -> None:
     class LlmArgs:
         kv_cache_config = KvCacheConfig(dtype="fp8_ds_mla")
 
@@ -873,7 +873,11 @@ def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, 
         ),
     ],
 )
-def test_deepseek_v4_sanity(kv_cache_dtype, tokens_per_block, binding_dtype):
+def test_deepseek_v4_sanity(
+    kv_cache_dtype: str,
+    tokens_per_block: int,
+    binding_dtype: tensorrt_llm.bindings.DataType,
+) -> None:
     config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
     config = DeepseekV4Config(**config_dict)
     config.dtype = torch.bfloat16

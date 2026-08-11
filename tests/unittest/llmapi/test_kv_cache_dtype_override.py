@@ -64,9 +64,25 @@ def test_kv_cache_config_dtype_validation():
         KvCacheConfig(dtype="invalid_dtype")
 
 
+def test_kv_cache_config_rejects_fp8_ds_mla_pool_rebalance():
+    with pytest.raises(
+        ValueError,
+        match="fp8_ds_mla.*enable_kv_pool_rebalance",
+    ):
+        KvCacheConfig(dtype="fp8_ds_mla", enable_kv_pool_rebalance=True)
+
+
 def test_torch_llm_args_syncs_nvfp4_kv_cache_dtype(tmp_path):
     llm_args = TorchLlmArgs(model=str(tmp_path), kv_cache_config=KvCacheConfig(dtype="nvfp4"))
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_torch_llm_args_syncs_fp8_ds_mla_kv_cache_dtype(tmp_path):
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(dtype="fp8_ds_mla"),
+    )
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 def test_update_from_hf_quant_config_keeps_auto_strict(tmp_path):
@@ -91,6 +107,20 @@ def test_update_from_hf_quant_config_explicit_dtype_overrides(tmp_path):
 
     assert model_loader._update_from_hf_quant_config() is True
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_update_from_hf_quant_config_fp8_ds_mla_overrides(tmp_path):
+    _write_hf_quant_config(tmp_path, kv_cache_quant_algo="NVFP4")
+
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(dtype="fp8_ds_mla"),
+    )
+    llm_args.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    model_loader = ModelLoader(llm_args)
+
+    assert model_loader._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 def test_update_from_hf_quant_config_parses_compressed_tensors_model_kwargs(tmp_path):
