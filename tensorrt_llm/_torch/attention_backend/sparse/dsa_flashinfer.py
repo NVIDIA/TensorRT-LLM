@@ -149,7 +149,7 @@ def run_flashinfer_sparse_mla(
             is_generation,
         )
 
-    topk_indices_global = forward_args.sparse_prediction.sparse_attn_indices
+    topk_indices_global = forward_args.sparse_runtime_params.sparse_attn_indices
     if topk_indices_global is None:
         raise RuntimeError("FlashInfer DSA FMHA requires sparse attention indices.")
     if not topk_indices_global.is_contiguous():

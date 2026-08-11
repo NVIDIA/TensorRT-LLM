@@ -11,9 +11,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
-    SparsePrediction,
 )
 from tensorrt_llm._torch.attention_backend.sparse import dsa_flashinfer, inline_scale_kv
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
 from tensorrt_llm._utils import get_sm_version
 
 
@@ -106,7 +106,7 @@ def test_dsa_sparse_mla_cuda_graph_capture_replay() -> None:
         output=output,
         update_kv_cache=False,
         skip_mla_rope_generation=True,
-        sparse_prediction=SparsePrediction(sparse_attn_indices=indices),
+        sparse_runtime_params=SparseRuntimeParams(sparse_attn_indices=indices),
     )
 
     def run() -> None:

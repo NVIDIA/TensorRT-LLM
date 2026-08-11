@@ -187,9 +187,9 @@ def run_flashinfer_sparse_mla(
             end_idx,
         )
 
-    sparse_prediction = forward_args.sparse_prediction
-    swa_indices = sparse_prediction.sparse_attn_indices
-    extra_indices = sparse_prediction.sparse_attn_offsets
+    sparse_runtime_params = forward_args.sparse_runtime_params
+    swa_indices = sparse_runtime_params.sparse_attn_indices
+    extra_indices = sparse_runtime_params.sparse_attn_offsets
     if swa_indices is None:
         raise RuntimeError("FlashInfer DSv4 FMHA requires sparse attention indices.")
 

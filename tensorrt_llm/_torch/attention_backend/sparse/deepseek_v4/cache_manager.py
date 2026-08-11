@@ -84,11 +84,25 @@ def get_token_bytes(
     attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
+    use_fp8_ds_mla: bool = False,
 ) -> int:
     if not compress_ratio_has_attention(compress_ratio, attn_type):
         raise ValueError(
             f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
         )
+
+    if use_fp8_ds_mla and attn_type in (
+        DeepseekV4AttentionType.SWA,
+        DeepseekV4AttentionType.COMPRESS,
+    ):
+        from . import footer_scale_kv
+
+        if head_dim != footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE:
+            raise ValueError(
+                f"footer-scale KV layout requires head_dim "
+                f"{footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE}, got {head_dim}"
+            )
+        return footer_scale_kv.TOKEN_BYTES
 
     attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
 
