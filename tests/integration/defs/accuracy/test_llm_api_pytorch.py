@@ -3947,14 +3947,10 @@ def _run_deepseekv4_eplb(model_name,
              enable_attention_dp=True,
              max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
              max_seq_len=4096,
-             enable_iter_perf_stats=True,
              **pytorch_config,
              speculative_config=mtp_config) as llm:
         task = GSM8K(model_name)
         task.evaluate(llm)
-        if mtp_nextn > 0:
-            return _compute_acceptance_length(llm)
-    return None
 
 
 @pytest.mark.timeout(14400)
