@@ -54,8 +54,10 @@ _WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 # silence.
 _PREFETCH_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 _PREFETCH_LOG_INTERVAL_SEC = 60.0
-# Log the chunked-read fallback once per process instead of once per file.
+# Log the chunked-read fallback once per process instead of once per file;
+# the lock makes the check-and-set atomic across concurrent prefetch threads.
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
+_PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
 
 
 @register_checkpoint_weight_loader("MX")
@@ -362,8 +364,13 @@ class HfWeightLoader(BaseWeightLoader):
             # populated (or empty) file never logs, and name the cause:
             # a partial populate would otherwise silently pay for both a
             # populate and a chunked read of the remainder on every file.
-            if read_back > 0 and not _PREFETCH_FALLBACK_LOGGED.is_set():
-                _PREFETCH_FALLBACK_LOGGED.set()
+            should_log = False
+            if read_back > 0:
+                with _PREFETCH_FALLBACK_LOG_LOCK:
+                    should_log = not _PREFETCH_FALLBACK_LOGGED.is_set()
+                    if should_log:
+                        _PREFETCH_FALLBACK_LOGGED.set()
+            if should_log:
                 if populated == 0:
                     logger.info(
                         "madvise(MADV_POPULATE_READ) did not populate "
@@ -393,8 +400,14 @@ class HfWeightLoader(BaseWeightLoader):
         # with a constant per-thread footprint. Returns the number of bytes
         # read, i.e. how much of the file population did not cover.
         total_read = 0
-        buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
         with open(file_name, 'rb') as f:
+            # Allocate the buffer only when there is something left to read:
+            # when population covered the whole file (the common case on
+            # capable kernels), eagerly allocating 64 MiB in each of up to 16
+            # workers would transiently waste ~1 GiB per rank to read EOF.
+            if offset >= os.fstat(f.fileno()).st_size:
+                return 0
+            buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
             f.seek(offset)
             while num_read := f.readinto(buffer):
                 total_read += num_read

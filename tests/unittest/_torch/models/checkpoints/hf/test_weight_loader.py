@@ -397,6 +397,53 @@ def test_prefetch_one_file_logs_partial_populate_once(tmp_path, monkeypatch):
     assert str(mmap.PAGESIZE) in str(partial_logs[0])
 
 
+def test_prefetch_one_file_fallback_logs_once_across_threads(tmp_path, monkeypatch):
+    # The once-per-process fallback log must stay single-shot when many files
+    # fall back concurrently: the check-and-set is atomic under a lock.
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
+    monkeypatch.setattr(wl, "_PREFETCH_FALLBACK_LOGGED", threading.Event())
+
+    num_threads = 8
+    barrier = threading.Barrier(num_threads)
+
+    def unsupported_populate(file_name, window_bytes, on_window=None):
+        barrier.wait()  # line every thread up just before the guarded log
+        return 0
+
+    monkeypatch.setattr(wl, "populate_file_pages", unsupported_populate)
+    files = []
+    for i in range(num_threads):
+        file = tmp_path / f"model-{i}.safetensors"
+        file.write_bytes(os.urandom(mmap.PAGESIZE))
+        files.append(str(file))
+
+    loader = HfWeightLoader()
+    with mock.patch.object(wl.logger, "info") as info:
+        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+            list(pool.map(loader._prefetch_one_file, files))
+
+    fallback_logs = [c for c in info.call_args_list if "chunked reads" in str(c)]
+    assert len(fallback_logs) == 1
+
+
+def test_read_file_in_chunks_no_buffer_when_nothing_to_read(tmp_path, monkeypatch):
+    # When population covered the whole file, the fallback must return before
+    # allocating its buffer: with this chunk size an allocation attempt would
+    # raise MemoryError, so returning 0 proves the allocation was skipped.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1 << 62)
+    payload = os.urandom(mmap.PAGESIZE)
+    file = tmp_path / "model.safetensors"
+    file.write_bytes(payload)
+
+    assert HfWeightLoader._read_file_in_chunks(str(file), offset=len(payload)) == 0
+
+
 def test_prefetch_one_file_no_fallback_log_when_fully_populated(tmp_path, monkeypatch):
     from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
