@@ -165,7 +165,7 @@ def eager_on_graph(inner: Callable) -> Callable:
         captured_kwargs = {
             key: make_weak_ref(value, preserve_unsupported=True) for key, value in kwargs.items()
         }
-        captured_output = make_weak_ref(output, preserve_unsupported=True)
+        captured_output = output
 
         def replay_fn() -> Any:
             new_output = inner(*captured_args, **captured_kwargs)

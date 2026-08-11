@@ -71,6 +71,37 @@ def test_single_and_multiple_breakpoints():
     torch.testing.assert_close(output, torch.full_like(output, 16))
 
 
+def test_eager_output_storage_survives_allocator_churn():
+    eager_output_ptrs = []
+
+    @eager_on_graph
+    def add_one(value):
+        output = value + 1
+        eager_output_ptrs.append(output.data_ptr())
+        return output
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        x = torch.zeros(1024, device="cuda")
+        output = torch.zeros_like(x)
+        graph = BreakableCUDAGraph()
+
+        with BreakableCUDAGraphCapture(graph, stream=stream):
+            output.copy_(add_one(x) * 2)
+
+        captured_output_ptr = eager_output_ptrs[0]
+        churn = [torch.full_like(x, value) for value in range(4)]
+        assert all(tensor.data_ptr() != captured_output_ptr for tensor in churn)
+
+        x.fill_(5)
+        graph.replay()
+
+    stream.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 12))
+    for value, tensor in enumerate(churn):
+        torch.testing.assert_close(tensor, torch.full_like(tensor, value))
+
+
 def test_outside_capture():
     @eager_on_graph
     def outside(value):
