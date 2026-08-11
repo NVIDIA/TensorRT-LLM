@@ -20,7 +20,6 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
-import os
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
@@ -120,11 +119,8 @@ class UlyssesAttention(AttentionBackend):
         # barrier kernels.
         self._pending_barriers: int = 0
         # Symm-mem barrier timeout (ms) passed to ulysses_a2a_async_barrier.
-        # Default 60 s covers the one-time first-touch warmup stall on large
-        # multi-node runs; override via TLLM_ULYSSES_ASYNC_BARRIER_TIMEOUT_MS.
-        self._barrier_timeout_ms = int(
-            os.environ.get("TLLM_ULYSSES_ASYNC_BARRIER_TIMEOUT_MS", "60000")
-        )
+        # 60 s covers the one-time first-touch warmup stall on large multi-node runs.
+        self._barrier_timeout_ms = 60000
         if async_ulysses:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:

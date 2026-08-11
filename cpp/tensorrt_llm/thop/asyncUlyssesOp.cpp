@@ -242,11 +242,10 @@ public:
         TLLM_CHECK_WITH_INFO(
             mCanonicalHandle, "emitBarrier: no slot allocated yet — _prepare must precede the first _async barrier.");
         // barrier() takes MILLISECONDS (its "microseconds" timeout-error text is mislabeled).
-        // Default 60 s (caller-supplied via TLLM_ULYSSES_ASYNC_BARRIER_TIMEOUT_MS) absorbs the
-        // one-time first-touch warmup barrier stall (~10-20 s on 16-GPU cfg2xuly8) and still
-        // traps a real hang with a rank+channel diagnostic before the SLURM wall-clock.
-        // channel=0: V/Q/K issues share one per-device side stream and FIFO-serialize, so
-        // channel multiplexing (needed only across distinct streams) is moot.
+        // Default 60 s absorbs the one-time first-touch warmup barrier stall (~10-20 s on
+        // 16-GPU cfg2xuly8) and still traps a real hang with a rank+channel diagnostic before
+        // the SLURM wall-clock. channel=0: V/Q/K issues share one per-device side stream and
+        // FIFO-serialize, so channel multiplexing (needed only across distinct streams) is moot.
         mCanonicalHandle->barrier(/*channel=*/0, /*timeout_ms=*/timeoutMs);
     }
 
