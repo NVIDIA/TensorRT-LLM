@@ -27,6 +27,7 @@ import torch
 import tqdm
 from mpi4py import MPI as _MPI
 
+from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
@@ -45,11 +46,16 @@ _DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 1
 _WEIGHT_CACHE_LOCK = threading.Lock()
 _WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 
-# Prefetch reads use one bounded buffer per in-flight file (see
-# _prefetch_one_file) and emit a progress log at a fixed cadence so that a
-# slow prefetch produces observable output instead of minutes of silence.
+# Prefetch warms the OS page cache with mmap + madvise(MADV_POPULATE_READ)
+# (no user-space copy, no anonymous buffer), falling back to chunked reads
+# through one bounded buffer per in-flight file where unsupported. Both paths
+# work in fixed-size windows and emit a progress log at a fixed cadence so
+# that a slow prefetch produces observable output instead of minutes of
+# silence.
 _PREFETCH_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
 _PREFETCH_LOG_INTERVAL_SEC = 60.0
+# Log the chunked-read fallback once per process instead of once per file.
+_PREFETCH_FALLBACK_LOGGED = threading.Event()
 
 
 @register_checkpoint_weight_loader("MX")
@@ -344,19 +350,39 @@ class HfWeightLoader(BaseWeightLoader):
             report_progress: Callable[[int], None] | None = None) -> None:
         if os.path.exists(file_name):
             logger.info(f"Prefetching {file_name} to memory...")
-            # Read in fixed-size chunks into a reusable buffer instead of one
-            # whole-file read: a whole-file read pins the entire file in
-            # anonymous memory until it completes, and with up to 16
-            # concurrent multi-GB files per local rank, slow storage lets
-            # those buffers accumulate into hundreds of GB across the local
-            # ranks, which can OOM the host. Chunked reads warm the OS page
-            # cache identically with a constant per-thread footprint.
-            buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
-            with open(file_name, 'rb') as f:
-                while num_read := f.readinto(buffer):
-                    if report_progress is not None:
-                        report_progress(num_read)
+            populated = populate_file_pages(file_name,
+                                            _PREFETCH_CHUNK_SIZE_BYTES,
+                                            report_progress)
+            if populated == 0 and not _PREFETCH_FALLBACK_LOGGED.is_set():
+                _PREFETCH_FALLBACK_LOGGED.set()
+                logger.info(
+                    "madvise(MADV_POPULATE_READ) is unavailable (requires "
+                    "Linux >= 5.14 and an mmap-capable filesystem); "
+                    "prefetching via chunked reads.")
+            # Chunked reads resume from wherever population stopped: from
+            # zero when MADV_POPULATE_READ is unsupported, reading nothing
+            # when population already covered the whole file.
+            self._read_file_in_chunks(file_name, populated, report_progress)
             logger.info(f"Finished prefetching {file_name}.")
+
+    @staticmethod
+    def _read_file_in_chunks(
+            file_name: str,
+            offset: int,
+            report_progress: Callable[[int], None] | None = None) -> None:
+        # Read in fixed-size chunks into a reusable buffer instead of one
+        # whole-file read: a whole-file read pins the entire file in
+        # anonymous memory until it completes, and with up to 16 concurrent
+        # multi-GB files per local rank, slow storage lets those buffers
+        # accumulate into hundreds of GB across the local ranks, which can
+        # OOM the host. Chunked reads warm the OS page cache identically
+        # with a constant per-thread footprint.
+        buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
+        with open(file_name, 'rb') as f:
+            f.seek(offset)
+            while num_read := f.readinto(buffer):
+                if report_progress is not None:
+                    report_progress(num_read)
 
     def prefetch_files(self, file_names: List[str]):
         """
@@ -383,6 +409,9 @@ class HfWeightLoader(BaseWeightLoader):
             # Periodic heartbeat: on slow storage, prefetching can run for
             # tens of minutes without completing a single file, and log
             # silence gets the process killed by output-stall watchdogs.
+            # Deliberately progress-gated: it proves liveness only while
+            # bytes are actually moving, so a fully hung mount still goes
+            # silent and such watchdogs retain the ability to kill it.
             nonlocal prefetched_size, last_log_time
             with progress_lock:
                 prefetched_size += num_bytes
@@ -393,7 +422,7 @@ class HfWeightLoader(BaseWeightLoader):
                 current_size = prefetched_size
             logger.info(
                 f"Prefetch progress: {current_size / (1024**3):.2f}GB / "
-                f"{total_size / (1024**3):.2f}GB (local rank).")
+                f"{total_size / (1024**3):.2f}GB (this rank's share).")
 
         max_workers = min(multiprocessing.cpu_count() * 2, 16,
                           len(local_file_names))

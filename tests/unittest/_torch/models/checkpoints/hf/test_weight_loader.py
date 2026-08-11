@@ -300,16 +300,18 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
     assert sequences["hit"] == sequences["miss"]  # divergence-safe ordering
 
 
-def test_prefetch_one_file_reads_full_file_in_bounded_chunks(tmp_path, monkeypatch):
-    # Prefetch must never hold more than one chunk per thread in memory:
+def test_prefetch_one_file_reports_full_file_in_bounded_windows(tmp_path, monkeypatch):
+    # Prefetch must never hold more than one window per thread in memory:
     # whole-file reads pinned up to hundreds of GB across ranks on slow
-    # storage and OOMed the host. Verify the full file is consumed strictly
-    # chunk by chunk, including a trailing partial chunk.
+    # storage and OOMed the host. The madvise-populate path and the chunked
+    # read fallback share the same window size, so this holds on whichever
+    # path the host kernel supports; every byte must be reported exactly
+    # once, including a trailing partial window.
     from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
     file = tmp_path / "model.safetensors"
-    payload = os.urandom(3 * 1024 + 137)  # not a multiple of the chunk size
+    payload = os.urandom(3 * 1024 + 137)  # not a multiple of the window size
     file.write_bytes(payload)
 
     reported: list[int] = []
@@ -317,6 +319,48 @@ def test_prefetch_one_file_reads_full_file_in_bounded_chunks(tmp_path, monkeypat
 
     assert sum(reported) == len(payload)
     assert max(reported) <= 1024
+
+
+def test_prefetch_one_file_chunked_fallback_when_populate_unsupported(tmp_path, monkeypatch):
+    # Force the MADV_POPULATE_READ path to report "unsupported" so the chunked
+    # readinto fallback is exercised even on kernels that support population.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+    monkeypatch.setattr(wl, "populate_file_pages", lambda *args, **kwargs: 0)
+    file = tmp_path / "model.safetensors"
+    payload = os.urandom(2 * 1024 + 57)
+    file.write_bytes(payload)
+
+    reported: list[int] = []
+    HfWeightLoader()._prefetch_one_file(str(file), report_progress=reported.append)
+
+    assert sum(reported) == len(payload)
+    assert max(reported) <= 1024
+
+
+def test_prefetch_one_file_resumes_reads_after_partial_populate(tmp_path, monkeypatch):
+    # If population stops early (e.g. a transient madvise failure), the
+    # chunked reads must resume from that offset: every byte prefetched and
+    # reported exactly once, none twice.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
+
+    def partial_populate(file_name, window_bytes, on_window=None):
+        if on_window is not None:
+            on_window(1024)
+        return 1024
+
+    monkeypatch.setattr(wl, "populate_file_pages", partial_populate)
+    file = tmp_path / "model.safetensors"
+    payload = os.urandom(3 * 1024 + 137)
+    file.write_bytes(payload)
+
+    reported: list[int] = []
+    HfWeightLoader()._prefetch_one_file(str(file), report_progress=reported.append)
+
+    assert sum(reported) == len(payload)
 
 
 def test_prefetch_one_file_missing_file_is_noop():
@@ -332,6 +376,10 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1024)
     monkeypatch.setattr(wl, "_PREFETCH_LOG_INTERVAL_SEC", 0.0)
+    # prefetch_files shards its input across local MPI ranks; pin to a single
+    # rank so the asserted file set does not depend on how tests are launched.
+    monkeypatch.setattr(wl, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(wl, "local_mpi_size", lambda: 1)
     files = []
     for i in range(3):
         file = tmp_path / f"model-0000{i}-of-00003.safetensors"

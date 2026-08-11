@@ -12,20 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-memory ``madvise`` helpers for releasing mmap-backed page cache.
+"""Host-memory ``mmap``/``madvise`` helpers for file-backed page cache.
 
-These utilities advise the OS to drop the physical pages backing read-only
-file-backed mmap regions (e.g. safetensors shards) so the resident file cache
-cannot grow unbounded during weight load on host-memory-constrained nodes.
-Callers must establish that a tensor is file-backed before using
-``advise_tensor_pageout``.
+These utilities either advise the OS to drop the physical pages backing
+read-only file-backed mmap regions (e.g. safetensors shards) so the resident
+file cache cannot grow unbounded during weight load on host-memory-constrained
+nodes, or conversely fault a file's pages into the page cache ahead of use
+(``populate_file_pages``). Callers must establish that a tensor is file-backed
+before using ``advise_tensor_pageout``.
 """
 
 import ctypes
 import mmap
+import os
+from collections.abc import Callable
 
 __all__ = [
     "madvise_range",
+    "populate_file_pages",
     "pageout_file_backed_regions",
     "advise_tensor_pageout",
 ]
@@ -33,6 +37,8 @@ __all__ = [
 _MADV_DONTNEED = 4
 _MADV_PAGEOUT = 21
 _MADV_ADVICE_BY_MODE = {"dontneed": _MADV_DONTNEED, "pageout": _MADV_PAGEOUT}
+_MADV_POPULATE_READ = 22  # Requires Linux >= 5.14.
+_MMAP_FAILED = ctypes.c_void_p(-1).value
 
 
 def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
@@ -71,6 +77,69 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     if ret != 0:
         err = ctypes.get_errno()
         raise OSError(err, f"madvise() failed with errno={err}")
+
+
+def populate_file_pages(
+    file_name: str, window_bytes: int, on_window: Callable[[int], None] | None = None
+) -> int:
+    """Fault a file's pages into the OS page cache without copying to user space.
+
+    Maps the file read-only and issues ``madvise(MADV_POPULATE_READ)`` over it in
+    ``window_bytes`` windows (``window_bytes`` must be a multiple of the page size).
+    Windowing keeps per-call ``mmap_lock`` hold times short, so concurrent
+    ``mmap``/``munmap`` callers in the process are not stalled behind one long
+    populate, and gives callers progress granularity via ``on_window(num_bytes)``.
+
+    The advice is issued through ``ctypes`` rather than ``mmap.mmap.madvise``
+    deliberately: population blocks for the duration of the underlying file read,
+    and ``ctypes`` releases the GIL during the call while the ``mmap`` method holds
+    it, which would serialize concurrent populating threads.
+
+    Returns the number of bytes populated. ``MADV_POPULATE_READ`` requires
+    Linux >= 5.14 and an mmap-capable filesystem; when unsupported (or on any other
+    failure) population stops early -- typically returning 0 -- and the caller is
+    expected to warm the remaining bytes by other means.
+    """
+    try:
+        fd = os.open(file_name, os.O_RDONLY)
+    except OSError:
+        return 0
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            return 0
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p  # Default int restype truncates on 64-bit.
+        libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
+        if addr in (None, _MMAP_FAILED):
+            return 0
+    finally:
+        os.close(fd)  # The mapping keeps its own reference to the file.
+    populated = 0
+    try:
+        while populated < size:
+            length = min(window_bytes, size - populated)
+            ret = libc.madvise(
+                ctypes.c_void_p(addr + populated),
+                ctypes.c_size_t(length),
+                ctypes.c_int(_MADV_POPULATE_READ),
+            )
+            if ret != 0:
+                break
+            populated += length
+            if on_window is not None:
+                on_window(length)
+    finally:
+        libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+    return populated
 
 
 def pageout_file_backed_regions(path_substring: str, mode: str = "dontneed") -> None:
