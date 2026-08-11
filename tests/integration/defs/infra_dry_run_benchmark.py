@@ -228,8 +228,13 @@ def _worker_import_module():
     MGMN workers run from this file's directory and can import it only as
     ``infra_dry_run_benchmark``.  Both RemoteMpiCommSession and multiprocessing
     serialize callables, so worker functions must come from that deterministic
-    top-level module.
+    top-level module and its directory must be inherited by spawn children.
     """
+    module_path = Path(__file__).resolve()
+    module_dir = str(module_path.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+
     module_name = Path(__file__).stem
     module = sys.modules.get(module_name)
     if module is None:
@@ -245,7 +250,7 @@ def _worker_import_module():
             raise
     else:
         module_file = getattr(module, "__file__", None)
-        if module_file is None or Path(module_file).resolve() != Path(__file__).resolve():
+        if module_file is None or Path(module_file).resolve() != module_path:
             raise RuntimeError(f"{module_name} resolves to {module_file}, expected {__file__}")
     return module
 

@@ -371,6 +371,66 @@ class InfraDryRunPytestTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout.decode().strip(), "infra_dry_run_benchmark")
 
+    def test_top_level_worker_module_is_importable_by_a_real_spawn_child(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            (temp_path / "torch.py").write_text("# import-only torch stub\n")
+            driver = temp_path / "spawn_driver.py"
+            driver.write_text(
+                textwrap.dedent(
+                    f"""
+                    import importlib.util
+                    import multiprocessing
+                    import sys
+                    from pathlib import Path
+
+                    benchmark_path = Path({str(BENCHMARK_PATH)!r})
+
+                    def main():
+                        spec = importlib.util.spec_from_file_location(
+                            "defs.infra_dry_run_benchmark", benchmark_path
+                        )
+                        module = importlib.util.module_from_spec(spec)
+                        sys.modules[spec.name] = module
+                        spec.loader.exec_module(module)
+
+                        module_dir = benchmark_path.parent.resolve()
+                        sys.path[:] = [
+                            entry
+                            for entry in sys.path
+                            if Path(entry or ".").resolve() != module_dir
+                        ]
+                        worker_module = module._worker_import_module()
+                        process = multiprocessing.get_context("spawn").Process(
+                            target=worker_module._required_int,
+                            args=({{"VALUE": "7"}}, "VALUE"),
+                        )
+                        process.start()
+                        process.join(30)
+                        if process.is_alive():
+                            process.terminate()
+                            process.join()
+                            raise RuntimeError("spawn child did not finish")
+                        raise SystemExit(process.exitcode)
+
+                    if __name__ == "__main__":
+                        main()
+                    """
+                )
+            )
+            env = {**os.environ, "PYTHONPATH": temp_dir}
+            result = subprocess.run(
+                [sys.executable, str(driver)],
+                cwd=temp_dir,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_llmapi_worker_binds_rank_environment_to_the_mpi_communicator(self):
         communicator = SimpleNamespace(Get_rank=lambda: 1, Get_size=lambda: 2)
         mpi4py = SimpleNamespace(MPI=SimpleNamespace(COMM_WORLD=communicator))
