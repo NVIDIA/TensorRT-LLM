@@ -11,6 +11,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.flashinfer_utils import get_sparse_mla_op
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from .interface import Fmha
 
@@ -31,7 +32,13 @@ def is_flashinfer_sparse_mla_enabled(algorithm: Optional[str]) -> bool:
 
     try:
         get_sparse_mla_op()
-    except (AttributeError, ImportError):
+    except (AttributeError, ImportError) as error:
+        logger.warning(
+            "FlashInfer sparse MLA on SM120/SM121 requires private symbol "
+            "flashinfer.mla._sparse_mla_sm120._sparse_mla_sm120_paged_attention "
+            "from the pinned flashinfer-python==0.6.16 build; backend disabled: "
+            f"{error}"
+        )
         return False
     return True
 

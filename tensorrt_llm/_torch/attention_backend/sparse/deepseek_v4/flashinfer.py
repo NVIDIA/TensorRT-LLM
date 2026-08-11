@@ -12,14 +12,16 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
 from ...interface import AttentionForwardArgs, AttentionInputType
-from ..flashinfer_utils import get_sparse_mla_op
+from ..flashinfer_utils import (
+    SPARSE_MLA_SPLIT_KV_TILE,
+    allocate_sparse_mla_split_workspace,
+    get_sparse_mla_op,
+)
 from . import footer_scale_kv
 from .cache_manager import get_token_bytes
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
 from .params import DeepseekV4AttentionType
-
-_KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
 
 
 def _footer_scale_pool_2d(
@@ -205,34 +207,24 @@ def run_flashinfer_sparse_mla(
         extra_pool = _footer_scale_pool_2d(
             metadata, DeepseekV4AttentionType.COMPRESS, attn.compress_ratio
         )
-        num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE + (
-            extra_indices.shape[1] + _KV_SPLIT_TILE - 1
-        ) // _KV_SPLIT_TILE
+        num_splits = (window + SPARSE_MLA_SPLIT_KV_TILE - 1) // SPARSE_MLA_SPLIT_KV_TILE + (
+            extra_indices.shape[1] + SPARSE_MLA_SPLIT_KV_TILE - 1
+        ) // SPARSE_MLA_SPLIT_KV_TILE
     else:
         extra_indices = None
         extra_lens = None
         extra_pool = None
-        num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
+        num_splits = (window + SPARSE_MLA_SPLIT_KV_TILE - 1) // SPARSE_MLA_SPLIT_KV_TILE
 
     out_view = output.view(num_tokens, attn.num_heads, attn.head_dim)
     out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
-    if num_tokens <= 64:
-        mid_out = torch.empty(
-            num_tokens,
-            attn.num_heads,
-            num_splits,
-            attn.head_dim,
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        mid_lse = torch.empty(
-            (num_tokens, attn.num_heads, num_splits),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    else:
-        mid_out = None
-        mid_lse = None
+    mid_out, mid_lse = allocate_sparse_mla_split_workspace(
+        num_tokens=num_tokens,
+        num_heads=attn.num_heads,
+        num_splits=num_splits,
+        value_dim=attn.head_dim,
+        device=q.device,
+    )
 
     sm_scale = 1.0 / (attn.q_scaling * math.sqrt(attn.head_dim))
     swa_pool = _footer_scale_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1)

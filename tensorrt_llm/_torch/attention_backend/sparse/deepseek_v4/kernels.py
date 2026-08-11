@@ -239,6 +239,10 @@ def deepseek_v4_local_to_global_indices(
     assert swa_local_indices.shape[0] == num_tokens
 
     has_compressed = compress_ratio > 1
+    if split_extra and has_compressed and num_compressed_indices == 0:
+        raise ValueError(
+            "split_extra=True with compressed inputs requires num_compressed_indices > 0"
+        )
 
     # Compute SWA buffer offset relative to swa_pool_base_ptr in tokens
     swa_buffer_offset_in_tokens = (swa_buffer_ptr - swa_pool_base_ptr) // token_stride

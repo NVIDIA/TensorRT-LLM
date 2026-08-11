@@ -292,7 +292,8 @@ class DSACacheManager(KVCacheManager):
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        if kwargs["kv_cache_config"].dtype == "fp8_ds_mla":
+        kv_cache_config = kwargs.get("kv_cache_config")
+        if kv_cache_config is not None and kv_cache_config.dtype == "fp8_ds_mla":
             from .inline_scale_kv import TOKEN_BYTES
 
             mem_per_token = num_attention_layers * TOKEN_BYTES

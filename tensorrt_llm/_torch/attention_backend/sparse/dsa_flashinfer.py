@@ -12,9 +12,11 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from ..interface import AttentionForwardArgs, AttentionInputType
 from . import inline_scale_kv
 from .dsa import DSAtrtllmAttentionMetadata
-from .flashinfer_utils import get_sparse_mla_op
-
-_KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
+from .flashinfer_utils import (
+    SPARSE_MLA_SPLIT_KV_TILE,
+    allocate_sparse_mla_split_workspace,
+    get_sparse_mla_op,
+)
 
 
 def _inline_scale_pool_paged(metadata: DSAtrtllmAttentionMetadata) -> torch.Tensor:
@@ -158,24 +160,14 @@ def run_flashinfer_sparse_mla(
 
     out_view = output.view(num_tokens, attn.num_heads, kv_lora_rank)
     out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
-    if num_tokens <= 64:
-        num_splits = (topk + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
-        mid_out = torch.empty(
-            num_tokens,
-            attn.num_heads,
-            num_splits,
-            kv_lora_rank,
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        mid_lse = torch.empty(
-            (num_tokens, attn.num_heads, num_splits),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    else:
-        mid_out = None
-        mid_lse = None
+    num_splits = (topk + SPARSE_MLA_SPLIT_KV_TILE - 1) // SPARSE_MLA_SPLIT_KV_TILE
+    mid_out, mid_lse = allocate_sparse_mla_split_workspace(
+        num_tokens=num_tokens,
+        num_heads=attn.num_heads,
+        num_splits=num_splits,
+        value_dim=kv_lora_rank,
+        device=q.device,
+    )
 
     qk_head_dim = attn.mla_params.qk_nope_head_dim + attn.mla_params.qk_rope_head_dim
     sm_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_head_dim))

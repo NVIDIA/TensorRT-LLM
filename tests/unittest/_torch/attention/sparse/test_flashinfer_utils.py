@@ -3,18 +3,126 @@
 
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.fmha import flashinfer_sparse_mla
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
 )
 from tensorrt_llm._torch.attention_backend.sparse import dsa_flashinfer, inline_scale_kv
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.kernels import (
+    deepseek_v4_local_to_global_indices,
+)
+from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.flashinfer_utils import (
+    allocate_sparse_mla_split_workspace,
+)
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.mapping import Mapping
+
+
+def test_sm120_sparse_mla_requires_packed_cache_dtype() -> None:
+    attn = SimpleNamespace(
+        fmha_libs=[],
+        is_mla_enable=True,
+        kv_cache_dtype="auto",
+        sparse_params=SimpleNamespace(algorithm="dsa"),
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.trtllm.get_sm_version",
+            return_value=120,
+        ),
+        pytest.raises(ValueError, match="requires kv_cache_config.dtype='fp8_ds_mla'"),
+    ):
+        TrtllmAttention.create_fmha_libs(attn)
+
+
+def test_sparse_mla_split_workspace_follows_kernel_threshold() -> None:
+    mid_out, mid_lse = allocate_sparse_mla_split_workspace(
+        num_tokens=64,
+        num_heads=8,
+        num_splits=3,
+        value_dim=512,
+        device=torch.device("cpu"),
+    )
+
+    assert mid_out is not None and mid_out.shape == (64, 8, 3, 512)
+    assert mid_lse is not None and mid_lse.shape == (64, 8, 3)
+
+    assert allocate_sparse_mla_split_workspace(
+        num_tokens=65,
+        num_heads=8,
+        num_splits=3,
+        value_dim=512,
+        device=torch.device("cpu"),
+    ) == (None, None)
+
+
+def test_flashinfer_sparse_mla_missing_private_op_warns() -> None:
+    with (
+        patch.object(flashinfer_sparse_mla, "get_sm_version", return_value=120),
+        patch.object(
+            flashinfer_sparse_mla,
+            "get_sparse_mla_op",
+            side_effect=ImportError("missing private op"),
+        ),
+        patch.object(flashinfer_sparse_mla.logger, "warning") as warning,
+    ):
+        assert flashinfer_sparse_mla.is_flashinfer_sparse_mla_enabled("dsa") is False
+
+    warning.assert_called_once()
+    assert "_sparse_mla_sm120_paged_attention" in warning.call_args.args[0]
+
+
+def test_split_extra_rejects_empty_compressed_output() -> None:
+    req_id = torch.zeros(1, dtype=torch.int32)
+    block_table = torch.zeros((1, 1), dtype=torch.int32)
+    indices = torch.zeros((1, 1), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="split_extra.*num_compressed_indices"):
+        deepseek_v4_local_to_global_indices(
+            req_id=req_id,
+            block_table_swa=block_table,
+            swa_local_indices=indices,
+            swa_pool_base_ptr=0,
+            swa_buffer_ptr=0,
+            tokens_per_block=64,
+            token_stride=1,
+            block_table_compressed=block_table,
+            compressed_local_indices=indices,
+            compress_ratio=4,
+            num_compressed_indices=0,
+            split_extra=True,
+        )
+
+
+def test_dsa_cache_size_estimation_allows_missing_kv_cache_config() -> None:
+    class FakeModelConfig:
+        pretrained_config = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+        sparse_attention_config = DeepSeekSparseAttentionConfig(index_head_dim=128)
+        quant_config = None
+
+        @staticmethod
+        def get_num_attention_layers() -> int:
+            return 2
+
+    assert (
+        DSACacheManager.get_cache_size_per_token(
+            FakeModelConfig(),
+            Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        )
+        > 0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
