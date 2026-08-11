@@ -433,6 +433,49 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
             reasoning_content = reasoning_content[len(self.reasoning_start):]
         return self._create_reasoning_end_result(content, reasoning_content)
 
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        # Streaming counterpart of parse for the bare-sentinel shape. The
+        # inherited DeepSeekR1Parser.parse_delta returns the whole buffer as
+        # content when no opening tag is found; M3's non-thinking shape is
+        # `</mm:think>{content}` with no opening tag, so the bare sentinel
+        # would leak into the first content delta. Only that no-opening-tag
+        # case is handled here (partition on the closing tag, mirroring
+        # parse, and strip an optional leading opening tag); every other
+        # shape - the common `<mm:think>...</mm:think>` flow, in-reasoning
+        # accumulation, and the partial-delimiter wait - is delegated to
+        # the inherited parser unchanged.
+        full = self._buffer + delta_text
+        if (not self.in_reasoning
+                and full.find(self.reasoning_start) == -1
+                and not self.reasoning_start.startswith(full)
+                and not self.reasoning_end.startswith(full)):
+            # No opening tag and the buffer is not a prefix of either
+            # delimiter: plain content or the bare sentinel. Partition on
+            # the closing tag so a leading bare sentinel is stripped rather
+            # than leaked as content.
+            self._buffer = full
+            end_idx = full.find(self.reasoning_end)
+            if end_idx == -1:
+                # Hold back a trailing prefix of the closing tag (a tag
+                # split across chunks) and emit the rest as content,
+                # matching parse's no-closing-tag branch.
+                last_idx = full.rfind(self.reasoning_end[0])
+                if last_idx != -1 and self.reasoning_end.startswith(
+                        full[last_idx:]):
+                    self._buffer = full[last_idx:]
+                    return ReasoningParserResult(content=full[:last_idx])
+                self._buffer = ""
+                return ReasoningParserResult(content=full)
+            reasoning_content = full[:end_idx]
+            if reasoning_content.startswith(self.reasoning_start):
+                reasoning_content = reasoning_content[
+                    len(self.reasoning_start):]
+            content = full[end_idx + len(self.reasoning_end):]
+            self._buffer = ""
+            return self._create_reasoning_end_result(content,
+                                                    reasoning_content)
+        return super().parse_delta(delta_text)
+
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3": "qwen3",
