@@ -608,6 +608,18 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 **机制(算术闭合)**:DSv4 的窗口池组(SWA+COMPRESSOR_KV+COMPRESSOR_SCORE,窗口=128+max_draft_len=133 token)是固定槽分配器,槽数被钉在下限 `min_slots≈1.05×maxbs`——①比例定容用 `typical_seq_len=max_seq_len`(serve 推断 1M)把配额喂给全注意力池,窗口池饿到下限(kv_cache_manager_v2.py:1775-1779);②下限按 history=0 的"刚起步 decode"建模 → 每请求 1 块(kv_cache_manager_v2.py:1803-1812 → _storage_manager.py:909-1001)。运行时窗口 133>块 128 → 每 gen 请求锁 2(偶 3)块(_life_cycle_registry.py:38-51)。**容量 = 1.05·maxbs/2.07 ≈ 0.51·maxbs**:maxbs=128 预测 63-65/实测 61-63;maxbs=256 预测 131-135/实测 131-136。配额不敏感(下限无配额项)、kv_util 0.014 是 token 口径(窗口池实为 100% 锁死)、首波满批(短 prompt 1 块,h>128 才要第二块)、spec 降级 vs no-spec 死锁(接受方差去相位 vs +1/步全队锁相集体撞边界)——全部观测闭合。字节估算器还漏了 +draft 窗口放大(cache_manager.py:1316-1326),但字节不是绑定资源。
 
+**C 方案实验判决(08-10 20:45,判别象限全齐)**:
+
+| 象限(Pro@DEP8,poetry 1024 burst)| 每步调度 | 结局 |
+|---|---|---|
+| spec, maxbs=128 | 60-63 | 优雅降级 |
+| spec, maxbs=256 | 115-128 | 健康 |
+| no-spec, maxbs=128 | 61 | **死锁崩溃** |
+| no-spec, maxbs=256 | 128×254 iter | 健康 |
+| **no-spec, maxbs=128 + `max_seq_len: 8192`** | **128×230 iter** | **健康,零死锁** |
+
+`max_seq_len` 显式设为真实值即解钉(推断值 1M 经 typical_seq_len 把窗口池饿到下限)——**C 方案(部署侧)验证通过,按用户决定采用**。部署规则:DSv4 serving 必须显式设 `max_seq_len`(或 `avg_seq_len`),且 `max_batch_size ≥ 目标并发/rank`(设了 max_seq_len 后无需 2×)。v2 定容的代码级修复(min-slots 稳态建模 / typical_seq_len 默认值 / 池钉死告警)属上游 KV-v2 关注面,与本 PR 分离,另开 PR 跟进。
+
 **修复**:A(首选)min-slots 按稳态 decode(2-3 块/请求)建模;B 估算器补 draft(须配 A);C `typical_seq_len` 不默认 max_seq_len / 部署侧显式设 max_seq_len 解钉(判别实验在跑)。上游三报:下限建模、估算器漏项、no-spec 高并发死锁崩溃(报错信息误导)。附:python-scheduler 旗标在 v2 下是 no-op(_util.py:2618),DSv4 强制 v2 管理器——当晚两条二分腿均为无效对照,已修订。
 
 ### 产品线终局判决:Pro@DEP8 置信度调度全面转正(08-10 13:50)
