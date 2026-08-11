@@ -52,6 +52,8 @@ Industry practitioners have recently introduced a growing body of work in this d
 
 ## Implementation
 
+The methodology above translates into three concrete artifacts: a trace format that records the structure of an agent run, a pipeline that collects and replays those traces, and the metrics computed from a replay. We describe the format first, since everything else is built around it.
+
 ### Trace Format
 
 Each agent run produces one compact JSON file holding a `trace_id` and an ordered `events` list. Because token content does not affect serving performance, a trace records only structure and sizes, never the underlying text, which keeps it small, readable, and shareable. The listing below abbreviates the opening of the Coder trace `matplotlib__matplotlib-23412`, one of the two representative traces followed later in this blog:
