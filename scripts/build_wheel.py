@@ -63,6 +63,8 @@ def _parse_linux_physical_cpu_count(
 
         try:
             processor_id = int(processor)
+            physical_id = int(physical_id)
+            core_id = int(core_id)
         except ValueError:
             return
 

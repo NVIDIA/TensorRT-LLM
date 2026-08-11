@@ -94,6 +94,28 @@ model name  : Example CPU
     )
 
 
+def test_parse_linux_physical_cpu_count_ignores_malformed_topology(
+    build_wheel_module: ModuleType,
+) -> None:
+    cpuinfo = """
+processor   : 0
+physical id : 0
+core id     : 0
+
+processor   : 1
+physical id : 0
+core id     : not-a-core
+
+processor   : 2
+physical id : not-a-socket
+core id     : 1
+"""
+
+    assert (
+        build_wheel_module._parse_linux_physical_cpu_count(cpuinfo, available_cpus={0, 1, 2}) == 1
+    )
+
+
 def test_get_available_cpu_count_prefers_physical_count(
     build_wheel_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
