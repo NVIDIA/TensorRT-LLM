@@ -230,6 +230,7 @@ class MockVisualGen:
             extra_param_specs=extra_param_specs
             or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
             supports_image_edit=supports_image_edit,
+            ref_slot_specs={},
         )
 
     def _maybe_batch(self, tensor, n):
@@ -1551,7 +1552,7 @@ class TestVideoGenerationSync:
         assert params.num_frames == int(2.0 * 8)
 
     def test_sync_video_generation_multipart(self, video_client, tmp_path):
-        """Multipart sync request with a real ``input_reference`` file."""
+        """Multipart sync request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (64, 64, 64)).save(str(ref_path))
         with open(ref_path, "rb") as f:
@@ -1563,7 +1564,7 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
@@ -1582,25 +1583,23 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # input_reference should have been written to media storage and passed
-        # through as params.image (a filesystem path).
+        # image_reference is written to media storage and passed through as a
+        # typed ImageRef carrying the filesystem path.
         params = video_client.mock_gen.last_params
-        assert isinstance(params.image, str)
-        assert params.image.endswith("_reference")
-        assert os.path.exists(params.image)
+        ref_path = params.image_reference[0].image
+        assert isinstance(ref_path, str)
+        assert ref_path.endswith("_image_ref_0")
+        assert os.path.exists(ref_path)
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client):
-        """A video ``input_reference`` rides through as the encoded payload on
-        the model-specific ``video`` extra param (V2V), byte-identical — the
-        serve never decodes video; the worker demuxes/NVDEC-decodes it.
-
-        Routed by container signature, so a checked-in H.264/MP4 fixture drives
-        the boundary directly.
+        """A ``video_reference`` upload is persisted byte-identical (V2V) — the
+        serve never decodes video; the worker demuxes/NVDEC-decodes the stored
+        file. A checked-in H.264/MP4 fixture drives the boundary directly.
         """
         payload = _V2V_FIXTURE_MP4.read_bytes()
         with open(_V2V_FIXTURE_MP4, "rb") as f:
@@ -1612,17 +1611,16 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+                files={"video_reference": ("ref.mp4", f, "video/mp4")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video content must NOT land on params.image; it rides the
-        # model-specific ``video`` extra param as the untouched encoded bytes
-        # (the same intake the offline example's --video_path uses).
+        # Video conditioning arrives as a typed VideoRef holding a stored path;
+        # no image_reference is set, and the encoded bytes are byte-identical.
         params = video_client.mock_gen.last_params
-        assert params.image is None
-        assert params.extra_params["video"] == payload
+        assert params.image_reference is None
+        assert Path(params.video_reference[0].video).read_bytes() == payload
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content matching no image or video container signature is rejected
@@ -1630,10 +1628,10 @@ class TestVideoGenerationSync:
         resp = video_client.post(
             "/v1/videos/sync",
             data={"prompt": "x"},
-            files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
+            files={"image_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
         )
         assert resp.status_code == 400
-        assert "not a recognized media container" in resp.text
+        assert "not a recognized image" in resp.text
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
@@ -1883,7 +1881,7 @@ class TestVideoGenerationAsync:
         )
 
     def test_async_video_multipart(self, video_client, tmp_path):
-        """Multipart async request with a real ``input_reference`` file."""
+        """Multipart async request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (16, 16, 16)).save(str(ref_path))
         with open(ref_path, "rb") as f:
@@ -1895,7 +1893,7 @@ class TestVideoGenerationAsync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 202
 

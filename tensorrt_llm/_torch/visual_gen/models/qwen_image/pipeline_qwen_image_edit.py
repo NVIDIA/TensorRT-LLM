@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
+from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
@@ -131,6 +132,15 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(1024, 1024)]
 
+    @property
+    def ref_slot_specs(self):
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="reference", min=1, max=None)],
+            ),
+        }
+
     def warmup_cache_key(self, height: int | None, width: int | None, **kwargs) -> tuple:
         return (height, width)
 
@@ -152,7 +162,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     @staticmethod
     def _load_edit_images(image: Any) -> list[Any]:
         if image is None:
-            raise ValueError("Qwen-Image-Edit requires params.image.")
+            raise ValueError("Qwen-Image-Edit requires image_reference.")
         images = image if isinstance(image, list) else [image]
         pil_images = []
         for item in images:
@@ -341,7 +351,8 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                 "QwenImageEditPlusPipeline currently supports num_images_per_prompt=1 only."
             )
         prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
-        pil_images = self._load_edit_images(params.image)
+        refs = params.image_reference
+        pil_images = self._load_edit_images([r.image for r in refs] if refs else None)
         height = params.height
         width = params.width
         if height is None or width is None:

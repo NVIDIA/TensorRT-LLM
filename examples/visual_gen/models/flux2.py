@@ -118,7 +118,7 @@ def main():
     # Start from per-model defaults and override only user-provided request fields.
     params = visual_gen.default_params
     params.num_images_per_prompt = args.num_images_per_prompt
-    params.image = args.image
+    params.image_reference = args.image
     if args.image:
         # Let FLUX.2 derive omitted dimensions from the first processed reference.
         params.height = args.height

@@ -385,6 +385,7 @@ class DiffusionExecutor:
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
                         "supports_image_edit": self.pipeline.supports_image_edit,
+                        "ref_slot_specs": self.pipeline.ref_slot_specs,
                     },
                 )
             )
@@ -428,7 +429,7 @@ class DiffusionExecutor:
         for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(params, field_name) and getattr(params, field_name) is None:
                 if (
-                    params.image is not None
+                    params.image_reference
                     and getattr(self.pipeline, "derive_output_size_from_reference", False) is True
                     and field_name in ("height", "width")
                 ):
@@ -721,6 +722,7 @@ class DiffusionRemoteClient:
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
         self.supports_image_edit: bool = False
+        self.ref_slot_specs: Dict = {}
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1077,6 +1079,7 @@ class DiffusionRemoteClient:
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
+                        self.ref_slot_specs = payload.get("ref_slot_specs", {})
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

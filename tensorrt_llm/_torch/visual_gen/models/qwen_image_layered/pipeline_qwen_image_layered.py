@@ -23,7 +23,12 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
@@ -245,6 +250,15 @@ class QwenImageLayeredPipeline(BasePipeline):
                     "Pack generated layers into one image grid. By default the pipeline "
                     "returns one image per layer."
                 ),
+            ),
+        }
+
+    @property
+    def ref_slot_specs(self):
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="reference", min=1, max=1)],
             ),
         }
 
@@ -758,8 +772,9 @@ class QwenImageLayeredPipeline(BasePipeline):
                 )
             negative = [n for n in negatives for _ in range(num_per)]
 
+        refs = req.params.image_reference
         return self.forward(
-            image=req.params.image,
+            image=refs[0].image if refs else None,
             prompt=prompts,
             negative_prompt=negative,
             height=req.params.height,

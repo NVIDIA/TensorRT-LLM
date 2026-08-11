@@ -63,7 +63,7 @@ def main() -> None:
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     params = visual_gen.default_params
-    params.image = args.image
+    params.image_reference = args.image
 
     output = visual_gen.generate(inputs=args.prompt, params=params)
     if output.image is not None and output.image.shape[0] > 1:

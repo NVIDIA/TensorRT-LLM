@@ -54,7 +54,9 @@ class TestVisualGenParamsValidation:
         assert params.num_frames is None
         assert params.frame_rate is None
         assert params.negative_prompt is None
-        assert params.image is None
+        assert params.image_reference is None
+        assert params.video_reference is None
+        assert params.audio_reference is None
         # ``image_cond_strength`` moved to per-pipeline ``extra_params``
         # (only LTX-2 consumes it). It is no longer a top-level field.
         assert not hasattr(params, "image_cond_strength")
@@ -99,23 +101,25 @@ class TestVisualGenParamsValidation:
         assert params.extra_params["stg_scale"] == 0.5
         assert params.extra_params["enhance_prompt"] is True
 
-    def test_image_accepts_str(self):
+    def test_image_reference_accepts_str(self):
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        params = VisualGenParams(image="/path/to/image.png")
-        assert params.image == "/path/to/image.png"
+        params = VisualGenParams(image_reference="/path/to/image.png")
+        assert params.image_reference[0].image == "/path/to/image.png"
+        assert params.image_reference[0].role is None
 
-    def test_image_accepts_bytes(self):
+    def test_image_reference_accepts_bytes(self):
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        params = VisualGenParams(image=b"\x89PNG")
-        assert params.image == b"\x89PNG"
+        params = VisualGenParams(image_reference=b"\x89PNG")
+        assert params.image_reference[0].image == b"\x89PNG"
 
-    def test_image_accepts_list(self):
+    def test_image_reference_accepts_list(self):
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        params = VisualGenParams(image=["/path/a.png", b"\x89PNG"])
-        assert len(params.image) == 2
+        params = VisualGenParams(image_reference=["/path/a.png", b"\x89PNG"])
+        assert len(params.image_reference) == 2
+        assert params.image_reference[0].image == "/path/a.png"
 
     def test_model_dump(self):
         from tensorrt_llm.visual_gen import VisualGenParams
@@ -299,9 +303,9 @@ class TestPipelineExtraParamSpecs:
         specs = WanImageToVideoPipeline.extra_param_specs.fget(
             _wan_mock(is_wan22_14b=True, is_wan22_5b=False)
         )
-        assert "last_image" in specs
+        # ``last_image`` moved to the typed image_reference 'last_frame' role.
+        assert "last_image" not in specs
         assert "guidance_scale_2" in specs
-        assert specs["last_image"].type == "str"
 
     def test_flux_no_extra_specs(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
@@ -394,7 +398,7 @@ class TestDefaultMerging:
 
         executor = self._make_mock_executor(Flux2Pipeline)
         executor.pipeline.derive_output_size_from_reference = True
-        req = self._make_request(image=b"encoded image")
+        req = self._make_request(image_reference=b"encoded image")
 
         self._merge(executor, req)
 
@@ -407,7 +411,7 @@ class TestDefaultMerging:
 
         executor = self._make_mock_executor(Flux2Pipeline)
         executor.pipeline.derive_output_size_from_reference = True
-        req = self._make_request(image=b"encoded image", height=768, width=512)
+        req = self._make_request(image_reference=b"encoded image", height=768, width=512)
 
         self._merge(executor, req)
 
@@ -818,8 +822,6 @@ class TestRequestValidation:
     def test_spec_validator_runs_at_preflight(self):
         """Per-param validators turn deterministic client errors into 400s at
         the boundary instead of worker-side failures (Cosmos3 conditioning)."""
-        import torch
-
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
         from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
 
@@ -832,16 +834,6 @@ class TestRequestValidation:
 
         # Valid values pass.
         _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
-        # ``video`` carries encoded MP4/AVI bytes: a video signature passes,
-        # empty / non-video bytes are client errors, and anything that is not
-        # bytes (e.g. a decoded tensor) fails the type check.
-        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"})
-        with pytest.raises(ValueError, match="empty"):
-            _validate({"video": b""})
-        with pytest.raises(ValueError, match="not a recognized video container"):
-            _validate({"video": b"\x89PNG\r\n\x1a\n and not a video"})
-        with pytest.raises(ValueError, match="expected type 'bytes'"):
-            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
 
         with pytest.raises(ValueError, match="non-negative"):
             _validate({"condition_video_latent_indexes": [0, -1]})
@@ -887,8 +879,6 @@ class TestRequestValidation:
         specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
         with pytest.raises(ValueError, match="first or last"):
             specs["condition_video_keep"].validator("middle")
-        with pytest.raises(ValueError, match="not a recognized video container"):
-            specs["video"].validator(b"garbage bytes")
 
     # --- unsupported universal fields ---
 
@@ -929,13 +919,14 @@ class TestRequestValidation:
         with pytest.raises(ValueError, match="Unknown extra_params"):
             self._validate(executor, req)
 
-    def test_image_not_checked_by_validator(self):
-        """image is a conditioning input — validated at runtime by infer(), not here."""
+    def test_image_reference_not_checked_without_ref_specs(self):
+        """Without ``ref_slot_specs``, image_reference is not role/arity checked
+        here — the pipeline's infer() consumes it at runtime."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
         executor = self._make_mock_executor(WanPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(image="/path/to/img.png")
-        # Should not raise — image validation is the pipeline's responsibility
+        req = self._make_request(image_reference="/path/to/img.png")
+        # Should not raise — ``_validate`` here passes no ref_slot_specs.
         self._merge_and_validate(executor, req)
 
     def test_num_frames_on_video_pipeline_ok(self):
@@ -946,14 +937,15 @@ class TestRequestValidation:
         req = self._make_request(num_frames=81)
         self._merge_and_validate(executor, req)
 
-    def test_image_on_i2v_pipeline_ok(self):
-        """image is declared by WanImageToVideoPipeline, should not raise."""
+    def test_image_reference_on_i2v_pipeline_ok(self):
+        """image_reference is consumed by WanImageToVideoPipeline; validating
+        without ref_slot_specs should not raise."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
             WanImageToVideoPipeline,
         )
 
         executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(image="/path/to/img.png")
+        req = self._make_request(image_reference="/path/to/img.png")
         self._merge_and_validate(executor, req)
 
     def test_none_fields_not_flagged(self):
@@ -1009,15 +1001,10 @@ class TestRequestValidation:
         self._merge_and_validate(executor, req)
 
     def test_wrong_type_str_extra_param(self):
-        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
-            WanImageToVideoPipeline,
-        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
-        req = self._make_request(
-            image="/img.png",
-            extra_params={"last_image": 123},
-        )
+        executor = self._make_mock_executor(LTX2Pipeline)
+        req = self._make_request(extra_params={"output_type": 123})
         with pytest.raises(ValueError, match="expected type 'str'"):
             self._merge_and_validate(executor, req)
 
@@ -1375,7 +1362,7 @@ class TestEngineFailureTransport:
         req = DiffusionRequest(
             request_id=8,
             prompt=["test"],
-            params=VisualGenParams(image=b"encoded image"),
+            params=VisualGenParams(image_reference=b"encoded image"),
         )
 
         DiffusionExecutor.process_request(executor, req)

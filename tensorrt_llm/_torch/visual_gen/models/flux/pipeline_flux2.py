@@ -44,7 +44,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     register_extractor_from_config,
 )
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
@@ -370,12 +370,23 @@ class Flux2Pipeline(BasePipeline):
             "max_sequence_length": 512,
         }
 
+    @property
+    def ref_slot_specs(self):
+        # Reference image(s): single "reference" role, count 1..N (multi-subject).
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="reference", min=1, max=None)],
+            )
+        }
+
     def prepare_request(self, req: Any) -> None:
         """Load and preprocess reference images before warmup bookkeeping."""
-        if req.params.image is None:
+        refs = req.params.image_reference
+        if not refs:
             return
 
-        reference_images = self._load_reference_images(req.params.image)
+        reference_images = self._load_reference_images([r.image for r in refs])
         condition_images = self._preprocess_reference_images(reference_images)
         req.params.height, req.params.width = self._resolve_target_dimensions(
             req.params.height,
@@ -386,6 +397,7 @@ class Flux2Pipeline(BasePipeline):
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
+        refs = req.params.image_reference
         return self.forward(
             prompt=req.prompt,
             height=req.params.height,
@@ -395,7 +407,7 @@ class Flux2Pipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             num_images_per_prompt=req.params.num_images_per_prompt,
-            image=req.params.image,
+            image=[r.image for r in refs] if refs else None,
             _condition_images=req.prepared_inputs.get("condition_images"),
         )
 

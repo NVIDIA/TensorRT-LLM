@@ -38,7 +38,7 @@ server_configs:
         max_concurrency: 1
         num_prompts: 1
         extra_body:
-          input_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=
+          image_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=
 
   - name: ltx2_2stage_bf16_t2v_cfg2_ulysses4_compile_on
     model_name: ltx2_bf16
@@ -98,4 +98,4 @@ server_configs:
         max_concurrency: 1
         num_prompts: 1
         extra_body:
-          input_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=
+          image_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=

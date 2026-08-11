@@ -13,11 +13,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
+
+Role = Literal["reference", "first_frame", "last_frame"]
+
+
+@set_api_status("prototype")
+class ImageRef(StrictBaseModel):
+    """A single image reference carried by ``image_reference``.
+
+    ``role`` is required only when the target model can accept the same
+    modality in more than one role (e.g. first + last frame); otherwise the
+    pipeline knows the image's meaning and ``role`` may be omitted.
+    """
+
+    image: Union[str, bytes] = Field(
+        description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
+    )
+    role: Optional[Role] = Field(
+        default=None, description="``reference`` | ``first_frame`` | ``last_frame``."
+    )
+
+
+@set_api_status("prototype")
+class VideoRef(StrictBaseModel):
+    """A single video reference carried by ``video_reference`` (always ``reference`` role)."""
+
+    video: Union[str, bytes] = Field(
+        description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
+    )
+
+
+@set_api_status("prototype")
+class AudioRef(StrictBaseModel):
+    """A single audio reference carried by ``audio_reference`` (always ``reference`` role)."""
+
+    audio: Union[str, bytes] = Field(
+        description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
+    )
+
+
+def _normalize_refs(value: Any, ref_cls: type, field: str) -> Optional[list]:
+    """Coerce a reference field to ``list[ref_cls]`` (or ``None``).
+
+    Accepts a bare path/bytes, a single ref object, or a list mixing the two;
+    a bare path/bytes ``x`` becomes ``ref_cls(**{field: x})``.
+    """
+    if value is None:
+        return None
+    items = value if isinstance(value, list) else [value]
+    return [x if isinstance(x, ref_cls) else ref_cls(**{field: x}) for x in items]
 
 
 @set_api_status("prototype")
@@ -78,9 +127,38 @@ class VisualGenParams(StrictBaseModel):
 
     # Conditioning inputs
     negative_prompt: Optional[str] = Field(default=None, description="Negative prompt for CFG.")
-    image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
-        default=None, description="Reference image(s) for I2V/I2I."
+    # Per-modality reference inputs. A bare path/bytes, a single ref, or a
+    # list; normalized to ``list[*Ref]``. ``image_reference`` carries an
+    # optional per-item ``role`` (first_frame / last_frame / reference);
+    # video/audio references are always the single ``reference`` role.
+    image_reference: Optional[Union[str, bytes, ImageRef, List[Union[str, bytes, ImageRef]]]] = (
+        Field(
+            default=None,
+            description="Reference image(s) for I2V/I2I; normalized to list[ImageRef].",
+        )
     )
+    video_reference: Optional[Union[str, bytes, VideoRef, List[Union[str, bytes, VideoRef]]]] = (
+        Field(default=None, description="Reference video(s) for V2V; normalized to list[VideoRef].")
+    )
+    audio_reference: Optional[Union[str, bytes, AudioRef, List[Union[str, bytes, AudioRef]]]] = (
+        Field(default=None, description="Reference audio(s); normalized to list[AudioRef].")
+    )
+
+    @field_validator("image_reference", mode="after")
+    @classmethod
+    def _norm_image_reference(cls, v):
+        return _normalize_refs(v, ImageRef, "image")
+
+    @field_validator("video_reference", mode="after")
+    @classmethod
+    def _norm_video_reference(cls, v):
+        return _normalize_refs(v, VideoRef, "video")
+
+    @field_validator("audio_reference", mode="after")
+    @classmethod
+    def _norm_audio_reference(cls, v):
+        return _normalize_refs(v, AudioRef, "audio")
+
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")
 
@@ -139,6 +217,7 @@ def validate_visual_gen_params(
     *,
     declared_defaults: Optional[Dict[str, Any]],
     extra_param_specs: Dict[str, Any],
+    ref_slot_specs: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Validate *params* against pipeline-declared defaults and extra specs.
 
@@ -227,6 +306,47 @@ def validate_visual_gen_params(
                     messages.append(
                         f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
                     )
+
+    # --- reference role / arity checks (duck-typed RefSlotSpec) ---
+    # ``ref_slot_specs`` maps a reference field name to a spec exposing
+    # ``.roles`` (a list of role specs with ``.role`` / ``.min`` / ``.max``).
+    # role is required only when a modality declares more than one role;
+    # otherwise the single declared role is inferred. Reference fields are
+    # already normalized to ``list[*Ref]`` by the field validators.
+    if ref_slot_specs:
+        for field in ("image_reference", "video_reference", "audio_reference"):
+            refs = getattr(params, field, None)
+            if not refs:
+                continue
+            spec = ref_slot_specs.get(field)
+            if spec is None:
+                messages.append(f"'{field}' is not accepted by the loaded pipeline.")
+                continue
+            role_specs = list(spec.roles)
+            allowed = {rs.role for rs in role_specs}
+            role_required = len(role_specs) > 1
+            counts: Dict[str, int] = {}
+            for r in refs:
+                role = getattr(r, "role", None)
+                if role is None:
+                    if role_required:
+                        messages.append(
+                            f"{field}: 'role' is required for this model "
+                            f"(one of {sorted(allowed)})."
+                        )
+                        continue
+                    role = role_specs[0].role
+                if role not in allowed:
+                    messages.append(
+                        f"{field}: role '{role}' not supported (allowed: {sorted(allowed)})."
+                    )
+                    continue
+                counts[role] = counts.get(role, 0) + 1
+            for rs in role_specs:
+                n = counts.get(rs.role, 0)
+                if n < rs.min or (rs.max is not None and n > rs.max):
+                    bound = f"{rs.min}..{'inf' if rs.max is None else rs.max}"
+                    messages.append(f"{field} role '{rs.role}': expected {bound}, got {n}.")
 
     if not messages:
         return

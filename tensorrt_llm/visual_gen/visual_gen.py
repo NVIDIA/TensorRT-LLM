@@ -28,7 +28,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     run_diffusion_worker,
 )
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
-from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.output import VisualGenOutput
@@ -38,6 +38,7 @@ __all__ = [
     "VisualGen",
     "VisualGenParams",
     "ExtraParamSchema",
+    "RefSlotSpec",
     "VisualGenResult",
 ]
 from tensorrt_llm.llmapi.utils import set_api_status
@@ -292,6 +293,16 @@ class VisualGen:
         return self.executor.extra_param_specs
 
     @property
+    def ref_slot_specs(self) -> Dict[str, "RefSlotSpec"]:
+        """Reference slots the loaded pipeline accepts.
+
+        Maps ``image_reference`` / ``video_reference`` / ``audio_reference`` to
+        a ``RefSlotSpec`` (accepted roles + per-role counts). Empty when the
+        pipeline takes no reference inputs.
+        """
+        return self.executor.ref_slot_specs
+
+    @property
     def default_params(self) -> "VisualGenParams":
         """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
 
@@ -413,6 +424,7 @@ class VisualGen:
                 resolved_params,
                 declared_defaults=self.executor.default_generation_params,
                 extra_param_specs=self.executor.extra_param_specs,
+                ref_slot_specs=self.executor.ref_slot_specs,
             )
         else:
             resolved_params = self.default_params

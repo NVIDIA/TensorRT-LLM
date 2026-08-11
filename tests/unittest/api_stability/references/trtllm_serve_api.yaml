@@ -1471,9 +1471,21 @@ models:
         default: null
         status: stable
         required: false
-      input_reference:
+      image_reference:
         kind: extension
-        type: Optional[Union[str, UploadFile]]
+        type: Optional[Union[str, UploadFile, ImageReferenceItem, List[Union[str, ImageReferenceItem]]]]
+        default: null
+        status: prototype
+        required: false
+      video_reference:
+        kind: extension
+        type: Optional[Union[str, UploadFile, VideoReferenceItem, List[Union[str, VideoReferenceItem]]]]
+        default: null
+        status: prototype
+        required: false
+      audio_reference:
+        kind: extension
+        type: Optional[Union[str, UploadFile, AudioReferenceItem, List[Union[str, AudioReferenceItem]]]]
         default: null
         status: prototype
         required: false

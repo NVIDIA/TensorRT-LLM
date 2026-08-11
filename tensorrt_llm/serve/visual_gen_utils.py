@@ -107,21 +107,107 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def _read_reference_payload(reference) -> bytes:
-    """Read the ``input_reference`` payload (base64 JSON or multipart file).
+def _read_reference_payload(reference: str) -> bytes:
+    """Decode one base64 (optionally ``data:`` URI) reference string to bytes.
 
     Payload size is deliberately not checked here: encoded size is not part
     of the request-validity contract, and body limits belong to the
     proxy/ASGI deployment layer (HTTP 413). Base64 decodes strictly so
     malformed encodings — not sizes — are rejected.
     """
-    if isinstance(reference, str):
-        try:
-            return base64.b64decode(reference, validate=True)
-        except ValueError as exc:
-            # binascii.Error subclasses ValueError.
-            raise ValueError("input_reference is not valid base64 data.") from exc
-    return reference.file.read()
+    data = reference
+    if data.startswith("data:"):
+        comma = data.find(",")
+        if comma == -1:
+            raise ValueError("reference data: URI is malformed (missing comma).")
+        data = data[comma + 1 :]
+    try:
+        return base64.b64decode(data, validate=True)
+    except ValueError as exc:
+        # binascii.Error subclasses ValueError.
+        raise ValueError("reference is not valid base64 data.") from exc
+
+
+def _reference_payload_and_role(ref, data_field: str) -> tuple[bytes, Optional[str]]:
+    """Extract ``(payload_bytes, role)`` from one raw HTTP reference.
+
+    ``ref`` is a base64/data-URI string, a multipart ``UploadFile`` (has
+    ``.file``), or a reference item exposing ``data_field`` ('image'/'video')
+    and, for images, an optional ``role``.
+    """
+    role = getattr(ref, "role", None)
+    if isinstance(ref, str):
+        return _read_reference_payload(ref), role
+    if hasattr(ref, "file"):  # multipart UploadFile
+        return ref.file.read(), role
+    data = getattr(ref, data_field, None)
+    if not isinstance(data, str):
+        raise ValueError(f"{data_field}_reference item must carry a base64 '{data_field}' string.")
+    return _read_reference_payload(data), role
+
+
+def _materialize_reference(
+    payload: bytes, *, modality: str, ref_id: str, media_storage_path: Optional[str]
+) -> str:
+    """Content-validate a reference payload and persist it, returning its path.
+
+    HEIF/AVIF images are rejected on signature alone (Pillow support depends
+    on optional plugins the worker need not share). Video acceptance beyond the
+    container signature happens in the worker's NVDEC demux.
+    """
+    if modality == "image":
+        if sniff_media_kind(payload) != "image":
+            raise ValueError(
+                "image_reference is not a recognized image; supported inputs are PNG/JPEG."
+            )
+        if is_isobmff_image_bytes(payload):
+            raise ValueError(
+                "image_reference is a HEIF/AVIF image, which is not a supported "
+                "reference format; convert it to PNG or JPEG."
+            )
+    elif modality == "video":
+        if sniff_media_kind(payload) != "video":
+            raise ValueError(
+                "video_reference is not a recognized media container; supported "
+                "inputs are MP4/AVI video."
+            )
+    # audio: no signature sniffing (sniff_media_kind detects only image/video);
+    # the consuming pipeline validates the audio codec in its worker.
+    if media_storage_path is None:
+        raise ValueError(f"media_storage_path is required to store the {modality}_reference.")
+    ref_path = os.path.join(media_storage_path, ref_id)
+    with open(ref_path, "wb") as f:
+        f.write(payload)
+    return ref_path
+
+
+def _build_reference_list(
+    value, *, modality: str, data_field: str, ref_cls, id: str, media_storage_path: Optional[str]
+):
+    """Materialize an HTTP reference field into a list of typed ``*Ref`` objects.
+
+    ``value`` is None, a base64/data-URI string, a multipart ``UploadFile``, a
+    reference item, or a list of any of those. Each entry is decoded,
+    content-validated for ``modality``, persisted to a per-index path, and
+    wrapped as ``ref_cls`` (carrying ``role`` for images).
+    """
+    if value is None:
+        return None
+    raw_items = value if isinstance(value, list) else [value]
+    refs = []
+    for i, item in enumerate(raw_items):
+        payload, role = _reference_payload_and_role(item, data_field)
+        ref_path = _materialize_reference(
+            payload,
+            modality=modality,
+            ref_id=f"{id}_{data_field}_ref_{i}",
+            media_storage_path=media_storage_path,
+        )
+        kwargs = {data_field: ref_path}
+        if role is not None:
+            kwargs["role"] = role
+        refs.append(ref_cls(**kwargs))
+    return refs
 
 
 def _decode_inline_media(extra_params: dict | None, specs) -> None:
@@ -426,42 +512,43 @@ def parse_visual_gen_params(
                     "directly."
                 )
             params.num_frames = derived
-        if request.input_reference is not None:
-            payload = _read_reference_payload(request.input_reference)
-            kind = sniff_media_kind(payload)
-            if kind == "image":
-                # Rejected on signature alone, not on a failed decode:
-                # whether Pillow reads HEIF/AVIF depends on optional plugins,
-                # and the worker process need not have the same ones.
-                if is_isobmff_image_bytes(payload):
-                    raise ValueError(
-                        "input_reference is a HEIF/AVIF image, which is not "
-                        "a supported reference format; convert it to PNG or "
-                        "JPEG."
-                    )
-                # I2V: the stored image file is the cross-model contract.
-                # every I2V pipeline reads ``params.image`` as a path.
-                if media_storage_path is None:
-                    raise ValueError(
-                        "media_storage_path is required when input_reference is an image"
-                    )
-                ref_path = os.path.join(media_storage_path, f"{id}_reference")
-                with open(ref_path, "wb") as f:
-                    f.write(payload)
-                params.image = ref_path
-            elif kind == "video":
-                # V2V: encoded bytes pass through untouched; the worker
-                # demuxes and NVDEC-decodes them (acceptance happens there,
-                # so corrupt content behind a valid signature still fails as
-                # a client error).
-                if params.extra_params is None:
-                    params.extra_params = {}
-                params.extra_params["video"] = payload
-            else:
-                raise ValueError(
-                    "input_reference is not a recognized media container; "
-                    "supported inputs are PNG/JPEG images and MP4/AVI video."
-                )
+        # Reference inputs: materialize each transport (base64/data-URI/upload)
+        # to a stored file and hand the pipeline a typed ``*Ref`` carrying the
+        # local path. Decode stays model-specific in the worker. Local import:
+        # the visual_gen tree is already loaded in a VisualGen serving process,
+        # and this keeps it out of every plain-LLM process (see TYPE_CHECKING).
+        from tensorrt_llm.visual_gen.params import AudioRef, ImageRef, VideoRef
+
+        image_refs = _build_reference_list(
+            request.image_reference,
+            modality="image",
+            data_field="image",
+            ref_cls=ImageRef,
+            id=id,
+            media_storage_path=media_storage_path,
+        )
+        if image_refs:
+            params.image_reference = image_refs
+        video_refs = _build_reference_list(
+            request.video_reference,
+            modality="video",
+            data_field="video",
+            ref_cls=VideoRef,
+            id=id,
+            media_storage_path=media_storage_path,
+        )
+        if video_refs:
+            params.video_reference = video_refs
+        audio_refs = _build_reference_list(
+            request.audio_reference,
+            modality="audio",
+            data_field="audio",
+            ref_cls=AudioRef,
+            id=id,
+            media_storage_path=media_storage_path,
+        )
+        if audio_refs:
+            params.audio_reference = audio_refs
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _decode_inline_media(request.extra_params, generator.extra_param_specs)

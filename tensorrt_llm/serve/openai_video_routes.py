@@ -141,7 +141,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference file
         """
         request_received = raw_request.state.server_arrival_time
         try:
@@ -309,8 +309,8 @@ class _VideoRoutesMixin:
             for key in form:
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded file (``input_reference``) — pass through
-                    # so the conversion layer reads ``.file``.
+                    # Uploaded reference file (image_reference / video_reference)
+                    # — pass through so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -373,7 +373,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference file
         """
         request_received = raw_request.state.server_arrival_time
         try:
@@ -398,6 +398,7 @@ class _VideoRoutesMixin:
                 params,
                 declared_defaults=self.generator.executor.default_generation_params,
                 extra_param_specs=self.generator.executor.extra_param_specs,
+                ref_slot_specs=self.generator.executor.ref_slot_specs,
             )
             request_format = _resolve_tensor_only_format(
                 request.format, request.extra_params, self.generator.extra_param_specs

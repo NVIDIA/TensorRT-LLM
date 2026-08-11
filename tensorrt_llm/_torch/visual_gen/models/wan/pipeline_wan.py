@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
@@ -424,17 +424,22 @@ class WanPipeline(BasePipeline):
     def extra_param_specs(self):
         return get_wan_extra_param_specs(self.is_wan22_14b)
 
+    @property
+    def ref_slot_specs(self):
+        # Optional single conditioning image (first frame); T2V when absent.
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=1, max=1)],
+            )
+        }
+
     def infer(self, req):
         """Run inference with request parameters."""
         extra = req.params.extra_params or {}
         # Wan 2.2 TI2V-5B takes one conditioning image if provided
-        image = req.params.image
-        if isinstance(image, list):
-            if len(image) != 1:
-                raise ValueError(
-                    f"WanPipeline I2V expects a single image, got list of {len(image)}."
-                )
-            image = image[0]
+        refs = req.params.image_reference
+        image = refs[0].image if refs else None
 
         return self.forward(
             prompt=req.prompt,

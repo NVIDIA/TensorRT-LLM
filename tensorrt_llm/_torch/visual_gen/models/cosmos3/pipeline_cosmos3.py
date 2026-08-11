@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - tqdm is optional at runtime.
 
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import load_wan_vae
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
@@ -73,6 +73,7 @@ from .defaults import (
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
     resolve_domain_action_config,
+    _validate_video_reference,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
@@ -602,6 +603,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # ``default_use_system_prompt``.
         return dict(COSMOS3_EXTRA_SPECS)
 
+    @property
+    def ref_slot_specs(self):
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=1, max=1)],
+            ),
+            "video_reference": RefSlotSpec(
+                modality="video",
+                roles=[RoleSpec(role="reference", min=1, max=1)],
+            ),
+        }
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
         # base defaults leave it None ("by mode") — warmup runs the video mode.
@@ -742,7 +756,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             value = getattr(req.params, field_name)
             return value if field_name in specified else None
 
-        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+        refs_v = req.params.video_reference
+        video = refs_v[0].video if refs_v else None
+        if isinstance(video, str):
+            from pathlib import Path
+
+            video = Path(video).read_bytes()  # forward() NVDEC-demuxes from memory
+        if video is not None:
+            _validate_video_reference(video)
         is_action = extra_params.get("action_mode") is not None
         if is_action:
             # Action resolves its whole recipe in forward() -- the canvas from
@@ -807,11 +828,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             width = resolved["width"]
             num_inference_steps = resolved["num_inference_steps"]
             guidance_scale = resolved["guidance_scale"]
+        refs_i = req.params.image_reference
 
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
-            image=req.params.image,
+            image=refs_i[0].image if refs_i else None,
             height=height,
             width=width,
             num_frames=req.params.num_frames,

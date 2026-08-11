@@ -2011,6 +2011,41 @@ class ImageGenerationResponse(OpenAIBaseModel):
     size: Optional[str] = None
 
 
+class ImageReferenceItem(OpenAIBaseModel):
+    """One image reference for conditioning (mirrors ``ImageRef``).
+
+    ``image`` carries base64-encoded bytes, optionally as a ``data:`` URI.
+    ``role`` is required only for models that accept more than one image
+    role (e.g. Wan first/last frame); single-role models infer it.
+    """
+
+    image: str = Field(
+        description="Base64-encoded image bytes, optionally as a ``data:`` URI."
+    )
+    role: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reference role (e.g. 'reference', 'first_frame', 'last_frame'). "
+            "Required only when the model accepts multiple image roles."),
+    )
+
+
+class VideoReferenceItem(OpenAIBaseModel):
+    """One video reference for conditioning (mirrors ``VideoRef``)."""
+
+    video: str = Field(
+        description="Base64-encoded video bytes, optionally as a ``data:`` URI."
+    )
+
+
+class AudioReferenceItem(OpenAIBaseModel):
+    """One audio reference for conditioning (mirrors ``AudioRef``)."""
+
+    audio: str = Field(
+        description="Base64-encoded audio bytes, optionally as a ``data:`` URI."
+    )
+
+
 class VideoGenerationRequest(OpenAIBaseModel):
     """Video generation request (extended API).
 
@@ -2034,15 +2069,36 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
-    input_reference: Optional[Union[str, UploadFile]] = Field(
-        default=None,
-        description=(
-            "Optional image or video reference that guides generation. PNG or "
-            "JPEG images condition image-to-video; MP4 or AVI video conditions "
-            "video-to-video, with H.264 the tested codec and others "
-            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
-            "base64 bytes; multipart requests upload the file."),
-    )
+    image_reference: Optional[Union[
+        str, UploadFile, ImageReferenceItem,
+        List[Union[str, ImageReferenceItem]]]] = Field(
+            default=None,
+            description=
+            ("Image reference(s) conditioning generation (e.g. image-to-video "
+             "first frame). JSON sends base64 bytes, an ``{image, role}`` "
+             "object, or a list of them; multipart uploads a single image file. "
+             "PNG or JPEG only — HEIF/AVIF are not supported."),
+        )
+    video_reference: Optional[Union[
+        str, UploadFile, VideoReferenceItem,
+        List[Union[str, VideoReferenceItem]]]] = Field(
+            default=None,
+            description=
+            ("Video reference(s) conditioning generation (video-to-video). JSON "
+             "sends base64 bytes, a ``{video}`` object, or a list of them; "
+             "multipart uploads a single video file. MP4 or AVI, with H.264 the "
+             "tested codec and others best-effort."),
+        )
+    audio_reference: Optional[Union[
+        str, UploadFile, AudioReferenceItem,
+        List[Union[str, AudioReferenceItem]]]] = Field(
+            default=None,
+            description=
+            ("Audio reference(s) conditioning generation. JSON sends base64 "
+             "bytes, an ``{audio}`` object, or a list of them; multipart uploads "
+             "a single audio file. Accepted only by models that declare an audio "
+             "reference slot."),
+        )
 
     # Resolution
     size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")

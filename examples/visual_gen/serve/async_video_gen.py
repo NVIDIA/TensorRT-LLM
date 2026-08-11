@@ -28,7 +28,7 @@ def test_async_video_generation(
     base_url: str = "http://localhost:8000/v1",
     model: str = "wan",
     prompt: str = "A video of a cool cat on a motorcycle in the night",
-    input_reference: str = None,
+    image_reference: str = None,
     duration: float = 4.0,
     fps: int = 24,
     size: str = "256x256",
@@ -41,7 +41,7 @@ def test_async_video_generation(
         base_url: Base URL of the API server
         model: Model name to use
         prompt: Text prompt for generation
-        input_reference: Path to reference image (optional, for TI2V mode)
+        image_reference: Path to reference image (optional, for TI2V mode)
         duration: Video duration in seconds
         fps: Frames per second
         size: Video resolution (WxH format)
@@ -51,7 +51,7 @@ def test_async_video_generation(
         The server may return either MP4 (H.264) or AVI (MJPEG) format depending on
         the available encoder. The output filename extension will be adjusted to match.
     """
-    mode = "TI2V" if input_reference else "T2V"
+    mode = "TI2V" if image_reference else "T2V"
     print("=" * 80)
     print(f"Testing Async Video Generation API - {mode} Mode")
     print("=" * 80)
@@ -62,8 +62,8 @@ def test_async_video_generation(
     print("\n1. Creating video generation job...")
     print(f"   Mode: {mode}")
     print(f"   Prompt: {prompt}")
-    if input_reference:
-        print(f"   Input Reference: {input_reference}")
+    if image_reference:
+        print(f"   Input Reference: {image_reference}")
     print(f"   Duration: {duration}s")
     print(f"   FPS: {fps}")
     print(f"   Size: {size}")
@@ -82,11 +82,11 @@ def test_async_video_generation(
         }
 
         # Add input reference if provided (TI2V mode)
-        if input_reference:
-            if not Path(input_reference).exists():
-                print(f"\n❌ Error: Input reference image not found: {input_reference}")
+        if image_reference:
+            if not Path(image_reference).exists():
+                print(f"\n❌ Error: Input reference image not found: {image_reference}")
                 return False
-            create_params["input_reference"] = open(input_reference, "rb")
+            create_params["image_reference"] = open(image_reference, "rb")
 
         # Create video generation job
         job = client.videos.create(**create_params)
@@ -269,7 +269,7 @@ Examples:
         base_url=args.base_url,
         model=args.model,
         prompt=args.prompt,
-        input_reference=args.image,
+        image_reference=args.image,
         duration=args.duration,
         fps=args.fps,
         size=args.size,
