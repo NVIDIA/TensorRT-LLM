@@ -491,6 +491,9 @@ MiniMaxAI/MiniMax-M2:
   - accuracy: 89.045
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
+  - quant_algo: FP8_BLOCK_SCALES
+    extra_acc_spec: tp_attn
+    accuracy: 92.0
 MiniMaxAI/MiniMax-M2.5:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75

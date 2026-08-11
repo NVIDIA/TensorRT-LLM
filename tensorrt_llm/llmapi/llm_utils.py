@@ -580,20 +580,61 @@ def apply_model_defaults_to_llm_args(
     return _compute_applied(model_defaults_dict, user_overrides)
 
 
+def _two_model_spec_dec_decoding_type(
+        llm_args: 'TorchLlmArgs') -> Optional[str]:
+    """Return the decoding type when a separate draft engine is configured.
+
+    ``has_draft_model()`` is the same predicate py_executor_creator uses to
+    decide whether to build a separate draft model engine, which is what forces
+    the second KV cache manager. Returns ``None`` for single-engine runs.
+    """
+    spec_config = llm_args.speculative_config
+    if spec_config is None:
+        return None
+    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+    if spec_dec_mode is None or not spec_dec_mode.has_draft_model():
+        return None
+    return getattr(spec_config, "decoding_type", "speculative decoding")
+
+
 def _resolve_kv_cache_manager_v2_auto(
         llm_args: 'TorchLlmArgs',
         model_defaults_dict: Dict[str, Any],
         original_setting: Optional[Union[bool, str]] = None) -> bool:
     """Resolve the KV cache manager auto setting after model defaults are applied.
 
-    The transceiver runtime auto setting must be resolved first. In
-    disaggregated serving, hybrid Mamba V2 requires the Python transceiver with
-    NIXL, so an incompatible route falls back to V1 unless the user explicitly
-    selected V2.
+    A model default of V2 is demoted to V1 for routes V2 cannot serve; an
+    explicit user value otherwise wins. The compatibility arms are:
+
+    - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
+      with NIXL, so any other route falls back to V1. The transceiver runtime
+      auto setting must be resolved first.
+    - Two-model speculative decoding: the draft model runs in a separate engine
+      with its own KV cache manager. ``build_managers`` hands that manager the
+      target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
+      by ``max_gpu_total_bytes``, so both managers size their pools from the
+      full budget. The model default falls back to V1, and an explicit ``True``
+      is rejected rather than deferred to that allocation.
+
+    The fallback only reaches models whose manager class is selected by
+    ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
+    -- sparse attention picks its class from the algorithm alone -- keep a V2
+    manager after the demotion, so the arm does not protect them.
     """
     setting = (llm_args.kv_cache_config.use_kv_cache_manager_v2
                if original_setting is None else original_setting)
     if setting != "auto":
+        if setting is True:
+            decoding_type = _two_model_spec_dec_decoding_type(llm_args)
+            if decoding_type is not None:
+                raise ValueError(
+                    "kv_cache_config.use_kv_cache_manager_v2=True is not "
+                    f"supported with {decoding_type}: the draft model runs in "
+                    "a separate engine and V2 sizes both KV cache managers "
+                    "from the full max_gpu_total_bytes budget instead of "
+                    "partitioning it between them. Set "
+                    "use_kv_cache_manager_v2 to False or 'auto', or use the "
+                    "one-model variant of this decoding mode.")
         return setting
 
     kv_cache_defaults = model_defaults_dict.get("kv_cache_config", {})
@@ -616,6 +657,16 @@ def _resolve_kv_cache_manager_v2_auto(
                 "KV cache manager V2 is the model default, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "
                 "falling back to V1.", runtime, effective_backend)
+            model_default = False
+
+    if model_default:
+        decoding_type = _two_model_spec_dec_decoding_type(llm_args)
+        if decoding_type is not None:
+            logger.info(
+                "KV cache manager V2 is the model default, but %s runs the "
+                "draft model in a separate engine and V2 sizes both KV cache "
+                "managers from the full max_gpu_total_bytes budget; falling "
+                "back to V1.", decoding_type)
             model_default = False
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default

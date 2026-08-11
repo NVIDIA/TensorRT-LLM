@@ -84,17 +84,28 @@ def get_moe_cls(
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
     elif moe_backend.upper() == "CUTEDSL":
+        has_w4a16_nvfp4 = (quant_config is not None
+                           and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4)
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4()):
-            # On SM120 / SM121 + NVFP4 the cuteDSL family member is the
+                or quant_config.quant_mode.has_nvfp4() or has_w4a16_nvfp4):
+            # On SM120 / SM121 + NVFP4/W4A16_NVFP4 the cuteDSL family member is the
             # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
             # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
             # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
-            if quant_config.quant_mode.has_nvfp4():
+            has_nvfp4 = (quant_config.quant_mode.has_nvfp4()
+                         and not has_w4a16_nvfp4)
+            if has_nvfp4 or has_w4a16_nvfp4:
                 from tensorrt_llm._utils import get_sm_version
                 sm_version = get_sm_version()
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                    mapping = model_config.mapping
+                    if mapping.moe_ep_size > 1 or mapping.dp_size > 1:
+                        logger.warning(
+                            "CuteDslB12xFusedMoE does not support expert "
+                            "parallelism or attention-DP/all-to-all; selecting "
+                            "CutlassFusedMoE.")
+                        return CutlassFusedMoE
                     try:
                         import flashinfer  # noqa: F401
                         logger.info(
@@ -107,13 +118,24 @@ def get_moe_cls(
                     except ImportError:
                         logger.warning(
                             "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
-                            "but flashinfer is not importable; using CuteDslFusedMoE.",
+                            "but flashinfer is not importable; using %s.",
                             sm_version,
+                            "CutlassFusedMoE"
+                            if has_w4a16_nvfp4 else "CuteDslFusedMoE",
                         )
+                        if has_w4a16_nvfp4:
+                            return CutlassFusedMoE
+                elif has_w4a16_nvfp4:
+                    logger.warning(
+                        "CuteDslB12xFusedMoE requires SM120/121 for W4A16_NVFP4 "
+                        "(got SM%d). Using CutlassFusedMoE.",
+                        sm_version,
+                    )
+                    return CutlassFusedMoE
             return CuteDslFusedMoE
         else:
             logger.warning(
-                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales, nvfp4, and w4a16_nvfp4. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE

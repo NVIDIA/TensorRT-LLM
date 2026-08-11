@@ -21,6 +21,12 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 from torch.fx import Graph
 
 import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
+
+# Registers torch.ops.trtllm.mla_custom_op_inplace, used below. The op is a
+# module-import side effect that the eagerly loaded model zoo used to provide
+# (models/__init__ -> modeling_deepseekv3 -> modules.mla); with the zoo lazy,
+# every test must import the ops it uses itself.
+import tensorrt_llm._torch.modules.mla  # noqa: F401
 from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
     fused_sigmoid_mul_inplace,  # noqa: F401
 )
@@ -145,11 +151,10 @@ def test_remove_copy_for_mutates_args_restores_optional_none() -> None:
             "position_ids": None,
             "layer_idx": "0",
             "latent_cache_gen": None,
-            "enable_dsv4_epilogue_fusion": False,
             "_all_bases": (output,),
             "_output_base_index": 0,
-            "_dsv4_output_base_index": None,
-            "_dsv4_output_sf_base_index": None,
+            "_sparse_output_base_index": None,
+            "_sparse_output_sf_base_index": None,
         },
     )
     mutated_output = graph.call_function(getitem, args=(functionalized, 1))
@@ -161,8 +166,8 @@ def test_remove_copy_for_mutates_args_restores_optional_none() -> None:
     inplace_nodes = [node for node in graph.nodes if node.target == inplace_func]
     assert len(inplace_nodes) == 1
     assert inplace_nodes[0].kwargs["output"] is output
-    assert inplace_nodes[0].kwargs["dsv4_output"] is None
-    assert inplace_nodes[0].kwargs["dsv4_output_sf"] is None
+    assert inplace_nodes[0].kwargs["sparse_output"] is None
+    assert inplace_nodes[0].kwargs["sparse_output_sf"] is None
     assert clone.args[0] is output
     graph.lint()
 
@@ -182,11 +187,10 @@ def test_remove_copy_for_mutates_args_rejects_getitem_for_optional_none(
             "position_ids": None,
             "layer_idx": "0",
             "latent_cache_gen": None,
-            "enable_dsv4_epilogue_fusion": False,
             "_all_bases": (output,),
             "_output_base_index": 0,
-            "_dsv4_output_base_index": None,
-            "_dsv4_output_sf_base_index": None,
+            "_sparse_output_base_index": None,
+            "_sparse_output_sf_base_index": None,
         },
     )
     optional_output = graph.call_function(getitem, args=(functionalized, 2))
@@ -196,13 +200,13 @@ def test_remove_copy_for_mutates_args_rejects_getitem_for_optional_none(
     monkeypatch.setattr(
         remove_copy_pass,
         "inplace_info",
-        lambda: {inplace_func: {1: "output", 2: "dsv4_output"}},
+        lambda: {inplace_func: {1: "output", 2: "sparse_output"}},
     )
 
     with pytest.raises(
         AssertionError,
         match=(
-            "getitem user for optional output 'dsv4_output' has no "
+            "getitem user for optional output 'sparse_output' has no "
             "base tensor -- graph is malformed"
         ),
     ):
