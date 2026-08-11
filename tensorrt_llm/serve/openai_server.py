@@ -426,13 +426,26 @@ class OpenAIServer(_VideoRoutesMixin):
                     "url": self.binding_addr
                 }
                 # TODO: add more metadata
-                # Register with ETCD using the existing key format
-                self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
-                                         metadata)
+                # Register with ETCD using the existing key format.
+                #
+                # Off the event loop: this lifespan now runs while the socket
+                # is already listening and answering STARTING probes (see
+                # serve/lifecycle.py). A slow or unreachable etcd would block
+                # the loop, so /health would be accepted and never answered --
+                # the "third ambiguous state" the lifecycle contract exists to
+                # remove, and strictly worse than the connection-refused it
+                # replaced. Before that change this ran before uvicorn
+                # listened, so the blocking was invisible.
+                await asyncio.to_thread(self.metadata_server.put,
+                                        f"trtllm/{self.generator.llm_id}",
+                                        metadata)
                 logger.info(f"trtllm/{self.generator.llm_id} is registered")
 
             if self.disagg_cluster_config:
-                self.disagg_cluster_storage = create_cluster_storage_client(
+                # Off the loop for the same reason: constructing the storage
+                # client dials the cluster backend.
+                self.disagg_cluster_storage = await asyncio.to_thread(
+                    create_cluster_storage_client,
                     self.disagg_cluster_config.cluster_uri,
                     self.disagg_cluster_config.cluster_name)
                 self.disagg_cluster_worker = DisaggClusterWorker(
