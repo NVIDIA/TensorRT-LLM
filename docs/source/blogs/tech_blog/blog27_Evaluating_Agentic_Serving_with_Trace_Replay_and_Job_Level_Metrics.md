@@ -88,14 +88,14 @@ Figure 1 shows the pipeline: a trace-collection phase (top), in which agents run
 The pieces, one by one:
 
 - **Scaffolding agents.** The traced agents are built on [Scaffolding](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding), TensorRT-LLM's inference-time-compute framework introduced in [Tech Blog 13](blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md), whose controller/worker structure makes an agent's execution graph explicit and therefore traceable.
-- **Trace hooks.** Two decorators attach tracing to an existing agent with no change to its own logic; the example agents wire this up behind a flag, so collecting a trace is one CLI switch.
-- **Trace files.** Each run is serialized as one `ExecutionTrace` JSON file in the format above, and a directory of them forms a replayable dataset.
-- **`ReplayEngine`.** It applies the replay rules — recorded ISL/OSL filled with random token IDs, a shared synthetic system-prompt prefix, tool calls as timed sleeps — and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serialized.
-- **Replay backend.** Any OpenAI-compatible endpoint, typically `trtllm-serve`; it need not be the system that served the agents during tracing, so a trace collected with one model can be replayed against another.
-- **Metrics collector.** It aggregates the run into the job- and token-level Pareto points over the steady-state window, alongside the engine-reported KV-cache hit rate.
-- **Offline analyzer.** A no-GPU pass that walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**, which we compare against engine-measured rates below.
+- **Trace hooks.** Two decorators attach tracing to an existing agent with no change to its logic, so collecting a trace is one CLI switch.
+- **Trace files.** Each run is serialized as one `ExecutionTrace` JSON file in the format above; a directory of them forms a replayable dataset.
+- **`ReplayEngine`.** It applies the replay rules and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serialized.
+- **Replay backend.** Any OpenAI-compatible endpoint, typically `trtllm-serve`, and not necessarily the system that served the agents during tracing.
+- **Metrics collector.** It aggregates the run into job- and token-level Pareto points over the steady-state window, alongside the engine-reported KV-cache hit rate.
+- **Offline analyzer.** A no-GPU pass that walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**.
 
-The framework lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay); a bundled example trace, the runnable replay scripts, and the analysis tools live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
+The core tracing and replay code is in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with an example trace, runnable replay scripts, and analysis tools in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
 ### Trace Dataset
 
@@ -121,26 +121,19 @@ All traces are collected with Claude Opus 4.6 behind an OpenAI-compatible API, w
 
 <p align="center"><sub><em>Table 1. Trace-dataset summary. ISL/OSL are per LLM request; last-turn values are per trace; the optimal cache hit rate is the per-trace upper bound on prefix reuse, computed offline from the trace.</em></sub></p>
 
-Figure 2 shows the per-request sequence-length distributions. Coder has by far the largest inputs (median 14.4k, p90 37.2k, tail to 210k), because file and shell output accumulate in one growing conversation, yet its outputs are tiny (median 110): it is input-heavy and decode-light. The research agents invert this — Open Deep Research and IterResearch sit near 6k input with much longer outputs (medians 632 and 1.7k), and Tree-of-Thought has the smallest inputs (median 1.7k) with long, reasoning-heavy outputs (median 985, p90 4.7k).
+Figure 2 shows the per-request sequence-length distributions. Coder is input-heavy and decode-light: file and shell output accumulate in one growing conversation (median ISL 14.4k, tail to 210k) while each turn emits little (median OSL 110). The research agents invert this, pairing moderate inputs with long, reasoning-heavy outputs.
 
 <div align="center">
     <img src="../media/tech_blog27_isl_osl_distribution.png" alt="Per-request input and output sequence-length distributions by agent" width="900px">
 </div>
 <p align="center"><sub><em>Figure 2. Per-request input (top) and output (bottom) sequence-length distributions, by agent.</em></sub></p>
 
-Figure 3 shows the last-turn distributions — the final and largest request of each trace, which sets the peak KV-cache footprint of a job. Open Deep Research reaches the largest peaks on both axes (last-turn input averaging 31.6k, output 12.8k for the synthesized report). Coder peaks high on input (mean 25.1k, tail to 210k) but stays short on output (mean 603), while IterResearch and Tree-of-Thought stay small on both — a direct consequence of context compaction and short math answers.
-
-<div align="center">
-    <img src="../media/tech_blog27_last_turn_distribution.png" alt="Per-trace last-turn input and output sequence-length distributions by agent" width="900px">
-</div>
-<p align="center"><sub><em>Figure 3. Per-trace last-turn input (top) and output (bottom) sequence-length distributions, by agent.</em></sub></p>
-
-Figure 4 shows where the four agents differ most: the per-trace optimal prefix-cache hit rate, computed offline by the analyzer against an unbounded cache with the system prompt preloaded. Coder traces are almost entirely reusable (mean 96.5%, tightly concentrated near 100%), because one shared prefix grows monotonically and each turn re-reads what previous turns already placed in cache. The research agents are far less reusable — 47.8% for Open Deep Research, 24.4% and 28.8% for IterResearch and Tree-of-Thought — because subagent fan-out, context rewriting, and branch exploration repeatedly introduce fresh context. This single plot previews why prefix caching dominates Coder-style serving and matters much less for the research agents.
+The agents differ most in reuse. Figure 3 plots the per-trace optimal prefix-cache hit rate, computed offline against an unbounded cache with the system prompt preloaded. Coder traces are almost entirely reusable (mean 96.5%, tightly concentrated near 100%), because one shared prefix grows monotonically and each turn re-reads what previous turns already cached. The research agents reach only 47.8%, 24.4%, and 28.8%, because subagent fan-out, context rewriting, and branch exploration repeatedly introduce fresh context — previewing why prefix caching dominates Coder-style serving and matters much less elsewhere.
 
 <div align="center">
     <img src="../media/tech_blog27_optimal_cache_hit_rate.png" alt="Per-trace optimal prefix-cache hit rate by agent" width="900px">
 </div>
-<p align="center"><sub><em>Figure 4. Per-trace optimal (idealized) prefix-cache hit rate, by agent.</em></sub></p>
+<p align="center"><sub><em>Figure 3. Per-trace optimal (idealized) prefix-cache hit rate, by agent.</em></sub></p>
 
 The rest of this blog follows two representative traces at opposite ends of this space: a **Coder** trace (`matplotlib__matplotlib-23412`, a single ReAct thread of 23 requests running 119 s, 60% generating and 40% in tools, whose prompts are ~34% shared system prompt and ~63% own history, leaving only ~3% fresh tokens) and an **Open Deep Research** trace (`deep-research-bench-59`, a supervisor plus four parallel researcher branches running 512 s, 98% generation-bound, where the supervisor reuses only ~35% of its prompt and the researcher leaves just ~10%).
 
@@ -150,28 +143,28 @@ We serve Qwen3-235B-A22B-Instruct-2507 through TensorRT-LLM on a single GB200 no
 
 ### Token-Level and Job-Level Metrics Can Disagree
 
-Figure 5 compares three ways of parallelizing the model across the four GPUs — TP4+EP4, DP4+EP4, and DP4+EP4 with KV-cache-aware routing — under the token-level view on fixed-shape inputs (top) and the job-level view on the agentic traces (bottom). On fixed shapes the three strategies nearly coincide; on the agentic traces TP4+EP4 leads along the entire frontier, and KV-cache-aware routing helps only where a large shared prefix exists to route toward: it lifts the frontier substantially on the highly cacheable Coder trace, but shows no visible gain on Open Deep Research, whose parallel researcher branches share little prefix, nor on fixed shapes, where independent requests share none at all. A fixed-shape benchmark would report the strategies as interchangeable and hide this difference entirely.
+Figure 4 compares three ways of parallelizing the model across the four GPUs — TP4+EP4, DP4+EP4, and DP4+EP4 with KV-cache-aware routing — under the token-level view on fixed-shape inputs (top) and the job-level view on the agentic traces (bottom). On fixed shapes the three strategies nearly coincide; on the agentic traces TP4+EP4 leads along the entire frontier, and KV-cache-aware routing helps only where a large shared prefix exists to route toward: it lifts the frontier substantially on the highly cacheable Coder trace, but shows no visible gain on Open Deep Research, whose parallel researcher branches share little prefix, nor on fixed shapes, where independent requests share none at all. A fixed-shape benchmark would report the strategies as interchangeable and hide this difference entirely.
 
 <div align="center">
     <img src="../media/tech_blog27_token_vs_job_pareto_strategies.png" alt="Token-level Pareto on fixed-shape inputs versus job-level Pareto on agentic traces" width="900px">
 </div>
-<p align="center"><sub><em>Figure 5. Token-level Pareto on fixed-shape inputs (top) versus job-level Pareto on the agentic traces (bottom), across three parallel strategies.</em></sub></p>
+<p align="center"><sub><em>Figure 4. Token-level Pareto on fixed-shape inputs (top) versus job-level Pareto on the agentic traces (bottom), across three parallel strategies.</em></sub></p>
 
-The two views also favor different batch sizes. Figure 6 holds C fixed and sweeps B: token-level interactivity (tokens/s/user) falls monotonically as B grows, because a larger decode batch lengthens each step — yet job-level interactivity (jobs/h/user) *rises* over most of the sweep, peaking at an intermediate B. The latency breakdown (panels c, d) explains why: a larger batch sharply reduces the queue wait that dominates end-to-end latency at small B, and that outweighs the longer decode, so the whole job finishes sooner. Only the job-level view follows the latency a user actually experiences.
+The two views also favor different batch sizes. Figure 5 holds C fixed and sweeps B: token-level interactivity (tokens/s/user) falls monotonically as B grows, because a larger decode batch lengthens each step — yet job-level interactivity (jobs/h/user) *rises* over most of the sweep, peaking at an intermediate B. The latency breakdown (panels c, d) explains why: a larger batch sharply reduces the queue wait that dominates end-to-end latency at small B, and that outweighs the longer decode, so the whole job finishes sooner. Only the job-level view follows the latency a user actually experiences.
 
 <div align="center">
     <img src="../media/tech_blog27_batch_size_sweep_fixed_concurrency.png" alt="Sweeping server batch size at fixed user concurrency" width="900px">
 </div>
-<p align="center"><sub><em>Figure 6. Sweeping the server batch size at fixed user concurrency. Token-level (a) and job-level (b) interactivity move oppositely; the per-job latency breakdown (c, d) explains why.</em></sub></p>
+<p align="center"><sub><em>Figure 5. Sweeping the server batch size at fixed user concurrency. Token-level (a) and job-level (b) interactivity move oppositely; the per-job latency breakdown (c, d) explains why.</em></sub></p>
 
 ### Prefix Caching Dominates Multi-Turn Serving
 
-Figure 7 sweeps concurrency (with TP4+EP4 fixed) and annotates each job-level Pareto point with the engine-measured KV-cache hit rate. At low and moderate concurrency the measured rate matches the optimal upper bound computed offline from the trace — about 0.97 for Coder and 0.50 for Open Deep Research — confirming that the idealized per-trace rates are actually realized once the cache can hold the prefixes. As concurrency rises, the KV-cache pool overflows and the hit rate falls off a **KV-cache eviction cliff** (toward 0.73 and 0.19 respectively), and the job-level Pareto degrades in exactly that region. For Coder-style serving, the performance ceiling is set by prefix-cache residency, not raw compute.
+Figure 6 sweeps concurrency (with TP4+EP4 fixed) and annotates each job-level Pareto point with the engine-measured KV-cache hit rate. At low and moderate concurrency the measured rate matches the optimal upper bound computed offline from the trace — about 0.97 for Coder and 0.50 for Open Deep Research — confirming that the idealized per-trace rates are actually realized once the cache can hold the prefixes. As concurrency rises, the KV-cache pool overflows and the hit rate falls off a **KV-cache eviction cliff** (toward 0.73 and 0.19 respectively), and the job-level Pareto degrades in exactly that region. For Coder-style serving, the performance ceiling is set by prefix-cache residency, not raw compute.
 
 <div align="center">
     <img src="../media/tech_blog27_hit_rate_eviction_cliff.png" alt="Measured versus optimal prefix-cache hit rate and the eviction cliff" width="900px">
 </div>
-<p align="center"><sub><em>Figure 7. Measured versus optimal prefix-cache hit rate, with the job-level Pareto alongside, as concurrency grows (Coder top, Open Deep Research bottom).</em></sub></p>
+<p align="center"><sub><em>Figure 6. Measured versus optimal prefix-cache hit rate, with the job-level Pareto alongside, as concurrency grows (Coder top, Open Deep Research bottom).</em></sub></p>
 
 Host offloading pushes the cliff back. In TensorRT-LLM this is one line in the serving config:
 
@@ -181,31 +174,31 @@ kv_cache_config:
   host_cache_size: 68719476736   # 64 GiB of host memory for offloaded KV blocks
 ```
 
-Figure 8 repeats the sweep with host budgets of 0–128 GiB. Evicted prefixes are retained in host memory instead of discarded, so the hit rate stays near optimal at high concurrency — for Coder, from 0.73 back to nearly the 0.97 optimum at the largest budgets — and the job-level Pareto lifts accordingly. The benefit scales with workload reusability: largest for Coder, still clear for Open Deep Research.
+Figure 7 repeats the sweep with host budgets of 0–128 GiB. Evicted prefixes are retained in host memory instead of discarded, so the hit rate stays near optimal at high concurrency — for Coder, from 0.73 back to nearly the 0.97 optimum at the largest budgets — and the job-level Pareto lifts accordingly. The benefit scales with workload reusability: largest for Coder, still clear for Open Deep Research.
 
 <div align="center">
     <img src="../media/tech_blog27_host_offloading.png" alt="Effect of host KV-cache offloading on hit rate and job-level throughput" width="900px">
 </div>
-<p align="center"><sub><em>Figure 8. Effect of host KV-cache offloading (0 to 128 GiB) on hit rate and job-level throughput (Coder top, Open Deep Research bottom).</em></sub></p>
+<p align="center"><sub><em>Figure 7. Effect of host KV-cache offloading (0 to 128 GiB) on hit rate and job-level throughput (Coder top, Open Deep Research bottom).</em></sub></p>
 
 ### Batch Size Should Follow the Agent's Branching Structure
 
 Single-request benchmarks conventionally set C = B and fill every batch slot. Agentic sessions break that correspondence in two opposite ways:
 
-- **Single-branch agents (Coder): stay near B = C.** Tool-call gaps mean fewer than C requests are on the server at any instant, so the batch runs underfilled at C = B (averaging ~51 of 64 slots in our sweep). But raising C above B to fill the batch adds more queuing delay than the underfill costs — especially since CUDA-graph batch padding makes a slightly underfilled batch nearly free. Figure 9 sweeps the full (B, C) grid for the Coder trace: the job-level frontier stays close to the B = C diagonal.
-- **Fan-out agents (Open Deep Research): B well above C.** One session issues multiple concurrent requests during its fan-out phase, so the server sees more requests in flight than sessions. Figure 10 repeats the sweep for the Open Deep Research trace, and the contrast with Figure 9 is stark: the frontier sits not on the diagonal but mostly at B = 2C and B = 4C. The branch multiplicity, not the session count, sets the batch size the server needs.
+- **Single-branch agents (Coder): stay near B = C.** Tool-call gaps mean fewer than C requests are on the server at any instant, so the batch runs underfilled at C = B (averaging ~51 of 64 slots in our sweep). But raising C above B to fill the batch adds more queuing delay than the underfill costs — especially since CUDA-graph batch padding makes a slightly underfilled batch nearly free. Figure 8 sweeps the full (B, C) grid for the Coder trace: the job-level frontier stays close to the B = C diagonal.
+- **Fan-out agents (Open Deep Research): B well above C.** One session issues multiple concurrent requests during its fan-out phase, so the server sees more requests in flight than sessions. Figure 9 repeats the sweep for the Open Deep Research trace, and the contrast with Figure 8 is stark: the frontier sits not on the diagonal but mostly at B = 2C and B = 4C. The branch multiplicity, not the session count, sets the batch size the server needs.
 
 Fan-out also makes the serving behavior harder to reason about in general. A single session no longer maps to a single in-flight request, so the load a server actually sees depends on how many branches are open at each moment — which varies within a job and across agent architectures. The best (B, C) point therefore leaves the diagonal and moves with the branching structure, and the configuration space to search grows accordingly. Finding a good configuration by intuition or by a fixed-shape benchmark is unlikely; it takes a reproducible replay of the real branching structure, which is what the trace-replay framework provides.
 
 <div align="center">
     <img src="../media/tech_blog27_coder_bc_frontier.png" alt="Job-level Pareto frontier over a (B, C) sweep for the Coder trace" width="900px">
 </div>
-<p align="center"><sub><em>Figure 9. Job-level Pareto frontier over a full (B, C) sweep for the Coder trace, by parallel strategy. The frontier stays close to the B = C diagonal.</em></sub></p>
+<p align="center"><sub><em>Figure 8. Job-level Pareto frontier over a full (B, C) sweep for the Coder trace, by parallel strategy. The frontier stays close to the B = C diagonal.</em></sub></p>
 
 <div align="center">
     <img src="../media/tech_blog27_odr_bc_frontier.png" alt="Job-level Pareto frontier over a (B, C) sweep for the Open Deep Research trace" width="900px">
 </div>
-<p align="center"><sub><em>Figure 10. Job-level Pareto frontier over a full (B, C) sweep for the Open Deep Research trace, by parallel strategy. Subagent fan-out pushes the frontier to B = 2C and B = 4C.</em></sub></p>
+<p align="center"><sub><em>Figure 9. Job-level Pareto frontier over a full (B, C) sweep for the Open Deep Research trace, by parallel strategy. Subagent fan-out pushes the frontier to B = 2C and B = 4C.</em></sub></p>
 
 ## Future Work
 
