@@ -1146,6 +1146,16 @@ class AwaitResponseHelper:
 
         return responses
 
+    def process_and_handle_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Process engine responses and dispatch the client-visible results."""
+        responses = self.process_responses(responses)
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
+            self.responses_handler(responses)
+        return responses
+
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
@@ -1162,12 +1172,7 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
-        responses = self.process_responses(responses)
-
-        with nvtx_range_debug(f"await_response-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-            self.responses_handler(responses)
+        self.process_and_handle_responses(responses)
 
         # Even when await_responses returned normally (e.g. via
         # _await_any_response, whose predicate already includes

@@ -12,8 +12,9 @@ This script is a shorthand to launch a single-GPU context and generation server,
 bash -e disagg_serving_local.sh
 ```
 
-KV cache transfer between the context and generation servers uses the NIXL backend. By default the C++ cache-transceiver runtime is used; pass `--transceiver_runtime PYTHON` to use the Python runtime instead:
+KV cache transfer between the context and generation servers uses the NIXL backend by default. Pass `--transceiver_backend UCX` to use UCX instead. The C++ cache-transceiver runtime is used by default; with NIXL, pass `--transceiver_runtime PYTHON` to use the Python runtime instead:
 ```bash
+bash -e disagg_serving_local.sh --transceiver_backend UCX
 bash -e disagg_serving_local.sh --transceiver_runtime PYTHON
 ```
 

@@ -80,8 +80,7 @@ class RpcWorkerMixin:
                 timeout if timeout is not None else getattr(self, "_fetch_timeout", 0.1)
             )
             responses = super().await_responses(timeout=actual_timeout)
-            responses = self._await_response_helper.process_responses(responses)
-            self._await_response_helper.responses_handler(responses)
+            responses = self._await_response_helper.process_and_handle_responses(responses)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
         qsize = self._response_queue.qsize()
