@@ -3628,6 +3628,31 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        # The CUDA copy kernel directly dereferences these host tensors. Under
+        # confidential compute, prefer_pinned() intentionally returns False,
+        # so launching that kernel would access unmapped pageable host memory.
+        host_inputs = (
+            self.host_kv_cache_block_offsets,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+        )
+        if not all(tensor.is_pinned() for tensor in host_inputs):
+            source = self.host_kv_cache_block_offsets[
+                :,
+                copy_idx.to(dtype=torch.long),
+                0,
+                :,
+            ]
+            valid = source != BAD_PAGE_INDEX
+            scales = self.index_scales.view(-1, 1, 1)
+            offsets = self.kv_offset.view(-1, 1, 1)
+            keys = torch.where(valid, source * scales, 0)
+            values = torch.where(valid, keys + offsets, 0)
+            staged_block_offsets = torch.stack((keys, values), dim=2)
+            dst_tensor[:, :num_seqs].copy_(staged_block_offsets, non_blocking=False)
+            return
+
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
