@@ -288,6 +288,37 @@ def test_bsx_route_env_knobs(monkeypatch):
         bsx_dispatch._reset_env_cache()
 
 
+@skip_not_sm100
+def test_bsx_cluster_cap_verdict_memoized():
+    """The guard's cluster-cap verdict is memoized per (bs, npad, K) —
+    the per-call route()+_parse_reg host cost the _DISPATCH_CACHE comment
+    motivates must not be re-paid by is_bsx_supported on every eager
+    forward — and _reset_env_cache clears it (routes depend on the env
+    thresholds)."""
+    bs, npad, top_k = 4, 65536, 512
+    logits, pre_idx, seq_lens = _make_bsx_inputs(bs, npad, top_k, seed=0)
+    out = torch.empty(bs, top_k, dtype=torch.int32, device="cuda")
+
+    bsx_dispatch._reset_env_cache()
+    assert (bs, npad, top_k) not in bsx_dispatch._CAP_OK_CACHE
+    ok = bsx_dispatch.is_bsx_supported(
+        logits, pre_idx, seq_lens, out, top_k, NEXT_N, CR, None, None
+    )
+    expected = bsx_dispatch.route_cluster_size(bs, npad, top_k) <= _query_max_cluster_size()
+    assert ok == expected
+    assert bsx_dispatch._CAP_OK_CACHE[(bs, npad, top_k)] == expected
+    # Second call must hit the memo (same verdict, no recompute observable
+    # beyond the cache entry staying put).
+    assert (
+        bsx_dispatch.is_bsx_supported(
+            logits, pre_idx, seq_lens, out, top_k, NEXT_N, CR, None, None
+        )
+        == expected
+    )
+    bsx_dispatch._reset_env_cache()
+    assert (bs, npad, top_k) not in bsx_dispatch._CAP_OK_CACHE
+
+
 # ---------------------------------------------------------------------------
 # reg tier: every launch-table instance's ROUTE is asserted (host-only,
 # free); a LAUNCH (JIT compile ~5-7s each) runs only for the 6 instances

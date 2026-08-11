@@ -35,7 +35,7 @@ Faithful phase-by-phase port otherwise:
   P1  : hint gather + minmax + two-stage 64-bin histogram -> CCDF rung ladder
   P2a : uniform every-32nd-float4 sampled multi-rung count (+ per-rung
         float4 occupancy for a clustering-aware sigma) -> 4-stage pivot:
-        stage 0 is the hint-ladder ADMISSION (in-tree R0 op#26 parity) —
+        stage 0 is the hint-ladder ADMISSION (in-tree R0 parity) —
         tightest rung whose sampled CI sits inside [K, 0.6*kC] (the
         legacy pivot-band hi) — stage 0b prefers the legacy band pick
         when it is strictly leaner and safe by its clustering-aware
@@ -1197,8 +1197,8 @@ class GvrTpKernel:
                     tgt = cutlass.Int32(tgt_py)
                     best = cutlass.Int32(AR - 1)
                     bestd = cutlass.Int32(0x7FFFFFFF)
-                    # Stage 0 — hint-ladder ADMISSION (in-tree R0 parity,
-                    # op#26 lineage): accept the TIGHTEST ladder rung
+                    # Stage 0 — hint-ladder ADMISSION (in-tree R0
+                    # parity): accept the TIGHTEST ladder rung
                     # (highest threshold = smallest admitted-candidate set)
                     # whose sampled-count confidence interval lies inside
                     # the [K, kC] acceptance window, mirroring the R0 rule
@@ -1838,8 +1838,8 @@ def _two_waves_rows() -> int:
     here — the import runs the other way). NOTE: only this term scales
     with the device; every other constant in ``tp_cluster_size`` and the
     dispatch band tables is frozen B200 calibration (the kernel family
-    measured HW-invariant across B200/B300 in the op9/op17 cross-arch
-    A/Bs, so the bands are kept device-independent on purpose).
+    measured HW-invariant in earlier B200/B300 cross-arch A/Bs, so the
+    bands are kept device-independent on purpose).
     """
     if not hasattr(_two_waves_rows, "_value"):
         _two_waves_rows._value = 2 * torch.cuda.get_device_properties().multi_processor_count

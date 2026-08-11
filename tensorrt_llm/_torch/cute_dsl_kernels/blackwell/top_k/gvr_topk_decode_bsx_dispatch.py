@@ -48,6 +48,9 @@ locals; :func:`_reset_env_cache` re-reads for tests):
   TRTLLM_BSX_TP_BS    unset/-1 -> baked per-npad bands; 0 -> disable (2^30);
                       else the bs threshold at which the tp tier takes over.
   TRTLLM_BSX_DENSE_BS same, for the dense (tb=1024) reg tiers.
+  TRTLLM_BSX_FALLBACK_BANDS
+                      0 -> disable the measured fallback-band table (bsx
+                      serves every guarded shape); unset/other -> active.
   TRTLLM_BSX_DISABLE  any value other than unset/""/"0" -> the guard
                       rejects everything (kill switch: every call takes the
                       in-tree kernel path).
@@ -105,6 +108,7 @@ def _env_flag(name):
 def _reset_env_cache():
     _ENV.clear()
     _DISPATCH_CACHE.clear()  # routes depend on the env thresholds
+    _CAP_OK_CACHE.clear()  # ditto (verdict embeds the routed tier)
 
 
 def _thresholds(npad):
@@ -236,6 +240,7 @@ def route_cluster_size(bs: int, npad: int, K: int) -> int:
 # [env thresholds are cached at first use, like the CUDA static locals], so
 # bind it once per key to a closure.
 _DISPATCH_CACHE = {}  # (bs, npad, K, next_n, cr) -> callable(logits, pre, seq_lens, out)
+_CAP_OK_CACHE = {}  # (bs, npad, K) -> routed tier's cluster size within hw max
 
 
 def _bind(bs, npad, K, next_n, cr):
@@ -316,10 +321,17 @@ def is_bsx_supported(
     ):
         return False
     # Cluster cap: fall back to the in-tree kernel (dispatcher-level) rather
-    # than silently degrading the tier's cluster shape.
-    if route_cluster_size(bs, npad, top_k) > _query_max_cluster_size():
-        return False
-    return True
+    # than silently degrading the tier's cluster shape. The verdict is pure
+    # in (bs, npad, K) once the env thresholds are cached, and computing it
+    # re-runs route() + the _parse_reg string parse (the ~2.5-3us host cost
+    # _DISPATCH_CACHE exists to avoid) — so memoize it the same way.
+    key = (bs, npad, top_k)
+    ok = _CAP_OK_CACHE.get(key)
+    if ok is None:
+        ok = _CAP_OK_CACHE[key] = (
+            route_cluster_size(bs, npad, top_k) <= _query_max_cluster_size()
+        )
+    return ok
 
 
 def bsx_topk(
