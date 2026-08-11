@@ -75,6 +75,9 @@ def test_on_update_kv_lens_rebuilds_stale_map():
     md = object.__new__(DSAtrtllmAttentionMetadata)
     md.kv_cache_manager = None
     md._num_generations = 0
+    # __init__ (bypassed by object.__new__) defaults this to False;
+    # on_update_kv_lens() reads it since #16925.
+    md.in_mtp_draft_loop = False
     # Stub collaborators unrelated to the map rebuild (test_dsa_indexer.py style).
     md.kv_lens_cuda = torch.tensor([100, 200, 300], dtype=torch.int32, device=device)
     md._compute_kv_lens_row_reorder = Mock()

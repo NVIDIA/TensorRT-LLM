@@ -62,6 +62,10 @@ class MarlinFusedMoE(CutlassFusedMoE):
             "sm_constraint": ("in", set(range(89, 100))),
             "dtypes": {torch.bfloat16},
         },
+        QuantAlgo.W4A16_NVFP4: {
+            "sm_constraint": ("in", set(range(89, 100))),
+            "dtypes": {torch.bfloat16},
+        },
     }
 
     @classmethod
@@ -73,9 +77,9 @@ class MarlinFusedMoE(CutlassFusedMoE):
     ) -> Tuple[bool, Optional[str]]:
         sm_version = get_sm_version()
 
-        if quant_algo != QuantAlgo.NVFP4:
+        if quant_algo not in cls._QUANT_SUPPORT_TABLE:
             return _warn_and_return(
-                f"MarlinFusedMoE only supports NVFP4 (got quant_algo={quant_algo})"
+                f"MarlinFusedMoE only supports NVFP4 or W4A16_NVFP4 (got quant_algo={quant_algo})"
             )
 
         if not is_nvfp4_marlin_supported_sm(sm_version):
