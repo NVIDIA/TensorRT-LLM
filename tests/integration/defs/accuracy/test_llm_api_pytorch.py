@@ -8020,15 +8020,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             # worker's /metrics buffer (enable_iter_perf_stats), drained
             # right before the probe; the dataset loads from the models
             # root so the probe works offline like the eval does.
-            from concurrent.futures import ThreadPoolExecutor
-
             import requests
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
             gen_url = info["server_lists"]["generation"][0]
-            base = f"{llm.router_url}/v1"
-            served = requests.get(f"{base}/models",
-                                  timeout=30).json()["data"][0]["id"]
             questions = [
                 r["question"]
                 for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
@@ -8043,19 +8038,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 for q in questions
             ]
             requests.get(f"http://{gen_url}/metrics", timeout=30)  # drain
-
-            def _complete(prompt):
-                requests.post(f"{base}/completions",
-                              json={
-                                  "model": served,
-                                  "prompt": prompt,
-                                  "max_tokens": 512,
-                                  "temperature": 0
-                              },
-                              timeout=900).raise_for_status()
-
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                list(pool.map(_complete, chat_prompts))
+            probe_params = SamplingParams(max_tokens=512, temperature=0)
+            for future in [
+                    llm.generate_async(prompt, probe_params)
+                    for prompt in chat_prompts
+            ]:
+                future.result()
             records = requests.get(f"http://{gen_url}/metrics",
                                    timeout=30).json()
             drafted = accepted = steps = 0
