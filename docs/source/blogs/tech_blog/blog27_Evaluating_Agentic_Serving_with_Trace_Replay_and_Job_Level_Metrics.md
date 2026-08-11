@@ -2,13 +2,9 @@
 
 by NVIDIA TensorRT LLM team
 
-## Overview
+## Motivation
 
 Agentic applications — coding assistants, deep-research pipelines, tree-structured reasoners — are a fast-growing share of LLM serving traffic, and they stress an inference system in ways chatbot traffic never did. Evaluation has not followed: performance is still reported on independent requests of fixed shape, while the workload served is a long-running, multi-turn, tool-invoking, sometimes parallel agent task. Hence a practical question for anyone deploying an agent stack: **how do we measure whether a serving system is actually good at agentic workloads?**
-
-Conventional benchmarks issue independent requests with fixed input and output lengths (ISL/OSL). A real agent task instead unfolds as a long-lived *job*: a shared system prompt is reused across many turns, the conversation grows as the agent reasons and invokes tools, and sub-agents may run in parallel before synchronizing. Prefix reuse, tool-call gaps, and parallel branching govern serving efficiency, yet none is visible to a fixed-shape benchmark — nor can one answer the question practitioners actually ask: how many agent tasks does a GPU complete per hour?
-
-We take a **trace-and-replay** approach: record each agent run once as a trace, then replay it structure-faithfully against an inference backend as many times as needed — without re-instantiating any tools — and evaluate with **job-level metrics** that complement conventional token-level ones. What follows is what we learned building and using this pipeline, offered as one set of concrete choices others can reuse or argue with.
 
 ## Methodology
 
