@@ -25,6 +25,9 @@ import threading
 import uuid
 from types import SimpleNamespace
 
+# Do not inherit a NIC pin from the host: the selected interface may not exist
+# in the test container and would prevent the NIXL agent from initializing.
+os.environ.pop("UCX_NET_DEVICES", None)
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
@@ -326,7 +329,7 @@ def _create_cache_manager(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     enable_indexer_k_cache: bool = False,
-    indexer_k_cache_layer_mask: Optional[List[bool]] = None,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
 ) -> "KVCacheManager | KVCacheManagerV2":
     """Create a KVCacheManager (V1) or KVCacheManagerV2 for the given mapping."""
     assert not (enable_indexer_k_cache and use_v2), "DSA indexer K cache is V1-only"
@@ -413,8 +416,8 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     enable_indexer_k_cache: bool = False,
-    indexer_k_cache_layer_mask: Optional[List[bool]] = None,
-) -> List[KVCacheManager | KVCacheManagerV2]:
+    indexer_k_cache_layer_mask: list[bool] | None = None,
+) -> list[KVCacheManager | KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance."""
     managers = []
     for pp_rank in range(pp):
@@ -873,7 +876,7 @@ def verify_all_requests(
 
 
 def _get_indexer_block_data(
-    managers: List[KVCacheManager],
+    managers: list[KVCacheManager],
     request_id: int,
     layer_idx: int,
     num_layers: int,
@@ -881,7 +884,7 @@ def _get_indexer_block_data(
     tp: int,
     enable_dp: bool,
     req_idx: int,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Per-request indexer-K bytes for one global layer on the owning rank.
 
     Indexer K is TP-replicated, so any TP rank of the layer's PP stage works;
@@ -907,8 +910,8 @@ def _get_indexer_block_data(
 
 def _verify_indexer_k_all_requests(
     request_lengths: List[int],
-    ctx_managers: List[KVCacheManager],
-    gen_managers: List[KVCacheManager],
+    ctx_managers: list[KVCacheManager],
+    gen_managers: list[KVCacheManager],
     ctx_tp: int,
     ctx_pp: int,
     gen_tp: int,
@@ -977,7 +980,7 @@ def run_transfer_test(
     num_layers: int = NUM_LAYERS,
     request_lengths: Optional[List[int]] = None,
     enable_indexer_k_cache: bool = False,
-    indexer_k_cache_layer_mask: Optional[List[bool]] = None,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
