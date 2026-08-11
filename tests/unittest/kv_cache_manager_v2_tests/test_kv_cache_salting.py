@@ -20,15 +20,21 @@ from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import TokenId, sequence_to_blockchain_keys
-    from kv_cache_manager_v2._block_radix_tree import Block, BlockRadixTree, ReuseScope
+    from kv_cache_manager_v2 import TokenId
+    from kv_cache_manager_v2._block_radix_tree import (
+        Block,
+        BlockRadixTree,
+        ReuseScope,
+        sequence_to_blockchain_keys,
+    )
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import TokenId, sequence_to_blockchain_keys
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import TokenId
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
         Block,
         BlockRadixTree,
         ReuseScope,
+        sequence_to_blockchain_keys,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
 
