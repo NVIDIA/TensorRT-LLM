@@ -52,7 +52,7 @@ Industry practitioners have recently introduced a growing body of work in this d
 
 ## Implementation
 
-The methodology above translates into three concrete artifacts: a trace format that records the structure of an agent run, a pipeline that collects and replays those traces, and the metrics computed from a replay. We describe the format first, since everything else is built around it.
+The methodology above translates into two concrete artifacts: a trace format that captures the structure of an agent run, and a pipeline that collects those traces, replays them against the system under evaluation, and turns the result into metrics.
 
 ### Trace Format
 
