@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -371,6 +371,34 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
         atol=1e-10,
         rtol=0.01,
         msg=f"UE8M0 decoded scales mismatch for shape ({m}, {k})")
+
+
+@pytest.mark.skipif(
+    getSMVersion() < 89,
+    reason="Needs FP8 E4M3 support",
+)
+def test_fp8_quantize_ue8m0_under_torch_compile():
+    """`per_token_quant_and_transform` has to compile under TorchInductor.
+
+    Inductor passes `fp8_max` / `fp8_min` in as fp64 scalars, which promotes
+    `output_s` to float64 and makes the UE8M0 exponent `bitcast` to int32 fail
+    to compile ("Cannot bitcast data-type of size 64 to data-type of size 32").
+    The kernel casts both bounds to float32 to pin the arithmetic.
+    """
+    torch.random.manual_seed(42)
+    input_tensor = torch.randn((512, 5376), device="cuda", dtype=torch.bfloat16)
+
+    eager_fp8, eager_scale = per_token_quant_and_transform(input_tensor.clone())
+    compiled_quantize = torch.compile(per_token_quant_and_transform,
+                                      dynamic=True)
+    compiled_fp8, compiled_scale = compiled_quantize(input_tensor.clone())
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(compiled_fp8.float(),
+                               eager_fp8.float(),
+                               atol=0,
+                               rtol=0)
+    torch.testing.assert_close(compiled_scale, eager_scale, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
