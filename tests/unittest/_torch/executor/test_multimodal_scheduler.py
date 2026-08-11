@@ -149,7 +149,7 @@ def test_item_scheduling_rejects_raw_payload_without_item_metadata():
 
 
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=10)
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_tokens=10)
     first = _request(1, [7, 7])
     second = _request(2, [3])
 
@@ -161,11 +161,10 @@ def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
 
 def test_scheduler_defers_items_beyond_output_byte_budget():
     # Budget hosts exactly one 1-row item (4 bytes): the second request's
-    # item must wait even though the token/item budgets would admit it
+    # item must wait even though the token budget would admit it
     # (allocate-before-compute).
     scheduler = MultimodalScheduler(
         _BaseScheduler(),
-        max_num_items=8,
         max_num_tokens=1 << 20,
         output_budget_bytes=4,
         bytes_per_encoder_embedding=4,
@@ -185,7 +184,6 @@ def test_resident_outputs_of_active_requests_block_new_admissions():
     # state — no counter, no release call — deferring new encoder work.
     scheduler = MultimodalScheduler(
         _BaseScheduler(),
-        max_num_items=8,
         max_num_tokens=1 << 20,
         output_budget_bytes=4,
         bytes_per_encoder_embedding=4,
@@ -211,7 +209,6 @@ def test_started_request_holds_its_whole_footprint_across_iterations():
     # squat that space and leave the head unable to finish.
     scheduler = MultimodalScheduler(
         _BaseScheduler(),
-        max_num_items=8,
         max_num_tokens=5,
         output_budget_bytes=8,
         bytes_per_encoder_embedding=4,
@@ -259,7 +256,6 @@ def test_admission_rejects_requests_larger_than_output_budget():
 def test_oversized_request_fails_fast_instead_of_starving():
     scheduler = MultimodalScheduler(
         _BaseScheduler(),
-        max_num_items=8,
         max_num_tokens=1 << 20,
         output_budget_bytes=4,
         bytes_per_encoder_embedding=4,
@@ -276,14 +272,13 @@ def test_scheduler_requires_bytes_per_embedding_alongside_budget():
     with pytest.raises(ValueError, match="bytes_per_encoder_embedding"):
         MultimodalScheduler(
             _BaseScheduler(),
-            max_num_items=1,
             max_num_tokens=1,
             output_budget_bytes=4,
         )
 
 
 def test_multimodal_scheduler_selects_all_items_and_admits_request_when_batch_fits():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=10)
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_tokens=10)
     request = _request(1, [6, 4])
 
     output = scheduler.schedule_request([request], set())
@@ -295,8 +290,18 @@ def test_multimodal_scheduler_selects_all_items_and_admits_request_when_batch_fi
     assert output.context_requests == [request]
 
 
+def test_multimodal_scheduler_has_no_separate_item_count_limit():
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_tokens=4)
+    request = _request(1, [1, 1, 1, 1])
+
+    output = scheduler.schedule_request([request], set())
+
+    assert output.scheduled_mm_encoder_items == {1: [0, 1, 2, 3]}
+    assert output.context_requests == [request]
+
+
 def test_multimodal_scheduler_withholds_request_on_budget_overflow():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=3, max_num_tokens=10)
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_tokens=10)
     request = _request(1, [6, 4, 1])
 
     output = scheduler.schedule_request([request], set())
@@ -306,7 +311,7 @@ def test_multimodal_scheduler_withholds_request_on_budget_overflow():
 
 
 def test_multimodal_scheduler_preserves_non_multimodal_requests():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=1, max_num_tokens=1)
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_tokens=1)
     request = _llm_request(1)
     initialize_multimodal_encoder_request(request, max_num_tokens=1)
 
@@ -325,7 +330,6 @@ def test_qwen_output_budget_uses_post_merge_embedding_capacity():
     processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
     engine = object.__new__(PyTorchModelEngine)
     engine.max_num_tokens = 8192
-    engine.encoder_max_num_items = 8
     engine.encoder_max_num_tokens = 65536
     engine.input_processor = processor
     engine._resolve_bytes_per_mm_encoder_embedding = lambda: 32768
@@ -339,7 +343,6 @@ def test_qwen_output_budget_uses_post_merge_embedding_capacity():
 
 def test_output_budget_requires_processor_embedding_capacity():
     engine = object.__new__(PyTorchModelEngine)
-    engine.encoder_max_num_items = 8
     engine.encoder_max_num_tokens = 65536
     engine.input_processor = SimpleNamespace(get_max_mm_encoder_output_embeddings=lambda *_: None)
 
@@ -394,7 +397,7 @@ def test_request_rejects_item_above_effective_startup_maximum():
 def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
     base_scheduler = _BaseScheduler()
     base_scheduler.capacity_scheduler = _RejectMultimodalCapacityScheduler()
-    scheduler = MultimodalEagerEncoderScheduler(base_scheduler, max_num_items=1, max_num_tokens=8)
+    scheduler = MultimodalEagerEncoderScheduler(base_scheduler, max_num_tokens=8)
     multimodal_request = _request(1, [8])
     text_request = _llm_request(2)
     initialize_multimodal_encoder_request(text_request, max_num_tokens=8)
@@ -540,7 +543,6 @@ def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
     executor.is_benchmark_disagg = False
     executor._mm_encoder_item_scheduling_enabled = True
     executor.model_engine = SimpleNamespace(
-        encoder_max_num_items=8,
         encoder_max_num_tokens=max_num_tokens,
     )
     executor.active_requests = active_requests
@@ -1207,7 +1209,7 @@ def test_mm_encoder_state_copies_validated_scheduler_costs_at_admission():
     metadata.encoder_token_lengths[0] = 100
     assert request.py_mm_encoder_state.encoder_token_lengths == [4, 7]
 
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=11)
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_tokens=11)
     output = scheduler.schedule_request([request], set())
     assert output.scheduled_mm_encoder_items == {1: [0, 1]}
 

@@ -123,4 +123,4 @@ def test_get_mm_max_tokens_per_item_default_empty():
 def test_get_dummy_mm_data_default_raises_not_implemented():
     builder = _StubBuilder()
     with pytest.raises(NotImplementedError):
-        builder.get_dummy_mm_data(max_num_encoder_tokens=1024, max_num_items=1)
+        builder.get_dummy_mm_data(max_num_encoder_tokens=1024)

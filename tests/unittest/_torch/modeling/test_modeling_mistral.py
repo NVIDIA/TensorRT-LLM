@@ -672,15 +672,11 @@ def test_dummy_mm_max_tokens_per_item_is_image_only():
     assert demand["image"] == (1540 // 14) ** 2 == 110**2
 
 
-def test_attention_metadata_capacity_uses_item_and_token_budgets():
+def test_attention_metadata_capacity_uses_token_budget():
     proc = _make_dummy_processor(spatial_merge_size=2)
 
-    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_items=8, max_num_tokens=100) == {
-        "attention": 8
-    }
-    assert proc.get_mm_encoder_attention_metadata_capacity(
-        max_num_items=100, max_num_tokens=12
-    ) == {"attention": 3}
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=100) == {"attention": 25}
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=12) == {"attention": 3}
 
 
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
@@ -708,7 +704,6 @@ def test_dummy_get_dummy_mm_data_saturates_budget(budget):
     proc = _make_dummy_processor()
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=budget,
-        max_num_items=1,
         dtype=torch.float16,
     )["image"]
     pixel_values = image["pixel_values"]
@@ -721,11 +716,10 @@ def test_dummy_get_dummy_mm_data_saturates_budget(budget):
     assert 2 * per_image > budget
 
 
-def test_dummy_get_dummy_mm_data_covers_many_item_boundary():
-    proc = _make_dummy_processor()
+def test_dummy_get_dummy_mm_data_repeats_items_to_fill_token_budget():
+    proc = _make_dummy_processor(image_size=448)
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=8192,
-        max_num_items=8,
         dtype=torch.float16,
     )["image"]
     pixel_values = image["pixel_values"]
@@ -748,7 +742,6 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
     proc = _make_dummy_processor()
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=8192,
-        max_num_items=4,
         dtype=torch.float16,
     )["image"]
 

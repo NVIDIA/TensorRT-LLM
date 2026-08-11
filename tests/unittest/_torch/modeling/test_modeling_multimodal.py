@@ -217,10 +217,6 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         for module in model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
-                    # Atomic item count is distinct from the token budget.
-                    # Each encoder maps both inputs to its internal attention
-                    # sequence/window capacity.
-                    max_num_items=2048,
                     max_num_tokens=model_config.max_num_tokens,
                 )
 

@@ -590,7 +590,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         }
 
     def get_max_mm_encoder_output_embeddings(
-            self, max_num_items: int, max_num_encoder_tokens: int) -> int:
+            self, max_num_encoder_tokens: int) -> int:
         """Bound post-merger embeddings from one Qwen encoder iteration.
 
         Every scheduled image or video contributes one output embedding per
@@ -703,13 +703,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                         "instead of lowering it per request.")
 
     def get_mm_encoder_attention_metadata_capacity(
-            self, max_num_items: int,
-            max_num_tokens: int) -> Optional[Dict[str, int]]:
+            self, max_num_tokens: int) -> Optional[Dict[str, int]]:
         """Bound Qwen2.5 full/window segments using processor geometry.
 
-        ``max_num_items`` is intentionally not part of the bound: one atomic
-        video item may contain enough temporal segments to consume the whole
-        token budget.
+        One atomic video item may contain enough temporal segments to consume
+        the whole token budget, so the bound is token-based.
         """
         cfg = self.config.vision_config
         window_size = getattr(cfg, "window_size", None)
@@ -735,17 +733,13 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         self,
         *,
         max_num_encoder_tokens: int,
-        max_num_items: int,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build a processed full-budget encoder profiling batch."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
-        if max_num_items <= 0:
-            raise ValueError("max_num_items must be positive")
 
-        per_image_budget = max(1, max_num_encoder_tokens // max_num_items)
-        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
+        size = self.get_size_for_max_tokens(max_tokens=max_num_encoder_tokens)
         tokens_per_image = max(
             1,
             self._num_vision_tokens(width=size["width"],
@@ -753,8 +747,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                     num_frames=size.get("num_frames", 1)))
         if tokens_per_image > max_num_encoder_tokens:
             return {}
-        num_images = min(max_num_items,
-                         max_num_encoder_tokens // tokens_per_image)
+        num_images = max_num_encoder_tokens // tokens_per_image
         return self._dummy_mm_data_for_size(
             width=size["width"],
             height=size["height"],
@@ -1709,17 +1702,16 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
     def setup_attn_metadata(
         self,
-        max_num_items: int,
         max_num_tokens: int,
         attention_metadata_capacity: Optional[Dict[str, int]] = None,
     ) -> None:
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
         # attention) instead of the mixin's single ``attn_metadata``.
         #
-        capacities = (attention_metadata_capacity
-                      if attention_metadata_capacity is not None else
-                      self.get_encoder_attention_metadata_capacity(
-                          max_num_items, max_num_tokens))
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
         kwargs = dict(max_num_tokens=max_num_tokens, kv_cache_manager=None)
         self.full_attn_metadata = self.metadata_cls(
             max_num_requests=capacities["full_attention"], **kwargs)
@@ -1745,13 +1737,12 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             vit_merger_window_size**2 * self.spatial_merge_unit)
 
     def get_encoder_attention_metadata_capacity(
-            self, max_num_items: int, max_num_tokens: int) -> Dict[str, int]:
+            self, max_num_tokens: int) -> Dict[str, int]:
         """Conservatively bound Qwen sequences without processor geometry.
 
-        ``max_num_items`` is intentionally ignored because one atomic video
-        item can expand to multiple temporal and window-attention sequences.
-        The normal model-engine path injects the tighter live-processor bound
-        into :meth:`setup_attn_metadata` instead.
+        One atomic video item can expand to multiple temporal and
+        window-attention sequences. The normal model-engine path injects the
+        tighter live-processor bound into :meth:`setup_attn_metadata` instead.
         """
         max_num_sequences = max(1, max_num_tokens // self.spatial_merge_unit)
         return {

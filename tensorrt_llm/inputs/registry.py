@@ -730,12 +730,11 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         return {}
 
     def get_max_mm_encoder_output_embeddings(
-            self, max_num_items: int,
-            max_num_encoder_tokens: int) -> Optional[int]:
+            self, max_num_encoder_tokens: int) -> Optional[int]:
         """Bound encoder-output embeddings produced in one encoder iteration.
 
         The result is the aggregate number of post-encoder embeddings across
-        every item that can be scheduled together under ``max_num_items`` and
+        every item that can be scheduled together under
         ``max_num_encoder_tokens``. Models opting into MM encoder item
         scheduling must override this method using their encoder geometry.
 
@@ -744,18 +743,17 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         return None
 
     def get_mm_encoder_attention_metadata_capacity(
-            self, max_num_items: int,
-            max_num_tokens: int) -> Optional[Dict[str, int]]:
+            self, max_num_tokens: int) -> Optional[Dict[str, int]]:
         """Return a processor-geometry-aware encoder sequence capacity.
 
         The keys identify model-specific attention metadata objects (for
         example, Qwen2.5-VL has separate ``full_attention`` and
         ``window_attention`` entries). ``None`` keeps the encoder model's
         conservative fallback mapping. Concrete processors should return a
-        positive upper bound derived from the startup item/token budgets and
-        the same geometry constraints used to normalize runtime media.
+        positive upper bound derived from the startup token budget and the
+        same geometry constraints used to normalize runtime media.
 
-        The default intentionally ignores both inputs.
+        The default intentionally ignores the input.
         """
         return None
 
@@ -772,14 +770,12 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         self,
         *,
         max_num_encoder_tokens: int,
-        max_num_items: int,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build processed ``multimodal_data`` for MM encoder profiling.
 
         Args:
             max_num_encoder_tokens: Aggregate encoder-attention token budget.
-            max_num_items: Maximum number of atomic multimodal items.
             dtype: Data type for floating-point encoder inputs.
 
         Returns:

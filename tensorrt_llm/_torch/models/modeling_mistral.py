@@ -569,38 +569,30 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
 
     def get_max_mm_encoder_output_embeddings(
-            self, max_num_items: int, max_num_encoder_tokens: int) -> int:
+            self, max_num_encoder_tokens: int) -> int:
         """Bound post-merger embeddings from one Pixtral encoder iteration."""
         _, merge, _, _ = self._vision_geometry()
         return max_num_encoder_tokens // (merge * merge)
 
     def get_mm_encoder_attention_metadata_capacity(
-            self, max_num_items: int,
-            max_num_tokens: int) -> Optional[Dict[str, int]]:
-        """Bound Pixtral contexts by item and physical-token budgets."""
+            self, max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Pixtral contexts by the physical-token budget."""
         _, merge, _, _ = self._vision_geometry()
         min_tokens_per_image = merge * merge
-        return {
-            "attention":
-            max(1, min(max_num_items, max_num_tokens // min_tokens_per_image))
-        }
+        return {"attention": max(1, max_num_tokens // min_tokens_per_image)}
 
     def get_dummy_mm_data(
         self,
         *,
         max_num_encoder_tokens: int,
-        max_num_items: int,
         dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
         """Build a processed full-budget encoder profiling batch."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
-        if max_num_items <= 0:
-            raise ValueError("max_num_items must be positive")
 
-        per_image_budget = max(1, max_num_encoder_tokens // max_num_items)
         patch, _, _, _ = self._vision_geometry()
-        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
+        size = self.get_size_for_max_tokens(max_tokens=max_num_encoder_tokens)
         tokens_per_image = max(
             1,
             self._vit_tokens(width=size["width"],
@@ -608,8 +600,7 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
                              patch=patch))
         if tokens_per_image > max_num_encoder_tokens:
             return {}
-        num_images = min(max_num_items,
-                         max_num_encoder_tokens // tokens_per_image)
+        num_images = max_num_encoder_tokens // tokens_per_image
         return self._dummy_mm_data_for_size(
             width=size["width"],
             height=size["height"],

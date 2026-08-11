@@ -266,52 +266,21 @@ model_kwargs:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
 class TestEncoderRuntimeSizes:
-    """Cover encoder runtime size fields and fallback to LLM limits.
+    """Cover encoder runtime size fields.
 
-    `encoder_max_num_items` / `encoder_max_num_tokens` are user-facing
-    knobs for multimodal encoder scheduling and AttentionMetadata. When unset,
-    they fall back to the corresponding LLM-side values before model-aware
-    atomic-item compatibility resolution. They are PyTorch-backend only, so
-    they live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    `encoder_max_num_tokens` is the user-facing multimodal encoder scheduling
+    and AttentionMetadata budget. It is PyTorch-backend only, so it lives on
+    `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
     """
 
     def test_defaults_are_none(self, llm_args_cls):
         llm_args = llm_args_cls(model=llama_model_path)
         assert llm_args.encoder_max_batch_size is None
-        assert llm_args.encoder_max_num_items is None
         assert llm_args.encoder_max_num_tokens is None
-
-    @pytest.mark.parametrize(
-        "kwargs, expected_runtime_sizes",
-        [
-            # Neither encoder knob set -- falls back to LLM limits.
-            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
-            # Only encoder_max_num_items overrides.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_num_items=512), (512, 2048)),
-            # Only encoder_max_num_tokens overrides.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_num_tokens=32768), (64, 32768)),
-            # Both encoder knobs override.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_num_items=512,
-                  encoder_max_num_tokens=32768), (512, 32768)),
-        ],
-        ids=["fallback", "only_items", "only_tokens", "both"],
-    )
-    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
-                                       expected_runtime_sizes):
-        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
-        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
 
     @pytest.mark.parametrize(
         "field_name, invalid_value",
         [
-            ("encoder_max_num_items", 0),
-            ("encoder_max_num_items", -1),
             ("encoder_max_num_tokens", 0),
             ("encoder_max_num_tokens", -1),
         ],

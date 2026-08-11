@@ -43,7 +43,7 @@ class MultimodalEncoderMixin:
 
     Marker + default ``setup_attn_metadata`` for multimodal encoders whose
     ``AttentionMetadata`` is built by ``PyTorchModelEngine`` after model load
-    using runtime sizes (``max_num_items``, ``max_num_tokens``).
+    using the runtime encoder token budget (``max_num_tokens``).
 
     Subclasses set ``metadata_cls`` in their own ``__init__`` (typically from
     ``get_attention_backend(model_config.attn_backend).Metadata``) and either
@@ -54,32 +54,31 @@ class MultimodalEncoderMixin:
     attn_metadata: Optional[AttentionMetadata] = None
 
     def get_encoder_attention_metadata_capacity(
-            self, max_num_items: int, max_num_tokens: int) -> dict[str, int]:
-        """Map item/token budgets to model-internal attention sequences.
+            self, max_num_tokens: int) -> dict[str, int]:
+        """Map the token budget to model-internal attention sequences.
 
         Keys name this encoder's attention metadata objects, so they are
         model-specific: this default declares a single `attention` object,
         while a windowed encoder such as Qwen2.5-VL declares `full_attention`
         and `window_attention`. There is no fixed superset to enumerate.
 
-        The default sizes from the item budget alone; encoders that split one
-        item across several sequences override this and use `max_num_tokens`.
+        The default conservatively allows one attention sequence per token.
+        Encoders with tighter geometry-aware bounds should override this.
         """
         return {
-            "attention": max(max_num_items, _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+            "attention": max(max_num_tokens, _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
         }
 
     def setup_attn_metadata(
         self,
-        max_num_items: int,
         max_num_tokens: int,
         attention_metadata_capacity: Optional[dict[str, int]] = None,
     ) -> None:
         """Map encoder item/token budgets to attention metadata capacity."""
-        capacities = (attention_metadata_capacity
-                      if attention_metadata_capacity is not None else
-                      self.get_encoder_attention_metadata_capacity(
-                          max_num_items, max_num_tokens))
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
         self.attn_metadata = self.metadata_cls(
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,

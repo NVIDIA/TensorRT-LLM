@@ -415,13 +415,15 @@ class PyTorchModelEngine(ModelEngine):
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
-        # Multimodal encoder runtime sizes; fall back to LLM-side values when
-        # the encoder-specific knobs are unset. The token budget may be
-        # raised after model load because atomic MM items cannot be split.
-        (
-            self.encoder_max_num_items,
-            self.encoder_max_num_tokens,
-        ) = llm_args.get_encoder_runtime_sizes()
+        self.encoder_batch_size = (llm_args.encoder_max_batch_size
+                                   if llm_args.encoder_max_batch_size
+                                   is not None else self.batch_size)
+        # The multimodal encoder token budget falls back to the LLM-side value
+        # when unset. It may be raised after model load because atomic MM items
+        # cannot be split.
+        self.encoder_max_num_tokens = (llm_args.encoder_max_num_tokens
+                                       if llm_args.encoder_max_num_tokens
+                                       is not None else self.max_num_tokens)
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -619,9 +621,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.encoder_max_num_tokens = effective_encoder_token_budget
             attention_metadata_capacity = (
                 self.input_processor.get_mm_encoder_attention_metadata_capacity(
-                    self.encoder_max_num_items,
-                    self.encoder_max_num_tokens,
-                ))
+                    self.encoder_max_num_tokens))
             if attention_metadata_capacity is not None:
                 if (not attention_metadata_capacity or any(
                         value <= 0
@@ -3405,9 +3405,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         max_output_embeddings = (
             self.input_processor.get_max_mm_encoder_output_embeddings(
-                self.encoder_max_num_items,
-                self.encoder_max_num_tokens,
-            ))
+                self.encoder_max_num_tokens))
         if max_output_embeddings is None or max_output_embeddings <= 0:
             raise ValueError(
                 "A model with MM encoder item scheduling must implement "
@@ -3506,14 +3504,14 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the
-        loaded model, using the engine's encoder runtime sizes
-        (`encoder_max_num_items` / `encoder_max_num_tokens`, falling back to
-        the LLM-side `max_batch_size` / `max_num_tokens`).
+        loaded model, using the engine's encoder token budget
+        (`encoder_max_num_tokens`, falling back to the LLM-side
+        `max_num_tokens`).
 
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
         by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
-        so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's `__init__`. The optional
+        so the sizes match the resolved encoder token budget rather than being
+        hardcoded inside each encoder's `__init__`. The optional
         per-segment capacity combines the encoder token budget with the input
         processor's largest supported item.
         """
@@ -3527,7 +3525,6 @@ class PyTorchModelEngine(ModelEngine):
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 setup_kwargs: Dict[str, Any] = dict(
-                    max_num_items=self.encoder_max_num_items,
                     max_num_tokens=self.encoder_max_num_tokens)
                 if self.mm_encoder_attention_metadata_capacity is not None:
                     setup_kwargs["attention_metadata_capacity"] = (

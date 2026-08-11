@@ -565,12 +565,10 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
     model = Qwen2VisionModelBase(model_config, Qwen2_5_VisionModel).visual
     model.metadata_cls = _StubVisionAttentionMetadata
 
-    max_num_items = 8
     max_num_tokens = 16
     fixed_max_seq_len = 65_536
     expected_window_max_seq_len = 64
-    model.setup_attn_metadata(max_num_items=max_num_items,
-                              max_num_tokens=max_num_tokens)
+    model.setup_attn_metadata(max_num_tokens=max_num_tokens)
     model.set_attn_max_seq_len(fixed_max_seq_len)
 
     assert model._full_attn_max_seq_len == fixed_max_seq_len
@@ -753,7 +751,7 @@ def test_qwen2_5_attention_metadata_capacity_uses_processor_geometry():
     proc.config.vision_config.window_size = 128
 
     capacities = proc.get_mm_encoder_attention_metadata_capacity(
-        max_num_items=8, max_num_tokens=160)
+        max_num_tokens=160)
 
     # One full-attention frame has at least 4 merged cells * 4 physical
     # patches. For 4x4 windows the worst window/area ratio is a 1x4 merged
@@ -815,11 +813,11 @@ def test_qwen3_attention_capacity_keeps_long_video_safe():
                                  spatial_merge_size=2)
 
     capacities = proc.get_mm_encoder_attention_metadata_capacity(
-        max_num_items=1, max_num_tokens=160)
+        max_num_tokens=160)
 
     # Qwen3's video resize clamp applies to aggregate temporal pixels. A long
     # atomic video can therefore reach the hard one-merged-cell minimum for
-    # each temporal segment, irrespective of the item-count budget.
+    # every temporal segment within the token budget.
     assert capacities == {"attention": 40}
 
 
@@ -829,7 +827,6 @@ def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
     proc = _make_dummy_processor(processor_cls)
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=budget,
-        max_num_items=1,
         dtype=torch.float32,
     )["image"]
     grid = image["image_grid_thw"]
@@ -842,11 +839,10 @@ def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_covers_many_item_boundary(processor_cls):
-    proc = _make_dummy_processor(processor_cls)
+def test_get_dummy_mm_data_repeats_items_to_fill_token_budget(processor_cls):
+    proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=8192,
-        max_num_items=8,
         dtype=torch.float16,
     )["image"]
     token_lengths = image["image_grid_thw"].prod(dim=1).tolist()
@@ -867,7 +863,6 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract(processor_cls):
     proc = _make_dummy_processor(processor_cls)
     mm_data = proc.get_dummy_mm_data(
         max_num_encoder_tokens=8192,
-        max_num_items=8,
         dtype=torch.float16,
     )
 

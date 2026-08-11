@@ -826,19 +826,12 @@ class KvCacheCreator:
 
         input_processor = self._model_engine.input_processor
         encoder_max_num_tokens = self._model_engine.encoder_max_num_tokens
-        max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
-        if not max_tokens_per_item:
+        if not input_processor.get_mm_max_tokens_per_item():
             return []
-        largest_item_tokens = max(max_tokens_per_item.values())
-        max_num_items = min(
-            self._model_engine.encoder_max_num_items,
-            max(1, encoder_max_num_tokens // largest_item_tokens),
-        )
 
         try:
             mm_data = input_processor.get_dummy_mm_data(
                 max_num_encoder_tokens=encoder_max_num_tokens,
-                max_num_items=max_num_items,
                 dtype=self._model_engine.model.dtype,
             )
         except NotImplementedError:
@@ -3066,7 +3059,6 @@ def create_py_executor_instance(
             scheduler_cls = MultimodalEagerEncoderScheduler
         scheduler = scheduler_cls(
             scheduler,
-            max_num_items=model_engine.encoder_max_num_items,
             max_num_tokens=model_engine.encoder_max_num_tokens,
             output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
             bytes_per_encoder_embedding=(
