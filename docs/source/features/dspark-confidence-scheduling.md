@@ -553,17 +553,17 @@ no-spec 应降级而非死锁、字节估算器补 draft 窗口放大）待报 u
 - 关键物理：OSL=64 + 长 prompt + 持续补位 → **~50% 的步是 ctx+gen 混合步**，纯 gen 采的
   成本表在混合步高估节省（成本模型 ctx 盲），裁剪收益不成立（sched −1.2~−6.3%）。收益是
   **负载 regime 的函数**，不是普适常数。
-- **把 gen bs 打到目标值的配方**（实测绑定约束是准入带宽：mnt=8192 时有准入的步 token 顶
-  死预算,到达率 3.76/步 × 寿命 24.6 步 = 均衡 bs 92）：
-  1. `max_num_tokens: 16384` —— 解除准入带宽上限；
-  2. `max_batch_size = 2 × 目标` —— ctx 准入槽位 headroom；
-  3. 客户端在飞 = 目标并发 —— 让 client 成为干净的绑定约束。
+- **bs 定量**：客户端在飞数 = 目标并发（8×目标/节点），maxbs/max_num_tokens 与生产配置
+  一致即可。本负载 OSL=64、请求周转极快，实测 gen bs 会因准入/周转间隙低于标签值——报告
+  时以 iter log 的实测中位为准，不以档位标签为准。
 - 成本表与 STS 均须在本负载重采（表按 `--from-iter-log` 纯 gen 段拟合）。
 
 ### 负载 B'：disagg（gen-only 吞吐；裁剪的顺风 regime）
 
 ctx/gen 分离后 gen server 每步纯 gen，成本表全程在域内。两台 B300 独立 slurm 作业,
-NIXL 传输。**四个必踩的坑与解法**：
+NIXL 传输。**bs 钉法**：gen server 没有 prefill 争抢槽位，直接
+`max_batch_size = 目标并发` + 客户端超发（如 16×）即可把 gen bs 钉在 maxbs 上。
+**四个必踩的坑与解法**：
 
 1. v2 KV manager 只支持 `transceiver_runtime: PYTHON` + `backend: NIXL`（C++/DEFAULT
    传输在启动时 `CUDA_ERROR_INVALID_CONTEXT`）。
