@@ -1651,6 +1651,8 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     )
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
+    # A skipped child exits successfully too; require the selected bounce case to run.
+    assert "1 passed" in output, f"Child pytest did not run the bounce case:\n{output}"
 
 
 if __name__ == "__main__":
