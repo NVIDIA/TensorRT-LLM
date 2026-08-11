@@ -537,11 +537,13 @@ no-spec 应降级而非死锁、字节估算器补 draft 窗口放大）待报 u
 - 硬件/形态：DeepSeek-V4-Pro-DSpark，8×B300 单节点，`--tp_size 8 --ep_size 8`（DEP8，
   `enable_attention_dp: true`），`--max_batch_size 256 --max_num_tokens 4096`。
 - 数据集：
-  - **poetry**：单条固定英文 free-verse 长诗 prompt（memory/rivers/glass/time 主题、
-    要求 ≥8 个场景、不许复用意象），复制 N 份。短输入（~60 tok）+ 长输出（实测
-    ~760 tok/req，自然 EOS）——短 ISL / 长 OSL 的极端。
-  - **arena**：arena-hard-v0.1 的 500 条真实问题（jsonl，取 `prompt` 字段，N>500 时循环
-    复用）。中等 ISL / 长输出的多样负载。
+  - **poetry**：单条固定英文 free-verse 长诗 prompt（逐字原文见
+    `docs/dspark_bench_assets/poetry_prompt.txt`），复制 N 份。短输入（~60 tok）+
+    `max_tokens=768, temperature=0.7`（实测均值 ~760 tok/req，基本打满上限）——
+    短 ISL / 长 OSL 的极端。
+  - **arena**：arena-hard-v0.1 全集 500 条真实问题（jsonl，取 `prompt` 字段，N>500 时
+    循环复用），同 `max_tokens=768, temperature=0.7`。中等 ISL / 长输出的多样负载。
+  - 打流客户端原件：`docs/dspark_bench_assets/p25fix_bench.py`。
 - 客户端 burst-drain：一次性下发全部 N（512/1024）个请求，计时到全部完成，n=10 轮取中位。
   **注意：该协议下 99% 的步是纯 gen 步**（prefill 波在头几十步内结束）——这是收益成立的
   regime 前提。

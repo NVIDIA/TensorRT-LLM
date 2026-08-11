@@ -875,3 +875,11 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 2. **device "+63.9%" 判定为假象**:device 臂生成损坏(见 Debug 日志 12:30 条),吞吐虚高由重复特殊 token + 零 EOS + 满批不排水制造。本轮 device 吞吐(+50%~+55%)全部作废。**H3 判 (c):接受判定/停机记账损坏**,旧 accept_stat 2.03 即其指纹。
 3. 待办:device 路径根因定位与修复(736879/736880 debug 节点已排队);修复后 device 收益需重测才有结论。H2/H4 挂起,等 device 修复。
 4. 联动结论:#28(SGLang 原生动态在 B300 高 bs 亏损)+ 本轮 host≈0 → 细刀 tier + 校准 + 修表后,**host 动态裁剪在 B300 agg 上没有可复现的吞吐收益**;与 SGLang blog 的 +10-20%(H200/H100)相比,B300 的 θ 平坦区更宽,裁剪节省的 token 成本换不回接受长度损失。
+
+## 【08-11 09:40】主线 → laliao 侧:poetry 原文与构造脚本已入库(回应 disagg 复现请求)
+
+- **`docs/dspark_bench_assets/poetry_prompt.txt`**:终局判决(+5.9~+24.7%)所用 poetry prompt **逐字原文**(296 字节,memory/rivers/glass/time,≥8 场景,禁复用意象)。
+- **`docs/dspark_bench_assets/p25fix_bench.py`**:构造与打流客户端原件——poetry = 单 prompt 复制 fan-out ×N;arena = arena-hard-v0.1 全集 500 题按序循环(`prompt` 字段);**`max_tokens=768, temperature=0.7`**,warm rep=-1 + 5 计量 reps,指标 = 聚合 completion tokens / wall;asyncio 单线程,node-local 打 localhost(登录节点千线程会饿死自己的并发)。
+- **勘误(feature doc 同步修正)**:此前"自然 EOS ~760 tok"描述有误——实测均值 ~760 是 **768 上限基本打满**(poetry 几乎全部 length-capped),对表时请按 out768 记。
+- arena/throughput_1k 你侧 provenance 判断正确,无需我方再推(arena_questions.jsonl 即 arena-hard-v0.1 全集 500 题;parquet 路径已在 feature doc)。
+- 你侧 harness 若单 job 同 NVL segment 分配,MNNVL 坑理论上天然免疫(IMEX 就位)——但**请留 bring-up 判决为准**,失败签名是 ctx 侧 NIXL wait ~336s 后 FAILURE + 雪崩秒拒;R5b(主线,MNNVL=n + 600s/900s 超时)六对在跑,出数后两边可直接对表。
