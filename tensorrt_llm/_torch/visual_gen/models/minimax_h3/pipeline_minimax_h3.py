@@ -383,7 +383,7 @@ def build_row_timesteps(
 @register_pipeline(
     "MiniMaxH3Pipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
-    defaults={"conditioner_offload": "auto"},
+    defaults={"conditioner_offload": "auto", "conditioner_device": ""},
     doc="MiniMax-H3 joint video + audio generation (t2va / fl2va).",
 )
 class MiniMaxH3Pipeline(BasePipeline):
@@ -411,13 +411,40 @@ class MiniMaxH3Pipeline(BasePipeline):
         # they only fit together on a >=128 GB accelerator. ``auto`` keeps the
         # conditioner on the host and swaps it with the transformer around the
         # one encode call per request when they do not both fit.
-        knob = (pipeline_config.extra_attrs or {}).get("conditioner_offload", "auto")
+        extra_attrs = pipeline_config.extra_attrs or {}
+        knob = extra_attrs.get("conditioner_offload", "auto")
         if knob not in ("auto", "always", "never"):
             raise ValueError(
                 f"`conditioner_offload` must be 'auto', 'always' or 'never', got {knob!r}."
             )
         self._conditioner_offload_mode = knob
         self._conditioner_offloaded = False
+
+        # A second accelerator holds the conditioner outright, which retires
+        # the swap: the two models never contend for one card's memory, at the
+        # cost of one cross-card copy of the prompt embeddings per request.
+        conditioner_device = extra_attrs.get("conditioner_device")
+        self._conditioner_device = (
+            self._parse_conditioner_device(conditioner_device)
+            if conditioner_device is not None
+            else None
+        )
+
+    @staticmethod
+    def _parse_conditioner_device(spec) -> torch.device:
+        device = torch.device(spec)
+        if device.type != "cuda":
+            raise ValueError(f"`conditioner_device` must name a CUDA device, got {spec!r}.")
+        if device.index is None:
+            raise ValueError(
+                f"`conditioner_device` must name a specific card, e.g. 'cuda:1', got {spec!r}."
+            )
+        visible = torch.cuda.device_count()
+        if device.index >= visible:
+            raise ValueError(
+                f"`conditioner_device`={spec!r} is out of range: {visible} CUDA device(s) visible."
+            )
+        return device
 
     # ------------------------------------------------------------------
     # Component setup
@@ -426,6 +453,11 @@ class MiniMaxH3Pipeline(BasePipeline):
     @property
     def device(self) -> torch.device:
         return next(self.transformer.parameters()).device
+
+    @property
+    def conditioner_device(self) -> torch.device:
+        """Where the Qwen3-VL conditioner runs: its own card, or the main one."""
+        return self._conditioner_device if self._conditioner_device is not None else self.device
 
     @property
     def canvas_multiple(self) -> int:
@@ -532,9 +564,15 @@ class MiniMaxH3Pipeline(BasePipeline):
             ).to(device)
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
-            offload = self._resolve_conditioner_offload(device)
-            where = "host (swapped in per request)" if offload else "accelerator"
-            logger.info(f"Loading Qwen3-VL text encoder onto the {where}...")
+            # A conditioner with its own card never needs the swap.
+            offload = (
+                False
+                if self._conditioner_device is not None
+                else self._resolve_conditioner_offload(device)
+            )
+            target = self._conditioner_device if self._conditioner_device is not None else device
+            where = "host (swapped in per request)" if offload else str(target)
+            logger.info(f"Loading Qwen3-VL text encoder onto {where}...")
             self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
@@ -543,7 +581,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.text_encoder.eval()
             self._conditioner_offloaded = offload
             if not offload:
-                self.text_encoder = self.text_encoder.to(device)
+                self.text_encoder = self.text_encoder.to(target)
 
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading Qwen2 tokenizer...")
@@ -691,21 +729,24 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"`text_encoder` has {num_layers}."
             )
 
-        # Resolve the accelerator before the swap: inside the context the
+        # Resolve both accelerators before the swap: inside the context the
         # transformer sits on the host, so `self.device` would report the host.
         device = self.device
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+        cond_device = self.conditioner_device
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=cond_device)
         mm_token_type_ids = torch.tensor(
-            self.processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device
+            self.processor.create_mm_token_type_ids([token_ids]),
+            dtype=torch.long,
+            device=cond_device,
         )
         vision_kwargs = {}
         for name, value in vision_inputs.items():
             vision_kwargs[name] = (
-                value.to(device, self.text_encoder.dtype)
+                value.to(cond_device, self.text_encoder.dtype)
                 if name.startswith("pixel_")
-                else value.to(device)
+                else value.to(cond_device)
             )
-        with self._conditioner_on_device(device):
+        with self._conditioner_on_device(cond_device):
             outputs = self.text_encoder.model(
                 input_ids=input_ids,
                 attention_mask=torch.ones_like(input_ids),
@@ -714,6 +755,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 output_hidden_states=True,
                 **vision_kwargs,
             )
+            # Back onto the transformer's card when the conditioner has its own.
             prompt_embeds = outputs.hidden_states[self.text_encoder_layer].to(
                 device=device, dtype=self.text_encoder.dtype
             )

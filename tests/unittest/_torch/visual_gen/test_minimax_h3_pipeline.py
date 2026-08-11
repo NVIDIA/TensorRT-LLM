@@ -123,6 +123,35 @@ class TestKeyframeVaeEncode:
         torch.testing.assert_close(conditions[0], torch.full_like(conditions[0], -0.5))
 
 
+class TestConditionerDevice:
+    """`conditioner_device` parks the conditioner on a second card."""
+
+    def test_defaults_to_no_explicit_placement(self):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline._conditioner_device = None
+        pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.zeros(1)]))
+
+        # With no placement the conditioner follows the transformer.
+        assert pipeline.conditioner_device == torch.device("cpu")
+
+    def test_explicit_placement_overrides_the_transformer_card(self):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline._conditioner_device = torch.device("cuda:1")
+        pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.zeros(1)]))
+
+        assert pipeline.conditioner_device == torch.device("cuda:1")
+
+    @pytest.mark.parametrize("spec", ["cpu", "cuda"])
+    def test_rejects_specs_that_are_not_a_specific_card(self, spec):
+        with pytest.raises(ValueError):
+            MiniMaxH3Pipeline._parse_conditioner_device(spec)
+
+    def test_rejects_a_card_that_is_not_visible(self):
+        visible = torch.cuda.device_count()
+        with pytest.raises(ValueError, match="out of range"):
+            MiniMaxH3Pipeline._parse_conditioner_device(f"cuda:{visible + 8}")
+
+
 class _StubTokenizer:
     """Maps every word to a distinct id and names the vision specials."""
 
@@ -175,6 +204,7 @@ class TestKeyframePromptTags:
             to=lambda *_args, **_kwargs: None,
         )
         pipeline._conditioner_offloaded = False
+        pipeline._conditioner_device = None
         # `self.device` reads the transformer's first parameter. A real module
         # cannot be attached to a `__new__`'d `nn.Module`, so stand in for it.
         pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.zeros(1)]))

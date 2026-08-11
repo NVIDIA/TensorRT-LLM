@@ -65,8 +65,12 @@ class TestRegistration:
         assert "MiniMaxAI/MiniMax-H3" in entry.hf_ids
         assert entry.doc
 
-    def test_conditioner_offload_is_a_declared_knob(self):
-        assert PIPELINE_REGISTRY["MiniMaxH3Pipeline"].defaults == {"conditioner_offload": "auto"}
+    def test_conditioner_knobs_are_declared(self):
+        # The loader rejects any `pipeline_config` key not declared here.
+        assert PIPELINE_REGISTRY["MiniMaxH3Pipeline"].defaults == {
+            "conditioner_offload": "auto",
+            "conditioner_device": "",
+        }
 
     def test_detected_from_model_index(self, tmp_path):
         (tmp_path / "model_index.json").write_text(
@@ -77,7 +81,7 @@ class TestRegistration:
 
 class TestConditionerOffloadKnob:
     @staticmethod
-    def _pipeline(knob=None):
+    def _pipeline(knob=None, **extra):
         from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
         from tensorrt_llm._torch.visual_gen.config import (
             DiffusionModelConfig,
@@ -85,6 +89,7 @@ class TestConditionerOffloadKnob:
         )
 
         extra_attrs = {} if knob is None else {"conditioner_offload": knob}
+        extra_attrs.update(extra)
         model_config = DiffusionModelConfig(
             component_name="transformer",
             pretrained_config=SimpleNamespace(**MINIMAX_H3_TRANSFORMER_CONFIG),
@@ -116,6 +121,18 @@ class TestConditionerOffloadKnob:
     def test_auto_keeps_the_conditioner_resident_on_the_host(self):
         # With no accelerator in play there is nothing to swap.
         assert self._pipeline("auto")._resolve_conditioner_offload(torch.device("cpu")) is False
+
+    def test_no_conditioner_device_by_default(self):
+        assert self._pipeline()._conditioner_device is None
+
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs a second GPU")
+    def test_conditioner_device_is_parsed(self):
+        pipeline = self._pipeline("never", conditioner_device="cuda:1")
+        assert pipeline._conditioner_device == torch.device("cuda:1")
+
+    def test_conditioner_device_rejects_an_invisible_card(self):
+        with pytest.raises(ValueError, match="conditioner_device"):
+            self._pipeline("never", conditioner_device=f"cuda:{torch.cuda.device_count() + 8}")
 
 
 class TestGeometry:

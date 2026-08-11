@@ -31,11 +31,16 @@ checkpoint weights are quantized to FP4 on the fly at load time, shrinking the
 conditioner + both VAEs) fits on a single 96 GB accelerator. The conditioner
 is swapped in per request by default in that configuration.
 
+Given a second accelerator the conditioner can simply live there instead
+(``conditioner_device: cuda:1``), which retires the swap; see
+``../configs/minimax-h3-t2va-fp8-2gpu.yaml``.
+
 Example:
     python minimax_h3.py --prompt "A red fox trotting through a snowy pine forest, snow crunching underfoot"
     python minimax_h3.py --num_frames 124 --num_inference_steps 50
     python minimax_h3.py --fp4 --num_inference_steps 50
     python minimax_h3.py --visual_gen_args ../configs/minimax-h3-t2va-fp4-1gpu.yaml
+    python minimax_h3.py --visual_gen_args ../configs/minimax-h3-t2va-fp8-2gpu.yaml
 """
 
 import argparse
