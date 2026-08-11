@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BSX throughput (tp) GVR Top-K tier — CuTe DSL, Blackwell SM100.
+"""Throughput (tp) GVR Top-K tier — CuTe DSL, Blackwell SM100.
 
 CuTe DSL translation of the CUDA ``gvr_topk_tp<TB,CS,AR,UF>``
 throughput GVR top-K kernel (tuned CUDA head),
@@ -469,7 +469,7 @@ class GvrTpKernel:
     # compound-Poisson sigma cnt/sqrt(occ) (equal to the classic
     # sqrt(cnt) Poisson sigma on IID data where occ == cnt). Packing
     # keeps registers, SMEM and the exchange at their pre-admission
-    # sizes; no field overflow: the bsx envelope pins npad <= 262144, so
+    # sizes; no field overflow: the tier envelope pins npad <= 262144, so
     # cluster-total cnt <= npad/32 = 8192 < 2^16 and occ <= npad/128.
     # ------------------------------------------------------------------
     @cute.jit

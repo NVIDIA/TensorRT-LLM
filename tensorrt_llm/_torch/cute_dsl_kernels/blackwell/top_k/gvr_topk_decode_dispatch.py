@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BSX top-K tier dispatcher — routes ``cute_dsl_gvr_topk_decode`` calls to
-the BSX CuTe DSL tiers (direct / reg / tp).
+"""Tiered-GVR top-K dispatcher — routes ``cute_dsl_gvr_topk_decode`` calls
+to the CuTe DSL GVR tiers (direct / reg / tp).
 
 Exact transcription of the original CUDA implementation's dispatch
 (``gvr_topk_launch_batched``)
 (``gvr_topk_launch_batched`` + ``launch_dense`` + ``launch_tp<512>``).
 The gvr streaming tier (cs=16 fallback for npad > 262144) is intentionally
 NOT ported: it is unreachable inside the deployment envelope
-(npad <= 262144), which :func:`is_bsx_supported` enforces.
+(npad <= 262144), which :func:`is_tiered_topk_supported` enforces.
 
 Dispatcher guard (anything else falls back to the in-tree
 ``GvrTopKKernel`` path in ``CuteDSLGvrTopKDecodeRunner.forward``):
@@ -31,10 +31,10 @@ Dispatcher guard (anything else falls back to the in-tree
   queried hardware max (never silently degrade the cluster shape).
 ``order_row`` is accepted and IGNORED: it is the LJF scheduling hint the
 caller (``dsa.py``) computes for the in-tree persistent kernel whenever
-num_rows >= 2 * num_sms, and the bsx tiers launch per-row CTAs that the
+num_rows >= 2 * num_sms, and the GVR tiers launch per-row CTAs that the
 hardware schedules directly — the permutation affects neither their
 correctness nor their measured performance (the tier mesh was benched in
-natural row order). Rejecting it would silently turn bsx off for every
+natural row order). Rejecting it would silently turn the tiers off for every
 large batch in production. ``counters`` (LB mode) still falls back: the
 LB partition contract belongs to the in-tree kernel.
 pre_idx / seq_lens are request-level ([num_rows // next_n, K] /
@@ -42,16 +42,15 @@ pre_idx / seq_lens are request-level ([num_rows // next_n, K] /
 (N_eff <= K) and ragged N are handled INSIDE the tiers, so the guard
 needs no device sync.
 
-Env knobs (identical semantics to the CUDA arm's ``GVR_BSX_*`` static locals,
-renamed for the production tree; cached at first use like the CUDA static
-locals; :func:`_reset_env_cache` re-reads for tests):
-  TRTLLM_BSX_TP_BS    unset/-1 -> baked per-npad bands; 0 -> disable (2^30);
+Env knobs (identical semantics to the CUDA development arm's static locals;
+cached at first use like those; :func:`_reset_env_cache` re-reads for tests):
+  TRTLLM_GVR_TP_BS    unset/-1 -> baked per-npad bands; 0 -> disable (2^30);
                       else the bs threshold at which the tp tier takes over.
-  TRTLLM_BSX_DENSE_BS same, for the dense (tb=1024) reg tiers.
-  TRTLLM_BSX_FALLBACK_BANDS
-                      0 -> disable the measured fallback-band table (bsx
-                      serves every guarded shape); unset/other -> active.
-  TRTLLM_BSX_DISABLE  any value other than unset/""/"0" -> the guard
+  TRTLLM_GVR_DENSE_BS same, for the dense (tb=1024) reg tiers.
+  TRTLLM_GVR_FALLBACK_BANDS
+                      0 -> disable the measured fallback-band table (the
+                      tiers serve every guarded shape); unset/other -> active.
+  TRTLLM_GVR_TIERS_DISABLE  any value other than unset/""/"0" -> the guard
                       rejects everything (kill switch: every call takes the
                       in-tree kernel path).
 Malformed numeric values fail soft: a warning is logged once and the knob
@@ -64,9 +63,9 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .gvr_topk_decode_bsx_direct import DKCMAX, direct_topk
-from .gvr_topk_decode_bsx_reg import reg_topk
-from .gvr_topk_decode_bsx_tp import tp_cluster_size, tp_topk
+from .gvr_topk_decode_direct import DKCMAX, direct_topk
+from .gvr_topk_decode_reg import reg_topk
+from .gvr_topk_decode_tp import tp_cluster_size, tp_topk
 from .single_pass_multi_cta_radix_topk_cluster import _query_max_cluster_size
 
 _BIG = 1 << 30
@@ -112,17 +111,17 @@ def _reset_env_cache():
 
 
 def _thresholds(npad):
-    tpb = _env_threshold("TRTLLM_BSX_TP_BS")
+    tpb = _env_threshold("TRTLLM_GVR_TP_BS")
     if tpb < 0:
         tpb = 256 if npad <= 20480 else (128 if npad < 32768 else 16)
-    dnb = _env_threshold("TRTLLM_BSX_DENSE_BS")
+    dnb = _env_threshold("TRTLLM_GVR_DENSE_BS")
     if dnb < 0:
         dnb = 8 if npad >= 163840 else (64 if npad < 32768 else _BIG)
     return tpb, dnb
 
 
 # Measured fallback band table (full-grid calibration, 2026-07-28):
-# (npad, bs) buckets where the in-tree kernel is faster than every bsx
+# (npad, bs) buckets where the in-tree kernel is faster than every GVR
 # tier by >1.10x on at least one production layer (865 real decode cells
 # x 11 BS, same-rep cold-L2 nsys pairs; to recalibrate, re-run that
 # paired sweep and route every (npad, bs) bucket whose per-case floor
@@ -130,10 +129,10 @@ def _thresholds(npad):
 # in-tree exact-count ladder admits a leaner candidate set and its
 # row-slice cluster split keeps every CTA busy through P4. Routing them
 # to the in-tree kernel caps the worst case at 1.10x while keeping the
-# bsx win elsewhere (full-grid gm 1.40 vs the in-tree head).
+# tier win elsewhere (full-grid gm 1.40 vs the in-tree head).
 # Keys are the nearest power-of-two of npad; values are inclusive bs
-# ranges. TRTLLM_BSX_FALLBACK_BANDS=0 disables the table (bsx serves
-# every guarded shape).
+# ranges. TRTLLM_GVR_FALLBACK_BANDS=0 disables the table (the tiers
+# serve every guarded shape).
 # 2026-07-29 recalibration: the 131072 band was extended down to bs=8 for
 # TRUE 128K shapes only (see _BAND_LOW_BS_NPAD_MAX). At bs=8 the reg tier
 # dips to 0.82-0.91x vs the in-tree kernel on 5 production layers at
@@ -151,13 +150,13 @@ _FALLBACK_BANDS = {
 
 # The bs=8 end of the 131072 band applies only up to this npad: shapes above
 # it (e.g. npad 163776) round INTO the 131072 bucket but behave like the next
-# tier band, where the bsx reg tier is far ahead. They keep the calibrated
+# tier band, where the reg tier is far ahead. They keep the calibrated
 # bs>=16 routing.
 _BAND_LOW_BS_NPAD_MAX = {131072: 147456}
 
 
 def _in_fallback_band(bs: int, npad: int) -> bool:
-    if _env_threshold("TRTLLM_BSX_FALLBACK_BANDS") == _BIG:  # "0" -> off
+    if _env_threshold("TRTLLM_GVR_FALLBACK_BANDS") == _BIG:  # "0" -> off
         return False
     up = 1 << max(npad - 1, 1).bit_length()  # pow2 >= npad
     np2 = up if 4 * npad >= 3 * up else up >> 1  # arithmetic-midpoint nearest
@@ -174,8 +173,8 @@ def _in_fallback_band(bs: int, npad: int) -> bool:
 # tier name -> (kind, params). reg params = (cs, tb, maxv, ar).
 def route(bs: int, npad: int, K: int) -> str:
     """Tier the CUDA gvr_topk_launch_batched would take. Returns
-    'tp' | 'direct' | 'reg(cs=C,tb=T,maxv=M,ar=A)' | 'gvr(cs=16,tb=512)'
-    ('gvr' is unreachable through :func:`bsx_topk` — see module docstring)."""
+    'tp' | 'direct' | 'reg(cs=C,tb=T,maxv=M,ar=A)' | 'cluster(cs=16,tb=512)'
+    ('cluster' is unreachable through :func:`tiered_topk` — see module docstring)."""
     tpb, dnb = _thresholds(npad)
     if bs >= tpb:
         return "tp"
@@ -191,7 +190,7 @@ def route(bs: int, npad: int, K: int) -> str:
             return "reg(cs=4,tb=1024,maxv=8,ar=8)"
         if npad <= 262144:
             return "reg(cs=8,tb=1024,maxv=8,ar=8)"
-        return "gvr(cs=16,tb=512)"
+        return "cluster(cs=16,tb=512)"
     # latency ladder
     if npad <= DKCMAX:
         return "direct"
@@ -213,7 +212,7 @@ def route(bs: int, npad: int, K: int) -> str:
         if K == 2048:
             return "reg(cs=16,tb=512,maxv=8,ar=8)"
         return "reg(cs=16,tb=512,maxv=8,ar=6)"
-    return "gvr(cs=16,tb=512)"
+    return "cluster(cs=16,tb=512)"
 
 
 def _parse_reg(tier):
@@ -232,7 +231,7 @@ def route_cluster_size(bs: int, npad: int, K: int) -> int:
         return 1
     if tier.startswith("reg"):
         return _parse_reg(tier)[0]
-    return 16  # gvr
+    return 16  # cluster
 
 
 # Per-call route()+_parse_reg() string work costs ~2.5-3us host-submit wall
@@ -253,10 +252,10 @@ def _bind(bs, npad, K, next_n, cr):
 
         def fn(lg, pre, sl, out):
             direct_topk(lg, sl, out, K, next_n, cr)
-    elif tier.startswith("gvr"):
+    elif tier.startswith("cluster"):
         raise ValueError(
-            f"bsx gvr tier is not ported (npad beyond the deployment "
-            f"envelope); is_bsx_supported must gate this out (bs={bs}, "
+            f"the cluster tier is not ported (npad beyond the deployment "
+            f"envelope); is_tiered_topk_supported must gate this out (bs={bs}, "
             f"npad={npad}, K={K})"
         )
     else:
@@ -268,7 +267,7 @@ def _bind(bs, npad, K, next_n, cr):
     return fn
 
 
-def is_bsx_supported(
+def is_tiered_topk_supported(
     logits: torch.Tensor,
     pre_idx: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -279,9 +278,9 @@ def is_bsx_supported(
     order_row,
     counters,
 ) -> bool:
-    """Host-only guard for the bsx tiers (no device sync; see module
+    """Host-only guard for the GVR tiers (no device sync; see module
     docstring). Returns False -> caller uses the in-tree kernel."""
-    if _env_flag("TRTLLM_BSX_DISABLE"):
+    if _env_flag("TRTLLM_GVR_TIERS_DISABLE"):
         return False
     if logits.dtype != torch.float32:
         return False
@@ -334,7 +333,7 @@ def is_bsx_supported(
     return ok
 
 
-def bsx_topk(
+def tiered_topk(
     logits: torch.Tensor,
     pre_idx: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -343,14 +342,14 @@ def bsx_topk(
     next_n: int = 1,
     compress_ratio: int = 4,
 ) -> None:
-    """Unified bsx tier dispatch, replicating gvr_topk_launch_batched.
+    """Unified GVR tier dispatch, replicating gvr_topk_launch_batched.
 
     logits [BS, npad] fp32 (BS = num_requests * next_n; npad multiple of
     64; per-row tail beyond N_eff may be garbage — masked in-kernel),
     pre_idx [BS // next_n, K] int32 (request-level), seq_lens
     [BS // next_n] int32 (request-level, uncompressed-token space),
     output_indices [BS, K] int32. Caller must have passed
-    :func:`is_bsx_supported`.
+    :func:`is_tiered_topk_supported`.
     """
     bs, npad = logits.shape
     key = (bs, npad, top_k, next_n, compress_ratio)
@@ -361,8 +360,8 @@ def bsx_topk(
 
 
 __all__ = [
-    "bsx_topk",
-    "is_bsx_supported",
+    "tiered_topk",
+    "is_tiered_topk_supported",
     "route",
     "route_cluster_size",
     "_reset_env_cache",

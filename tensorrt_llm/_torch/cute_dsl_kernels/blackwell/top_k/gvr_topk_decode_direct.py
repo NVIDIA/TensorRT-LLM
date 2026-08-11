@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BSX direct (short-row) top-K tier — CuTe DSL, Blackwell SM100.
+"""Direct (short-row) GVR top-K tier — CuTe DSL, Blackwell SM100.
 
 CuTe DSL translation of the original CUDA ``direct_topk_kernel``,
 adapted for the production
 ``trtllm::cute_dsl_gvr_topk_decode`` contract (ragged N via a device
 ``seq_lens`` tensor + per-row degenerate identity emit; see the module
-docstring of ``gvr_topk_decode_bsx_tp`` for the shared adaptation inventory).
+docstring of ``gvr_topk_decode_tp`` for the shared adaptation inventory).
 
 Exact top-K indices for short padded rows (npad <= DKCMAX = 12288), one CTA
 per row, TB = 1024 threads. No threshold solve: the whole row is collected
@@ -46,7 +46,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
 
 FLT_MAX = 3.4028234663852886e38
-DKCMAX = 12288  # direct-path candidate capacity (mirrors gvr_bsx.cu)
+DKCMAX = 12288  # direct-path candidate capacity (mirrors the CUDA development arm)
 
 
 @cute.jit
@@ -69,7 +69,7 @@ class DirectTopKKernel:
     (TB, default 1024), ``next_n`` / ``compress_ratio`` for the per-row
     N_eff arithmetic (constexpr; the direct tier reads no hints, so MTP
     support is the N_eff formula alone). SMEM layout
-    mirrors gvr_bsx.cu's DSmem<TB> with the same packed (key << 32 | idx)
+    mirrors the CUDA development arm's DSmem<TB> with the same packed (key << 32 | idx)
     u64 layout (measured: split key/idx arrays cost 2x smem
     transactions in collect + emits vs CUDA's single STS.64 / LDS.64 per
     candidate):
@@ -98,7 +98,7 @@ class DirectTopKKernel:
 
     # ------------------------------------------------------------------
     # Per-row valid length (ragged N) — mirrors the in-tree run_one_row
-    # arithmetic exactly (see gvr_topk_decode_bsx_tp._row_n_eff).
+    # arithmetic exactly (see gvr_topk_decode_tp._row_n_eff).
     # ------------------------------------------------------------------
     @cute.jit
     def _row_n_eff(self, seq_lens: cute.Tensor, row):

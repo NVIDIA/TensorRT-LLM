@@ -17,10 +17,10 @@
 from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
 from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
 from .gvr_topk_decode import GvrParams, GvrTopKKernel
-from .gvr_topk_decode_bsx_direct import DirectTopKKernel
-from .gvr_topk_decode_bsx_dispatch import bsx_topk, is_bsx_supported
-from .gvr_topk_decode_bsx_reg import GvrRegKernel
-from .gvr_topk_decode_bsx_tp import GvrTpKernel
+from .gvr_topk_decode_direct import DirectTopKKernel
+from .gvr_topk_decode_dispatch import tiered_topk, is_tiered_topk_supported
+from .gvr_topk_decode_reg import GvrRegKernel
+from .gvr_topk_decode_tp import GvrTpKernel
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel
 
 __all__ = [
@@ -32,6 +32,6 @@ __all__ = [
     "GvrTpKernel",
     "GvrRegKernel",
     "DirectTopKKernel",
-    "bsx_topk",
-    "is_bsx_supported",
+    "tiered_topk",
+    "is_tiered_topk_supported",
 ]

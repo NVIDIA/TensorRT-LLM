@@ -18,7 +18,7 @@ The tie-aware checker lives here (single definition) and is handed to tests
 via the ``tie_aware_check`` fixture: conftest is collected by pytest
 regardless of rootdir/package-resolution style, so this sidesteps the
 cross-module import problem that previously forced a keep-in-sync duplicate
-of the checker in ``test_cute_dsl_bsx_topk_decode.py``.
+of the checker in ``test_cute_dsl_gvr_topk_tiers.py``.
 """
 
 import pytest

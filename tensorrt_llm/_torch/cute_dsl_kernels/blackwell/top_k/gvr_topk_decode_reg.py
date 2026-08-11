@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BSX register-resident (reg) GVR Top-K tier — CuTe DSL, Blackwell SM100.
+"""Register-resident (reg) GVR Top-K tier — CuTe DSL, Blackwell SM100.
 
 CuTe DSL translation of the CUDA
 ``gvr_topk_reg<CS,TB,MAXV,AR>`` register-resident GVR top-K kernel
 (tuned CUDA head), adapted for the production
 ``trtllm::cute_dsl_gvr_topk_decode`` contract (see the module docstring of
-``gvr_topk_decode_bsx_tp`` for the shared adaptation inventory: ragged-N
+``gvr_topk_decode_tp`` for the shared adaptation inventory: ragged-N
 masking, pre_idx clamping, per-row degenerate identity emit).
 
 The row is loaded ONCE from GMEM into per-thread registers (MAXV float4s per
@@ -29,7 +29,7 @@ emit / collect over the register array). All subsequent passes are pure ALU —
 global traffic pinned at 4*npad bytes/row.
 
 Phase skeleton (shared with the tp tier — helpers REUSED from
-``gvr_topk_decode_bsx_tp``):
+``gvr_topk_decode_tp``):
   P1 : hint gather + two-stage 64-bin histogram -> rung ladder (tp.phase1)
   P2 : full AR-rung register count + cluster exchange, secant refine /
        max-below plateau descent                              (count_reg here)
@@ -71,7 +71,7 @@ from cutlass.cute import runtime as _crt
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from .gvr_topk_decode_bsx_tp import (
+from .gvr_topk_decode_tp import (
     FLT_MAX,
     INF,
     MAXPASS,

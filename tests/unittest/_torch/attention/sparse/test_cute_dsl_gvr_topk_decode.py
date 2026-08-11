@@ -23,7 +23,7 @@ from cutlass.cute import runtime as _crt
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-    gvr_topk_decode_bsx_dispatch as _bsx_dispatch,
+    gvr_topk_decode_dispatch as _tier_dispatch,
 )
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import (
     GvrTopKKernel as _GvrTopKKernel,
@@ -37,19 +37,19 @@ skip_not_sm100 = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _bsx_off(monkeypatch):
+def _tiers_off(monkeypatch):
     """This module tests the IN-TREE kernel contract. Its op-level cases
-    (fp32 shapes within the bsx envelope) would otherwise be routed to the
-    bsx tiers by the dispatcher — which also ignores the explicit
+    (fp32 shapes within the tier envelope) would otherwise be routed to the
+    GVR tiers by the dispatcher — which also ignores the explicit
     ``cluster_size`` these tests parametrize over — so pin the op to the
-    in-tree path. The bsx tiers are covered by
-    ``test_cute_dsl_bsx_topk_decode.py`` (which flips the routing the other
-    way: fallback bands off so every test reaches a bsx tier)."""
-    monkeypatch.setenv("TRTLLM_BSX_DISABLE", "1")
-    _bsx_dispatch._reset_env_cache()
+    in-tree path. The GVR tiers are covered by
+    ``test_cute_dsl_gvr_topk_tiers.py`` (which flips the routing the other
+    way: fallback bands off so every test reaches a GVR tier)."""
+    monkeypatch.setenv("TRTLLM_GVR_TIERS_DISABLE", "1")
+    _tier_dispatch._reset_env_cache()
     yield
-    monkeypatch.delenv("TRTLLM_BSX_DISABLE", raising=False)
-    _bsx_dispatch._reset_env_cache()
+    monkeypatch.delenv("TRTLLM_GVR_TIERS_DISABLE", raising=False)
+    _tier_dispatch._reset_env_cache()
 
 
 def _make_inputs_impl(

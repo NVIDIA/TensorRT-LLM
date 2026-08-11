@@ -7271,10 +7271,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import \
         GvrTopKKernel as _GvrTopKKernel
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_bsx_dispatch import \
-        bsx_topk as _bsx_topk
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_bsx_dispatch import \
-        is_bsx_supported as _is_bsx_supported
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+        tiered_topk as _tiered_topk
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+        is_tiered_topk_supported as _is_tiered_topk_supported
 
     class CuteDSLGvrTopKDecodeRunner:
         """Runner for the GVR Top-K cuTe DSL kernel (Blackwell SM100).
@@ -7533,20 +7533,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             ``counters`` without ``order_row`` is rejected.
             """
-            # BSX tier fast path: fp32 / next_n >= 1 (MTP) /
+            # Tiered-GVR fast path: fp32 / next_n >= 1 (MTP) /
             # cr in {1, 4} / npad <= 262144 decode rows route to the
             # direct/reg/tp CuTe DSL tiers; everything else (half-prec, LB,
             # oversize npad, hw cluster cap) falls through to the in-tree
             # kernel below. ``order_row`` (the LJF hint dsa.py computes for
-            # num_rows >= 2 * num_sms) is accepted and ignored: the bsx
+            # num_rows >= 2 * num_sms) is accepted and ignored: the GVR
             # tiers launch per-row CTAs and do not consume the permutation.
             # Host-only guard — no device sync. The op signature and output
             # contract are unchanged (unordered int32 indices, -1 pad only
             # for degenerate rows).
-            if _is_bsx_supported(logits, pre_idx, seq_lens, output_indices,
+            if _is_tiered_topk_supported(logits, pre_idx, seq_lens, output_indices,
                                  top_k, next_n, compress_ratio, order_row,
                                  counters):
-                _bsx_topk(logits, pre_idx, seq_lens, output_indices, top_k,
+                _tiered_topk(logits, pre_idx, seq_lens, output_indices, top_k,
                           next_n, compress_ratio)
                 return
 
