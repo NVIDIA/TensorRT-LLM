@@ -2733,9 +2733,16 @@ def run_disaggregated_aiperf(config_file,
         # of requests, so this is the only check that catches a mid-run error
         # storm on this path (the fatal-pattern scan above is hang/OOM only).
         if max_error_rate is not None:
+            # aiperf 0.8.0 derives the request count from concurrency when
+            # --request-count is not passed (max(10, concurrency * 2) for
+            # synthetic datasets; --num-dataset-entries only sizes the prompt
+            # pool). Mirror that so the completeness check also covers the
+            # default request mode instead of silently disabling.
+            expected_records = (request_count if request_count is not None else
+                                max(10, concurrency * 2))
             enforce_aiperf_error_rate(artifact_dir,
                                       max_error_rate,
-                                      expected_records=request_count)
+                                      expected_records=expected_records)
 
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(

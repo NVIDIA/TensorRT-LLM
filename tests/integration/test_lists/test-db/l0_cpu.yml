@@ -12,6 +12,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - disaggregated/test_aiperf_gate.py
   - unittest/_torch/auto_deploy
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
