@@ -29,7 +29,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
-                                 prefer_pinned, torch_comm)
+                                 prefer_pinned, torch_comm,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -44,7 +45,8 @@ from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
 # isort: on
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
+from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
+                       nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -581,7 +583,14 @@ class KVCacheManager(BaseResourceManager):
                 ) for pc in self.pool_configurations
             ]
 
-        if kv_cache_type != CacheTypeCpp.SELF:
+        # Hybrid linear-attention managers intentionally carry two windows
+        # (the RECURRENT_STATES sentinel window plus the full attention
+        # window), including with the SELFKONLY cache type (e.g. Kimi K3:
+        # MLA latent cache + KDA recurrent state). The C++ WindowBlockManager
+        # treats kSELFKONLY as a self cache (kv_factor=1) with regular
+        # per-window pools, so the single-window normalization below (meant
+        # for cross-KV caches) must not fire for them.
+        if kv_cache_type != CacheTypeCpp.SELF and not self.is_linear_attention:
             assert len(
                 blocks_per_window
             ) == 1, "Only one window size is supported for non-self KV cache"
@@ -2686,7 +2695,8 @@ class PeftCacheManager(BaseResourceManager):
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None,
                  execution_stream: Optional[torch.cuda.Stream] = None,
-                 lora_target_modules: Optional[List[str]] = None):
+                 lora_target_modules: Optional[List[str]] = None,
+                 initial_data_type: Optional[torch.dtype] = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -2721,6 +2731,9 @@ class PeftCacheManager(BaseResourceManager):
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
+        if initial_data_type is not None:
+            self.impl.configure_data_type(
+                torch_dtype_to_binding(initial_data_type))
         self._lora_config = lora_config
         self._lora_model_config = LoraModelConfig(
             lora_target_modules if lora_target_modules is not None else
@@ -2745,6 +2758,10 @@ class PeftCacheManager(BaseResourceManager):
 
     def get_lora_manager(self) -> LoraManager:
         return self._lora_manager
+
+    @property
+    def data_type(self) -> torch.dtype:
+        return binding_to_torch_dtype(self.impl.data_type)
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:

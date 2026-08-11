@@ -1337,7 +1337,7 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.model_config = _FakeModelConfig()
         server.tokenizer = None
         server.metrics_collector = None
-        server.perf_metrics = None
+        server._collect_perf_metrics = False
         server._input_proc_executor = None
 
         request = CompletionRequest(model="test-model",

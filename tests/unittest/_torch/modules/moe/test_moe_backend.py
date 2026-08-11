@@ -65,9 +65,11 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadin
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
+    NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
@@ -352,6 +354,11 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert result == "loaded"
     backend.load_weights.assert_called_once_with(weights, True)
     assert configurable_moe._weights_transformed is False
+
+
+def test_moe_nvfp4_activation_quantization_capability():
+    assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
+    assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations
 
 
 def test_marlin_moe_repack_is_transform_stage():
@@ -820,13 +827,16 @@ def generate_element_wise_test_params() -> List:
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
-            [None, QuantAlgo.NVFP4],
+            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
         ):
             if skip_reason:
                 continue
             if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
                 continue
             if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
+                continue
+            # INT8 weight-only per-channel non-gated MoE is CUTLASS-path only.
+            if quant_algo == QuantAlgo.W8A16 and backend_type != MoeBackendType.CUTLASS:
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (
@@ -1172,7 +1182,12 @@ def _make_bf16_routing_method(routing_kind: str, top_k: int, num_experts: int, d
 )
 @pytest.mark.parametrize("routing_kind", ["deepseekv3", "renormalize"])
 def test_trtllm_bf16_unquantized_moe(
-    routing_kind, activation_type, seq_len, trtllm_use_router_logits
+    routing_kind,
+    activation_type,
+    seq_len,
+    trtllm_use_router_logits,
+    num_experts=_BF16_UNQUANT_NUM_EXPERTS,
+    top_k=_BF16_UNQUANT_TOP_K,
 ):
     """TRTLLM-Gen BF16 (unquantized) MoE accuracy vs the reference impl."""
     backend_type = MoeBackendType.TRTLLM
@@ -1184,8 +1199,6 @@ def test_trtllm_bf16_unquantized_moe(
     if not can_impl:
         pytest.skip(skip_reason)
 
-    num_experts = _BF16_UNQUANT_NUM_EXPERTS
-    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
@@ -1261,6 +1274,24 @@ def test_trtllm_bf16_unquantized_moe(
         with torch.inference_mode():
             output = run_moe()
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.parametrize("seq_len", [1, 8])
+def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
+    """Kimi-K3 routing shape: 896 experts / top_k 16 without expert groups.
+
+    Exercises the (1024, 32) tier of the trtllm-gen DeepSeekV3 routing
+    kernels, including the cooperative small-batch kernel at num_tokens 1,
+    via the fused-routing path (router logits consumed in-kernel).
+    """
+    test_trtllm_bf16_unquantized_moe(
+        routing_kind="deepseekv3",
+        activation_type=ActivationType.Swiglu,
+        seq_len=seq_len,
+        trtllm_use_router_logits=True,
+        num_experts=896,
+        top_k=16,
+    )
 
 
 # ============================================================================
