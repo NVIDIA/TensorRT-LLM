@@ -43,11 +43,36 @@ Inference systems are conventionally compared with token-level Pareto curves (to
 
 Industry efforts are converging on the same trace-replay idea from different directions: [AA-AgentPerf](https://artificialanalysis.ai/methodology/agentperf) replays recorded coding sessions to report the concurrent agents a deployment sustains under an SLO, and SemiAnalysis's [InferenceX AgentX](https://inferencex.semianalysis.com/datasets) replays coding traces with per-turn token counts and KV-block hashes to reproduce prefix reuse. Ours differs in scope rather than in kind: it covers agent architectures beyond a coding ReAct thread, replays their execution graph concurrently, and reports job-level throughput instead of SLO-conditioned concurrency.
 
-## Trace Format and Dataset
+## Implementation
+
+### Trace Format
 
 Each agent run produces one compact JSON file holding an ordered `events` list. Because token content does not affect serving performance, a trace records only structure and sizes, never the underlying text.
 
 Every event is one of three kinds: a **`message`** (one conversation turn, with role, conversation membership, token counts, and — for assistant turns — prompt/completion/reasoning token splits and issued tool calls), a **`tool_call`** (tool name plus measured `duration_ms`), or a **`parallel_start`/`parallel_end`** boundary marking fan-out and synchronization of concurrent branches. A `system_prompt_id` marks which messages share a cacheable prefix, so replay reproduces prefix-cache behavior faithfully.
+
+### Framework Pipeline
+
+Figure 1 shows the pipeline: a trace-collection phase (top), in which agents run real agentic task benchmarks with their tools while hooks record the stepwise footprint of every run, and a replay-and-evaluation phase (bottom), in which the replay engine re-issues the recorded requests against the system under evaluation and metrics are computed from the run.
+
+<div align="center">
+    <img src="../media/tech_blog27_pipeline.png" alt="The scaffolding trace-replay evaluation pipeline" width="800px">
+</div>
+<p align="center"><sub><em>Figure 1. The trace-replay evaluation pipeline: a trace-collection phase (top) and a replay-and-evaluation phase (bottom).</em></sub></p>
+
+The pieces, one by one:
+
+- **Scaffolding agents.** The traced agents are built on [Scaffolding](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding), TensorRT-LLM's inference-time-compute framework introduced in [Tech Blog 13](blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md), whose controller/worker structure makes an agent's execution graph explicit and therefore traceable.
+- **Trace hooks.** Two decorators attach tracing to an existing agent with no change to its own logic; the example agents wire this up behind a flag, so collecting a trace is one CLI switch.
+- **Trace files.** Each run is serialized as one `ExecutionTrace` JSON file in the format above, and a directory of them forms a replayable dataset.
+- **`ReplayEngine`.** It applies the replay rules — recorded ISL/OSL filled with random token IDs, a shared synthetic system-prompt prefix, tool calls as timed sleeps — and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serialized.
+- **Replay backend.** Any OpenAI-compatible endpoint, typically `trtllm-serve`; it need not be the system that served the agents during tracing, so a trace collected with one model can be replayed against another.
+- **Metrics collector.** It aggregates the run into the job- and token-level Pareto points over the steady-state window, alongside the engine-reported KV-cache hit rate.
+- **Offline analyzer.** A no-GPU pass that walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**, which we compare against engine-measured rates below.
+
+The framework lives under [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay); a bundled example trace, the runnable replay scripts, and the analysis tools live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
+
+### Trace Dataset
 
 We collect 730 traces from four Scaffolding agents chosen to cover distinct execution patterns: **Coder**, a single-thread ReAct loop over filesystem/shell tools (500 SWE-bench Verified tasks); **Open Deep Research**, a supervisor that fans out to parallel researcher subagents (100 Deep Research Bench tasks); **IterResearch**, an iterative researcher that keeps its context bounded through compaction (100 Deep Research Bench tasks); and **Tree-of-Thought Research**, a tree-structured reasoner that expands, scores, and prunes parallel branches (30 AIME 2026 problems). They occupy clearly different regions of the workload space:
 
@@ -60,21 +85,6 @@ We collect 730 traces from four Scaffolding agents chosen to cover distinct exec
 <p align="center"><sub><em>Table 1. Trace-dataset summary. The optimal cache hit rate is the per-trace upper bound on prefix reuse, computed offline from the trace.</em></sub></p>
 
 Coder is input-heavy and decode-light, and caches almost perfectly (96.5%): one shared prefix grows monotonically, so each turn re-reads what previous turns already cached. The research agents invert the shape — moderate inputs, long reasoning-heavy outputs — and cache far worse, because subagent fan-out, context rewriting, and branch exploration repeatedly introduce fresh context. The rest of this blog follows two representative traces at opposite ends of this space: a **Coder** trace (single ReAct thread, 23 requests, only ~3% fresh tokens per prompt) and an **Open Deep Research** trace (supervisor plus four parallel researcher branches, generation-bound, mostly fresh context).
-
-## Implementation
-
-Figure 1 shows the pipeline. In the trace-collection phase (top), Scaffolding-based agents run agentic task benchmarks with their tools while trace hooks record the stepwise footprint of every run. In the replay-and-evaluation phase (bottom), the replay engine re-issues the recorded requests against the replay backend — the system under evaluation — and we compute agentic serving metrics from the run. The replay backend need not be the system that served the agents during tracing: a trace collected with one model can be replayed against another.
-
-<div align="center">
-    <img src="../media/tech_blog27_pipeline.png" alt="The scaffolding trace-replay evaluation pipeline" width="800px">
-</div>
-<p align="center"><sub><em>Figure 1. The trace-replay evaluation pipeline: a trace-collection phase (top) and a replay-and-evaluation phase (bottom).</em></sub></p>
-
-Tracing attaches to an existing Scaffolding agent through two decorators, with no change to the agent's own logic; the example agents already wire this up behind a flag, so collecting a trace is one CLI switch. On the replay side, the `ReplayEngine` applies the rules above — recorded ISL/OSL filled with random token IDs, a shared synthetic system-prompt prefix, tool calls as timed sleeps — and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serialized.
-
-A bundled example trace replays against any running `trtllm-serve` endpoint; the runnable scripts and their usage live in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
-
-The framework also includes an offline analyzer that needs no GPU: it walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**, which we compare against engine-measured hit rates below.
 
 ## Experimental Findings
 
