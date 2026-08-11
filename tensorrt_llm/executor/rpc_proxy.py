@@ -129,6 +129,21 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
             return {}
 
+    def get_effective_llm_args(self) -> dict:
+        """Get the effective llm_args from the worker runtime via RPC.
+
+        The worker may have disabled runtime features (e.g. chunked prefill)
+        by mutating its copy of ``llm_args`` during engine creation. Fetching
+        the effective values keeps the main-process ``LLM.args`` (and the
+        frontend validations that read it) in sync with the runtime.
+        """
+        try:
+            llm_args = self.rpc_client.get_effective_llm_args().remote()
+            return llm_args if isinstance(llm_args, dict) else {}
+        except RPCError as e:
+            logger.debug(f"Error fetching effective llm_args via RPC: {e}")
+            return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 

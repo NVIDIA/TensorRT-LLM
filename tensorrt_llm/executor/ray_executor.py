@@ -29,6 +29,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from .request import GenerationRequest
 from .result import GenerationResult
+from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .utils import has_event_loop
 
@@ -69,9 +70,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
                 try:
                     ray.init(address="auto", **ray_init_args)
-                    logger.info(f"Attached to an existing Ray cluster.")
+                    logger.info("Attached to an existing Ray cluster.")
                 except ConnectionError:
-                    logger.info(f"Ray cluster not found, starting a new one.")
+                    logger.info("Ray cluster not found, starting a new one.")
 
                 if not ray.is_initialized():
                     ray.init(**ray_init_args)
@@ -257,8 +258,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         return await asyncio.gather(*refs)
 
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
-        """
-        Low-level API to the executor. Return a "future" GenerationResult
+        """Low-level API to the executor. Return a "future" GenerationResult
         which can be waited. Forwards the request to the workers through RPC.
         """
         if request.id is None:
@@ -280,6 +280,21 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
     def start(self):
         pass
+
+    def get_effective_llm_args(self) -> dict:
+        """Get the effective llm_args from the worker runtime via RPC.
+
+        The worker may have disabled runtime features (e.g. chunked prefill)
+        by mutating its copy of ``llm_args`` during engine creation. Fetching
+        the effective values keeps the main-process ``LLM.args`` (and the
+        frontend validations that read it) in sync with the runtime.
+        """
+        try:
+            llm_args = self.rpc_client.get_effective_llm_args().remote()
+            return llm_args if isinstance(llm_args, dict) else {}
+        except RPCError as e:
+            logger.debug(f"Error fetching effective llm_args via RPC: {e}")
+            return {}
 
     def setup_engine_remote(self):
         return self.collective_rpc("setup_engine", non_block=False)
@@ -327,7 +342,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if hasattr(self, '_shutdown_event'):
             self._shutdown_event.set()
 
-        logger_debug(f"Shutting down RayExecutor", color="yellow")
+        logger_debug("Shutting down RayExecutor", color="yellow")
 
         if hasattr(self, 'main_loop') and self.main_loop and hasattr(
                 self, 'main_loop_task_obj') and self.main_loop_task_obj:
@@ -437,8 +452,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self,
             tp_size: int,
             worker_kwargs: Dict = None) -> Tuple[Any, List[int]]:
-        """
-        Obtain placement group(s) and bundle indices for workers.
+        """Obtain placement group(s) and bundle indices for workers.
 
         Priorities:
         1. `ray_placement_config` in `llm_args`.

@@ -155,10 +155,8 @@ class BaseWorker(GenerationExecutor):
         return comm_ranks, device_ids
 
     def setup_engine(self):
+        """Setup the engine for the worker.
         """
-        Setup the engine for the worker.
-        """
-
         if isinstance(self._engine, list):
             self._engine = self._engine[self.rank]
 
@@ -256,7 +254,7 @@ class BaseWorker(GenerationExecutor):
         self.result_queue = queue
 
     def set_postproc_queues(self, queues: List["IpcQueue"]):
-        """ Set the IPC queues for feeding post-processing processes. """
+        """Set the IPC queues for feeding post-processing processes."""
         assert self.result_queue is None
         assert self.frontend_result_queues is None
         self.postproc_queues = queues
@@ -589,7 +587,7 @@ class BaseWorker(GenerationExecutor):
             raise RequestError(str(e)) from e
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
+        """Low-level API to the executor. Return a "future" GenerationResult which can be waited."""
         self.start()
 
         if self.rank != 0:
@@ -973,6 +971,23 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
+    def get_effective_llm_args(self) -> dict:
+        """Return the effective ``llm_args`` as decided by the worker.
+
+        ``create_py_executor`` may disable runtime features (e.g. chunked
+        prefill for MLA on unsupported SMs) by mutating its copy of
+        ``llm_args`` during engine creation. The main process needs those
+        effective values (e.g. for the per-request prompt-length validation
+        in ``LLM._check_arguments``), but the mutation is not propagated back
+        automatically, so expose the mutated fields here.
+        """
+        if self.llm_args is None:
+            return {}
+        return {
+            "enable_chunked_prefill":
+            getattr(self.llm_args, "enable_chunked_prefill", None),
+        }
+
     def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
         if self.engine is None:
             return None
@@ -1072,7 +1087,7 @@ class BaseWorker(GenerationExecutor):
 
 
 class AwaitResponseHelper:
-    ''' Multiple-implementations for await_response for performance. '''
+    """Multiple-implementations for await_response for performance."""
 
     class HandlerKind(enum.Enum):
         unknown = 0
@@ -1095,14 +1110,14 @@ class AwaitResponseHelper:
                               or self.worker.postproc_queues is not None
                               or self.worker.frontend_result_queues is not None)
             if not has_ipc_queues:
-                logger_debug(f"creating await_response helper for Worker\n",
+                logger_debug("creating await_response helper for Worker\n",
                              color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
             else:
                 # The ExecutorBindingProxy is used
-                logger_debug(f"creating await_response helper for IPC\n",
+                logger_debug("creating await_response helper for IPC\n",
                              color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
 
@@ -1115,7 +1130,7 @@ class AwaitResponseHelper:
                 raise NotImplementedError
 
     def __call__(self, timeout: Optional[float] = None) -> bool:
-        ''' This method should be called by a ManagedThread. '''
+        """This method should be called by a ManagedThread."""
         timeout = timeout or 0.1
         try:
             responses = self.worker.engine.await_responses(
@@ -1220,7 +1235,7 @@ class AwaitResponseHelper:
         return False
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
-        ''' Return the responses to asyncio.event_loop. '''
+        """Return the responses to asyncio.event_loop."""
         event_loop = None
         async_queues = []
         for response in responses:
@@ -1250,7 +1265,7 @@ class AwaitResponseHelper:
             _SyncQueue.notify_many(event_loop, async_queues)
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
-        ''' Perform the IPC in batch explicitly. '''
+        """Perform the IPC in batch explicitly."""
         postproc_batches = [
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
@@ -1307,7 +1322,7 @@ def _get_params_for_first_rsp(
 def _compute_pytorch_prompt_logprobs(
         generation_result: GenerationResult,
         response: LlmResponse) -> Optional[LogProbsResult]:
-    """Compute prompt logprobs for PyTorch backend (cached when streaming) """
+    """Compute prompt logprobs for PyTorch backend (cached when streaming)"""
     logprob_params = generation_result._logprob_params  # should be present and non None
     assert logprob_params is not None
     if generation_result._streaming:
@@ -1351,7 +1366,6 @@ def _get_logprobs(worker,
     - PyTorch: Generation logprobs computed in sampler, only prompt logprobs computed here
     - TRT: Both prompt and generation logprobs computed here from logits
     """
-
     logprobs_result = None
     generation_result = worker._results.get(response.client_id, None)
 

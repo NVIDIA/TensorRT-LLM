@@ -49,13 +49,9 @@ from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
-_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
-_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
-    f"SM{sm_version}"
-    for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 
 
 class _ExecutorMemoryMonitor:
@@ -449,6 +445,7 @@ def create_py_executor(
         logger.warning(
             f"Disabling chunked context for {llm_args.attn_backend} backend")
         enable_chunked_context = False
+        llm_args.enable_chunked_prefill = False
 
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
@@ -579,6 +576,18 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    # Must run before validate_feature_combination so feature_status is correct.
+    config = model_engine.model.model_config.pretrained_config
+    if is_mla(config) and enable_chunked_context:
+        sm_version = get_sm_version()
+        if sm_version not in [90, 100, 103, 120]:
+            logger.warning(
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
+                f"disable enable_chunked_context for SM{sm_version}")
+            enable_chunked_context = False
+            llm_args.enable_chunked_prefill = False
+            model_engine.attn_runtime_features.chunked_prefill = False
+
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     calibrator = get_calibrator()
@@ -654,6 +663,8 @@ def create_py_executor(
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
+            if not enable_chunked_context:
+                draft_model_engine.attn_runtime_features.chunked_prefill = False
     else:
         draft_model_engine = None
 
@@ -735,16 +746,6 @@ def create_py_executor(
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
-        if (enable_chunked_context and sm_version
-                not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
-            logger.warning("Chunked Prefill for MLA can only be enabled on "
-                           f"{_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR}, "
-                           f"disable enable_chunked_context for SM{sm_version}")
-            enable_chunked_context = False
-            model_engine.attn_runtime_features.chunked_prefill = False
-            if draft_model_engine is not None:
-                draft_model_engine.attn_runtime_features.chunked_prefill = False
-
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires
