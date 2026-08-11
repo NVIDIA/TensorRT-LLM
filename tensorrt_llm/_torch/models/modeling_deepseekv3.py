@@ -1908,6 +1908,13 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for this model implementation."""
+        return "V2"
+
+    @classmethod
     def get_preferred_transceiver_runtime(
             cls,
             pretrained_config: Any = None
