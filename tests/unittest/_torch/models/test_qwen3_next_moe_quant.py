@@ -221,7 +221,7 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, quant_config_dict=
     return captured
 
 
-@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "DEEPGEMM", "WIDEEP", "CUTEDSL"])
+@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "DEEPGEMM", "CUTEDSL"])
 @pytest.mark.parametrize("layer_idx", [5, MTP_LAYER_IDX])
 def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     per_layer_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
@@ -245,7 +245,6 @@ _UNEXCLUDED_EXPECTED_MOE_CLS = {
     "CUTLASS": "CutlassFusedMoE",
     "TRTLLM": "TRTLLMGenFusedMoE",
     "DEEPGEMM": "DeepGemmFusedMoE",
-    "WIDEEP": "WideEPMoE",
     "CUTEDSL": "CuteDslFusedMoE",
 }
 

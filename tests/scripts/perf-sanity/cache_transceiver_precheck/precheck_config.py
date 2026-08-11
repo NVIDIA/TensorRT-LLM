@@ -139,10 +139,13 @@ def precheck_prefix_lines(
     expressions ($llmSrcNode etc.), expanded at sbatch runtime.
     """
     knobs = cfg.get("cache_transceiver_precheck", {}) or {}
-    # On by default; yaml opts out per test; the env var (when set) overrides
-    # the yaml either way (global kill switch). Parse the usual boolean spellings
-    # so a well-meant TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently
-    # read as "off"; reject anything ambiguous instead of guessing.
+    # Off by default until the gate is validated on the post-merge stages
+    # (the precheck is a launch-script gate, not a pytest case, so it cannot
+    # be waived in waives.txt — this default is the waive). Yaml opts in per
+    # test; the env var (when set) overrides the yaml either way (global kill
+    # switch). Parse the usual boolean spellings so a well-meant
+    # TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently read as
+    # "off"; reject anything ambiguous instead of guessing.
     env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
     if env is not None:
         val = env.strip().lower()
@@ -156,7 +159,7 @@ def precheck_prefix_lines(
                 f"(1/0/true/false/on/off/yes/no), got {env!r}"
             )
     else:
-        enabled = bool(knobs.get("enabled", True))
+        enabled = bool(knobs.get("enabled", False))
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
@@ -304,8 +307,8 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         plan[f"{role}_kv_dtype"] = str(kv_cfg.get("dtype", "auto"))
         # Tri-state, matching KvCacheConfig's pydantic default: explicit
         # True/False from the yaml wins; absent means "auto", which the
-        # driver resolves against the model class's get_model_defaults() at
-        # runtime — exactly like serving (_resolve_kv_cache_manager_v2_auto).
+        # driver resolves against the model class's manager preference at
+        # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
         plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan

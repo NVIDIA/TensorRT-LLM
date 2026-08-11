@@ -13,6 +13,8 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import \
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
 # Model configurations for different processors
 MODEL_CONFIGS = {
     "LlavaNextInputProcessor": {

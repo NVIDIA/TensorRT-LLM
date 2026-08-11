@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # --------------------------------------------------
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
@@ -832,8 +835,6 @@ class DeepseekV32Attention(MLA):
                          aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
-
-        self.indexer = self.mqa.indexer
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
@@ -1905,6 +1906,13 @@ class DeepseekV3Model(DecoderModel):
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for this model implementation."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(

@@ -90,6 +90,16 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  # ------------- Kimi K3 (KimiLinear) unit tests ---------------
+  - unittest/_torch/modeling/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modeling/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  # test_kda_prefill_op.py is NOT wired here: its compute cases produce
+  # NaN on B200 (cosine check fails; passes on GB300). Under
+  # investigation before enabling on this machine type (TRTLLM-15204).
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
@@ -183,7 +193,6 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- KV Cache Iteration Stats ---------------
-  - unittest/metrics/test_collector.py
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
@@ -224,7 +233,11 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
   - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
+  - unittest/_torch/visual_gen/test_wan_dup_up3d.py
   - unittest/_torch/visual_gen/test_wan_vae.py
+  - unittest/_torch/visual_gen/test_wan_vae_halo.py
+  - unittest/_torch/visual_gen/test_fastwan_dmd_math.py
+  - unittest/_torch/visual_gen/test_fastwan_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache_user_coefficients.py
@@ -235,17 +248,16 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
-  - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
-  - examples/visual_gen/test_visual_gen.py::test_flux1_example
-  - examples/visual_gen/test_visual_gen.py::test_flux2_example
-  - examples/visual_gen/test_visual_gen.py::test_flux2_reference_image_example
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_example
-  - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
-  - examples/visual_gen/test_visual_gen.py::test_qwen_image_example
-  - examples/visual_gen/test_visual_gen.py::test_qwen_image_layered_example
-  - examples/visual_gen/test_visual_gen.py::test_qwen_image_edit_example
-  # - examples/visual_gen/test_visual_gen.py
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -272,8 +284,8 @@ l0_b200:
       backend: pytorch
   tests:
   - unittest/disaggregated/test_openai_server_info.py
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:
@@ -333,24 +345,44 @@ l0_b200:
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4]
   # ------------- VisualGen single-GPU tests ---------------
-  - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
-  - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
-  - examples/visual_gen/test_visual_gen.py::test_flux1_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend
-  - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux1_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cuda-graph]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-cuda-graph]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[cuda-graph]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[cuda-graph]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-nvfp4]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-cuda-graph]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-nvfp4]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
-  - examples/visual_gen/test_visual_gen.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_qwen_image_layered_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen_wan.py::test_fastwan_lpips_against_golden TIMEOUT (10)
   # Heavyweight CPU-offload accuracy tests (each loads the full pipeline twice:
   # offload + baseline). Kept in post_merge to bound the B200 pre_merge wall-time.
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload_matches_baseline

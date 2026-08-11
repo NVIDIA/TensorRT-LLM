@@ -22,6 +22,10 @@ correctly and that our version takes precedence over any external installation.
 import unittest
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 
 class TestTritonKernelsVendoring(unittest.TestCase):
     def test_triton_kernels_is_vendored_version(self):
