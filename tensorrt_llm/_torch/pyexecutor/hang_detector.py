@@ -99,7 +99,7 @@ class HangDetector:
                 timeout = int(env_threshold)
             except ValueError:
                 logger.warning(
-                    f"Invalid value for TLLM_HANG_DETECTOR_THRESHOLD: "
+                    f"Invalid value for TRTLLM_HANG_DETECTOR_THRESHOLD: "
                     f"{env_threshold} (must be an integer). "
                     f"Using passed in value {timeout}."
                 )
