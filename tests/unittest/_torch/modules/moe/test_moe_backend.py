@@ -470,8 +470,10 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
     model_config = ModelConfig(
         pretrained_config=SimpleNamespace(
-            activation_situ_beta=4.0,
-            activation_situ_linear_beta=25.0,
+            text_config=SimpleNamespace(
+                activation_situ_beta=4.0,
+                activation_situ_linear_beta=25.0,
+            )
         )
     )
 

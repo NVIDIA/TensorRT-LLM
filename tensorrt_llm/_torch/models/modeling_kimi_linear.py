@@ -778,6 +778,12 @@ class KimiK3MoERuntime(nn.Module):
                     situ_linear_beta if situ_linear_beta is not None else 1.0
                 ),
             )
+        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+            routed_moe_kwargs.update(
+                activation="situ",
+                situ_beta=float(situ_beta),
+                situ_linear_beta=float(situ_linear_beta if situ_linear_beta is not None else 1.0),
+            )
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(

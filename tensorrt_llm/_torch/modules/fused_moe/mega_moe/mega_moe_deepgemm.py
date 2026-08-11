@@ -367,8 +367,13 @@ class MegaMoEDeepGemm(MoE):
         situ_linear_beta: Optional[float],
     ) -> Tuple[str, Optional[float], Optional[float]]:
         pretrained_config = model_config.pretrained_config
+        text_config = getattr(pretrained_config, "text_config", None)
         config_situ_beta = getattr(pretrained_config, "activation_situ_beta", None)
         config_situ_linear_beta = getattr(pretrained_config, "activation_situ_linear_beta", None)
+        if config_situ_beta is None:
+            config_situ_beta = getattr(text_config, "activation_situ_beta", None)
+        if config_situ_linear_beta is None:
+            config_situ_linear_beta = getattr(text_config, "activation_situ_linear_beta", None)
         if activation is None:
             activation = "situ" if config_situ_beta is not None else "swiglu"
         activation = activation.lower()
