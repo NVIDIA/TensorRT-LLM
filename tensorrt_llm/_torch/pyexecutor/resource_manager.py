@@ -29,7 +29,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
-                                 prefer_pinned, torch_comm)
+                                 prefer_pinned, torch_comm,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -44,7 +45,8 @@ from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
 # isort: on
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
+from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
+                       nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -292,6 +294,8 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         indexer_k_cache_use_fp4: bool = False,
+        # Boolean array indicating whether each layer has an indexer K cache.
+        indexer_k_cache_layer_mask: Optional[List[bool]] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
@@ -319,11 +323,27 @@ class KVCacheManager(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
+        # can distinguish the throwaway estimation-phase managers from the
+        # final ones: the estimation cache is sized with no headroom for
+        # retained dummy requests.
+        self.is_estimating_kv_cache = is_estimating_kv_cache
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        if indexer_k_cache_layer_mask is not None:
+            assert len(indexer_k_cache_layer_mask) >= max(self.pp_layers) + 1, (
+                f"indexer_k_cache_layer_mask covers "
+                f"{len(indexer_k_cache_layer_mask)} layers but this rank "
+                f"manages global layer {max(self.pp_layers)}")
+            self.indexer_k_cache_local_layer_mask: Optional[List[bool]] = [
+                bool(indexer_k_cache_layer_mask[i]) for i in self.pp_layers
+            ]
+        else:
+            self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
 
@@ -563,7 +583,14 @@ class KVCacheManager(BaseResourceManager):
                 ) for pc in self.pool_configurations
             ]
 
-        if kv_cache_type != CacheTypeCpp.SELF:
+        # Hybrid linear-attention managers intentionally carry two windows
+        # (the RECURRENT_STATES sentinel window plus the full attention
+        # window), including with the SELFKONLY cache type (e.g. Kimi K3:
+        # MLA latent cache + KDA recurrent state). The C++ WindowBlockManager
+        # treats kSELFKONLY as a self cache (kv_factor=1) with regular
+        # per-window pools, so the single-window normalization below (meant
+        # for cross-KV caches) must not fire for them.
+        if kv_cache_type != CacheTypeCpp.SELF and not self.is_linear_attention:
             assert len(
                 blocks_per_window
             ) == 1, "Only one window size is supported for non-self KV cache"
@@ -621,6 +648,7 @@ class KVCacheManager(BaseResourceManager):
             indexer_k_cache_quant_block_size,
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
+            'indexer_k_cache_layer_mask': self.indexer_k_cache_local_layer_mask,
             'linear_attention_metadata': linear_attention_metadata,
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.
@@ -967,59 +995,92 @@ class KVCacheManager(BaseResourceManager):
                 _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
 
-        # Use add_sequence_batch for all dummy requests, then add extra tokens.
-        # This must happen before is_gen state modifications below, which may
-        # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
-        if batch_request_infos:
-            self.impl.add_sequence_batch(batch_request_infos,
-                                         batch_llm_requests)
-            for req_id, token_num, _ in batch_request_infos:
-                for _ in range(self.num_extra_kv_tokens):
-                    self.impl.add_token(req_id)
-                for _ in range(num_extra_decoding_steps):
-                    self.impl.add_token(req_id)
+        try:
+            # Use add_sequence_batch for all dummy requests, then add extra tokens.
+            # This must happen before is_gen state modifications below, which may
+            # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
+            if batch_request_infos:
+                self.impl.add_sequence_batch(batch_request_infos,
+                                             batch_llm_requests)
+                for req_id, token_num, _ in batch_request_infos:
+                    for _ in range(self.num_extra_kv_tokens):
+                        self.impl.add_token(req_id)
+                    for _ in range(num_extra_decoding_steps):
+                        self.impl.add_token(req_id)
 
-        if draft_batch_request_infos and draft_kv_cache_manager is not None:
-            draft_kv_cache_manager.impl.add_sequence_batch(
-                draft_batch_request_infos, draft_batch_llm_requests)
-            for req_id, _, _ in draft_batch_request_infos:
-                for _ in range(self.num_extra_kv_tokens):
-                    draft_kv_cache_manager.impl.add_token(req_id)
+            if draft_batch_request_infos and draft_kv_cache_manager is not None:
+                draft_kv_cache_manager.impl.add_sequence_batch(
+                    draft_batch_request_infos, draft_batch_llm_requests)
+                for req_id, _, _ in draft_batch_request_infos:
+                    for _ in range(self.num_extra_kv_tokens):
+                        draft_kv_cache_manager.impl.add_token(req_id)
 
-        # Set is_gen state after add_sequence_batch to avoid modifying
-        # prompt_len before the C++ side reads it.
-        if is_gen:
-            for i, req in enumerate(requests):
-                token_num = token_nums[
-                    i] if token_nums is not None else 1 + max_num_draft_tokens
-                if self.mapping.has_cp_helix():
-                    token_num = max(token_num, 2)
-                req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1
-                req.py_prompt_len = req.prompt_len
-                if self.mapping.has_cp_helix():
-                    if self.mapping.cp_size - 1 == self.mapping.cp_rank:
-                        req.py_helix_is_inactive_rank = False
-                        req.prompt_len = token_num - 1
-                        req.py_prompt_len = req.prompt_len
-                        req.seqlen_this_rank_cp = req.prompt_len
-                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
-                        req.py_decoding_iter = 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        req.prompt_len = token_num
-                        req.py_prompt_len = req.prompt_len
-                        req.seqlen_this_rank_cp = req.prompt_len
-                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
-                        req.py_decoding_iter = 1
-                req.py_draft_tokens = [1] * max_num_draft_tokens
-                if prepare_resource:
-                    for _ in range(_kv_draft):
-                        self.impl.add_token(req.request_id)
-                    if draft_kv_cache_manager is not None:
+            # Set is_gen state after add_sequence_batch to avoid modifying
+            # prompt_len before the C++ side reads it.
+            if is_gen:
+                for i, req in enumerate(requests):
+                    token_num = token_nums[
+                        i] if token_nums is not None else 1 + max_num_draft_tokens
+                    if self.mapping.has_cp_helix():
+                        token_num = max(token_num, 2)
+                    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    req.prompt_len = token_num - 1
+                    req.py_prompt_len = req.prompt_len
+                    if self.mapping.has_cp_helix():
+                        if self.mapping.cp_size - 1 == self.mapping.cp_rank:
+                            req.py_helix_is_inactive_rank = False
+                            req.prompt_len = token_num - 1
+                            req.py_prompt_len = req.prompt_len
+                            req.seqlen_this_rank_cp = req.prompt_len
+                            req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                            req.py_decoding_iter = 1
+                        else:
+                            req.py_helix_is_inactive_rank = True
+                            req.prompt_len = token_num
+                            req.py_prompt_len = req.prompt_len
+                            req.seqlen_this_rank_cp = req.prompt_len
+                            req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                            req.py_decoding_iter = 1
+                    req.py_draft_tokens = [1] * max_num_draft_tokens
+                    if prepare_resource:
                         for _ in range(_kv_draft):
-                            draft_kv_cache_manager.impl.add_token(
-                                req.request_id)
+                            self.impl.add_token(req.request_id)
+                        if draft_kv_cache_manager is not None:
+                            for _ in range(_kv_draft):
+                                draft_kv_cache_manager.impl.add_token(
+                                    req.request_id)
+        except Exception:
+            # A partial allocation failure (e.g. add_token raising "no free
+            # blocks left" after add_sequence_batch succeeded) must not leak
+            # the sequences already registered. On the minimal KV pool built
+            # for cache-size estimation, such a leak leaves too few blocks
+            # for the estimation requests themselves, so the executor loop
+            # spins forever without ever scheduling them and LLM startup
+            # hangs (TRTLLM-14903). remove_sequence is a no-op for request
+            # ids the failed batched add never registered, so every request
+            # can be removed unconditionally; attempt all target and draft
+            # cleanup before re-raising so one cleanup failure doesn't leak
+            # the remaining sequences.
+            cleanup_error = None
+            for freeing_impl, freeing_requests in (
+                (self.impl, batch_llm_requests),
+                (draft_kv_cache_manager.impl if draft_kv_cache_manager
+                 is not None else None, draft_batch_llm_requests),
+            ):
+                if freeing_impl is None:
+                    continue
+                for req in freeing_requests:
+                    try:
+                        freeing_impl.remove_sequence(req.py_request_id, req,
+                                                     False)
+                    except Exception as e:
+                        cleanup_error = cleanup_error or e
+            if cleanup_error is not None:
+                # A failed release leaves the KV pool poisoned — the same
+                # hang mechanism this cleanup exists to prevent — so it
+                # must not be masked by the allocation failure alone.
+                raise cleanup_error
+            raise
 
         return requests
 
@@ -2634,7 +2695,8 @@ class PeftCacheManager(BaseResourceManager):
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None,
                  execution_stream: Optional[torch.cuda.Stream] = None,
-                 lora_target_modules: Optional[List[str]] = None):
+                 lora_target_modules: Optional[List[str]] = None,
+                 initial_data_type: Optional[torch.dtype] = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -2669,6 +2731,9 @@ class PeftCacheManager(BaseResourceManager):
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
+        if initial_data_type is not None:
+            self.impl.configure_data_type(
+                torch_dtype_to_binding(initial_data_type))
         self._lora_config = lora_config
         self._lora_model_config = LoraModelConfig(
             lora_target_modules if lora_target_modules is not None else
@@ -2693,6 +2758,10 @@ class PeftCacheManager(BaseResourceManager):
 
     def get_lora_manager(self) -> LoraManager:
         return self._lora_manager
+
+    @property
+    def data_type(self) -> torch.dtype:
+        return binding_to_torch_dtype(self.impl.data_type)
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:

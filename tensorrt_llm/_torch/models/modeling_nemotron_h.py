@@ -162,7 +162,6 @@ class TransformerLayer(Attention):
                                **kwargs)
 
 
-# Ref code: https://huggingface.co/nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024/blob/main/modeling_nemotron_h.py#L818
 class NemotronHMOE(nn.Module):
 
     def __init__(
@@ -252,12 +251,12 @@ class NemotronHMOE(nn.Module):
         # UnquantizedFusedMoEMethod and allocate BF16 weight buffers, causing a shape mismatch
         # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
         # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
-        moe_model_config = model_config
+        override_quant_config = None
         if model_config.quant_config_dict is not None:
             experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
             for key, cfg in model_config.quant_config_dict.items():
                 if key.startswith(experts_prefix):
-                    moe_model_config = replace(model_config, quant_config=cfg)
+                    override_quant_config = cfg
                     break
 
         # Setup MoE experts.
@@ -269,7 +268,8 @@ class NemotronHMOE(nn.Module):
             aux_stream_dict=aux_stream_dict,
             dtype=config.torch_dtype,
             reduce_results=self.reduce_results,
-            model_config=moe_model_config,
+            model_config=model_config,
+            override_quant_config=override_quant_config,
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,

@@ -33,6 +33,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1151,7 +1154,7 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
-    def test_partial_transfer_admission_uses_only_admitted_requests(self):
+    def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
         """The admitted subset is prepared and passed to the idle check."""
         admitted_req = _make_active_request(in_init=True)
         deferred_req = _make_active_request(in_init=True)
@@ -1166,7 +1169,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
         ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
-            0, [admitted_req], False, False
+            0, [admitted_req], False, False, is_idle=True
         )
         ex._handle_errors.assert_not_called()
 

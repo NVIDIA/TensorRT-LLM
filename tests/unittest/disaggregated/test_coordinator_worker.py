@@ -36,7 +36,8 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 import pytest
@@ -598,6 +599,59 @@ def test_worker_generates_disagg_request_id_before_generation_routing():
 
             assigned_id = asyncio.run(drive())
             assert assigned_id > 0
+
+
+def test_coordinator_session_gives_up_idle_connections_before_the_server():
+    """The fleet's pool must drop an idle connection before the coordinator does.
+
+    aiohttp never probes a pooled connection before reuse, so if the SERVER
+    closes first the next /select borrows a half-closed socket and fails
+    instantly with BrokenPipeError/ConnectionResetError -- a 500 on whichever
+    live request happened to draw that connection.
+    """
+    from tensorrt_llm.serve import disagg_coordinator as dc
+    from tensorrt_llm.serve.coordinator_server import TIMEOUT_KEEP_ALIVE
+
+    assert dc.COORDINATOR_KEEPALIVE_TIMEOUT_S < TIMEOUT_KEEP_ALIVE
+
+    for url, connector_name in (
+        ("unix:/tmp/trtllm_disagg_coord_8333.sock", "UnixConnector"),
+        ("http://coordinator:8332", "TCPConnector"),
+    ):
+        with (
+            patch.object(dc.aiohttp, connector_name) as connector,
+            patch.object(dc.aiohttp, "ClientSession"),
+        ):
+            dc.make_coordinator_session(url)
+        assert connector.call_args.kwargs["limit"] == 0
+        assert connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("keep_alive_kwargs", "expected_timeout"),
+    [({}, 10), ({"keep_alive_timeout": 3600}, 3600)],
+)
+async def test_coordinator_keep_alive_timeout_is_passed_to_uvicorn(
+    monkeypatch, keep_alive_kwargs, expected_timeout
+):
+    """Both coordinator listeners honor the configured keep-alive timeout."""
+    from tensorrt_llm.serve import coordinator_server
+
+    server = object.__new__(CoordinatorServer)
+    server._coordinator = AsyncMock()
+    server.app = object()
+
+    config_factory = Mock(return_value=object())
+    uvicorn_server = SimpleNamespace(serve=AsyncMock())
+    monkeypatch.setattr(coordinator_server.uvicorn, "Config", config_factory)
+    monkeypatch.setattr(coordinator_server.uvicorn, "Server", Mock(return_value=uvicorn_server))
+
+    await server("localhost", 8332, uds="/tmp/coord.sock", **keep_alive_kwargs)
+
+    assert config_factory.call_count == 2  # UDS (hot path) + TCP (health)
+    for call in config_factory.call_args_list:
+        assert call.kwargs["timeout_keep_alive"] == expected_timeout
 
 
 if __name__ == "__main__":

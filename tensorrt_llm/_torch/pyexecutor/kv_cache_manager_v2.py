@@ -66,6 +66,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _cpp_introspection,
     _introspection,
     _KVCache,
     exact_div,
@@ -767,6 +768,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        is_estimating_kv_cache: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -789,13 +791,20 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+
+        # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
+        # can distinguish the throwaway estimation-phase managers from the
+        # final ones: the estimation cache is sized with no headroom for
+        # retained dummy requests.
+        self.is_estimating_kv_cache = is_estimating_kv_cache
+
         # Set True by a compression manager; generation-step resize then leaves history untouched.
         self.kv_compression_manages_history: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
         block_reuse_config = kv_cache_config.block_reuse_config
-        self.block_reuse_policy = BlockReusePolicy(block_reuse_config.block_reuse_policy)
+        self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -2305,7 +2314,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
-                all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                all_tokens = self._reuse_token_source(req)
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
                 if self.enable_block_reuse:
@@ -2531,6 +2540,18 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
 
+    def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
+        """Beam-0 tokens for block reuse, in the form the active backend consumes.
+
+        The C++ backend ingests a zero-copy int32 view (get_tokens_view) — no per-token
+        PyLong allocation. The pure-Python backend cannot consume a numpy array, so it gets
+        a plain list (get_tokens), preserving pre-optimization behavior. ``_cpp_introspection``
+        is None exactly when the Python backend is active.
+        """
+        if _cpp_introspection is not None:
+            return req.get_tokens_view(DEFAULT_BEAM_INDEX)
+        return req.get_tokens(DEFAULT_BEAM_INDEX)
+
     def _augment_tokens_for_block_reuse(
         self, tokens: Sequence[int], req: LlmRequest, start: int = 0, end: int | None = None
     ) -> Sequence[TokenIdExt]:
@@ -2562,7 +2583,11 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             return tokens[chunk_start:chunk_end] if is_sliced else tokens
 
-        result: list[TokenIdExt] = list(tokens[chunk_start:chunk_end])
+        # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
+        # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
+        # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
+        chunk = tokens[chunk_start:chunk_end]
+        result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
         run_metadata = _resolve_multimodal_run_metadata(req)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(
@@ -3185,7 +3210,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if request.context_current_position > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
-                request.get_tokens(DEFAULT_BEAM_INDEX),
+                self._reuse_token_source(request),
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=request.context_current_position,
@@ -3721,7 +3746,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # is NOT registered in kv_cache_map / IndexMapper.
         success = True
         for req in requests:
-            all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+            all_tokens = self._reuse_token_source(req)
             tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.

@@ -108,17 +108,56 @@ KV-cache contract. At a high level, it owns:
 (`is_lite == True`). In lite mode there is no separate Q low-rank compression
 stage. `is_lite` changes the projection structure, not just a small code path.
 
-Dense MLA and current sparse MLA variants still use the same module/backend/
-metadata/KV-cache split described above. Sparse-specific routing may currently
-pass through `MLA`, but that should be treated as an implementation detail
-rather than a stable design boundary.
+Dense and sparse MLA variants use the same `MLA` module. `MLA.forward_impl()`
+selects the dense implementation or the sparse facade in
+`attention_backend/sparse/hooks.py`. Each algorithm registers a typed adapter
+from its `module.py`; MLA-specific dispatch is intentionally not part of the
+generic `AttentionBackend` interface.
+
+`MLASparseHooks` and `AttentionSparseHooks` define separate typed module
+contracts. Concrete adapters override only the lifecycle methods their
+algorithm needs; default adapter methods preserve the dense behavior for
+optional paths. MLA adapters declare whether absorption modules, a dense MHA
+fallback, and the default output projection are needed. Shared `MLA` reads
+these capabilities before constructing optional modules, then passes only the
+owning module to the adapter initialization method.
+
+`Attention` and `MLA` resolve and cache their typed adapter during module
+initialization. Each module owns a separate adapter instance. Later lifecycle
+methods use that cached contract instead of redispatching from `sparse_params`.
+Dense modules and algorithms without module-layer overrides receive no adapter.
+
+`Attention` invokes its adapter at initialization, `forward_impl()`, and output
+projection. Its initialization method runs before rotary embedding and backend
+construction so an algorithm can configure module-level choices that affect
+both. The separate adapter types make the `Attention` and `MLA` signatures
+statically checkable without runtime signature inspection.
+
+Ordinary sparse variants use `attention_output_hidden_size` and the shared
+output allocation. DeepSeek-V4's fused epilogue is the exception: it requires
+two typed output buffers before the attention op runs, so it implements the
+optional output-preparation hook. `_create_outputs()` always returns a tensor
+list whose first entry is the standard attention output. The same list flows
+through forward, the registered custom op, and output projection; algorithms
+own the meaning of any additional entries. Context- and generation-phase
+helpers stay within each algorithm module and are not part of the generic hook
+facade.
+
+Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
+their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
+pass it through the registered `AttentionForwardArgs.sparse_backend_args`
+field. For example, DSA owns `DSABackendForwardArgs`, whose indexer
+intermediates are consumed by `DSATrtllmAttention.sparse_attn_predict`.
+Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices` and
+the backend-to-AttentionOp `SparseRuntimeParams`, live in
+`attention_backend/sparse/params.py`.
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
 can preserve the current latent-cache / paged-KV contract. If it can, the
 task usually stays within the existing MLA stack. If it depends on sparse
-helper-level control flow, read `mla.py` and the relevant sparse
-backend code directly.
+helper-level control flow, read `mla.py`, `attention_backend/sparse/hooks.py`,
+and the relevant algorithm's `module.py` directly.
 
 ## 2. Backend Layer Reference
 
@@ -148,7 +187,7 @@ managers stay model-scope and consume the user-facing config directly.
 Sparse metadata consumes `SparseMetadataParams`, derived independently from the
 same user-facing config.
 
-Sparse registrations are defined in `attention_backend/sparse/utils.py`. Check
+Sparse registrations are defined in `attention_backend/sparse/registry.py`. Check
 that file for the current supported combinations, as they may change over time.
 
 ### 2.3 Backend contract
@@ -247,21 +286,23 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from
-FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
-`thop.attention` runtime path. These are not separate attention backends.
+libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+`FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
+the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
+runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
-library exposes `is_available()` for module/static environment checks and
-`is_supported()` for per-forward request checks.
+`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
+or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
+path. Each FMHA library exposes `is_available()` for module/static environment
+checks and `is_supported()` for per-forward request checks.
 
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
+- `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
@@ -345,7 +386,8 @@ Working rules:
 
 - Stay on `Attention` or `MLA` plus an existing backend family when possible.
 - Extend the `TRTLLM` backend path before adding a new backend.
-- Extend module-level hooks before adding a new backend.
+- Extend the sparse hook facade and the algorithm's `module.py` for
+  sparse MLA module-side behavior.
 - Follow an existing sparse family pattern before adding a new sparse
   abstraction.
 - Treat cache-manager mismatch as a real blocker.
@@ -362,7 +404,9 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/sparse/` | DSA, Rocket sparse backends, metadata, cache managers |
+| `tensorrt_llm/_torch/attention_backend/sparse/hooks.py` | Sparse module hooks and backend prediction orchestration |
+| `tensorrt_llm/_torch/attention_backend/sparse/<algorithm>/module.py` | Algorithm-specific module-hook implementations |
+| `tensorrt_llm/_torch/attention_backend/sparse/` | Sparse prediction backends, metadata, cache managers, and kernels |
 
 ## 6. Testing Notes
 

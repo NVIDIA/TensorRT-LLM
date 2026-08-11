@@ -63,7 +63,7 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 384
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     trust_remote_code: true
     num_postprocess_workers: 4
     stream_interval: 20
@@ -90,5 +90,5 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 384
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     trust_remote_code: true
