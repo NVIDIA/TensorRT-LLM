@@ -459,6 +459,11 @@ def _remap_deepseek_v4_checkpoint_keys(
             return
         tensor = _maybe_view_deepseek_v4_routed_moe_tensor(model_key, tensor, routed_moe_scale_name)
         out[model_key] = tensor
+        # Hopper's W4A16 MXFP4 loader consumes the legacy suffix, while the
+        # Blackwell loaders consume the canonical suffix. Both keys reference
+        # the same packed E8M0 scale tensor.
+        if ".mlp.experts." in model_key and model_key.endswith(".weight_scale"):
+            out[f"{model_key}_inv"] = tensor
 
     for k, v in weights.items():
         # Top-level keys that don't go through the layer/mtp branches.

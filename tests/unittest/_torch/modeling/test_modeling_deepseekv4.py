@@ -191,7 +191,10 @@ def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
     remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=1, kv_lora_rank=448)
 
     assert remapped["model.layers.0.mlp.experts.0.w1.weight"].dtype == torch.uint8
-    assert remapped["model.layers.0.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
+    canonical_scale = remapped["model.layers.0.mlp.experts.0.w1.weight_scale"]
+    legacy_scale = remapped["model.layers.0.mlp.experts.0.w1.weight_scale_inv"]
+    assert canonical_scale.dtype == torch.uint8
+    assert legacy_scale is canonical_scale
 
 
 def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
