@@ -1045,7 +1045,7 @@ def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
     permanently ahead of what was committed. In-place and sync-free, so safe
     to record into a CUDA graph.
     """
-    caps = getattr(spec_metadata, "accept_caps", None)
+    caps = spec_metadata.accept_caps
     if caps is None:
         return
     gen = num_accepted_tokens[num_contexts:]

@@ -1,24 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``cap-accept``: run the schedule's policy without the layout that pays for it.
+"""DSpark accept-caps and ragged-verify observability (hardware-agnostic, CPU).
 
-The mode exists to split one question into two. ``compact`` changes both what
-the scheduler commits *and* how the batch is laid out, so when its output moves,
-nothing says which half did it. ``cap-accept`` applies the same per-request
-windows to commitment while submitting the full block, giving two independent
-assertions instead of one entangled one:
-
-    cap-accept output != static output   ->  the scheduling policy is wrong
-    compact output    != cap-accept      ->  the layout compaction is wrong
-
-It also produces a number ``compact`` structurally cannot: ``cap_trim_tokens``,
-the positions the target accepted and the window then discarded. Under
-``compact`` those positions are never scored, so the acceptance cost of trimming
-can only be bounded (``trim_regret_rate``), never measured.
-
-The price is that it saves no compute at all, which is why it is a diagnostic
-mode and never a serving one -- and why the counters must not report it as
-though it had saved any.
+Covers `apply_accept_caps` clamping semantics, the cap-accept diagnostic mode's
+counters (`cap_trim_tokens`, trim shape), `trim_ratio` row-base accounting under
+CUDA-graph padding, and trim-regret acceptance stats.
 """
 
 import os
@@ -34,8 +20,13 @@ from tensorrt_llm._torch.speculative.interface import apply_accept_caps
 MAX_DRAFT_LEN = 5
 
 
-def _stats(mode=RaggedVerifyMode.CAP_ACCEPT):
+def _cap_stats(mode=RaggedVerifyMode.CAP_ACCEPT):
     return DSparkRaggedStats(mode=mode, max_draft_len=MAX_DRAFT_LEN)
+
+
+def _compact_stats(max_draft_len=5):
+    return DSparkRaggedStats(mode=RaggedVerifyMode.COMPACT,
+                             max_draft_len=max_draft_len)
 
 
 class _Meta:
@@ -49,16 +40,7 @@ class _Meta:
                                 if track_trim else None)
 
 
-# --- the cap itself ---------------------------------------------------------
-#
-# WHERE this runs is the whole point, and it is not testable from here: it has
-# to be inside acceptance, because the DSpark drafter reads the same
-# `num_accepted_tokens` later in the SAME forward to advance its rolling KV
-# window and its persistent decode position (`_ctx_len += nacc`, dspark.py).
-# Capping on the host afterwards leaves the drafter advanced by the uncapped
-# count while only the capped prefix was committed -- lossless output, but the
-# draft state drifts and the mode stops being a faithful reference.
-#
+# --- the cap itself ----------------------------------------------------------
 # Units: `num_accepted_tokens` is `accepted drafts + 1`, so a window of w
 # drafted positions is a cap of `w + 1`, matching `verify_lens`.
 
@@ -71,13 +53,8 @@ def test_no_caps_is_a_no_op():
 
 
 def test_counts_beyond_their_windows_are_clamped_and_the_loss_accumulated():
-    """Clamp plus per-step (not cumulative) loss recording.
-
-    The host accumulates across steps, so the buffer must hold what THIS step
-    lost: a buffer that added would double-count every request still in the
-    batch next step. Repeating the same step must therefore leave the same
-    losses, not multiples of them.
-    """
+    """The trim buffer holds this step's loss, not a running sum: repeating the
+    same step leaves the same losses."""
     meta = _Meta(caps=[3, 5, 6])
     for _ in range(3):
         counts = torch.tensor([6, 5, 2], dtype=torch.int32)
@@ -125,11 +102,11 @@ def test_nothing_is_lost_or_invented(accepted, window):
     assert committed <= window + 1
 
 
-# --- what the counters must say ---------------------------------------------
+# --- what the counters must say ----------------------------------------------
 
 
 def test_cap_trim_is_recorded_per_request():
-    stats = _stats()
+    stats = _cap_stats()
     # Given 5, allowed 2 -> 3 accepted positions thrown away.
     stats.record_acceptance(accepted=2, window=2, cap_trim=3)
     # Died on its own inside a wide window: the schedule cost it nothing.
@@ -154,17 +131,13 @@ def test_cap_trim_is_recorded_per_request():
 
 
 def test_the_same_total_loss_is_distinguished_by_its_shape():
-    """The reason this is per request at all.
-
-    Both runs lose 20 tokens over 10 requests. The first spreads it; the
-    second takes it all out of one request. A total cannot tell them apart,
-    and they mean opposite things about the planner.
-    """
-    spread = _stats()
+    """Equal totals with different per-request shapes must stay
+    distinguishable: spread loss vs. loss concentrated in one request."""
+    spread = _cap_stats()
     for _ in range(10):
         spread.record_acceptance(accepted=1, window=1, cap_trim=2)
 
-    concentrated = _stats()
+    concentrated = _cap_stats()
     concentrated.record_acceptance(accepted=1, window=1, cap_trim=20)
     for _ in range(9):
         concentrated.record_acceptance(accepted=3, window=5, cap_trim=0)
@@ -184,7 +157,7 @@ def test_the_same_total_loss_is_distinguished_by_its_shape():
 
 def test_the_loss_is_absent_rather_than_zero_when_not_measured():
     """`compact` cannot produce this number, and must not appear to."""
-    stats = _stats(mode=RaggedVerifyMode.COMPACT)
+    stats = _cap_stats(mode=RaggedVerifyMode.COMPACT)
     stats.record_acceptance(accepted=3, window=3)
     assert stats.cap_trim_tokens == 0
     assert stats.cap_trim_concentration == 0.0
@@ -194,19 +167,9 @@ def test_the_loss_is_absent_rather_than_zero_when_not_measured():
 
 
 def test_cap_accept_must_not_be_credited_with_a_compute_saving():
-    """The regression this guards: cap-accept booking the windows as delivered.
-
-    It submits the full block by construction. Deriving delivered tokens from
-    the windows would report a trim ratio for a run that trimmed no compute at
-    all -- and that ratio is the headline number for whether the feature works.
-
-    For the same reason the active gate must not demand a saving here:
-    `require_trim` asks "did delivered tokens come in under the no-trim
-    ceiling", cap-accept answers no by construction, and keying the gate on
-    the ratio alone would fail every cap-accept run -- the reference run
-    against which the others are judged.
-    """
-    stats = _stats()
+    """cap-accept submits the full block, so delivered tokens must not be
+    derived from the windows and `trim_ratio` must stay 0."""
+    stats = _cap_stats()
     num_reqs = 4
     full_block = num_reqs * (1 + MAX_DRAFT_LEN)
     stats.record_step(num_gen_requests=num_reqs,
@@ -224,7 +187,7 @@ def test_cap_accept_must_not_be_credited_with_a_compute_saving():
 
 def test_compact_still_derives_delivered_from_the_bucket():
     """The default path is unchanged by the new argument."""
-    stats = _stats(mode=RaggedVerifyMode.COMPACT)
+    stats = _cap_stats(mode=RaggedVerifyMode.COMPACT)
     stats.record_step(num_gen_requests=4,
                       verify_lens=[5, 3, 2, 1],
                       bucket=16)
@@ -232,7 +195,7 @@ def test_compact_still_derives_delivered_from_the_bucket():
     assert stats.trim_ratio > 0.0
 
 
-# --- mode plumbing ----------------------------------------------------------
+# --- mode plumbing -----------------------------------------------------------
 
 
 def test_cap_accept_computes_windows_but_does_not_trim_the_token_axis():
@@ -248,13 +211,8 @@ def test_cap_accept_computes_windows_but_does_not_trim_the_token_axis():
 
 
 def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():
-    """The stale-buffer hazard, guarded at the one place it can arise.
-
-    cap_trim_lens is persistent and slot-indexed. A step that produces no
-    caps -- static, or any other speculation mode -- must still write ZEROS
-    into this batch's slots, or a slot recycled to a new request would report
-    whatever its previous occupant lost.
-    """
+    """cap_trim_lens is persistent and slot-indexed: a step producing no caps
+    must still zero this batch's slots or recycled slots report stale loss."""
     import inspect
 
     from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSamplerBase
@@ -266,16 +224,8 @@ def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():
 
 
 def test_the_cuda_graph_padding_dummy_carries_a_cap():
-    """The regression that made the whole mode a silent no-op.
-
-    `pad_batch` appends a shared dummy request to reach a captured batch size,
-    and `_attach_accept_caps` drops the batch's caps if ANY request lacks one.
-    The dummy has no cap of its own, so before this it disabled cap-accept --
-    on padded steps only, so the mode measured nothing on some steps and
-    worked on others, with nothing in the output to say which.
-
-    Mirrors the treatment `py_verify_len` already got for the ragged path.
-    """
+    """The CUDA-graph padding dummy must carry a verify cap, or cap-accept
+    silently degrades to static on every padded step."""
     import inspect
 
     from tensorrt_llm._torch.pyexecutor import cuda_graph_runner
@@ -292,20 +242,8 @@ def test_the_cuda_graph_padding_dummy_carries_a_cap():
 
 
 def test_the_capture_set_follows_the_mode_not_the_config_flag():
-    """The bug the first end-to-end run found, in CUDA-graph capture.
-
-    cap-accept is configured with enable_ragged_verify=True -- the config is
-    byte-identical to compact, only the environment differs. Anything that
-    SHAPES the batch must therefore ask whether the token axis actually
-    shrinks, not whether ragged was requested. The capture set asked the flag,
-    so it built synthetic batches at ragged token totals (bs*(t+1)) for a mode
-    whose real steps always submit the full block, and the capture pass died
-    inside MoE on `unmatched tensor shape` -- before any request had run, with
-    nothing pointing at the scheduler.
-
-    Unit tests could not have caught it: it needs a real capture pass. This
-    pins the predicate instead.
-    """
+    """Batch shaping must ask whether the token axis actually shrinks, not
+    whether ragged was requested: cap-accept always submits the full block."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.speculative.dspark_observability import (
@@ -333,15 +271,8 @@ def test_the_capture_set_follows_the_mode_not_the_config_flag():
 
 
 def test_accept_caps_is_not_the_ragged_flag():
-    """The distinction the whole fix rests on.
-
-    `is_ragged_verify` means two things at once -- cap acceptance AND the draft
-    buffers are packed by window (`_padded_gen_draft_tokens` slices
-    `draft_tokens[:total_verify_tokens - num_gens]`). cap-accept wants only the
-    first: its buffers are the ordinary rectangle. If `accept_caps` ever starts
-    implying ragged, a rectangle gets unpacked as if it were packed and one
-    request's drafts are attributed to another, silently.
-    """
+    """`accept_caps` must not imply ragged buffer packing: cap-accept's draft
+    buffers are the ordinary rectangle."""
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
     fields = SpecMetadata.__dataclass_fields__
@@ -351,3 +282,82 @@ def test_accept_caps_is_not_the_ragged_flag():
     meta = _Meta(caps=[2, 3])
     # The mock stands in for a metadata object carrying caps but no windows.
     assert getattr(meta, "verify_lens", None) is None
+
+
+# --- trim_ratio row-base under CUDA-graph padding ----------------------------
+
+
+def test_padding_rows_do_not_make_the_trim_look_negative():
+    """A top-tier step on padded rows saved nothing -- and lost nothing."""
+    stats = _compact_stats(max_draft_len=5)
+    # 3 real requests, graph padded to 4 rows, every window at the full block.
+    # delivered = 4 * 6 = 24. Against a ceiling of 3 * 6 = 18 that is -0.333.
+    stats.record_step(num_gen_requests=3, verify_lens=[5, 5, 5],
+                      bucket=4 * 6, padded_bs=4)
+    summary = stats.summary()
+    assert summary["trim_ratio"] == pytest.approx(0.0), (
+        f"a step that verified the full block on every row trimmed nothing, so "
+        f"the ratio is 0 -- got {summary['trim_ratio']}, which came from "
+        f"comparing {summary['delivered_tokens']} padded-row tokens against a "
+        f"ceiling counted over {3} real requests")
+    # The padded row count itself must land in the summary: the executor once
+    # passed padded_bs=None unconditionally, and an always-empty padded_bs_hist
+    # is indistinguishable from "padding never happened".
+    assert summary["padded_bs_hist"] == {4: 1}
+
+
+def test_a_real_trim_still_reads_as_a_saving():
+    """The fix must not flatten genuine trimming to zero."""
+    stats = _compact_stats(max_draft_len=5)
+    # 4 rows, no padding, every window trimmed to 2 -> bucket 4*3 = 12 against a
+    # ceiling of 4*6 = 24.
+    stats.record_step(num_gen_requests=4, verify_lens=[2, 2, 2, 2],
+                      bucket=4 * 3, padded_bs=4)
+    assert stats.summary()["trim_ratio"] == pytest.approx(0.5)
+
+
+def test_paths_without_a_bucket_keep_the_local_row_base():
+    """Only the bucket path rebases to the padded row count; widening the
+    no-window and cap-accept paths would invent a saving out of padding."""
+    no_window = _compact_stats(max_draft_len=5)
+    no_window.record_step(num_gen_requests=3, verify_lens=None, padded_bs=8)
+    assert no_window.summary()["trim_ratio"] == pytest.approx(0.0)
+
+    explicit = _compact_stats(max_draft_len=5)
+    # cap-accept: windows are computed but the full block is submitted anyway.
+    explicit.record_step(num_gen_requests=3, verify_lens=[2, 3, 1],
+                         bucket=8 * 6, padded_bs=8, delivered=3 * 6)
+    assert explicit.summary()["trim_ratio"] == pytest.approx(0.0)
+
+
+# --- trim regret -------------------------------------------------------------
+
+
+def test_trim_regret_counts_only_drafts_alive_at_the_cut():
+    """Regret separates "trimming was free, those drafts would have died
+    anyway" from "trimming discarded acceptance"."""
+    stats = _compact_stats()
+    # Given the full block and died early: not trimmed, no regret.
+    stats.record_acceptance(accepted=2, window=5)
+    # Trimmed to 3 and died at 1: the cut cost nothing.
+    stats.record_acceptance(accepted=1, window=3)
+    # Trimmed to 3 and accepted all 3: still alive at the cut -> regret.
+    stats.record_acceptance(accepted=3, window=3)
+
+    assert stats.requests_scored == 3
+    assert stats.requests_trimmed == 2
+    assert stats.trimmed_hit_ceiling == 1
+    assert stats.trim_regret_rate == 0.5
+    assert stats.accept_len == pytest.approx(2.0)
+    summary = stats.summary()
+    for key in ("accept_len", "requests_scored", "requests_trimmed",
+                "trim_regret_rate"):
+        assert key in summary, f"{key} missing from the summary"
+
+    # Nothing trimmed: the regret rate is 0/0-safe and stays 0.
+    untrimmed = _compact_stats()
+    for accepted in (0, 3, 5):
+        untrimmed.record_acceptance(accepted=accepted, window=5)
+    assert untrimmed.requests_trimmed == 0
+    assert untrimmed.trim_regret_rate == 0.0
+    assert untrimmed.summary()["accept_len"] == pytest.approx(8 / 3, abs=1e-4)

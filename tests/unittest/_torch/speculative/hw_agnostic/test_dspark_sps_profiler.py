@@ -14,45 +14,35 @@
 # limitations under the License.
 """Unit tests for the DSpark SPS cost-table profiler (CPU only, no model load).
 
-Everything here exercises the pure half of the profiler: turning ``get_stats``
-rows into aligned samples, summarizing cells, separating ``alpha(bs)`` from
-``theta(M)``, and assembling / refusing the emitted JSON. The sweep driver needs
-a GPU and a checkpoint and is deliberately not covered.
-
-The load-bearing case is :func:`test_round_trip_reproduces_measured_cells`: it
-takes a synthetic machine with a known cost curve, runs it through the whole
-fit-and-emit pipeline, and reloads the JSON exactly the way
-``dspark.py::_build_verify_planner`` does. If the profiler and the loader ever
-disagree about units, keys or the meaning of a token count, that test is where
-it shows up.
+Covers stats-row alignment, cell summarizing, the additive alpha/theta fit,
+staircase compression, payload assembly/refusals, sweep geometry guards, the
+profitability probe, and reading samples out of production iteration logs.
 """
 
 import importlib.util
 import json
 import pathlib
 import sys
+import tempfile
 
 import numpy as np
 import pytest
 
 from tensorrt_llm._torch.speculative.dspark_planner import SpsCostTable, total_verify_tokens
+
 # The profiler is a development tool under tests/microbenchmarks, not part of
-# the shipped package: nothing on the serving path imports it, and keeping a
-# 1.8k-line sweep driver inside tensorrt_llm/ would ship it to every user.
-# Load it by path so this test follows the file rather than an import root.
+# the shipped package; load it by path so this test follows the file. The
+# module must be registered in sys.modules BEFORE exec so @dataclass can
+# resolve annotations through sys.modules[cls.__module__].__dict__.
 _SPEC = importlib.util.spec_from_file_location(
     "dspark_sps_profiler",
     pathlib.Path(__file__).resolve().parents[4] / "microbenchmarks" /
     "dspark_sps_profiler.py")
 _PROFILER = importlib.util.module_from_spec(_SPEC)
-# Registered BEFORE exec: @dataclass resolves annotations through
-# sys.modules[cls.__module__].__dict__, so a module executed without being
-# registered raises "'NoneType' object has no attribute '__dict__'" on its
-# first dataclass.
 sys.modules[_SPEC.name] = _PROFILER
 _SPEC.loader.exec_module(_PROFILER)
 
-globals().update({name: getattr(_PROFILER, name) for name in ('CellStat', 'FlatCostTableError', 'InertCostTableError', 'InsufficientSamplesError', 'StepSample', 'SweepConfig', 'SweepGeometryError', 'aligned_steps_from_stats', 'build_cost_table_payload', 'check_table_is_informative', 'compress_to_risers', 'fit_additive_cost_model', 'load_cost_table', 'profitability_probe', 'running_max', 'summarize_cells')})
+globals().update({name: getattr(_PROFILER, name) for name in ('CellStat', 'FlatCostTableError', 'InertCostTableError', 'InsufficientSamplesError', 'StepSample', 'SweepConfig', 'SweepGeometryError', 'aligned_steps_from_stats', 'build_cost_table_payload', 'check_table_is_informative', 'compress_to_risers', 'fit_additive_cost_model', 'load_cost_table', 'profitability_probe', 'resolve_padded_shape', 'running_max', 'samples_from_iter_log', 'summarize_cells')})
 
 #: The exact set of keys ``dspark.py::_build_verify_planner`` reads. Anything
 #: else in the file is ignored by the loader, so the profiler must not rely on
@@ -101,12 +91,8 @@ def test_aligned_steps_drops_prefill_iterations():
 
 
 def test_aligned_steps_requires_every_dp_rank():
-    """Multi-rank alignment: complete, agreeing, and timed by rank 0.
-
-    A missing rank means the iteration was not observed batch-wide; ranks at
-    different batch sizes are not one (bs, M) point; and ADP fans out
-    rank-local counters with rank-0's clock, so timing must never be averaged.
-    """
+    """Multi-rank alignment: iterations must be complete, agree on batch size,
+    and be timed by rank 0's clock, never averaged."""
     rows = [
         _stats_row(iteration=0, num_gen=8, rank=0),
         _stats_row(iteration=0, num_gen=8, rank=1),
@@ -168,16 +154,8 @@ def test_summarize_reports_median_not_mean():
 
 
 def test_summarize_drops_thin_cells_outside_the_requested_grid():
-    """A deployment log carries ramp/drain occupancy nobody asked to measure.
-
-    Job 2585129: a five-rung server sweep with 984-step cells at every
-    requested (bs, L) died at the very end on (bs=2, L=1) with one sample --
-    the admission ramp of the first cell's client, filed as a cell and then
-    held to the requested-grid bar. Incidental cells must be dropped when
-    thin, kept when thick, and a thin REQUESTED cell must still refuse --
-    with or without a requested grid, since a silently dropped cell can
-    disconnect the grid, not just widen error bars.
-    """
+    """Thin incidental cells are dropped, thick ones kept, and a thin
+    REQUESTED cell must still refuse -- with or without a requested grid."""
     grid = [(8, 3)]
     requested = _samples(8, 3, [10.0] * 8)
     ramp = _samples(2, 3, [30.0])                    # thin, incidental: drop
@@ -273,12 +251,8 @@ def test_fit_recovers_relative_structure_exactly():
 
 
 def test_fit_surfaces_a_bad_cell_rather_than_hiding_it():
-    """A cell the additive model cannot explain is evidence, not noise.
-
-    Dropping it would produce a table that fits beautifully and predicts badly,
-    and would delete the one signal that says ``theta`` is not a function of
-    ``M`` alone.
-    """
+    """A cell the additive model cannot explain is surfaced in the warnings,
+    not dropped as noise."""
 
     def noise(batch_size, verify_len):
         return 500.0 if (batch_size, verify_len) == (32, 3) else 0.0
@@ -326,13 +300,8 @@ def test_running_max_is_monotone():
 
 
 def test_compress_keeps_risers_and_closes_their_shelves():
-    """A shelf must survive as a breakpoint PAIR under the interp consumer.
-
-    Keeping only [16, 64] would turn the measured flat 16..48 into one long
-    rising segment: mid-shelf totals get billed part of the riser -- the
-    over-trim mirror of the floor-lookup bug. The shelf's last point (48)
-    rides along so interpolation stays flat where the hardware was flat.
-    """
+    """A shelf survives as a breakpoint PAIR so the interpolating consumer
+    stays flat where the hardware was flat."""
     tokens = [16, 32, 48, 64, 80]
     times = [1.0, 1.002, 1.004, 2.0, 2.001]
     kept_tokens, kept_times = compress_to_risers(
@@ -343,15 +312,8 @@ def test_compress_keeps_risers_and_closes_their_shelves():
 
 
 def test_truncation_drops_the_point_cheapest_to_interpolate():
-    """Over budget, remove the interior point interpolation best reconstructs.
-
-    Here 64 goes: its neighbors predict it within 0.27ms, while removing 32
-    would ramp the near-flat 16..32 stretch into the 64 riser and misprice it
-    by 0.9ms. The previous rule (drop the smallest incoming jump first) chose
-    32 -- by construction it always chose the shelf-side point, re-billing
-    mid-shelf totals upward, the exact over-charge the pair encoding of
-    shelves exists to prevent.
-    """
+    """Over budget, remove the interior point interpolation best reconstructs
+    -- never the shelf-side point, which would re-bill mid-shelf totals."""
     tokens = [16, 32, 64, 128]
     times = [1.0, 1.1, 4.0, 9.0]
     kept_tokens, _ = compress_to_risers(tokens, times, min_riser_ms=0.0, max_breakpoints=3)
@@ -377,15 +339,8 @@ def _payload():
 
 
 def test_round_trip_reproduces_measured_cells():
-    """The whole point: what the planner reads back must be what was measured.
-
-    The payload must carry exactly the keys ``dspark.py::_build_verify_planner``
-    reads (everything else under ``_meta``, where the loader ignores it),
-    survive a JSON file round trip into a real ``SpsCostTable``, and price
-    every measured cell back to within one shelf width -- the emitted curve is
-    a floor staircase by construction, so a cell between two risers is
-    deliberately priced at the lower shelf.
-    """
+    """The payload carries exactly the loader's keys, survives a JSON round
+    trip into a real SpsCostTable, and prices every cell within one shelf."""
     payload, cells = _payload()
     assert LOADER_KEYS.issubset(payload)
     assert set(payload) - LOADER_KEYS == {"_meta"}
@@ -461,12 +416,8 @@ def test_refuses_a_curve_that_only_moves_by_noise():
 # (M=192) above, so the curve is genuinely non-flat and clears the noise floor
 # (2.5%), yet the step only gets 2.5% more expensive while the acceptance yield
 # given up between those tiers is ~36% at p=0.9. The argmax therefore never
-# leaves max_tier -- non-flat and inert at the same time.
-#
-# The shelf is ENCODED as a breakpoint pair: under the interpolating consumer
-# a bare [0, 160] would ramp from 2.0 to 2.5 across the whole range, dropping
-# the ladder spread below the noise floor and turning this fixture into the
-# flat-noise case instead of the inert one it exists to pin.
+# leaves max_tier -- non-flat and inert at the same time. The shelf is encoded
+# as a breakpoint pair so the interpolating consumer keeps it flat.
 INERT_PAYLOAD = {
     "token_counts": [0, 159, 160],
     "step_time_ms": [2.0, 2.0, 2.5],
@@ -477,12 +428,8 @@ INERT_PAYLOAD = {
 
 
 def test_refuses_an_inert_table():
-    """Non-flat, but no tier pair is worth trading yield for.
-
-    This is the failure mode that does *not* trip ``fallback_flat_cost``, so
-    nothing downstream would report it. ``allow_inert=True`` is the explicit
-    escape hatch -- and it must still say that nothing trims.
-    """
+    """Non-flat, but no tier pair is worth trading yield for; allow_inert=True
+    is the escape hatch and must still say that nothing trims."""
     kwargs = dict(batch_sizes=[32], tiers=[1, 3, 5], acceptance_rates=[0.9, 0.95])
     with pytest.raises(InertCostTableError, match="inert"):
         check_table_is_informative(INERT_PAYLOAD, **kwargs)
@@ -589,11 +536,8 @@ def test_probe_trims_at_low_acceptance_and_not_at_high():
 
 
 def test_probe_uses_the_bonus_token_convention():
-    """A tier's cost must be looked up at bs*(L+1), never bs*L.
-
-    The two differ by a whole batch, which is easily a shelf's width; this pins
-    the profiler to the same convention as ``total_verify_tokens``.
-    """
+    """A tier's cost must be looked up at bs*(L+1), never bs*L -- the same
+    convention as ``total_verify_tokens``."""
     payload = {
         # Priced so that tier 5 (M = 8*6 = 48) is expensive and tier 3
         # (M = 8*4 = 32) is cheap. Under the wrong bs*L convention tier 5 would
@@ -610,3 +554,115 @@ def test_probe_uses_the_bonus_token_convention():
     assert table.step_time(total_verify_tokens(8, 3), 8) == pytest.approx(1.0)
     probes = profitability_probe(payload, batch_size=8, tiers=[1, 3, 5], acceptance_rates=[0.9])
     assert probes[0]["chosen_verify_len"] == 3
+
+
+# --------------------------------------------------------------------------
+# reading cost-table samples out of production iteration logs
+# --------------------------------------------------------------------------
+
+# A deployment's captured ladder, abbreviated. Padding rounds a step's rows up
+# to the smallest entry at or above them, which is what turns a padded token
+# total into exactly one verify length.
+LADDER = [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]
+
+
+def _line(iteration, bs, step_ms, gen_tokens, rank="0"):
+    return (f"{rank}: [08/04/2026-19:08:13] [TRT-LLM] [I] [_torch][RANK 0] "
+            f"iter = {iteration}, global_rank = 0, rank = 0, "
+            f"num_scheduled_requests = {bs}, kv_cache_util = 0.125, "
+            f"currank_total_requests = 1/8, host_step_time = {step_ms}ms, "
+            f"prev_device_step_time = {step_ms}ms, "
+            f"timestamp = 2026-08-04 19:08:13, "
+            f"states = {{'num_ctx_requests': 0, 'num_ctx_tokens': 0, "
+            f"'num_generation_tokens': {gen_tokens}, "
+            f"'cached_kv_tokens': 63821}}")
+
+
+def _write(lines, name="gen.log"):
+    # tempfile rather than pytest's tmp_path: these tests also run under the
+    # fixture-less in-container runner used for the GPU images.
+    path = pathlib.Path(tempfile.mkdtemp()) / name
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+def test_verify_length_comes_from_the_padded_token_total():
+    """The label is read out of the log, never inferred from step times; steps
+    the ladder cannot explain are skipped, not mislabelled."""
+    log = _write([
+        _line(1, 1, 62098.0, 6),        # executor's first step: dropped
+        _line(2, 244, 79.2, 768),       # 244 rows padded to 256 -> rung-2
+        _line(3, 242, 117.1, 1536),     # padded to 256 -> full block
+        _line(4, 128, 61.0, 384),       # exactly 128 rows -> rung-2
+        _line(5, 256, 300.0, 2048),     # L = 7, past the block: skipped
+        _line(6, 300, 400.0, 1800),     # more rows than the ladder holds: skipped
+    ])
+    samples = samples_from_iter_log([log], max_draft_len=5,
+                                    padded_batch_sizes=LADDER)
+    got = sorted((s.batch_size, s.verify_len, s.step_time_ms)
+                 for s in samples)
+    assert got == [(128, 2, 61.0), (256, 2, 79.2), (256, 5, 117.1)]
+    # The table is indexed by the padded token total, which each sample exposes.
+    assert sorted(s.total_verify_tokens for s in samples) == [384, 768, 1536]
+
+
+def test_the_padded_width_is_what_gets_recorded():
+    """A padded step is filed under the padded width, the ladder disambiguates
+    the verify length, and an unexplainable token total drops the step."""
+    assert resolve_padded_shape(num_rows=244, num_generation_tokens=768,
+                                max_draft_len=5, max_batch_size=256,
+                                padded_batch_sizes=LADDER) == (256, 2)
+    assert resolve_padded_shape(num_rows=128, num_generation_tokens=768,
+                                max_draft_len=5, max_batch_size=256) is None
+    assert resolve_padded_shape(num_rows=128, num_generation_tokens=768,
+                                max_draft_len=5, max_batch_size=256,
+                                padded_batch_sizes=LADDER) == (128, 5)
+    assert resolve_padded_shape(num_rows=200, num_generation_tokens=600,
+                                max_draft_len=5, max_batch_size=256,
+                                padded_batch_sizes=LADDER) is None
+
+
+def test_the_first_step_of_each_executor_is_dropped():
+    """Each executor numbers from iter 1 and its first step's host time
+    contains the wait for the first request, so it is never a measurement."""
+    log = _write([
+        _line(1, 1, 200.0, 6),          # KV-estimation executor
+        _line(2, 256, 79.0, 768),
+        _line(1, 1, 62098.0, 6),        # real executor starts over
+        _line(2, 256, 79.4, 768),
+    ])
+    times = [s.step_time_ms for s in samples_from_iter_log([log], max_draft_len=5)]
+    assert times == [79.0, 79.4]
+
+
+def test_only_the_requested_rank_is_read():
+    """Every rank logs; counting all of them would multiply every cell.
+    Outlier steps are bounded out on the same pass."""
+    log = _write([
+        _line(2, 256, 79.2, 768, rank="0"),
+        _line(2, 256, 79.9, 768, rank="3"),   # another rank's copy: dropped
+        _line(3, 256, 5000.0, 768),           # outlier past max_step_ms
+    ])
+    times = [s.step_time_ms for s in
+             samples_from_iter_log([log], max_draft_len=5, max_step_ms=1000.0)]
+    assert times == [79.2]
+
+
+def test_several_logs_are_pooled():
+    """One arm gives one rung; the table needs the ladder, so pool the runs."""
+    a = _write([_line(1, 1, 100.0, 6), _line(2, 256, 117.1, 1536)],
+               name="a.log")
+    c = _write([_line(1, 1, 100.0, 6), _line(2, 256, 79.2, 768)],
+               name="c.log")
+    got = sorted(s.verify_len for s in
+                 samples_from_iter_log([a, c], max_draft_len=5))
+    assert got == [2, 5]
+
+
+def test_a_log_without_the_states_dict_yields_nothing():
+    """enable_iter_perf_stats off: fail loudly upstream, not with a bad table."""
+    path = pathlib.Path(tempfile.mkdtemp()) / "bare.log"
+    path.write_text(
+        "0: [TRT-LLM] iter = 2, num_scheduled_requests = 256, "
+        "host_step_time = 79.2ms\n")
+    assert samples_from_iter_log([str(path)], max_draft_len=5) == []

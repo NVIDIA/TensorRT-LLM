@@ -3865,7 +3865,7 @@ class PyTorchModelEngine(ModelEngine):
         from ..speculative.dspark_device_select import select_windows_device
 
         runner = self.cuda_graph_runner
-        budget = getattr(self, "_dspark_device_budget", None)
+        budget = self._dspark_device_budget
         self._dspark_device_budget = None
         if budget is None or runner.agreed_ragged_bucket is None:
             return False
@@ -3875,7 +3875,7 @@ class PyTorchModelEngine(ModelEngine):
             # previous device tensor breaks that addressing.
             return False
         worker = self._get_spec_worker()
-        planner = getattr(worker, "verify_planner", None)
+        planner = worker.verify_planner
         if planner is None or worker.staged_confidence_buffer() is None:
             return False
         if worker.batch_slot_view(1) is None:

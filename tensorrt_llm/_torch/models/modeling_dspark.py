@@ -174,7 +174,7 @@ class DSparkBlock(DeepseekV4DecoderLayer):
             disable_post_moe_fusion=True,
         )
         config = model_config.pretrained_config
-        spec_cfg = getattr(model_config, "spec_config", None)
+        spec_cfg = model_config.spec_config
         self.stage_id = int(stage_id)
         self.num_stages = int(num_stages)
         # mask_token_id is a user override on the speculative_config; None means
@@ -266,7 +266,7 @@ class DSparkDraftModel(nn.Module):
         # ``mtp.{0..n-1}.*`` weight namespace. Resolve it from (in priority):
         # an explicit override, the spec config's ``num_draft_layers``, a
         # pretrained-config ``n_mtp_layers``, else fall back to nextn.
-        spec_cfg = getattr(model_config, "spec_config", None)
+        spec_cfg = model_config.spec_config
         self.num_stages = int(
             num_stages
             if num_stages is not None
@@ -521,8 +521,8 @@ class DSparkDraftModel(nn.Module):
         when nothing changes (e.g. the MXFP4 checkpoint, whose global algo is not
         ``MIXED_PRECISION``) so the draft config is left byte-identical.
         """
-        qc = getattr(model_config, "quant_config", None)
-        if qc is None or getattr(qc, "quant_algo", None) != QuantAlgo.MIXED_PRECISION:
+        qc = model_config.quant_config
+        if qc is None or qc.quant_algo != QuantAlgo.MIXED_PRECISION:
             return None
         # Reuse the target normalizer on a throwaway shallow copy so we only
         # extract the resolved global quant_config; the shared ``model_config``
@@ -530,7 +530,7 @@ class DSparkDraftModel(nn.Module):
         probe = copy.copy(model_config)
         object.__setattr__(probe, "_frozen", False)
         normalized = _normalize_deepseek_v4_nvfp4_mixed_precision_config(probe)
-        resolved = getattr(normalized, "quant_config", qc)
+        resolved = normalized.quant_config
         return resolved if resolved is not qc else None
 
     @staticmethod
@@ -541,7 +541,7 @@ class DSparkDraftModel(nn.Module):
         sparse config must expose the draft layers' per-layer ratios at indices
         ``[0, num_stages)``.
         """
-        sa = getattr(model_config, "sparse_attention_config", None)
+        sa = model_config.sparse_attention_config
         compress_ratios = getattr(sa, "compress_ratios", None) if sa is not None else None
         if not compress_ratios or len(compress_ratios) < base + num_stages:
             return None
@@ -564,7 +564,7 @@ class DSparkDraftModel(nn.Module):
         physically MXFP4 (identical to the main MoE layers), so copy a
         representative main MoE layer's experts quant onto the draft layer keys.
         """
-        qcd = getattr(model_config, "quant_config_dict", None)
+        qcd = model_config.quant_config_dict
         if not qcd:
             return None
         src = next(

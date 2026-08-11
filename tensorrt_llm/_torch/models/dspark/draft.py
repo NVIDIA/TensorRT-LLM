@@ -111,7 +111,7 @@ def dspark_propose(
         prev_ids = torch.cat([bonus_token_ids.unsqueeze(1), draft_tokens[:, :-1]], dim=1)
         prev_emb = (
             markov_head.get_prev_embeddings(prev_ids)
-            if (markov_head is not None and getattr(confidence_head, "with_markov", False))
+            if (markov_head is not None and confidence_head.with_markov)
             else None
         )
         confidence = (

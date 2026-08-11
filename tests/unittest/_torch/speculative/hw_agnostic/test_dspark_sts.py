@@ -1,21 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""STS pairing must join on draft-pass identity, never on arrival order.
-
-The recorder's label (accepted count) and its feature (confidence logits) are
-produced by different steps: the block verified at step ``i`` was drafted at
-step ``i-1``, and under the overlap scheduler the sampler consumes the label
-while pass ``i+1`` has already overwritten the shared confidence buffer. The
-single mutable stash this ring replaced had NO execution order under which
-the pair was correct -- and the shards looked perfectly healthy.
-
-These tests pin the join contract: a pair is appended only when the ring
-snapshot's per-row stamp equals the pass the label verifies, everything else
-is a *counted* decline, and the shard carries provenance the fitter can
-refuse. No CUDA: the recorder itself is device-agnostic (CPU tensors skip the
-pinned-copy event), which is exactly what lets this run in pre-merge CI.
+"""DSpark STS calibration subsystem: recorder ring pairing, shard provenance,
+fitter acceptance, collection-regime guards, and confidence-head resolution.
+Runs on CPU only (the recorder is device-agnostic), so it fits pre-merge CI.
 """
 
+import contextlib
 import importlib.util
 import os
 import pathlib
@@ -25,10 +15,14 @@ import tempfile
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark_sts import DSparkStsRecorder
+from tensorrt_llm._torch.speculative.dspark_sts import (DSparkStsRecorder,
+                                                        STS_COLLECT_ENV,
+                                                        make_recorder_from_env)
 
 BLOCK = 5
 ROWS = 8
+
+_PIN = "TLLM_DSPARK_FORCE_VERIFY_LEN"
 
 
 def _recorder(tmp, flush_every=1000):
@@ -38,12 +32,7 @@ def _recorder(tmp, flush_every=1000):
 
 
 def _stage(rec, seq, written_rows, fill):
-    """Stage one pass's snapshot: `written_rows` stamped `seq`, rest stale.
-
-    Mirrors the producer: the in-graph scatter stamps only the rows the pass
-    actually drafted; every other row keeps whatever stamp it had (0 for
-    never-written, matching the worker's zero-initialized stamp buffer).
-    """
+    """Stage one pass's snapshot: `written_rows` stamped `seq`, rest stale."""
     logits = torch.full((ROWS, BLOCK), float(fill))
     stamps = torch.zeros(ROWS, dtype=torch.int32)
     stamps[list(written_rows)] = seq
@@ -76,9 +65,7 @@ def test_row_not_written_for_that_pass_is_declined():
 
 def test_ring_eviction_declines_instead_of_mispairing():
     """A label older than the ring depth is dropped, never matched to the
-
-    evicting pass's content: the slot's stamps say who actually wrote it.
-    """
+    evicting pass's content."""
     with tempfile.TemporaryDirectory() as tmp:
         rec = _recorder(tmp)
         for seq in range(1, 2 + DSparkStsRecorder._RING_DEPTH):
@@ -89,7 +76,7 @@ def test_ring_eviction_declines_instead_of_mispairing():
 
 
 def test_every_giving_up_path_is_counted():
-    """Silent declines are how the mispaired fit shipped; none may be silent."""
+    """No decline path may be silent; every one increments a named counter."""
     with tempfile.TemporaryDirectory() as tmp:
         rec = _recorder(tmp)
         rec.record(row=2, accepted=1, target_seq=None)   # no pass id
@@ -117,6 +104,7 @@ def test_staging_without_stamps_is_a_noop():
 
 
 def test_shard_carries_provenance_and_prefix_semantics():
+    """Flushed shards carry ring provenance, stats, and prefix-mask labels."""
     with tempfile.TemporaryDirectory() as tmp:
         rec = _recorder(tmp)
         _stage(rec, seq=1, written_rows=[2], fill=1.5)
@@ -132,11 +120,6 @@ def test_shard_carries_provenance_and_prefix_semantics():
         assert blob["prefix_mask"].tolist() == [[1.0, 1.0, 1.0, 0.0, 0.0]]
 
 
-# ---------------------------------------------------------------------------
-# The fitter must refuse shards from the pre-ring recorders: their pairs are
-# mislabeled in ways the tensors themselves cannot reveal.
-# ---------------------------------------------------------------------------
-
 _SPEC = importlib.util.spec_from_file_location(
     "dspark_fit_sts",
     pathlib.Path(__file__).resolve().parents[4] / "microbenchmarks" /
@@ -147,6 +130,7 @@ _SPEC.loader.exec_module(_FITTER)
 
 
 def test_fitter_refuses_shards_without_ring_provenance():
+    """The fitter must refuse shards lacking draft_seq_ring provenance."""
     with tempfile.TemporaryDirectory() as tmp:
         torch.save({"logits": torch.zeros(4, BLOCK),
                     "prefix_mask": torch.zeros(4, BLOCK)},
@@ -156,6 +140,7 @@ def test_fitter_refuses_shards_without_ring_provenance():
 
 
 def test_fitter_accepts_ring_shards():
+    """Shards produced by the ring recorder load cleanly in the fitter."""
     with tempfile.TemporaryDirectory() as tmp:
         rec = _recorder(tmp)
         _stage(rec, seq=1, written_rows=[2, 3], fill=0.5)
@@ -164,3 +149,89 @@ def test_fitter_accepts_ring_shards():
         rec.flush()
         logits, mask = _FITTER.load_shards(os.path.join(tmp, "*.pt"))
         assert logits.shape == (2, BLOCK) and mask.shape == (2, BLOCK)
+
+
+@contextlib.contextmanager
+def collecting(pin=None):
+    """Set the collection env for the block, restore it after."""
+    saved = {k: os.environ.get(k) for k in (STS_COLLECT_ENV, _PIN)}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ[STS_COLLECT_ENV] = os.path.join(tmp, "collect")
+            if pin is None:
+                os.environ.pop(_PIN, None)
+            else:
+                os.environ[_PIN] = str(pin)
+            yield
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def test_collection_off_builds_nothing():
+    """The serving default must be untouched by any of this."""
+    os.environ.pop(STS_COLLECT_ENV, None)
+    assert make_recorder_from_env(block_size=5) is None
+    assert make_recorder_from_env(block_size=5, has_cost_table=True,
+                                  ragged_mode="compact") is None
+
+
+def test_a_loaded_cost_table_without_a_pin_is_refused():
+    """A table means the planner trims, and trimming censors the label."""
+    with collecting():
+        with pytest.raises(ValueError, match="censors the acceptance label"):
+            make_recorder_from_env(block_size=5, has_cost_table=True)
+
+
+def test_a_pinned_window_makes_the_table_harmless():
+    """Every uncensored regime (pinned window, no table, static mode) must
+    build a recorder."""
+    with collecting(pin=5):
+        rec = make_recorder_from_env(block_size=5, has_cost_table=True)
+        assert rec is not None and rec.block_size == 5
+    with collecting():
+        assert make_recorder_from_env(block_size=5,
+                                      has_cost_table=False) is not None
+        assert make_recorder_from_env(block_size=5,
+                                      ragged_mode="static") is not None
+
+
+def test_compact_mode_is_refused():
+    """Padding rows contribute prefix labels that measure nothing; refused
+    even with the pin set."""
+    with collecting(pin=5):
+        with pytest.raises(ValueError, match="Padded verify rows"):
+            make_recorder_from_env(block_size=5, ragged_mode="compact")
+
+
+class _Head:
+    pass
+
+
+class _Bare:
+    """DSparkDraftModel layout: stages under .mtp_layers."""
+
+    def __init__(self, head):
+        stage = type("Stage", (), {})()
+        if head is not None:
+            stage.confidence_head = head
+        self.mtp_layers = [object(), object(), stage]
+
+
+class _Wrapper:
+    """DSparkForCausalLM layout: bare model under .dspark_model."""
+
+    def __init__(self, head):
+        self.dspark_model = _Bare(head)
+
+
+def test_head_resolves_across_both_layouts_and_absence_is_none():
+    """resolve_confidence_head finds the head under either model layout and
+    returns None when absent."""
+    from tensorrt_llm._torch.speculative.dspark_sts import resolve_confidence_head
+    h = _Head()
+    assert resolve_confidence_head(_Bare(h)) is h
+    assert resolve_confidence_head(_Wrapper(h)) is h
+    assert resolve_confidence_head(_Bare(None)) is None
+    assert resolve_confidence_head(_Wrapper(None)) is None
+    assert resolve_confidence_head(object()) is None

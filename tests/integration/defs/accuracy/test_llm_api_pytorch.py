@@ -4174,12 +4174,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=CudaGraphConfig(enable_padding=True),
                  enable_chunked_prefill=False,
-                 # Diagnostic override only. The overlap scheduler is the
-                 # configuration this test exists to cover, so it stays on by
-                 # default; turning it off isolates whether a failure needs the
-                 # previous step's kernels to still be in flight.
-                 disable_overlap_scheduler=bool(
-                     os.environ.get("TLLM_DSPARK_DISABLE_OVERLAP")),
+                 disable_overlap_scheduler=False,
                  custom_tokenizer="deepseek_v4",
                  speculative_config=spec_config) as llm:
             score, acc_params = self._run_gsm8k(llm)

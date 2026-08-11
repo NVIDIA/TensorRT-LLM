@@ -3246,7 +3246,7 @@ class PyExecutor:
                 "no DSpark confidence planner on this executor; the verify-len "
                 "pin only applies to a DSpark engine with confidence "
                 "scheduling enabled")
-        mode = getattr(worker, "ragged_verify_mode", None)
+        mode = worker.ragged_verify_mode
         computes = (mode.computes_windows if mode is not None else
                     self.model_engine.spec_config.enable_ragged_verify)
         if not computes:
@@ -3298,7 +3298,7 @@ class PyExecutor:
                 "no DSpark confidence planner on this executor; the budget "
                 "fraction only applies to a DSpark engine with confidence "
                 "scheduling enabled")
-        mode = getattr(worker, "ragged_verify_mode", None)
+        mode = worker.ragged_verify_mode
         trims = (mode.trims_submitted_tokens if mode is not None else
                  self.model_engine.spec_config.enable_ragged_verify)
         if not trims:
@@ -3562,8 +3562,7 @@ class PyExecutor:
                               # Only when the fit delivered: otherwise this
                               # books the LAST fit's row count on steps that
                               # never entered the fit.
-                              padded_bs=(getattr(self.model_engine,
-                                                 "_dspark_last_padded_bs", None)
+                              padded_bs=(self.model_engine._dspark_last_padded_bs
                                          if bucket is not None else None),
                               fallback=fallback_reason,
                               delivered=delivered)
