@@ -47,7 +47,6 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
-ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -56,13 +55,19 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-src-" : "tensorrt-llm-release-src-" ) + (env.artifactCommit ? env.artifactCommit : env.gitlabCommit) + ".tar.gz"
 
 // Container configuration
-// available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
+// available tags can be found in: https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
 X86_64_DOCKER_IMAGE = LLM_DOCKER_IMAGE.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
+
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
+// Read-only artifactory pull credentials
+ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
@@ -705,6 +710,7 @@ def isValidSlurmJobId(def slurmJobID) {
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+        def s3SpoolRoot = "/home/svc_tensorrt/bloom/scripts/.s3-spool-${jobUID}"
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
@@ -740,7 +746,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} || true",
+            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -786,6 +792,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
+            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName} || true",
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
@@ -984,8 +991,48 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
+                // Enroot needs artifactory auth. Use a per-job config dir (nodeName is
+                // unique) — never the shared ~/.config/enroot, which races across jobs.
+                // ENROOT_CONFIG_PATH is exported in the sbatch submit shell so Slurm
+                // propagates it into the agent setup script (--export=ALL by default).
+                def enrootConfigDir = null
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    enrootConfigDir = "${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName}"
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASSWORD'
+                    )]) {
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials_slurm-${nodeName}")
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${credsLocal}",
+                            "ARTIFACTORY_DOCKER_HOST=${ARTIFACTORY_DOCKER_HOST}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                cat > "$ENROOT_CREDS_PATH" <<EOF
+                                machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}
+                                EOF
+                            '''.replaceAll("\\n\\s*", "\n"))
+                        }
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd("mkdir -p '${enrootConfigDir}'")))
+                        Utils.copyFileToRemoteHost(
+                            pipeline,
+                            remote,
+                            credsLocal,
+                            "${enrootConfigDir}/.credentials"
+                        )
+                    }
+                }
+
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)
+                def imageForSlurm = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    imageForSlurm = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
+                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
@@ -997,12 +1044,17 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     }
                 }
 
+                def slurmSubmitCommand = slurmCommandWithExclusion
+                if (enrootConfigDir) {
+                    slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
+                }
+
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        "\"${slurmCommandWithExclusion}\""
+                        Utils.bashWrappedRemoteCmd(slurmSubmitCommand)
                     ),
                     returnStdout: true,
                     numRetries: 3
@@ -1068,7 +1120,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (Exception e) {
                         if (e.message?.contains("is no longer active")) {
                             def slurmLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
-                            echoRemoteLogTail(pipeline, remote, slurmLogPath)
+                            CloudManager.withSlurmFrontendFailover(pipeline, remotes) { logRemote ->
+                                echoRemoteLogTail(pipeline, logRemote, slurmLogPath)
+                            }
                             throw new InfraFailure(
                                 "${e.message}. Check SLURM logs at ${slurmLogPath} on ${cluster.host}",
                                 e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>"
@@ -1369,7 +1423,7 @@ def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
     def args = nodeCount == 1 ? [
         "--nodes=${nodeCount}",
-        "--gpus=${gpuCount}"
+        "--gpus-per-node=${gpuCount}"
     ] : [
         "--nodes=${nodeCount}",
         "--ntasks=${gpuCount}",
@@ -1475,9 +1529,6 @@ def getPytestBaseCommandLine(
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
-    if (ENABLE_UPLOAD_TEST_RESULTS) {
-        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
-    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1577,6 +1628,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def s3SecretKeyPathLocal = Utils.createTempLocation(pipeline, "./s3_secret_key")
             def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
+            // Per-job enroot config (never shared ~/.config/enroot — that races across jobs).
+            def enrootConfigDirNode = "${jobWorkspace}/enroot-config"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
@@ -1668,6 +1721,36 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     )
                 }
 
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASSWORD'
+                    )]) {
+                        // Unique per stage so parallel stages do not share one @tmp path.
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials-${stageName}")
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${credsLocal}",
+                            "ARTIFACTORY_DOCKER_HOST=${ARTIFACTORY_DOCKER_HOST}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                cat > "$ENROOT_CREDS_PATH" <<EOF
+                                machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}
+                                EOF
+                            '''.replaceAll("\\n\\s*", "\n"))
+                        }
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${enrootConfigDirNode}\""), numRetries: 3)
+                        Utils.copyFileToRemoteHost(
+                            pipeline,
+                            remote,
+                            credsLocal,
+                            "${enrootConfigDirNode}/.credentials"
+                        )
+                    }
+                }
+
                 // Generate .coveragerc: CBTS stages render coveragerc.template; all other stages get an empty rcfile (no coverage).
                 if (isCbtsStage(stageName)) {
                     // @TRTLLM_WHEEL_PATH@ stays a placeholder; slurm_run.sh substitutes it on the worker.
@@ -1710,17 +1793,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
-                        "-s",
+                        "--capture=fd",
                         "--s3-upload-path=${uploadPath}/${stageName}",
+                        "--s3-upload-mode=deferred",
                     ]
-                    if (ENABLE_S3_ECHO_STDOUT) {
-                        extraArgs += [
-                            "--s3-echo-stdout",
-                            "--s3-capture-mode=timestamped",
-                        ]
-                    }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -1734,7 +1812,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 ).join(" ")
 
                 // Generate Job Launch Script
-                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                def container = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    container = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
@@ -1755,6 +1837,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+
+                    # Job-private enroot config (under jobWorkspace). Avoids racing on
+                    # the shared ~/.config/enroot/.credentials across concurrent jobs.
+                    export ENROOT_CONFIG_PATH="${enrootConfigDirNode}"
+                    cleanup_enroot_config() { rm -rf "\${ENROOT_CONFIG_PATH}"; }
+                    trap cleanup_enroot_config EXIT
 
                     containerDir="$containerDir"
                     mkdir -p "\$containerDir"
@@ -1819,6 +1907,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     }
 
                     importContainerWithRetries "$container" "\$enrootImagePath"
+                    cleanup_enroot_config
+                    trap - EXIT
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -1977,6 +2067,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     filesToKeepWhenRetry += [
                         s3SecretKeyPathNode
+                    ]
+                }
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    filesToKeepWhenRetry += [
+                        enrootConfigDirNode
                     ]
                 }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
@@ -2139,7 +2234,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     # Record the verdict and always exit 0: a re-run can't change a
                     # terminal state, so numRetries should only fire on transport loss.
-                    printf '%s %s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
+                    printf '%s|%s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                     else
@@ -2176,10 +2271,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     )
                 )
 
-                // Verdict: "<STATE> <EXIT_CODE>"; success is COMPLETED + exit 0.
+                // Verdict: "<STATE>|<EXIT_CODE>"; success is COMPLETED + exit 0.
+                // STATE may contain spaces.
                 def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName, 3)
-                def resultFields = jobResult ? jobResult.tokenize(' ') : []
-                def jobState = resultFields ? resultFields[0] : null
+                def resultFields = jobResult ? jobResult.tokenize('|') : []
+                def jobState = resultFields ? resultFields[0]?.tokenize(' ')?.getAt(0) : null
                 def jobExit = resultFields.size() > 1 ? resultFields[1] : null
                 if (jobState != "COMPLETED" || jobExit != "0") {
                     // Verdict unreadable: fall back to an authoritative sacct query.
@@ -3269,6 +3365,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:
@@ -4382,17 +4480,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Temporarily disable to reduce the log size
         // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def extraArgs = [*clusterDurationsArgs]
-        if (ENABLE_UPLOAD_TEST_RESULTS) {
+        if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
-                "-s",
+                "--capture=fd",
                 "--s3-upload-path=${uploadPath}/${stageName}",
+                "--s3-upload-mode=deferred",
             ]
-            if (ENABLE_S3_ECHO_STDOUT) {
-                extraArgs += [
-                    "--s3-echo-stdout",
-                    "--s3-capture-mode=timestamped",
-                ]
-            }
         }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
@@ -4427,57 +4520,66 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
-                    if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
+                    try {
+                        if (preprocessedLists.regularCount > 0) {
+                            sh """
+                                rm -rf ${stageName}/ && \
+                                cd ${llmSrc}/tests/integration/defs && \
+                                ${pytestCommand.join(" ")}
+                            """
+                        } else {
+                            echo "No regular tests to run for stage ${stageName}"
+                            noRegularTests = true
+                            sh "mkdir -p ${stageName}"
+                            // Create an empty results.xml file for consistency
+                            sh """
+                                echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
+                                echo '<testsuites>' >> ${stageName}/results.xml
+                                echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
+                                echo '</testsuite>' >> ${stageName}/results.xml
+                                echo '</testsuites>' >> ${stageName}/results.xml
+                            """
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
+                        if (isRerunFailed) {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Regular tests failed after rerun attempt"
+                            }
+                            rerunFailed = true
+                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                            // Rerun passed but the first run had a timeout: mark this
+                            // stage FAILURE so "[${stageName}] Run Pytest" turns red,
+                            // not just the enclosing parent stage.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests terminated unexpectedly, please check the test report."
+                            }
+                        }
+                    }
+
+                    // Run the isolated tests if exists
+                    if (preprocessedLists.isolateCount > 0) {
+                        stage ("[${stageName}] Run Pytest (Isolated)") {
+                            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
+                            rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
+                        }
                     } else {
-                        echo "No regular tests to run for stage ${stageName}"
-                        noRegularTests = true
-                        sh "mkdir -p ${stageName}"
-                        // Create an empty results.xml file for consistency
+                        echo "No isolated tests to run for stage ${stageName}"
+                        noIsolateTests = true
+                    }
+
+                    if (noRegularTests && noIsolateTests) {
+                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                    }
+                } finally {
+                    if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                         sh """
-                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                            echo '<testsuites>' >> ${stageName}/results.xml
-                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                            echo '</testsuite>' >> ${stageName}/results.xml
-                            echo '</testsuites>' >> ${stageName}/results.xml
+                            python3 ${llmSrc}/tests/test_common/s3_output.py \
+                                --drain-spool "${WORKSPACE}/${stageName}" || true
                         """
                     }
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
-                    if (isRerunFailed) {
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Regular tests failed after rerun attempt"
-                        }
-                        rerunFailed = true
-                    } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
-                        // Rerun passed but the first run had a timeout: mark this
-                        // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                        // not just the enclosing parent stage.
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Some tests terminated unexpectedly, please check the test report."
-                        }
-                    }
-                }
-
-                // Run the isolated tests if exists
-                if (preprocessedLists.isolateCount > 0) {
-                    stage ("[${stageName}] Run Pytest (Isolated)") {
-                        echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                        rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
-                    }
-                } else {
-                    echo "No isolated tests to run for stage ${stageName}"
-                    noIsolateTests = true
-                }
-
-                if (noRegularTests && noIsolateTests) {
-                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
             }
 
@@ -4937,6 +5039,16 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                     deleteDir()
                 }
                 stage('Pull Docker Image') {
+                    withCredentials([usernamePassword(
+                        credentialsId: ARTIFACTORY_CREDENTIALS_ID,
+                        usernameVariable: 'USERNAME',
+                        passwordVariable: 'PASSWORD'
+                    )]) {
+                        sh """
+                            set +x
+                            echo "\$PASSWORD" | docker login ${ARTIFACTORY_DOCKER_HOST} -u "\$USERNAME" --password-stdin
+                        """
+                    }
                     docker.image(image).pull()
                 }
                 // We submit the Slurm job with the Slurm partition's time spec.

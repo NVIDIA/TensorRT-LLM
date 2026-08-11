@@ -294,6 +294,9 @@ def transform_local_topk_and_prepare_pool_view(
     assert topk_indices.dtype == torch.int32
 
     attn_metadata._ensure_pool_view_cached()
+    page_index_scale, layer_offset = (
+        attn_metadata.kv_cache_manager.get_primary_pool_page_index_params(layer_idx)
+    )
 
     if is_generation:
         block_table = attn_metadata._cached_block_table_gen
@@ -308,8 +311,8 @@ def transform_local_topk_and_prepare_pool_view(
         topk_indices,
         attn_metadata._cached_tokens_per_block,
         topk_indices.shape[1],
-        attn_metadata._cached_stride_factor,
-        layer_idx,
+        page_index_scale * attn_metadata._cached_tokens_per_block,
+        layer_offset,
     )
 
     return global_indices, attn_metadata._cached_pool_view
@@ -933,6 +936,86 @@ class Indexer(nn.Module):
         )
 
     @staticmethod
+    def recompute_context_kv_gather_mappings(
+        metadata: DSAtrtllmAttentionMetadata,
+        indexer_params: Optional[IndexerParams] = None,
+    ) -> None:
+        """Recompute context KV-cache gather mappings for the active cache manager."""
+        if not metadata.enable_context_mla_with_cached_kv:
+            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
+            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            return
+
+        if indexer_params is None:
+            indexer_params = Indexer.build_indexer_params(metadata)
+            if indexer_params is None:
+                return
+
+        num_contexts = indexer_params.num_contexts
+        if num_contexts == 0:
+            # Generation does not consume full-KV gather mappings. In
+            # particular, avoid allocating temporary zero-length tensors
+            # while capturing generation CUDA graphs.
+            return
+
+        if metadata.skip_indexer_for_ctx_reqs:
+            # The dense short-context path does not gather from the indexer K
+            # cache, so full-KV mappings would be allocated but never consumed.
+            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
+            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            return
+
+        cached_kv_tokens = indexer_params.cached_kv_tokens[:num_contexts]
+        if indexer_params.compress_ratio == 1 and cached_kv_tokens.count_nonzero().item() == 0:
+            # Without compression or cached tokens, the regular mappings cover
+            # every context KV token in the same order and remain equivalent
+            # when on_update_kv_lens() refreshes them in place.
+            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
+            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            return
+
+        total_kv_per_request = indexer_params.kv_lens[:num_contexts]
+        total_kv_len = total_kv_per_request.sum().item()
+        if total_kv_len == 0:
+            # No chunk can gather indexer KV, so avoid zero-length allocation
+            # and H2D work for short compressed contexts.
+            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
+            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            return
+
+        host_slot_mapping_fp8_fullkv = torch.empty(
+            total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned()
+        )
+        host_slot_mapping_scale_fullkv = torch.empty(
+            total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned()
+        )
+
+        req_indices = torch.repeat_interleave(
+            torch.arange(num_contexts, dtype=torch.int64, device="cpu"), total_kv_per_request
+        )
+
+        cu_kv = torch.zeros(num_contexts + 1, dtype=torch.int64, device="cpu")
+        cu_kv[1:] = total_kv_per_request.to(torch.int64).cumsum(0)
+        kv_positions = torch.arange(total_kv_len, dtype=torch.int64, device="cpu") - cu_kv[
+            :-1
+        ].repeat_interleave(total_kv_per_request)
+
+        fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
+            kv_positions,
+            metadata.host_indexer_k_cache_block_offsets,
+            req_indices,
+            indexer_params.head_dim,
+            indexer_params.tokens_per_block,
+            indexer_params.quant_block_size,
+            data_bytes_per_token=indexer_params.data_bytes_per_token,
+        )
+
+        host_slot_mapping_fp8_fullkv.copy_(fp8_flat_indices)
+        host_slot_mapping_scale_fullkv.copy_(scale_flat_indices)
+        metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(non_blocking=True)
+        metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(non_blocking=True)
+
+    @staticmethod
     def prepare_for_update_k_cache(
         metadata: DSAtrtllmAttentionMetadata, indexer_params: IndexerParams
     ):
@@ -953,8 +1036,6 @@ class Indexer(nn.Module):
         """
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
-        tokens_per_block = indexer_params.tokens_per_block
-        head_dim = indexer_params.head_dim
 
         # When MLA chunked prefill is active, it already handles chunking
         # Indexer should just process the current MLA chunk as a single chunk
@@ -1001,57 +1082,9 @@ class Indexer(nn.Module):
             else:
                 metadata.indexer_prefill_chunks = None
 
-        # Chunked prefill and KV-cache reuse require the full KV for indexer
-        # logits. The indexer's own chunking gathers only the current chunk.
-        if metadata.enable_context_mla_with_cached_kv:
-            # Use kv_lens which correctly computes (raw_past + seq_lens) // compress_ratio.
-            total_kv_per_request = indexer_params.kv_lens[:num_contexts]
-            total_kv_len = total_kv_per_request.sum().item()
-            host_slot_mapping_fp8_fullkv = torch.empty(
-                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned()
-            )
-            host_slot_mapping_scale_fullkv = torch.empty(
-                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned()
-            )
-
-            req_indices = torch.repeat_interleave(
-                torch.arange(num_contexts, dtype=torch.int64, device="cpu"), total_kv_per_request
-            )
-
-            cu_kv = torch.zeros(num_contexts + 1, dtype=torch.int64, device="cpu")
-            cu_kv[1:] = total_kv_per_request.to(torch.int64).cumsum(0)
-            kv_positions = torch.arange(total_kv_len, dtype=torch.int64, device="cpu") - cu_kv[
-                :-1
-            ].repeat_interleave(total_kv_per_request)
-
-            fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
-                kv_positions,
-                metadata.host_indexer_k_cache_block_offsets,
-                req_indices,
-                head_dim,
-                tokens_per_block,
-                indexer_params.quant_block_size,
-                data_bytes_per_token=head_dim // 2
-                if metadata.kv_cache_manager.use_fp4
-                else head_dim,
-            )
-
-            host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
-            host_slot_mapping_scale_fullkv[:total_kv_len] = scale_flat_indices
-
-            assert len(fp8_flat_indices) == total_kv_len, (
-                "host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv "
-                f"length mismatch: {len(fp8_flat_indices)} != total_kv_len={total_kv_len}"
-            )
-
-            # Store extended mappings for indexer full KV gathering
-            metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(non_blocking=True)
-            metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(
-                non_blocking=True
-            )
-        else:
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+        # Chunked prefill and KV-cache reuse require gather mappings that cover
+        # all cached and newly appended indexer tokens.
+        Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
 
     @staticmethod
     def prepare_scheduler_metadata(metadata: DSAtrtllmAttentionMetadata):
@@ -1216,7 +1249,7 @@ class Indexer(nn.Module):
 
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
 
-        head_dim = self.head_dim
+        head_dim = self.head_dim // 2 if self.use_fp4 else self.head_dim
         scale_size = 4  # float32 = 4 bytes
 
         # Extract slot mappings using chunk's k_token_start/end

@@ -62,6 +62,7 @@ class DummyFactory(ModelFactory):
         return 512
 
 
+@pytest.mark.cpu_only
 def test_quantization_base_does_not_register_noop_post_load_hook():
     assert FP8LinearQuantizationFromConfig.post_load_hook is Quantization.post_load_hook
     assert FP8BMMQuantizationFromConfig.post_load_hook is not Quantization.post_load_hook

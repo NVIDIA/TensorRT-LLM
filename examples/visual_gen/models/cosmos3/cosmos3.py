@@ -31,6 +31,9 @@ from tensorrt_llm import VisualGen, VisualGenArgs
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
+DEFAULT_PROMPT_FILE = "prompts/t2v.json"
+DEFAULT_NEGATIVE_PROMPT_FILE = "cosmos3_negative_prompt.json"
+
 
 def _resolve_path(path: str) -> str:
     candidate = Path(path)
@@ -42,16 +45,74 @@ def _resolve_path(path: str) -> str:
     return path
 
 
-def load_prompt_file(path: str) -> Dict[str, Any]:
-    """Load a Cosmos3 omni prompt JSON (``prompt``, optional ``vision_path``, etc.)."""
+def _is_prompt_file(value: str) -> bool:
+    """Whether a ``--prompt``/``--negative_prompt`` value names an existing file."""
+    return bool(value) and os.path.isfile(_resolve_path(value))
+
+
+def _read_prompt_payload(path: str) -> Any:
+    """Read a prompt file, decoding it as JSON when it parses and as text otherwise."""
     resolved = _resolve_path(path)
+    if not os.path.isfile(resolved):
+        raise ValueError(f"Prompt file {path!r} does not exist (resolved to {resolved!r}).")
     with open(resolved, encoding="utf-8") as f:
-        data = json.load(f)
+        raw = f.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip()
+
+
+def load_prompt_file(path: str) -> Dict[str, Any]:
+    """Load a Cosmos3 prompt file.
+
+    Three shapes are accepted: an omni prompt object (``prompt`` plus optional
+    ``vision_path`` / ``model_mode`` / ``enable_audio``), a structured caption
+    object such as the ``assets/*_prompt.json`` files shipped with a checkpoint,
+    or plain text. The latter two carry no options, so they yield ``prompt`` only.
+    """
+    data = _read_prompt_payload(path)
+    if isinstance(data, str):
+        if not data:
+            raise ValueError(f"Prompt file {path!r} is empty.")
+        return {"prompt": data}
     if not isinstance(data, dict):
-        raise ValueError(f"Prompt file must be a JSON object, got {type(data)!r}.")
-    if not data.get("prompt"):
-        raise ValueError(f"Prompt file {resolved!r} is missing a non-empty 'prompt' field.")
+        raise ValueError(
+            f"Prompt file {path!r} must hold a JSON object or text, got {type(data).__name__}."
+        )
+    if "prompt" not in data:
+        if not data:
+            raise ValueError(f"Prompt file {path!r} is an empty JSON object.")
+        return {"prompt": json.dumps(data)}
+    if not data["prompt"]:
+        raise ValueError(f"Prompt file {path!r} is missing a non-empty 'prompt' field.")
     return data
+
+
+def load_negative_prompt_file(path: str) -> str:
+    """Load a negative prompt file (structured JSON object or plain text)."""
+    data = _read_prompt_payload(path)
+    if isinstance(data, dict):
+        return json.dumps(data)
+    if isinstance(data, str):
+        return data
+    raise ValueError(
+        f"Negative prompt file {path!r} must hold a JSON object or text, got {type(data).__name__}."
+    )
+
+
+def resolve_negative_prompt(
+    *,
+    negative_prompt: Optional[str],
+    negative_prompt_file: Optional[str],
+) -> str:
+    """Pick the negative prompt: ``--negative_prompt``, then the file, then the default."""
+    if negative_prompt is not None:
+        # --negative_prompt takes either literal text or a path to a prompt file.
+        if _is_prompt_file(negative_prompt):
+            return load_negative_prompt_file(negative_prompt)
+        return negative_prompt
+    return load_negative_prompt_file(negative_prompt_file or DEFAULT_NEGATIVE_PROMPT_FILE)
 
 
 def resolve_prompt_and_options(
@@ -67,7 +128,15 @@ def resolve_prompt_and_options(
     if prompt_file is not None:
         prompt_data = load_prompt_file(prompt_file)
 
-    resolved_prompt = prompt
+    inline_prompt: Optional[str] = None
+    if prompt is not None:
+        # --prompt takes either literal text or a path to a prompt file.
+        if _is_prompt_file(prompt):
+            prompt_data = {**prompt_data, **load_prompt_file(prompt)}
+        else:
+            inline_prompt = prompt
+
+    resolved_prompt = inline_prompt
     if resolved_prompt is None:
         resolved_prompt = prompt_data.get("prompt")
     if not resolved_prompt:
@@ -93,7 +162,8 @@ def main():
         "--model",
         type=str,
         default="nvidia/Cosmos3-Nano",
-        help="Model path or HuggingFace Hub ID (nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super)",
+        help="Model path or HuggingFace Hub ID "
+        "(nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super, nvidia/Cosmos3-Edge)",
     )
     parser.add_argument(
         "--visual_gen_args",
@@ -106,19 +176,27 @@ def main():
         "--prompt",
         type=str,
         default=None,
-        help="Text prompt for generation (overrides --prompt_file when both are set)",
+        help="Prompt text, or a path to a prompt file (overrides --prompt_file when both are set)",
     )
     parser.add_argument(
         "--prompt_file",
         type=str,
-        default="prompts/t2v.json",
-        help="Path to a JSON prompt file (default: prompts/t2v.json)",
+        default=DEFAULT_PROMPT_FILE,
+        help=f"Path to a prompt file; must exist (default: {DEFAULT_PROMPT_FILE})",
     )
     parser.add_argument(
         "--negative_prompt",
         type=str,
-        default="cosmos3_negative_prompt.json",
-        help="Text prompt or path to JSON file for negative prompt",
+        default=None,
+        help="Negative prompt text, or a path to a negative prompt file "
+        f"(overrides --negative_prompt_file; default: {DEFAULT_NEGATIVE_PROMPT_FILE})",
+    )
+    parser.add_argument(
+        "--negative_prompt_file",
+        type=str,
+        default=None,
+        help=f"Path to a negative prompt file; must exist "
+        f"(default: {DEFAULT_NEGATIVE_PROMPT_FILE})",
     )
     parser.add_argument(
         "--image_path",
@@ -187,15 +265,10 @@ def main():
     if image_path is not None:
         params.image = image_path
 
-    negative_prompt_path = _resolve_path(args.negative_prompt)
-    if args.negative_prompt is not None:
-        if os.path.isfile(negative_prompt_path) and negative_prompt_path.endswith(".json"):
-            with open(negative_prompt_path, encoding="utf-8") as f:
-                negative_prompt = json.load(f)
-        else:
-            negative_prompt = args.negative_prompt
-    else:
-        negative_prompt = None
+    negative_prompt = resolve_negative_prompt(
+        negative_prompt=args.negative_prompt,
+        negative_prompt_file=args.negative_prompt_file,
+    )
 
     if args.disable_duration_template:
         params.extra_params["use_duration_template"] = False
@@ -210,12 +283,7 @@ def main():
     if args.video_path is not None:
         params.extra_params["video"] = Path(args.video_path).read_bytes()
 
-    if negative_prompt is None:
-        params.negative_prompt = None
-    elif isinstance(negative_prompt, str):
-        params.negative_prompt = negative_prompt
-    else:
-        params.negative_prompt = json.dumps(negative_prompt)
+    params.negative_prompt = negative_prompt
 
     output = visual_gen.generate(
         inputs=prompt,
