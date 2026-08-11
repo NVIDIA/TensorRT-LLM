@@ -263,7 +263,7 @@ def main():
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
     if image_path is not None:
-        params.image = image_path
+        params.image_reference = image_path
 
     negative_prompt = resolve_negative_prompt(
         negative_prompt=args.negative_prompt,
@@ -281,7 +281,7 @@ def main():
     params.extra_params["output_type"] = output_type
 
     if args.video_path is not None:
-        params.extra_params["video"] = Path(args.video_path).read_bytes()
+        params.video_reference = args.video_path
 
     params.negative_prompt = negative_prompt
 

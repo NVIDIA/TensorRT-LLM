@@ -36,7 +36,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
@@ -402,26 +402,34 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def extra_param_specs(self):
-        specs = get_wan_extra_param_specs(self.is_wan22_14b)
-        specs["last_image"] = ExtraParamSchema(
-            type="str",
-            default=None,
-            description="Last frame path for video interpolation (Wan I2V).",
-        )
-        return specs
+        return get_wan_extra_param_specs(self.is_wan22_14b)
+
+    @property
+    def ref_slot_specs(self):
+        # I2V first frame (required) + optional last frame for interpolation.
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=1, max=1),
+                    RoleSpec(role="last_frame", min=0, max=1),
+                ],
+            )
+        }
 
     def infer(self, req):
         """Run inference with request parameters."""
-        # Extract image from request (can be path, PIL Image, or torch.Tensor)
-        if req.params.image is None:
-            raise ValueError("I2V pipeline requires 'image' parameter")
-
-        image = req.params.image[0] if isinstance(req.params.image, list) else req.params.image
+        refs = req.params.image_reference
+        if not refs:
+            raise ValueError("I2V pipeline requires an image_reference (first_frame)")
+        by_role = {r.role: r for r in refs}
+        first = by_role.get("first_frame") or by_role.get(None)
+        if first is None:
+            raise ValueError("I2V pipeline requires a first_frame image_reference")
+        last = by_role.get("last_frame")
+        image = first.image
+        last_image = last.image if last is not None else None
         extra = req.params.extra_params or {}
-        last_image = extra.get("last_image")
-
-        if last_image is not None and isinstance(last_image, list):
-            last_image = last_image[0] if last_image else None
 
         return self.forward(
             image=image,

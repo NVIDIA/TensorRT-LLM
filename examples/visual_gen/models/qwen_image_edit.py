@@ -64,7 +64,7 @@ def main() -> None:
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
-    params.image = args.image if len(args.image) > 1 else args.image[0]
+    params.image_reference = args.image
     output = visual_gen.generate(inputs=args.prompt, params=params)
     saved = output.save(args.output_path)
     print(f"Saved edited image to {saved}")

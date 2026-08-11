@@ -102,7 +102,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference file
         """
         try:
             # Client-side ValueErrors from content-type parsing, request
@@ -256,8 +256,8 @@ class _VideoRoutesMixin:
             for key in form:
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded file (``input_reference``) — pass through
-                    # so the conversion layer reads ``.file``.
+                    # Uploaded reference file (image_reference / video_reference)
+                    # — pass through so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -320,7 +320,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference file
         """
         try:
             # Parse request based on content-type
@@ -341,6 +341,7 @@ class _VideoRoutesMixin:
                 params,
                 declared_defaults=self.generator.executor.default_generation_params,
                 extra_param_specs=self.generator.executor.extra_param_specs,
+                ref_slot_specs=self.generator.executor.ref_slot_specs,
             )
             _preflight_encoder_format(request.format)
             logger.info(
