@@ -3,7 +3,7 @@
 
 import copy
 import dataclasses
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torchvision
@@ -559,14 +559,26 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             }
         }
 
-    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
-        """Largest single image's ViT patch count (the ``max_image_size``-capped
-        square), used to weight the shared-budget split. Image only -- image and
-        video share the Pixtral ViT."""
+    def get_mm_max_tokens_per_item(
+        self,
+        max_num_encoder_tokens: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Return the largest legal Pixtral image encoder item size."""
         patch, merge, _, max_size = self._vision_geometry()
         unit = patch * merge
         edge = max((max_size // unit) * unit, unit)
-        return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
+        max_image_tokens = self._vit_tokens(width=edge,
+                                            height=edge,
+                                            patch=patch)
+        token_budget = (max_num_encoder_tokens if max_num_encoder_tokens
+                        is not None else max_image_tokens)
+        size = self.get_size_for_max_tokens(max_tokens=token_budget)
+        encoder_tokens = self._vit_tokens(width=size["width"],
+                                          height=size["height"],
+                                          patch=patch)
+        if encoder_tokens > token_budget:
+            return {}
+        return {"image": encoder_tokens}
 
     def get_max_mm_encoder_output_embeddings(
             self, max_num_encoder_tokens: int) -> int:
@@ -585,22 +597,31 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         self,
         *,
         max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
         dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
-        """Build a processed full-budget encoder profiling batch."""
+        """Build processed Pixtral tensors for profiler-selected images."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
+        unsupported_modalities = set(mm_counts) - {"image"}
+        if unsupported_modalities:
+            raise ValueError("Pixtral cannot build dummy data for modalities "
+                             f"{sorted(unsupported_modalities)}")
+        num_images = mm_counts.get("image", 0)
+        if num_images < 0:
+            raise ValueError("Multimodal item counts must be nonnegative; got "
+                             f"{num_images} for image")
+        if num_images == 0:
+            return {}
 
         patch, _, _, _ = self._vision_geometry()
         size = self.get_size_for_max_tokens(max_tokens=max_num_encoder_tokens)
-        tokens_per_image = max(
-            1,
-            self._vit_tokens(width=size["width"],
-                             height=size["height"],
-                             patch=patch))
-        if tokens_per_image > max_num_encoder_tokens:
-            return {}
-        num_images = max_num_encoder_tokens // tokens_per_image
+        tokens_per_image = self._vit_tokens(width=size["width"],
+                                            height=size["height"],
+                                            patch=patch)
+        if num_images * tokens_per_image > max_num_encoder_tokens:
+            raise ValueError("Requested multimodal dummy items exceed "
+                             f"max_num_encoder_tokens={max_num_encoder_tokens}")
         return self._dummy_mm_data_for_size(
             width=size["width"],
             height=size["height"],

@@ -574,22 +574,24 @@ class PyTorchModelEngine(ModelEngine):
                                                                    int]] = None
         self.max_mm_encoder_output_embeddings: Optional[int] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
-        # Item scheduling bounds three distinct MM encoder resources. They are
+        # Item scheduling bounds four distinct MM encoder resources. They are
         # owned in different places and measured in different units, so they
         # are enumerated here once:
-        #   (A) encoder-forward workspace — `encoder_max_num_tokens` (below),
+        #   (A) encoder batch cardinality — `encoder_batch_size`, counting
+        #       atomic MM items rather than model-internal attention sequences.
+        #   (B) encoder-forward workspace — `encoder_max_num_tokens` (below),
         #       in encoder attention tokens, clamped up to the largest atomic
         #       item; profiled by a direct full-budget encoder warmup.
-        #   (B) resident output bytes — `mm_encoder_output_budget_bytes`
+        #   (C) resident output bytes — `mm_encoder_output_budget_bytes`
         #       (`_resolve_mm_encoder_output_budget_bytes`), the maximum
         #       post-encoder embeddings produced by one legal encoder iteration,
         #       converted to bytes. Enforced by the scheduler; any capacity not
         #       materialized by warmup is reserved in KV-capacity estimation.
-        #   (C) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
+        #   (D) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
         #       `TensorLRUCache`, self-bounded by LRU; unprofiled capacity is
-        #       reserved on top of (B) for cache-enabled models.
+        #       reserved on top of (C) for cache-enabled models.
         # Prefill currently waits for every item in a request, so admission
-        # rejects a request whose complete MM embedding exceeds (B).
+        # rejects a request whose complete MM embedding exceeds (C).
         if self.mm_encoder_item_scheduling_enabled:
             if self.encoder_max_num_tokens is None:
                 raise ValueError(
@@ -612,7 +614,7 @@ class PyTorchModelEngine(ModelEngine):
             if effective_encoder_token_budget > self.encoder_max_num_tokens:
                 logger.warning_once(
                     f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
-                    "is smaller than the model's largest atomic "
+                    "is smaller than the model's largest profiled atomic "
                     f"multimodal item ({model_max_atomic_item_tokens}); "
                     f"using {model_max_atomic_item_tokens} as the "
                     "effective encoder runtime budget.",

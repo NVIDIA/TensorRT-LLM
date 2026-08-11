@@ -64,17 +64,20 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         def __init__(self):
             self.calls = []
 
-        def get_mm_max_tokens_per_item(self):
+        def get_mm_max_tokens_per_item(self, max_num_encoder_tokens=None):
+            del max_num_encoder_tokens
             return {"image": 4096}
 
         def get_dummy_mm_data(
             self,
             *,
             max_num_encoder_tokens,
+            mm_counts,
             dtype,
         ):
-            self.calls.append((max_num_encoder_tokens, dtype))
-            return {"image": {"item_count": max_num_encoder_tokens // 4096}}
+            self.calls.append((max_num_encoder_tokens, mm_counts, dtype))
+            item_count = mm_counts["image"]
+            return {"image": {"item_count": item_count}}
 
     class _Model(MultimodalModelMixin):
         dtype = torch.float16
@@ -97,6 +100,7 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     creator._model_engine = SimpleNamespace(
         model=model,
         input_processor=input_processor,
+        encoder_batch_size=4,
         encoder_max_num_tokens=8192,
         use_mrope=False,
     )
@@ -113,7 +117,7 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
 
     creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
-    assert input_processor.calls == [(8192, torch.float16)]
+    assert input_processor.calls == [(8192, {"image": 2}, torch.float16)]
 
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     retained_output = creator._encode_dummy_inputs()

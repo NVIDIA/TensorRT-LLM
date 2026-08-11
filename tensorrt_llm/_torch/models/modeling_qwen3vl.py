@@ -261,11 +261,49 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # ``tokens_per_second`` scaling).
         return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
 
-    # Deterministic dummy-input sizing (`spatial_merge_unit`,
-    # `_num_vision_tokens`, `get_size_for_max_tokens`) and the
-    # `get_num_tokens_per_image` override are inherited unchanged from
-    # `Qwen2VLInputProcessorBase` -- the grid math and the HF `smart_resize`
-    # it defers to are identical for Qwen3-VL.
+    def _get_dummy_grid_for_modality(
+        self,
+        modality: str,
+        max_num_encoder_tokens: Optional[int],
+    ) -> Optional[Tuple[int, int, int]]:
+        """Return one Qwen3 processor-valid grid under the shared budget.
+
+        Qwen3 applies ``video_processor.size`` to the complete temporal pixel
+        volume rather than independently to every frame. Image sizing and the
+        common modality contract remain inherited.
+        """
+        if modality != "video":
+            return super()._get_dummy_grid_for_modality(modality, max_num_encoder_tokens)
+        try:
+            min_pixels, max_pixels = self._vision_pixel_bounds("video")
+        except ValueError:
+            return None
+
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        grid_t = 1
+        temporal_pixels = grid_t * temporal_patch_size
+        token_budget = max_num_encoder_tokens
+        if token_budget is None:
+            _, image_max_pixels = self._vision_pixel_bounds()
+            token_budget = max(1, image_max_pixels // (patch_size**2))
+        size = self._size_for_max_tokens(
+            max_tokens=token_budget // grid_t,
+            min_pixels=math.ceil(min_pixels / temporal_pixels),
+            max_pixels=max_pixels // temporal_pixels,
+        )
+        if size is None:
+            return None
+        grid_h = size["height"] // patch_size
+        grid_w = size["width"] // patch_size
+        grid = (grid_t, grid_h, grid_w)
+        if math.prod(grid) > token_budget:
+            return None
+        return grid
+
+    # Qwen3 overrides the shared grid hook only because its video processor
+    # clamps aggregate temporal pixels rather than pixels per frame.
 
     def get_mm_encoder_attention_metadata_capacity(
         self, max_num_tokens: int

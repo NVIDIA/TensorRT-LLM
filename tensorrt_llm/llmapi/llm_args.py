@@ -5226,9 +5226,13 @@ class TorchLlmArgs(BaseLlmArgs):
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
         description=
-        ("Maximum encoder batch size for encoder-decoder models. This controls "
-         "encoder microbatch admission and limits encoder CUDA graph batch "
-         "sizes. Falls back to `max_batch_size` when unset."),
+        ("Maximum number of top-level encoder inputs processed in one "
+         "iteration. For encoder-decoder models, each encoder request counts "
+         "as one input. For multimodal models, each atomic image, video, or "
+         "other encoder item counts as one input, even if it expands into "
+         "multiple internal attention sequences. For encoder-decoder models, "
+         "it also limits encoder CUDA graph batch sizes. Falls back to "
+         "`max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(

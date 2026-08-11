@@ -530,10 +530,11 @@ class MultimodalScheduler(RequestScheduler):
     deliberately reuses the wrapped scheduler's capacity and microbatch
     schedulers so MM encoder costs never enter the LLM token budget.
 
-    ``max_num_tokens`` is shared across requests and modalities. Each atomic
-    item's positive encoder-token cost bounds both aggregate encoder work and
-    the number of items selected in one iteration, so no separate item-count
-    budget is needed.
+    ``max_batch_size`` and ``max_num_tokens`` are shared across requests and
+    modalities. For multimodal encoders, one atomic image or video occupies
+    one encoder batch slot even when it expands into several model-internal
+    attention sequences. Those attention metadata capacities are derived
+    separately from the token budget and model geometry.
 
     When ``output_budget_bytes`` is configured, selection also enforces the
     encoder output byte budget (allocate-before-compute): an item is only
@@ -546,12 +547,14 @@ class MultimodalScheduler(RequestScheduler):
     def __init__(
         self,
         scheduler: SimpleScheduler,
+        max_batch_size: int,
         max_num_tokens: int,
         *,
         output_budget_bytes: int | None = None,
         bytes_per_encoder_embedding: int = 0,
     ) -> None:
         self.scheduler = scheduler
+        self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         # Optional byte budget for encoder outputs living outside a forward
         # pass. Item selection performs allocate-before-compute against it:
@@ -609,6 +612,7 @@ class MultimodalScheduler(RequestScheduler):
         eligible for LLM microbatch scheduling this iteration (encoder
         outputs already ready, or every pending item selected above).
         """
+        remaining_batch_slots = self.max_batch_size
         remaining_tokens = self.max_num_tokens
         budget = self.output_budget_bytes
         resident_bytes = (
@@ -647,6 +651,7 @@ class MultimodalScheduler(RequestScheduler):
                 budget is not None
                 and not state.has_storage
                 and pending
+                and remaining_batch_slots > 0
                 and token_lengths[pending[0]] <= remaining_tokens
             ):
                 request_bytes = sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
@@ -671,9 +676,10 @@ class MultimodalScheduler(RequestScheduler):
             request_items: list[int] = []
             for item_idx in pending:
                 cost = token_lengths[item_idx]
-                if cost > remaining_tokens:
+                if remaining_batch_slots == 0 or cost > remaining_tokens:
                     break
                 request_items.append(item_idx)
+                remaining_batch_slots -= 1
                 remaining_tokens -= cost
 
             if request_items:

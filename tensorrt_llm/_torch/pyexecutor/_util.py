@@ -826,12 +826,38 @@ class KvCacheCreator:
 
         input_processor = self._model_engine.input_processor
         encoder_max_num_tokens = self._model_engine.encoder_max_num_tokens
-        if not input_processor.get_mm_max_tokens_per_item():
+        if encoder_max_num_tokens is None or encoder_max_num_tokens <= 0:
             return []
 
         try:
+            max_tokens_per_item = input_processor.get_mm_max_tokens_per_item(
+                max_num_encoder_tokens=encoder_max_num_tokens)
+            for modality, num_tokens in max_tokens_per_item.items():
+                if not modality:
+                    raise ValueError("Multimodal modality name cannot be empty")
+                if num_tokens <= 0:
+                    raise ValueError(
+                        "Multimodal encoder token counts must be positive; "
+                        f"got {num_tokens} for {modality}")
+            max_tokens_per_item = {
+                modality: num_tokens
+                for modality, num_tokens in max_tokens_per_item.items()
+                if num_tokens <= encoder_max_num_tokens
+            }
+            if not max_tokens_per_item:
+                return []
+
+            modality, num_tokens_per_item = max(
+                max_tokens_per_item.items(),
+                key=lambda item: (item[1], item[0]),
+            )
+            num_items = min(
+                self._model_engine.encoder_batch_size,
+                encoder_max_num_tokens // num_tokens_per_item,
+            )
             mm_data = input_processor.get_dummy_mm_data(
                 max_num_encoder_tokens=encoder_max_num_tokens,
+                mm_counts={modality: num_items},
                 dtype=self._model_engine.model.dtype,
             )
         except NotImplementedError:
@@ -841,6 +867,10 @@ class KvCacheCreator:
             return []
         if not mm_data:
             return []
+        if not isinstance(mm_data, dict):
+            raise ValueError(
+                "get_dummy_mm_data() must return a multimodal_data "
+                "dictionary")
         return [MultimodalParams(multimodal_data=mm_data)]
 
     def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
@@ -3059,6 +3089,7 @@ def create_py_executor_instance(
             scheduler_cls = MultimodalEagerEncoderScheduler
         scheduler = scheduler_cls(
             scheduler,
+            max_batch_size=model_engine.encoder_batch_size,
             max_num_tokens=model_engine.encoder_max_num_tokens,
             output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
             bytes_per_encoder_embedding=(

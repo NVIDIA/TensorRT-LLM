@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the base multimodal input-processor mixins.
 
 A concrete multimodal input processor inherits both
@@ -17,6 +20,8 @@ Dummy contract (`BaseMultimodalDummyInputsBuilder`):
 * Defaults — ``get_mm_max_tokens_per_item`` returns ``{}`` and
   ``get_dummy_mm_data`` raises ``NotImplementedError``. Together they mean
   "no multimodal profiling" until a concrete processor opts in.
+* The profiler selects the workload; a concrete processor receives the
+  resulting per-modality counts and materializes the processed tensors.
 """
 
 from types import SimpleNamespace
@@ -123,4 +128,42 @@ def test_get_mm_max_tokens_per_item_default_empty():
 def test_get_dummy_mm_data_default_raises_not_implemented():
     builder = _StubBuilder()
     with pytest.raises(NotImplementedError):
-        builder.get_dummy_mm_data(max_num_encoder_tokens=1024)
+        builder.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": 4})
+
+
+class _DummyBuilder(_StubBuilder):
+    def __init__(self):
+        self.build_calls = []
+
+    def get_mm_max_tokens_per_item(self, max_num_encoder_tokens=None):
+        del max_num_encoder_tokens
+        return {
+            "image": 100,
+            "video": 200,
+        }
+
+    def get_dummy_mm_data(
+        self,
+        *,
+        max_num_encoder_tokens,
+        mm_counts,
+        dtype=None,
+    ):
+        self.build_calls.append((max_num_encoder_tokens, mm_counts, dtype))
+        return {modality: {"num_items": num_items} for modality, num_items in mm_counts.items()}
+
+
+def test_common_dummy_builder_uses_reported_default_tokens():
+    assert _DummyBuilder().get_mm_max_tokens_per_item() == {
+        "image": 100,
+        "video": 200,
+    }
+
+
+def test_model_dummy_builder_receives_profiler_counts():
+    builder = _DummyBuilder()
+
+    mm_data = builder.get_dummy_mm_data(max_num_encoder_tokens=1000, mm_counts={"video": 3})
+
+    assert mm_data == {"video": {"num_items": 3}}
+    assert builder.build_calls == [(1000, {"video": 3}, None)]

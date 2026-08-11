@@ -699,11 +699,18 @@ def test_dummy_get_size_rejects_non_positive_budget():
         proc.get_size_for_max_tokens(max_tokens=0)
 
 
+def test_dummy_get_dummy_mm_data_rejects_negative_item_count():
+    proc = _make_dummy_processor()
+    with pytest.raises(ValueError, match=r"item counts must be nonnegative"):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": -1})
+
+
 @pytest.mark.parametrize("budget", [4096, 8192])
 def test_dummy_get_dummy_mm_data_saturates_budget(budget):
     proc = _make_dummy_processor()
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=budget,
+        mm_counts={"image": 1},
         dtype=torch.float16,
     )["image"]
     pixel_values = image["pixel_values"]
@@ -720,6 +727,7 @@ def test_dummy_get_dummy_mm_data_repeats_items_to_fill_token_budget():
     proc = _make_dummy_processor(image_size=448)
     image = proc.get_dummy_mm_data(
         max_num_encoder_tokens=8192,
+        mm_counts={"image": 8},
         dtype=torch.float16,
     )["image"]
     pixel_values = image["pixel_values"]
@@ -728,6 +736,17 @@ def test_dummy_get_dummy_mm_data_repeats_items_to_fill_token_budget():
     assert num_images == 8
     assert tokens_per_image == 1024
     assert num_images * tokens_per_image == 8192
+
+
+def test_dummy_get_dummy_mm_data_respects_requested_item_count():
+    proc = _make_dummy_processor(image_size=448)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"image": 3},
+        dtype=torch.float16,
+    )["image"]
+
+    assert image["pixel_values"].shape[0] == 3
 
 
 def test_dummy_mm_data_satisfies_the_encoder_input_contract():
@@ -740,8 +759,12 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
     expectations here, so a change on either side fails this test.
     """
     proc = _make_dummy_processor()
+    budget = 8192
+    tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
+    num_images = min(8, budget // tokens_per_image)
     image = proc.get_dummy_mm_data(
-        max_num_encoder_tokens=8192,
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": num_images},
         dtype=torch.float16,
     )["image"]
 

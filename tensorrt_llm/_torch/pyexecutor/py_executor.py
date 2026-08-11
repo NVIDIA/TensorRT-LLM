@@ -5362,17 +5362,19 @@ class PyExecutor:
         cannot make encoder progress, all later requests are deferred and
         prepended to the waiting queue.
         """
+        remaining_batch_slots = self.model_engine.encoder_batch_size
         remaining_tokens = self.model_engine.encoder_max_num_tokens
 
         def consume_pending(costs, pending_indices=None):
-            nonlocal remaining_tokens
+            nonlocal remaining_batch_slots, remaining_tokens
             if pending_indices is None:
                 pending_indices = range(len(costs))
             progressed = False
             for item_idx in pending_indices:
                 cost = costs[item_idx]
-                if cost > remaining_tokens:
+                if remaining_batch_slots == 0 or cost > remaining_tokens:
                     break
+                remaining_batch_slots -= 1
                 remaining_tokens -= cost
                 progressed = True
             return progressed

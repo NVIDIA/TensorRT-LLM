@@ -20,8 +20,8 @@ import importlib
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, ClassVar, Dict, List, NamedTuple, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, Mapping, NamedTuple,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -686,9 +686,10 @@ class BaseMultimodalInputProcessor(ABC):
 class BaseMultimodalDummyInputsBuilder(ABC):
     """Build deterministic multimodal data for KV-cache profiling.
 
-    A model declares the per-item token demand of each modality it encodes via
-    :meth:`get_mm_max_tokens_per_item`, and materializes the corresponding
-    processed encoder inputs via :meth:`get_dummy_mm_data`.
+    Concrete processors report per-modality item sizes through
+    :meth:`get_mm_max_tokens_per_item` and directly implement
+    :meth:`get_dummy_mm_data`. The profiler owns modality selection and passes
+    the selected per-modality item counts to the processor.
 
     Token unit is **encoder attention** (pre-merger), matching
     ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
@@ -712,21 +713,23 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     def model_path(self) -> str:
         ...
 
-    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
-        """Per-modality encoder-attention tokens of the single worst-case item.
+    def get_mm_max_tokens_per_item(
+        self,
+        max_num_encoder_tokens: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Return the largest legal item size for every encoder modality.
 
-        Keyed by modality — e.g. ``{"image": 16384}`` for a vision-only model or
-        ``{"image": 16384, "audio": 1500}`` for a mixed one. The engine uses
-        the largest value to ensure that the encoder budget admits every atomic
-        item. A concrete dummy builder decides how to distribute its aggregate
-        profiling budget across the declared modalities. (Qwen-VL declares
-        only ``"image"``: image and video share one ViT, so the image worst case
-        already covers the vision encoder.)
+        ``max_num_encoder_tokens=None`` asks for bounded startup maxima used to
+        resolve the largest atomic item. An integer asks for the largest legal
+        item of each modality under that encoder-token budget; the profiler
+        uses those values to select its workload.
 
         Default ``{}`` → no multimodal encoder profiling (text-only fallback);
-        a model opts in by overriding this together with
+        a processor opts in by overriding this method together with
         :meth:`get_dummy_mm_data`.
         """
+        if max_num_encoder_tokens is not None:
+            raise NotImplementedError
         return {}
 
     def get_max_mm_encoder_output_embeddings(
@@ -770,19 +773,23 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         self,
         *,
         max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build processed ``multimodal_data`` for MM encoder profiling.
 
         Args:
             max_num_encoder_tokens: Aggregate encoder-attention token budget.
+            mm_counts: Number of items to materialize for each modality. The
+                profiler computes these counts within the token and item-count
+                limits before calling the model-specific builder.
             dtype: Data type for floating-point encoder inputs.
 
         Returns:
             The model-specific tensors consumed directly by the encoder.
 
-        The default raises ``NotImplementedError``. The profiler then falls
-        back to text-only memory estimation.
+        Concrete processors construct the processed tensors consumed directly
+        by their encoder. The default keeps profiling unsupported.
         """
         raise NotImplementedError
 

@@ -281,6 +281,8 @@ class TestEncoderRuntimeSizes:
     @pytest.mark.parametrize(
         "field_name, invalid_value",
         [
+            ("encoder_max_batch_size", 0),
+            ("encoder_max_batch_size", -1),
             ("encoder_max_num_tokens", 0),
             ("encoder_max_num_tokens", -1),
         ],
