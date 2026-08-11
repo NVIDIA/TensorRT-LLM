@@ -1797,9 +1797,15 @@ def _build_per_layer_num_kv_heads(
         draft_pretrained, 'num_key_value_heads',
         getattr(draft_pretrained, 'num_attention_heads', None))
 
-    if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
+    if draft_num_kv_heads is None:
         return num_key_value_heads
 
+    # Return the extended per-layer list even when the drafter's head count
+    # equals the target's: the list's draft tail is what tells shared-draft
+    # managers that the appended layers exist. An equal-head drafter (e.g.
+    # MiniMax-M3's GQA Eagle head, 4 KV heads like the target) otherwise
+    # disappears into the target's layer range and gets routed through the
+    # target's attention machinery.
     num_spec_layers = get_num_spec_layers(spec_config)
     logger.info(f"Per-layer KV heads for speculative decoding: "
                 f"target={num_key_value_heads} x {num_hidden_layers} layers, "

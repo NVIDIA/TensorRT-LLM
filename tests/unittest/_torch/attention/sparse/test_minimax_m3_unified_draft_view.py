@@ -166,6 +166,15 @@ def test_draft_layout_target_only_num_layers():
     assert num_target == 60
 
 
+def test_draft_layout_equal_head_drafter():
+    # The GQA Eagle head has the target's KV head count, so the heads list
+    # is uniform; the draft tail must still resolve from the list length
+    # (an equal-head drafter is invisible in the values).
+    draft_ids, num_target = derive_shared_draft_layout(60, [4] * 61, 1)
+    assert draft_ids == [60]
+    assert num_target == 60
+
+
 def test_draft_layout_pre_extended_num_layers():
     # Flows that pass the extended count directly must resolve identically.
     heads = [4] * 60 + [64]
