@@ -37,7 +37,10 @@ class _FakeResources:
 class _SharedTargetWithView:
     """Target manager carrying appended draft layers (unified KV cache)."""
 
-    draft_subpage_view = object()
+    _view = object()
+
+    def get_draft_subpage_view(self):
+        return self._view
 
 
 class _PlainSharedTarget:
@@ -58,7 +61,7 @@ def test_registered_separate_manager_wins():
 def test_shared_manager_falls_back_to_subpage_view():
     target = _SharedTargetWithView()
     resources = _FakeResources({ResourceManagerType.KV_CACHE_MANAGER: target})
-    assert resolve_draft_kv_cache_manager(resources) is target.draft_subpage_view
+    assert resolve_draft_kv_cache_manager(resources) is target._view
 
 
 def test_plain_shared_manager_resolves_to_none():
@@ -71,15 +74,14 @@ def test_no_target_manager_resolves_to_none():
 
 
 class _BrokenViewTarget:
-    @property
-    def draft_subpage_view(self):
+    def get_draft_subpage_view(self):
         raise AttributeError("max_blocks_per_seq")
 
 
 def test_broken_view_construction_propagates():
     # A failure inside view construction must surface, not silently
-    # downgrade to "no view" (getattr's default would swallow it and the
-    # drafter would attend the shared manager at the wrong page size).
+    # downgrade to "no view": getattr fetches the bound method without
+    # executing it, so the exception escapes from the call itself.
     resources = _FakeResources({ResourceManagerType.KV_CACHE_MANAGER: _BrokenViewTarget()})
     try:
         resolve_draft_kv_cache_manager(resources)

@@ -537,8 +537,9 @@ def resolve_draft_kv_cache_manager(resource_manager):
     """Resolve the draft-side KV manager for one-model speculative decoding.
 
     The registered separate manager is the ground truth when present;
-    otherwise fall back to the target manager's ``draft_subpage_view`` (None
-    for managers that do not expose one, e.g. same-geometry shared drafters).
+    otherwise ask the target manager for its draft sub-page view (managers
+    without one — e.g. same-geometry shared drafters — resolve to None and
+    the drafter attends the shared manager directly).
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -549,18 +550,11 @@ def resolve_draft_kv_cache_manager(resource_manager):
         return draft_manager
     target_manager = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
-    if target_manager is None:
-        _log_draft_kv_mode("none (no target manager registered)")
-        return None
-    # Probe the class descriptor, then access the attribute directly: a
-    # plain getattr default would also swallow an AttributeError raised
-    # *inside* view construction, silently downgrading a broken view to
-    # "no view" (the drafter would then attend the shared manager at the
-    # wrong page size instead of failing loudly).
-    if getattr(type(target_manager), "draft_subpage_view", None) is None:
-        _log_draft_kv_mode("none (shared manager without a draft view)")
-        return None
-    view = target_manager.draft_subpage_view
+    # getattr fetches the method without executing it, so a failure inside
+    # view construction propagates from the call below instead of being
+    # silently swallowed into "no view".
+    get_view = getattr(target_manager, "get_draft_subpage_view", None)
+    view = get_view() if get_view is not None else None
     _log_draft_kv_mode(
         "target manager's draft sub-page view" if view is not None else
         "none (drafter attends the shared manager directly)")

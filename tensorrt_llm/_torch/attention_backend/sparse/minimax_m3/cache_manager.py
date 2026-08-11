@@ -208,13 +208,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # dense draft layers have no page-size constraint, so the drafter
     # runs at 32: this value sizes the separate draft manager (read by
     # ``_create_one_model_draft_kv_cache_manager``) and the sub-pages of
-    # ``draft_subpage_view``. Retirement plan once the kernels are fixed
+    # ``get_draft_subpage_view``. Retirement plan once the kernels are fixed
     # (single source of truth; WAR sites below point here):
     #   1. Set TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128 and validate: the
     #      view degenerates to subdiv=1 (the identity block-table
     #      expansion, unit-tested).
     #   2. Then delete the WAR surface entirely: MiniMaxM3DraftSubpageView,
-    #      the ``draft_subpage_view`` property, the ``add_dummy_requests``
+    #      the ``get_draft_subpage_view`` accessor, the ``add_dummy_requests``
     #      override, and this attribute. The resolver falls back to "no
     #      view" and the drafter attends the shared manager directly — a
     #      control run at P128 with fixed kernels and the view disabled
@@ -318,13 +318,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     device=device,
                 )
 
-    @property
-    def draft_subpage_view(self) -> Optional["MiniMaxM3DraftSubpageView"]:
+    def get_draft_subpage_view(self) -> Optional["MiniMaxM3DraftSubpageView"]:
         """Sub-page view over the shared drafter pool, or None.
 
-        Only meaningful on a target manager that carries appended one-model
-        draft layers; a separate draft manager (``is_draft``) never exposes
-        one. Built lazily so the manager's page-table tensors exist.
+        A plain method rather than a property so callers can fetch it with
+        ``getattr(manager, "get_draft_subpage_view", None)`` without
+        executing it — construction failures then propagate from the call
+        itself (see ``resolve_draft_kv_cache_manager``). Only meaningful on
+        a target manager that carries appended one-model draft layers; a
+        separate draft manager (``is_draft``) never exposes one. Built
+        lazily so the manager's page-table tensors exist.
 
         Retires with the P128 Eagle kernel fixes; see the retirement plan
         on ``draft_manager_tokens_per_block``.

@@ -118,11 +118,11 @@ def test_subdiv_one_degenerates_to_identity():
     assert dst[0, 0, 1, :2].tolist() == [5 * SCALE + 1, 7 * SCALE + 1]
 
 
-def test_manager_property_builds_and_caches_view():
-    # Exercise the property itself (construction + the log statement), not
+def test_manager_accessor_builds_and_caches_view():
+    # Exercise the accessor itself (construction + the log statement), not
     # just direct view construction: a stale field reference in the log
-    # f-string once raised AttributeError here, which the resolver's
-    # defaulted getattr silently swallowed into "no view".
+    # f-string once raised AttributeError here and silently disabled the
+    # view.
     class _FakeSharedManager(_FakeManager):
         is_draft = False
         draft_manager_tokens_per_block = 32
@@ -133,15 +133,15 @@ def test_manager_property_builds_and_caches_view():
             self._draft_subpage_view_obj = None
 
     manager = _FakeSharedManager()
-    prop = MiniMaxM3KVCacheManagerV2.draft_subpage_view
-    view = prop.fget(manager)
+    get_view = MiniMaxM3KVCacheManagerV2.get_draft_subpage_view
+    view = get_view(manager)
     assert isinstance(view, MiniMaxM3DraftSubpageView)
     assert view.tokens_per_block == 32
-    assert prop.fget(manager) is view  # cached on second access
+    assert get_view(manager) is view  # cached on second call
 
     manager_draft = _FakeSharedManager()
     manager_draft.is_draft = True
-    assert prop.fget(manager_draft) is None
+    assert get_view(manager_draft) is None
 
 
 def test_view_rejects_draft_layer_outside_pool_zero():
