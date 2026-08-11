@@ -557,8 +557,12 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             transceiver_runtime="PYTHON",
             max_tokens_in_buffer=512,
         )
-        ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
-        gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
+        ctx_tcs = _create_transceivers(
+            ctx_tp, ctx_mgrs, config, enable_attention_dp=enable_attention_dp
+        )
+        gen_tcs = _create_transceivers(
+            gen_tp, gen_mgrs, config, enable_attention_dp=enable_attention_dp
+        )
         ctx_endpoint = ctx_tcs[0]._context_info_endpoint
 
         sampling_params = SamplingParams()
@@ -643,13 +647,15 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
         # Transfer-size metric must include the fixed-size KDA state — the actual
         # transferred bytes must cover the computed payload size: per rank,
         # num_layers * (conv + ssm) per-rank slot bytes on top of any KV bytes.
-        # The harness transceiver Mapping does not set enable_attention_dp, so
-        # the metric's rank factor is always gen_tp here.
+        # The transceiver's _kv_size_rank_factor is 1 under attention-DP (the
+        # local slot already holds the full replicated state) and gen_tp
+        # otherwise (the request total is the sum of the per-rank shards).
+        rank_factor = 1 if enable_attention_dp else gen_tp
         kda_bytes_per_rank = NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES) // gen_state_tp
         for req in gen_reqs:
-            assert req.py_kv_cache_xfer_bytes >= kda_bytes_per_rank * gen_tp, (
+            assert req.py_kv_cache_xfer_bytes >= kda_bytes_per_rank * rank_factor, (
                 f"kv_cache_xfer_bytes={req.py_kv_cache_xfer_bytes} misses the KDA "
-                f"state payload ({kda_bytes_per_rank} bytes/rank x {gen_tp})"
+                f"state payload ({kda_bytes_per_rank} bytes/rank x {rank_factor})"
             )
 
         # Bitwise comparison of every participating gen rank's shard (the
