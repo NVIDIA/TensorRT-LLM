@@ -8016,17 +8016,18 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             # the disagg fixture is an OpenAI duck with no get_stats, so
             # read the worker's /metrics buffer (populated by
             # enable_iter_perf_stats) after the eval. The measured
-            # workload is the accuracy eval itself, so the floor is
-            # calibrated per eval mode. The inferenceX protocol (chat
-            # template + thinking budget) is the drafter's training
-            # distribution: the MHA head measures 3.44-3.48 there and
-            # broken drafter-KV transfer plateaus at ~3.33, so its floor
-            # sits between the two and catches a transfer regression.
-            # Completion-format default GSM8K measures ~2.97 (the
-            # chat-trained drafter accepts less out of distribution);
-            # there the floor is only a catastrophic-breakage guard
-            # (corrupted or missing drafter KV collapses acceptance
-            # toward 1.x).
+            # workload is the accuracy eval itself and every prompt
+            # format has its own acceptance level (MHA head): the
+            # InferenceMAX protocol (5-shot multiturn chat + format
+            # instruction) measures 3.08, plain chat-formatted prompts
+            # 3.44-3.48, and few-shot completion format 2.97. The
+            # inferencemax floor sits between its healthy 3.08 and a
+            # broken-transfer plateau estimated at ~2.95 (transferring
+            # the 0.11-0.15 healthy-to-broken delta measured on the chat
+            # workload; refine when a broken baseline is measured on
+            # this protocol). The default-eval floor is only a
+            # catastrophic-breakage guard (corrupted or missing drafter
+            # KV collapses acceptance toward 1.x).
             import requests
             info = requests.get(f"{llm.router_url}/cluster_info",
                                 timeout=30).json()
@@ -8042,8 +8043,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations in /metrics"
             rate = accepted / drafted
             length = 1 + accepted / steps
-            min_length, min_rate = ((3.38, 0.76) if inferencemax else
-                                    (2.5, 0.5))
+            min_length, min_rate = ((3.0, 0.65) if inferencemax else (2.5, 0.5))
             print(f"MiniMax-M3 Eagle3 disagg GSM8K acceptance: "
                   f"rate={rate:.3f}, mean acceptance length={length:.3f} "
                   f"({steps} spec iterations)")
