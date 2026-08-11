@@ -14,7 +14,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,7 +27,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DEFAULT_BEAM_INDEX
 from tensorrt_llm.sampling_params import SamplingParams
@@ -83,6 +85,15 @@ class _StatsRequest:
         assert beam_id == DEFAULT_BEAM_INDEX
         return self.tokens
 
+    def get_tokens_view(self, beam_id: int = DEFAULT_BEAM_INDEX) -> np.ndarray:
+        """Mirror LlmRequest.get_tokens_view, which the C++ backend takes on the reuse path.
+
+        The real binding returns a zero-copy contiguous 1-D int32 view of the token buffer;
+        the dtype matters because it selects the C++ int32 ingest fast path.
+        """
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return np.asarray(self.tokens, dtype=np.int32)
+
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
 
@@ -126,7 +137,7 @@ def _create_manager(
             max_gpu_total_bytes=gpu_bytes,
             max_util_for_resume=1.0,
             max_attention_window=max_attention_window,
-            block_reuse_policy=block_reuse_policy,
+            block_reuse_config=BlockReuseConfig(policy=block_reuse_policy),
         ),
         CacheType.SELF,
         num_layers=num_layers,
@@ -277,6 +288,44 @@ def _assert_request_stats(
     assert request.alloc_new_blocks == alloc_new
     assert request.reused_blocks == reused
     assert request.missed_blocks == missed
+
+
+@pytest.mark.parametrize(
+    ("is_active", "resume_succeeds", "expected_result", "expected_calls"),
+    [
+        (True, False, True, []),
+        (False, False, False, ["resume"]),
+        (False, True, True, ["resume", "restore"]),
+    ],
+)
+def test_v2_resume_restores_offsets_only_after_execution_stream_ready(
+    is_active: bool,
+    resume_succeeds: bool,
+    expected_result: bool,
+    expected_calls: list[str],
+) -> None:
+    """V2 restores page tables only after resume joins the execution stream."""
+    manager = object.__new__(KVCacheManagerV2)
+    execution_stream = object()
+    manager._stream = SimpleNamespace(cuda_stream=execution_stream)
+    calls: list[str] = []
+
+    def resume(actual_stream: object) -> bool:
+        assert actual_stream is execution_stream
+        calls.append("resume")
+        return resume_succeeds
+
+    kv_cache = SimpleNamespace(is_active=is_active, resume=resume)
+
+    def restore(request_id: int, actual_cache: object) -> None:
+        assert request_id == 17
+        assert actual_cache is kv_cache
+        calls.append("restore")
+
+    manager._restore_page_index_bufs = restore
+
+    assert manager._resume_and_restore(17, kv_cache) is expected_result
+    assert calls == expected_calls
 
 
 def _run_v1_context(manager: KVCacheManagerV1, request: LlmRequest):

@@ -146,8 +146,11 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
             assert packed_qkv.is_contiguous()
             assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
         if fused_gating:
-            a_raw = torch.randn(N, T, HV, device=device, dtype=dtype) * 0.5
-            b_raw = torch.randn(N, T, HV, device=device, dtype=dtype)
+            packed_ba = torch.randn(N * T, 2 * HV, device=device, dtype=dtype)
+            packed_ba[:, HV:].mul_(0.5)
+            b_raw = packed_ba[:, :HV].view(N, T, HV)
+            a_raw = packed_ba[:, HV:].view(N, T, HV)
+            assert not a_raw.is_contiguous() and not b_raw.is_contiguous()
             # Host reference of the in-kernel gating (fp32, same inputs).
             g = -(A_log_t.exp() * torch.nn.functional.softplus(a_raw.float() + dt_bias_t))
             beta = torch.sigmoid(b_raw.float())
@@ -319,7 +322,8 @@ def _cached_replay_commit_reference(initial_states, old_u, old_k, old_G, work_it
     return reference
 
 
-def test_gdn_cached_replay_all_layer_commit_matches_reference():
+@pytest.mark.parametrize("state_layout", ["contiguous", "affine", "indirect"])
+def test_gdn_cached_replay_all_layer_commit_matches_reference(state_layout):
     """The all-layer commit must match its direct mathematical reference."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -365,9 +369,55 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference():
         work_items,
         n_writes,
     )
-    actual_states = initial_states.clone()
+    state_descriptors = None
+    state_num_layers = None
+    state_layer_stride = None
+    state_slot_stride = None
+    if state_layout == "indirect":
+        state_numel = HV * V * K
+        state_views = []
+        for layer in range(num_layers):
+            backing = torch.empty(
+                num_slots,
+                state_numel + layer + 1,
+                device=device,
+                dtype=dtype,
+            )
+            state = backing[:, :state_numel].view(num_slots, HV, V, K)
+            state.copy_(initial_states[layer])
+            state_views.append(state)
+        state_descriptors = torch.tensor(
+            [(state.data_ptr(), state.stride(0)) for state in state_views],
+            device=device,
+            dtype=torch.int64,
+        )
+        commit_states = state_views[0]
+    elif state_layout == "affine":
+        backing = torch.empty(
+            num_slots,
+            num_layers,
+            HV,
+            V,
+            K,
+            device=device,
+            dtype=dtype,
+        )
+        state_views = [backing[:, layer] for layer in range(num_layers)]
+        for layer, state in enumerate(state_views):
+            state.copy_(initial_states[layer])
+        commit_states = state_views[0]
+        state_num_layers = num_layers
+        state_layer_stride = backing.stride(1)
+        state_slot_stride = backing.stride(0)
+    else:
+        actual_states = initial_states.clone()
+        commit_states = actual_states
     commit_gdn_cached_replay_history_layers(
-        ssm_states=actual_states,
+        ssm_states=commit_states,
+        ssm_state_descriptors=state_descriptors,
+        ssm_state_num_layers=state_num_layers,
+        ssm_state_layer_stride=state_layer_stride,
+        ssm_state_slot_stride=state_slot_stride,
         old_u=old_u,
         old_k=old_k,
         old_G=old_G,
@@ -375,6 +425,8 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference():
         n_writes=n_writes,
         history_size=HIST,
     )
+    if state_layout in ("affine", "indirect"):
+        actual_states = torch.stack(state_views)
 
     torch.testing.assert_close(actual_states.float(), expected_states.float(), rtol=2e-2, atol=2e-2)
 

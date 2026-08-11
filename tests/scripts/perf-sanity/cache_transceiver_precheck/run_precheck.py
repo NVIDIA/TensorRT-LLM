@@ -196,12 +196,11 @@ def load_internal_apis():
     import types
 
     import tensorrt_llm
-    import tensorrt_llm._torch.models  # noqa: F401 - populates the model registry
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
     from tensorrt_llm._torch.distributed import Distributed
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
     from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
@@ -232,7 +231,7 @@ def load_internal_apis():
         KvCacheConfigCpp=trtllm_executor.KvCacheConfig,
         DisaggregatedParams=DisaggregatedParams,
         Distributed=Distributed,
-        MODEL_CLASS_MAPPING=MODEL_CLASS_MAPPING,
+        get_registered_model_class=get_registered_model_class,
         HangDetector=HangDetector,
         KVCacheManager=KVCacheManager,
         KVCacheManagerV2=KVCacheManagerV2,
@@ -314,14 +313,15 @@ def _lookup_model_cls(model_dir):
     hf_view = type("HFConfigView", (), hf_cfg)  # attribute access for the pref hook
     if not archs:
         return None, hf_view
-    return load_internal_apis().MODEL_CLASS_MAPPING.get(archs[0]), hf_view
+    # Resolves the lazily imported provider on demand, like serving does.
+    return load_internal_apis().get_registered_model_class(archs[0]), hf_view
 
 
 def resolve_model_prefs(model_dir, side, cache_cfg):
     """Mirror serving's model-preference resolution (PR #15823 semantics).
 
     - use_kv_cache_manager_v2 == "auto" (yaml absent): adopt the model
-      class's get_model_defaults() value, default False
+      class's get_preferred_kv_cache_manager_version() value, falling back to V1
       (llm_utils._resolve_kv_cache_manager_v2_auto).
     - cache_cfg.transceiver_runtime == "auto": adopt
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
@@ -349,25 +349,17 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto":
-        defaults = {}
-        if model_cls is not None:
-            try:
-                defaults = model_cls.get_model_defaults(None) or {}
-            except Exception as e:  # noqa: BLE001 - model hooks may need llm_args
-                print(
-                    f"[precheck] WARNING: get_model_defaults failed ({e!r}); assuming V1",
-                    flush=True,
-                )
         try:
             # The REAL serving resolver, via the same shim pattern as the
             # runtime resolution below -- one owner for the 'auto' semantics.
             # cache_transceiver_config feeds the resolver's disagg gating
-            # (a V2 model default requires the NIXL Python transceiver).
+            # (a V2 model preference requires the NIXL Python transceiver).
             shim = types.SimpleNamespace(
                 kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto"),
                 cache_transceiver_config=cache_cfg,
+                speculative_config=None,
             )
-            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, defaults))
+            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, model_cls, hf_view))
         except Exception as e:  # noqa: BLE001 - fall back like a missing model
             print(
                 f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); assuming V1", flush=True
@@ -820,7 +812,7 @@ class PrecheckRunner:
         self.kvm = None
         self.xcvr = None
         self.runtime = "CPP"
-        # Resolved in setup(): "auto" needs the model class (get_model_defaults).
+        # Resolved in setup(): "auto" needs the model preference hook.
         self.use_v2 = False
         self.mapping = None
         self.llm_request_state = None

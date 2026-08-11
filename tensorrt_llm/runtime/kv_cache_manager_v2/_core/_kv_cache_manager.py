@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
@@ -37,6 +38,7 @@ from .._common import (
     TokenIdExt,
 )
 from .._config import DataRole, KVCacheManagerConfig
+from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
@@ -196,8 +198,8 @@ class KVCacheManager:
     __slots__ = (
         "_init_config",
         "_life_cycles",
-        "_radix_tree",
         "_storage",
+        "_radix_tree",
         "_living_kv_caches",
         "_avg_reused_length",
         "_avg_sqr_capacity",
@@ -219,8 +221,8 @@ class KVCacheManager:
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
-    _radix_tree: BlockRadixTree
     _storage: StorageManager
+    _radix_tree: BlockRadixTree
     _living_kv_caches: set[rawref.ref[_KVCache]]
     # Eventually we should let the eviction controller evict associated pages together, i.e.
     # when a page eviction makes other pages in the same cache level useless, it should also
@@ -258,9 +260,8 @@ class KVCacheManager:
         config = deepcopy(config)
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         storage_config = create_storage_config(config)
-        self._storage = StorageManager(
+        storage = StorageManager(
             self._life_cycles,
             storage_config,
             config.tokens_per_block,
@@ -271,6 +272,9 @@ class KVCacheManager:
             event_manager=event_manager,
             max_util_for_resume=config.max_util_for_resume,
         )
+        radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
+        self._storage = storage
+        self._radix_tree = radix_tree
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
@@ -292,13 +296,37 @@ class KVCacheManager:
         self._stats_excluded_kv_cache_ids = set()
 
     def __del__(self) -> None:
-        self.shutdown()
+        try:
+            self.shutdown()
+        except LogicError as e:
+            warnings.warn(str(e))
+
+    def _check_no_living_kv_caches(self, api: str) -> None:
+        """Raise unless every KV cache has been closed.
+
+        `api` names the caller so the message points at the mistake rather than at
+        whatever breaks later. Entries are dropped by `_KVCache.close()`, so this counts
+        sequences that are still open, not merely un-collected objects.
+        """
+        if self._living_kv_caches:
+            raise LogicError(
+                f"{api} with {len(self._living_kv_caches)} KV cache(s) still open; "
+                "close them (or drain the engine) first"
+            )
 
     def shutdown(self) -> None:
-        self.clear_reusable_blocks()
-        self._storage.destroy()
+        self._check_no_living_kv_caches("shutdown()")
+        # A failed constructor may leave either owner unset. Release tree pages
+        # before destroying storage whenever the corresponding objects exist.
+        radix_tree = getattr(self, "_radix_tree", None)
+        if radix_tree is not None:
+            radix_tree.clear()
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
+        self._check_no_living_kv_caches("clear_reusable_blocks()")
         self._radix_tree.clear()
 
     def get_mem_pool_base_address(
@@ -389,12 +417,27 @@ class KVCacheManager:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
     ) -> _KVCache:
         """
-        reuse_scope: namespace to match before matching any tokens.
-        custom_priority_callback: takes block index and layer sliding window size, returns priority.
-        If priority returned is higher than existing priority for reused blocks, the block priority is updated.
-        expected_prompt_length: optional prompt length hint used to size SWA scratch slots.
+        Args:
+            reuse_scope: Namespace to match before matching any tokens.
+            input_tokens: Optional initial tokens used for reuse matching.
+            id: Optional cache identifier.
+            custom_priority_callback: Takes a block index and layer sliding-window
+                size and returns a priority. Reused blocks are updated when the
+                returned priority is higher than their existing priority.
+            expected_prompt_length: Optional token count marking the
+                prefill-to-generation boundary. Once history length reaches it,
+                subsequent capacity growth is recorded as generation-phase
+                allocation statistics. Defaults to the length of ``input_tokens``
+                and does not affect allocation, reuse, or correctness.
+            text_only: Optional per-cache override for the manager setting. ``True``
+                enables digest-free fast paths and requires all tokens to be text
+                token IDs; ``False`` permits digest tokens but is invalid when the
+                manager is configured with ``text_only=True``; ``None`` inherits
+                the manager setting.
+
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -417,6 +460,7 @@ class KVCacheManager:
             id,
             custom_priority_callback,
             expected_prompt_length,
+            text_only,
         )
 
     def _match_reuse(
@@ -671,6 +715,11 @@ class KVCacheManager:
         """
         Layers are divided into multiple groups.
         Buffers in the same layer group for the same token block are always allocated/deallocated together.
+
+        NOTE: the iteration order of the layer lists (and of the groups) is NOT part of
+        the API contract and may differ across backends/runs. Do not rely on it for
+        buffer/pool memory order -- query ``pool_group_descs`` (PoolGroupDesc.pools[i]
+        .base_address + coalesced_buffers) for that.
         """
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids
         num_life_cycles = self._life_cycles.size
@@ -933,3 +982,7 @@ class KVCacheManager:
     @property
     def commit_min_snapshot(self) -> bool:
         return self.init_config.commit_min_snapshot
+
+    @property
+    def text_only(self) -> bool:
+        return self.init_config.text_only

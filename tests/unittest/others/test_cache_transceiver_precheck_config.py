@@ -280,7 +280,7 @@ class TestControlWireFormat:
 
 def test_use_kv_cache_manager_v2_flags():
     # Absent -> "auto" (the driver resolves it against the model's
-    # get_model_defaults at runtime, like serving).
+    # get_preferred_kv_cache_manager_version at runtime, like serving).
     plan = pcfg.resolve_plan(_disagg_yaml())
     assert plan["ctx_use_kv_cache_manager_v2"] == "auto"
     assert plan["gen_use_kv_cache_manager_v2"] == "auto"
@@ -372,7 +372,8 @@ def test_precheck_env_kill_switch_truthy(monkeypatch):
     """
     cfg = {"cache_transceiver_precheck": {"enabled": True}}
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
-    assert _enabled_line(cfg).endswith("=1")  # yaml default
+    assert _enabled_line(cfg).endswith("=1")  # yaml opt-in
+    assert _enabled_line({}).endswith("=0")  # off by default (waived)
     for v in ("1", "true", "on", "YES", " True "):
         monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
         assert _enabled_line(cfg).endswith("=1"), v

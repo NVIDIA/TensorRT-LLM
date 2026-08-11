@@ -7,7 +7,7 @@ from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
-                       CacheTransceiverConfig, CalibConfig,
+                       BlockReuseConfig, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DecodeCudaGraphConfig,
                        DeepSeekSparseAttentionConfig,
@@ -19,13 +19,14 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        KVEventsConfig, LlmArgs, LookaheadDecodingConfig,
                        MambaStateConfig, MedusaDecodingConfig,
                        MiniMaxM3SparseAttentionConfig, MoeConfig,
-                       MTPDecodingConfig, NGramDecodingConfig,
+                       MTPDecodingConfig, MultimodalConfig, NGramDecodingConfig,
                        PARDDecodingConfig, PrometheusMetricsConfig,
                        ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
                        SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, UserProvidedDecodingConfig)
+                       TorchLlmArgs, TriAttentionKvCacheCompressionConfig,
+                       UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
@@ -43,6 +44,7 @@ __all__ = [
     'DisaggregatedParams',
     'ConversationParams',
     'DisaggScheduleStyle',
+    'BlockReuseConfig',
     'KvCacheConfig',
     'KVEventsConfig',
     'MambaStateConfig',
@@ -90,7 +92,9 @@ __all__ = [
     'MiniMaxM3SparseAttentionConfig',
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
+    'TriAttentionKvCacheCompressionConfig',
     'PrometheusMetricsConfig',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',
+    'MultimodalConfig',
 ]

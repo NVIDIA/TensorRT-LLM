@@ -45,58 +45,95 @@ from tensorrt_llm.serve.openai_disagg_service import (
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, CompletionRequest, UCompletionRequest,
     UCompletionResponse, ensure_request_chat_template_allowed)
-from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
+from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
+                                             PerfMetricsJsonlWriter,
+                                             PerfMetricsMiddleware,
+                                             combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
-TIMEOUT_KEEP_ALIVE = 10  # seconds.
 _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
 
 class RawRequestResponseHooks(ResponseHooks):
-    def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
+    def __init__(self, raw_req: Request, queue_latency_metric,
+                 collect_perf_metrics: bool):
         self.raw_req = raw_req
+        self.queue_latency_metric = queue_latency_metric
+        self.collect_perf_metrics = collect_perf_metrics
         self.ctx_server = ""
         self.gen_server = ""
+        self.request_id = ""
+        self.disagg_request_id = None
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
         self.ctx_dispatch_time = 0
-        self.perf_metrics_collector = perf_metrics_collector
+        self.ctx_metrics = None
+        self.gen_metrics = None
 
     def on_req_begin(self, request: UCompletionRequest):
-        self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
+        params = request.disaggregated_params
+        if params is not None:
+            self.disagg_request_id = params.disagg_request_id
+            request_id = params.disagg_request_id or params.ctx_request_id
+            self.request_id = str(request_id or "")
+        self.queue_latency_metric.observe(
+            get_steady_clock_now_in_seconds() - self.request_arrival_time)
+
+    def on_disagg_request_id(self, disagg_request_id: int):
+        self.disagg_request_id = disagg_request_id
+        self.request_id = str(disagg_request_id)
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
 
+    def on_perf_metrics(self, server: str, role: str, metrics: dict):
+        if role == "ctx":
+            self.ctx_server = server
+            self.ctx_metrics = metrics
+        elif role == "gen":
+            self.gen_server = server
+            self.gen_metrics = metrics
+
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
 
-    def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+    def on_first_token(
+            self, gen_server: str, request: UCompletionRequest,
+            response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
-    def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
-        if request.disaggregated_params:
-            ctx_req_id = request.disaggregated_params.ctx_request_id
-            task = asyncio.create_task(
-                self.perf_metrics_collector.add_per_request_metrics(
-                    self.ctx_server,
-                    gen_server,
-                    ctx_req_id,
-                    self.raw_req.state.server_arrival_time,
-                    self.server_first_token_time,
-                    self.ctx_dispatch_time,
-                )
-            )
-            background_tasks = self.perf_metrics_collector._background_tasks
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
+    def on_resp_done(
+            self, gen_server: str, request: UCompletionRequest,
+            response: UCompletionResponse = None):
+        self.gen_server = gen_server
+        if not self.collect_perf_metrics:
+            return
+        disagg_phase = {
+            "ctx_server": self.ctx_server,
+            "gen_server": self.gen_server,
+            "timing_metrics": {
+                "arrival_time": self.request_arrival_time,
+                "last_token_time": get_steady_clock_now_in_seconds(),
+                "server_arrival_time": self.request_arrival_time,
+                "ctx_dispatch_time": self.ctx_dispatch_time or None,
+                "server_first_token_time": self.server_first_token_time or None,
+            },
+        }
+        self.raw_req.state.perf_metrics_records.append(
+            combine_disagg_metrics(
+                self.request_id,
+                disagg_phase,
+                self.ctx_metrics,
+                self.gen_metrics,
+                disagg_request_id=self.disagg_request_id,
+            ))
 
 
 class OpenAIDisaggServer:
@@ -118,7 +155,15 @@ class OpenAIDisaggServer:
         # the coordinator at coordinator_url (CoordinatorClient). Otherwise this
         # process owns the routers + cluster state (DisaggCoordinatorService).
         self._coordinator_url = coordinator_url
-        self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
+
+        self._perf_metrics_collector = DisaggPerfMetricsCollector(
+            config.perf_metrics_max_requests)
+        self._expose_perf_metrics = config.return_perf_metrics
+        self._collect_perf_metrics = (
+            config.return_perf_metrics
+            or config.perf_metrics_output_dir is not None)
+        self._perf_metrics_writer = PerfMetricsJsonlWriter(
+            config.perf_metrics_output_dir, "disagg")
 
         self._disagg_cluster_storage = None
         if config.disagg_cluster_config:
@@ -146,8 +191,7 @@ class OpenAIDisaggServer:
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._coordinator, self._create_client,
-            req_timeout_secs=self._req_timeout_secs,
-            perf_metrics_collector=self._perf_metrics_collector)
+            req_timeout_secs=self._req_timeout_secs)
 
         try:
             otlp_cfg = config.otlp_config
@@ -163,17 +207,19 @@ class OpenAIDisaggServer:
         @asynccontextmanager
         async def lifespan(app) -> None:
             # The cluster manager (via setup) owns server preparation + monitoring.
+            await self._perf_metrics_writer.start()
             await self._service.setup()
             yield
             await self._service.teardown()
-            if self._perf_metrics_collector._background_tasks:
-                await asyncio.gather(
-                    *self._perf_metrics_collector._background_tasks,
-                    return_exceptions=True,
-                )
+            await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
 
+        if self._collect_perf_metrics:
+            self.app.add_middleware(
+                PerfMetricsMiddleware,
+                expose_headers=self._expose_perf_metrics,
+                writer=self._perf_metrics_writer)
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
         # Log request-body validation failures so a client/server schema mismatch
@@ -206,8 +252,9 @@ class OpenAIDisaggServer:
             return await self._coordinator.get_disagg_request_id()
         client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
-            disagg_id_generator=disagg_id_generator)
-        self._perf_metrics_collector.add_client(client)
+            disagg_id_generator=disagg_id_generator,
+            request_perf_metrics=self._collect_perf_metrics,
+            internal_disagg_auth_key=self._config.internal_request_auth_key)
         return client
 
     def register_routes(self):
@@ -219,7 +266,6 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/perf_metrics", self._perf_metrics_collector.get_perf_metrics, methods=["GET"])
         # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
         from prometheus_client import (CollectorRegistry, make_asgi_app,
                                        multiprocess)
@@ -273,6 +319,7 @@ class OpenAIDisaggServer:
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
         # CompletionRequest first and 400 every chat body, so override the wrapper's
         # annotation with request_type (as openai_server.py does).
+        @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
             try:
                 self._perf_metrics_collector.total_requests.inc()
@@ -286,13 +333,16 @@ class OpenAIDisaggServer:
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(req, raw_req)
-                hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
+                hooks = RawRequestResponseHooks(
+                    raw_req, self._perf_metrics_collector.queue_latency_seconds,
+                    self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    return StreamingResponse(content=response_or_generator, media_type="text/event-stream")
-                else:
-                    return JSONResponse(content=response_or_generator.model_dump())
+                    return StreamingResponse(
+                        content=response_or_generator,
+                        media_type="text/event-stream")
+                return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
                 self._handle_exception(e)
         return wrapper
@@ -323,11 +373,12 @@ class OpenAIDisaggServer:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
+        keep_alive_timeout = self._config.server_keep_alive_timeout
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=keep_alive_timeout)
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):

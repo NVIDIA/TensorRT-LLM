@@ -152,6 +152,16 @@ class ScheduledRequests:
     """Requests that are in the generation phase."""
     paused_requests: RequestList
     """Requests that are paused."""
+    added_inflight_req_ids: list[int]
+    """Request ids this batch inserted into the executor's inflight set.
+
+    Recorded by ``PyExecutor._add_inflight_ids`` so the paired
+    ``_remove_inflight_ids`` erases exactly what was added. The batch is trimmed
+    between the two calls -- ``ResourceManager.prepare_resources`` shrinks
+    over-budget context chunks at its end, which can move a request out of
+    ``context_requests_last_chunk`` -- so the ids are no longer derivable from
+    the request lists at removal time.
+    """
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -159,6 +169,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.added_inflight_req_ids: list[int] = []
 
     @property
     def is_generation_only(self) -> bool:

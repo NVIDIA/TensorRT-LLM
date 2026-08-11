@@ -632,6 +632,7 @@ def test_deepseek_v2_model_can_be_exported():
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 def test_deepseek_v2_model_registration():
     """Test that DeepSeekV2ForCausalLM is registered with the factory."""
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory

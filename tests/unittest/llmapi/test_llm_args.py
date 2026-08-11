@@ -8,6 +8,7 @@ from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
+from unittest.mock import patch
 
 import pydantic_core
 import pytest
@@ -15,7 +16,6 @@ import torch
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere
 
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi as public_llmapi
@@ -24,13 +24,15 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
-from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
-                                          CalibConfig, ContextChunkingPolicy,
+from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
+                                          CacheTransceiverConfig, CalibConfig,
+                                          ContextChunkingPolicy,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
@@ -68,6 +70,24 @@ from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from .test_llm import llama_model_path
 
 
+@pytest.mark.cpu_only
+def test_generation_config_mode_defaults_and_validation() -> None:
+    assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
+    assert (TorchLlmArgs(model=llama_model_path,
+                         generation_config="auto").generation_config == "auto")
+
+    with pytest.raises(ValidationError, match="generation_config"):
+        TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
+def test_generation_config_auto_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError,
+                       match="AutoDeploy does not support generation_config"):
+        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
+
+
+@pytest.mark.cpu_only
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,
@@ -95,6 +115,7 @@ def test_LookaheadDecodingConfig():
     assert pybind_config.max_verification_set_size == 4
 
 
+@pytest.mark.cpu_only
 def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     config = MTPDecodingConfig()
 
@@ -110,6 +131,7 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     assert "max_draft_len" in explicit_config.model_fields_set
 
 
+@pytest.mark.cpu_only
 def test_rejection_sampling_allows_attention_dp(monkeypatch):
     """ADP (incl. ADP+LM-head-TP) supports rejection sampling.
 
@@ -141,6 +163,7 @@ def test_rejection_sampling_allows_attention_dp(monkeypatch):
     assert args.speculative_config.use_rejection_sampling is True
 
 
+@pytest.mark.cpu_only
 def test_rejection_sampling_still_gated_on_context_parallel():
     """Context parallelism remains an unsupported rejection combination.
 
@@ -157,6 +180,7 @@ def test_rejection_sampling_still_gated_on_context_parallel():
                      speculative_config=spec_cfg)
 
 
+@pytest.mark.cpu_only
 class TestYaml:
 
     def _yaml_to_dict(self, yaml_content: str) -> dict:
@@ -238,6 +262,7 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
 class TestEncoderRuntimeSizes:
     """Cover encoder runtime size fields and fallback to LLM limits.
@@ -295,6 +320,7 @@ class TestEncoderRuntimeSizes:
             llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
 
 
+@pytest.mark.cpu_only
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(
@@ -304,6 +330,7 @@ def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     assert isinstance(spec_cfg, Eagle3DecodingConfig)
 
 
+@pytest.mark.cpu_only
 def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
     warnings_seen: list[str] = []
 
@@ -323,6 +350,7 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
         for m in warnings_seen)
 
 
+@pytest.mark.cpu_only
 def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
     (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
     spec_cfg = DSparkDecodingConfig(max_draft_len=5,
@@ -337,6 +365,7 @@ def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
     assert args.speculative_config.block_size == 5
 
 
+@pytest.mark.cpu_only
 def test_dspark_block_size_must_match_max_draft_len(tmp_path):
     (tmp_path / "config.json").write_text('{"dspark_block_size": 4}')
     spec_cfg = DSparkDecodingConfig(max_draft_len=5,
@@ -350,6 +379,7 @@ def test_dspark_block_size_must_match_max_draft_len(tmp_path):
         )
 
 
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
     # When the user leaves target_layer_ids unset, the checkpoint's ordered
     # dspark_target_layer_ids must be adopted verbatim.
@@ -368,6 +398,7 @@ def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
     assert args.speculative_config.target_layer_ids == [3, 1, 2]
 
 
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_matching_override_accepted(tmp_path):
     # An explicit override that matches the checkpoint list exactly is fine.
     (tmp_path / "config.json").write_text(
@@ -385,6 +416,7 @@ def test_dspark_target_layer_ids_matching_override_accepted(tmp_path):
     assert args.speculative_config.target_layer_ids == [1, 2, 3]
 
 
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_mismatched_count_rejected(tmp_path):
     # A different number of layers would mismatch main_proj.in_features.
     (tmp_path / "config.json").write_text(
@@ -401,6 +433,7 @@ def test_dspark_target_layer_ids_mismatched_count_rejected(tmp_path):
         )
 
 
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_same_count_different_layers_rejected(tmp_path):
     # Same count but different layers: shapes line up, but the draft would see
     # hidden states it was not trained on, so this must be rejected too.
@@ -418,6 +451,7 @@ def test_dspark_target_layer_ids_same_count_different_layers_rejected(tmp_path):
         )
 
 
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
     # Same set but different order: projection columns are order-dependent, so a
     # reordered override must be rejected rather than silently accepted.
@@ -435,6 +469,7 @@ def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
         )
 
 
+@pytest.mark.cpu_only
 def test_dspark_requires_speculative_model():
     # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
     # unset speculative_model must fail fast at config validation instead of
@@ -450,6 +485,7 @@ def test_dspark_requires_speculative_model():
         )
 
 
+@pytest.mark.cpu_only
 def test_dspark_requires_positive_max_draft_len(tmp_path):
     (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
     spec_cfg = DSparkDecodingConfig(speculative_model=str(tmp_path))
@@ -462,6 +498,7 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
         )
 
 
+@pytest.mark.cpu_only
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     """post_processor_hook + skip_tokenizer_init must fail fast.
 
@@ -476,6 +513,7 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
 
 
+@pytest.mark.cpu_only
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
@@ -484,84 +522,6 @@ class TestModelDefaults:
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
-
-    @pytest.mark.parametrize("explicit_auto", [False, True])
-    def test_kv_cache_manager_v2_auto_uses_model_default(self, explicit_auto):
-        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
-                           if explicit_auto else KvCacheConfig())
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
-                                kv_cache_config=kv_cache_config)
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
-
-    def test_kv_cache_manager_v2_auto_falls_back_to_false(self):
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
-
-        _resolve_kv_cache_manager_v2_auto(llm_args, {})
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
-
-    @pytest.mark.parametrize(
-        ("backend", "runtime"),
-        [
-            ("NIXL", "CPP"),
-            ("UCX", None),
-            ("MPI", None),
-        ],
-    )
-    def test_kv_cache_manager_v2_auto_falls_back_for_incompatible_disagg(
-            self, backend, runtime):
-        llm_args = TorchLlmArgs(
-            model="/tmp/dummy_model",
-            cache_transceiver_config=CacheTransceiverConfig(
-                backend=backend, transceiver_runtime=runtime),
-        )
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
-
-    def test_kv_cache_manager_v2_auto_keeps_python_nixl_model_default(self):
-        llm_args = TorchLlmArgs(
-            model="/tmp/dummy_model",
-            cache_transceiver_config=CacheTransceiverConfig(
-                backend="NIXL", transceiver_runtime="PYTHON"),
-        )
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args,
-                                          model_defaults,
-                                          original_setting="auto")
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
-
-    @pytest.mark.parametrize("user_setting", [False, True])
-    def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
-            self, user_setting):
-        llm_args = TorchLlmArgs(
-            model="/tmp/dummy_model",
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
-        model_defaults = {
-            "kv_cache_config": {
-                "use_kv_cache_manager_v2": not user_setting
-            }
-        }
-
-        apply_model_defaults_to_llm_args(llm_args, model_defaults)
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
-
-        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -660,11 +620,117 @@ class TestModelDefaults:
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
 
+@pytest.mark.cpu_only
+class TestKvCacheManagerV2AutoResolution:
+    """Test model preferences for the KV cache manager version."""
+
+    class _PreferV2:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V2"
+
+    class _PreferV1:
+
+        @classmethod
+        def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+            return "V1"
+
+    @pytest.mark.parametrize("explicit_auto", [False, True])
+    def test_auto_uses_model_preference(self, explicit_auto):
+        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
+                           if explicit_auto else KvCacheConfig())
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                kv_cache_config=kv_cache_config)
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_auto_without_preference_falls_back_to_v1(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        _resolve_kv_cache_manager_v2_auto(llm_args)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    @pytest.mark.parametrize(
+        ("backend", "runtime"),
+        [
+            ("NIXL", "CPP"),
+            ("UCX", None),
+            ("MPI", None),
+        ],
+    )
+    def test_auto_v2_falls_back_for_incompatible_disagg(self, backend, runtime):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime=runtime),
+        )
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    def test_auto_v2_keeps_python_nixl_preference(self):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"),
+        )
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    @pytest.mark.parametrize(("user_setting", "model_cls"), [
+        pytest.param(False, _PreferV2, id="explicit-v1"),
+        pytest.param(True, _PreferV1, id="explicit-v2"),
+    ])
+    def test_explicit_value_overrides_model_preference(self, user_setting,
+                                                       model_cls):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
+
+    def test_registered_models_prefer_v2(self):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "GptOssForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "MiniMaxM2ForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None
+            assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_declaration():
     assert KvCacheConfig().mamba_state_cache_interval is None
     assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
-    assert KvCacheConfig().block_reuse_policy == "all_reusable"
+    assert KvCacheConfig().block_reuse_config == BlockReuseConfig()
     assert KvCacheConfig().enable_swa_scratch_reuse is False
     assert KvCacheConfig().use_kv_cache_manager_v2 == "auto"
     assert KvCacheConfig(
@@ -697,7 +763,8 @@ def test_KvCacheConfig_declaration():
                            ),
                            pool_ratio=[0.25, 0.75],
                            avg_seq_len=2048,
-                           block_reuse_policy="per_request",
+                           block_reuse_config=BlockReuseConfig(
+                               policy="per_request", max_num_turns=2),
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -716,7 +783,8 @@ def test_KvCacheConfig_declaration():
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
     assert config.pool_ratio == [0.25, 0.75]
     assert config.avg_seq_len == 2048
-    assert config.block_reuse_policy == "per_request"
+    assert config.block_reuse_config.policy == "per_request"
+    assert config.block_reuse_config.max_num_turns == 2
     assert config.mamba_state_config.periodic_snapshot_interval == 0
     assert config.mamba_state_config.additional_snapshot_offsets_from_start == [
         128
@@ -726,7 +794,7 @@ def test_KvCacheConfig_declaration():
     ]
     assert not hasattr(pybind_config, "pool_ratio")
     assert not hasattr(pybind_config, "avg_seq_len")
-    assert not hasattr(pybind_config, "block_reuse_policy")
+    assert not hasattr(pybind_config, "block_reuse_config")
     assert not hasattr(pybind_config, "enable_swa_scratch_reuse")
     assert KvCacheConfig(
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
@@ -739,12 +807,24 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
-    assert (KvCacheConfig(block_reuse_policy="per_conversation").
-            block_reuse_policy == "per_conversation")
+    assert BlockReuseConfig(
+        policy="per_conversation").policy == "per_conversation"
     with pytest.raises(ValidationError):
-        KvCacheConfig(block_reuse_policy="invalid")
+        BlockReuseConfig(policy="invalid")
+    with pytest.raises(ValidationError):
+        BlockReuseConfig(max_num_turns=0)
 
 
+@pytest.mark.cpu_only
+def test_BlockReuseConfig_reports_renamed_policy_field():
+    with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
+        KvCacheConfig.model_validate(
+            {"block_reuse_config": {
+                "block_reuse_policy": "per_request"
+            }})
+
+
+@pytest.mark.cpu_only
 def test_MambaStateConfig_defaults_use_independent_lists():
     first = MambaStateConfig()
     second = MambaStateConfig()
@@ -758,11 +838,13 @@ def test_MambaStateConfig_defaults_use_independent_lists():
     assert public_llmapi.MambaStateConfig is MambaStateConfig
 
 
+@pytest.mark.cpu_only
 def test_MambaStateConfig_rejects_unknown_fields():
     with pytest.raises(ValidationError, match="extra_forbidden"):
         MambaStateConfig(unknown_snapshot_policy=1)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -778,6 +860,7 @@ def test_MambaStateConfig_rejects_invalid_snapshot_offsets(field, value):
         MambaStateConfig(**{field: value})
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("field", "offsets"),
     [
@@ -802,6 +885,7 @@ def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
     assert getattr(config.mamba_state_config, field) == offsets
 
 
+@pytest.mark.cpu_only
 def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     warnings_seen = []
     monkeypatch.setattr(llm_args_mod.logger, "warning",
@@ -816,6 +900,7 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     assert "mamba_state_cache_interval" not in config.model_dump()
 
 
+@pytest.mark.cpu_only
 def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
         monkeypatch):
     warnings_seen = []
@@ -823,7 +908,7 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
                         lambda message: warnings_seen.append(message))
 
     config = KvCacheConfig(
-        block_reuse_policy="per_conversation",
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=64,
             additional_snapshot_offsets_from_end=[0],
@@ -834,14 +919,16 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
     assert config.mamba_state_config.additional_snapshot_offsets_from_end == [0]
     assert len(warnings_seen) == 1
     assert "periodic_snapshot_interval=64" in warnings_seen[0]
-    assert "block_reuse_policy=per_conversation" in warnings_seen[0]
+    assert ("block_reuse_config.policy=per_conversation" in warnings_seen[0])
     assert "setting it to 0" in warnings_seen[0]
 
     warnings_seen.clear()
-    KvCacheConfig(block_reuse_policy="per_conversation")
+    KvCacheConfig(block_reuse_config=BlockReuseConfig(
+        policy="per_conversation"))
     assert warnings_seen == []
 
 
+@pytest.mark.cpu_only
 def test_update_llm_args_with_empty_options_file(tmp_path):
     yaml_path = tmp_path / "empty.yaml"
     yaml_path.write_text("", encoding="utf-8")
@@ -851,6 +938,7 @@ def test_update_llm_args_with_empty_options_file(tmp_path):
                                               str(yaml_path)) == llm_args
 
 
+@pytest.mark.cpu_only
 def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input(
 ):
     yaml_dict = {
@@ -873,6 +961,7 @@ def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input
     assert yaml_dict["kv_cache_config"]["mamba_state_cache_interval"] == 64
 
 
+@pytest.mark.cpu_only
 def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
     with pytest.raises(ValueError, match="Cannot set both"):
         update_llm_args_with_extra_dict(
@@ -888,6 +977,7 @@ def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
         )
 
 
+@pytest.mark.cpu_only
 def test_KvCacheConfig_disk_cache_validation(tmp_path):
     config = KvCacheConfig(disk_cache_size=2048, disk_cache_path=str(tmp_path))
 
@@ -899,6 +989,7 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
     assert "disk_cache_path" in str(exc_info.value)
 
 
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_minimal_required_fields(self):
@@ -941,6 +1032,7 @@ class TestMultimodalEncoderCudaGraphConfig:
             MultimodalEncoderCudaGraphConfig(buckets=[(1, 2)])
 
 
+@pytest.mark.cpu_only
 class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
@@ -981,10 +1073,9 @@ class TestMultimodalConfig:
     def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
         args = TorchLlmArgs(model=llama_model_path,
                             multimodal_config=MultimodalConfig(
-                                encoder_side_stream_max_ahead=2,
-                                encoder_cache_max_bytes=0,
-                            ))
+                                encoder_side_stream_max_ahead=2, ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -1045,12 +1136,14 @@ class TestMultimodalConfig:
                 },
             )
 
-    def test_encoder_cache_and_side_stream_max_ahead_are_exclusive(self):
-        with pytest.raises(ValidationError, match="mutually exclusive"):
-            MultimodalConfig(
-                encoder_cache_max_bytes="1MiB",
-                encoder_side_stream_max_ahead=1,
-            )
+    def test_encoder_cache_and_side_stream_max_ahead_can_be_combined(self):
+        config = MultimodalConfig(
+            encoder_cache_max_bytes="1MiB",
+            encoder_side_stream_max_ahead=1,
+        )
+
+        assert config.encoder_cache_max_bytes == 1024**2
+        assert config.encoder_side_stream_max_ahead == 1
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -1067,23 +1160,27 @@ class TestMultimodalConfig:
         "avg_seq_len": 0
     },
 ])
+@pytest.mark.cpu_only
 def test_KvCacheConfig_pool_ratio_avg_seq_len_validation(kwargs):
     with pytest.raises(ValidationError):
         KvCacheConfig(**kwargs)
 
 
+@pytest.mark.cpu_only
 def test_CapacitySchedulerPolicy():
     val = CapacitySchedulerPolicy.MAX_UTILIZATION
     assert PybindMirror.maybe_to_pybind(
         val) == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
 
 
+@pytest.mark.cpu_only
 def test_ContextChunkingPolicy():
     val = ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.maybe_to_pybind(
         val) == tle.ContextChunkingPolicy.EQUAL_PROGRESS
 
 
+@pytest.mark.cpu_only
 def test_SleepConfig_restore_modes_normalized_from_dict():
     sleep_config = SleepConfig(
         restore_modes={
@@ -1099,6 +1196,7 @@ def test_SleepConfig_restore_modes_normalized_from_dict():
                       RestoreMode)
 
 
+@pytest.mark.cpu_only
 def test_SleepConfig_restore_modes_normalized_from_defaultdict():
     sleep_config = SleepConfig(restore_modes=defaultdict(
         lambda: RestoreMode.CPU, {
@@ -1114,7 +1212,7 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
 
 
-@force_ampere
+@pytest.mark.cpu_only
 def test_SleepConfig_is_picklable():
     """SleepConfig with default construction must survive a pickle round-trip.
 
@@ -1130,7 +1228,7 @@ def test_SleepConfig_is_picklable():
     assert rt.restore_modes == cfg_default.restore_modes
 
 
-@force_ampere
+@pytest.mark.cpu_only
 def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
     """SleepConfig with explicit per-key overrides must survive a pickle round-trip."""
     import pickle
@@ -1147,7 +1245,7 @@ def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
 
 
-@force_ampere
+@pytest.mark.cpu_only
 def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
     """The defaultdict default_factory must remain functional after pickle.
 
@@ -1166,6 +1264,7 @@ def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
         missing_key]
 
 
+@pytest.mark.cpu_only
 def test_DynamicBatchConfig_declaration():
     config = DynamicBatchConfig(enable_batch_size_tuning=True,
                                 enable_max_num_tokens_tuning=True,
@@ -1178,12 +1277,12 @@ def test_DynamicBatchConfig_declaration():
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
+@pytest.mark.cpu_only
 def test_SchedulerConfig_declaration() -> None:
     default_config = SchedulerConfig()
     default_pybind_config = PybindMirror.maybe_to_pybind(default_config)
     assert default_config.enable_prefix_aware_scheduling is True
     assert default_pybind_config.enable_prefix_aware_scheduling is True
-
     config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
@@ -1201,6 +1300,7 @@ def test_SchedulerConfig_declaration() -> None:
     assert pybind_config.enable_prefix_aware_scheduling is False
 
 
+@pytest.mark.cpu_only
 def test_PeftCacheConfig_declaration():
     config = PeftCacheConfig(num_host_module_layer=1,
                              num_device_module_layer=1,
@@ -1230,6 +1330,7 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.lora_prefetch_dir == "."
 
 
+@pytest.mark.cpu_only
 def test_PeftCacheConfig_from_pybind():
     pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
                                         num_device_module_layer=1,
@@ -1259,6 +1360,7 @@ def test_PeftCacheConfig_from_pybind():
     assert config.lora_prefetch_dir == "."
 
 
+@pytest.mark.cpu_only
 def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
 ):
     pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
@@ -1291,6 +1393,7 @@ def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
     assert config.lora_prefetch_dir == "."
 
 
+@pytest.mark.cpu_only
 class TestTelemetryConfigPrecedence:
     """Telemetry-config precedence in the merge helper.
 
@@ -1422,6 +1525,7 @@ class TestTelemetryConfigPrecedence:
         assert tc.disabled is False
 
 
+@pytest.mark.cpu_only
 class TestExplicitCliKeysPrecedence:
     """`explicit_cli_keys` makes the CLI side win over YAML on conflicts."""
 
@@ -1534,6 +1638,7 @@ class TestExplicitCliKeysPrecedence:
         assert merged["kv_cache_config"].enable_block_reuse is False
 
 
+@pytest.mark.cpu_only
 class TestEvalTranslationMap:
     """eval's _CLICK_TO_LLM_ARG via the shared helper."""
 
@@ -1578,6 +1683,7 @@ class TestEvalTranslationMap:
         assert self._collect({"extra_llm_api_options", "config"}) == set()
 
 
+@pytest.mark.cpu_only
 class TestBenchTranslationMap:
     """`collect_explicit_cli_keys` in bench.benchmark rewrites Click param names."""
 
@@ -1629,6 +1735,7 @@ class TestBenchTranslationMap:
         assert self._collect({"extra_llm_api_options", "config"}) == set()
 
 
+@pytest.mark.cpu_only
 class TestDisaggLauncherKwargsPreservation:
     """Regression tests for `_build_llm_args_from_disagg_server_cfg`.
 
@@ -1680,6 +1787,7 @@ class TestDisaggLauncherKwargsPreservation:
         assert final.get("tensor_parallel_size") == 1
 
 
+@pytest.mark.cpu_only
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
@@ -1745,6 +1853,73 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.seq_lens == [8, 32]
         assert args.cuda_graph_config.max_seq_len == 32
 
+    def test_encoder_decoder_cuda_graph_user_interface(self):
+        encoder_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[16, 64],
+            seq_lens=[8, 32],
+            enable_padding=True,
+        )
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            cuda_graph_config=DecodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
+            ),
+            encoder_cuda_graph_config=encoder_config,
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert isinstance(args.encoder_cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.encoder_cuda_graph_config.batch_sizes == [1, 4]
+        assert args.enable_encoder_decoder_mixed_cuda_graph
+
+        disabled_args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=encoder_config,
+            enable_encoder_decoder_mixed_cuda_graph=False,
+        )
+
+        assert not disabled_args.enable_encoder_decoder_mixed_cuda_graph
+
+    def test_encoder_cuda_graph_config_validation(self):
+        invalid_cases = [
+            (
+                {
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        num_tokens=[16, 64],
+                        seq_lens=[8, 32],
+                        enable_padding=True,
+                    ),
+                },
+                "encoder_cuda_graph_config requires encoder_max_batch_size",
+            ),
+            (
+                {
+                    "encoder_max_batch_size":
+                    4,
+                    "encoder_cuda_graph_config":
+                    EncodeCudaGraphConfig(
+                        batch_sizes=[1, 4],
+                        enable_padding=True,
+                    ),
+                },
+                ("encoder_cuda_graph_config requires "
+                 "num_tokens/max_num_token and seq_lens/max_seq_len"),
+            ),
+        ]
+
+        for kwargs, error_match in invalid_cases:
+            with pytest.raises(ValidationError, match=error_match):
+                TorchLlmArgs(
+                    model=llama_model_path,
+                    **kwargs,
+                )
+
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(
             model=llama_model_path,
@@ -1782,6 +1957,7 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert max_batch_size in batch_sizes
 
 
+@pytest.mark.cpu_only
 class TestPiecewiseCudaGraphCaptureDefaults:
     """Piecewise CUDA graph capture-set defaults and reachable-ceiling filter.
 
@@ -2068,6 +2244,7 @@ class TestTorchLlmArgs:
             assert max_seq_len == 128
             assert max_batch_size == 8
 
+    @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
@@ -2076,6 +2253,7 @@ class TestTorchLlmArgs:
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
 
+    @pytest.mark.cpu_only
     def test_speculative_model_alias(self):
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
@@ -2087,6 +2265,7 @@ class TestTorchLlmArgs:
                             speculative_config=spec_config)
         assert args.speculative_model == "/path/to/model"
 
+    @pytest.mark.cpu_only
     @print_traceback_on_error
     def test_model_kwargs_with_num_hidden_layers(self):
         config_no_kwargs = ModelConfig.from_pretrained(
@@ -2098,6 +2277,7 @@ class TestTorchLlmArgs:
         assert config_with_kwargs.num_hidden_layers == 2
 
 
+@pytest.mark.cpu_only
 class TestStrictBaseModelArbitraryArgs:
     """Test that StrictBaseModel prevents arbitrary arguments from being accepted."""
 
@@ -2352,7 +2532,13 @@ class TestStrictBaseModelArbitraryArgs:
         assert "extra_field" in str(exc_info.value)
 
 
+@pytest.mark.cpu_only
 class TestServeDefaults:
+
+    @pytest.fixture(autouse=True)
+    def _patch_device_count(self):
+        with patch("tensorrt_llm.commands.serve.device_count", return_value=1):
+            yield
 
     def test_serve_get_llm_args_preserves_model_defaults(self):
         # No explicit CLI flags: only required params and serve-side defaults
@@ -2361,6 +2547,7 @@ class TestServeDefaults:
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
+            gpus_per_node=1,
         )
 
         assert "model" in llm_args
@@ -2376,6 +2563,7 @@ class TestServeDefaults:
         llm_args_with_values, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
+            gpus_per_node=1,
             max_batch_size=128,
             tensor_parallel_size=4,
             explicit_cli_keys={"max_batch_size", "tensor_parallel_size"},
@@ -2385,7 +2573,9 @@ class TestServeDefaults:
 
     def test_serve_filters_default_values(self):
         # All defaults, no explicit CLI flags.
-        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+        llm_args, _ = get_llm_args(model=llama_model_path,
+                                   backend="pytorch",
+                                   gpus_per_node=1)
 
         assert "model" in llm_args
         assert "backend" in llm_args
@@ -2398,6 +2588,7 @@ class TestServeDefaults:
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
+            gpus_per_node=1,
             max_batch_size=128,
             tensor_parallel_size=4,
             explicit_cli_keys={"max_batch_size", "tensor_parallel_size"},
@@ -2421,7 +2612,8 @@ class TestServeDefaults:
         # PyTorch backend: build_config / scheduler_config stay None and are
         # filtered out.
         llm_args_pytorch, _ = get_llm_args(model=llama_model_path,
-                                           backend="pytorch")
+                                           backend="pytorch",
+                                           gpus_per_node=1)
         assert "build_config" not in llm_args_pytorch
         assert "scheduler_config" not in llm_args_pytorch
 
@@ -2430,6 +2622,7 @@ class TestServeDefaults:
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
+            gpus_per_node=1,
             tensor_parallel_size=1,
             explicit_cli_keys={"tensor_parallel_size"},
         )
@@ -2441,6 +2634,50 @@ class TestServeDefaults:
             explicit_cli_keys={"tensor_parallel_size"},
         )
         assert merged["tensor_parallel_size"] == 1
+
+    def test_serve_generation_config_cli_over_yaml_precedence(self,
+                                                              tmp_path) -> None:
+        """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
+        from unittest import mock
+
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("generation_config: auto\n", encoding="utf-8")
+
+        with (
+                mock.patch(
+                    "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                    return_value=False),
+                mock.patch("tensorrt_llm.commands.serve.device_count",
+                           return_value=1),
+                mock.patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=["dummy/model", "--config",
+                      str(config_path)],
+                standalone_mode=False,
+            )
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
+            mock_launch_server.reset_mock()
+            config_path.write_text("generation_config: trtllm\n",
+                                   encoding="utf-8")
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--config",
+                    str(config_path),
+                    "--generation-config",
+                    "auto",
+                ],
+                standalone_mode=False,
+            )
+
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
@@ -2604,6 +2841,7 @@ class TestPyTorchBackendModelDefaults:
             assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
 
 
+@pytest.mark.cpu_only
 def test_executor_config_consistency():
     """Verify that BaseLlmArgs exposes all ExecutorConfig options."""
     # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
@@ -2685,6 +2923,7 @@ def _get_qualified_name(cls: type) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+@pytest.mark.cpu_only
 class TestPydanticBestPractices:
     """Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
     """
@@ -2946,6 +3185,37 @@ class TestPydanticBestPractices:
             )
 
 
+@pytest.mark.cpu_only
+def test_kv_cache_compression_config_dispatches_by_algorithm():
+    from tensorrt_llm.llmapi.llm_args import \
+        TriAttentionKvCacheCompressionConfig
+
+    config_dict = yaml.safe_load("""
+kv_cache_compression_config:
+  algorithm: triattention
+  budget: 32
+  beta: 17
+  eviction_mode: per_head
+  normalize_scores: false
+  model_path: /tmp/model
+  calibration_path: /tmp/calibration.pt
+""")
+
+    config = TorchLlmArgs(model="/tmp/dummy_model",
+                          **config_dict).kv_cache_compression_config
+
+    assert isinstance(config, TriAttentionKvCacheCompressionConfig)
+    assert config.budget == 32
+    assert config.beta == 17
+    assert config.eviction_mode == "per_head"
+    assert config.normalize_scores is False
+    assert config.changes_physical_kv_length
+    assert config.supports_block_reuse()
+    assert not config.supports_speculative_decoding()
+    assert "changes_physical_kv_length" not in config.model_dump()
+
+
+@pytest.mark.cpu_only
 class TestSkipSoftmaxAttentionConfig:
     """Test LLM Skip Softmax Attention config behavior."""
 
@@ -2984,7 +3254,7 @@ class TestSkipSoftmaxAttentionConfig:
     @staticmethod
     def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
         sparse_params = config.to_sparse_params(**kwargs)
-        return sparse_params.scheduler.get_kernel_params()
+        return sparse_params.scheduler.get_runtime_params()
 
     def test_python_api_parses_skip_softmax_config(self):
         args = TorchLlmArgs(
@@ -3264,6 +3534,7 @@ sparse_attention_config:
             100.0 * math.exp(5.0 * 0.5))
 
 
+@pytest.mark.cpu_only
 class TestDeepSeekV4SparseAttentionConfig:
 
     def test_zero_compress_ratios_are_normalized(self):
@@ -3329,11 +3600,15 @@ class TestEnableLowLatencyHostDispatch:
 
 
 class _PreferPythonTransceiverModel:
-    """Fake model class opting into the Python transceiver."""
+    """Fake model class preferring Python transceiver and KV manager V2."""
 
     @classmethod
     def get_model_defaults(cls, llm_args):
         return {}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None):
@@ -3420,7 +3695,8 @@ class TestMambaSnapshotConfigResolution:
             ),
             (
                 KvCacheConfig(
-                    block_reuse_policy="per_conversation",
+                    block_reuse_config=BlockReuseConfig(
+                        policy="per_conversation"),
                     mamba_state_config=MambaStateConfig(
                         periodic_snapshot_interval=64),
                     use_kv_cache_manager_v2=True,
@@ -3450,6 +3726,11 @@ class TestMambaSnapshotConfigResolution:
             assert "no Mamba state snapshot policy" in warnings[0]
 
     def test_hybrid_fixed_snapshot_rejects_auto_resolved_v1(self, monkeypatch):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+
+        monkeypatch.setitem(MODEL_CLASS_MAPPING, "Qwen3NextForCausalLM",
+                            _NoModelDefaults)
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(
@@ -3503,6 +3784,14 @@ class TestTransceiverRuntimeAutoResolution:
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
+    @pytest.mark.parametrize("model_cls", [Gemma3ForCausalLM, LlamaForCausalLM])
+    def test_llama_and_gemma_model_preferences_adopted(self, model_cls):
+        """Llama and Gemma adopt Python when the runtime is left at auto."""
+        args = self._disagg_args()
+        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+        _resolve_transceiver_runtime_auto(args, model_cls)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
     @pytest.mark.parametrize("explicit_runtime", ["CPP", "PYTHON", None])
     def test_explicit_value_not_overridden_by_model_preference(
             self, explicit_runtime):
@@ -3549,13 +3838,9 @@ class TestTransceiverRuntimeAutoResolution:
             monkeypatch.delenv(env_var, raising=False)
         monkeypatch.setenv(backend_env, "1")
         args = self._disagg_args(backend="DEFAULT")
-        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
-        apply_model_defaults_to_llm_args(args, model_defaults)
 
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
-        _resolve_kv_cache_manager_v2_auto(args,
-                                          model_defaults,
-                                          original_setting="auto")
+        _resolve_kv_cache_manager_v2_auto(args, _PreferPythonTransceiverModel)
 
         assert args.cache_transceiver_config.transceiver_runtime is None
         assert args.kv_cache_config.use_kv_cache_manager_v2 is False
@@ -3636,6 +3921,7 @@ class TestTransceiverRuntimeAutoResolution:
         ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", args,
                                                    None)
         assert args.cache_transceiver_config.transceiver_runtime is None
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is False
 
     @staticmethod
     def _fake_checkpoint_loader(architectures):
@@ -3660,6 +3946,7 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     @pytest.mark.parametrize("arch,expected", [
         ("ModelAForCausalLM", "PYTHON"),
@@ -3719,6 +4006,7 @@ class TestTransceiverRuntimeAutoResolution:
         model_loader_mod.ModelLoader.load_config_and_apply_defaults(
             "/tmp/dummy_model", args, fake_loader)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     def test_model_loader_full_chain_aggregated_stays_none(self, monkeypatch):
         """Full chain in aggregated mode: no transceiver config appears."""
@@ -3760,12 +4048,13 @@ class TestTransceiverRuntimeAutoResolution:
             backend="UCX")._resolve_default_backend() == ("UCX", None)
 
 
-class TestGlm5TransceiverPreference:
-    """GLM-5 defaults to the Python KV-cache transceiver in disagg.
+class TestDeepseekRuntimePreferences:
+    """DeepSeek KV-cache manager and transceiver preferences.
 
-    DeepseekV3ForCausalLM is shared by DeepSeek-V3/V3.2 and GLM-5
-    (GlmMoeDsaForCausalLM); the preference must apply to GLM checkpoints
-    only.
+    DeepseekV3ForCausalLM and DeepseekV32ForCausalLM prefer the Python KV-cache
+    transceiver, while GlmMoeDsaForCausalLM (GLM 5.2) requires the C++ transceiver
+    because its per-layer masked DSA indexer k-cache pool is not supported by the
+    Python (v2) transceiver.
     """
 
     @staticmethod
@@ -3775,43 +4064,35 @@ class TestGlm5TransceiverPreference:
         cfg.model_type = model_type
         return cfg
 
-    @pytest.mark.parametrize(
-        "architectures,model_type,expected",
-        [
-            (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "PYTHON"),
-            (["DeepseekV3ForCausalLM"], "deepseek_v3", None),
-            (["DeepseekV32ForCausalLM"], "deepseek_v32", None),
-            # Each predicate in isolation: the architecture match and the
-            # model_type fallback must each suffice on their own.
-            (["GlmMoeDsaForCausalLM"], "deepseek_v32", "PYTHON"),
-            (["DeepseekV32ForCausalLM"], "glm_moe_dsa", "PYTHON"),
-        ])
-    def test_preference_per_architecture(self, architectures, model_type,
-                                         expected):
+    @pytest.mark.parametrize("architectures,model_type,expected", [
+        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "CPP"),
+        (["DeepseekV3ForCausalLM"], "deepseek_v3", "PYTHON"),
+        (["DeepseekV32ForCausalLM"], "deepseek_v32", "PYTHON"),
+    ])
+    def test_preference_per_architecture(self, architectures: list[str],
+                                         model_type: str,
+                                         expected: str) -> None:
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
         cfg = self._pretrained_config(architectures, model_type)
         assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
             cfg) == expected
 
-    def test_no_config_defers_to_cpp(self):
-        """Without a pretrained config the class defers to the C++ default."""
+    def test_prefers_python_without_config(self) -> None:
+        """Preference is unconditional without a pretrained config."""
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
-        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime() is None
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
+        ) == "PYTHON"
 
-    def test_glm5_resolves_auto_to_python_on_nixl(self):
-        """GLM-5 on NIXL adopts the Python transceiver from 'auto'.
-
-        End-to-end through _resolve_transceiver_runtime_auto with the real
-        model class and a GLM pretrained config.
-        """
+    def test_deepseek_resolves_auto_to_python_on_nixl(self) -> None:
+        """DeepseekV3ForCausalLM on NIXL adopts the Python transceiver from 'auto'."""
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
             DeepseekV3ForCausalLM
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
         )
-        cfg = self._pretrained_config(["GlmMoeDsaForCausalLM"], "glm_moe_dsa")
+        cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"

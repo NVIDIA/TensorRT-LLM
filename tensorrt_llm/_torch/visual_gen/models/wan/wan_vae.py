@@ -100,6 +100,18 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
     return x.to(device)
 
 
+def _decode_chunk_slices(num_frames: int, chunk_size: int) -> list[slice]:
+    """Keep the cache-initializing first frame separate, then batch later frames."""
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if num_frames < 1:
+        return []
+    return [slice(0, 1)] + [
+        slice(start, min(start + chunk_size, num_frames))
+        for start in range(1, num_frames, chunk_size)
+    ]
+
+
 def _causal_conv_with_cache(
     conv: "WanCausalConv3d",
     x: torch.Tensor,
@@ -263,6 +275,24 @@ class DupUp3D(nn.Module):
         self.repeats = out_channels * self.factor // in_channels
 
     def forward(self, x: torch.Tensor, first_chunk: bool = False) -> torch.Tensor:
+        from .dup_up3d import can_implement_dup_up3d, dup_up3d
+
+        if can_implement_dup_up3d(
+            x,
+            output_channels=self.out_channels,
+            repeats=self.repeats,
+            factor_t=self.factor_t,
+            factor_s=self.factor_s,
+            first_chunk=first_chunk,
+        ):
+            return dup_up3d(
+                x,
+                output_channels=self.out_channels,
+                repeats=self.repeats,
+                factor_t=self.factor_t,
+                factor_s=self.factor_s,
+                first_chunk=first_chunk,
+            )
         x = x if self.repeats == 1 else x.repeat_interleave(self.repeats, dim=1)
         x = x.reshape(
             x.size(0),
@@ -313,7 +343,19 @@ class WanCausalConv3d(nn.Conv3d):
         )
         self.padding = (0, self.padding[1], self.padding[2])
 
-    def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+        *,
+        spatial_padding: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Apply causal temporal padding and optionally override H/W padding.
+
+        Spatial halo exchange uses the override to suppress padding on the
+        split axis. Temporal padding remains explicitly causal through
+        ``self._padding``.
+        """
         x = _channels_last_3d_if_needed(x)
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
@@ -324,7 +366,18 @@ class WanCausalConv3d(nn.Conv3d):
         if any(padding):
             x = F.pad(x, padding)
         x = _channels_last_3d_if_needed(x)
-        x = super().forward(x)
+        if spatial_padding is None:
+            x = super().forward(x)
+        else:
+            x = F.conv3d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                (0, *spatial_padding),
+                self.dilation,
+                self.groups,
+            )
         return _channels_last_3d_if_needed(x)
 
 
@@ -1013,7 +1066,11 @@ class WanVAE(nn.Module):
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def _decode(
-        self, z: torch.Tensor, return_dict: bool = True
+        self,
+        z: torch.Tensor,
+        return_dict: bool = True,
+        *,
+        temporal_chunk_size: int = 1,
     ) -> DecoderOutput | tuple[torch.Tensor]:
         _, _, num_frame, _, _ = z.shape
 
@@ -1021,16 +1078,22 @@ class WanVAE(nn.Module):
         z = _channels_last_3d_if_needed(z)
         x = self.post_quant_conv(z)
         out_chunks: list[torch.Tensor] = []
-        for i in range(num_frame):
+        # Decode the first frame alone to initialize each causal Conv cache.
+        # Later slices batch adjacent frames through the complete decoder while
+        # reusing the preceding slice's per-layer temporal context.
+        for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, temporal_chunk_size)):
+            # Each decoder pass starts from layer zero; cached context persists.
             self._conv_idx = [0]
             out_chunk = self.decoder(
-                x[:, :, i : i + 1, :, :],
+                x[:, :, frame_slice, :, :],
                 feat_cache=self._feat_map,
                 feat_idx=self._conv_idx,
-                first_chunk=i == 0,
+                first_chunk=index == 0,
             )
             out_chunks.append(out_chunk)
 
+        # Every chunk has traversed the complete decoder; concatenate only
+        # these final decoder outputs along the temporal dimension.
         if len(out_chunks) == 1:
             out = out_chunks[0]
         else:
@@ -1047,9 +1110,13 @@ class WanVAE(nn.Module):
         return DecoderOutput(sample=out)
 
     def decode(
-        self, z: torch.Tensor, return_dict: bool = True
+        self,
+        z: torch.Tensor,
+        return_dict: bool = True,
+        *,
+        temporal_chunk_size: int = 1,
     ) -> DecoderOutput | tuple[torch.Tensor]:
-        decoded = self._decode(z).sample
+        decoded = self._decode(z, temporal_chunk_size=temporal_chunk_size).sample
 
         if not return_dict:
             return (decoded,)

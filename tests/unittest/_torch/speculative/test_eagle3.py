@@ -1,8 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,6 +31,8 @@ from utils.util import (skip_blackwell, skip_num_gpus_less_than,
                         skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+    DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor._util import \
@@ -30,6 +48,70 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
+    """Refresh DSA mappings after switching to the draft cache."""
+    events = []
+    draft_manager = object.__new__(DSACacheManagerV2)
+
+    class _Metadata(DSAtrtllmAttentionMetadata):
+
+        def __init__(self):
+            self._seq_lens_cuda = torch.tensor([1], dtype=torch.int32)
+            self._num_ctx_tokens = 0
+
+        def set_in_mtp_draft_loop(self, active):
+            pass
+
+        def set_mtp_num_accepted(self, value):
+            pass
+
+        def set_skip_topk(self, value):
+            pass
+
+        def on_update_kv_lens(self):
+            events.append("refresh")
+
+    metadata = _Metadata()
+
+    @contextmanager
+    def draft_context(attn_metadata, manager):
+        assert attn_metadata is metadata
+        assert manager is draft_manager
+        events.append("switch")
+        yield metadata
+
+    class _StopAfterFirstDraftForward(Exception):
+        pass
+
+    def run_draft_forward(*args, **kwargs):
+        events.append("forward")
+        raise _StopAfterFirstDraftForward
+
+    worker = SimpleNamespace(
+        is_mtp_eagle=True,
+        draft_kv_cache_context=draft_context,
+        _run_draft_forward=run_draft_forward,
+    )
+
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+
+    with pytest.raises(_StopAfterFirstDraftForward):
+        Eagle3OneModelWorker._forward_linear_draft_loop(
+            worker,
+            {"position_ids": torch.tensor([0], dtype=torch.int32)},
+            metadata,
+            SimpleNamespace(runtime_draft_len=1),
+            draft_model=object(),
+            draft_kv_cache_manager=draft_manager,
+            num_contexts=0,
+            batch_size=1,
+            num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
+            original_all_rank_num_tokens=None,
+        )
+
+    assert events == ["switch", "refresh", "forward"]
 
 
 def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
@@ -206,6 +288,39 @@ def test_eagle3_one_model_capture_uses_real_token_count() -> None:
     assert torch.equal(spec_metadata.hidden_states[:4, :2],
                        hidden_states[:4] + residual[:4])
     assert spec_metadata.hidden_states.shape == (4, 2)
+
+
+def test_eagle3_resource_manager_shares_padding_dummy_slot() -> None:
+    """The target and draft engines of two-model EAGLE3 share one
+    Eagle3ResourceManager, and each registers its own CUDA graph padding dummy
+    under the same draft-length-derived request ID
+    (CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len). The second registration must
+    reuse the already-reserved slot instead of tripping the strict re-add
+    assert in SlotManager.add_slot."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+        CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
+
+    config = Eagle3DecodingConfig(max_draft_len=4,
+                                  speculative_model="/dummy/eagle3")
+    manager = Eagle3ResourceManager(config,
+                                    torch.half,
+                                    hidden_size=8,
+                                    max_num_requests=4,
+                                    max_seq_len=32,
+                                    max_num_tokens=64)
+
+    dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - config.max_draft_len
+    # The target engine registers the padding dummy first (e.g. during warmup
+    # preallocation), then the draft engine registers the same ID.
+    manager.add_dummy_requests([dummy_request_id])
+    dummy_slot = manager.slot_manager.get_slot(dummy_request_id)
+    manager.add_dummy_requests([dummy_request_id])
+    assert manager.slot_manager.get_slot(dummy_request_id) == dummy_slot
+
+    # Real request IDs still get their own slots.
+    real_slot = manager.slot_manager.add_slot(7)
+    assert real_slot != dummy_slot
 
 
 @pytest.fixture(scope="function")
@@ -1028,7 +1143,18 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
         "The future of AI is",
     ]
 
-    sampling_params = SamplingParams(max_tokens=2048, temperature=0)
+    # Short generations keep all three requests within the KV cache budget so
+    # they run concurrently and batches of 3 actually pad up to the graph
+    # batch size 4. With long generations (2048 tokens against the 4096-token
+    # cache) the guaranteed-no-evict scheduler caps the batch at two requests,
+    # which exactly matches a graph batch size, so runtime padding (and the
+    # shared padding-dummy slot this test exists to cover) never engages.
+    # The overlap-scheduler variant must keep the long generations for now:
+    # padded draft batches trip a pre-existing shape mismatch in
+    # Eagle3SpecMetadata.prepare on the incremental-update path
+    # (hidden_states_read_indices sized without the padded requests).
+    max_tokens = 64 if disable_overlap_scheduler else 2048
+    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0)
     llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 

@@ -42,9 +42,11 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+
 from ..pyexecutor.sampler.ops.flashinfer import (
-    compute_probs_from_logits, sampling_batch_spec_dec_one_model,
-    sampling_batch_spec_dec_one_model_for_rejection)
+    compute_probs_from_logits, resolve_advanced_sampling_filters,
+    sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
@@ -113,6 +115,8 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
         return False
+    if spec_config._use_shared_kv_cache:
+        return False
     # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
     # model does not read the paged draft KV cache managed by attention metadata.
     if spec_config.spec_dec_mode.is_dspark():
@@ -123,9 +127,11 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
                                            draft_kv_cache_manager):
     """
-    Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
-    Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
-    batch. Call restore_attn_metadata_after_draft_replay after replay in a finally block.
+    Prepare attention metadata for a draft forward or CUDA graph replay when using a
+    separate draft KV cache. Swaps cache-layout-dependent buffers, refreshes FlashMLA
+    block IDs outside capture, and (for DSA) re-prepares indexer slot mappings
+    for the current batch.
+    Call restore_attn_metadata_after_draft_replay in a finally block.
     Returns saved state or None if no-op.
     """
     if draft_kv_cache_manager is None:
@@ -145,6 +151,18 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         'target_host_kv_cache_block_offsets':
         attn_metadata.host_kv_cache_block_offsets,
     }
+    if attn_metadata.enable_flash_mla:
+        if (attn_metadata.draft_block_ids_per_seq is None
+                or attn_metadata.draft_kv_block_ids_per_seq is None):
+            raise RuntimeError(
+                "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
+            )
+        saved['target_block_ids_per_seq'] = attn_metadata.block_ids_per_seq
+        saved[
+            'target_kv_block_ids_per_seq'] = attn_metadata.kv_block_ids_per_seq
+        attn_metadata.block_ids_per_seq = attn_metadata.draft_block_ids_per_seq
+        attn_metadata.kv_block_ids_per_seq = (
+            attn_metadata.draft_kv_block_ids_per_seq)
     attn_metadata.kv_cache_manager = draft_kv_cache_manager
     attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     attn_metadata.host_kv_cache_block_offsets = (
@@ -153,45 +171,63 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         attn_metadata.prepare_flash_mla()
 
     from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer)
+                                                Indexer, is_dsa_cache_manager)
+
+    # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
+    # different dual-pool layout. Only native DSA cache managers use the DSA
+    # draft-replay buffers below.
     if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
+            and is_dsa_cache_manager(draft_kv_cache_manager)):
         m = attn_metadata
         saved['saved_dsa_state'] = {
             'host_indexer_k_cache_block_offsets':
-            m.host_indexer_k_cache_block_offsets.clone(),
-            'indexer_k_cache_block_offsets':
-            m.indexer_k_cache_block_offsets.clone(),
-            'host_slot_mapping_fp8':
-            m.host_slot_mapping_fp8.clone(),
-            'host_slot_mapping_scale':
-            m.host_slot_mapping_scale.clone(),
-            'slot_mapping_fp8':
-            m.slot_mapping_fp8.clone(),
-            'slot_mapping_scale':
-            m.slot_mapping_scale.clone(),
+            m.host_indexer_k_cache_block_offsets,
+            'indexer_k_cache_block_offsets': m.indexer_k_cache_block_offsets,
+            'host_slot_mapping_fp8': m.host_slot_mapping_fp8,
+            'host_slot_mapping_scale': m.host_slot_mapping_scale,
+            'slot_mapping_fp8': m.slot_mapping_fp8,
+            'slot_mapping_scale': m.slot_mapping_scale,
+            'block_table': m.block_table,
+            'block_table_expanded': m.block_table_expanded,
+            'host_block_table_expanded': m.host_block_table_expanded,
         }
-        # Derive pool indices from the draft manager's encoded block
-        # offsets (via _get_pool_block_indices) instead of using raw block
-        # IDs.  With host cache offload, block IDs can exceed
-        # blocks_in_primary_pool after offload swaps (the block keeps its
-        # original high ID even though its memory now lives in the primary
-        # GPU pool).  Using raw block IDs as pool indices causes OOB access
-        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
-        # decodes memPoolBlockIndex from the C++ encoded offsets.
-        # Note: kv_cache_manager was already swapped to draft above (line 67).
-        pool_indices = m._get_pool_block_indices()
-        num_blocks = pool_indices.shape[1]
-        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
-            pool_indices)
-        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
-            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
-            non_blocking=True)
-        # Safety clamp: sanitize stale padding entries beyond num_seqs
-        # that may contain negative or out-of-range values, matching the
-        # regular DSA prepare() flow.
-        m.indexer_k_cache_block_offsets.clamp_(min=0)
-        Indexer.recompute_slot_mappings(m)
+        # The cached-KV feature owns these references even when an optimized
+        # path aliases them to slot_mapping_*. With the feature disabled, the
+        # aliases are lazy and may not exist on the first generation replay.
+        if m.enable_context_mla_with_cached_kv:
+            saved['saved_dsa_state'].update({
+                'slot_mapping_fp8_fullkv':
+                m.slot_mapping_fp8_fullkv,
+                'slot_mapping_scale_fullkv':
+                m.slot_mapping_scale_fullkv,
+            })
+        # Rebind to the draft manager's dedicated buffers instead of
+        # overwriting the target tensors in place. Rebinding is invisible to
+        # CUDA graph capture, so the target and draft segments of the graph
+        # bake distinct addresses (like draft_kv_cache_block_offsets) and no
+        # graph-recorded copy from a transient host buffer is needed.
+        m.host_indexer_k_cache_block_offsets = (
+            m.host_draft_indexer_k_cache_block_offsets)
+        m.indexer_k_cache_block_offsets = m.draft_indexer_k_cache_block_offsets
+        m.host_slot_mapping_fp8 = m.host_draft_slot_mapping_fp8
+        m.slot_mapping_fp8 = m.draft_slot_mapping_fp8
+        m.host_slot_mapping_scale = m.host_draft_slot_mapping_scale
+        m.slot_mapping_scale = m.draft_slot_mapping_scale
+        m.block_table = m.draft_block_table
+        m.block_table_expanded = m.draft_block_table_expanded
+        m.host_block_table_expanded = m.host_draft_block_table_expanded
+        m._invalidate_pool_view_cache()
+        # Recording a capture executes no kernels, so the draft mappings only
+        # need refreshing when the transfers actually run: eager forwards
+        # (warmup) and the pre-replay call from model_engine. The per-step
+        # advance inside the captured graph re-derives slot mappings on
+        # device from the rebound block-offset buffer.
+        # kv_cache_manager was already swapped to the draft manager above.
+        if not torch.cuda.is_current_stream_capturing():
+            m.prepare_for_indexer_k_cache()
+            m._refresh_expanded_block_table()
+            Indexer.recompute_slot_mappings(m)
+        Indexer.recompute_context_kv_gather_mappings(m)
     return saved
 
 
@@ -205,18 +241,37 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
     if attn_metadata.enable_flash_mla:
-        attn_metadata.prepare_flash_mla()
+        attn_metadata.block_ids_per_seq = saved_state[
+            'target_block_ids_per_seq']
+        attn_metadata.kv_block_ids_per_seq = saved_state[
+            'target_kv_block_ids_per_seq']
+        # Target and draft block-ID buffers are independent. Restoring only
+        # needs to invalidate the scheduler metadata; refreshing the unchanged
+        # target buffers would repeat request-specific H2D work.
+        attn_metadata._flash_mla_metadata_valid = False
     saved_dsa = saved_state.get('saved_dsa_state')
     if saved_dsa is not None:
         m = attn_metadata
-        m.host_indexer_k_cache_block_offsets.copy_(
-            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
-        m.indexer_k_cache_block_offsets.copy_(
-            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
-        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
-        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
-        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
-        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+        m.host_indexer_k_cache_block_offsets = saved_dsa[
+            'host_indexer_k_cache_block_offsets']
+        m.indexer_k_cache_block_offsets = saved_dsa[
+            'indexer_k_cache_block_offsets']
+        m.host_slot_mapping_fp8 = saved_dsa['host_slot_mapping_fp8']
+        m.host_slot_mapping_scale = saved_dsa['host_slot_mapping_scale']
+        m.slot_mapping_fp8 = saved_dsa['slot_mapping_fp8']
+        m.slot_mapping_scale = saved_dsa['slot_mapping_scale']
+        m.block_table = saved_dsa['block_table']
+        m.block_table_expanded = saved_dsa['block_table_expanded']
+        m.host_block_table_expanded = saved_dsa['host_block_table_expanded']
+        m._invalidate_pool_view_cache()
+        if 'slot_mapping_fp8_fullkv' in saved_dsa:
+            m.slot_mapping_fp8_fullkv = saved_dsa['slot_mapping_fp8_fullkv']
+            m.slot_mapping_scale_fullkv = saved_dsa['slot_mapping_scale_fullkv']
+        else:
+            # The draft recomputation rebound the aliases to the draft tensors;
+            # point them back at the restored target tensors.
+            m.slot_mapping_fp8_fullkv = m.slot_mapping_fp8
+            m.slot_mapping_scale_fullkv = m.slot_mapping_scale
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -538,6 +593,8 @@ class SpecMetadata:
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
+    advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -742,6 +799,13 @@ class SpecMetadata:
             top_p: Optional[float],
         ) -> tuple[float, int, float, bool, bool, bool, bool]:
             """Convert request sampling params into normalized per-request scalars."""
+            # NB: min_p is intentionally omitted here. One-engine speculative
+            # decoding does not support min_p (there is no request_min_p buffer
+            # nor min_p wiring in the sampling_batch_spec_dec_one_model*
+            # kernels); a min_p request is rejected at admission by
+            # SpecSampler.validate_request, so nothing reaching this scan
+            # carries a min_p that would change its classification. The
+            # two-model draft/target path honors min_p via _request_strategy.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,
@@ -847,7 +911,6 @@ class SpecMetadata:
         # resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
-
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1009,7 +1072,7 @@ class SpecWorkerBase(nn.Module, ABC):
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
         # One-model speculative sampling goes through flashinfer unconditionally
-        # (sampling_batch_spec_dec_one_model), so flashinfer>=0.6.4 is a hard
+        # (sample_from_logits_op), so flashinfer>=0.6.4 is a hard
         # dependency here. Fail at construction with a clear error instead of
         # crashing mid-inference on the first non-greedy sampling step.
         if not IS_FLASHINFER_AVAILABLE or Version(
@@ -1503,7 +1566,7 @@ class SpecWorkerBase(nn.Module, ABC):
         With rejection enabled and a ``draft_step``, samples via
         ``sampling_batch_spec_dec_one_model_for_rejection`` and scatters this
         step's proposal distribution into the slot-indexed ``draft_probs``
-        buffer; otherwise uses ``sampling_batch_spec_dec_one_model`` (tokens
+        buffer; otherwise uses ``sample_from_logits_op`` (tokens
         only). Returns tokens in draft-vocab space (the caller applies d2t).
         Expects 2D ``[batch_size, vocab]`` logits (one row per request).
         """
@@ -1512,13 +1575,15 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
         self._update_advance_draft_sampling_seed(logits.device)
+        eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
+            spec_metadata.advanced_sampling_mode, top_ks, top_ps)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             draft_tokens, probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(
                     logits,
                     temperatures,
-                    top_ks,
-                    top_ps,
+                    eff_top_ks,
+                    eff_top_ps,
                     seed=self.seed,
                     offset=self.offset))
             # Scatter probs into the slot-indexed buffer so each request's data
@@ -1532,12 +1597,12 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
         else:
-            draft_tokens = sampling_batch_spec_dec_one_model(logits,
-                                                             temperatures,
-                                                             top_ks,
-                                                             top_ps,
-                                                             seed=self.seed,
-                                                             offset=self.offset)
+            draft_tokens = sample_from_logits_op(logits,
+                                                 temperatures,
+                                                 eff_top_ks,
+                                                 eff_top_ps,
+                                                 seed=self.seed,
+                                                 offset=self.offset)
 
         return draft_tokens.type(torch.int32)
 
@@ -1687,6 +1752,8 @@ class SpecWorkerBase(nn.Module, ABC):
                       spec_metadata.top_ks[gen_start:gen_end])
             top_ps = (None if spec_metadata.skip_top_p else
                       spec_metadata.top_ps[gen_start:gen_end])
+            top_ks, top_ps = resolve_advanced_sampling_filters(
+                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
@@ -1894,7 +1961,7 @@ class SpecWorkerBase(nn.Module, ABC):
         With rejection enabled, samples via
         ``sampling_batch_spec_dec_one_model_for_rejection`` and scatters the K
         proposal rows into ``draft_probs[gen_slot_ids, 0:K, :]``; otherwise uses
-        ``sampling_batch_spec_dec_one_model`` (tokens only). Only called for a
+        ``sample_from_logits_op`` (tokens only). Only called for a
         non-greedy batch (the all-greedy path is handled by the caller). Returns
         ``[num_gens, K]`` int32 tokens in draft-vocab space (the caller applies
         d2t); stored probs likewise stay in draft-vocab space.
@@ -1916,14 +1983,16 @@ class SpecWorkerBase(nn.Module, ABC):
 
         self._update_advance_draft_sampling_seed(gen_logits.device)
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
+        eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
+            spec_metadata.advanced_sampling_mode, top_ks, top_ps)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
             flat_tokens, flat_probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(
                     flat_logits,
                     temps,
-                    top_ks,
-                    top_ps,
+                    eff_top_ks,
+                    eff_top_ps,
                     seed=self.seed,
                     offset=self.offset))
             # Scatter the K prob rows per gen request into its stable slot row.
@@ -1937,12 +2006,12 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.draft_probs[gen_slot_ids, :K, :vocab] = probs
                 spec_metadata.draft_probs_last_dim = vocab
         else:
-            flat_tokens = sampling_batch_spec_dec_one_model(flat_logits,
-                                                            temps,
-                                                            top_ks,
-                                                            top_ps,
-                                                            seed=self.seed,
-                                                            offset=self.offset)
+            flat_tokens = sample_from_logits_op(flat_logits,
+                                                temps,
+                                                eff_top_ks,
+                                                eff_top_ps,
+                                                seed=self.seed,
+                                                offset=self.offset)
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
@@ -2119,51 +2188,38 @@ class SpecWorkerBase(nn.Module, ABC):
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
         """
-        Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
+        Select draft attention metadata for one-engine speculative decoding.
 
-        This swaps both the kv_cache_manager reference AND the block offset tensors,
-        since the target and draft KV caches have different block layouts.
+        TRTLLM metadata temporarily swaps its manager and cache-layout-dependent
+        buffers, including DSA indexer offsets and slot mappings.
+        FlashInfer uses an independently planned metadata view because its page
+        tables and kernel wrappers are manager-specific.
         """
 
         # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
         if draft_kv_cache_manager is None:
-            yield
+            yield attn_metadata
             return
 
-        # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
+        from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+        if isinstance(attn_metadata, FlashInferAttentionMetadata):
+            yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
+            return
+
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-            yield
+            yield attn_metadata
             return
 
-        # Check if draft KV cache block offsets are allocated
-        draft_block_offsets = getattr(attn_metadata,
-                                      'draft_kv_cache_block_offsets', None)
-        if draft_block_offsets is None:
-            # Draft KV cache block offsets not allocated, skip switching
-            yield
+        saved_state = prepare_attn_metadata_for_draft_replay(
+            attn_metadata, draft_kv_cache_manager)
+        if saved_state is None:
+            yield attn_metadata
             return
-
-        # Save main KV cache manager and block offsets
-        target_kv_cache_manager = attn_metadata.kv_cache_manager
-        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
-        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
-
-        # Switch to draft KV cache manager and its block offsets
-        attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
-        if attn_metadata.enable_flash_mla:
-            attn_metadata.prepare_flash_mla()
 
         try:
-            yield
+            yield attn_metadata
         finally:
-            # Restore main KV cache manager and block offsets
-            attn_metadata.kv_cache_manager = target_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
-            if attn_metadata.enable_flash_mla:
-                attn_metadata.prepare_flash_mla()
+            restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_tokens_for_batch(
         self,
@@ -2189,7 +2245,7 @@ class SpecWorkerBase(nn.Module, ABC):
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
             # graph was built for a shorter draft_len, causing a shape mismatch
-            # in sampling_batch_spec_dec_one_model (which is torch.compiled).
+            # in sample_from_logits_op (which is torch.compiled).
             num_tokens = logits.shape[0]
 
             temperatures = spec_metadata.temperatures[:num_tokens]
@@ -2207,13 +2263,14 @@ class SpecWorkerBase(nn.Module, ABC):
             self.seed += 1
             self.seed %= (2**31)
 
-            sampled_tokens = sampling_batch_spec_dec_one_model(
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                seed=self.seed,
-                offset=self.offset)
+            eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
+                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+            sampled_tokens = sample_from_logits_op(logits,
+                                                   temperatures,
+                                                   eff_top_ks,
+                                                   eff_top_ps,
+                                                   seed=self.seed,
+                                                   offset=self.offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 

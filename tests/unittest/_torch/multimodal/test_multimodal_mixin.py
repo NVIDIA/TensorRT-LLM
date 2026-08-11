@@ -76,6 +76,8 @@ class TensorEncoderMultimodalModel(DummyMultimodalModel):
 
 
 class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     @property
     def embedding_dim(self) -> int:
         raise NotImplementedError
@@ -86,6 +88,8 @@ class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
 
 
 class CountingEncoderMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     def __init__(
         self,
         embedding: Embedding,
@@ -172,6 +176,7 @@ def make_keyed_multimodal_param(
     )
 
 
+@pytest.mark.cpu_only
 def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
     module = torch.nn.Linear(4, 4, device="meta")
 
@@ -217,8 +222,7 @@ def test_prepare_multimodal_inputs_forwards_precomputed_indices(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
-@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
-def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
+def _test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     hidden = 8
     mm_token_id = 7
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
@@ -251,6 +255,15 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
+@pytest.mark.cpu_only
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cpu")
+
+
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
+
+
 def test_encoder_cache_first_request_writes_per_item_entries():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -267,6 +280,15 @@ def test_encoder_cache_first_request_writes_per_item_entries():
     assert model.encode_calls == 1
     assert embeddings.shape == (3, 4)
     assert len(model._multimodal_encoder_cache) == 2
+
+
+def test_encoder_cache_requires_model_opt_in():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    assert not model.encoder_cache_active
 
 
 def test_encoder_cache_creation_logs_embedding_row_capacity():
