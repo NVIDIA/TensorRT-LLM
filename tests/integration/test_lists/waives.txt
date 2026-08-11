@@ -186,6 +186,7 @@ full:B300/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_f
 full:B300/accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6539941)
 full:B300/llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] SKIP (https://nvbugs/6475623)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy SKIP (https://nvbugs/6571418)
+full:DGX_B200/disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b] SKIP (https://nvbugs/6594241)
 full:DGX_B200/perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k] SKIP (https://nvbugs/6571410)
 full:DGX_B200/perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_llama8b_spec_decode-llama8b_spec_bs1_128_128] SKIP (https://nvbugs/6571408)
 full:DGX_H200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[disable_skip_indexer] SKIP (https://nvbugs/6476233)
