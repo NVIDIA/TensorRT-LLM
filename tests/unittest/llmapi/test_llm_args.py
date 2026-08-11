@@ -718,6 +718,11 @@ class TestKvCacheManagerV2AutoResolution:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)

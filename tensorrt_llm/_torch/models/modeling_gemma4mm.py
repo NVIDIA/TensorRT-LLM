@@ -564,10 +564,12 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
         return {
             "attn_backend": "FLASHINFER",
-            "kv_cache_config": {
-                "use_kv_cache_manager_v2": True,
-            },
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 — see Gemma4ForCausalLM."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(

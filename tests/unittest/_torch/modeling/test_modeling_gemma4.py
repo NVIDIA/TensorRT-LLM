@@ -47,7 +47,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextScaledWordEmbedding,
 )
 from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
-from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmapiKvCacheConfig
@@ -4080,39 +4080,36 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
         ("Gemma4ForConditionalGeneration", Gemma4ForConditionalGeneration),
     ],
 )
-def test_gemma4_defaults_resolve_to_v2(architecture: str, model_cls: type) -> None:
+def test_gemma4_preference_resolves_to_v2(architecture: str, model_cls: type) -> None:
     """The checkpoint's architectures[0] must map to the class carrying the
-    defaults, and those defaults must survive the production resolution
-    ordering (transceiver first, then KV-cache manager) on the NIXL
+    V2 preference, and the preference must survive the production resolution
+    ordering (defaults merge, transceiver, then KV-cache manager) on the NIXL
     disaggregated route — the route where a missing transceiver preference
-    silently downgrades the V2 default back to V1."""
-    assert MODEL_CLASS_MAPPING[architecture] is model_cls
+    silently downgrades V2 back to V1."""
+    assert get_registered_model_class(architecture) is model_cls
 
     llm_args = TorchLlmArgs(
         model="/tmp/dummy_model",
         cache_transceiver_config=CacheTransceiverConfig(backend="NIXL", transceiver_runtime="auto"),
     )
-    original_setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     defaults = model_cls.get_model_defaults(llm_args)
     apply_model_defaults_to_llm_args(llm_args, defaults)
     _resolve_transceiver_runtime_auto(llm_args, model_cls)
-    _resolve_kv_cache_manager_v2_auto(llm_args, defaults, original_setting=original_setting)
+    assert _resolve_kv_cache_manager_v2_auto(llm_args, model_cls) is True
 
     assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
     assert llm_args.attn_backend == "FLASHINFER"
 
 
+@pytest.mark.parametrize("user_setting", [False, True])
 @pytest.mark.parametrize("model_cls", [Gemma4ForCausalLM, Gemma4ForConditionalGeneration])
-def test_gemma4_explicit_user_setting_wins(model_cls: type) -> None:
+def test_gemma4_explicit_setting_wins(model_cls: type, user_setting: bool) -> None:
     llm_args = TorchLlmArgs(
-        model="/tmp/dummy_model", kv_cache_config=LlmapiKvCacheConfig(use_kv_cache_manager_v2=False)
+        model="/tmp/dummy_model",
+        kv_cache_config=LlmapiKvCacheConfig(use_kv_cache_manager_v2=user_setting),
     )
-    original_setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
-    defaults = model_cls.get_model_defaults(llm_args)
-    apply_model_defaults_to_llm_args(llm_args, defaults)
-    _resolve_kv_cache_manager_v2_auto(llm_args, defaults, original_setting=original_setting)
-    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+    assert _resolve_kv_cache_manager_v2_auto(llm_args, model_cls) is user_setting
 
 
 if __name__ == "__main__":
