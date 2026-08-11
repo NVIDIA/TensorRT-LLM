@@ -196,13 +196,20 @@ def test_launch_server_requires_a_way_to_learn_the_port() -> None:
     ],
 )
 def test_disaggregated_rejects_a_worker_fleet(
-    tmp_path: Path, port: int, extra_args: list[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, port: int, extra_args: list[str]
 ) -> None:
     """A fleet spreads the port over N workers, so one published address is wrong.
 
     Only the rejected combinations are exercised: anything the guard lets
     through goes on to bind a socket and serve.
     """
+    # set_prometheus_multiproc_dir, which disaggregated() calls before reaching
+    # the guard, deletes the directory its own environment variable points at on
+    # the second call in a process, so the third call raises FileNotFoundError.
+    # Pointing the variable at a directory that outlives every invocation keeps
+    # these parametrised cases independent of one another.
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+
     config = tmp_path / "disagg.yaml"
     config.write_text(
         yaml.safe_dump(
