@@ -11,7 +11,8 @@ problem. Config errors belong at construction.
 
 There is no exception: a crafted (non-flat) cost table is how a test makes the
 planner trim, which exercises the real confidence-driven path rather than
-bypassing it. See tests/unittest/_torch/speculative/test_dspark_planner_trims.py.
+bypassing it. See
+tests/unittest/_torch/speculative/hw_agnostic/test_dspark_confidence_schedule.py.
 """
 
 import pytest

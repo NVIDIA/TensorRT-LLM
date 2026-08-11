@@ -432,7 +432,7 @@ class DSparkDraftModel(nn.Module):
         """Populate ``_dspark_attn`` by reading the ``mtp.{s}.attn.*`` tensors from the
         checkpoint shards on disk, then dequantizing via :meth:`_cache_attn_weights`.
 
-        TODO(step 3): source these from the loaded ``MLA`` modules instead, once the
+        TODO: source these from the loaded ``MLA`` modules instead, once the
         fused/interleaved fp8 scale layout is decoded, to drop the checkpoint I/O.
         """
         from safetensors import safe_open

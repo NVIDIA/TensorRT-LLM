@@ -2180,14 +2180,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # here because block IDs do not move within a step and their refresh
         # is prepare-time only.
         self.refresh_token_major_block_table()
-        block_table_expanded = getattr(self, "block_table_expanded", None)
-        indexer_offsets = getattr(self, "indexer_k_cache_block_offsets", None)
-        if block_table_expanded is not None and indexer_offsets is not None:
-            width = min(indexer_offsets.shape[-1],
-                        block_table_expanded.shape[-1])
-            block_table_expanded[:rows, :width] = (
-                indexer_offsets[nc:self.num_seqs, :width].index_select(
-                    0, req_idx).clamp_(min=0))
+        width = min(self.indexer_k_cache_block_offsets.shape[-1],
+                    self.block_table_expanded.shape[-1])
+        self.block_table_expanded[:rows, :width] = (
+            self.indexer_k_cache_block_offsets[nc:self.num_seqs, :width]
+            .index_select(0, req_idx).clamp_(min=0))
 
     def prepare_for_indexer_k_cache(self):
         # Build indexer_k_cache_block_offsets using pool block indices derived

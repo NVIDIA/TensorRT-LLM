@@ -7,9 +7,7 @@ produced by different steps: the block verified at step ``i`` was drafted at
 step ``i-1``, and under the overlap scheduler the sampler consumes the label
 while pass ``i+1`` has already overwritten the shared confidence buffer. The
 single mutable stash this ring replaced had NO execution order under which
-the pair was correct -- measured on job 2562577, 82.2% of rows paired
-confidence(t+1) with accepted(t), correlation 0.14 -- and the shards looked
-perfectly healthy.
+the pair was correct -- and the shards looked perfectly healthy.
 
 These tests pin the join contract: a pair is appended only when the ring
 snapshot's per-row stamp equals the pass the label verifies, everything else

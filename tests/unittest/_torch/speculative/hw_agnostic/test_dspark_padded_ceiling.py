@@ -2,13 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """``trim_ratio`` must not report a saving the run did not make -- or a loss.
 
-Four runs reported a NEGATIVE ``trim_ratio`` (jobs 2560992 -0.001, 2561519
--0.0438, 2563581 -0.0082), which reads as "the ragged path delivered more tokens
-than a no-trim run". It did not. ``delivered_tokens`` books the fitted bucket,
-which is ``padded_bs * (tier + 1)`` where ``padded_bs`` is the CUDA-graph-rounded
-maximum row count *across attention-DP ranks*; ``ceiling_tokens`` booked
-``num_gen_requests * (1 + block)`` over this rank's real, unpadded requests. Two
-different row bases in one ratio.
+Real runs reported a NEGATIVE ``trim_ratio``, which reads as "the ragged path
+delivered more tokens than a no-trim run". It did not. ``delivered_tokens``
+books the fitted bucket, which is ``padded_bs * (tier + 1)`` where ``padded_bs``
+is the CUDA-graph-rounded maximum row count *across attention-DP ranks*;
+``ceiling_tokens`` booked ``num_gen_requests * (1 + block)`` over this rank's
+real, unpadded requests. Two different row bases in one ratio.
 
 A wrong ratio silently misreports the feature's saving in every summary.
 """

@@ -1200,7 +1200,7 @@ class SweepConfig:
         can ever yield a sample. A cell is only counted while all ``dp_size``
         ranks hold exactly ``batch_size`` generating requests, so the request
         admitted first must still be alive when the last one is admitted.
-        Measured on job 2561986 (bs=256, input_len=1024): the scheduler admits
+        Measured at bs=256, input_len=1024: the scheduler admits
         roughly one context request per iteration per rank, so the ramp is
         ~``batch_size`` iterations, while the budget was 85 -- the first
         requests died ~170 iterations before the last arrived, concurrency
@@ -1482,7 +1482,7 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int,
     # bs>=128 the whole retained window therefore lands inside the drain: every
     # step it contains has 0..11 generating requests, none has `batch_size`,
     # and the cell reports "kept nothing" while the plateau it was measuring
-    # scrolled out of the buffer unseen (jobs 2561986, 2563525).
+    # scrolled out of the buffer unseen.
     #
     # `IterationResult` latches done when its queue runs dry, so an
     # empty read ends collection. Polling only while requests are still
@@ -2407,7 +2407,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # is enforceable. Under attention DP the router spreads the load and
         # each rank's occupancy is emergent -- 1024 requests over 8 ranks
         # oscillates around 128/rank and pads to whatever ladder entry the
-        # drift lands on (job 2585368: requested 128, measured at 192; only
+        # drift lands on (observed: requested 128, measured at 192; only
         # the cap-saturated 256 landed exactly). The pin guarantees L; bs is
         # whatever the deployment did. Require nothing, keep what is thick,
         # and let the fit's grid-connectivity check catch a real hole.

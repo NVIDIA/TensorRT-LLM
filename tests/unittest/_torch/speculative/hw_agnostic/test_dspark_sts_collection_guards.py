@@ -32,12 +32,7 @@ _PIN = "TLLM_DSPARK_FORCE_VERIFY_LEN"
 
 @contextlib.contextmanager
 def collecting(pin=None):
-    """Set the collection env for the block, restore it after.
-
-    A context manager rather than a pytest fixture: these run inside the
-    container, which ships no pytest, under a minimal shim that does not
-    implement fixtures or tmp_path.
-    """
+    """Set the collection env for the block, restore it after."""
     saved = {k: os.environ.get(k) for k in (STS_COLLECT_ENV, _PIN)}
     try:
         with tempfile.TemporaryDirectory() as tmp:

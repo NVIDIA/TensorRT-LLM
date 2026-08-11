@@ -4070,12 +4070,6 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
     def test_gsm8k_dep8_static_verify_overlap(self, moe_backend):
         """DSpark verifying the full block, with the overlap scheduler ON.
 
-        This was a confidence-scheduling test until the uniform tier ladder was
-        removed. That path chose one verify length for the whole batch and, on
-        this checkpoint, always chose the full block -- so it never differed
-        from what this test does now, and the combination it configured
-        (scheduling on, ragged off) is rejected outright by llm_args today.
-
         Kept, rather than deleted, because it is the STATIC reference the other
         two modes are differenced against: same prompts, same seed, verify
         everything. cap-accept must match it token for token (the schedule only

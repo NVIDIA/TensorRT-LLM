@@ -549,9 +549,7 @@ def test_validate_rejects_a_decode_step_wider_than_max_num_tokens():
 
 
 def test_validate_accepts_a_sane_sweep():
-    """Sane includes verifying below a constant drafted block: the Repeat.cu
-    output_size assert that geometry used to trip was an IMA-family symptom,
-    fixed by the published-bucket graph key and verified gone 2026-08-06."""
+    """Sane includes verifying below a constant drafted block."""
     _sweep(block_follows_verify_len=True).validate()
     _sweep(verify_lens=[5], max_draft_len=5).validate()
     _sweep().validate()

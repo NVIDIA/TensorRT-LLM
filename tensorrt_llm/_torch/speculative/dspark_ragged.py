@@ -50,7 +50,7 @@ def round_up_to_bucket(total: int, buckets: Sequence[int]) -> int:
     """Smallest captured bucket that fits ``total``.
 
     Raises rather than clamping; callers must reject an oversized batch before
-    selecting a layout (see :func:`exceeds_captured_buckets`).
+    selecting a layout.
     """
     if not buckets:
         raise ValueError("round_up_to_bucket requires a non-empty bucket list")
@@ -60,11 +60,6 @@ def round_up_to_bucket(total: int, buckets: Sequence[int]) -> int:
             f"the caller must reject this batch before building a layout"
         )
     return buckets[bisect.bisect_left(buckets, total)]
-
-
-def exceeds_captured_buckets(total: int, buckets: Sequence[int]) -> bool:
-    """Whether ``total`` has no captured bucket (check before building a layout)."""
-    return bool(buckets) and total > buckets[-1]
 
 
 def build_qo_indptr(verify_lens: torch.Tensor) -> torch.Tensor:

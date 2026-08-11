@@ -22,7 +22,6 @@ from tensorrt_llm._torch.speculative.dspark_ragged import (
     build_qo_indptr,
     choose_ragged_capture_shape,
     count_accepted_ragged,
-    exceeds_captured_buckets,
     fill_padded_rows_onehot,
     round_up_to_bucket,
     row_ids_from_lens,
@@ -82,8 +81,6 @@ def test_round_up_raises_past_the_largest_bucket():
     """Clamping would silently drop the step out of graph replay into eager."""
     with pytest.raises(ValueError, match="exceeds the largest captured bucket"):
         round_up_to_bucket(65, [8, 16, 32, 64])
-    assert exceeds_captured_buckets(65, [8, 16, 32, 64])
-    assert not exceeds_captured_buckets(64, [8, 16, 32, 64])
 
 
 def test_layout_derives_the_bucket_from_the_host_total():
@@ -425,7 +422,7 @@ def test_shape_requires_bs_buckets():
 # shared dummy), so decomposability is a divisibility question -- sharpest
 # under a full-block pin where real rows have zero slack -- and a rank that
 # failed it declined ALONE while its peers published the bucket. The ADP
-# shape gate then took the whole group eager: 70/962 steps on job 2586075.
+# shape gate then took the whole group eager.
 # ---------------------------------------------------------------------------
 
 MAXLEN_BUCKETS = [16, 24, 32, 40, 48]   # padded_bs 8, tiers 1..5 -> 8*(t+1)
@@ -443,7 +440,7 @@ def _shape6(num_real, total, peers):
 
 
 def test_pinned_ranks_agree_on_a_bucket_every_rank_can_decompose():
-    """The job-2586075 divergence, miniaturised.
+    """The production ADP divergence, miniaturised.
 
     Both ranks are pinned to the full block (floor == capacity). needed =
     8 + 25 = 33 rounds to 40, which rank (5, 30) cannot decompose (3 pad rows,

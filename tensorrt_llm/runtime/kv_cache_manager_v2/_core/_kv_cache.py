@@ -870,9 +870,7 @@ class _KVCache:
                             # and is therefore max_blocks_per_seq long, so this
                             # means the sequence wants more blocks than
                             # max_seq_len allows -- i.e. it is consuming KV
-                            # faster than it emits tokens. The bare message gave
-                            # no way to tell that from a genuinely oversized
-                            # request, which cost several 20-minute runs.
+                            # faster than it emits tokens.
                             raise ValueError(
                                 f"User-provided base page indices is too short: "
                                 f"buffer holds {len(indices)} blocks "

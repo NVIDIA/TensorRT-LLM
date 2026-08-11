@@ -814,12 +814,8 @@ class PyTorchModelEngine(ModelEngine):
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
 
-        # Pinned staging buffers for async H2D copies on the ragged path; see
-        # _pinned_host / _pinned_host_record. Two slots per key: the WAR guard
-        # on a slot only waits for the H2D enqueued two steps ago, so in
-        # steady state the wait is free. A single slot would serialize step
-        # N+1's prepare against step N's stream position (measured 6 blocking
-        # event syncs / 21.6 ms per step on short-window batches).
+        # Pinned staging buffers for async H2D copies on the ragged path;
+        # see _pinned_host for the two-slot WAR-guard rationale.
         self._pinned_host_cache = {}
         self._pinned_host_events = {}
         self._pinned_host_active = {}
@@ -3844,21 +3840,6 @@ class PyTorchModelEngine(ModelEngine):
         runner.ragged_pad_verify_len = pad_len - 1
 
         published = filled.verify_lens.tolist()
-        if os.environ.get("TLLM_DSPARK_HOST_STEEP") == "1" and n_real > 1:
-            # Debug bisector: force truly non-uniform windows through the
-            # HOST staging (the reference implementation, no device
-            # prologue). The production host scheduler only ever publishes
-            # uniform windows (budget quantized to the tier ladder), so the
-            # ragged consumers' non-uniform handling is otherwise exercised
-            # only by the device path -- this isolates them.
-            lo = 1 + getattr(self.spec_config, "min_verify_len", 1)
-            hi = max_verify_len
-            pairs = (n_real // 2) * 2
-            for i in range(0, pairs, 2):
-                give = min(published[i] - lo, hi - published[i + 1])
-                if give > 0:
-                    published[i] -= give
-                    published[i + 1] += give
         for request, tokens in zip(generation_requests, published):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)

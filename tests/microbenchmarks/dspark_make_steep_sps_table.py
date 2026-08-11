@@ -21,11 +21,8 @@ evidence.
 
 WHY A TABLE RATHER THAN AN OVERRIDE
 -----------------------------------
-This replaces ``TLLM_DSPARK_FORCE_VERIFY_LENS``, which assigned windows by
-batch position. Position is orthogonal to confidence, so that knob reproduced
-the ragged *shape* while bypassing the policy entirely -- it could not tell a
-correct assignment from an arbitrary one, and it had to sit in production code
-ahead of the cost-table gate to be reachable. A table drives the real path.
+A table drives the real confidence-scheduled path; it is the only sanctioned
+mechanism for forcing window assignments.
 
 HOW STEEPNESS IS CHOSEN
 -----------------------
