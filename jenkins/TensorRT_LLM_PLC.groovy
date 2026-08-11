@@ -322,7 +322,7 @@ def pulseScanContainer(llmRepo, ref) {
         withCredentials([usernamePassword(credentialsId: 'trtllm-artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
             sh """
                 mkdir -p /root/.docker
-                echo '{"auths":{"artifactory.nvidia.com":{"auth":"'"\$(echo -n "\${ARTIFACTORY_USER}:\${ARTIFACTORY_PASSWORD}" | base64)"'"}}}' > /root/.docker/config.json
+                echo '{"auths":{"artifactory.nvidia.com":{"auth":"'"\$(echo -n "\${ARTIFACTORY_USER}:\${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\\n')"'"}}}' > /root/.docker/config.json
             """
         }
         def token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
