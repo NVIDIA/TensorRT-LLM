@@ -16,9 +16,14 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from unittest.mock import MagicMock, Mock
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+import torch
+import torch.distributed as torch_dist
+import torch.multiprocessing as torch_mp
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -26,13 +31,77 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    DisaggTransferAdmissionController,
+    EncoderStepResult,
+    PyExecutor,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+
+pytestmark = pytest.mark.cpu_only
+
+
+class _TorchCollectiveDist:
+    """Minimal distributed adapter for idle-progress collective tests."""
+
+    world_size = 2
+    tp_size = 2
+    cp_size = 1
+
+    def allreduce(self, value: int, op: ReduceOp | None = None) -> int:
+        tensor = torch.tensor(value)
+        torch_dist.all_reduce(tensor)
+        return int(tensor.item())
+
+
+def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: str) -> None:
+    torch_dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=1),
+    )
+    try:
+        if rank == 0:
+            # Model a rank blocked in request_and_receive_sync(). It cannot
+            # participate in an idle-progress collective on the peer rank.
+            time.sleep(2)
+            return
+
+        executor = object.__new__(PyExecutor)
+        executor.dist = _TorchCollectiveDist()
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+            is_idle=True,
+        )
+    finally:
+        torch_dist.destroy_process_group()
+
+
+class _InflightRequestIds:
+    def __init__(self):
+        self.ids = set()
+
+    def insert(self, request_id):
+        self.ids.add(request_id)
+
+    def erase(self, request_id):
+        self.ids.discard(request_id)
+
+    def __contains__(self, request_id):
+        return request_id in self.ids
 
 
 class MockPyExecutor:
@@ -115,6 +184,263 @@ def mock_dist():
     mock_dist.rank = 0
     mock_dist.tp_size = 1
     return mock_dist
+
+
+def _make_async_encoder_executor(future):
+    executor = object.__new__(PyExecutor)
+    executor.dist = types.SimpleNamespace(tp_size=1)
+    executor.encoder_launch_executor = Mock()
+    executor.encoder_launch_executor.submit.return_value = future
+    executor.pending_encoder_steps = []
+    executor.inflight_req_ids = _InflightRequestIds()
+    executor._run_encoder_step_unchecked = Mock()
+    executor._publish_encoder_step = Mock()
+    executor._handle_errors = Mock()
+    return executor
+
+
+def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
+    executor = object.__new__(PyExecutor)
+    executor.max_batch_size = 32
+    batch_sizes = batch_sizes or [1, 2, 4, 8]
+    executor.llm_args = types.SimpleNamespace(
+        encoder_cuda_graph_config=types.SimpleNamespace(
+            batch_sizes=batch_sizes,
+            enable_padding=True,
+            num_tokens=[96],
+            seq_lens=[512],
+        ),
+        encoder_max_batch_size=encoder_max_batch_size,
+    )
+    executor.batch_wait_timeout_iters = 48
+    executor.encoder_batch_wait_iters_count = 0
+    return executor
+
+
+def _make_encoder_fallback_batch_wait_executor():
+    executor = object.__new__(PyExecutor)
+    executor.llm_args = types.SimpleNamespace(
+        encoder_cuda_graph_config=None,
+        encoder_max_batch_size=None,
+    )
+    executor.batch_wait_timeout_iters = 48
+    executor.encoder_batch_wait_iters_count = 0
+    executor.batch_wait_max_tokens_ratio = 0.5
+    executor.max_num_tokens = 32
+    executor.active_requests = []
+    executor.inflight_req_ids = _InflightRequestIds()
+    return executor
+
+
+def _make_encoder_request(request_id):
+    return types.SimpleNamespace(
+        request_id=request_id,
+        state=LlmRequestState.ENCODER_INIT,
+        encoder_output_len=4,
+    )
+
+
+def test_encoder_graph_warmup_uses_runtime_encoder_stream():
+    executor = object.__new__(PyExecutor)
+    executor.device_id = 3
+    executor.encoder_stream = Mock()
+    executor.resource_manager = object()
+    executor.model_engine = Mock()
+    stream_context = MagicMock()
+
+    with (
+        patch("torch.cuda.set_device") as set_device,
+        patch("torch.cuda.stream", return_value=stream_context) as cuda_stream,
+    ):
+        executor._warmup_encoder_cuda_graphs_enc_dec()
+
+    set_device.assert_called_once_with(3)
+    cuda_stream.assert_called_once_with(executor.encoder_stream)
+    executor.model_engine._warmup_encoder_cuda_graphs_enc_dec.assert_called_once_with(
+        executor.resource_manager
+    )
+
+
+def test_encoder_microbatch_graph_admission_boundaries():
+    executor = _make_encoder_batch_wait_executor()
+    encoder_requests = [object()] * 7
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 24,
+    )
+    assert scheduled == []
+    assert executor.encoder_batch_wait_iters_count == 1
+
+    executor = _make_encoder_batch_wait_executor()
+    encoder_requests = [object() for _ in range(12)]
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 20,
+    )
+    assert scheduled == encoder_requests[:8]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+    executor = _make_encoder_batch_wait_executor(
+        batch_sizes=[1, 3, 6],
+        encoder_max_batch_size=8,
+    )
+    executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
+    encoder_requests = [object() for _ in range(5)]
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [],
+    )
+    assert scheduled == encoder_requests[:3]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+    executor = _make_encoder_batch_wait_executor()
+    executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
+    encoder_requests = [object() for _ in range(8)]
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object() for _ in range(25)],
+    )
+    assert scheduled == []
+    assert executor.encoder_batch_wait_iters_count == executor.batch_wait_timeout_iters + 1
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object() for _ in range(24)],
+    )
+
+    assert scheduled == encoder_requests
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_fallback_distinguishes_inflight_encoder_and_decoder_work():
+    executor = _make_encoder_fallback_batch_wait_executor()
+    encoder_requests = [_make_encoder_request(1)]
+    inflight_encoder_request = _make_encoder_request(2)
+    executor.active_requests.append(inflight_encoder_request)
+    executor.inflight_req_ids.insert(inflight_encoder_request.request_id)
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [])
+    assert scheduled == encoder_requests
+    assert executor.encoder_batch_wait_iters_count == 0
+
+    decoder_request = types.SimpleNamespace(
+        request_id=3,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+    )
+    executor.active_requests = [decoder_request]
+    executor.inflight_req_ids.erase(inflight_encoder_request.request_id)
+    executor.inflight_req_ids.insert(decoder_request.request_id)
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [])
+    assert scheduled == []
+    assert executor.encoder_batch_wait_iters_count == 1
+
+
+def test_async_encoder_step_lifecycle():
+    ready_event = Mock()
+    ready_event.query.side_effect = [False, True]
+    result = EncoderStepResult(
+        hidden_states=torch.arange(12).reshape(6, 2),
+        sequence_lengths=[2, 4],
+        ready_event=ready_event,
+    )
+    future = Mock()
+    future.done.side_effect = [False, True]
+    future.result.return_value = result
+    executor = _make_async_encoder_executor(future)
+    active_request = types.SimpleNamespace(
+        request_id=11,
+        state=LlmRequestState.ENCODER_INIT,
+    )
+    completed_request = types.SimpleNamespace(
+        request_id=12,
+        state=LlmRequestState.GENERATION_COMPLETE,
+    )
+    requests = [active_request, completed_request]
+    executor._publish_encoder_step.side_effect = (
+        lambda encoder_requests, encoder_result: PyExecutor._publish_encoder_step(
+            executor,
+            encoder_requests,
+            encoder_result,
+        )
+    )
+
+    executor._submit_encoder_step(requests)
+    executor._poll_encoder_steps()
+
+    future.result.assert_not_called()
+    executor._publish_encoder_step.assert_not_called()
+    assert executor.inflight_req_ids.ids == {11, 12}
+    assert len(executor.pending_encoder_steps) == 1
+    executor.encoder_launch_executor.submit.assert_called_once_with(
+        executor._run_encoder_step_unchecked,
+        requests,
+    )
+
+    executor._poll_encoder_steps()
+    future.result.assert_called_once_with()
+    ready_event.query.assert_called_once_with()
+    executor._publish_encoder_step.assert_not_called()
+    assert executor.inflight_req_ids.ids == {11, 12}
+    assert len(executor.pending_encoder_steps) == 1
+
+    executor._poll_encoder_steps()
+    future.result.assert_called_once_with()
+    assert ready_event.query.call_count == 2
+    executor._publish_encoder_step.assert_called_once_with(requests, result)
+    assert executor.inflight_req_ids.ids == set()
+    assert executor.pending_encoder_steps == []
+    assert active_request.state == LlmRequestState.CONTEXT_INIT
+    assert active_request.py_encoder_output_ready_event is ready_event
+    assert torch.equal(active_request.py_encoder_output, result.hidden_states[:2])
+    assert completed_request.state == LlmRequestState.GENERATION_COMPLETE
+    assert not hasattr(completed_request, "py_encoder_output")
+
+    executor.execution_stream = Mock()
+    encoder_output = Mock()
+    active_request.py_encoder_output = encoder_output
+    scheduled_requests = types.SimpleNamespace(context_requests=[active_request])
+    executor._attach_encoder_output_to_execution_stream(scheduled_requests)
+
+    executor.execution_stream.wait_event.assert_not_called()
+    encoder_output.record_stream.assert_called_once_with(executor.execution_stream)
+    assert active_request.py_encoder_output_ready_event is None
+
+
+def test_tp_encoder_step_synchronizes_and_publishes_inline():
+    call_order = []
+    execution_stream = Mock()
+    encoder_stream = Mock()
+    encoder_stream.wait_stream.side_effect = lambda stream: call_order.append("wait_stream")
+    ready_event = Mock()
+    ready_event.synchronize.side_effect = lambda: call_order.append("synchronize")
+    result = EncoderStepResult(
+        hidden_states=torch.empty((1, 2)),
+        sequence_lengths=[1],
+        ready_event=ready_event,
+    )
+    future = Mock()
+    future.result.side_effect = lambda: (call_order.append("result"), result)[1]
+    executor = _make_async_encoder_executor(future)
+    executor.dist.tp_size = 2
+    executor.execution_stream = execution_stream
+    executor.encoder_stream = encoder_stream
+    executor._publish_encoder_step.side_effect = lambda requests, encoder_result: call_order.append(
+        "publish"
+    )
+    request = types.SimpleNamespace(request_id=13, state=LlmRequestState.ENCODER_INIT)
+
+    executor._submit_encoder_step([request])
+
+    assert call_order == ["wait_stream", "result", "synchronize", "publish"]
+    encoder_stream.wait_stream.assert_called_once_with(execution_stream)
+    assert executor.inflight_req_ids.ids == set()
+    assert executor.pending_encoder_steps == []
 
 
 @pytest.fixture
@@ -687,11 +1013,14 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_sync_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    def test_gen_only_no_context_benchmark_polls_context_when_idle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.is_benchmark_disagg = True
+        executor.dist.allreduce.return_value = 0
+        executor.dist.tp_allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -701,18 +1030,20 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            is_idle=True,
         )
 
-        executor.dist.allreduce.assert_not_called()
-        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor.dist.tp_allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
 
-    def test_sync_non_benchmark_skips_idle_transfer_collectives(self, monkeypatch):
+    def test_sync_transfer_skips_idle_progress_collectives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.is_benchmark_disagg = False
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -722,6 +1053,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            is_idle=True,
         )
 
         executor.dist.allreduce.assert_not_called()
@@ -729,6 +1061,19 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.assert_not_called()
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_sync_multi_rank_does_not_wait_for_blocked_peer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        rendezvous_file = tmp_path / "sync-idle-progress-rendezvous"
+
+        torch_mp.spawn(
+            _run_sync_idle_progress_rank,
+            args=(2, str(rendezvous_file)),
+            nprocs=2,
+            join=True,
+        )
 
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -1485,6 +1830,41 @@ def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
 
     assert len(stub.add_dummy_calls) == 1
     assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_tolerates_surplus_over_expected_on_busy_rank() -> None:
+    # expected_num_active_requests is capped at max_num_active_requests after
+    # the per-rank-load floor is applied, so a rank can legitimately end up
+    # holding more requests than the router expected -- e.g. when a pad dummy
+    # survives an iteration that was skipped fleet-wide and the next
+    # gather_all_rank_states counts it. This used to trip a bare assert and
+    # kill the executor event loop; a busy rank needs no dummy, so it must be
+    # tolerated instead.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS) for _ in range(3)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 3
+    # Tolerating must not leak a mutated expectation to downstream consumers.
+    assert stub.expected_num_active_requests == 2
+
+
+def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None:
+    # Tolerating the surplus must not short-circuit padding. A rank can hold
+    # more requests than expected AND have none of them schedulable (all parked
+    # at GENERATION_TO_COMPLETE), in which case it still schedules batch=0 and
+    # needs a dummy to stay in the forward-pass collectives.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE) for _ in range(3)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.expected_num_active_requests == 2
 
 
 def test_pad_dummy_allocation_failure_skips_padding():

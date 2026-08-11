@@ -42,10 +42,13 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
+    SampleStateTensorsHostTorch,
+    SampleStateTorch,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
     _request_strategy,
+    _SeedManager,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
@@ -56,6 +59,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     FlashInferGroupedStrategySampler,
     Greedy,
     MinP,
+    RequestSeeds,
     Strategy,
     StrategyMetadata,
     TemperatureOnly,
@@ -747,11 +751,222 @@ def test_select_generated_logits(
     run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
+def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.MonkeyPatch):
+    sampler = object.__new__(TorchSampler)
+    sampler.max_beam_width = 1
+    sampler._stable_greedy_request_ids = []
+    sampler._stable_greedy_seq_slots = []
+    sampler._stable_greedy_seq_slots_host = None
+    sampler._stable_greedy_seq_slots_cuda = None
+    monkeypatch.setattr(sampler, "_copy_to_host", lambda tensor: tensor.clone())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.sampler.sampler.prefer_pinned", lambda: False
+    )
+
+    original_tensor_to = torch.Tensor.to
+
+    def copy_without_cuda(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", copy_without_cuda)
+
+    logits = torch.tensor([[0.0, 1.0, 2.0]])
+    new_tokens = torch.zeros((1, 2, 1), dtype=torch.int32)
+    requests = [
+        LlmRequest(
+            request_id=0,
+            max_new_tokens=4,
+            input_tokens=[1],
+            sampling_config=SamplingConfig(),
+            seq_slot=seq_slot,
+            is_streaming=False,
+            is_draft=is_draft,
+        )
+        for seq_slot, is_draft in ((0, False), (1, True))
+    ]
+
+    for seq_slot, request in enumerate(requests):
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.generation_requests = [request]
+
+        (
+            _,
+            seq_slots_host,
+            _,
+            seq_slots_cuda,
+            _,
+            _,
+            single_step_greedy,
+        ) = sampler._process_requests(
+            scheduled_requests,
+            {"logits": logits},
+            new_tokens,
+            [0],
+        )
+
+        assert single_step_greedy
+        assert seq_slots_host.tolist() == [seq_slot]
+        assert seq_slots_cuda.tolist() == [seq_slot]
+        assert new_tokens[0, seq_slot, 0].item() == 2
+
+
+@force_ampere
+def test_greedy_no_repeat_ngram_uses_token_ban_path():
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
+        )
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1, 2, 1],
+        sampling_config=SamplingConfig(),
+        seq_slot=0,
+        is_streaming=False,
+    )
+    setattr(request, "py_no_repeat_ngram_size", 2)
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 0.0, 10.0, 9.0]], device="cuda")
+
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 3
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    ("penalty_name", "penalty_value"),
+    [
+        pytest.param("repetition_penalty", 100.0, id="repetition"),
+        pytest.param("presence_penalty", 2.0, id="presence"),
+        pytest.param("frequency_penalty", 2.0, id="frequency"),
+    ],
+)
+def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penalty_value: float):
+    if penalty_name == "repetition_penalty":
+        sampling_params = SamplingParams(repetition_penalty=penalty_value)
+    elif penalty_name == "presence_penalty":
+        sampling_params = SamplingParams(presence_penalty=penalty_value)
+    else:
+        assert penalty_name == "frequency_penalty"
+        sampling_params = SamplingParams(frequency_penalty=penalty_value)
+
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
+        )
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+        seq_slot=0,
+        is_streaming=False,
+    )
+
+    admission = ScheduledRequests()
+    admission.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(admission)
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 10.0, 9.0]], device="cuda")
+
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 2
+
+
 class TestFinishReasons:
     NOT_FINISHED = FinishReason.NOT_FINISHED
     STOP_WORDS = FinishReason.STOP_WORDS
     END_ID = FinishReason.END_ID
     LENGTH = FinishReason.LENGTH
+
+    def test_single_step_greedy_updates_finish_reasons_and_filters_completed_requests(self):
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        requests = [
+            LlmRequest(
+                request_id=0,
+                seq_slot=0,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=1,
+                seq_slot=1,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=2,
+                seq_slot=2,
+                input_tokens=[2, 0],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+        ]
+        requests[2].finish_by(FinishReason.LENGTH, 0)
+        new_tokens = torch.tensor([2, 7, 99], dtype=torch.int32)
+        state = SampleStateTorch(
+            requests=requests,
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=new_tokens,
+                finish_reasons=None,
+                first_finish_reasons=None,
+            ),
+            single_step_greedy=True,
+        )
+
+        sampler.update_requests(state)
+
+        assert all(request.is_finished for request in requests)
+        # The first request reaches EOS and length together; EOS takes precedence.
+        assert not requests[0].is_finished_due_to_length
+        assert requests[1].is_finished_due_to_length
+        assert requests[0].get_tokens(0)[-1] == 2
+        assert requests[1].get_tokens(0)[-1] == 7
+        assert requests[2].get_tokens(0) == [2, 0]
 
     class RequestCase:
         MAX_NEW_TOKENS = 10
@@ -1644,7 +1859,14 @@ class TestBatchedSampling:
             assert sample_state.sampler_event is not None
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
-            new_tokens_tensors.append(sample_state.host.new_tokens.unsqueeze(-1))
+            host_new_tokens = sample_state.host.new_tokens
+            if sample_state.single_step_greedy:
+                # The stable greedy path copies one token per active request instead of
+                # the full [step, slot, beam] buffer. This fixture uses dense sequence
+                # slots, so restore that layout before comparing sampling results.
+                assert host_new_tokens.shape == (len(sample_state.requests),)
+                host_new_tokens = host_new_tokens.reshape(1, -1, 1)
+            new_tokens_tensors.append(host_new_tokens.unsqueeze(-1))
         new_tokens = torch.cat(new_tokens_tensors, dim=-1)
         if num_repeats is None:
             new_tokens = new_tokens.squeeze(-1)
@@ -1963,6 +2185,7 @@ class TestBatchedSampling:
             generator: Optional[torch.Generator] = None,
             return_probs: bool,
             group_metadata: StrategyMetadata | None = None,
+            seeds: Optional[RequestSeeds] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
             assert generator is sampler.get_generator(logits.device)
             if isinstance(group_key, tuple):
@@ -1981,6 +2204,7 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                     group_metadata=group_metadata,
+                    seeds=seeds,
                 )
             )
             return result
@@ -2884,6 +3108,185 @@ class TestBatchedSampling:
                 input_offset += steps
 
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+
+
+class TestRequestSeed:
+    """Functional guards for per-request ``SamplingParams.seed``.
+
+    The property that matters is reproducibility that does not depend on batch
+    composition: a seeded request must draw the same tokens whether it runs
+    alone or beside unrelated requests, which is exactly what a single
+    batch-wide generator cannot provide.
+    """
+
+    VOCAB_SIZE = 128
+    NUM_STEPS = 8
+
+    @staticmethod
+    def _sampling_params(seed: Optional[int]) -> SamplingParams:
+        # Temperature+top_k keeps sampling stochastic, so matching tokens across
+        # runs indicate the seed is being honored rather than coincidence.
+        return SamplingParams(temperature=1.0, top_k=64, seed=seed)
+
+    def _run(
+        self,
+        sampling_params_list: list[SamplingParams],
+        *,
+        logits: torch.Tensor,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> torch.Tensor:
+        """Sample ``NUM_STEPS`` steps; returns tokens indexed by [step, seq slot]."""
+        harness = TestBatchedSampling()
+        seq_slot_assignment = (list(range(len(sampling_params_list))), len(sampling_params_list))
+        scheduled_requests = harness._build_mock_requests(
+            sampling_params_list=sampling_params_list,
+            seq_slot_assignment=seq_slot_assignment,
+            draft_lens=[0] * len(sampling_params_list),
+        )
+        sampler = TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=321,
+                max_draft_len=42,
+                max_beam_width=1,
+                max_num_sequences=len(sampling_params_list),
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=False,
+            )
+        )
+        return harness._sample(
+            sampler,
+            scheduled_requests,
+            {"logits": logits},
+            num_repeats=self.NUM_STEPS,
+            monkeypatch=monkeypatch,
+        )
+
+    def _logits(self, num_requests: int) -> torch.Tensor:
+        return torch.testing.make_tensor(
+            (num_requests, self.VOCAB_SIZE), dtype=torch.float32, device="cuda"
+        )
+
+    def test_seed_is_independent_of_batch_composition(self, monkeypatch: pytest.MonkeyPatch):
+        """The core guarantee: batching must not perturb a seeded stream."""
+        logits = self._logits(3)
+        seeded = self._sampling_params(1234)
+
+        alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
+
+        # Same seeded request, now in slot 0 of a batch whose other members
+        # draw from the same strategy group and would advance a shared
+        # generator's state.
+        batched = self._run(
+            [seeded, self._sampling_params(None), self._sampling_params(999)],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+
+        torch.testing.assert_close(alone[:, 0], batched[:, 0])
+
+        # Negative control, disabled until FlashInfer honors per-row seeds.
+        #
+        # The assertion above passes even if the seed path is entirely inert,
+        # because slot 0 is the one row whose seed is read either way. This
+        # check would catch that -- but flashinfer-python 0.6.15 reads only
+        # seed[0]/offset[0] for the whole call and distinguishes rows by
+        # blockIdx.x, so rows 1..N sample from row 0's seed and this assertion
+        # fails for reasons outside this code. Re-enable once the pinned
+        # FlashInfer supports per-row seeds -- tracked upstream in
+        # https://github.com/flashinfer-ai/flashinfer/pull/2345 (note it lands
+        # the feature as generator=(seed_arr, offset_arr), so the sampler call
+        # sites change with it).
+        #
+        # assert not torch.equal(batched[:, 0], batched[:, 2])
+
+    def test_draft_batch_does_not_disturb_target_seed_state(self):
+        """Draft slots come from a different SeqSlotManager over the same range.
+
+        Observing a draft batch must not look like a change of occupant for the
+        target request holding that slot number, which would reset its offset
+        and make it replay part of its stream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+
+        target = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=100,
+                py_is_draft=False,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([target])
+        manager.advance([0, 0, 0])
+        assert manager.any_seeded is False  # target carries no user seed
+        offset_before = manager._offsets[0].item()
+
+        # A draft request lands on slot 0, owned by `target` above.
+        draft = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=200,
+                py_is_draft=True,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([draft])
+        assert manager.any_seeded is False  # draft never uses the per-row path
+        assert manager._offsets[0].item() == offset_before
+        assert manager._slot_owner[0] == 100  # still the target request
+
+        # The target is unchanged when it comes back around.
+        manager.observe([target])
+        assert manager._offsets[0].item() == offset_before
+
+    def test_multi_row_offsets_do_not_overlap(self):
+        """Speculative decoding draws several rows per request per step.
+
+        Those rows must be assigned distinct stretches of the request's stream,
+        and the next step must resume past all of them -- otherwise a request
+        would replay the same random numbers across steps.
+
+        This asserts the offsets ``_SeedManager`` produces, not what the kernel
+        does with them: the pinned flashinfer reads only ``offset[0]``, so the
+        per-row values are not yet honored downstream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 1234
+        manager._seeds[1] = 999
+        manager._any_seeded = True
+
+        rows = [0, 0, 0, 1]  # slot 0 draws 3 tokens this step, slot 1 draws 1
+        device = torch.device("cpu")
+
+        first = manager.make_row_seeds(rows, device=device)
+        assert first.seed.tolist() == [1234, 1234, 1234, 999]
+
+        manager.advance(rows)
+        second = manager.make_row_seeds(rows, device=device)
+
+        # Each row reserves a stretch of the stream; the invariant is that no
+        # two stretches overlap, within a step or across steps. Asserted as a
+        # property rather than against OFFSET_STRIDE, so that a stride too small
+        # for the kernel's per-row consumption fails here instead of silently
+        # rescaling the expected values.
+        #
+        # flashinfer 0.6.15 reserves 32 offset units per row for the top-k/top-p
+        # rejection samplers, so a stride below that would replay random values.
+        # Only within a slot: distinct slots carry distinct seeds, so they are
+        # independent streams and may legitimately share offsets.
+        assert _SeedManager.OFFSET_STRIDE >= 32
+        per_slot: dict[int, set[int]] = {}
+        for offsets in (first.offset.tolist(), second.offset.tolist()):
+            for slot, off in zip(rows, offsets):
+                stretch = range(off, off + _SeedManager.OFFSET_STRIDE)
+                used = per_slot.setdefault(slot, set())
+                assert used.isdisjoint(stretch), (
+                    f"slot {slot} reuses offsets {off}..{off + _SeedManager.OFFSET_STRIDE - 1}; "
+                    "the stream is replayed"
+                )
+                used.update(stretch)
 
 
 class TestTopPDecay:

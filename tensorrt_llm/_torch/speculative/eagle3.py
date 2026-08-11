@@ -18,10 +18,9 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler, _select_mtp_position_ids
+from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -134,7 +133,13 @@ class Eagle3ResourceManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            self.slot_manager.add_slot(rid)
+            # In two-model speculation the target and draft engines share this
+            # resource manager, and each registers its own padding dummy under
+            # the same draft-length-derived request ID. Reserve the slot once
+            # and share it between them; dummy outputs are discarded, so the
+            # slot contents never matter (mirrors SuffixAutomatonManager).
+            if self.slot_manager.get_slot(rid) is None:
+                self.slot_manager.add_slot(rid)
         if self.sa_manager is not None:
             self.sa_manager.add_dummy_requests(request_ids)
 
@@ -593,22 +598,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                    i * self.hidden_size,
                                    (i + 1) * self.hidden_size)
                 break
-
-
-class Eagle3OneModelSampler(MTPSampler):
-    """Sampler for one-model EAGLE3 (linear and dynamic tree modes)."""
-
-    def __init__(self, args: TorchSampler.Args, spec_config=None):
-        self._spec_config = spec_config
-        super().__init__(args, nextn=args.max_total_draft_tokens)
-
-    def _get_max_new_tokens(self, args: TorchSampler.Args,
-                            draft_len: int) -> int:
-        """Dynamic tree: accepted path depth <= max_draft_len + 1."""
-        if (self._spec_config is not None
-                and getattr(self._spec_config, 'use_dynamic_tree', False)):
-            return self._spec_config.max_draft_len + 1
-        return self._get_max_tokens(args, draft_len)
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,7 +72,7 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
     std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
     std::optional<ITensor::SharedPtr> const& optReqLoraConfig, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig)
+    runtime::WorldConfig const& worldConfig, std::optional<tensorrt_llm::DataType> loraDataType)
 {
     TLLM_CHECK_WITH_INFO(optTaskId.has_value(), "lora_task_id must be set for LoRA inference");
     if (optReqLoraWeights.has_value() || optReqLoraConfig.has_value())
@@ -86,8 +86,10 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
             : ITensor::view(config, ITensor::makeShape({config->getShape().d[1], config->getShape().d[2]}));
 
         SizeType32 nbModelLayers = modelConfig.getNbLoraLayers();
-        TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
-            "Expected lora weights to be the same data type as base model");
+        auto const expectedDataType = loraDataType.value_or(modelConfig.getDataType());
+        TLLM_CHECK_WITH_INFO(weights->getDataType() == expectedDataType,
+            "Expected LoRA weights dtype %s to match homogeneous cache dtype %s", weights->getDataTypeName(),
+            IBuffer::getDataTypeName(expectedDataType));
 
         auto loraModules = modelConfig.getLoraModules();
         auto maxAdapterSize = modelConfig.getMaxLoraRank();
