@@ -330,10 +330,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 subpage_tokens,
             )
             logger.info(
-                f"[unified-kv] draft subpage view active: "
-                f"draft_layers={self._shared_draft_layer_ids} "
-                f"subdiv={self._draft_subpage_view_obj._subdiv} "
-                f"tokens_per_block={self._draft_subpage_view_obj.tokens_per_block}"
+                f"[unified-kv] draft sub-page view active "
+                f"(tokens_per_block={self._draft_subpage_view_obj.tokens_per_block})"
             )
         return self._draft_subpage_view_obj
 
