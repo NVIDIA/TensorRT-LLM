@@ -29,22 +29,24 @@ as-is; only the transformer runs on the TRT-LLM VisualGen stack.
 """
 
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 from diffusers.models import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio
 from diffusers.schedulers import MiniMaxH3Scheduler
 from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel,
 )
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
 # Per-row modality tags. They index the transformer's AdaLN table, so the
@@ -57,6 +59,12 @@ MINIMAX_H3_AUDIO_TAG = 2
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_ASPECT_RATIO = 1 / 4
 MINIMAX_H3_MAX_ASPECT_RATIO = 4
+
+# Request defaults. 124 frames is ~5.2 s at 24 fps, the shortest clip the
+# checkpoint was tuned for, and the guidance-distilled model needs the full
+# 50-point sigma grid.
+MINIMAX_H3_DEFAULT_NUM_FRAMES = 124
+MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS = 50
 
 # The audio VAE hops 800 samples at 32 kHz, i.e. 40 latents per second. Stereo
 # is carried as two channel-major blocks of audio rows (and as two batch items
@@ -124,6 +132,32 @@ def resolve_canvas_size(
     return max(multiple, round(height / multiple) * multiple), max(
         multiple, round(width / multiple) * multiple
     )
+
+
+def fit_keyframe_to_canvas(
+    keyframe: Image.Image, width: int, height: int, stretch: bool
+) -> Image.Image:
+    """Fit a `fl2va` keyframe onto the canvas.
+
+    The anchor that opens the video is stretched onto the canvas, a follower is
+    cover-cropped: scaled by the larger of the two axis ratios, then cropped
+    about the center. This is the released model's arithmetic, which differs
+    from `VaeImageProcessor`'s by a pixel on some aspect ratios.
+    """
+    if keyframe.size == (width, height):
+        return keyframe
+    if stretch:
+        return keyframe.resize((width, height), Image.Resampling.LANCZOS)
+
+    scale = max(width / keyframe.size[0], height / keyframe.size[1])
+    resized_size = (
+        max(width, round(keyframe.size[0] * scale)),
+        max(height, round(keyframe.size[1] * scale)),
+    )
+    left = max(0, (resized_size[0] - width) // 2)
+    top = max(0, (resized_size[1] - height) // 2)
+    resized = keyframe.resize(resized_size, Image.Resampling.LANCZOS)
+    return resized.crop((left, top, left + width, top + height))
 
 
 def align_num_frames(num_frames: int, frames_per_chunk: int, latents_per_chunk: int) -> int:
@@ -438,6 +472,40 @@ class MiniMaxH3Pipeline(BasePipeline):
     def pixel_std(self) -> Tuple[float, ...]:
         return (0.229, 0.224, 0.225)
 
+    @property
+    def default_generation_params(self) -> dict:
+        """Fields the executor merges into every request.
+
+        Key membership is also what marks a field supported during request
+        validation, so every knob the pipeline honours has to appear here or
+        a request that sets it is rejected before reaching ``infer()``.
+        ``height``/``width`` stay ``None``: the canvas is resolved from the
+        first keyframe's aspect ratio, or 16:9 for text-only requests.
+        """
+        return {
+            "height": None,
+            "width": None,
+            "num_frames": MINIMAX_H3_DEFAULT_NUM_FRAMES,
+            "num_inference_steps": MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS,
+            "frame_rate": self.fps,
+        }
+
+    @property
+    def extra_param_specs(self) -> dict:
+        """``last_image`` rides in ``extra_params``.
+
+        ``VisualGenParams`` forbids extra fields and declares only ``image``,
+        so the ``fl2va`` end keyframe has to be an explicitly declared extra
+        rather than an attribute read off the params model.
+        """
+        return {
+            "last_image": ExtraParamSchema(
+                type="str",
+                default=None,
+                description="Last keyframe for fl2va end-frame conditioning (MiniMax-H3).",
+            )
+        }
+
     def _init_transformer(self) -> None:
         logger.info("Initializing MiniMaxH3Transformer3DModel")
         model_config = self.pipeline_config.model_configs["transformer"]
@@ -563,12 +631,19 @@ class MiniMaxH3Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _encode_prompt(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_prompt(
+        self, prompt: str, keyframes: Optional[List[Image.Image]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize the prompt and encode it with the Qwen3-VL conditioner.
+
+        For a `fl2va` request every keyframe prepends a ``"<Picture i>: "`` label
+        and a vision block to the prompt presentation, and the keyframe pixels
+        are passed to the conditioner as image inputs. The vision-block rows
+        are tagged as video, matching the transformer's per-row AdaLN modality.
 
         Returns `(prompt_embeds, text_token_tags)` where `prompt_embeds` is
         `(1, num_text_tokens, text_dim)` read after decoder layer
-        `text_encoder_layer` and every tag is the text modality tag.
+        `text_encoder_layer`.
         """
         if not isinstance(prompt, str):
             raise ValueError(
@@ -576,8 +651,37 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"{type(prompt)}."
             )
 
-        # The prompt verbatim, with no chat template and no special tokens.
-        token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        vision_inputs = {}
+        if keyframes:
+            vision = self.processor.image_processor(images=keyframes, return_tensors="pt")
+            vision_inputs = {
+                "pixel_values": vision["pixel_values"],
+                "image_grid_thw": vision["image_grid_thw"],
+            }
+
+        # The presentation, tokenized: a `"<Picture i>: "` label and a vision
+        # block per keyframe, then the prompt verbatim, with no chat template
+        # and no special tokens.
+        token_ids, token_tags = [], []
+        if keyframes:
+            merge_size = self.processor.image_processor.merge_size**2
+            for index in range(len(keyframes)):
+                num_image_tokens = int(vision["image_grid_thw"][index].prod()) // merge_size
+                label_ids = self.tokenizer(f"<Picture {index + 1}>: ", add_special_tokens=False)[
+                    "input_ids"
+                ]
+                vision_ids = (
+                    [self.tokenizer.convert_tokens_to_ids("<|vision_start|>")]
+                    + [self.tokenizer.convert_tokens_to_ids("<|image_pad|>")] * num_image_tokens
+                    + [self.tokenizer.convert_tokens_to_ids("<|vision_end|>")]
+                )
+                token_ids += label_ids + vision_ids
+                token_tags += [MINIMAX_H3_TEXT_TAG] * len(label_ids) + [MINIMAX_H3_VIDEO_TAG] * len(
+                    vision_ids
+                )
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        token_ids += prompt_ids
+        token_tags += [MINIMAX_H3_TEXT_TAG] * len(prompt_ids)
 
         num_layers = self.text_encoder.config.text_config.num_hidden_layers
         if num_layers <= self.text_encoder_layer:
@@ -594,6 +698,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         mm_token_type_ids = torch.tensor(
             self.processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device
         )
+        vision_kwargs = {}
+        for name, value in vision_inputs.items():
+            vision_kwargs[name] = (
+                value.to(device, self.text_encoder.dtype)
+                if name.startswith("pixel_")
+                else value.to(device)
+            )
         with self._conditioner_on_device(device):
             outputs = self.text_encoder.model(
                 input_ids=input_ids,
@@ -601,13 +712,69 @@ class MiniMaxH3Pipeline(BasePipeline):
                 mm_token_type_ids=mm_token_type_ids,
                 use_cache=False,
                 output_hidden_states=True,
+                **vision_kwargs,
             )
             prompt_embeds = outputs.hidden_states[self.text_encoder_layer].to(
                 device=device, dtype=self.text_encoder.dtype
             )
             del outputs
-        text_token_tags = torch.full((len(token_ids),), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        text_token_tags = torch.tensor(token_tags, dtype=torch.long)
         return prompt_embeds, text_token_tags
+
+    def _encode_keyframes(
+        self, keyframes: List[Image.Image], encode_seed: int = 42
+    ) -> List[torch.Tensor]:
+        """Encode the `fl2va` keyframes into normalized conditioning latents.
+
+        The released model's recipe, reproduced exactly: pixels are
+        ImageNet-normalized, the posterior is sampled under a fresh generator
+        seeded independently of the request, and the sampled latent is rounded
+        to float16 before being normalized by the VAE's `latents_mean` /
+        `latents_std`.
+        """
+        device = self.vae.device
+        latents_mean = torch.tensor(self.vae.config.latents_mean, device=device).view(
+            1, -1, 1, 1, 1
+        )
+        latents_std = torch.tensor(self.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+        pixel_mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, -1, 1, 1, 1)
+        pixel_std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, -1, 1, 1, 1)
+
+        conditions = []
+        for keyframe in keyframes:
+            # (H, W, 3) -> (1, 3, 1, H, W): batch, channels, single frame, H, W.
+            pixels = torch.from_numpy(np.asarray(keyframe)).permute(2, 0, 1)[None, :, None]
+            pixels = pixels.to(device).to(torch.float32).div(255.0)
+            pixels = (pixels - pixel_mean) / pixel_std
+            posterior = self.vae.encode(pixels, return_dict=False)[0]
+            latents = posterior.sample(generator=torch.Generator().manual_seed(encode_seed))
+            latents = latents.to(torch.float16).float().cpu()
+            conditions.append((latents - latents_mean.cpu()) / latents_std.cpu())
+        return conditions
+
+    @staticmethod
+    def _load_keyframe(keyframe, anchor: str) -> Image.Image:
+        """Decode one request keyframe to RGB PIL.
+
+        Requests carry keyframes as a path, URL, data URI, or a one-element
+        list of those; a already-decoded ``PIL.Image`` is passed through so
+        in-process callers can hand one over directly. An undecodable
+        reference is the client's fault, so PIL's ``OSError`` becomes a
+        ``ValueError`` rather than surfacing as a server fault.
+        """
+        if isinstance(keyframe, (list, tuple)):
+            if len(keyframe) != 1:
+                raise ValueError(
+                    f"MiniMax-H3 takes a single {anchor} keyframe, got {len(keyframe)}."
+                )
+            keyframe = keyframe[0]
+        try:
+            return load_image(keyframe, format="pil")
+        except OSError as exc:
+            raise ValueError(
+                f"The {anchor} keyframe could not be decoded; it may be truncated, "
+                f"corrupt, or in an unsupported format: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Inference
@@ -622,18 +789,44 @@ class MiniMaxH3Pipeline(BasePipeline):
         seed = params.seed if params.seed is not None else 0
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
+        # `fl2va` keyframes: `image` anchors the video start, `last_image` the
+        # end. The first keyframe's aspect ratio resolves the canvas when the
+        # request does not. `image` arrives as a path/URL/bytes and `last_image`
+        # rides in `extra_params`, so both are decoded to PIL here.
+        extra = params.extra_params or {}
+        supplied_keyframes = tuple(
+            (anchor, kf)
+            for anchor, kf in (("first", params.image), ("last", extra.get("last_image")))
+            if kf is not None
+        )
+        keyframe_anchors = tuple(anchor for anchor, _ in supplied_keyframes)
+        keyframe_images = [self._load_keyframe(kf, anchor) for anchor, kf in supplied_keyframes]
+
         height = params.height
         width = params.width
         if (height is None) != (width is None):
             raise ValueError("`height` and `width` have to be passed together, or neither of them.")
         if height is None:
-            height, width = resolve_canvas_size(
-                16, 9, self.canvas_multiple, self.canvas_short_edge, self.canvas_max_pixels
-            )
+            if keyframe_images:
+                height, width = resolve_canvas_size(
+                    *keyframe_images[0].size,
+                    self.canvas_multiple,
+                    self.canvas_short_edge,
+                    self.canvas_max_pixels,
+                )
+            else:
+                height, width = resolve_canvas_size(
+                    16, 9, self.canvas_multiple, self.canvas_short_edge, self.canvas_max_pixels
+                )
         if height % self.canvas_multiple or width % self.canvas_multiple:
             raise ValueError(
                 f"`height` and `width` must be multiples of {self.canvas_multiple}, got {height}x{width}."
             )
+
+        keyframes = [
+            fit_keyframe_to_canvas(keyframe, width, height, stretch=index == 0)
+            for index, keyframe in enumerate(keyframe_images)
+        ]
 
         num_frames = params.num_frames if params.num_frames is not None else 124
         num_inference_steps = (
@@ -661,10 +854,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         latent_width = width // ratio
         num_audio_latents = audio_latent_num_frames(num_frames)
 
-        # 1. Text conditioning.
-        prompt_embeds, text_token_tags = self._encode_prompt(prompt)
+        # 1. Text conditioning. For `fl2va` the keyframes are presented as
+        # vision blocks in the prompt and additionally encoded into latent
+        # conditioning rows.
+        prompt_embeds, text_token_tags = self._encode_prompt(prompt, keyframes or None)
+        condition_latents = self._encode_keyframes(keyframes) if keyframes else []
 
-        # 2. Packed layout: [text | target audio | target video] for t2va.
+        # 2. Packed layout: [text | keyframe conditions | target audio | target video].
         (
             position_ids,
             token_tags,
@@ -679,6 +875,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             latent_width,
             num_audio_latents,
             self.transformer.patch_size,
+            keyframe_anchors=keyframe_anchors,
         )
         device = self.device
         position_ids = position_ids.to(device)
@@ -695,6 +892,18 @@ class MiniMaxH3Pipeline(BasePipeline):
         timesteps = self.scheduler.timesteps
         audio_timesteps = self.audio_scheduler.timesteps
 
+        # 4. Conditioning rows: one noise draw per keyframe, in packed order,
+        # before the generated rows' noise. The anchors are not fully clean —
+        # the released model noises them to `t = _KEYFRAME_NOISE_AUG` and holds
+        # them there for every step.
+        condition_rows = []
+        for condition in condition_latents:
+            noise = randn_tensor(
+                condition.shape, generator=generator, device=device, dtype=torch.float32
+            )
+            noised = self.scheduler.scale_noise(condition.to(device), _KEYFRAME_NOISE_AUG, noise)
+            condition_rows.append(patchify_video_latents(noised, self.transformer.patch_size))
+
         latents = randn_tensor(
             (1, self.vae_latent_channels, num_latent_frames, latent_height, latent_width),
             generator=generator,
@@ -702,6 +911,8 @@ class MiniMaxH3Pipeline(BasePipeline):
             dtype=torch.float32,
         )
         video_rows = patchify_video_latents(latents, self.transformer.patch_size)
+        if condition_rows:
+            video_rows = torch.cat(condition_rows + [video_rows])
         audio_rows = randn_tensor(
             (num_audio_latents * self.audio_channels, self.audio_latent_channels),
             generator=generator,
@@ -739,7 +950,9 @@ class MiniMaxH3Pipeline(BasePipeline):
                 audio_indices=audio_indices,
                 text_indices=text_indices,
             )
-            video_rows = self.scheduler.step(
+            # In-place: only the generated rows are written, so the
+            # conditioning anchors survive the whole loop untouched.
+            video_rows[num_condition_video_rows:] = self.scheduler.step(
                 video_velocity[0, num_condition_video_rows:].float(),
                 timestep,
                 video_rows[num_condition_video_rows:],
@@ -752,9 +965,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 return_dict=False,
             )[0]
 
-        # 5. Unpack the denoised rows back into latents.
+        # 5. Unpack the denoised rows back into latents. The conditioning rows
+        # rode through the loop untouched (only the generated rows were ever
+        # written) and are dropped here — only the generated rows are decoded.
         video_latents = unpatchify_video_latents(
-            video_rows,
+            video_rows[num_condition_video_rows:],
             num_latent_frames,
             latent_height,
             latent_width,
