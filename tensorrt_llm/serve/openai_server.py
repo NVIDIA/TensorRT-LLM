@@ -904,7 +904,9 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._collect_perf_metrics:
             self.app.add_middleware(PerfMetricsMiddleware,
                                     expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer)
+                                    writer=self._perf_metrics_writer,
+                                    clock_offset_provider=lambda: self.
+                                    disagg_server_steady_clock_offset)
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
     def _init_visual_gen(self):

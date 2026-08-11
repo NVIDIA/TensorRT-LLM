@@ -47,8 +47,9 @@ import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
+from tensorrt_llm._utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._perf_metrics_schema import (
@@ -191,7 +192,9 @@ STEP_METRICS_HEADER = "X-TRTLLM-Step-Metrics"
 CTX_CHUNK_METRICS_HEADER = "X-TRTLLM-Ctx-Chunk-Metrics"
 SSE_METRICS_EVENT = "trtllm.perf_metrics"
 RETURN_METRICS_HEADER = "X-TRTLLM-return-metrics"
+CLOCK_SYNC_HEADER = "X-TRTLLM-Clock-Sync"
 _RETURN_METRICS_HEADER_BYTES = RETURN_METRICS_HEADER.lower().encode()
+_CLOCK_SYNC_HEADER_BYTES = CLOCK_SYNC_HEADER.encode()
 
 _SCHEMA_VERSION = 1
 _PERF_METRICS_HEADER_BUDGET_BYTES = 80 * 1024
@@ -358,6 +361,7 @@ def build_metrics_record_from_headers(
     headers: Any,
     phase: str,
     request_id: str = "",
+    steady_clock_offset: float = 0,
 ) -> Optional[Dict[str, Any]]:
     """Build a request-local phase from standard metrics fields."""
     metrics_headers = {}
@@ -383,7 +387,7 @@ def build_metrics_record_from_headers(
         name, separator, timestamp = item.strip().partition(";ts=")
         if separator and name in fields:
             try:
-                timing_metrics[fields[name]] = float(timestamp)
+                timing_metrics[fields[name]] = float(timestamp) + steady_clock_offset
             except ValueError:
                 logger.warning("Ignoring invalid %s timestamp: %s", name, timestamp)
 
@@ -417,6 +421,49 @@ def build_metrics_record_from_headers(
         "metrics_headers": metrics_headers,
         "phases": {phase: phase_record},
     }
+
+
+def build_clock_sync_header(receive_time: float, transmit_time: float) -> str:
+    """Serialize worker receive/transmit timestamps for clock normalization."""
+    return f"receive;ts={receive_time:.9f}, transmit;ts={transmit_time:.9f}"
+
+
+def clock_offset_from_headers(
+    headers: Any,
+    originate_time: float,
+    destination_time: float,
+) -> float:
+    """Return the offset that maps response timestamps to the client clock."""
+    value = headers.get(CLOCK_SYNC_HEADER)
+    if not value:
+        return 0
+
+    timestamps = {}
+    for item in value.split(","):
+        name, separator, timestamp = item.strip().partition(";ts=")
+        if separator:
+            try:
+                timestamps[name] = float(timestamp)
+            except ValueError:
+                logger.warning("Ignoring invalid clock sync timestamp: %s", timestamp)
+                return 0
+
+    try:
+        receive_time = timestamps["receive"]
+        transmit_time = timestamps["transmit"]
+    except KeyError:
+        logger.warning("Ignoring incomplete clock sync header: %s", value)
+        return 0
+
+    values = (originate_time, receive_time, transmit_time, destination_time)
+    if not all(math.isfinite(timestamp) for timestamp in values):
+        logger.warning("Ignoring non-finite clock sync header: %s", value)
+        return 0
+
+    # NTP offset is worker clock minus client clock. Metrics need the inverse
+    # correction because combined disaggregated records use the client clock.
+    offset = ((receive_time - originate_time) + (transmit_time - destination_time)) / 2
+    return -offset
 
 
 def _limit_metrics_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -669,11 +716,16 @@ class PerfMetricsMiddleware:
     """Expose request metrics and optionally persist completed records."""
 
     def __init__(
-        self, app: Any, expose_headers: bool, writer: Optional[PerfMetricsJsonlWriter] = None
+        self,
+        app: Any,
+        expose_headers: bool,
+        writer: Optional[PerfMetricsJsonlWriter] = None,
+        clock_offset_provider: Optional[Callable[[], float]] = None,
     ):
         self._app = app
         self._expose_headers = expose_headers
         self._writer = writer
+        self._clock_offset_provider = clock_offset_provider
 
     async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -701,6 +753,15 @@ class PerfMetricsMiddleware:
                     headers.extend(
                         (name.encode(), value.encode()) for name, value in public_headers.items()
                     )
+                if return_metrics and self._clock_offset_provider is not None:
+                    receive_time = scope.get("state", {}).get("server_arrival_time")
+                    if receive_time is not None:
+                        offset = self._clock_offset_provider()
+                        clock_sync = build_clock_sync_header(
+                            receive_time + offset,
+                            get_steady_clock_now_in_seconds() + offset,
+                        )
+                        headers.append((_CLOCK_SYNC_HEADER_BYTES, clock_sync.encode()))
                 message["headers"] = headers
 
             elif message["type"] == "http.response.body" and not message.get("more_body", False):
