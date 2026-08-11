@@ -536,8 +536,13 @@ no-spec 应降级而非死锁、字节估算器补 draft 窗口放大）待报 u
 
 - 硬件/形态：DeepSeek-V4-Pro-DSpark，8×B300 单节点，`--tp_size 8 --ep_size 8`（DEP8，
   `enable_attention_dp: true`），`--max_batch_size 256 --max_num_tokens 4096`。
-- 负载：poetry = 固定短 prompt（写诗，输出 ~760 tok/req）；arena = arena 真实问题集。
-  客户端 burst-drain：一次性下发全部 N（512/1024）个请求，计时到全部完成，n=10 轮取中位。
+- 数据集：
+  - **poetry**：单条固定英文 free-verse 长诗 prompt（memory/rivers/glass/time 主题、
+    要求 ≥8 个场景、不许复用意象），复制 N 份。短输入（~60 tok）+ 长输出（实测
+    ~760 tok/req，自然 EOS）——短 ISL / 长 OSL 的极端。
+  - **arena**：arena-hard-v0.1 的 500 条真实问题（jsonl，取 `prompt` 字段，N>500 时循环
+    复用）。中等 ISL / 长输出的多样负载。
+- 客户端 burst-drain：一次性下发全部 N（512/1024）个请求，计时到全部完成，n=10 轮取中位。
   **注意：该协议下 99% 的步是纯 gen 步**（prefill 波在头几十步内结束）——这是收益成立的
   regime 前提。
 - S 臂 spec 配置（`pro_sched_arm.yaml`）：tiers `[2,3,4,5]`，
@@ -548,8 +553,11 @@ no-spec 应降级而非死锁、字节估算器补 draft 窗口放大）待报 u
 
 ### 负载 B：throughput_1k（roofline 对齐负载，agg 持续饱和）
 
-- 负载：throughput_1k parquet 前 1024 条（ISL≈1110），greedy，`max_tokens=64`；客户端
-  持续饱和（固定在飞数，完成即补位，ramp 256 后计量 1024 个完成）。
+- 数据集：roofline 报告使用的 **throughput_1k** parquet
+  （`iputterman/speed/throughput_1k/test-00000-of-00001.parquet`），按文件序取前 1024 条、
+  每条取 `turns[0]` 为 prompt（实测 ISL≈1110 tok）；greedy（temp=0），`max_tokens=64`。
+  注：源 parquet 的 SHA 与 roofline 报告冻结 dump 不同，对比其报告数字时需留意版本。
+- 客户端持续饱和：固定在飞数，完成即补位，ramp 256 个完成后计量 1024 个完成。
 - 关键物理：OSL=64 + 长 prompt + 持续补位 → **~50% 的步是 ctx+gen 混合步**，纯 gen 采的
   成本表在混合步高估节省（成本模型 ctx 盲），裁剪收益不成立（sched −1.2~−6.3%）。收益是
   **负载 regime 的函数**，不是普适常数。
