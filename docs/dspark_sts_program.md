@@ -634,6 +634,10 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 结论:上限=窗口池按 min_slots 下限定容(比例定容被推断的 max_seq_len=1M 饿死)+ 运行时每请求锁 2 块;**显式设 max_seq_len 即解钉**(用户已拍板 C 方向)。部署规约:DSv4 serving 必须显式设 `max_seq_len`(或 `avg_seq_len`),否则窗口池被钉死在 ~maxbs/2 并发,no-spec 高并发直接死锁。代码侧 C 修复(typical_seq_len 不默认 max_seq_len)+ 上游三报(下限建模、估算器漏 draft、死锁而非降级)待落。
 
+### GSM8K 精度回归:新表真实裁剪下通过(08-10 21:40)
+
+`test_gsm8k_dep8_ragged_verify[moe_backend=TRTLLM]`(DEP8 + overlap + CUDA graph + ragged verify + 置信度调度),`TLLM_DSPARK_SPS_TABLE=postfix_pro_table.json` 注入修复后真实表(planner 主动裁剪而非退化均匀),**1 passed(27 分钟)——精度 ≥ 记录参考值,断言通过**。终局判决的精度一环闭合。注:MEGAMOE_DEEPGEMM 变体在该节点因 DeepGEMM JIT "NVCC compilation failed" 无法初始化(nvcc 在位、/tmp 空,原因未深究;TRTLLM 变体即吞吐判决所用后端,更具代表性)。
+
 ### 产品线终局判决:Pro@DEP8 置信度调度全面转正(08-10 13:50)
 
 Flash 三臂翻案后,Pro@DEP8 终局(maxbs=256 解锁满批 + `postfix_pro_table.json` 新表,scheduled vs notrim,双节点臂序对调,每 cell n=10):
