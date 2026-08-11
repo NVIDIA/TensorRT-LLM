@@ -233,17 +233,19 @@ declines: freshness that cannot be shown is not assumed.
 
 ### 8.3 What happens with the result
 
-The tarball is downloaded (retried), the sqlite extracted, and `coverage_audit.py` run over it;
-any failure in this whole path is caught and non-fatal — `coverageDb.path` stays empty, Tier 2
-never runs, and the PR gets a full run.
+`--prepare DIR` does the whole fetch in one call: select, measure, stream the tarball down
+(retried, and streamed rather than buffered — it runs past 200 MB), unpack it, write the selection
+JSON beside the sqlite as `cbts_coverage_db.json`, and print `{path, meta}`. Groovy is left with
+the two things only it can do — bind the credential and run `coverage_audit.py` over the result —
+and any failure anywhere is caught and non-fatal: `coverageDb.path` stays empty, Tier 2 never
+runs, and the PR gets a full run.
 
-The selection JSON is written to `cbts_coverage_db.json` verbatim and reaches `main.py` as
-`--coverage-db-meta`, so a new field needs no Groovy change. `main.py` records all of it and
-**gates on the drift**: past `--coverage-max-drift` (default 30) the tier declines and the PR runs
-in full, on
-the grounds that a DB that far from the PR's base no longer describes who touches what in the code
-under test. A drift that could not be measured — including a meta file that is missing or
-unreadable — is treated the same way.
+Those two paths reach `main.py` as `--coverage-db` and `--coverage-db-meta`, so a new selection
+field needs no Groovy change. `main.py` records all of it and **gates on the drift**: past
+`--coverage-max-drift` (default 30) the tier declines and the PR runs in full, on the grounds that
+a DB that far from the PR's base no longer describes who touches what in the code under test. A
+drift that could not be measured — including a meta file that is missing or unreadable — is
+treated the same way.
 
 All of it lands in the decision and in OpenSearch:
 

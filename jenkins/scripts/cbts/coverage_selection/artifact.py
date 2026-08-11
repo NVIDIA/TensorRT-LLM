@@ -24,9 +24,10 @@ being per-IP and exhausted by shared CI egress.
 Ranking scores candidates against the tip of `COVERAGE_BRANCH`; gating scores the
 winner against the PR's merge base, which `--pr-head` supplies.
 
-`--print-selection` prints `{url, build, commit, lag, base_commit, drift,
-drift_status}` as JSON for the Groovy wiring, which downloads and extracts the
-tarball itself.
+Two entry points. `--print-selection` prints `{url, build, commit, lag,
+base_commit, drift, drift_status}` and stops. `--prepare DIR` goes on to
+download and unpack the winner, drop that JSON beside it, and print
+`{path, meta}` — the two paths `main.py` needs.
 """
 
 from __future__ import annotations
@@ -34,15 +35,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import tarfile
 import urllib.error
 import urllib.request
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 # Merged-artifact base for the main-branch L0_PostMerge job.
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
 TARBALL_NAME = "cbts_pystart_report.tar.gz"
+# sqlite at the tar root, and the selection JSON `prepare` drops beside it.
+DB_NAME = "cbts_touchmap.sqlite"
+META_NAME = "cbts_coverage_db.json"
 # Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
@@ -56,8 +63,12 @@ _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Max builds to walk back when recent builds have no tarball.
 _MAX_PROBE = 10
-# Per-request timeout in seconds.
+# Per-request timeout in seconds, for the small JSON/metadata calls.
 _TIMEOUT = 15
+# Socket timeout for the tarball itself, which runs to hundreds of MB.
+_DOWNLOAD_TIMEOUT = 300
+# Tarball download attempts.
+_RETRIES = 3
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -233,6 +244,81 @@ def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
     return sel
 
 
+def describe(sel: dict) -> str:
+    """One-line account of the selection, for the CI log."""
+    lag = "lag unknown" if sel.get("lag") is None else f"{sel['lag']} commit(s) behind main"
+    if sel.get("drift") is None:
+        drifted = "drift unmeasured"
+    else:
+        base = (sel.get("base_commit") or "")[:10]
+        drifted = f"{sel['drift']} commit(s) {sel.get('drift_status')} the PR base {base}"
+    return (
+        f"[artifact] build {sel.get('build')}, commit {(sel.get('commit') or 'unknown')[:10]}, "
+        f"{lag}, {drifted}"
+    )
+
+
+def download(url: str, dest: Path, attempts: int = _RETRIES) -> Optional[Path]:
+    """Stream the tarball into `dest`, retrying; None when every attempt fails.
+
+    Streamed, not buffered: the artifact runs to hundreds of MB.
+    """
+    out = dest / TARBALL_NAME
+    for attempt in range(1, attempts + 1):
+        try:
+            with (
+                urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT) as resp,
+                out.open("wb") as f,
+            ):
+                shutil.copyfileobj(resp, f)
+            return out
+        except OSError as e:  # HTTPError/URLError are OSError subclasses
+            print(f"[artifact] download {attempt}/{attempts} failed: {e}", file=sys.stderr)
+    return None
+
+
+def extract(tarball: Path, dest: Path) -> bool:
+    """Unpack the tarball into `dest`; False when it is not readable."""
+    try:
+        with tarfile.open(tarball, "r:gz") as tf:
+            # `filter` lands in 3.12 and is the default from 3.14; older runtimes lack it.
+            if sys.version_info >= (3, 12):
+                tf.extractall(dest, filter="data")
+            else:
+                tf.extractall(dest)
+    except (OSError, tarfile.TarError) as e:
+        print(f"[artifact] extract failed: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
+    """Resolve, measure, download and unpack the DB; `{path, meta}` or None on any failure.
+
+    `meta` is the selection JSON on disk, which `main.py --coverage-db-meta` reads.
+    Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
+    """
+    sel = select_tarball()
+    if sel is None:
+        return None
+    measure_drift(sel, pr_head)
+    print(describe(sel), file=sys.stderr)
+
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    tarball = download(sel["url"], dest)
+    if tarball is None or not extract(tarball, dest):
+        return None
+    db = dest / DB_NAME
+    if not db.is_file():
+        print(f"[artifact] {DB_NAME} not in the tarball", file=sys.stderr)
+        return None
+
+    meta = dest / META_NAME
+    meta.write_text(json.dumps(sel))
+    return {"path": str(db), "meta": str(meta)}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -246,6 +332,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
     )
     ap.add_argument(
+        "--prepare",
+        metavar="DIR",
+        default=None,
+        help="resolve, download and unpack the DB into DIR, then print {path, meta} as JSON",
+    )
+    ap.add_argument(
         "--pr-head",
         default=None,
         help="PR head revision; its merge base is what drift is measured against "
@@ -253,8 +345,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    if not args.print_selection:
-        ap.error("--print-selection is required")
+    if not args.print_selection and not args.prepare:
+        ap.error("one of --print-selection / --prepare is required")
+
+    if args.prepare:
+        ready = prepare(args.prepare, args.pr_head)
+        if ready is None:
+            return 1
+        print(json.dumps(ready))
+        return 0
 
     if args.build is not None:
         commit = build_commit(args.build)

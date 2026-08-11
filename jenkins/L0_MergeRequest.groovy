@@ -847,7 +847,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
         // Download the touch DB for audit + Tier 2 coverage-based narrowing.
-        def coverageDb = _cbtsCoverageAudit(pipeline, globalVars)
+        def coverageDb = _cbtsCoverageAudit(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -918,43 +918,29 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Download the touch DB, audit it, and return the sqlite path (or "" on failure).
-def _cbtsCoverageAudit(pipeline, globalVars)
+// Fetch the touch DB, audit it, and return its `[path, meta]` (both "" on failure).
+def _cbtsCoverageAudit(pipeline)
 {
     try {
-        // All commands run from ${LLM_ROOT}; covDir and the returned path are
+        // artifact.py resolves, downloads and unpacks; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
-        def covDir = "cbts_cov"
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
-        def prHeadArg = env.gitlabMergeRequestLastCommit ? " --pr-head ${env.gitlabMergeRequestLastCommit}" : ""
-        // Ranked by collected revision, not build number; the token is what measures it (depth-1 checkout cannot).
-        def selJson = ""
+        def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def readyJson = ""
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
-            selJson = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-selection${prHeadArg} || true",
+            readyJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
                 returnStdout: true,
             ).trim()
         }
-        if (!selJson) {
-            pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
+        if (!readyJson) {
+            pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
             return [path: "", meta: ""]
         }
-        def sel = new groovy.json.JsonSlurper().parseText(selJson)
-        def url = sel.url
-        pipeline.echo("CBTS audit: coverage DB from build ${sel.build}, " +
-                      "commit ${sel.commit ?: 'unknown'}, ${sel.lag == null ? 'lag unknown' : sel.lag + ' commit(s) behind main'}, " +
-                      "${sel.drift == null ? 'drift unmeasured' : sel.drift + ' commit(s) ' + (sel.drift_status ?: '') + ' the PR base ' + (sel.base_commit ?: '')}")
-        sh "cd ${LLM_ROOT} && mkdir -p ${covDir}"
-        // wget the tarball (retrying) and extract the sqlite.
-        trtllm_utils.llmExecStepWithRetry(pipeline, script:
-            "cd ${LLM_ROOT} && wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
-            "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
-        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
-           "--db ${covDir}/cbts_touchmap.sqlite"
-        // The selection JSON rides along verbatim for main.py's record and drift gate.
-        def metaPath = "cbts_coverage_db.json"
-        writeFile file: "${LLM_ROOT}/${metaPath}", text: selJson
-        return [path: "${covDir}/cbts_touchmap.sqlite", meta: metaPath]
+        def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
+        return [path: ready.path, meta: ready.meta]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
