@@ -370,7 +370,7 @@ class WanBlock(nn.Module):
         self._norm1_fp4_scale: Optional[torch.Tensor] = None
         self._norm2_fp4_scale: Optional[torch.Tensor] = None
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
-        self._fused_ln_supported = hidden_size == 5120
+        self._fused_ln_shape_supported = hidden_size == 5120
 
         self.ffn = MLP(
             hidden_size=hidden_size,
@@ -467,6 +467,19 @@ class WanBlock(nn.Module):
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
 
+    def _use_fused_ln(self, fp4_scale: Optional[torch.Tensor]) -> bool:
+        """Whether a norm site should take the fused LayerNorm kernel.
+
+        The kernel's value is folding the site's downstream NVFP4 quantize into
+        the normalization epilogue, so only take it where that quantize exists:
+        fp4_scale is its input scale, None for an unquantized checkpoint or a
+        quant-excluded layer. The op computes the LayerNorm statistics itself
+        and is not bit-exact with F.layer_norm, so with no quantize to fold in
+        we would pay that difference for nothing -- on Wan 2.2 T2V it alone
+        moved LPIPS from 0.040 to 0.225 (nvbugs/6535765).
+        """
+        return self._fused_ln_shape_supported and fp4_scale is not None
+
     def _fused_adaln_quant(self, x, scale_msa, shift_msa, temb, fp4_scale, eps):
         """Shared norm1/norm3 path: flatten x to 2D, build the per-token or
         per-batch modulation rows, and run the fused LayerNorm+AdaLN+NVFP4 op.
@@ -536,7 +549,7 @@ class WanBlock(nn.Module):
                 self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
-        if self._fused_ln_supported:
+        if self._use_fused_ln(self._norm1_fp4_scale):
             # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
             normed = self._fused_adaln_quant(
                 x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
@@ -566,7 +579,7 @@ class WanBlock(nn.Module):
         x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         if (
-            self._fused_ln_supported
+            self._use_fused_ln(self._norm2_fp4_scale)
             and isinstance(self.norm2, LayerNorm)
             and self.norm2.weight is not None
         ):
@@ -625,7 +638,7 @@ class WanBlock(nn.Module):
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
-        if self._fused_ln_supported:
+        if self._use_fused_ln(self._norm3_fp4_scale):
             normed = self._fused_adaln_quant(
                 x,
                 c_scale_msa,

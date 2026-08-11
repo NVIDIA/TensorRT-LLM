@@ -42,7 +42,10 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
+    WanBlock,
+    WanTransformer3DModel,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
@@ -163,14 +166,16 @@ WAN_1_3B_CONFIG = {
 }
 
 
-def _make_model_config(config_dict: dict) -> DiffusionModelConfig:
+def _make_model_config(
+    config_dict: dict, *, skip_create_weights: bool = False
+) -> DiffusionModelConfig:
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(**config_dict),
         quant_config=QuantConfig(),
         quant_config_dict=None,
         dynamic_weight_quant=False,
         force_dynamic_quantization=False,
-        skip_create_weights_in_init=False,
+        skip_create_weights_in_init=skip_create_weights,
     )
 
 
@@ -340,6 +345,32 @@ class TestWanUnit:
             ).float()
 
         torch.testing.assert_close(trt_out, hf_out, atol=0.4, rtol=0.4)
+
+    @pytest.mark.parametrize("num_heads,shape_supported", [(40, True), (12, False)])
+    def test_fused_layernorm_requires_its_quantize(self, num_heads, shape_supported):
+        """The fused LN kernel is only taken where a quantize exists to fold in.
+
+        The kernel derives the LayerNorm statistics itself and is not bit-exact
+        with F.layer_norm, so taking it with no downstream NVFP4 quantize costs
+        accuracy for nothing (nvbugs/6535765, nvbugs/6572800). Off the supported
+        hidden size (40 heads x 128 = 5120) it is never taken, scale or not.
+        """
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 1,
+            "num_attention_heads": num_heads,
+            "hidden_size": num_heads * WAN_1_3B_CONFIG["attention_head_dim"],
+        }
+        block = WanBlock(
+            model_config=_make_model_config(cfg, skip_create_weights=True), _layer_idx=0
+        )
+        assert block._fused_ln_shape_supported is shape_supported
+
+        # An unquantized checkpoint leaves every norm's fp4 scale unset.
+        assert block._norm1_fp4_scale is None
+        assert not block._use_fused_ln(block._norm1_fp4_scale)
+        # With a scale present, the fusion is taken iff the shape supports it.
+        assert block._use_fused_ln(torch.empty(1)) is shape_supported
 
 
 # ============================================================================
