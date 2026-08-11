@@ -15,12 +15,11 @@ and the budget then flows through the same confidence-ordered top-k, which
 hands different windows to requests with different survival. That exercises
 what actually ships.
 
-Why this matters beyond tidiness: the KV leak fixed in this branch (KV reserved
-for the full drafted block but only the verified window rewound) is reachable
-only when verified_len < draft_len. On this checkpoint the planner declines to
-trim at every batch size, because draft acceptance is ~90% and the fitted table
-says verifying the full block wins -- so without a way to make it trim, that
-code path ships untested.
+Why this matters beyond tidiness: the KV rewind path (KV reserved for the full
+drafted block but only the verified window rewound) is reachable only when
+verified_len < draft_len, and a well-fitted table can decline to trim at every
+batch size -- so without a table that forces trimming, that code path ships
+untested.
 """
 
 import torch
