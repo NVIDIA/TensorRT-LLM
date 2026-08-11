@@ -44,12 +44,32 @@ from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
 )
 from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
 
 situ_supported = pytest.mark.skipif(
     not is_native_situ_supported(),
     reason="native SiTU cubins require SM100/SM103 (Blackwell)",
 )
+
+
+@pytest.fixture
+def _single_rank_nccl_process_group(monkeypatch):
+    if dist.is_initialized():
+        yield
+        return
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", str(get_free_port()))
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    torch.cuda.set_device(0)
+    dist.init_process_group(backend="nccl", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @dataclasses.dataclass
@@ -750,7 +770,9 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
         pytest.param(32, 16, id="experts32-top16"),
     ],
 )
-def test_megamoe_deepgemm_situ_matches_trtllm_gen(num_tokens, num_experts, top_k):
+def test_megamoe_deepgemm_situ_matches_trtllm_gen(
+    num_tokens, num_experts, top_k, _single_rank_nccl_process_group
+):
     """Compare SiTU kernels with identical packed MXFP4 weights and routing.
 
     MegaMoE folds routing weights into the FC1 activation before its MXFP8
@@ -758,18 +780,6 @@ def test_megamoe_deepgemm_situ_matches_trtllm_gen(num_tokens, num_experts, top_k
     quantized graphs therefore need semantic, rather than elementwise,
     parity: high cosine similarity and bounded relative L2 error.
     """
-    if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29561")
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("LOCAL_RANK", "0")
-        torch.cuda.set_device(0)
-        dist.init_process_group(
-            backend="nccl",
-            rank=0,
-            world_size=1,
-        )
     bank = _make_packed_expert_bank(num_experts, _TP_INTERMEDIATE, _TP_HIDDEN)
     gate = _make_test_gate(num_experts=num_experts, top_k=top_k)
 
