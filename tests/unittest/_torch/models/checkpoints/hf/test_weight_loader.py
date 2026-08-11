@@ -15,6 +15,7 @@
 
 import mmap
 import os
+import threading
 from unittest import mock
 
 import pytest
@@ -367,6 +368,55 @@ def test_prefetch_one_file_resumes_reads_after_partial_populate(tmp_path, monkey
 def test_prefetch_one_file_missing_file_is_noop():
     # Missing files must be silently skipped (no exception).
     HfWeightLoader()._prefetch_one_file("/nonexistent/model.safetensors")
+
+
+def test_prefetch_one_file_logs_partial_populate_once(tmp_path, monkeypatch):
+    # A populate that consistently stops partway must be visible in the log
+    # (once per process, with the populated byte count) — otherwise every
+    # file silently pays for both a partial populate and a chunked read.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
+    monkeypatch.setattr(wl, "_PREFETCH_FALLBACK_LOGGED", threading.Event())
+
+    def partial_populate(file_name, window_bytes, on_window=None):
+        if on_window is not None:
+            on_window(mmap.PAGESIZE)
+        return mmap.PAGESIZE
+
+    monkeypatch.setattr(wl, "populate_file_pages", partial_populate)
+    file = tmp_path / "model.safetensors"
+    file.write_bytes(os.urandom(2 * mmap.PAGESIZE))
+
+    with mock.patch.object(wl.logger, "info") as info:
+        HfWeightLoader()._prefetch_one_file(str(file))
+        HfWeightLoader()._prefetch_one_file(str(file))  # must not log again
+
+    partial_logs = [c for c in info.call_args_list if "stopped after" in str(c)]
+    assert len(partial_logs) == 1
+    assert str(mmap.PAGESIZE) in str(partial_logs[0])
+
+
+def test_prefetch_one_file_no_fallback_log_when_fully_populated(tmp_path, monkeypatch):
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
+    monkeypatch.setattr(wl, "_PREFETCH_FALLBACK_LOGGED", threading.Event())
+    payload = os.urandom(2 * mmap.PAGESIZE)
+
+    def full_populate(file_name, window_bytes, on_window=None):
+        if on_window is not None:
+            on_window(len(payload))
+        return len(payload)
+
+    monkeypatch.setattr(wl, "populate_file_pages", full_populate)
+    file = tmp_path / "model.safetensors"
+    file.write_bytes(payload)
+
+    with mock.patch.object(wl.logger, "info") as info:
+        HfWeightLoader()._prefetch_one_file(str(file))
+
+    assert not [c for c in info.call_args_list if "chunked reads" in str(c)]
 
 
 def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):

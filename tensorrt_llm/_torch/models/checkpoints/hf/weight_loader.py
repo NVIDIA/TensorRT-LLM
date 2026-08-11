@@ -353,36 +353,54 @@ class HfWeightLoader(BaseWeightLoader):
             populated = populate_file_pages(file_name,
                                             _PREFETCH_CHUNK_SIZE_BYTES,
                                             report_progress)
-            if populated == 0 and not _PREFETCH_FALLBACK_LOGGED.is_set():
-                _PREFETCH_FALLBACK_LOGGED.set()
-                logger.info(
-                    "madvise(MADV_POPULATE_READ) is unavailable (requires "
-                    "Linux >= 5.14 and an mmap-capable filesystem); "
-                    "prefetching via chunked reads.")
             # Chunked reads resume from wherever population stopped: from
             # zero when MADV_POPULATE_READ is unsupported, reading nothing
             # when population already covered the whole file.
-            self._read_file_in_chunks(file_name, populated, report_progress)
+            read_back = self._read_file_in_chunks(file_name, populated,
+                                                  report_progress)
+            # Gate the fallback log on bytes actually read so a fully
+            # populated (or empty) file never logs, and name the cause:
+            # a partial populate would otherwise silently pay for both a
+            # populate and a chunked read of the remainder on every file.
+            if read_back > 0 and not _PREFETCH_FALLBACK_LOGGED.is_set():
+                _PREFETCH_FALLBACK_LOGGED.set()
+                if populated == 0:
+                    logger.info(
+                        "madvise(MADV_POPULATE_READ) did not populate "
+                        f"{file_name} (kernel < 5.14, filesystem without "
+                        "mmap support, or open/mmap failure; enable debug "
+                        "logging for the errno); prefetching via chunked "
+                        "reads.")
+                else:
+                    logger.info(
+                        "madvise(MADV_POPULATE_READ) stopped after "
+                        f"{populated} bytes of {file_name} (enable debug "
+                        "logging for the errno); finishing affected files "
+                        "via chunked reads.")
             logger.info(f"Finished prefetching {file_name}.")
 
     @staticmethod
     def _read_file_in_chunks(
             file_name: str,
             offset: int,
-            report_progress: Callable[[int], None] | None = None) -> None:
+            report_progress: Callable[[int], None] | None = None) -> int:
         # Read in fixed-size chunks into a reusable buffer instead of one
         # whole-file read: a whole-file read pins the entire file in
         # anonymous memory until it completes, and with up to 16 concurrent
         # multi-GB files per local rank, slow storage lets those buffers
         # accumulate into hundreds of GB across the local ranks, which can
         # OOM the host. Chunked reads warm the OS page cache identically
-        # with a constant per-thread footprint.
+        # with a constant per-thread footprint. Returns the number of bytes
+        # read, i.e. how much of the file population did not cover.
+        total_read = 0
         buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
         with open(file_name, 'rb') as f:
             f.seek(offset)
             while num_read := f.readinto(buffer):
+                total_read += num_read
                 if report_progress is not None:
                     report_progress(num_read)
+        return total_read
 
     def prefetch_files(self, file_names: List[str]):
         """

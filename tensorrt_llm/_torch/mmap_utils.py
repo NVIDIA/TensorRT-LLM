@@ -23,6 +23,7 @@ before using ``advise_tensor_pageout``.
 """
 
 import ctypes
+import errno as errno_codes
 import mmap
 import os
 from collections.abc import Callable
@@ -79,6 +80,20 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
         raise OSError(err, f"madvise() failed with errno={err}")
 
 
+def _log_populate_stop(message: str) -> None:
+    # Lazy import keeps this module importable standalone (no torch); the
+    # debug line carries the errno so a stopped populate is diagnosable.
+    try:
+        from tensorrt_llm.logger import logger
+    except ImportError:
+        return
+    logger.debug(message)
+
+
+def _errno_name(err: int) -> str:
+    return errno_codes.errorcode.get(err, "unknown")
+
+
 def populate_file_pages(
     file_name: str, window_bytes: int, on_window: Callable[[int], None] | None = None
 ) -> int:
@@ -107,7 +122,8 @@ def populate_file_pages(
         raise ValueError("window_bytes must be a positive multiple of the page size.")
     try:
         fd = os.open(file_name, os.O_RDONLY)
-    except OSError:
+    except OSError as e:
+        _log_populate_stop(f"populate_file_pages: open('{file_name}') failed: {e}")
         return 0
     try:
         size = os.fstat(fd).st_size
@@ -125,10 +141,16 @@ def populate_file_pages(
         ]
         addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
         if addr in (None, _MMAP_FAILED):
+            err = ctypes.get_errno()
+            _log_populate_stop(
+                f"populate_file_pages: mmap('{file_name}') failed with errno {err} "
+                f"({_errno_name(err)})"
+            )
             return 0
-    except OSError:
+    except OSError as e:
         # Same contract as an unsupported kernel/filesystem: stop early and
         # let the caller warm the file by other means.
+        _log_populate_stop(f"populate_file_pages: setup failed for '{file_name}': {e}")
         return 0
     finally:
         os.close(fd)  # The mapping keeps its own reference to the file.
@@ -142,6 +164,11 @@ def populate_file_pages(
                 ctypes.c_int(_MADV_POPULATE_READ),
             )
             if ret != 0:
+                err = ctypes.get_errno()
+                _log_populate_stop(
+                    f"populate_file_pages: madvise(MADV_POPULATE_READ) failed at offset "
+                    f"{populated} of '{file_name}' with errno {err} ({_errno_name(err)})"
+                )
                 break
             populated += length
             if on_window is not None:
