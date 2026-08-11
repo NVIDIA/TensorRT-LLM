@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 
 import pytest
@@ -67,7 +70,7 @@ def test_kv_cache_config_dtype_validation():
 def test_kv_cache_config_rejects_fp8_ds_mla_pool_rebalance():
     with pytest.raises(
         ValueError,
-        match="fp8_ds_mla.*enable_kv_pool_rebalance",
+        match=r"fp8_ds_mla.*enable_kv_pool_rebalance",
     ):
         KvCacheConfig(dtype="fp8_ds_mla", enable_kv_pool_rebalance=True)
 
