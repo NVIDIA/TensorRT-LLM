@@ -3363,7 +3363,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
         // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
         // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
-        // Redis is a native sidecar: Kubernetes < 1.33 must enable SidecarContainers.
+        // Redis is a native sidecar. A one-shot init container waits for Redis because
+        // the CI cluster rejects probe fields on restartable init containers.
         serviceInitContainerConfig = """
                 initContainers:
                   - name: redis
@@ -3372,16 +3373,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     restartPolicy: Always
                     ports:
                     - containerPort: 6379
-                    startupProbe:
-                      tcpSocket:
-                        port: 6379
-                      initialDelaySeconds: 1
-                      periodSeconds: 1
-                      failureThreshold: 30
-                    livenessProbe:
-                      tcpSocket:
-                        port: 6379
-                      periodSeconds: 10
                     resources:
                       requests:
                         cpu: 500m
@@ -3391,6 +3382,29 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         cpu: 500m
                         memory: 1Gi
                         ephemeral-storage: 2Gi
+                    imagePullPolicy: Always
+                  - name: wait-for-redis
+                    image: ${MODEL_EXPRESS_REDIS_IMAGE}
+                    command: ["/bin/sh", "-c"]
+                    args:
+                    - |
+                      attempt=0
+                      until redis-cli -h 127.0.0.1 ping | grep -q PONG; do
+                        attempt=\$((attempt + 1))
+                        if [ "\$attempt" -ge 30 ]; then
+                          exit 1
+                        fi
+                        sleep 1
+                      done
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 64Mi
+                        ephemeral-storage: 1Gi
+                      limits:
+                        cpu: 100m
+                        memory: 64Mi
+                        ephemeral-storage: 1Gi
                     imagePullPolicy: Always
         """
         serviceContainerConfig = """
