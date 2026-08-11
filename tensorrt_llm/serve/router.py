@@ -178,6 +178,13 @@ class KvCacheAwareServerState(ServerState):
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
                 f"{self._base_url}/kv_cache_events") as response:
+            # Same reason as _fetch_server_info: a still-initializing worker
+            # now answers 503 STARTING instead of refusing the connection, so
+            # an unchecked .json() would hand a STARTING body to
+            # update_with_events and fail deep inside the event loop with a
+            # shape error rather than at the source. poll_and_update() logs
+            # and moves on, so raising here just defers the poll.
+            response.raise_for_status()
             events_raw = await response.json()
         return events_raw
 
