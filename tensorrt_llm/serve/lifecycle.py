@@ -25,6 +25,16 @@ A serving process must be remotely distinguishable in exactly three states:
 dead                    Nothing is listening, so a TCP connect is refused.
 ======================  =====================================================
 
+Only the first two are :class:`ServerState` members, and deliberately so.
+``STARTING`` and ``READY`` are things the process *reports*; dead is the
+absence of a reporter. A ``DEAD`` enum value could only ever be served by
+a process still running enough to serve it, which is precisely the
+contradiction this contract removes -- a live socket answering "I am
+dead" is a fourth ambiguous state, not a clearer third one. Dead is
+therefore observed one layer down, as connection-refused, and never
+appears in ``ServerState`` or in the ``X-TensorRT-LLM-Server-State``
+header.
+
 Historically the listening socket only appeared *after* engine
 initialization finished (weight load, KV-cache allocation, warmup, CUDA
 graph capture -- minutes for a large model). The port was bound but never
@@ -121,7 +131,12 @@ ASGIApp = Callable[
 
 
 class ServerState(StrEnum):
-    """Observable startup state of a serving process."""
+    """Observable startup state of a *running* serving process.
+
+    There is intentionally no ``DEAD`` member: a dead process cannot
+    report anything, so death is observed as connection-refused rather
+    than as a value served over the wire. See the module docstring.
+    """
 
     STARTING = "starting"
     READY = "ready"
