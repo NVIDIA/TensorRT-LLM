@@ -27,6 +27,7 @@ Tier semantics (see gvr_routing):
     step.
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -44,10 +45,21 @@ LIST_SEG_A = 8192
 LIST_CAP_C = 24576
 LIST_WIDTH = 2 * LIST_SEG_A + LIST_CAP_C
 
-# Closed-loop lines around the published k-th anchor: t1 hugs the k-th
-# value from below; t0/t2 guard by the (anchor - kth) span.
-__all__ = ["GvrExtState", "LIST_EMIT_MIN_N", "LIST_PARK_LINE"]
+__all__ = ["GvrEmissionState", "LIST_EMIT_MIN_N", "LIST_PARK_LINE"]
 
+# Closed-loop line placement: fit the slope of log2(count) vs threshold
+# from the previous step's (lines, counts) and place the new lines at
+# these K-relative target counts (t0 loosest .. t2 tightest).
+LINE_TARGETS = (8.0, 5.0, 2.0)
+LIST_T0_TARGET = 2.5  # list tier: single collect-line target (xK)
+LIST_T0_COUNT_MAX = 6144.0  # keep n0 inside the [K+64, segA] admission band
+SLOPE_MIN = 0.05
+SLOPE_MAX = 64.0
+
+# No-fit fallback: multiplicative guards around the published k-th value
+# (t1 hugs it from below; t0/t2 guard by GUARD_LO/GUARD_HI spans).
+FALLBACK_REL = 2.0**0.125 - 1.0
+FALLBACK_ABS = 1e-3
 GUARD_LO = 2.0
 GUARD_HI = 0.5
 
@@ -58,7 +70,7 @@ GUARD_HI = 0.5
 LIST_PARK_LINE = 1.0e30
 
 
-class GvrExtState:
+class GvrEmissionState:
     """Per-attention-backend emission state (persistent buffers)."""
 
     def __init__(
@@ -69,6 +81,9 @@ class GvrExtState:
         # packed seed row: lines at cols 0..2, counts (emission-filled)
         # at 3..5, adaptive-skip pass count at 6
         self.seed_row = torch.zeros((max_rows, 8), dtype=torch.float32, device=device)
+        # contiguous alias of the three lines for the rungs tier (a
+        # [rows, 3] column view of the packed row is non-contiguous)
+        self.seed_rungs = torch.zeros((max_rows, 3), dtype=torch.float32, device=device)
         self.xstate = torch.zeros((max_rows, 8), dtype=torch.float32, device=device)
         self.cand_vals: Optional[torch.Tensor] = None
         self.cand_idx: Optional[torch.Tensor] = None
@@ -95,7 +110,7 @@ class GvrExtState:
             # address into the graph, so fail loudly instead
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "GvrExtState.ensure_block_max: (re)allocation requested "
+                    "GvrEmissionState.ensure_block_max: (re)allocation requested "
                     "during CUDA graph capture; the block_max buffer must be "
                     "created by a warmup step before capture"
                 )
@@ -124,26 +139,70 @@ class GvrExtState:
     def update_seed_rows(self, num_rows: int, emit_tier: str = "counts") -> None:
         """Device-side closed-loop line update from the last publish.
 
-        Pure tensor ops (graph-capturable). Rows with invalid xstate
-        (col 0 == 0, e.g. cold start) get non-finite lines, which the
-        kernel's validity guard routes to the stock path.
+        Slope-fits log2(count) vs threshold from the previous step's
+        (lines, counts) and places the new lines at K-relative target
+        counts. Counts come from the packed row (counts/list emission)
+        or from the kernel's rung-count publish in xstate cols 4..6
+        (rungs tier). Rows without a usable fit get multiplicative
+        guards around the published k-th value; rows with invalid
+        xstate (col 0 == 0, e.g. cold start) get non-finite lines,
+        which the kernel's validity guard routes to the stock path.
+        Pure tensor ops (graph-capturable).
         """
         s = self.seed_row[:num_rows]
         x = self.xstate[:num_rows]
-        kth = x[:, 1]
-        anch = torch.maximum(x[:, 2], kth + 1e-5)
-        span = (anch - kth).clamp_min(1e-4)
         valid = x[:, 0] > 0
+        kth = x[:, 1]
+        anchor = x[:, 2]
+        t_prev0 = s[:, 0]
+        t_prev2 = s[:, 2]
+        cnts = x[:, 4:7] if emit_tier == "rungs" else s[:, 3:6]
+        k = float(self.top_k)
         inf = torch.full_like(kth, float("inf"))
-        s[:, 0] = torch.where(valid, kth - GUARD_LO * span, inf)
+        d_fb = kth.abs() * FALLBACK_REL + FALLBACK_ABS
         if emit_tier == "list":
+            # two-point fit (t0_prev, n0) / (kth, K): kth is the exact
+            # k-th boundary on list rows
+            n0 = cnts[:, 0].clamp_min(1.0)
+            dthr = (kth - t_prev0).clamp_min(1e-3)
+            slope = ((torch.log2(n0) - math.log2(k)) / dthr).clamp(SLOPE_MIN, SLOPE_MAX)
+            tgt0 = min(LIST_T0_TARGET * k, LIST_T0_COUNT_MAX)
+            t0 = kth - math.log2(tgt0 / k) / slope
+            fit_ok = torch.isfinite(t_prev0) & (n0 > k)
+            t0 = torch.where(fit_ok, t0, kth - GUARD_LO * d_fb)
             park = torch.full_like(kth, LIST_PARK_LINE)
-            s[:, 1] = torch.where(valid, park, inf)
-            s[:, 2] = torch.where(valid, park + park, inf)
+            new0 = torch.where(valid, t0, inf)
+            new1 = torch.where(valid, park, inf)
+            new2 = torch.where(valid, park + park, inf)
         else:
-            s[:, 1] = torch.where(valid, kth - 1e-6, inf)
-            s[:, 2] = torch.where(valid, kth + GUARD_HI * span, inf)
+            c0 = cnts[:, 0].clamp_min(1.0)
+            c2 = cnts[:, 2].clamp_min(1.0)
+            dthr = (t_prev2 - t_prev0).clamp_min(1e-3)
+            slope = ((torch.log2(c0) - torch.log2(c2)) / dthr).clamp(SLOPE_MIN, SLOPE_MAX)
+            # anchor count estimate: slide the anchor onto the prev line fit
+            anch_c = (c2 * torch.exp2(-(anchor - t_prev2) * slope)).clamp(1.0, 1e6)
+            t0 = anchor + torch.log2(anch_c / (LINE_TARGETS[0] * k)) / slope
+            t1 = anchor + torch.log2(anch_c / (LINE_TARGETS[1] * k)) / slope
+            t2 = anchor + torch.log2(anch_c / (LINE_TARGETS[2] * k)) / slope
+            # t_prev2 < 1e29 also rejects a parked line left by a tier flip
+            fit_ok = torch.isfinite(t_prev0) & (t_prev2 < 1e29) & (c0 > c2)
+            t0 = torch.where(fit_ok, t0, kth - GUARD_LO * d_fb)
+            t1 = torch.where(fit_ok, t1, kth - 1e-6)
+            t2 = torch.where(fit_ok, t2, kth + GUARD_HI * d_fb)
+            # strictly ascending (kernel line-validity contract)
+            t1 = torch.maximum(t1, t0 + 1e-4)
+            t2 = torch.maximum(t2, t1 + 1e-4)
+            new0 = torch.where(valid, t0, inf)
+            new1 = torch.where(valid, t1, inf)
+            new2 = torch.where(valid, t2, inf)
+        s[:, 0] = new0
+        s[:, 1] = new1
+        s[:, 2] = new2
         s[:, 3:8] = 0.0
+        rungs = self.seed_rungs[:num_rows]
+        rungs[:, 0] = new0
+        rungs[:, 1] = new1
+        rungs[:, 2] = new2
         if self.cand_ctl is not None:
             self.cand_ctl[:num_rows].zero_()
             self.cand_cur[:num_rows].zero_()
@@ -177,8 +236,9 @@ class GvrExtState:
             kw["num_threads"] = route.num_threads
         if route.tier in ("counts", "list"):
             kw["seed_thr"] = self.seed_row[:num_rows]
-        # rungs tier: pass no seed at all (a [rows, 3] column view of the
-        # packed row is non-contiguous and would trip the runner's assert)
+        elif route.tier == "rungs":
+            # [rows, 3] seed selects the op's ext_rungs variant
+            kw["seed_thr"] = self.seed_rungs[:num_rows]
         if route.tier == "list":
             # accept_cap must match the emitter's segment geometry: the
             # buffers are laid out at bases 0 / LIST_SEG_A / 2*LIST_SEG_A,

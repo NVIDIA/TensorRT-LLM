@@ -7745,11 +7745,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # emission-assisted tiers: mode from which ext tensors the
             # caller handed in (see gvr_routing.plan_emission)
             if seed_thr is not None:
-                assert seed_thr.shape[1] == 3 or seed_thr.shape[1] >= 6, (
-                    "seed_thr width must be 3 (rungs) or >= 6 (packed "
-                    f"counts row); got {seed_thr.shape[1]} - refusing to "
-                    "silently ignore the seed")
-            use_ext_counts = seed_thr is not None and seed_thr.shape[1] >= 6
+                assert seed_thr.shape[1] == 3 or seed_thr.shape[1] == 8, (
+                    "seed_thr must be [rows, 3] (rungs) or [rows, 8] "
+                    "(packed lines + counts row, the width the kernel "
+                    f"is compiled for); got width {seed_thr.shape[1]}")
+            use_ext_counts = seed_thr is not None and seed_thr.shape[1] == 8
             ext_rungs = seed_thr is not None and seed_thr.shape[1] == 3
             use_ext_cand = cand_vals is not None
             enable_block_skip = block_max is not None
@@ -7864,6 +7864,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_batch_size: Required with ``counters``; ignored
                 otherwise. Power of 2 in ``[64, 1024]``, must match
                 the value passed to LB prepare.
+
+        Of the optional hint tensors the kernel WRITES ``xstate`` (the
+        closed-loop publish); it cannot be declared in ``mutates_args``:
+        torch.library raises IndexError when a declared-mutable Optional
+        arg is None at call time (re-verified on the pinned torch), and
+        most calls pass no hints. Under torch.compile/functionalization
+        the undeclared write is invisible, so the hint path is eager /
+        CUDA-graph only. ``TRTLLM_GVR_EMISSION=1`` gates the
+        emission-assisted wiring that feeds these tensors (opt-in,
+        experimental).
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9170,6 +9180,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Returns:
                 logits [B*next_n, max_context_len]; with emit_block_meta,
                 the tuple (logits, block_max, hit_stats).
+
+            The optional emission tensors (``block_max_out`` /
+            ``seed_thr`` / ``cand_*``) are written by the kernel but
+            cannot be declared in ``mutates_args``: torch.library raises
+            IndexError when a declared-mutable Optional arg is None at
+            call time (re-verified on the pinned torch), and plain
+            logits-only calls pass none of them. Emission is therefore
+            eager / CUDA-graph only.
             """
             B, next_n, H, half_D = q.shape
             N = next_n * H

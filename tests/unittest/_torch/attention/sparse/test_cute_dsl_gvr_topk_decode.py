@@ -1283,7 +1283,7 @@ def test_cute_dsl_gvr_topk_decode_tie_flood_beyond_capacity():
 # ---------------------------------------------------------------------------
 # Emission-assisted (ext) tiers: packed seed row / candidate list / block max.
 # Inputs emulate the indexer epilogue host-side against the layout contracts
-# in ``gvr_ext`` (segments at bases 0 / LIST_SEG_A / 2*LIST_SEG_A, packed row
+# in ``gvr_emission`` (segments at bases 0 / LIST_SEG_A / 2*LIST_SEG_A, packed row
 # = lines at [0..2] + exact counts at [3..5] + skip pass count at [6]).
 # ---------------------------------------------------------------------------
 
@@ -1365,7 +1365,7 @@ def test_cute_dsl_gvr_topk_decode_ext_counts(top_k, mode):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("mode", ["hit", "pads", "hist", "void", "bucketed"])
+@pytest.mark.parametrize("mode", ["hit", "pads", "hist", "void", "bucketed", "starved"])
 def test_cute_dsl_gvr_topk_decode_ext_list(mode):
     """Candidate-list tier at the production geometry (accept_cap =
     LIST_SEG_A, width = LIST_WIDTH).
@@ -1379,8 +1379,11 @@ def test_cute_dsl_gvr_topk_decode_ext_list(mode):
     void:     collection overflows LIST_CAP_C -> void=1 -> full scan.
     bucketed: three live lines spread across segments A/B/C, cut at the
               tightest line inside the band.
+    starved:  fewer than K real candidates, but sentinel pads lift the
+              claim into the admission band -> the line-cut copy must
+              re-measure and demote (exactness regression).
     """
-    from tensorrt_llm._torch.attention_backend.sparse.gvr_ext import (
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import (
         LIST_CAP_C,
         LIST_PARK_LINE,
         LIST_SEG_A,
@@ -1396,7 +1399,7 @@ def test_cute_dsl_gvr_topk_decode_ext_list(mode):
     if mode == "bucketed":
         lines = _lines_at_counts(logits, n_eff, (20000, 4000, 600))
     else:
-        n0 = {"hit": 4096, "pads": 4096, "hist": 12000, "void": 30000}[mode]
+        n0 = {"hit": 4096, "pads": 4096, "hist": 12000, "void": 30000, "starved": 400}[mode]
         l0 = _lines_at_counts(logits, n_eff, (n0,))
         lines = torch.cat(
             [l0, torch.full_like(l0, LIST_PARK_LINE), torch.full_like(l0, 2 * LIST_PARK_LINE)], 1
@@ -1405,7 +1408,7 @@ def test_cute_dsl_gvr_topk_decode_ext_list(mode):
     cand_vals = torch.full((batch, LIST_WIDTH), float("-inf"), dtype=torch.float32, device=dev)
     cand_idx = torch.full((batch, LIST_WIDTH), -1, dtype=torch.int32, device=dev)
     cand_ctl = torch.zeros((batch, 4), dtype=torch.int32, device=dev)
-    pads = 64 if mode == "pads" else 0
+    pads = {"pads": 64, "starved": 200}.get(mode, 0)
     for r in range(batch):
         ne = int(n_eff[r])
         row = logits[r, :ne]
@@ -1501,3 +1504,81 @@ def test_cute_dsl_gvr_topk_decode_ext_block_max(tail_mode):
     )
     torch.cuda.synchronize()
     _tie_aware_check(out_indices, logits, seq_lens, top_k, 1)
+
+
+def _emulate_emission(logits, n_eff, st, tier, top_k):
+    """Host-side stand-in for the indexer epilogue: fill the packed-row
+    counts (and the candidate list on the list tier) against the CURRENT
+    seed lines, exactly as the production emitter would."""
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import LIST_CAP_C, LIST_SEG_A
+
+    batch, N = logits.shape
+    dev = logits.device
+    lines = st.seed_row[:batch, 0:3]
+    pos = torch.arange(N, device=dev)[None, :]
+    valid = pos < n_eff[:, None]
+    finite = torch.isfinite(lines[:, 0])
+    counts = torch.stack(
+        [((logits >= lines[:, j : j + 1]) & valid).sum(-1) for j in range(3)], 1
+    ).float()
+    st.seed_row[:batch, 3:6] = torch.where(finite[:, None], counts, torch.zeros_like(counts))
+    if tier == "list" and st.cand_vals is not None:
+        st.cand_vals[:batch].fill_(float("-inf"))
+        st.cand_idx[:batch].fill_(-1)
+        st.cand_ctl[:batch].zero_()
+        for r in range(batch):
+            if not bool(finite[r]):
+                continue
+            ne = int(n_eff[r])
+            row = logits[r, :ne]
+            hits = torch.nonzero(row >= lines[r, 0], as_tuple=False).flatten()
+            cnt = int(hits.numel())
+            nwr = min(cnt, LIST_CAP_C)
+            base = 2 * LIST_SEG_A
+            st.cand_idx[r, base : base + nwr] = hits[:nwr].int()
+            st.cand_vals[r, base : base + nwr] = row[hits[:nwr]]
+            st.cand_ctl[r, 0] = cnt
+            st.cand_ctl[r, 1] = 1 if cnt > LIST_CAP_C else 0
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "tier_shape", [("list", 2, 131072), ("counts", 8, 131072), ("rungs", 1, 32768)]
+)
+def test_cute_dsl_gvr_topk_decode_ext_closed_loop(tier_shape):
+    """Chained multi-step closed loop: kernel xstate publish ->
+    update_seed_rows -> next step's emission and admission.
+
+    Step 2's logits shift the k-th value far beyond any fixed guard
+    width, so line placement must come from the fitted slope; every step
+    must stay exact regardless of which internal path admission picks.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import GvrEmissionState
+
+    want_tier, batch, N = tier_shape
+    top_k = 512
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    logits0, pre_idx, seq_lens = _make_inputs(
+        batch, N, top_k, torch.float32, 1, seed=17, varlen=False
+    )
+    dev = logits0.device
+    n_eff = seq_lens.to(device=dev, dtype=torch.long)
+    st = GvrEmissionState(max_rows=batch, top_k=top_k, device=dev, enable_list_tier=True)
+    # k-th drift per step: step1 -> step2 rises by ~0.05 (>> any fixed
+    # guard), step3 falls back near step1's level
+    shifts = (0.0, 0.05, -0.03)
+    for step, shift in enumerate(shifts):
+        logits = (logits0 + shift).contiguous()
+        tier, route = st.plan(batch, N, num_sms, compress_ratio=1)
+        assert tier == want_tier
+        st.update_seed_rows(batch, tier)
+        _emulate_emission(logits, n_eff, st, tier, top_k)
+        pre = torch.topk(logits.float(), top_k, dim=-1).indices.int().contiguous()
+        out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+        kw = st.topk_ext_kwargs(route, batch, None)
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits, pre, seq_lens, out_indices, top_k=top_k, **kw
+        )
+        torch.cuda.synchronize()
+        _tie_aware_check(out_indices, logits, seq_lens, top_k, 1)
+        assert bool((st.xstate[:batch, 0] > 0).all().item()), f"step {step}: publish missing"

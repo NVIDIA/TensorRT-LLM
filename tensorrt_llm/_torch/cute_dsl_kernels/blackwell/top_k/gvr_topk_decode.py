@@ -495,7 +495,9 @@ class GvrTopKKernel:
         self.enable_block_skip = bool(enable_block_skip)
         self.SKIP_BLOCK = 32
         self.SKIP_BLOCK_LOG2 = 5
-        self.SKIP_MAX_BLOCKS = 8192  # covers N up to 262144 at grain 32
+        self.SKIP_MAX_BLOCKS = 8192  # smem active-list budget (32KB of local
+        # ids); bounds block-skip to N_local <= 262144 at grain 32 - longer
+        # rows run the dense fallback and owe nothing to block-skip
         self.SKIP_UNROLL = 2
         self.skip_order = "grouped"
         if enable_block_skip and num_threads not in (512, 1024):
@@ -692,6 +694,14 @@ class GvrTopKKernel:
             self.cap_c = 0
         if use_ext_cand and not use_ext_counts:
             raise ValueError("use_ext_cand requires use_ext_counts")
+        if (use_ext_counts or ext_rungs or use_ext_cand) and not enable_r0:
+            # the effective flags below are and-ed with enable_r0; reject
+            # instead of silently compiling the stock path
+            raise ValueError("ext tiers require enable_r0")
+        if use_ext_cand and self.list_cap <= 0:
+            raise ValueError(
+                f"cand_cap={cand_cap} leaves no C segment past 2*accept_cap={2 * self.accept_cap}"
+            )
         # ext_rungs (two-pass variant B): closed-loop rung THRESHOLDS come
         # from the host (previous-step xstep lines); the kernel counts them
         # itself via the stock R0 multi-count and admits the tightest rung
@@ -1793,7 +1803,11 @@ class GvrTopKKernel:
                 # or the fallback (under) - exactly the v5 state machine
                 # fed with n0 == n1 == n2
                 curT0 = s_seg[0]
+                # claims past segA were dropped by the walk: honor the
+                # "void==0 means nothing was dropped" contract
                 s_seg[3] = cutlass.Int32(0)
+                if curT0 > cutlass.Int32(segA):
+                    s_seg[3] = cutlass.Int32(1)
                 s_seg[4] = curT0
                 s_seg[5] = curT0
                 s_seg[6] = curT0
@@ -5399,7 +5413,7 @@ class GvrTopKKernel:
         xstate: cute.Tensor,  # [numRows, 8] fp32 closed-loop state (or None)
         cand_vals: cute.Tensor,  # [numRows, CAP] fp32 scores (or None)
         cand_idx: cute.Tensor,  # [numRows, CAP] int32 positions (or None)
-        cand_ctl: cute.Tensor,  # [numRows, 2] int32 {claimed, void} (or None)
+        cand_ctl: cute.Tensor,  # [numRows, 4] int32 {n0, void, n1, n2} (or None)
     ):
         """Thin entry: bidx → row_idx → run_one_row.
 
@@ -5475,7 +5489,7 @@ class GvrTopKKernel:
         xstate: cute.Tensor = None,  # [numRows, 8] fp32 (emit_xstate)
         cand_vals: cute.Tensor = None,  # [numRows, CAP] fp32 (ext cand)
         cand_idx: cute.Tensor = None,  # [numRows, CAP] int32 (ext cand)
-        cand_ctl: cute.Tensor = None,  # [numRows, 2] int32 (ext cand)
+        cand_ctl: cute.Tensor = None,  # [numRows, 4] int32 (ext cand)
     ):
         """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
@@ -5532,6 +5546,18 @@ class GvrTopKKernel:
         # Slice per-row views.
         input_row = input_data[row_idx, None]
         pre_idx_row = pre_idx[pre_idx_row_idx, None]
+        # trace-time contract checks: a feature flag without its tensor
+        # must fail HERE, not as a NoneType subscript deep in the phases
+        if cutlass.const_expr((self.use_ext_counts or self.ext_rungs) and seed_thr is None):
+            raise ValueError("use_ext_counts/ext_rungs kernels require seed_thr")
+        if cutlass.const_expr(self.emit_xstate and xstate is None):
+            raise ValueError("emit_xstate kernels require xstate")
+        if cutlass.const_expr(
+            self.use_ext_cand and (cand_vals is None or cand_idx is None or cand_ctl is None)
+        ):
+            raise ValueError("use_ext_cand kernels require cand_vals/cand_idx/cand_ctl")
+        if cutlass.const_expr(self.enable_block_skip and block_max is None):
+            raise ValueError("enable_block_skip kernels require block_max")
         if cutlass.const_expr(self.enable_block_skip and block_max is not None):
             block_max_row = block_max[row_idx, None]
         else:
@@ -6635,6 +6661,7 @@ class GvrTopKKernel:
                     list_used = cutlass.Int32(1)
                     if tidx == cutlass.Int32(0):
                         s_iscalars[0] = cutlass.Int32(0)
+                        s_iscalars[2] = cutlass.Int32(0)  # non-sentinel count
                         s_thr[0] = anch_t
                         s_iscalars[1] = cutlass.Int32(1)  # done
                     cute.arch.barrier()
@@ -6654,6 +6681,7 @@ class GvrTopKKernel:
                         # no atomics - every read is a winner candidate.
                         if tidx == cutlass.Int32(0):
                             s_iscalars[0] = cut_n
+                        nreal_c = cutlass.Int32(0)
                         i_c = tidx
                         while i_c < cut_n:
                             for _ju in cutlass.range_constexpr(4):
@@ -6683,14 +6711,32 @@ class GvrTopKKernel:
                                         cute.AddressSpace.gmem,
                                         assumed_align=4,
                                     )
-                                    smem_vals[j_c] = cute.make_tensor(ip_c, cute.make_layout((1,)))[
-                                        0
-                                    ]
+                                    iv_c = cute.make_tensor(ip_c, cute.make_layout((1,)))[0]
+                                    smem_vals[j_c] = iv_c
+                                    # sentinel pads carry idx -1; cut_n
+                                    # (= claimed n0) counts them, so the
+                                    # REAL candidate count must be
+                                    # re-measured during the copy
+                                    if iv_c >= cutlass.Int32(0):
+                                        nreal_c = nreal_c + cutlass.Int32(1)
                             i_c = i_c + cutlass.Int32(4 * num_threads)
+                        wsum_c = self.warp_reduce_sum_i32(nreal_c)
+                        if lane_c == cutlass.Int32(0):
+                            atomicAdd(s_iscalars.iterator + cutlass.Int32(2), wsum_c)
                         wmax_w = self.warp_reduce_max_f32(wmax_acc)
                         if lane_c == cutlass.Int32(0):
                             smem_wcnt[tidx // cutlass.Int32(32)] = float_as_uint32(wmax_w)
                         cute.arch.barrier()
+                        # demote when the pad-inflated claim admitted a
+                        # list that holds fewer than K real candidates;
+                        # the stock path below recovers exactly
+                        real_c = s_iscalars[2]
+                        if real_c < cutlass.Int32(self.top_k):
+                            take_cand = cutlass.Int32(0)
+                            list_used = cutlass.Int32(0)
+                            if tidx == cutlass.Int32(0):
+                                s_iscalars[1] = cutlass.Int32(0)
+                            cute.arch.barrier()
                     if line_cut == cutlass.Int32(0):
                         # ---- histogram-edge cut: value-filtered mapped
                         # walk with merged-ballot claims (float edges
