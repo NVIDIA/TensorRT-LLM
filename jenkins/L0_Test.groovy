@@ -73,7 +73,8 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
-MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:0.4.1"
+MODEL_EXPRESS_VERSION = "0.4.1"
+MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
 
 //Ubuntu base image
@@ -4533,6 +4534,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+            }
+            if (stageName.contains("-ModelExpress-")) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
             }
         }
 
