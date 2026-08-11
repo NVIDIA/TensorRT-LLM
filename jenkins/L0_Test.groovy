@@ -2180,11 +2180,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         s3SecretKeyPathNode
                     ]
                 }
-                if (cluster.containerRuntime.toString() == "ENROOT") {
-                    filesToKeepWhenRetry += [
-                        enrootConfigDirNode
-                    ]
-                }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
 
                 def scriptSubmit = """#!/bin/bash
