@@ -7849,7 +7849,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton")
-        moe_config = MoeConfig(backend="CUTLASS")
+        moe_config = MoeConfig(backend="TRTLLM")
         # InferenceMAX evaluates a serving endpoint with client concurrency
         # capped at 64 (EVAL_CONCURRENT_REQUESTS); match that batching regime.
         max_batch_size = 64 if inferencemax else 32
@@ -7861,18 +7861,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             enable_piecewise_cuda_graph=True,
             capture_num_tokens=[1, 8192],
             max_num_streams=3)
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 sparse_attention_config=sparse_attention_config,
-                 moe_config=moe_config,
-                 cuda_graph_config=cuda_graph_config,
-                 torch_compile_config=torch_compile_config,
-                 max_seq_len=16384 if inferencemax else 4096,
-                 max_num_tokens=8192,
-                 max_batch_size=max_batch_size,
-                 trust_remote_code=True) as llm:
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                sparse_attention_config=sparse_attention_config,
+                moe_config=moe_config,
+                cuda_graph_config=cuda_graph_config,
+                #  torch_compile_config=torch_compile_config,
+                max_seq_len=16384 if inferencemax else 4096,
+                max_num_tokens=8192,
+                max_batch_size=max_batch_size,
+                trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if inferencemax:
                 task = GSM8KInferenceMax(model_name)

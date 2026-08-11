@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Mapping as TMapping
 
@@ -51,7 +52,7 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
+from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, TRTLLMGenFusedMoE, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -76,6 +77,8 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
+
+print(f"HAIDER modeling_minimaxm3 imported from {__file__}", file=sys.stderr, flush=True)
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -706,40 +709,54 @@ class MiniMaxM3MoE(nn.Module):
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
 
-        # Resolved on first use, once the expert weights and their scales
-        # exist. The answer cannot change after weight load.
-        self._routed_expert_input_scale: Optional[torch.Tensor] = None
-        self._routed_expert_input_scale_resolved = False
-
     @property
     def routed_expert_input_scale(self) -> Optional[torch.Tensor]:
         """NVFP4 global activation scale for the routed experts, or None.
 
-        Non-None only when the experts quantize their input to NVFP4 with a
-        static per-layer scale and no reshaping, which is what lets an
-        upstream kernel produce that quantized input in its epilogue.
+        Non-None only when the experts are a trtllm-gen MoE that quantizes its
+        input to NVFP4 with a static per-layer scale and no reshaping, which
+        is what lets an upstream kernel produce that input in its epilogue.
         """
-        if self._routed_expert_input_scale_resolved:
-            return self._routed_expert_input_scale
-        self._routed_expert_input_scale = self._resolve_routed_expert_input_scale()
-        self._routed_expert_input_scale_resolved = True
-        return self._routed_expert_input_scale
+        return self.resolve_routed_expert_input_scale()[0]
 
-    def _resolve_routed_expert_input_scale(self) -> Optional[torch.Tensor]:
-        experts = self.experts
+    def resolve_routed_expert_input_scale(self) -> Tuple[Optional[torch.Tensor], str]:
+        """The routed-expert input scale, and why it is what it is.
+
+        Recomputed per call rather than cached. The answer depends only on
+        load-time facts, but caching it would mean writing to an attribute
+        from inside the forward, which Dynamo cannot trace. Every read here
+        is a module attribute or a static shape, so a traced graph folds the
+        whole thing away.
+        """
+        # ConfigurableMoE is a wrapper; the expert weights and the activation
+        # quantize both live on the backend it dispatches to.
+        experts = getattr(self.experts, "backend", self.experts)
+        if not isinstance(experts, TRTLLMGenFusedMoE):
+            # Only this backend consumes an activation whose scale factors are
+            # in the linear layout the AllReduce epilogue emits. The weight
+            # geometry below is also specific to its FP4 packing.
+            return None, f"experts are {type(experts).__name__}, not TRTLLMGenFusedMoE"
         if not experts.has_nvfp4:
-            return None
+            return None, "experts are not NVFP4"
         if getattr(experts, "fc31_act_scale", None) is not None:
             # NVFP4_AWQ applies a per-channel pre-quant scale before
             # quantizing, which an RMSNorm epilogue cannot reproduce.
-            return None
+            return None, "NVFP4_AWQ pre-quant scale"
         w3_w1_weight = getattr(experts, "w3_w1_weight", None)
-        if w3_w1_weight is None or w3_w1_weight.shape[-1] * 2 != self.hidden_dim:
+        if w3_w1_weight is None:
+            return None, "w3_w1_weight is not loaded"
+        if w3_w1_weight.shape[-1] * 2 != self.hidden_dim:
             # The MoE pads the activation to the weight's hidden extent before
             # quantizing, which an epilogue emitting exactly hidden_dim
-            # columns cannot do.
-            return None
-        return getattr(experts, "fc31_input_scale", None)
+            # columns cannot do. The factor of two is the backend's FP4
+            # packing, matching how quantize_input sizes the padding.
+            return None, (
+                f"activation is padded from {self.hidden_dim} to {w3_w1_weight.shape[-1] * 2}"
+            )
+        scale = getattr(experts, "fc31_input_scale", None)
+        if scale is None:
+            return None, "fc31_input_scale is missing"
+        return scale, "available"
 
     def forward(
         self,
@@ -753,10 +770,12 @@ class MiniMaxM3MoE(nn.Module):
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
             # The experts take the pre-quantized activation when the caller
-            # supplies one.
+            # supplies one. An FP4 input carries no output dtype, so name the
+            # one the un-quantized activation already implies.
             return self.experts(
                 hidden_states if hidden_states_fp4 is None else hidden_states_fp4,
                 router_logits,
+                output_dtype=hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
             )
@@ -2385,6 +2404,20 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             )
         return self.post_attention_layernorm(hidden_states, residual)
 
+    def _check_moe_input_fold(self, reason: str) -> None:
+        """Fail if the MoE input quantize was not folded into the AllReduce.
+
+        Temporary instrumentation for local runs. Every way the fold can
+        decline is silent, so turn each one into a hard failure instead.
+        """
+        if not self.pre_feed_forward_fusion:
+            reason = "pre_feed_forward_fusion is off"
+        elif reason == "available":
+            return
+        raise RuntimeError(
+            f"HAIDER layer {self.layer_idx} MoE input NVFP4 quantize declined: {reason}"
+        )
+
     def _apply_pre_moe_norm(
         self,
         hidden_states: torch.Tensor,
@@ -2401,7 +2434,8 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         Returns a None fp4 tensor when the fold does not apply, leaving the
         MoE to quantize for itself.
         """
-        scale = self.block_sparse_moe.routed_expert_input_scale
+        scale, reason = self.block_sparse_moe.resolve_routed_expert_input_scale()
+        self._check_moe_input_fold(reason)
         if not self.pre_feed_forward_fusion or scale is None:
             hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
             return hidden_states, None, residual

@@ -990,7 +990,10 @@ class MoE(nn.Module):
         num_tokens = all_rank_num_tokens[
             self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
         hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
-        return x.new_empty((num_tokens, hidden_size), dtype=data_type)
+        # Fp4QuantizedTensor is a plain wrapper, so allocate off the tensor it
+        # carries rather than the wrapper itself.
+        proto = x.fp4_tensor if is_nvfp4_input else x
+        return proto.new_empty((num_tokens, hidden_size), dtype=data_type)
 
     # Sub class is not allowed to override forward.
     # This is universal interface for all MoE backends
