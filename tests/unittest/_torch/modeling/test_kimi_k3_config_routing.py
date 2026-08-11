@@ -15,6 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -106,7 +109,7 @@ class TestVisionRequiresReplication(unittest.TestCase):
         self.assertTrue(_vision_requires_replication(_vision_model_config(16, True), num_heads=16))
 
 
-def _load_config_from_dict(cfg):
+def _load_config_from_dict(cfg: dict[str, Any]) -> PretrainedConfig:
     """Round-trip a raw config dict through load_pretrained_config."""
     with tempfile.TemporaryDirectory() as model_dir:
         (Path(model_dir) / "config.json").write_text(json.dumps(cfg))
@@ -122,7 +125,7 @@ class TestKimiK3LoaderRouting(unittest.TestCase):
     just the predicate) fails in unit CI.
     """
 
-    def test_composite_checkpoint_loads_as_vlm(self):
+    def test_composite_checkpoint_loads_as_vlm(self) -> None:
         config = _load_config_from_dict(_composite_config())
         self.assertEqual(config.architectures, ["KimiK3ForConditionalGeneration"])
         self.assertEqual(config.model_type, "kimi_k3")
@@ -130,14 +133,14 @@ class TestKimiK3LoaderRouting(unittest.TestCase):
         self.assertIsNotNone(config.vision_config)
         self.assertEqual(config.vision_config.vt_num_attention_heads, 12)
 
-    def test_language_model_only_checkpoint_flattens_to_text(self):
+    def test_language_model_only_checkpoint_flattens_to_text(self) -> None:
         cfg = _composite_config()
         cfg["language_model_only"] = True
         config = _load_config_from_dict(cfg)
         self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
         self.assertEqual(config.model_type, "kimi_linear")
 
-    def test_text_only_kimi_linear_checkpoint_flattens(self):
+    def test_text_only_kimi_linear_checkpoint_flattens(self) -> None:
         config = _load_config_from_dict({"model_type": "kimi_linear", "hidden_size": 7168})
         self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
         self.assertEqual(config.model_type, "kimi_linear")
