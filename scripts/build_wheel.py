@@ -41,17 +41,79 @@ except (ImportError, ModuleNotFoundError):
 build_run = partial(run, shell=True, check=True)
 
 
-def get_available_cpu_count() -> int:
-    """Return the number of CPUs available to this process.
-
-    Respects the process CPU affinity mask (Linux) so that builds launched
-    inside a cgroup or taskset-constrained environment don't over-subscribe.
-    Falls back to the total CPU count on platforms that don't expose affinity.
-    """
+def _get_cpu_affinity() -> Optional[set[int]]:
     try:
-        return len(os.sched_getaffinity(0))
+        return set(os.sched_getaffinity(0))
     except AttributeError:
-        return cpu_count() or 1
+        return None
+
+
+def _parse_linux_physical_cpu_count(
+        cpuinfo: str, available_cpus: Optional[set[int]]) -> Optional[int]:
+    """Count physical CPU cores from Linux /proc/cpuinfo content."""
+    physical_cores = set()
+    current_cpu = {}
+
+    def add_current_cpu() -> None:
+        processor = current_cpu.get("processor")
+        physical_id = current_cpu.get("physical id")
+        core_id = current_cpu.get("core id")
+        if processor is None or physical_id is None or core_id is None:
+            return
+
+        try:
+            processor_id = int(processor)
+        except ValueError:
+            return
+
+        if available_cpus is not None and processor_id not in available_cpus:
+            return
+
+        physical_cores.add((physical_id, core_id))
+
+    for line in cpuinfo.splitlines():
+        if not line.strip():
+            add_current_cpu()
+            current_cpu = {}
+            continue
+
+        if ":" not in line:
+            continue
+
+        key, value = line.split(":", 1)
+        current_cpu[key.strip().lower()] = value.strip()
+
+    add_current_cpu()
+    return len(physical_cores) or None
+
+
+def _get_linux_physical_cpu_count(
+        available_cpus: Optional[set[int]]) -> Optional[int]:
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    return _parse_linux_physical_cpu_count(cpuinfo, available_cpus)
+
+
+def get_available_cpu_count() -> int:
+    """Return the default parallelism for native compilation.
+
+    Uses physical CPU cores when Linux exposes enough topology information.
+    Respects the process CPU affinity mask so builds launched inside a cgroup
+    or taskset-constrained environment don't over-subscribe. Falls back to the
+    available logical CPU count when physical topology is unavailable.
+    """
+    available_cpus = _get_cpu_affinity()
+    physical_cpu_count = _get_linux_physical_cpu_count(available_cpus)
+    if physical_cpu_count is not None:
+        return physical_cpu_count
+
+    if available_cpus is not None:
+        return len(available_cpus) or 1
+
+    return cpu_count() or 1
 
 
 @contextmanager
@@ -1266,7 +1328,7 @@ def add_arguments(parser: ArgumentParser):
         const=get_available_cpu_count(),
         nargs="?",
         help=
-        "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
+        "Number of parallel jobs for compilation (default: number of physical CPU cores available to this process, respecting affinity)"
     )
     parser.add_argument(
         "--cpp_only",
