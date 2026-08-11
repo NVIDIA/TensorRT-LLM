@@ -103,12 +103,6 @@ def llm_models_root() -> str:
     if not root.exists():
         root = Path("/scratch.trt_llm_data/llm-models/")
 
-    if not root.exists() and os.environ.get("TRTLLM_BINDINGS_STUB") == "1":
-        # Collection-only (Check Test List): class attributes such as
-        # MODEL_PATH = f"{llm_models_root()}/..." just need a string, and no
-        # weights are ever read. Real runs keep the assert below.
-        return str(root)
-
     assert root.exists(), (
         "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
     )

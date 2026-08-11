@@ -18,13 +18,10 @@ Options:
 --validate: Run AST-based validation of test list entries against source files.
 
 Collection stub (``--l0`` / ``--qa`` / ``--waive``):
-  These modes run ``pytest --co`` with ``tests/integration/defs/stubify_bindings.py``
-  (loaded only via ``-p stubify_bindings``, not by default) so TensorRT-LLM need
-  not be compiled and no ``tensorrt_llm`` wheel is downloaded. The stub fabricates
-  the compiled modules on demand; its ``_EXPLICIT`` table is only for symbols
-  whose real *value* is consumed at import time. Full local builds will not catch
-  stub gaps — watch Jenkins Check Test List. Pre-commit still runs only
-  ``--validate`` / waive duplicate checks (no stubbed ``--co``).
+  These modes run ``pytest --co`` with the plugin
+  ``tests/integration/defs/stubify_bindings.py`` to avoid compiling or
+  downloading TRT-LLM C++ binaries. Instead, the plugin creates a pure-Python
+  stub of the compiled modules.
 
 Note:
 All the perf tests will be excluded since they are generated dynamically.
@@ -563,18 +560,18 @@ def install_python_dependencies(llm_src):
 
 
 def _collection_pytest_env(llm_src):
-    """Env for stubbed ``pytest --co``: PYTHONPATH + bindings stub flags.
-
-    LLM_MODELS_ROOT is deliberately left alone: helpers degrade gracefully when
-    no models root exists, but an empty one makes model lookups fail.
-    """
+    """Env for stubbed ``pytest --co``: PYTHONPATH + placeholder models root."""
+    # The stubify_bindings plugin needs to be in the PYTHONPATH so it can be imported by pytest.
+    defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
     existing = os.environ.get("PYTHONPATH", "")
-    pythonpath = os.pathsep.join(p for p in (llm_src, existing) if p)
+    pythonpath = os.pathsep.join(p for p in (llm_src, defs_dir, existing) if p)
     return {
         **os.environ,
         "PYTHONPATH": pythonpath,
-        "TRTLLM_BINDINGS_STUB": "1",
         "TRT_LLM_NO_LIB_INIT": "1",
+        # Collection only needs llm_models_root() to be a directory.
+        # Fixtures and weight loads do not run under pytest --co.
+        "LLM_MODELS_ROOT": "/tmp",
     }
 
 
