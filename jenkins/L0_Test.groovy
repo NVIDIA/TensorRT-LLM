@@ -47,7 +47,6 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
-ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -711,6 +710,7 @@ def isValidSlurmJobId(def slurmJobID) {
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+        def s3SpoolRoot = "/home/svc_tensorrt/bloom/scripts/.s3-spool-${jobUID}"
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
@@ -746,7 +746,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} || true",
+            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -1423,7 +1423,7 @@ def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
     def args = nodeCount == 1 ? [
         "--nodes=${nodeCount}",
-        "--gpus=${gpuCount}"
+        "--gpus-per-node=${gpuCount}"
     ] : [
         "--nodes=${nodeCount}",
         "--ntasks=${gpuCount}",
@@ -1529,9 +1529,6 @@ def getPytestBaseCommandLine(
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
-    if (ENABLE_UPLOAD_TEST_RESULTS) {
-        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
-    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1796,17 +1793,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
-                        "-s",
+                        "--capture=fd",
                         "--s3-upload-path=${uploadPath}/${stageName}",
+                        "--s3-upload-mode=deferred",
                     ]
-                    if (ENABLE_S3_ECHO_STDOUT) {
-                        extraArgs += [
-                            "--s3-echo-stdout",
-                            "--s3-capture-mode=timestamped",
-                        ]
-                    }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -4488,17 +4480,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Temporarily disable to reduce the log size
         // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
         def extraArgs = [*clusterDurationsArgs]
-        if (ENABLE_UPLOAD_TEST_RESULTS) {
+        if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
-                "-s",
+                "--capture=fd",
                 "--s3-upload-path=${uploadPath}/${stageName}",
+                "--s3-upload-mode=deferred",
             ]
-            if (ENABLE_S3_ECHO_STDOUT) {
-                extraArgs += [
-                    "--s3-echo-stdout",
-                    "--s3-capture-mode=timestamped",
-                ]
-            }
         }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
@@ -4533,57 +4520,66 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
                 try {
-                    if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
+                    try {
+                        if (preprocessedLists.regularCount > 0) {
+                            sh """
+                                rm -rf ${stageName}/ && \
+                                cd ${llmSrc}/tests/integration/defs && \
+                                ${pytestCommand.join(" ")}
+                            """
+                        } else {
+                            echo "No regular tests to run for stage ${stageName}"
+                            noRegularTests = true
+                            sh "mkdir -p ${stageName}"
+                            // Create an empty results.xml file for consistency
+                            sh """
+                                echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
+                                echo '<testsuites>' >> ${stageName}/results.xml
+                                echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
+                                echo '</testsuite>' >> ${stageName}/results.xml
+                                echo '</testsuites>' >> ${stageName}/results.xml
+                            """
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
+                        if (isRerunFailed) {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Regular tests failed after rerun attempt"
+                            }
+                            rerunFailed = true
+                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                            // Rerun passed but the first run had a timeout: mark this
+                            // stage FAILURE so "[${stageName}] Run Pytest" turns red,
+                            // not just the enclosing parent stage.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests terminated unexpectedly, please check the test report."
+                            }
+                        }
+                    }
+
+                    // Run the isolated tests if exists
+                    if (preprocessedLists.isolateCount > 0) {
+                        stage ("[${stageName}] Run Pytest (Isolated)") {
+                            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
+                            rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
+                        }
                     } else {
-                        echo "No regular tests to run for stage ${stageName}"
-                        noRegularTests = true
-                        sh "mkdir -p ${stageName}"
-                        // Create an empty results.xml file for consistency
+                        echo "No isolated tests to run for stage ${stageName}"
+                        noIsolateTests = true
+                    }
+
+                    if (noRegularTests && noIsolateTests) {
+                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                    }
+                } finally {
+                    if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                         sh """
-                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                            echo '<testsuites>' >> ${stageName}/results.xml
-                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                            echo '</testsuite>' >> ${stageName}/results.xml
-                            echo '</testsuites>' >> ${stageName}/results.xml
+                            python3 ${llmSrc}/tests/test_common/s3_output.py \
+                                --drain-spool "${WORKSPACE}/${stageName}" || true
                         """
                     }
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
-                    if (isRerunFailed) {
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Regular tests failed after rerun attempt"
-                        }
-                        rerunFailed = true
-                    } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
-                        // Rerun passed but the first run had a timeout: mark this
-                        // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                        // not just the enclosing parent stage.
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Some tests terminated unexpectedly, please check the test report."
-                        }
-                    }
-                }
-
-                // Run the isolated tests if exists
-                if (preprocessedLists.isolateCount > 0) {
-                    stage ("[${stageName}] Run Pytest (Isolated)") {
-                        echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                        rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
-                    }
-                } else {
-                    echo "No isolated tests to run for stage ${stageName}"
-                    noIsolateTests = true
-                }
-
-                if (noRegularTests && noIsolateTests) {
-                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
             }
 

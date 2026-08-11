@@ -34,6 +34,7 @@
 #include <ATen/ATen.h>
 #include <algorithm>
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -131,6 +132,20 @@ void initBindings(nb::module_& m)
                 return GenLlmReq::VecTokens(tokens.begin() + begin, tokens.begin() + end);
             },
             nb::arg("beam"), nb::arg("begin"), nb::arg("end"))
+        // Zero-copy read-only int32 view of a beam's tokens (aliases the internal buffer; no
+        // per-token PyLong allocation, unlike get_tokens). reference_internal keeps this request
+        // alive for the view's lifetime. Consume synchronously — the view is invalidated if the
+        // token buffer is mutated/reallocated (e.g. by add_new_token). Used on the KV-cache-v2
+        // block-reuse hot path where it feeds an int32 fast path with no Python round-trip.
+        .def(
+            "get_tokens_view",
+            [](GenLlmReq const& self, GenLlmReq::SizeType32 beam)
+            {
+                auto const& tokens = self.getTokens(beam);
+                return nb::ndarray<nb::numpy, GenLlmReq::TokenIdType const, nb::ndim<1>, nb::c_contig>(
+                    tokens.data(), {tokens.size()});
+            },
+            nb::arg("beam"), nb::rv_policy::reference_internal)
         .def("get_last_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLastTokens), nb::arg("beam"))
         .def("get_last_tokens", nb::overload_cast<>(&GenLlmReq::getLastTokens))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, nb::arg("for_next_iteration") = false)

@@ -1518,9 +1518,12 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     _LANG_PREFIX = "language_model."
 
     @classmethod
-    def get_model_defaults(cls, llm_args: Any) -> dict:
-        """Use the C++ KV cache manager V2 by default."""
-        return {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Kimi K2.5."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(
