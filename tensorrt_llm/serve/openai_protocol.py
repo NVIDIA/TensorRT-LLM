@@ -212,6 +212,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
+    # Context worker -> generation worker: the reasoning mode the context
+    # worker read off the prompt it rendered. The generation worker only sees
+    # prompt_token_ids, so it cannot resolve this for itself.
+    resolved_thinking: Optional[bool] = None
 
 
 class ConversationParams(OpenAIBaseModel):

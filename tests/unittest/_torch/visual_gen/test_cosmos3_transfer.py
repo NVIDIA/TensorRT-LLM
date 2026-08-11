@@ -28,9 +28,13 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_m
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_PIPELINE_DEFAULTS,
+    COSMOS3_GENERATION_DEFAULTS,
     VIDEO_RES_SIZE_INFO,
 )
+
+# What a plain Cosmos3 video request advertises, and so what the executor
+# merges into every request before infer() sees it.
+_ADVERTISED_VIDEO_DEFAULTS = COSMOS3_GENERATION_DEFAULTS[("qwen3", "video")]
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     BILATERAL_D,
@@ -44,7 +48,11 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     resolve_transfer_config,
     uint8_cthw_to_normalized_5d,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import TransformerOutput
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import DISTILLED_GUIDANCE_SCALE
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    QWEN3_RECIPE,
+    TransformerOutput,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer
 from tensorrt_llm.media.decoding import VideoStreamInfo
 from tensorrt_llm.visual_gen.params import VisualGenParams
@@ -186,6 +194,16 @@ class StubSamplingPolicy:
         self.step_kwargs_calls += 1
         return {"generator": generator} if self.is_distilled else {}
 
+    def generation_default_overrides(self):
+        # Mirrors the real policy rather than returning {}, so a distilled stub
+        # still overrides the table the way the checkpoint would.
+        if not self.is_distilled:
+            return {}
+        return {
+            "num_inference_steps": len(self.fixed_sigmas),
+            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
+        }
+
     def num_steps(self, default):
         return len(self.fixed_sigmas) if self.is_distilled else default
 
@@ -201,6 +219,9 @@ def _make_pipeline(sampling=None):
     pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
     nn.Module.__init__(pipeline)
     pipeline.transformer = StubTransformer()
+    # __new__ skips __init__, which is where the real pipeline resolves this
+    # from the transformer config; the mode-defaults tables are keyed on it.
+    pipeline.family = QWEN3_RECIPE.name
     pipeline.scheduler = StubScheduler()
     pipeline.sampling = sampling or StubSamplingPolicy()
     pipeline.safety_checker = None
@@ -251,8 +272,8 @@ class TestTransferConfig:
         `infer()` sees it. A request carrying only those merged values must
         still get the preset; values the caller actually chose must win."""
         merged = _merged_req(
-            num_frames=COSMOS3_PIPELINE_DEFAULTS["num_frames"],
-            frame_rate=COSMOS3_PIPELINE_DEFAULTS["frame_rate"],
+            num_frames=_ADVERTISED_VIDEO_DEFAULTS["num_frames"],
+            frame_rate=_ADVERTISED_VIDEO_DEFAULTS["frame_rate"],
         )
         cfg = resolve_transfer_config({"wsm": True}, merged)
         assert (cfg.num_frames, cfg.fps) == (101, 10)
@@ -264,8 +285,11 @@ class TestTransferConfig:
     def test_advertised_defaults_are_left_intact(self):
         """The preset is recovered inside transfer, not by nulling the model's
         published defaults — clients read those to learn the output shape."""
-        assert COSMOS3_PIPELINE_DEFAULTS["num_frames"] == COSMOS3_720P_PARAMS["num_frames"]
-        assert COSMOS3_PIPELINE_DEFAULTS["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+        # Positive, not merely equal to the table they are read from: the
+        # advertised entry *is* that table, so an identity check would hold
+        # even if both were zeroed to make the preset win.
+        assert _ADVERTISED_VIDEO_DEFAULTS["num_frames"] > 0
+        assert _ADVERTISED_VIDEO_DEFAULTS["frame_rate"] > 0
 
     def test_precomputed_control_bytes_reach_the_decoder(self, monkeypatch):
         monkeypatch.setattr(

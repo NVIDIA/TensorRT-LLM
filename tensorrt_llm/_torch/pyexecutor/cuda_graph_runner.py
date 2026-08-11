@@ -48,6 +48,7 @@ class KeyType(NamedTuple):
     num_contexts: int = 0
     context_query_len: int = 0
     num_encoder_tokens: int = 0
+    peft_cache_data_type: Optional[torch.dtype] = None
 
 
 def _save_spec_decode_capture_state(
@@ -313,7 +314,8 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: Optional[torch.dtype] = None,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -339,7 +341,8 @@ class CUDAGraphRunner:
                           draft_len=draft_len,
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample)
+                          is_all_greedy_sample=is_all_greedy_sample,
+                          peft_cache_data_type=peft_cache_data_type)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -368,7 +371,8 @@ class CUDAGraphRunner:
                           is_all_greedy_sample=is_all_greedy_sample,
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
-                          num_encoder_tokens=num_encoder_tokens)
+                          num_encoder_tokens=num_encoder_tokens,
+                          peft_cache_data_type=peft_cache_data_type)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -429,6 +433,7 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: Optional[torch.dtype] = None,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
@@ -474,7 +479,8 @@ class CUDAGraphRunner:
         # callers pass the empty default and retain generation-only behavior.
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
-                                 promoted_context_request_ids)
+                                 promoted_context_request_ids,
+                                 peft_cache_data_type)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:

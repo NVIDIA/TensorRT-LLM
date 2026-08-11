@@ -293,16 +293,11 @@ class VisualGen:
 
     @property
     def default_params(self) -> "VisualGenParams":
-        """Returns a ``VisualGenParams`` with the loaded pipeline's defaults.
+        """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
 
         Universal fields (height, width, etc.) are filled from the
-        pipeline's defaults.  Pipelines with mode-dependent defaults
-        (e.g. Cosmos3, where text-to-image and video requests use
-        different resolutions) leave such fields as ``None``; they are
-        resolved per request from the output mode, so ``None`` here
-        means "the mode's default", not "unset".  All declared
-        ``extra_params`` keys are included with their defaults
-        (``None`` for params without one).
+        pipeline's defaults.  All declared ``extra_params`` keys are
+        included with their defaults (``None`` for params without one).
 
         Fields carrying a pipeline default are reported as unset, so a
         round trip through this object does not read as caller intent

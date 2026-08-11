@@ -421,6 +421,8 @@ class DiffusionExecutor:
                 # Marks it as a pipeline default rather than caller intent, so
                 # request-dependent defaults stay re-resolvable; assigning the
                 # field re-marks it.
+                # Assumes model_fields_set is the live __pydantic_fields_set__, not a
+                # copy; TestDefaultMarksThroughRealPath fails loudly if that changes.
                 params.model_fields_set.discard(field_name)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
