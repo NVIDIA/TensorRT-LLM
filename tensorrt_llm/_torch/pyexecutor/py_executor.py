@@ -886,7 +886,13 @@ class PyExecutor:
 
         env_threshold = os.environ.get("TLLM_HANG_DETECTOR_THRESHOLD")
         if env_threshold is not None:
-            hang_detection_timeout = int(env_threshold)
+            try:
+                hang_detection_timeout = int(env_threshold)
+            except ValueError:
+                logger.warning(
+                    f"Invalid value for TLLM_HANG_DETECTOR_THRESHOLD: {env_threshold} which shall be an integer. Using default."
+                )
+                hang_detection_timeout = 300
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
 

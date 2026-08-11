@@ -93,10 +93,8 @@ class HangDetector:
     def __init__(
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
-        self.timeout = (
-            timeout if timeout is not None and timeout > 0 else 300
-        )  # unused when disabled
-        self._disabled = self.timeout <= 0
+        self._disabled = timeout is not None and timeout <= 0
+        self.timeout = timeout if timeout is not None and timeout > 0 else 300
         self.on_detected = on_detected or (lambda: None)
         self.task = None
         self.loop = None
