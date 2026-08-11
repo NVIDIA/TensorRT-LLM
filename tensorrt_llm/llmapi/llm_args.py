@@ -3638,6 +3638,7 @@ class KVEventsConfig(StrictBaseModel):
         "decode on one host) must use distinct base ports.")
     replay_endpoint: Optional[str] = Field(
         default=None,
+        min_length=1,
         description=
         "Optional base ZeroMQ endpoint used to replay KV cache events.")
     buffer_steps: int = Field(

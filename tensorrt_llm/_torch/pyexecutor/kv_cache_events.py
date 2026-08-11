@@ -156,7 +156,16 @@ class ZmqEventPublisher(EventPublisher):
         self.published_batches = 0
         self._queue_full_drops = 0
         self._send_error_drops = 0
-        self._socket_setup()
+        try:
+            self._socket_setup()
+        except Exception:
+            # __init__ never returns on failure, so shutdown() is unreachable;
+            # close the sockets here to avoid leaking them on the shared context.
+            if self._pub is not None:
+                self._pub.close(linger=0)
+            if self._replay is not None:
+                self._replay.close(linger=0)
+            raise
         self._thread = threading.Thread(
             target=self._publisher_thread,
             daemon=True,
@@ -307,10 +316,17 @@ class ZmqEventPublisher(EventPublisher):
         """Apply vLLM's base-port-plus-rank endpoint convention."""
         if not endpoint or data_parallel_rank == 0:
             return endpoint
+        # Match the scheme with startswith so detection agrees with
+        # _socket_setup (substring tests misclassify hosts like "ipc-host").
         # ipc/inproc have no port; give each rank a distinct suffix instead.
-        if "inproc" in endpoint or "ipc" in endpoint:
+        if endpoint.startswith(("inproc://", "ipc://")):
             return f"{endpoint}_dp{data_parallel_rank}"
-        if "tcp" in endpoint and ":" in endpoint:
+        if endpoint.startswith("tcp://"):
+            host_port = endpoint[len("tcp://") :]
+            if ":" not in host_port:
+                raise ValueError(
+                    f"TCP KV event endpoint must include a port: {endpoint!r}"
+                )
             last_colon_idx = endpoint.rfind(":")
             base_addr = endpoint[:last_colon_idx]
             base_port = int(endpoint[last_colon_idx + 1 :])
@@ -320,7 +336,9 @@ class ZmqEventPublisher(EventPublisher):
                     f"KV event endpoint port exceeds 65535 for rank {data_parallel_rank}"
                 )
             return f"{base_addr}:{new_port}"
-        raise ValueError("Invalid endpoint: must contain 'inproc', 'ipc', or 'tcp'")
+        raise ValueError(
+            "Invalid endpoint: must start with 'inproc://', 'ipc://', or 'tcp://'"
+        )
 
 
 def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> EventPublisher:
@@ -349,6 +367,15 @@ def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
     # truncation, then reinterpret the low 64 bits as vLLM's signed wire hash.
     unsigned_hash = truncate_sha256_hash_to_int64(block_key)
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
+
+
+class _MultimodalBlockError(ValueError):
+    """A block token is a multimodal cache-key digest (bytes), not a wire int.
+
+    ``gen_multimodal_cache_key_tokens`` stores the per-item digest as ``bytes``,
+    which has no vLLM-wire integer representation. Such blocks are skipped
+    quietly rather than routed through the malformed-data traceback path.
+    """
 
 
 class StreamingKVCacheEventManager:
@@ -383,6 +410,7 @@ class StreamingKVCacheEventManager:
         self.stored_blocks = 0
         self.removed_blocks = 0
         self.partial_blocks_suppressed = 0
+        self.multimodal_blocks_suppressed = 0
         self.non_target_life_cycles_ignored = 0
         self.dropped_events = 0
         self.enqueued_batches = 0
@@ -452,6 +480,12 @@ class StreamingKVCacheEventManager:
         try:
             token_ids = self._token_ids(block.tokens)
             block_hash, parent_hash = self._block_hashes(block)
+        except _MultimodalBlockError:
+            # Expected for multimodal cache-key blocks; skip without the
+            # malformed-data traceback that would otherwise flood the log.
+            self.multimodal_blocks_suppressed += 1
+            self._pending_entries -= 1
+            return
         except ValueError:
             self.dropped_events += 1
             self._pending_entries -= 1
@@ -485,6 +519,9 @@ class StreamingKVCacheEventManager:
     def _token_ids(tokens: Any) -> list[int]:
         token_ids: list[int] = []
         for token in tokens:
+            if type(token) is bytes:
+                # Multimodal cache-key digest; not representable as a wire int.
+                raise _MultimodalBlockError
             if type(token) is not int:
                 raise ValueError("vLLM-compatible KV events require integer token IDs")
             token_ids.append(token)
