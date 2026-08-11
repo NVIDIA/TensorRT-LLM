@@ -85,15 +85,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        if self.kv_transfer_timeout_ms is None:
+            raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
         self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
-        transfer_timeout_s = (
-            self.kv_transfer_timeout_ms / 1000.0
-            if self.kv_transfer_timeout_ms is not None
-            else None
-        )
+        transfer_timeout_s = self.kv_transfer_timeout_ms / 1000.0
         sender_wait_slice_s = (
             self._sender_future_timeout_ms / 1000.0
             if self._sender_future_timeout_ms is not None

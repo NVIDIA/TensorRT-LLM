@@ -700,7 +700,7 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
     ("transfer_timeout_ms", "sender_wait_ms", "expected_timeout_s", "expected_slice_s"),
     [
         (60_000, 1_000, 60.0, 1.0),
-        (None, None, None, None),
+        (60_000, None, 60.0, None),
     ],
 )
 def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
@@ -765,6 +765,25 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
     assert worker_config.tx_timeout_s == expected_slice_s
     assert worker_config.tx_overall_timeout_s == expected_timeout_s
     assert worker_config.rx_timeout_s == expected_timeout_s
+
+
+def test_transceiver_rejects_unset_transfer_timeout() -> None:
+    cache_config = SimpleNamespace(
+        kv_transfer_timeout_ms=None,
+        kv_transfer_poll_interval_ms=5_000,
+        kv_transfer_sender_future_timeout_ms=1_000,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms",
+    ):
+        KvCacheTransceiverV2(
+            mapping=Mock(),
+            dist=Mock(),
+            kv_cache_manager=Mock(),
+            cache_transceiver_config=cache_config,
+        )
 
 
 def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> None:
