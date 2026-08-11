@@ -2333,7 +2333,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             None,  # kv_scale_orig_quant
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
-            int(metadata.kv_cache_manager.max_seq_len),
+            metadata.kv_cache_manager.max_seq_len,
             beam_width,
             self.quant_mode,
         )
@@ -2465,7 +2465,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_kv_heads,
             self.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
-            int(metadata.max_seq_len),  # attention_window_size
+            metadata.max_seq_len,  # attention_window_size
             metadata.beam_width,
             self.quant_mode,
             self.q_scaling,

@@ -57,7 +57,7 @@ class DeepSeekV4FlashMLA:
     ) -> None:
         """Apply RoPE and update the DeepSeek-V4 paged cache on Hopper."""
         if not is_generation:
-            if getattr(metadata, "max_ctx_seq_len", 0) > 0:
+            if metadata.max_ctx_seq_len > 0:
                 with nvtx_range_debug("mla_rope_append_paged_kv_assign_q_deepseek_v4_hopper"):
                     self._attention.mla_rope_append_paged_kv_assign_q(
                         q, latent_cache, metadata, is_generation=False

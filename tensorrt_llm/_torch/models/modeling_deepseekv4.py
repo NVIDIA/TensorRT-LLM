@@ -230,7 +230,7 @@ _SHARED_EXPERT_RENAME = {
 }
 
 
-def _get_deepseek_v4_routed_moe_scale_name(weights: Dict, key_prefix: str, moe_backend: str) -> str:
+def _get_deepseek_v4_routed_moe_scale_name(weights: Dict, key_prefix: str) -> str:
     """Return the model scale suffix for routed-expert checkpoint tensors."""
     for key, value in weights.items():
         if (
@@ -240,12 +240,6 @@ def _get_deepseek_v4_routed_moe_scale_name(weights: Dict, key_prefix: str, moe_b
             and getattr(value, "ndim", 0) == 2
             and getattr(value, "dtype", None) in (torch.int8, torch.uint8)
         ):
-            # Hopper CUTLASS uses the legacy WFP4A16 weight loader. It accepts
-            # the checkpoint's raw E8M0 scale codes but looks them up through
-            # the weight_scale_inv key. Blackwell CUTLASS and TRTLLM use the
-            # newer raw-MXFP4 loaders, whose contract is weight_scale.
-            if moe_backend.upper() == "CUTLASS" and get_sm_version() == 90:
-                return "weight_scale_inv"
             return "weight_scale"
     return "weight_scale_inv"
 
@@ -287,9 +281,10 @@ def _maybe_view_deepseek_v4_routed_moe_tensor(
 ) -> torch.Tensor:
     """Expose packed MXFP4 routed-expert tensors through their uint8 view."""
     if (
-        ".mlp.experts." in model_key
-        and (model_key.endswith(".weight") or model_key.endswith(f".{routed_moe_scale_name}"))
-        and tensor.dtype in (torch.int8, torch.float8_e8m0fnu)
+        routed_moe_scale_name == "weight_scale"
+        and ".mlp.experts." in model_key
+        and (model_key.endswith(".weight") or model_key.endswith(".weight_scale"))
+        and tensor.dtype != torch.uint8
     ):
         return tensor.view(torch.uint8)
     return tensor
@@ -391,10 +386,7 @@ def _copy_deepseek_v4_fused_a_weight_scale(
 
 
 def _remap_deepseek_v4_checkpoint_keys(
-    weights: Dict,
-    num_hidden_layers: int,
-    kv_lora_rank: int = 448,
-    moe_backend: str = "AUTO",
+    weights: Dict, num_hidden_layers: int, kv_lora_rank: int = 448
 ) -> Dict:
     """Convert DeepSeek-V4 checkpoint keys to model named-parameter keys.
 
@@ -413,9 +405,8 @@ def _remap_deepseek_v4_checkpoint_keys(
         are zero-filled — V4 indexer's k path is served by the compressor, so
         the base ``Indexer.wk`` / ``k_norm`` are unused at forward time.
       * Routed experts can use either FP8 block scales or the packed MXFP4
-        layout. The first routed expert weight and the resolved MoE backend
-        determine the scale suffix used for all routed expert tensors in the
-        shard.
+        layout. The first routed expert weight determines the scale suffix used
+        for all routed expert tensors in the shard.
       * ``self_attn.o_a_proj`` is loaded by the DeepSeek-V4 loader because it
         is a direct MLA parameter, not a child Linear module.
       * ``mtp.0.head.weight`` is dropped — DeepSeekV4MTP reuses the main
@@ -423,7 +414,7 @@ def _remap_deepseek_v4_checkpoint_keys(
         carries it but matches the main head, so we let the main head win.
     """
     mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
-    routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, "layers.", moe_backend)
+    routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, "layers.")
 
     def _rename_layer_subkey(rest: str) -> Optional[str]:
         # rest examples: "attn_norm.weight", "ffn_norm.weight",
@@ -587,7 +578,6 @@ class DeepseekV4WeightLoader:
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
-                moe_backend=self.model_config.moe_backend,
             )
             # Synthesize defaults (with correct shape pulled from the model)
             # for parameters the model has but the V4 checkpoint omits. We do

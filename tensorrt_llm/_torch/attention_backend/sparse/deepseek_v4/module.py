@@ -25,7 +25,6 @@ from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
 from .backend import DeepseekV4TrtllmAttention
 from .flash_mla import DeepSeekV4FlashMLA
-from .metadata import DeepseekV4TrtllmAttentionMetadata
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
@@ -639,12 +638,6 @@ def forward_generation_sparse_attn(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 generation absorption path."""
     if get_sm_version() < 100:
-        if latent_cache is None:
-            raise ValueError("DeepSeek-V4 Hopper generation requires a latent cache")
-        if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
-            raise TypeError(
-                "DeepSeek-V4 Hopper generation requires DeepseekV4TrtllmAttentionMetadata"
-            )
         if self._dsv4_flash_mla is None:
             raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
         return self._dsv4_flash_mla.forward_generation(
@@ -826,10 +819,6 @@ def forward_context_sparse_attn(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 context absorption path."""
     if get_sm_version() < 100:
-        if latent_cache is None:
-            raise ValueError("DeepSeek-V4 Hopper context requires a latent cache")
-        if not isinstance(attn_metadata, DeepseekV4TrtllmAttentionMetadata):
-            raise TypeError("DeepSeek-V4 Hopper context requires DeepseekV4TrtllmAttentionMetadata")
         if self._dsv4_flash_mla is None:
             raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
         return self._dsv4_flash_mla.forward_context(
@@ -1037,7 +1026,6 @@ def forward_sparse_attn(
     # construction rather than by assertion.
     _use_q_b_cute = (
         self.has_dsv4_indexer
-        and get_sm_version() >= 100
         and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
         and self.q_b_proj.bias is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
@@ -1290,12 +1278,6 @@ class DeepSeekV4Hooks(MLASparseHooks):
 
     def create_weights(self, mla: MLA) -> None:
         create_sparse_attn_weights(mla)
-
-    def supports_custom_op(self, mla: MLA) -> bool:
-        # Hopper ratio-4 decode updates persistent MODEL1 shadow-cache tensors
-        # that are not explicit custom-op arguments. This is also true when
-        # the source KV pool is BF16 because MODEL1 always consumes FP8 data.
-        return get_sm_version() >= 100 or not _has_dsv4_indexer(mla)
 
     def prepare_outputs(
         self,

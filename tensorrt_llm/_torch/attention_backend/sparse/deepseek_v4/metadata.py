@@ -36,6 +36,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     num_total_compressed_tokens: Dict[int, int]
     # The max number of context compressed tokens for each compress ratio
     max_ctx_compressed_tokens: Dict[int, int]
+    # Context metadata used by Hopper FlashMLA.
+    max_ctx_seq_len: int = 0
+    num_ctx_cached_tokens: int = 0
+    max_ctx_kv_len: int = 0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -54,15 +58,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
         )
-        # The Hopper path uses MLA's fused RoPE/cache-append helpers. Executor
-        # warmup can invoke the model before prepare(), so initialize the
-        # metadata fields those helpers read.
-        if not hasattr(self, "max_ctx_seq_len"):
-            self.max_ctx_seq_len = 0
-        if not hasattr(self, "num_ctx_cached_tokens"):
-            self.num_ctx_cached_tokens = 0
-        if not hasattr(self, "max_ctx_kv_len"):
-            self.max_ctx_kv_len = 0
         capture_graph = self.is_cuda_graph
         self.compress_ratio_set = set(self.compress_ratios)
         # Cache a sorted list for deterministic iteration order across
