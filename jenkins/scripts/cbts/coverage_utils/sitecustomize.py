@@ -170,12 +170,11 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     if _initial_nodeid:
         switch_test_context(_initial_nodeid)
 
-    # mpi4py.futures pool workers enable PY_START only after the product framework's first import
-    # settles (or CBTS_WORKER_ACTIVATE_MAX_SECONDS); every other process enables it now. Deferring
-    # keeps a wait_shutdown MpiPoolSession identity barrier from timing out on the instrumented cold
-    # import; coverage is unaffected since functions a test exercises are re-entered after activation.
+    # Product lazy imports make the instrumented worker bootstrap cheap enough to capture by default.
+    # CBTS_DEFER_WORKER_ACTIVATION=1 restores the old post-import activation if a worker bootstrap
+    # timeout regresses. Every non-MPI process continues to enable the tracker immediately.
     _defer_worker_activation = _is_mpi_pool_worker and os.environ.get(
-        "CBTS_DEFER_WORKER_ACTIVATION", "1"
+        "CBTS_DEFER_WORKER_ACTIVATION", "0"
     ) not in ("0", "false", "False", "")
 
     if not _defer_worker_activation:
