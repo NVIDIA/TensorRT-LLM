@@ -6,7 +6,7 @@ by NVIDIA TensorRT LLM team
 
 Agentic applications — coding assistants, deep-research pipelines, tree-structured reasoners — are a fast-growing share of LLM serving traffic, and they stress an inference system in ways chatbot traffic never did. Evaluation has not followed: performance is still reported on independent requests of fixed shape, while the workload served is a long-running, multi-turn, tool-invoking, sometimes parallel agent task. Hence a practical question for anyone deploying an agent stack: **how do we measure whether an inference system is actually good at agentic workloads?**
 
-We believe a good agentic benchmark should have four characteristics:
+Answering it starts with agreeing on what a good answer looks like. We believe a benchmark for agentic serving should have four characteristics:
 
 - **Intuitive** — it reports the quantity users actually care about, not a proxy.
 - **Realistic** — it reflects how the system behaves in a production agent deployment.
@@ -100,7 +100,7 @@ The pieces, one by one:
 
 The core tracing and replay code is in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with an example trace, runnable replay scripts, and analysis tools in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
 
-### Trace Dataset
+## Trace Dataset
 
 We collect 730 traces from four Scaffolding agents, each chosen for a distinct execution pattern and paired with a task suite that matches its workload:
 
