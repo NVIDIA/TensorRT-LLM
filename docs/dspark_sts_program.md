@@ -888,6 +888,14 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - 复证下一步已在跑:我环境重采 postfix Pro 表(pin{2,3,4,5} × conc{512,1024,2048} poetry,--from-iter-log),然后 scheduled vs notrim 终局对表主线 +9.9~+24.7%。
 - disagg 进展:R2 死因=ctx 挂 spec 后 host OOM(tp4 单节点 4 rank 双份权重 staging 撑爆 host RAM;slurm oom_kill 实锤)——**ctx 已改 tp8×2 节点**(与 gen 同规格),R3 在队。坑登记:Pro 这个体量,disagg ctx 至少 tp8(或关 TRTLLM_PINNED_WEIGHT_STAGING 试 tp4,未验)。
 
+## 【08-11 14:30】disagg bring-up 门禁全过 + agg 复证首轮的 STS 违规教训(laliao 侧)
+
+- **disagg R4 门禁全过**(poetry lbs64,ctx tp8×2 节点 + gen DEP8×2 + 两侧显式 max_seq_len 8192):**77,823 步 mode=64 逐字满档**、KV 传输全程行使零 FAILURE、无 IMA/OOM。单 job 同 NVL segment(--segment 分配)下 **MNNVL 免疫假设证实**——五件套里的 MNNVL=n / UCX_TLS 去 IB 是跨 job 跨机架的处方,同机架单 job 不需要。仅墙钟 2.5h 被截尾,已抬 4h。
+- **两个新坑入册**:①ctx(tp4 单节点)挂 spec 后 host OOM(双份权重 staging;Pro 体量 disagg ctx 至少 tp8);②harness 自动推导 ctx `max_seq_len=isl+40`,poetry 短 ISL 下= **104 < 窗口池几何 133**,稀疏 topk 被钳成非 4 倍数 → `SparseAttnTopK must be a multiple of 4` 在 ctx warmup 验证步断言(ctx+spec+短 ISL 的新角落,ISL≈1110 的负载永不触发)。修法都指回协议:**两侧显式 8192**。
+- **我环境的 postfix Pro 表出炉**(pin{2..5}×conc{512,1024,2048} poetry,--from-iter-log):fixed 35.1ms、α(256)=3.8ms、θ 单调(192→7.7 … 768→40.9 … 1536→78.9ms);**bs128 步时 54% 可裁 / w5→w2 省 27%,与主线表(56% / 26.7%)跨环境互证**。login 无 tensorrt_llm 的拟合配方:venv numpy + 包级 stub runner(绕开重 __init__)。
+- **agg scheduled 复证首轮为负(−4~−12%)——但发现协议违规**:我的 config 挂了旧 `sts_v1_reconstructed.json`,主线 Pro 的 +9.9~+24.7% 是**裸 sigmoid**;过时温度扭曲排序即乱裁。v2(去 STS,协议逐字对齐)已重排。⚠️ 若 v2 仍负,则分歧升级为真(候选:表绝对值差异/图集 [1,8,32,64,128] vs 全阶梯/客户端 burst 语义),将请主线共享 `pro_sched_arm.yaml` 逐键对表。
+- stage A 第一波在队:poetry lbs{64,128} × {pin2..5, notrim+STS 采集},disagg 表与 STS 原地重采。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
