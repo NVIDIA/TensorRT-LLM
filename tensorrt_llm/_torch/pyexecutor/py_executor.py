@@ -3387,7 +3387,12 @@ class PyExecutor:
         # would re-rank a batch it was never computed for.
         self.model_engine._dspark_device_budget = None
         if compute_windows:
-            if planner.device_windows and mode.trims_submitted_tokens:
+            if planner.skip_mixed_trim and scheduled_batch.context_requests:
+                # Mixed-step guard (experiment): prefill work shares this
+                # step, so the pure-decode cost table cannot price the trim.
+                # Declining here rides the normal all-or-nothing gate below.
+                fallback_reason = "mixed_step_declined"
+            elif planner.device_windows and mode.trims_submitted_tokens:
                 # Device-window mode: the host decides only the CAPACITY, from
                 # the lag-2 snapshot; the returned lens are a shape split used
                 # for the cross-rank agreement and the fit. The true windows

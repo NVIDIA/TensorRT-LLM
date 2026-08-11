@@ -59,6 +59,13 @@ _FRAC_WIRE_SCALE = 10_000
 #: once at init on every rank.
 DEVICE_WINDOWS_ENV = "TLLM_DSPARK_DEVICE_WINDOWS"
 
+#: Experiment-only mixed-step guard: when set, a rank whose scheduled batch
+#: carries context (prefill) requests declines to trim that step, and the
+#: cross-rank all-or-nothing gate reverts the whole group to the full block.
+#: The cost table is profiled on pure-decode steps and cannot price a trim
+#: whose step time is dominated by prefill compute; this isolates that effect.
+SKIP_MIXED_TRIM_ENV = "TLLM_DSPARK_SKIP_MIXED_TRIM"
+
 
 def device_windows_enabled() -> bool:
     """Whether device-side window selection is on (process-constant env)."""
@@ -128,6 +135,9 @@ class DSparkVerifyPlanner:
         # Two pinned buffers alternate; the pair we are NOT writing this step
         # is the older, guaranteed-landed one.
         self.device_windows = os.environ.get(DEVICE_WINDOWS_ENV, "0") == "1"
+        # Constant per process like the pin: every rank reads the same env at
+        # spawn, so the per-step decline needs no extra collective.
+        self.skip_mixed_trim = os.environ.get(SKIP_MIXED_TRIM_ENV, "0") == "1"
         if self.device_windows and self._forced_verify_len is not None:
             raise ValueError(
                 f"{DEVICE_WINDOWS_ENV}=1 is incompatible with "

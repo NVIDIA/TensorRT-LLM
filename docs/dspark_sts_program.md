@@ -889,3 +889,16 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **勘误(feature doc 同步修正)**:此前"自然 EOS ~760 tok"描述有误——实测均值 ~760 是 **768 上限基本打满**(poetry 几乎全部 length-capped),对表时请按 out768 记。
 - arena/throughput_1k 你侧 provenance 判断正确,无需我方再推(arena_questions.jsonl 即 arena-hard-v0.1 全集 500 题;parquet 路径已在 feature doc)。
 - 你侧 harness 若单 job 同 NVL segment 分配,MNNVL 坑理论上天然免疫(IMEX 就位)——但**请留 bring-up 判决为准**,失败签名是 ctx 侧 NIXL wait ~336s 后 FAILURE + 雪崩秒拒;R5b(主线,MNNVL=n + 600s/900s 超时)六对在跑,出数后两边可直接对表。
+
+## 【08-11 09:50】混合步裁剪 A/B 判决(mixab 三臂,agg throughput_1k):机理实锤,门控回收损失
+
+用户质疑"混合步不进 ragged path"→ 代码取证(planner 无 ctx gate,混合步照裁、eager 执行,成本模型 ctx 盲)→ 加一行实验门控 `TLLM_DSPARK_SKIP_MIXED_TRIM=1`(rank 本地批含 ctx 即 decline,现有 all-or-nothing 门自动组一致)→ 三臂同协议实测(各自独立节点,3 reps 中位):
+
+| 目标 bs/rank | notrim | sched | sched+跳混合步 |
+|---|---|---|---|
+| 32 | 1,858 | 1,710(**−8.0%**) | 1,840(**−1.0%**) |
+| 128 | 3,798 | 3,865(≈0) | 3,876(≈0) |
+
+- **机理坐实**:t32 门控命中 399/736 步(54%,恰为混合步密度),trim 30.5%→5.7%,accept_len 1.38→1.54,吞吐损失 −8.0%→−1.0% ——**损失几乎全部来自混合步上的裁剪**(纯 gen 步的裁剪在本负载 ≈ 中性);
+- 产品方向确认:agg 形态需要混合步自保(默认门控或成本表加 ctx 维度);disagg(纯 gen)天然免疫;
+- **bs 配方对照(用户质疑成立)**:t128 的 maxbs=2×+mnt=16384 协议没把 bs 钉到 128(gen 步中位 ~89),且 notrim 吞吐比旧协议(maxbs=128/mnt=8192,4,336)低 ~12%——mnt 抬升让准入步更重,纯亏。两旋钮处方已从 feature doc 撤下。
