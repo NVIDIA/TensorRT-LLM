@@ -148,6 +148,7 @@ def savePipelineScripts() {
     // Capture the pipeline's own version of the scan scripts before the workspace
     // is overwritten by checkoutSource() with params.ref. This ensures the script
     // logic always matches the Groovy that is actually running.
+    trtllm_utils.setupGitMirror()
     checkout scm
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
 }
@@ -480,8 +481,8 @@ pipeline {
             steps {
                 script {
                     container("cpu") {
-                        savePipelineScripts()
                         installTools()
+                        savePipelineScripts()
                         checkoutSource()
                         validateRef()
                     }
