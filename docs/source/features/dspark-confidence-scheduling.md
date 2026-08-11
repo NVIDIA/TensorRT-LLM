@@ -562,8 +562,9 @@ no-spec 应降级而非死锁、字节估算器补 draft 窗口放大）待报 u
 
 ctx/gen 分离后 gen server 每步纯 gen，成本表全程在域内。两台 B300 独立 slurm 作业,
 NIXL 传输。**bs 钉法**：gen server 没有 prefill 争抢槽位，直接
-`max_batch_size = 目标并发` + 客户端超发（如 16×）即可把 gen bs 钉在 maxbs 上。
-**四个必踩的坑与解法**：
+`max_batch_size = 目标并发` + 客户端适度超发（2–4×，够填补周转间隙即可）把 gen bs 钉在
+maxbs 上；**必须从 gen 侧 iter log 监控实测调度 bs 确认钉住**，不能只信标签。超发过猛没
+有额外收益，只会加深 ctx 队列、压穿 KV-transfer / router 超时。**四个必踩的坑与解法**：
 
 1. v2 KV manager 只支持 `transceiver_runtime: PYTHON` + `backend: NIXL`（C++/DEFAULT
    传输在启动时 `CUDA_ERROR_INVALID_CONTEXT`）。
