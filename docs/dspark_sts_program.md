@@ -638,6 +638,21 @@ Flash DEP4,修复 b87ea28bf3 + 新表 `postfix_flash_table.json`,每 cell n=10(�
 
 `test_gsm8k_dep8_ragged_verify[moe_backend=TRTLLM]`(DEP8 + overlap + CUDA graph + ragged verify + 置信度调度),`TLLM_DSPARK_SPS_TABLE=postfix_pro_table.json` 注入修复后真实表(planner 主动裁剪而非退化均匀),**1 passed(27 分钟)——精度 ≥ 记录参考值,断言通过**。终局判决的精度一环闭合。注:MEGAMOE_DEEPGEMM 变体在该节点因 DeepGEMM JIT "NVCC compilation failed" 无法初始化(nvcc 在位、/tmp 空,原因未深究;TRTLLM 变体即吞吐判决所用后端,更具代表性)。
 
+### 对齐实验:zhaoyuanh 的 throughput_1k 负载 × 我们的栈(08-11 02:10,主矩阵完成)
+
+**协议**(与 roofline 报告对齐,按用户修正):throughput_1k parquet 前 1024 行 file 序(源 parquet,SHA 与其冻结 dump 不同,已标注)、greedy temp=0、max_tokens=64、**持续满并发**(完成即补位,计量段=256 个 ramp 完成后的 1024 个完成);**每 cell 独立重启且 maxbs=local bs**;max_seq_len=8192 显式;成本表与 STS **均在本负载重采**(表:burst 模式采纯 gen 段,bs32/64 实测、128/256 α 外推;STS:142k 样本,位置接受率 [0.70,0.46,0.30,0.20,0.15],温度 ~2 → 裸分数显著过自信,ECE 5/5 位置改善)。
+
+**主矩阵(中位数 tok/s,n=3/cell)**:
+
+| local bs | notrim | sched(表+STS) | Δ | pin3 参照 |
+|---|---|---|---|---|
+| 32 | 1,850 | 1,734 | −6.3% | — |
+| 64 | 2,988 | 2,858 | −4.4% | — |
+| 128 | 4,336 | 4,284 | −1.2% | 4,227(−2.5%)|
+| 256 | 7,216 | 7,112 | −1.4% | 6,129(**−15.1%**)|
+
+**判读**:①此负载上调度裁剪无收益(−1~−6%),盲砍(pin3)在大 bs 重亏——**与 poetry/arena 的 +5.9~+24.7% 并立:裁剪收益是负载性质的函数**;②机理:64 输出 + 长 prompt + 持续补位 → 几乎每步都是 prefill 主导的混合步,纯 gen 步采的成本表在混合步里**高估 θ 节省**,被裁的接受 token 却真实损失;③他们 +13.29% 的天花板在我们栈的混合步现实中不兑现,落在其自身敏感性分析预言的失效区(静态代理 + 紧凑执行假设);其"DL3 优于 DL5"在我们 runtime 亦反向(诚实支付 D(5) 的 pin3 −15%);④**产品方向**:planner 需要"无标的自保"——混合步密集时降权或停裁(表纳入 ctx 混合度维度)。no-STS 消融进行中(分离校准效应)。
+
 ### 产品线终局判决:Pro@DEP8 置信度调度全面转正(08-10 13:50)
 
 Flash 三臂翻案后,Pro@DEP8 终局(maxbs=256 解锁满批 + `postfix_pro_table.json` 新表,scheduled vs notrim,双节点臂序对调,每 cell n=10):
