@@ -38,7 +38,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.llmapi.llm_args import FeatureEncoderCudaGraphConfig
+from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -165,6 +165,11 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
+    executor.model_engine = types.SimpleNamespace(
+        encoder_cuda_graph_runner=types.SimpleNamespace(
+            feature_mode=False, enabled=True, supported_batch_sizes=batch_sizes
+        )
+    )
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -175,19 +180,21 @@ def _make_feature_encoder_batch_wait_executor(
 ):
     """Batch-wait executor whose encoder graph config is the feature variant.
 
-    `FeatureEncoderCudaGraphConfig` has no `num_tokens` / `seq_lens`, and its
-    `batch_sizes` may have been derived rather than configured, so the resolved
-    sizes come from the engine's encoder graph runner rather than the config.
+    A feature encoder leaves `num_tokens` / `seq_lens` unset and may have had
+    its `batch_sizes` derived rather than configured, so the resolved sizes come
+    from the engine's encoder graph runner rather than the config.
     """
     executor = object.__new__(PyExecutor)
     executor.max_batch_size = 32
     executor.llm_args = types.SimpleNamespace(
-        encoder_cuda_graph_config=FeatureEncoderCudaGraphConfig(enable_padding=True),
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
         encoder_max_batch_size=encoder_max_batch_size,
     )
     executor.model_engine = types.SimpleNamespace(
         encoder_cuda_graph_runner=types.SimpleNamespace(
-            supported_batch_sizes=runner_batch_sizes, enabled=runner_enabled
+            supported_batch_sizes=runner_batch_sizes,
+            enabled=runner_enabled,
+            feature_mode=True,
         )
     )
     executor.batch_wait_timeout_iters = 48
@@ -201,6 +208,7 @@ def _make_encoder_fallback_batch_wait_executor():
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
+    executor.model_engine = types.SimpleNamespace(encoder_cuda_graph_runner=None)
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -240,8 +248,8 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
 
 
 def test_encoder_microbatch_admission_supports_feature_encoder_config():
-    # A feature config carries no num_tokens / seq_lens, so reading them to
-    # gate this path raises AttributeError on the first encoder batch.
+    # A feature encoder leaves num_tokens / seq_lens unset, so gating this
+    # path on them would skip microbatch admission entirely.
     executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 8])
     encoder_requests = [object() for _ in range(12)]
 
@@ -255,11 +263,12 @@ def test_encoder_microbatch_admission_supports_feature_encoder_config():
     assert executor.encoder_batch_wait_iters_count == 0
 
 
-def test_encoder_microbatch_admission_uses_derived_feature_batch_sizes():
-    # batch_sizes left unset on the config: the engine derived them, so the
-    # runner is the only place the resolved list exists.
+def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes():
+    # The runner's list is authoritative: the engine filters the configured
+    # sizes by the scheduler's encoder-batch bound, so the config alone can
+    # name sizes that were never captured.
     executor = _make_feature_encoder_batch_wait_executor([1, 2, 3, 4])
-    assert executor.llm_args.encoder_cuda_graph_config.batch_sizes is None
+    executor.llm_args.encoder_cuda_graph_config.batch_sizes = [1, 2, 3, 4, 8]
     encoder_requests = [object() for _ in range(6)]
 
     scheduled = executor._waiting_encoder_requests(

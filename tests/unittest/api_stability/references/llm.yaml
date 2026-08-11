@@ -100,7 +100,7 @@ methods:
         default: null
         status: beta
       encoder_cuda_graph_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.FeatureEncoderCudaGraphConfig, NoneType]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig]
         default: null
         status: prototype
       enable_encoder_decoder_mixed_cuda_graph:

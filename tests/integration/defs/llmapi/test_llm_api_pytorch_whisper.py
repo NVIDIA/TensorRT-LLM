@@ -31,7 +31,7 @@ import soundfile
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
-    FeatureEncoderCudaGraphConfig,
+    EncodeCudaGraphConfig,
     KvCacheConfig,
     SamplingParams,
     SchedulerConfig,
@@ -131,11 +131,12 @@ def _make_llm(
     encoder_kwargs = {}
     if encoder_graphs:
         # Whisper's encoder emits a fixed `_ENCODER_OUTPUT_LEN` positions per
-        # request, so the graph key is the batch size alone.
+        # request, so the graph key is the batch size alone; num_tokens and
+        # seq_lens are derived from the model and are not supplied here.
         encoder_batch_sizes = list(cuda_graph_batch_sizes or [1])
         encoder_kwargs = {
             "encoder_max_batch_size": max(encoder_batch_sizes),
-            "encoder_cuda_graph_config": FeatureEncoderCudaGraphConfig(
+            "encoder_cuda_graph_config": EncodeCudaGraphConfig(
                 batch_sizes=encoder_batch_sizes,
                 enable_padding=True,
             ),

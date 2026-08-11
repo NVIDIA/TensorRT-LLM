@@ -446,57 +446,11 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         return sizes
 
 
-class FeatureEncoderCudaGraphConfig(StrictBaseModel):
-    """CUDA graph configuration for fixed-shape feature encoder requests.
-
-    Applies to encoder-decoder models whose encoder consumes a fixed-shape
-    per-request feature tensor rather than packed tokens, e.g. Whisper's
-    30 s-padded waveform. Such an encoder emits the same number of positions
-    for every request, so the graph key is the batch size alone and the
-    token-shaped `num_tokens` / `seq_lens` buckets of
-    :class:`EncodeCudaGraphConfig` do not apply.
-    """
-
-    mode: Literal["feature_encode"] = Field(
-        default="feature_encode", description="CUDA graph configuration mode.")
-
-    batch_sizes: Optional[List[PositiveInt]] = Field(
-        default=None,
-        min_length=1,
-        description=(
-            "Encoder batch sizes to capture. None derives them from "
-            "`encoder_max_batch_size`, capped by the scheduler's encoder-batch "
-            "bound (max_num_tokens // encoder output length)."),
-        status="prototype",
-    )
-
-    enable_padding: bool = Field(
-        default=True,
-        description=(
-            "Pad an encoder batch up to the next captured batch size. Each pad "
-            "slot costs a full encoder forward, so padding is skipped when it "
-            "would add disproportionate encoder work."),
-        status="prototype",
-    )
-
-    @model_validator(mode='after')
-    def validate_feature_encoder_cuda_graph_config(
-            self) -> 'FeatureEncoderCudaGraphConfig':
-        if self.batch_sizes is not None:
-            self.batch_sizes = sorted(set(self.batch_sizes))
-        return self
-
-
 # For CudaGraphConfig's backward compatibility
 CudaGraphConfig = DecodeCudaGraphConfig
 
 CudaGraphConfigType: TypeAlias = Annotated[
     Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
-    Field(discriminator="mode"),
-]
-
-EncoderCudaGraphConfigType: TypeAlias = Annotated[
-    Union[EncodeCudaGraphConfig, FeatureEncoderCudaGraphConfig],
     Field(discriminator="mode"),
 ]
 
@@ -5129,16 +5083,13 @@ class TorchLlmArgs(BaseLlmArgs):
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
 
-    encoder_cuda_graph_config: Optional[EncoderCudaGraphConfigType] = Field(
+    encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig] = Field(
         default=None,
         description=(
             "CUDA graph configuration for the encoder forward pass of an "
             "encoder-decoder model. Use `cuda_graph_config` for the decoder "
-            "and this field for the encoder. Pass an `EncodeCudaGraphConfig` "
-            "for a token encoder (T5/BART) or a "
-            "`FeatureEncoderCudaGraphConfig` for a fixed-shape feature encoder "
-            "(Whisper). Encoder CUDA graphs require `encoder_max_batch_size` "
-            "to be set."),
+            "and this field for the encoder. Encoder CUDA graphs require "
+            "`encoder_max_batch_size` to be set."),
         status="prototype")
 
     enable_encoder_decoder_mixed_cuda_graph: bool = Field(
@@ -5228,19 +5179,6 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError("must be a positive integer when set")
         return v
 
-    @field_validator('encoder_cuda_graph_config', mode='before')
-    @classmethod
-    def infer_encoder_cuda_graph_config_mode(cls, v):
-        if isinstance(v, dict) and "mode" not in v:
-            token_keys = {
-                "num_tokens", "max_num_token", "seq_lens", "max_seq_len"
-            }
-            v = dict(v)
-            v["mode"] = "encode" if any(
-                k in v and v[k] not in (None, 0)
-                for k in token_keys) else "feature_encode"
-        return v
-
     @model_validator(mode="after")
     def validate_encoder_cuda_graph_config(self) -> 'TorchLlmArgs':
         if self.encoder_cuda_graph_config is None:
@@ -5253,19 +5191,10 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.encoder_max_batch_size is None:
             raise ValueError(
                 "encoder_cuda_graph_config requires encoder_max_batch_size.")
-        if isinstance(self.encoder_cuda_graph_config,
-                      FeatureEncoderCudaGraphConfig):
-            # A feature encoder's token counts and sequence lengths follow from
-            # the model, so batch_sizes is the only bucket dimension to require.
-            return self
-        missing = []
-        if not self.encoder_cuda_graph_config.num_tokens:
-            missing.append("num_tokens/max_num_token")
-        if not self.encoder_cuda_graph_config.seq_lens:
-            missing.append("seq_lens/max_seq_len")
-        if missing:
-            raise ValueError("encoder_cuda_graph_config requires "
-                             f"{' and '.join(missing)}.")
+        # `num_tokens` / `seq_lens` are checked by the model engine rather than
+        # here: an encoder whose input is a fixed-shape per-request feature
+        # tensor derives both from the model, and only the engine knows which
+        # kind of encoder the model has.
         return self
 
     attn_backend: str = Field(
