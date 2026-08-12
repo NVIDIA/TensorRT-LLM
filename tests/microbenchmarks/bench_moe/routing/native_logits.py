@@ -26,6 +26,7 @@ the supplied-topk patches in this module.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -200,23 +201,23 @@ def _make_supplied_topk_run_moe(
     balanced/imbalanced selection helpers.
     """
 
-    def supplied_run_moe(
-        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
-    ):
+    def supplied_run_moe(ctx, *, workspace=None):
         if getattr(moe_module, "_routing_results_replaced_at", None) is not None:
-            return run_moe_orig(
-                x,
-                token_selected_experts,
-                token_final_scales,
-                x_sf,
-                router_logits,
-                do_finalize,
-                moe_output,
-            )
+            return run_moe_orig(ctx, workspace=workspace)
+        x = ctx.x
+        do_finalize = ctx.do_finalize
         local, scales = _align_topk_to_batch(materialized_ids, materialized_scales, x.shape[0])
         local = local.to(device=x.device, dtype=torch.int32)
         scales = scales.to(device=x.device)
-        final_hidden_states = run_moe_orig(x, local, scales, x_sf, None, do_finalize, moe_output)
+        final_hidden_states = run_moe_orig(
+            replace(
+                ctx,
+                token_selected_experts=local,
+                token_final_scales=scales,
+                router_logits=None,
+            ),
+            workspace=workspace,
+        )
         if not do_finalize:
             final_hidden_states = (
                 final_hidden_states[0],

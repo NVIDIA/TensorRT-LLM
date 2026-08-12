@@ -24,8 +24,9 @@ combination x request length, the ctx side fills a request's KV blocks with a
 deterministic, rank-specific pattern, sends it, and the gen side verifies the
 received blocks regenerate to the same pattern. Bandwidth is emitted by the
 transceivers themselves into per-rank CSVs (parsed later by report.py):
-  C++  -> TRTLLM_KVCACHE_TIME_OUTPUT_PATH (rank_*_send.csv / rank_*_recv.csv)
-  Py   -> TLLM_KV_TRANSFER_PERF_LOG_FILE  (py_*_*.csv, throughput_mbs)
+  C++  -> TRTLLM_KVCACHE_TIME_OUTPUT_PATH (<instanceId>_*_send.csv / <instanceId>_*_recv.csv)
+  Py   -> same env var (PerfLogManager gives it top priority):
+          <instanceUuid>_<rank>.csv, throughput_mbs column
 
 This driver mirrors the single-process test (tests/unittest/others/
 test_kv_cache_transceiver.py) and the multi-process Python test
@@ -39,7 +40,7 @@ import os
 import pickle
 import signal
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -57,7 +58,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -104,7 +105,7 @@ class KvCacheConfigV2:
     dtype: str = "auto"
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
@@ -286,6 +287,35 @@ class _TransferError(Exception):
     pass
 
 
+def _wait_ctx_complete(xcvr, rid, runtime):
+    """Block until this ctx request's send finishes (or errors).
+
+    * C++ transceiver: check_context_transfer_status(None) is a true block-all;
+      a single call suffices (see the comment at the call site).
+    * PYTHON (V2) transceiver: even under block_all, each TxSession wait is
+      bounded by kv_transfer_sender_future_timeout_ms (default 1000 ms). A
+      slower peer handshake makes the call log "TxSession ... timed out" and
+      return with the request still DISAGG_CONTEXT_TRANS_IN_PROGRESS -- in the
+      real executor that is benign (the session stays open and is re-polled
+      every iteration), but returning here would free and refill the KV blocks
+      mid-flight, so the receiver reads the NEXT request's pattern (verify FAIL
+      on every request except the last). So poll until
+      this rid lands in the completed/failed lists. Collectively safe: every
+      ctx rank loops on the same rid and the per-call consensus makes all
+      ranks observe completion on the same iteration. The per-cell
+      signal.alarm and the hang detector bound the loop.
+    """
+    if runtime != "PYTHON":
+        xcvr.check_context_transfer_status(None)
+        return
+    while True:
+        completed, failed = xcvr.check_context_transfer_status(None)
+        if rid in failed:
+            raise _TransferError(f"ctx transfer failed for rid={rid}")
+        if rid in completed:
+            return
+
+
 def _wait_gen_complete(xcvr, req, runtime):
     """Block until this gen request's receive finishes (or errors).
 
@@ -371,7 +401,9 @@ def run_one_request(
         # transfer is still in progress. NIXL/UCX cold-start connection setup can
         # exceed that, so the harness would free the request mid-transfer, leaving
         # the gen side hung and the ctx sender thread asserting on a freed session.
-        xcvr.check_context_transfer_status(None)
+        # The PYTHON runtime additionally needs a poll loop on top of block_all;
+        # see _wait_ctx_complete.
+        _wait_ctx_complete(xcvr, rid, runtime)
         state = req.state
         tensorrt_llm.logger.info(f"[ctx r{rank}] rid={rid}: transfer DONE (send), state={state}")
         free_sequence(kvm, req, kv_handle, use_v2)
@@ -437,15 +469,19 @@ def _preserve_cpp_csvs(csv_dir, ci, rank):
     request lengths of a combination and appends a row per request, so we move
     the whole combination's output aside (rid encodes req_len).
 
-    Each rank touches ONLY its own files: all ranks share `csv_dir`, so a glob
-    over `rank_*` would race -- multiple ranks renaming the same file, leaving
-    some with FileNotFoundError, crashing those ranks and deadlocking the rest on
-    the next case's collective KVCacheManager allreduce.
+    C++ names files "<instanceId>_<rank>_<tag>.csv" (instanceId is a runtime
+    UUID). Each rank touches ONLY files carrying its own "_<rank>_<tag>.csv"
+    suffix: all ranks share `csv_dir`, so matching a broader pattern would race
+    -- multiple ranks renaming the same file, leaving some with
+    FileNotFoundError, crashing those ranks and deadlocking the rest on the next
+    case's collective KVCacheManager allreduce.
     """
     for tag in ("send", "recv"):
-        path = os.path.join(csv_dir, f"rank_{rank}_{tag}.csv")
-        if os.path.exists(path):
-            os.replace(path, os.path.join(csv_dir, f"rank_{rank}_{tag}__c{ci}.csv"))
+        suffix = f"_{rank}_{tag}.csv"
+        for name in os.listdir(csv_dir):
+            if name.endswith(suffix) and "__c" not in name:
+                base = name[: -len(".csv")]
+                os.replace(os.path.join(csv_dir, name), os.path.join(csv_dir, f"{base}__c{ci}.csv"))
 
 
 def main():
@@ -483,12 +519,12 @@ def main():
     work_dir = cfg["environment"]["work_dir"]
     csv_dir = os.path.join(work_dir, "csv", str(sweep), role)
     os.makedirs(csv_dir, exist_ok=True)
+    # One env var drives both transceivers: C++ caches it on first read, and
+    # Python's PerfLogManager gives it top priority (enabling perf logging and
+    # writing task CSVs as <instanceUuid>_<rank>.csv in csv_dir; the
+    # per-transceiver UUID avoids cross-combination collisions, and report.py
+    # identifies these files by header columns, not name).
     os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = csv_dir
-    # Python perf logging (singleton reads these once; C++ ignores them). Set at
-    # startup so it is enabled regardless of combination ordering. Per-transceiver UUID
-    # filenames (py_<uuid>_<rank>.csv) avoid cross-combination collisions.
-    os.environ["TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO"] = "1"
-    os.environ["TLLM_KV_TRANSFER_PERF_LOG_FILE"] = os.path.join(csv_dir, "py")
 
     status_dir = os.path.join(work_dir, "status")
     os.makedirs(status_dir, exist_ok=True)
@@ -643,6 +679,13 @@ def main():
             backend=backend,
             transceiver_runtime=(None if runtime == "CPP" else "PYTHON"),
             max_tokens_in_buffer=cfg["kv_cache"]["max_tokens_in_buffer"],
+            # PYTHON (V2) only; 0 keeps bounce off. With bounce on, the KV data
+            # rides a fabric-VMM staging buffer (CU_MEM_HANDLE_TYPE_FABRIC), which
+            # is what lets UCX pick cuda_ipc across NVL72 nodes -- direct
+            # pool-to-pool transfers from non-fabric allocations fall back to
+            # much slower host-staged tcp, so enable bounce for cross-node
+            # transfers inside an NVLink domain.
+            kv_cache_bounce_size_mb=int(cfg["kv_cache"].get("bounce_size_mb", 0)),
         )
 
         # Build the cache manager + transceiver ONCE per case (the manager is

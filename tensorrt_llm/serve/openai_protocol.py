@@ -50,6 +50,25 @@ from tensorrt_llm.scheduling_params import AgentHierarchy
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
 
+# Beam-search stopping mode as exposed over HTTP, mirroring the HuggingFace
+# Transformers interface. The engine encodes it as an integer, but that encoding
+# is an implementation detail and is kept out of the public schema.
+EarlyStopping: TypeAlias = Union[bool, Literal["never"]]
+
+
+def _early_stopping_to_int(value: Optional[EarlyStopping]) -> Optional[int]:
+    """Translate the HF-style tri-state into the engine's integer encoding.
+
+    Mirrors ``BeamSearchEarlyStop``: ``False`` -> 0, ``True`` -> 1,
+    ``"never"`` -> 2. ``None`` stays unset so the engine picks its default.
+    """
+    if value is None:
+        return None
+    if value == "never":
+        return 2
+    # NB: bool is a subclass of int, so this yields 1/0 for True/False.
+    return int(value)
+
 
 def ensure_request_chat_template_allowed(request: Any,
                                          allow_request_chat_template: bool):
@@ -212,6 +231,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
+    # Context worker -> generation worker: the reasoning mode the context
+    # worker read off the prompt it rendered. The generation worker only sees
+    # prompt_token_ids, so it cannot resolve this for itself.
+    resolved_thinking: Optional[bool] = None
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -492,6 +515,14 @@ def _response_format_text_config_to_guided_decoding_params(
         resp_format, reasoning_parser=reasoning_parser)
 
 
+def _record_sampling_params_request_fields(
+        request: OpenAIBaseModel, sampling_params: SamplingParams) -> None:
+    """Preserve explicitly supplied fields across protocol defaulting."""
+    sampling_params._set_request_provided_fields(
+        field_name for field_name in request.model_fields_set
+        if getattr(request, field_name, None) is not None)
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -522,8 +553,12 @@ class CompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[EarlyStopping] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -554,6 +589,15 @@ class CompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
     )
     conversation_params: Optional[ConversationParams] = Field(
         default=None,
@@ -599,7 +643,7 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            early_stopping=self.early_stopping,
+            early_stopping=_early_stopping_to_int(self.early_stopping),
             stop_token_ids=self.stop_token_ids,
             include_stop_str_in_output=self.include_stop_str_in_output,
             ignore_eos=self.ignore_eos,
@@ -622,6 +666,7 @@ class CompletionRequest(OpenAIBaseModel):
         )
         if return_log_probs:
             sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode="before")
@@ -868,8 +913,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[EarlyStopping] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -954,6 +1003,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
+    )
 
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")
@@ -1005,7 +1063,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            early_stopping=self.early_stopping,
+            early_stopping=_early_stopping_to_int(self.early_stopping),
             stop_token_ids=self.stop_token_ids,
             include_stop_str_in_output=self.include_stop_str_in_output,
             ignore_eos=self.ignore_eos,
@@ -1026,6 +1084,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         if return_log_probs:
             sampling_params._return_log_probs = True
+        _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
     @model_validator(mode='before')
@@ -1203,7 +1262,7 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding = _response_format_text_config_to_guided_decoding_params(
                 self.text.format, reasoning_parser=reasoning_parser)
 
-        return SamplingParams(
+        sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -1212,6 +1271,8 @@ class ResponsesRequest(OpenAIBaseModel):
             guided_decoding=guided_decoding,
             thinking_token_budget=self.thinking_token_budget,
         )
+        _record_sampling_params_request_fields(self, sampling_params)
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -1668,7 +1729,12 @@ class VideoGenerationRequest(OpenAIBaseModel):
                                 description="Random seed for reproducibility.")
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description="Optional image reference that guides generation.",
+        description=(
+            "Optional image or video reference that guides generation. PNG or "
+            "JPEG images condition image-to-video; MP4 or AVI video conditions "
+            "video-to-video, with H.264 the tested codec and others "
+            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
+            "base64 bytes; multipart requests upload the file."),
     )
 
     # Resolution

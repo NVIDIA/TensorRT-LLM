@@ -29,8 +29,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -72,9 +72,29 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
     if isinstance(exc, PermissionError):
         return True
     if isinstance(exc, OSError):
+        # EEXIST: filelock's ensure_directory_exists() can lose the
+        # mkdir(exist_ok=True) race on NFS when many ranks start at once
+        # (the post-EEXIST is_dir() recheck sees a stale attribute cache).
+        # An un-creatable lock dir is broken infra, not contention.
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
-                             errno.ESTALE)
+                             errno.ESTALE, errno.EEXIST)
     return False
+
+
+def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
+    """Release ``lock``, downgrading broken-lock-infra errors to a warning.
+
+    NFS can return ENOLCK/ESTALE from the unlock ``flock`` call itself (e.g.
+    lock-daemon exhaustion when many ranks start simultaneously). The config
+    load the lock protected has already completed at release time, so
+    crashing the process here would fail an otherwise healthy executor.
+    """
+    try:
+        lock.release()
+    except (PermissionError, OSError) as e:
+        if not _is_lock_infra_error(e):
+            raise
+        logger.warning(f"config lock release failed ({e}), continuing")
 
 
 @contextlib.contextmanager
@@ -120,12 +140,12 @@ def config_file_lock(timeout: int = 10):
             try:
                 yield
             finally:
-                tmp_lock.release()
+                _release_lock_ignoring_infra_errors(tmp_lock)
     else:
         try:
             yield
         finally:
-            lock.release()
+            _release_lock_ignoring_infra_errors(lock)
 
 
 @dataclass(kw_only=True)
@@ -352,6 +372,17 @@ class ModelConfig(Generic[TConfig]):
             if 100 <= sm_version < 120:
                 return "TRTLLM"
 
+        is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
+                          in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
+        if is_w4a16_nvfp4:
+            sm_version = get_sm_version()
+            # CuteDslB12xFusedMoE on SM120/121, MarlinFusedMoE on Hopper. Any
+            # other SM falls through to CUTLASS, which dequantizes on the fly.
+            if sm_version in (120, 121):
+                return "CUTEDSL"
+            if 90 <= sm_version < 100:
+                return "MARLIN"
+
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()
             # Select the best performing backend based on SM version
@@ -494,12 +525,15 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
-        # DeepSeek V3 FP8 ckpt
-        if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
-                "weight_block_size", []):
+        # FP8 ckpt: DeepSeek V3 style (weight_block_size) or
+        # per-tensor static activation scale style (activation_scheme="static",
+        # e.g. Ministral / Pixtral).
+        if hf_quant_config.get("quant_method") == "fp8" and (
+                hf_quant_config.get("weight_block_size")
+                or hf_quant_config.get("activation_scheme") == "static"):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
-            block_size = hf_quant_config.get("weight_block_size", [])
+            block_size = hf_quant_config.get("weight_block_size", [128, 128])
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]
@@ -919,6 +953,7 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+                        index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -930,6 +965,7 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
                         indexer_k_dtype = "fp8"
+                        index_share_for_mtp_iteration = None
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -944,7 +980,9 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
-                            indexer_k_dtype=indexer_k_dtype)
+                            indexer_k_dtype=indexer_k_dtype,
+                            index_share_for_mtp_iteration=
+                            index_share_for_mtp_iteration)
                 elif pretrained_config.architectures[
                         0] == "DeepseekV4ForCausalLM":
                     if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):
@@ -1384,6 +1422,8 @@ class ModelConfig(Generic[TConfig]):
             return cfg.hybrid_override_pattern.count("*")
         if is_qwen3_hybrid(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
+        if is_kimi_linear(cfg):
+            return get_kimi_linear_num_attention_layers(cfg)
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:
@@ -1393,6 +1433,9 @@ class ModelConfig(Generic[TConfig]):
             return cfg.hybrid_override_pattern.count("M")
         if is_qwen3_hybrid(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
+                cfg)
+        if is_kimi_linear(cfg):
+            return cfg.num_hidden_layers - get_kimi_linear_num_attention_layers(
                 cfg)
         return 0
 

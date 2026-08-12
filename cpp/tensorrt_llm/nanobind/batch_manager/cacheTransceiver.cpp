@@ -27,6 +27,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
@@ -92,6 +93,12 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync,
             nb::call_guard<nb::gil_scoped_release>())
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
+        .def("get_serialized_data_transceiver_state",
+            [](tb::BaseCacheTransceiver& self)
+            {
+                auto serialized = self.getSerializedDataTransceiverState();
+                return nb::bytes(serialized.data(), serialized.size());
+            })
         .def(
             "check_context_transfer_status",
             [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
@@ -123,11 +130,13 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
                  runtime::WorldConfig, std::vector<SizeType32>, tensorrt_llm::DataType,
                  executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>,
-                 std::vector<SizeType32>>(),
+                 std::vector<SizeType32>, std::vector<SizeType32>>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{},
+            nb::arg("indexer_layer_num_per_pp") = std::vector<SizeType32>{})
+        .def("get_status_dump", &tb::CacheTransceiver::getStatusDump);
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

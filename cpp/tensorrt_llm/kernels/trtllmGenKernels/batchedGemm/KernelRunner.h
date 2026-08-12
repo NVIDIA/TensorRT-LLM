@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,8 +28,11 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// Keep this in sync with the ActType in
-// cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
+// Backend-local activation type. The numeric values here are part of the Python/thop
+// contract (see ActType_TrtllmGen in tensorrt_llm/_torch/utils.py) and are intentionally
+// decoupled from the generated batchedGemm::gemmGatedAct::ActType, whose values shift
+// between generator exports. KernelRunner.cpp maps gated entries explicitly; never cast
+// between the two enums by value.
 enum class ActType
 {
     // For ActType == SwiGlu, ideally we would like to have something like
@@ -43,8 +46,23 @@ enum class ActType
     // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
     SwiGlu,
     Relu2,
-    Silu
+    Silu,
+    // SiTu gated activation (Kimi K3). Gate on x1, matching the SwiGlu convention:
+    //    left     = beta  * tanh(x0 / beta)
+    //    right    = alpha * tanh(x1 / alpha) * sigmoid(x1)
+    //    gatedAct = left * right
+    // alpha/beta come from the per-expert mPtrGatedActAlpha/mPtrGatedActBeta runtime
+    // parameters and must be > 0.
+    SiTu
 };
+
+// Gated activations combine gate and up projections inside the FC1 kernel; the FC1
+// logical output width is 2 * intermediateSize. Element-wise activations (Relu2/Silu)
+// run on a single projection.
+constexpr bool isGatedActType(ActType actType)
+{
+    return actType == ActType::SwiGlu || actType == ActType::SiTu;
+}
 
 // Type of the element-wise activation to apply after the Gemm
 enum class EltwiseActType

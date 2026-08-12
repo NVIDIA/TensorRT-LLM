@@ -21,8 +21,10 @@ import pytest
 from tensorrt_llm import bindings
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm.bindings import DataType
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_rank_info_construction():
@@ -35,7 +37,6 @@ def test_rank_info_construction():
         pp_rank=0,
         layer_num_per_pp=[32],
         sender_endpoints=["tcp://10.0.0.1:5000"],
-        server_endpoint="tcp://10.0.0.1:5000",
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"\x00\x01\x02",
     )
@@ -56,7 +57,6 @@ def test_rank_info_msgpack_roundtrip():
         pp_rank=0,
         layer_num_per_pp=[32],
         sender_endpoints=["tcp://10.0.0.1:5000"],
-        server_endpoint="tcp://10.0.0.1:5000",
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"\x00\x01\x02",
     )
@@ -84,7 +84,6 @@ def test_rank_info_roundtrip_with_aux_meta():
         pp_rank=0,
         layer_num_per_pp=[32],
         sender_endpoints=["tcp://10.0.0.1:5000"],
-        server_endpoint="tcp://10.0.0.1:5000",
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"",
         aux_meta=meta,
@@ -126,9 +125,42 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
     assert info.attention.kv_heads_per_rank == 8
 
 
+def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
+    mapping = SimpleNamespace(
+        rank=1,
+        tp_size=2,
+        tp_rank=1,
+        pp_size=1,
+        pp_rank=0,
+        dp_size=1,
+        cp_size=1,
+        cp_rank=0,
+        enable_attention_dp=True,
+    )
+    manager = SimpleNamespace(
+        mapping=mapping,
+        num_kv_heads_per_layer=[0, 0],
+        pp_layers=[0, 1],
+        tokens_per_block=32,
+        head_dim=128,
+        dtype=bindings.DataType.HALF,
+        kv_factor=2,
+    )
+
+    info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+    assert info.attention is not None
+    assert info.attention.kv_heads_per_rank == 0
+    assert info.attention.enable_attention_dp
+    assert MambaPolicy._mamba_tp(info) == (1, 0)
+
+
 @pytest.mark.parametrize(
     ("dtype", "expected_element_bytes", "expected_type"),
-    [(DataType.NVFP4, 0.5, float), (DataType.HALF, 2, int)],
+    [(bindings.DataType.NVFP4, 0.5, float), (bindings.DataType.HALF, 2, int)],
 )
 def test_rank_info_represents_cache_element_bytes(
     monkeypatch, dtype, expected_element_bytes, expected_type

@@ -8,6 +8,8 @@ from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content_part
 
+pytestmark = pytest.mark.cpu_only
+
 
 class CustomError(Exception):
     pass
