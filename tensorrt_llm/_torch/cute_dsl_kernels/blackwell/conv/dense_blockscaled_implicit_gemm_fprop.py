@@ -488,9 +488,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         mma_tiler_mn: Tuple[int, int],
         preferred_cluster_shape_mn: Tuple[int, int],
         fallback_cluster_shape_mn: Tuple[int, int],
-        input_C: int,
-        output_K: int,
-        output_nzpq: Tuple[int, int, int, int],
+        cta_tile_k: int,
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
     ):
@@ -514,14 +512,10 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         )
         self.sf_vec_size = sf_vec_size
 
-        # Layout-shaping geometry must stay host Python int so it remains
-        # trace-const: input_C feeds the mma_tiler K dim (SMEM shape), output_K
-        # feeds SFB/SFD host sizing, and output_nzpq (N,Z,P,Q) shapes the SFD
-        # global descriptor whose M-mode drives the SIMT autovec_copy store
-        # fragment (must be statically shaped).
-        self.input_C = input_C
-        self.output_K = output_K
-        self.output_nzpq = output_nzpq
+        # cta_tile_k shapes the compile-time shared-memory allocation. The
+        # runtime tensors provide C and all output geometry, which lets one
+        # cubin serve every shape compatible with this K tile.
+        self.cta_tile_k = cta_tile_k
 
         # Override warp specialization for fp4 conv: 4 LDGSTS_SFA warps + sched warp.
         self.epilogue_warp_id = (0, 1, 2, 3)
@@ -813,10 +807,9 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
 
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        # Dynamic K tiling: when C < 4*mma_inst_shape_k (256), reduce K_gemm_tile
-        # so each K tile fits within one filter position (C elements).
-        # This ensures A's im2col RestK == B's flat RestK.
-        mma_inst_tile_k = min(4, self.input_C // mma_inst_shape_k)
+        # can_implement() validates the runtime C against this compile-time K
+        # tile before compilation.
+        mma_inst_tile_k = self.cta_tile_k // mma_inst_shape_k
         # Expose for overlapping-accum SF column accounting (see below).
         self.mma_inst_tile_k = mma_inst_tile_k
         self.mma_tiler = (
@@ -1096,20 +1089,6 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             )
         self._setup_attributes()
 
-        # Reject a swizzle_size that exceeds the cluster count in the swizzled
-        # dimension (GEMM-M = NZPQ spatial, GEMM-N = Kout output channels).
-        n_zpq, z, p, q = self.output_nzpq
-        _check_swizzle_size(
-            n_zpq * z * p * q,
-            self.output_K,
-            self.mma_tiler_mn,
-            self.use_2cta_instrs,
-            self.preferred_cluster_shape_mn,
-            self.fallback_cluster_shape_mn,
-            self.swizzle_size,
-            self.raster_along,
-        )
-
         # Pad/stride/dilation operands that BOTH the im2col A descriptor corner
         # and the device per-tile coord math consume. They are the runtime
         # Int32 scalars passed at the cute.compile entry, so one cubin serves
@@ -1185,10 +1164,10 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # partial last tile slice_n runs OOB on the flattened RestN and the TMA load
         # clamps to zeros -> wrong (zero) SFB scaling on that tile. A dynamic N keeps y
         # symbolic, blocks the coalesce, and slice_n decomposes to an in-bounds coord.
-        # input_C stays a host int because it shapes the mma_tiler/SMEM.
+        # C*T*R*S = GEMM-K, with every extent supplied by the runtime filter.
         b_shape_for_sfb = (
             b_tensor.shape[0],
-            self.input_C * b_tensor.shape[1] * b_tensor.shape[2] * b_tensor.shape[3],
+            b_tensor.shape[4] * b_tensor.shape[1] * b_tensor.shape[2] * b_tensor.shape[3],
             1,
         )
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b_shape_for_sfb, self.sf_vec_size)
@@ -1349,6 +1328,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         conv_D = cute.size(a_tensor, mode=[1])
         conv_H = cute.size(a_tensor, mode=[2])
         conv_W = cute.size(a_tensor, mode=[3])
+        conv_C = cute.size(a_tensor, mode=[4])
         conv_Z = cute.size(d_tensor, mode=[1])
         conv_P = cute.size(d_tensor, mode=[2])
         conv_Q = cute.size(d_tensor, mode=[3])
@@ -1369,36 +1349,29 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         pad_d, pad_h, pad_w = lower_pad_op
         K_gemm_tile = self.mma_tiler[2][0]  # mma_inst_shape_k * mma_inst_tile_k
 
-        # Build mSFD tensor: same logical shape as mD (((Q,P,Z,N), K, 1)) but
-        # with the K dimension expressed as (sfd_vec_size, sf_k_padded) with
-        # strides (0, 1) so that sfd_vec_size consecutive K elements share one
-        # physical scale factor. Storage layout matches SFA's K-contig-in-M
-        # form: (mn=NZPQ, sf_k_padded, 1) with mn-stride = sf_k_padded.
+        # Build mSFD with a flat runtime M=N*Z*P*Q axis. A hierarchical runtime
+        # mode does not divide correctly in local_tile and can leave rows
+        # unwritten; the backing SFD buffer is already dense row-major NZPQ.
         if cutlass.const_expr(self.gen_sfd):
-            # The SFD store is a SIMT autovec_copy (no TMA), so this global
-            # descriptor's shape feeds a register fragment that must be
-            # statically shaped. Source N/Z/P/Q/K from host ints (not the
-            # dynamic-tensor cute.size values) so the layout stays trace-const.
-            sfd_N, sfd_Z, sfd_P, sfd_Q = self.output_nzpq
-            conv_K = self.output_K
+            sfd_N = conv_N
+            sfd_Z = conv_Z
+            sfd_P = conv_P
+            sfd_Q = conv_Q
+            conv_K = cute.size(d_tensor, mode=[4])
             sf_k = (conv_K + self.sfd_vec_size - 1) // self.sfd_vec_size
             sf_k_padded = ((sf_k + 3) // 4) * 4  # pad sf_k to multiple of 4
             stride_mn = sf_k_padded
+            sfd_M = sfd_N * sfd_Z * sfd_P * sfd_Q
             mSFD_layout = cute.make_layout(
                 (
-                    (sfd_Q, sfd_P, sfd_Z, sfd_N),
+                    sfd_M,
                     (self.sfd_vec_size, sf_k_padded),
                     1,
                 ),
                 stride=(
-                    (
-                        stride_mn,
-                        sfd_Q * stride_mn,
-                        sfd_P * sfd_Q * stride_mn,
-                        sfd_Z * sfd_P * sfd_Q * stride_mn,
-                    ),
+                    stride_mn,
                     (0, 1),
-                    sfd_N * sfd_Z * sfd_P * sfd_Q * stride_mn,
+                    sfd_M * stride_mn,
                 ),
             )
             mSFD_mnl = cute.make_tensor(sfd_tensor.iterator, mSFD_layout)
@@ -1412,9 +1385,15 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         # epilogue reads it through the same partition_C chain as the accumulator
         # and each thread lands on its own N-column bias scalar.
         if cutlass.const_expr(bias_tensor is not None):
-            bias_N, bias_Z, bias_P, bias_Q = self.output_nzpq
+            # Only the channel mode contributes to the address. A static M
+            # extent keeps the partitioned shared-memory read layout static;
+            # the runtime output tensor supplies the channel extent.
             mBias_layout = cute.make_layout(
-                ((bias_Q, bias_P, bias_Z, bias_N), self.output_K, 1),
+                (
+                    (self.cta_tile_shape_mnk[0], 1, 1, 1),
+                    cute.size(d_tensor, mode=[4]),
+                    1,
+                ),
                 stride=((0, 0, 0, 0), 1, 0),
             )
             mBias_mnl = cute.make_tensor(bias_tensor.iterator, mBias_layout)
@@ -1478,7 +1457,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             conv_P,
             conv_Q,
             conv_N,
-            self.input_C,
+            conv_C,
             K_gemm_tile,
         ).launch(
             grid=preferred_grid,
@@ -1559,7 +1538,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         output_P: cutlass.Int32,
         output_Q: cutlass.Int32,
         input_N: cutlass.Int32,
-        input_C: cutlass.Constexpr,
+        input_C: cutlass.Int32,
         K_gemm_tile: cutlass.Constexpr,
     ):
         """
@@ -1749,7 +1728,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         output_P: cutlass.Int32,
         output_Q: cutlass.Int32,
         input_N: cutlass.Int32,
-        input_C: cutlass.Constexpr,
+        input_C: cutlass.Int32,
         K_gemm_tile: cutlass.Constexpr,
     ):
         """
@@ -3132,7 +3111,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     sBias_tiled = cute.make_tensor(sBias.iterator.align(min_align=4), row_layout)
                     # Predicated cp.async: a CTA N-tile rounds up to cta_tile_n,
                     # but K (= output channels = GEMM-N) need not divide it, so
-                    # the tail lanes address bias columns n >= output_K that have
+                    # the tail lanes address bias columns n >= output K that have
                     # no backing storage. Guard each lane's contiguous vector on
                     # its base channel: in-bounds lanes cp.async from gmem,
                     # out-of-bounds lanes zero-fill sBias (cp.async writes 0 on a
@@ -3143,7 +3122,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     if epi_tidx < n_active:
                         bias_pred = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Boolean)
                         bias_pred[0] = cutlass.Boolean(
-                            n_base + epi_tidx * bias_elems_per_copy < self.output_K
+                            n_base + epi_tidx * bias_elems_per_copy < mD_mnl.shape[1]
                         )
                         cute.copy_atom_call(
                             bias_g2s_atom,
@@ -3337,12 +3316,11 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                             sfgen_slice.store(sfgen_slice.load() * acc_scale)
                         # Store SFD to gmem (predicated on both the M and N
                         # bounds; the last m-tile and partial-N overhangs have no
-                        # backing SFD storage).
+                        # backing SFD storage). The per-thread element count is
+                        # static, but the global extent and stride are runtime.
                         if sfd_in_bounds:
-                            if cutlass.const_expr(cute.size(rSFD) == 1):
-                                t2r_gSFD[0] = rSFD[0]
-                            else:
-                                cute.autovec_copy(rSFD, t2r_gSFD)
+                            for i_st in cutlass.range(n_sf, unroll_full=True):
+                                t2r_gSFD[i_st] = rSFD[(0, i_st)]
 
                     #
                     # Convert to D type
@@ -3870,50 +3848,6 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         return is_valid
 
     @staticmethod
-    def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ) -> bool:
-        """
-        Check if the mma tiler and cluster shape are valid
-
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
-        :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
-        :type cluster_shape_mn: Tuple[int, int]
-
-        :return: True if the mma tiler and cluster shape are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-        # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [128, 256]:
-            is_valid = False
-        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
-            is_valid = False
-        # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
-            is_valid = False
-
-        # Skip invalid cluster shape
-        def is_power_of_2(x):
-            return x > 0 and (x & (x - 1)) == 0
-
-        if (
-            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-            or cluster_shape_mn[0] <= 0
-            or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
-        ):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
     def is_valid_tensor_alignment(
         m: int,
         n: int,
@@ -4007,6 +3941,14 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     f"got leading_dim={output.leading_dim}"
                 )
             self.check_mma_tiler_and_cluster_shape()
+            per_cta_m = self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1)
+            if per_cta_m != 128:
+                raise testing.CantImplementError(
+                    f"Blockscaled conv requires per-CTA M=128, got {per_cta_m} from "
+                    f"mma_tiler_m={self.mma_tiler_mn[0]}, use_2cta_instrs="
+                    f"{self.use_2cta_instrs}. Use mma_tiler_m=128 with 1CTA or "
+                    "mma_tiler_m=256 with 2CTA."
+                )
             # 16B output alignment forces Kout % 32 == 0 for FP4 D, which is
             # what makes the SFD N-bound predicate (gates a whole subtile on its
             # first-element N coord) exact -- so no separate Kout guard is needed.
@@ -4033,6 +3975,16 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     f"<= 256 or a multiple of 256 (e.g. 64, 128, 192, 256, 512, 768). "
                     f"Other values silently corrupt the SFD dequant output."
                 )
+            if self.cta_tile_k == 256:
+                if c % 256 != 0:
+                    raise testing.CantImplementError(
+                        f"cta_tile_k=256 requires C to be a multiple of 256, got C = {c}."
+                    )
+            elif c != self.cta_tile_k:
+                raise testing.CantImplementError(
+                    f"cta_tile_k={self.cta_tile_k} only serves C == {self.cta_tile_k}, "
+                    f"got C = {c}. Use cta_tile_k=256 for C that is a 256-multiple."
+                )
         except testing.CantImplementError as e:
             print(e)
             return False
@@ -4056,6 +4008,7 @@ def compile_conv(
     residual: Optional[cute.Tensor],
     beta: float,
     sf_vec_size: int,
+    cta_tile_k: int,
     mma_tiler: Tuple[int, int] = (256, 256),
     preferred_cluster_shape_mn: Tuple[int, int] = (2, 1),
     fallback_cluster_shape_mn: Tuple[int, int] = (1, 1),
@@ -4077,6 +4030,7 @@ def compile_conv(
     :param filter: Filter tensor in KTRSC format (K, T, R, S, C) with C contiguous
     :param output: Output tensor (N, Z, P, Q, K) with K contiguous
     :param acc_dtype: Accumulator data type
+    :param cta_tile_k: Compile-time GEMM-K tile used to shape shared memory
     :param mma_tiler: MMA tile shape (M, N)
     :param preferred_cluster_shape_mn: Preferred cluster shape (M, N) for CLC dynamic scheduling
     :param fallback_cluster_shape_mn: Fallback cluster shape (M, N) for CLC dynamic scheduling
@@ -4092,7 +4046,6 @@ def compile_conv(
     """
     from cutlass.cute.runtime import make_fake_stream
 
-    # Output spatial dims for the SFD global descriptor (host int, trace-const).
     zpq = compute_zpq(
         ncdhw[2:],
         ktrs[1:],
@@ -4101,12 +4054,19 @@ def compile_conv(
         lower_padding_dhw,
         dilation_dhw,
     )
-    output_nzpq = (ncdhw[0], zpq[0], zpq[1], zpq[2])
+    _check_swizzle_size(
+        ncdhw[0] * zpq[0] * zpq[1] * zpq[2],
+        ktrs[0],
+        mma_tiler,
+        use_2cta_instrs,
+        preferred_cluster_shape_mn,
+        fallback_cluster_shape_mn,
+        swizzle_size,
+        raster_along,
+    )
 
-    # Create convolution kernel object. input_C, output_K, output_nzpq stay
-    # host int (layout-shaping, trace-const). Filter T/R/S and pad/stride/dil
-    # are NOT passed here: T/R/S come from the dynamic-layout filter tensor and
-    # pad/stride/dil arrive as boxed runtime Int32 at the cute.compile entry.
+    # Only cta_tile_k shapes this cubin. Runtime tensor layouts provide C and
+    # output geometry; boxed scalars provide pad, stride, and dilation.
     conv_op = Sm100BlockScaledPersistentDenseImplicitGemmKernel(
         acc_dtype,
         sf_vec_size,
@@ -4114,9 +4074,7 @@ def compile_conv(
         mma_tiler,
         preferred_cluster_shape_mn,
         fallback_cluster_shape_mn,
-        ncdhw[1],
-        ktrs[0],
-        output_nzpq,
+        cta_tile_k,
         swizzle_size,
         raster_along,
     )
@@ -4319,6 +4277,7 @@ def run(
     acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
     sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
     sf_vec_size: int = 16,
+    cta_tile_k: Optional[int] = None,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     preferred_cluster_shape_mn: Tuple[int, int] = (2, 1),
     fallback_cluster_shape_mn: Tuple[int, int] = (1, 1),
@@ -4347,6 +4306,9 @@ def run(
     :param ab_dtype: Data type for A/B input tensors
     :param d_dtype: Data type for output tensor D
     :param acc_dtype: Accumulator data type
+    :param cta_tile_k: Compile-time GEMM-K tile. A 256 tile can serve runtime
+        channel counts that are multiples of 256; smaller tiles serve only a
+        matching channel count.
     :param mma_tiler_mn: MMA tiler shape
     :param preferred_cluster_shape_mn: Preferred cluster shape (M, N) for CLC dynamic scheduling
     :param fallback_cluster_shape_mn: Fallback cluster shape (M, N) for CLC dynamic scheduling
@@ -4364,6 +4326,8 @@ def run(
 
     N, C, D, H, W = ncdhw
     K, T, R, S = ktrs
+    if cta_tile_k is None:
+        cta_tile_k = min(256, C)
 
     # Residual (C) shares the output's shape and im2col TMA descriptor, so its
     # dtype defaults to the output dtype when the caller does not set one.
@@ -4488,7 +4452,9 @@ def run(
         )
         return ref_f32_torch_tensor_cpu, cute_tensor, cute_torch_tensor
 
-    def create_scale_factor_tensor_unswizzled(L, mn, k, sf_vec_size, dtype):
+    def create_scale_factor_tensor_unswizzled(
+        L, mn, k, sf_vec_size, dtype, mark_dynamic_leading_dim=None
+    ):
         def ceil_div(a, b):
             return (a + b - 1) // b
 
@@ -4506,6 +4472,8 @@ def run(
 
         sf_torch = sf_raw.to(dtype=cutlass_torch.dtype(dtype)).cuda()
         sf_tensor = from_dlpack(sf_torch, assumed_align=16)
+        if mark_dynamic_leading_dim is not None:
+            sf_tensor = sf_tensor.mark_layout_dynamic(leading_dim=mark_dynamic_leading_dim)
 
         # Build f32 reference for verification (only the original sf_k, not padded)
         sf_ref = (
@@ -4527,6 +4495,7 @@ def run(
         C,
         sf_vec_size,
         sf_dtype,
+        mark_dynamic_leading_dim=1,
     )
     sfb_ref, sfb_, sfb_storage = create_scale_factor_tensor_swizzled(
         1,
@@ -4604,6 +4573,7 @@ def run(
         c_,
         beta,
         sf_vec_size,
+        cta_tile_k,
         mma_tiler=mma_tiler_mn,
         preferred_cluster_shape_mn=preferred_cluster_shape_mn,
         fallback_cluster_shape_mn=fallback_cluster_shape_mn,
@@ -4986,6 +4956,12 @@ if __name__ == "__main__":
         help="Data type for A/B/D scaling factor tensors (NVFP4 default: E4M3)",
     )
     parser.add_argument("--sf_vec_size", type=int, default=16)
+    parser.add_argument(
+        "--cta_tile_k",
+        type=int,
+        default=None,
+        help="Compile-time GEMM-K tile; defaults to min(256, input C)",
+    )
 
     # Kernel parameters
     parser.add_argument(
@@ -5082,6 +5058,7 @@ if __name__ == "__main__":
         args.acc_dtype,
         args.sf_dtype,
         args.sf_vec_size,
+        args.cta_tile_k,
         args.mma_tiler_mn,
         args.preferred_cluster_shape_mn,
         args.fallback_cluster_shape_mn,
