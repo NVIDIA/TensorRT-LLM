@@ -42,9 +42,12 @@
 //     started (or whose API status lags) is not reaped.
 //   * Per-cluster best-effort: one cluster's failure never aborts the others.
 //
-// DEPENDENCY (companion change, separate PR): SLURM submission in L0_Test.groovy
-// must stamp the owner tag onto each job (see OWNER_TAG_KEY) via `--comment`.
-// Until that lands this job matches nothing and is a safe no-op.
+// COMPANION (same change set): SLURM submission in L0_Test.groovy stamps the owner
+// tag onto each job's `--comment` on both the sbatch path (#SBATCH --comment) and
+// the agent path (addSlurmOwnerComment); its SLURM_OWNER_TAG_KEY must stay in sync
+// with OWNER_TAG_KEY below. A job that predates the tag, or that the agent-path
+// injector left untouched, simply carries no owner tag and is never a reap
+// candidate (safe).
 //
 // INFRA-TODO (fill in with the team before enabling non-dry-run):
 //   * Jenkins job config: schedule (cron), which Jenkins instance(s) it runs on.
