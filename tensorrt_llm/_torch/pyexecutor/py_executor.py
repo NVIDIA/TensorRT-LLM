@@ -3460,6 +3460,10 @@ class PyExecutor:
         """
         if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
+                # The empty-batch padding dummy joins after scheduling, so its
+                # capacity was never grown; reverting would shrink it.
+                if getattr(req, "py_skip_gen_alloc_revert", False):
+                    continue
                 self.kv_cache_manager.revert_allocate_generation(req)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
@@ -3469,10 +3473,10 @@ class PyExecutor:
         decision. If one rank cannot allocate its dummy, peers that succeeded
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
-        """
-        if not self._enable_dsv4_adp_dummy_fixes:
-            return
 
+        Only paths that register a pending dummy are affected; the others leave
+        ``_pending_adp_dummy_request`` unset and no-op here.
+        """
         dummy_request = self._pending_adp_dummy_request
         self._pending_adp_dummy_request = None
         if dummy_request is None or can_queue:
@@ -3838,6 +3842,10 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+
+        # Must run after _schedule(): the empty scheduled batch it repairs does
+        # not exist until the capacity scheduler has returned its verdict.
+        self._pad_empty_attention_dp_batch(scheduled_batch)
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -6380,6 +6388,96 @@ class PyExecutor:
         self.active_requests.append(dummy_request)
         self._pending_adp_dummy_request = dummy_request
 
+    @nvtx_range("_pad_empty_attention_dp_batch")
+    def _pad_empty_attention_dp_batch(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Pad an empty scheduled batch so attention DP can make progress.
+
+        `_can_queue` vetoes the forward pass on every rank when any rank's
+        *scheduled* batch is empty. `_pad_attention_dp_dummy_request` cannot
+        prevent that: it guarantees every rank has an *active* request, and runs
+        before `_schedule()`, so a rank whose only active request does not fit
+        the free KV cache is left unpadded and schedules an empty batch. Peers
+        then never advance their context chunks (`_update_request_states` runs
+        under `if can_queue:`), so no KV cache is freed and the rank stays
+        starved -- silently, since nothing on that path raises or times out.
+
+        Padding is rank-local because `_schedule()` allgathers inside
+        `_balance_adp_requests`. A generation dummy is used rather than the
+        context dummy the pre-schedule path would pick, since this rank is empty
+        precisely because it is short of KV cache. Not reached under pipeline
+        parallelism, which does not call `_prepare_and_schedule_batch`.
+        """
+        if not self.enable_attention_dp:
+            return
+        if scheduled_batch is None or scheduled_batch.batch_size != 0:
+            return
+        if not self.active_requests or self.expected_num_active_requests <= 0:
+            return
+        # Unlike the pre-schedule path, this one pads a rank that already holds
+        # active requests, so it must respect the cap that
+        # `_pad_attention_dp_dummy_request` asserts against. A rank at the cap
+        # is not starved anyway.
+        if len(self.active_requests) >= self.max_num_active_requests:
+            return
+        # The fill gate suppresses forwards on purpose; dummies added then are
+        # never terminated (termination follows a forward pass).
+        if self._should_skip_dummy_for_benchmark_disagg(
+                self._count_schedulable_active_requests()):
+            return
+        # ATTENTION_DP_DUMMY_REQUEST_ID is a singleton resource.
+        if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
+               for request in self.active_requests):
+            return
+        if not self._has_adp_dummy_kv_capacity(None):
+            logger.warning_once(
+                "attention-DP rank scheduled an empty batch and cannot afford "
+                "even a padding dummy; the forward pass is vetoed fleet-wide "
+                "this iteration",
+                key="attention_dp_empty_batch_no_pad_capacity")
+            return
+
+        dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        try:
+            # Degrade to an empty batch rather than propagate: the ranks have
+            # yet to agree on can_queue, so a rank-local raise would strand the
+            # peers in the collectives that follow.
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=None,
+                is_gen=True,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )
+        except (OutOfPagesError, NoFreeSlotsError):
+            dummy_requests = None
+        if not dummy_requests:
+            logger.warning_once(
+                "Could not allocate the attention-DP empty-batch padding "
+                "dummy; retrying next iteration",
+                key="attention_dp_empty_batch_pad_alloc_failed")
+            return
+
+        dummy_request = dummy_requests[0]
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            try:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            except NoFreeSlotsError:
+                self.kv_cache_manager.free_resources(dummy_request)
+                return
+
+        dummy_request.is_attention_dp_dummy = True
+        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
+        dummy_request.py_skip_gen_alloc_revert = True
+        self.active_requests.append(dummy_request)
+        scheduled_batch.generation_requests.append(dummy_request)
+        # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
+        # cannot queue: no forward runs then, so the usual dummy teardown in
+        # `_handle_responses` is not reached this iteration.
+        self._pending_adp_dummy_request = dummy_request
+
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
@@ -6396,6 +6494,16 @@ class PyExecutor:
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
+
+            # Reporting this mini-batch to the KV connector used to happen
+            # inside KVCacheManager.prepare_resources; it now runs after the
+            # token-budget trim, which this path does not go through. Kept here
+            # so the connector's per-request state advances exactly as before.
+            kv_cache_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
+                kv_cache_manager.publish_connector_scheduler_output(
+                    disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
@@ -7583,30 +7691,47 @@ class PyExecutor:
         Only requests that sample new tokens should be added to the inflight set since their next iteration depends
         on these new tokens, so they should be skipped in the scheduler until the new tokens are generated.
         This includes context requests that finish context phase and generation requests.
+
+        The inserted ids are recorded on ``scheduled_requests`` so the paired
+        ``_remove_inflight_ids`` erases exactly what was added, rather than
+        re-deriving the set from a batch that has changed in between. An id left
+        behind is not recoverable: the scheduler skips inflight ids, so the
+        request is never scheduled again while still holding its KV blocks and
+        sequence slot.
+
+        This is load-bearing, not defensive. In this loop the next step is
+        ``resource_manager.prepare_resources``, which runs
+        ``ResourceManager.maybe_fit_token_budget`` at its end -- and that can
+        shrink a context request out of ``context_requests_last_chunk``. By
+        removal time the batch no longer agrees with what was inserted here.
         """
+        added: List[int] = []
         for req in scheduled_requests.context_requests_last_chunk:
             logger.debug(
                 f"Context request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
         for req in scheduled_requests.generation_requests:
             logger.debug(
                 f"Generation request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
+        scheduled_requests.added_inflight_req_ids = added
 
     def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
-        """Remove request IDs of current sampling requests from self.inflight_req_ids."""
-        for req in scheduled_requests.context_requests_last_chunk:
+        """Remove the request IDs this batch added to self.inflight_req_ids.
+
+        Erases the ids recorded by ``_add_inflight_ids`` rather than re-deriving
+        them from the batch, which may have been trimmed since (see there).
+        """
+        for req_id in scheduled_requests.added_inflight_req_ids:
             logger.debug(
-                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
+                f"Request with ID {req_id} removed from DECODER model inflight set"
             )
-            self.inflight_req_ids.erase(req.request_id)
-        for req in scheduled_requests.generation_requests:
-            logger.debug(
-                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
-            )
-            self.inflight_req_ids.erase(req.request_id)
+            self.inflight_req_ids.erase(req_id)
+        scheduled_requests.added_inflight_req_ids = []
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs

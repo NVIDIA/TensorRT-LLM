@@ -12,8 +12,8 @@ that a non-empty lora_params is forwarded:
 
   1. QwenMoE.forward to the routed self.experts call (legacy wrapper).
   2. ConfigurableMoE.forward_impl to scheduler.forward.
-  3. ExternalCommMoEScheduler._get_backend_kwargs to the CutlassFusedMoE
-     run_moe kwargs, and not to backends that cannot carry LoRA.
+  3. ExternalCommMoEScheduler._build_run_context to the CutlassFusedMoE
+     run_moe context, and not to backends that cannot carry LoRA.
 """
 
 from types import SimpleNamespace
@@ -106,8 +106,8 @@ def test_configurable_moe_forward_impl_forwards_lora_params_to_scheduler():
 
 def _make_external_comm_scheduler(backend_cls):
     """Build an ExternalCommMoEScheduler whose moe.backend is an uninitialized
-    instance of backend_cls, sufficient for _get_backend_kwargs class dispatch
-    without constructing weights."""
+    instance of backend_cls, sufficient for building a run context without
+    constructing weights."""
     backend = backend_cls.__new__(backend_cls)
     moe = SimpleNamespace(
         backend=backend,
@@ -121,35 +121,39 @@ def _make_external_comm_scheduler(backend_cls):
     return scheduler
 
 
-def test_scheduler_threads_lora_params_to_cutlass_run_moe_kwargs():
-    """_get_backend_kwargs must thread lora_params into the
-    CutlassFusedMoE.run_moe kwargs."""
-    scheduler = _make_external_comm_scheduler(CutlassFusedMoE)
-
-    kwargs = scheduler._get_backend_kwargs(
+def _build_run_context(scheduler):
+    return scheduler._build_run_context(
+        x=torch.randn(4, 8),
+        x_sf=None,
+        token_selected_slots=torch.zeros(4, 2, dtype=torch.int32),
+        token_final_scales=torch.ones(4, 2),
+        router_logits=None,
+        do_finalize=True,
         output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
         lora_params=_LORA_PARAMS_SENTINEL,
     )
 
-    assert kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL, (
+
+def test_scheduler_threads_lora_params_to_cutlass_run_context():
+    """The run context handed to CutlassFusedMoE.run_moe must carry
+    lora_params."""
+    ctx = _build_run_context(_make_external_comm_scheduler(CutlassFusedMoE))
+
+    assert ctx.lora_params is _LORA_PARAMS_SENTINEL, (
         "Scheduler dropped lora_params before CutlassFusedMoE.run_moe; "
         "routed-expert MoE LoRA would be silently disabled."
     )
 
 
-def test_scheduler_does_not_thread_lora_params_to_non_cutlass_backend():
-    """Only CutlassFusedMoE.run_moe accepts lora_params. Other backends must
-    not receive it, since it is not in their run_moe signature."""
-    scheduler = _make_external_comm_scheduler(DeepGemmFusedMoE)
+def test_scheduler_does_not_thread_lora_params_to_non_lora_backend():
+    """Backends that do not declare supports_moe_lora must get lora_params
+    cleared, so an adapter never silently no-ops inside their kernel."""
+    ctx = _build_run_context(_make_external_comm_scheduler(DeepGemmFusedMoE))
 
-    kwargs = scheduler._get_backend_kwargs(
-        output_dtype=torch.bfloat16,
-        lora_params=_LORA_PARAMS_SENTINEL,
-    )
-
-    assert "lora_params" not in kwargs, (
-        "lora_params must only be forwarded to CutlassFusedMoE.run_moe; "
-        f"DeepGemmFusedMoE.run_moe does not accept it. Got kwargs: {list(kwargs)}"
+    assert ctx.lora_params is None, (
+        "lora_params must only reach backends declaring supports_moe_lora; "
+        f"DeepGemmFusedMoE does not fuse it. Got: {ctx.lora_params}"
     )
 
 
