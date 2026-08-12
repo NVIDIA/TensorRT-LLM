@@ -635,10 +635,7 @@ class VisualGenArgs(StrictBaseModel):
     runtime_lora_config: Optional[RuntimeLoRAConfig] = Field(
         None,
         status="prototype",
-        description=(
-            "Startup-preloaded LoRA adapter fused into VisualGen transformer "
-            "weights."
-        ),
+        description=("Startup-preloaded LoRA adapter fused into VisualGen transformer weights."),
     )
 
     pipeline_config: Dict[str, Any] = Field(

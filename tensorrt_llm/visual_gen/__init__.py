@@ -106,6 +106,7 @@ def __getattr__(name):
 def __dir__():
     return sorted(set(__all__) | set(globals()))
 
+
 __all__ = [
     # Entry-point classes (also top-level re-exports)
     "VisualGen",
