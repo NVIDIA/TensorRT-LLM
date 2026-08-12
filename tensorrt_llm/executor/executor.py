@@ -471,8 +471,8 @@ class GenerationExecutor(ABC):
     def get_data_transceiver_state(self) -> bytes:
         return b""
 
-    def get_startup_metrics(self) -> dict:
-        """Return metrics captured while initializing the executor."""
+    def get_startup_metrics(self) -> dict | None:
+        """Return startup metrics, or ``None`` when temporarily unavailable."""
         return {}
 
     @staticmethod

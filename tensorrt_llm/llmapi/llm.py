@@ -482,10 +482,17 @@ class BaseLLM:
     @property
     @set_api_status("beta")
     def startup_metrics(self) -> dict:
-        """Return the cached startup metrics reported by worker rank 0."""
+        """Cache and return rank-0 startup metrics.
+
+        Returns:
+            dict: The cached metrics, or an empty dict when metrics retrieval fails.
+        """
         if self._startup_metrics is None:
-            self._startup_metrics = self._executor.get_startup_metrics(
+            startup_metrics = self._executor.get_startup_metrics(
             ) if self._executor else {}
+            if startup_metrics is None:
+                return {}
+            self._startup_metrics = startup_metrics
         return self._startup_metrics
 
     @staticmethod

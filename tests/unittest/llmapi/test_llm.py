@@ -1326,7 +1326,7 @@ class _FakeRawRequest:
         return True
 
 
-def test_startup_metrics_are_cached_and_reported_by_server_info() -> None:
+def test_startup_metrics_by_server_info() -> None:
 
     class FakeExecutor:
 
@@ -1334,7 +1334,9 @@ def test_startup_metrics_are_cached_and_reported_by_server_info() -> None:
             self.calls = 0
 
         def get_startup_metrics(self):
-            self.calls += 1
+            self.calls += 1  # keep track of # calls to ensure the cache in the server works
+            if self.calls == 1:
+                return None
             return {"model_loader": {"total_model_loading_seconds": 1.5}}
 
     executor = FakeExecutor()
@@ -1347,8 +1349,13 @@ def test_startup_metrics_are_cached_and_reported_by_server_info() -> None:
     server.generator = generator
     first_response = asyncio.run(server.get_server_info())
     second_response = asyncio.run(server.get_server_info())
+    third_response = asyncio.run(server.get_server_info())
 
-    expected = {
+    assert json.loads(first_response.body) == {
+        "disaggregated_params": {},
+        "startup_metrics": {},
+    }
+    expected_success = {
         "disaggregated_params": {},
         "startup_metrics": {
             "model_loader": {
@@ -1356,9 +1363,9 @@ def test_startup_metrics_are_cached_and_reported_by_server_info() -> None:
             }
         },
     }
-    assert json.loads(first_response.body) == expected
-    assert json.loads(second_response.body) == expected
-    assert executor.calls == 1
+    assert json.loads(second_response.body) == expected_success
+    assert json.loads(third_response.body) == expected_success
+    assert executor.calls == 2
 
 
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
