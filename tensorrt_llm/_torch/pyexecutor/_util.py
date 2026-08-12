@@ -1690,17 +1690,21 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        # Split combined KV cache budgets before creating managers. Skip during
-        # estimation — estimation uses max_tokens-based logic and must not
-        # mutate the config.
+        # Split combined KV cache budgets before creating managers. GPU budget
+        # splitting is skipped during estimation because estimation uses
+        # max_tokens-based logic. Host pools are still created during
+        # estimation, so their budget must always be split to avoid allocating
+        # the full host_cache_size once per manager.
         has_draft = (
             self._draft_model_engine is not None  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_draft:
+        if has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
-            if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
+            if (not estimating_kv_cache
+                    and self._needs_gpu_kv_cache_budget_split(
+                        self_kv_cache_config)):
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,

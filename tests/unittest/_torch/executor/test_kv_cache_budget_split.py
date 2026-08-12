@@ -265,6 +265,33 @@ class TestSplitHostCacheBudgetForDraft:
         assert c._kv_cache_config.max_gpu_total_bytes == total_gpu
         assert c._kv_cache_config.host_cache_size == total_host
 
+    def test_estimation_splits_host_budget_before_creating_managers(self):
+        total_host = 20 * GB
+        c = _make_creator(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=total_host,
+            total_kv_per_token=100,
+            target_kv_per_token=80,
+        )
+        c._skip_est = False
+        c._draft_model_engine = None
+        c._is_kv_cache_manager_v2 = True
+        c._is_encoder_decoder = Mock(return_value=False)
+        c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        c._create_kv_cache_manager = Mock(return_value=Mock())
+        c._create_one_model_draft_kv_cache_manager = Mock(return_value=Mock())
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        target_config = c._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+        draft_config = c._create_one_model_draft_kv_cache_manager.call_args.kwargs[
+            "kv_cache_config_override"
+        ]
+        assert target_config.host_cache_size == 16 * GB
+        assert draft_config.host_cache_size == 4 * GB
+        assert target_config.host_cache_size + draft_config.host_cache_size == total_host
+        assert c._kv_cache_config.host_cache_size == total_host
+
 
 class TestHostSplitIgnoresGpuFixedCost:
     """The fixed cost models GPU-resident state and is not host memory."""
