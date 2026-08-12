@@ -803,7 +803,10 @@ class TestProcessTelemetrySession:
         assert usage_lib._SESSION is None
         assert usage_lib._REPORTER_STOP.is_set()
         assert not stale_session.claim_initial()
-        assert stale_session.claim_terminal() is None
+        assert (
+            stale_session.claim_terminal(usage_lib.TerminalOutcome(termination_kind="unknown"))
+            is None
+        )
 
     def test_explicit_opt_out_remains_sticky_after_fork_reset(self, enable_telemetry):
         """Resetting inherited locks cannot discard an explicit user opt-out."""

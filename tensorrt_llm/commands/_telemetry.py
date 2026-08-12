@@ -166,7 +166,6 @@ def run_with_terminal_reporting(
 
     def report(outcome: usage.TerminalOutcome) -> None:
         try:
-            outcome = outcome.with_observation(usage.get_termination_observation())
             usage.report_exit(
                 outcome,
                 lifecycle_phase=None,

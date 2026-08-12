@@ -80,11 +80,6 @@ def terminal_mocks():
         patch.object(_telemetry.usage, "start_usage_session", return_value=True) as start,
         patch.object(_telemetry.usage, "set_lifecycle_phase") as set_phase,
         patch.object(_telemetry.usage, "get_observed_signal", return_value=0) as signal,
-        patch.object(
-            _telemetry.usage,
-            "get_termination_observation",
-            return_value=None,
-        ) as observation,
         patch.object(_telemetry.usage, "record_observed_signal") as record_signal,
         patch.object(_telemetry.usage, "report_exit") as report_exit,
     ):
@@ -92,7 +87,6 @@ def terminal_mocks():
             start=start,
             set_phase=set_phase,
             signal=signal,
-            observation=observation,
             record_signal=record_signal,
             report_exit=report_exit,
         )
@@ -329,52 +323,6 @@ class TestTelemetryGroup:
         assert outcome.exit_code == 128 + signal.SIGTERM
         assert outcome.signal_number == signal.SIGTERM
         assert outcome.termination_kind == "signal"
-
-    @pytest.mark.parametrize(
-        ("observation", "observed_signal"),
-        [
-            pytest.param(
-                _telemetry.usage.TerminalOutcome(
-                    termination_kind="worker_failure",
-                    component="engine_worker",
-                    reporting_source="supervisor",
-                    exit_code_known=True,
-                    exit_code=137,
-                    signal_number=9,
-                ),
-                0,
-                id="authoritative-child-status",
-            ),
-            pytest.param(
-                _telemetry.usage.TerminalOutcome(
-                    termination_kind="worker_failure",
-                    component="engine_worker",
-                    reporting_source="executor_proxy",
-                    exit_code_known=False,
-                ),
-                signal.SIGINT,
-                id="liveness-only",
-            ),
-        ],
-    )
-    def test_worker_observation_overrides_boundary(
-        self,
-        terminal_mocks,
-        observation,
-        observed_signal,
-    ):
-        """The first causal worker observation overrides parent symptoms."""
-
-        def fail():
-            raise RuntimeError("worker unavailable")
-
-        terminal_mocks.signal.return_value = observed_signal
-        terminal_mocks.observation.return_value = observation
-        cli = _make_cli(fail)
-        with pytest.raises(RuntimeError):
-            cli.main(args=["run"], prog_name="test-cli")
-
-        assert terminal_mocks.report_exit.call_args.args[0] == observation
 
 
 class TestSerializedTerminationKinds:

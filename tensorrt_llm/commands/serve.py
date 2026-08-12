@@ -54,9 +54,9 @@ from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
+from tensorrt_llm.usage import TerminalOutcome
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.usage import (TerminalOutcome, get_observed_signal,
-                                record_observed_signal,
+from tensorrt_llm.usage import (get_observed_signal, record_observed_signal,
                                 record_termination_observation,
                                 set_lifecycle_phase, set_usage_context,
                                 start_usage_session)
@@ -2312,13 +2312,15 @@ def _run_fleet_worker():
     binds its own ``SO_REUSEPORT`` socket on the shared public port.
     """
     start_usage_session(
-        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.value,
+        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.
+        value,
         component="server",
         lifecycle_phase="config_validation",
     )
     return _command_telemetry.run_with_terminal_reporting(
         _run_fleet_worker_impl,
-        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.value,
+        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.
+        value,
         infer_signal_from_exit_code=True,
     )
 

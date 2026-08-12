@@ -31,8 +31,7 @@ from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
 from ..usage import config as _telemetry_config
 from ..usage import start_usage_session
-from ._telemetry import (TelemetryGroup,
-                         apply_raw_config_telemetry_opt_out)
+from ._telemetry import TelemetryGroup, apply_raw_config_telemetry_opt_out
 from .utils import collect_explicit_cli_keys
 
 # CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
