@@ -147,12 +147,31 @@ def _build_traced_moe(m: dict):
     return moe, model, routing_logits_dtype
 
 
-def _forward_kernels(moe, model, routing_logits_dtype, num_tokens: int):
-    from .timing.cuda_graph import _time_moe_forward_cuda_graph
-    from .timing.cupti import _try_init_cupti
+@pytest.fixture(scope="module", autouse=True)
+def _cupti_before_any_cuda_context():
+    """Register CUPTI before the first test builds anything on the GPU.
 
-    cupti_ctx = _try_init_cupti()
-    if not cupti_ctx.ok:
+    cupti.py:117 needs exactly 2*iters CUDA_EVENT records and returns None
+    otherwise, which collapses the whole breakdown to empty lists. Its own
+    diagnostic names the cause: "Most likely CUPTI was registered after CUDA
+    context creation." That is what happened on build #44 -- the backend test
+    runs first, builds a module on cuda, and by the time a later test called
+    _try_init_cupti the context already existed, so both kernel-level tests saw
+    0 kernels. Doing it here, once, before any test body, keeps the ordering
+    right no matter which tests get selected.
+    """
+    if not torch.cuda.is_available():
+        yield None
+        return
+    from .timing.cupti import _try_init_cupti
+    yield _try_init_cupti()
+
+
+def _forward_kernels(request, moe, model, routing_logits_dtype, num_tokens: int):
+    from .timing.cuda_graph import _time_moe_forward_cuda_graph
+
+    cupti_ctx = request.getfixturevalue("_cupti_before_any_cuda_context")
+    if cupti_ctx is None or not cupti_ctx.ok:
         pytest.skip("cupti package unavailable; per-kernel breakdown not possible")
 
     x = torch.randn(num_tokens, model.hidden_size, dtype=torch.bfloat16, device="cuda")
@@ -161,7 +180,21 @@ def _forward_kernels(moe, model, routing_logits_dtype, num_tokens: int):
     _times, stats = _time_moe_forward_cuda_graph(
         moe, x, router_logits, all_rank_num_tokens=[num_tokens],
         warmup=3, iters=1, cupti_ctx=cupti_ctx, flush_l2=True)
-    return stats.get("moe_forward_kernels") or []
+    kernels = stats.get("moe_forward_kernels") or []
+    if not kernels:
+        # Not a bootstrap condition. An empty breakdown means the capture itself
+        # failed, and treating it as "observed 0" would invite pinning a golden of
+        # 0 -- a test that asserts nothing while looking green forever. cupti.py
+        # prints the reason to stdout, which pytest swallows on a passing or
+        # skipped test, so `-s` is where to look.
+        other = len(stats.get("other_kernels") or [])
+        pytest.fail(
+            "CUPTI captured no kernels inside the MoE forward window "
+            f"({other} landed outside it). This is a broken capture, not a missing "
+            "golden. cupti.py returns None when it does not see exactly 2*iters "
+            "CUDA_EVENT records, usually because CUPTI was registered after the "
+            "CUDA context existed; re-run with -s to see its diagnostic.")
+    return kernels
 
 
 @_GPU
@@ -186,7 +219,7 @@ def test_v4_moe_backend_honored():
 
 @_GPU
 @pytest.mark.discrete
-def test_v4_moe_traced_gemm_shapes_present():
+def test_v4_moe_traced_gemm_shapes_present(request):
     """Every GEMM shape the trace says dominates the iteration is still issued.
 
     This is the assertion the trace buys. The shapes are compile-time template
@@ -201,7 +234,7 @@ def test_v4_moe_traced_gemm_shapes_present():
     """
     m = _manifest()
     moe, model, rl = _build_traced_moe(m)
-    kernels = _forward_kernels(moe, model, rl, m["workload"]["num_tokens"])
+    kernels = _forward_kernels(request, moe, model, rl, m["workload"]["num_tokens"])
     names = "\n".join(k["name"] for k in kernels)
 
     # Only the grouped shapes: the num_groups=1 ones come from the dense
@@ -213,8 +246,6 @@ def test_v4_moe_traced_gemm_shapes_present():
         if needle not in names:
             missing.append(g)
 
-    if not kernels:
-        pytest.skip("no kernels captured; cannot assert shapes")
     assert not missing, (
         "GEMM shapes present in the traced run are absent from this build: "
         + ", ".join(f"N={g['N']} K={g['K']} groups={g['num_groups']} "
@@ -225,7 +256,7 @@ def test_v4_moe_traced_gemm_shapes_present():
 
 @_GPU
 @pytest.mark.discrete
-def test_v4_moe_launch_count():
+def test_v4_moe_launch_count(request):
     """One MoE forward issues a fixed number of kernels.
 
     Catches lost fusion and lost graph coverage, both of which change the count
@@ -233,7 +264,7 @@ def test_v4_moe_launch_count():
     """
     m = _manifest()
     moe, model, rl = _build_traced_moe(m)
-    observed = len(_forward_kernels(moe, model, rl, m["workload"]["num_tokens"]))
+    observed = len(_forward_kernels(request, moe, model, rl, m["workload"]["num_tokens"]))
 
     case_id, sm = _case_id(m), _current_sm()
     expected = _EXPECTED_LAUNCH_COUNT.get(case_id, {}).get(sm)
