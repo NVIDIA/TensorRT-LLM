@@ -173,6 +173,15 @@ if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
   include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
 endif()
 
+# Generated FMHA sources (see contextFusedMultiHeadAttention/CMakeLists.txt for
+# the full definition and default). fmha_cubin.h is included transitively by
+# headers used across several targets, so when generation is redirected out of
+# the source tree the directory must be on every target's include path, not just
+# the FMHA target's.
+if(DEFINED TRTLLM_FMHA_GEN_DIR AND NOT "${TRTLLM_FMHA_GEN_DIR}" STREQUAL "")
+  include_directories("${TRTLLM_FMHA_GEN_DIR}")
+endif()
+
 setup_cuda_compiler()
 
 enable_language(C CXX CUDA)
