@@ -327,6 +327,8 @@ def test_autotuner_do_preparation_try_block():
             [x, w])
     assert tactic == -1, \
         f"Expect the fallback tactic -1, but got tactic {tactic}."
+    assert runner is runners[0], \
+        f"Expect the fallback runner, but got {runner}."
     assert tuner.stats.failed_profiling_count[
         "test_autotuner_do_preparation_try_block"], \
         "Expect the failure to be recorded."
