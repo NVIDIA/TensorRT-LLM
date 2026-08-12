@@ -3,6 +3,7 @@
 
 """Shared utilities for FlashInfer sparse MLA."""
 
+from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -14,7 +15,8 @@ SPARSE_MLA_SPLIT_KV_TILE = 64
 SPARSE_MLA_SPLIT_Q_THRESHOLD = 64
 
 
-def get_sparse_mla_op():
+def get_sparse_mla_op() -> Callable[..., None]:
+    """Return the pinned FlashInfer SM120 sparse-MLA operator."""
     from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
 
     return _sparse_mla_sm120_paged_attention
@@ -28,7 +30,14 @@ def allocate_sparse_mla_split_workspace(
     value_dim: int,
     device: torch.device,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Allocate split-K scratch required by FlashInfer's private SM120 kernel."""
+    """Allocate split-K scratch required by FlashInfer's private SM120 kernel.
+
+    For at most 64 query tokens, returns ``mid_out`` with shape
+    ``[num_tokens, num_heads, num_splits, value_dim]`` and dtype bfloat16,
+    plus ``mid_lse`` with shape ``[num_tokens, num_heads, num_splits]`` and
+    dtype float32. For more than 64 query tokens, the kernel does not use the
+    split-K path and this function returns ``(None, None)``.
+    """
     if num_tokens > SPARSE_MLA_SPLIT_Q_THRESHOLD:
         return None, None
 

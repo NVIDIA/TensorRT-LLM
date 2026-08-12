@@ -1422,6 +1422,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
+                values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
+                torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
+                used by DeepSeek-V4 and DSA on SM120/SM121.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)

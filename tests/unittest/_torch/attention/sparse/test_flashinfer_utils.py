@@ -29,20 +29,25 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 
-def test_sm120_sparse_mla_requires_packed_cache_dtype() -> None:
+@pytest.mark.parametrize("algorithm", ["dsa", "deepseek_v4"])
+@pytest.mark.parametrize("sm", [120, 121])
+def test_sm120_sm121_sparse_mla_requires_packed_cache_dtype(algorithm: str, sm: int) -> None:
     attn = SimpleNamespace(
         fmha_libs=[],
         is_mla_enable=True,
         kv_cache_dtype="auto",
-        sparse_params=SimpleNamespace(algorithm="dsa"),
+        sparse_params=SimpleNamespace(algorithm=algorithm),
     )
 
     with (
         patch(
             "tensorrt_llm._torch.attention_backend.trtllm.get_sm_version",
-            return_value=120,
+            return_value=sm,
         ),
-        pytest.raises(ValueError, match="requires kv_cache_config.dtype='fp8_ds_mla'"),
+        pytest.raises(
+            ValueError,
+            match=r"requires kv_cache_config\.dtype='fp8_ds_mla'",
+        ),
     ):
         TrtllmAttention.create_fmha_libs(attn)
 
@@ -58,6 +63,8 @@ def test_sparse_mla_split_workspace_follows_kernel_threshold() -> None:
 
     assert mid_out is not None and mid_out.shape == (64, 8, 3, 512)
     assert mid_lse is not None and mid_lse.shape == (64, 8, 3)
+    assert mid_out.dtype == torch.bfloat16
+    assert mid_lse.dtype == torch.float32
 
     assert allocate_sparse_mla_split_workspace(
         num_tokens=65,
@@ -89,7 +96,7 @@ def test_split_extra_rejects_empty_compressed_output() -> None:
     block_table = torch.zeros((1, 1), dtype=torch.int32)
     indices = torch.zeros((1, 1), dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="split_extra.*num_compressed_indices"):
+    with pytest.raises(ValueError, match=r"split_extra.*num_compressed_indices"):
         deepseek_v4_local_to_global_indices(
             req_id=req_id,
             block_table_swa=block_table,
