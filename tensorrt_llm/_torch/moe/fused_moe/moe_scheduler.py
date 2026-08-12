@@ -519,7 +519,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
-            if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+            # The optimization belongs to the DeepEP transport contract: any
+            # backend exposing an NVFP4 input scale can use it when DeepEP's
+            # own shape, dtype, quantization, and feature-flag checks pass.
+            if isinstance(moe.comm, DeepEPLowLatency):
                 nvfp4_input_scale = getattr(moe.backend, "fc31_input_scale", None)
                 fuse_bf16_nvfp4_dispatch = (
                     nvfp4_input_scale is not None
