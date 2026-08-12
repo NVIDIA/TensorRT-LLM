@@ -183,6 +183,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
     # Sub-configs from VisualGenArgs (merged during from_pretrained)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
+    # VAE quantization is component-scoped. None preserves checkpoint-driven
+    # selection, while QuantConfig(quant_algo=None) explicitly disables it.
+    vae_quant_config: Optional[QuantConfig] = None
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
@@ -628,6 +631,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 "a full-precision checkpoint first, or disable quantization."
             )
 
+        # Keep VAE precision independent from the transformer. Reuse the
+        # established QuantConfig schema and ModelOpt ``ignore`` parser, but do
+        # not reuse the transformer instance: component routing by name pattern
+        # cannot represent BF16 transformer + FP4 VAE (or the reverse).
+        user_vae_quant = args.vae_quant_config if args else None
+        if isinstance(user_vae_quant, dict):
+            vae_quant_config, _, _, _ = cls.load_diffusion_quant_config(user_vae_quant)
+        elif isinstance(user_vae_quant, QuantConfig):
+            vae_quant_config = user_vae_quant
+        else:
+            vae_quant_config = None
+
         # Enable tunable FP4 quantize for visual gen: larger activation
         # tensors (full image/video latents) amortize the AutoTuner overhead.
         if quant_config.quant_algo == QuantAlgo.NVFP4:
@@ -648,6 +663,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         pipeline_config = cls(
             quant_config=quant_config,
+            vae_quant_config=vae_quant_config,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,

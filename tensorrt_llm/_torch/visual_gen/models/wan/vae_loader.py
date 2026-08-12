@@ -25,6 +25,8 @@ from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .wan_vae import WanVAE, WanVAEConfig
 
@@ -75,7 +77,14 @@ def _is_nvfp4_vae_ckpt(vae_dir: Path) -> bool:
     )
 
 
-def _load_nvfp4_wan_vae(checkpoint_dir: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
+def _load_nvfp4_wan_vae(
+    checkpoint_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    enable_fp4: bool = True,
+    quant_config: QuantConfig | None = None,
+) -> nn.Module:
     """Load ModelOpt weights and replace their quantized Conv3d modules.
 
     Quantized weights are first dequantized into the native state dict, then
@@ -140,25 +149,80 @@ def _load_nvfp4_wan_vae(checkpoint_dir: str, device: torch.device, dtype: torch.
             state_dict[key] = value
     wan_vae.load_state_dict(state_dict, strict=True)
     wan_vae = wan_vae.to(device=device, dtype=dtype).eval()
-    n, n_static = swap_wan_convs_to_fp4(wan_vae, input_scales, only_names=quantized)
-    if n != len(quantized):
+    selected = {
+        name
+        for name in quantized
+        if quant_config is None or not quant_config.is_module_excluded_from_quantization(name)
+    }
+    n = n_static = 0
+    if enable_fp4:
+        n, n_static = swap_wan_convs_to_fp4(wan_vae, input_scales, only_names=selected)
+    if n != len(selected) and enable_fp4:
         raise ValueError(
-            f"NVFP4 checkpoint contains {len(quantized)} quantized convolutions, "
+            f"NVFP4 checkpoint selects {len(selected)} quantized convolutions, "
             f"but only {n} are supported Wan residual convolutions"
         )
-    logger.info(
-        f"Loaded NVFP4 Wan VAE: {len(quantized)} quantized convs; "
-        f"{n} run on the FP4 kernel ({n_static} static, {n - n_static} dynamic)."
-    )
+    if enable_fp4:
+        logger.info(
+            f"Loaded NVFP4 Wan VAE: {len(quantized)} quantized convs; "
+            f"{n} run on the FP4 kernel ({n_static} static, {n - n_static} dynamic); "
+            f"{len(quantized) - len(selected)} excluded by vae_quant_config."
+        )
+    else:
+        logger.info("Loaded the NVFP4 Wan VAE checkpoint as dequantized BF16 modules.")
     return wan_vae
+
+
+def _load_native_wan_vae(
+    checkpoint_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> WanVAE:
+    vae_dir = Path(checkpoint_dir) / "vae"
+    wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
+    state_dict = WeightLoader(components=PipelineComponent.VAE).load_weights(
+        checkpoint_dir,
+        Mapping(),
+    )
+    wan_vae.load_state_dict(state_dict, strict=True)
+    return wan_vae.to(device=device, dtype=dtype).eval()
+
+
+def _select_dynamic_fp4_convs(vae: WanVAE, quant_config: QuantConfig) -> set[str]:
+    """Return supported residual convolutions not excluded by the VAE config."""
+    from .wan_vae import WanCausalConv3d, WanResidualBlock
+
+    selected: set[str] = set()
+    for name, module in vae.named_modules():
+        if not isinstance(module, WanResidualBlock):
+            continue
+        for attr in ("conv1", "conv2"):
+            conv_name = f"{name}.{attr}"
+            if isinstance(getattr(module, attr), WanCausalConv3d) and not (
+                quant_config.is_module_excluded_from_quantization(conv_name)
+            ):
+                selected.add(conv_name)
+    return selected
 
 
 def load_wan_vae(
     checkpoint_dir: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    quant_config: QuantConfig | None = None,
 ) -> nn.Module:
+    requested_algo = quant_config.quant_algo if quant_config is not None else None
+    if requested_algo not in (None, QuantAlgo.NVFP4):
+        raise ValueError(
+            f"Wan VAE supports only NVFP4 quantization, got {requested_algo}. "
+            "Use quant_config for transformer quantization."
+        )
+
     if not _use_native_wan_vae():
+        if requested_algo == QuantAlgo.NVFP4:
+            raise ValueError(
+                f"NVFP4 VAE requires the native Wan VAE; unset {TRTLLM_USE_DIFFUSER_VAE_ENV}."
+            )
         return AutoencoderKLWan.from_pretrained(
             checkpoint_dir,
             subfolder="vae",
@@ -166,14 +230,35 @@ def load_wan_vae(
         ).to(device)
 
     vae_dir = Path(checkpoint_dir) / "vae"
-    if _is_nvfp4_vae_ckpt(vae_dir):
-        return _load_nvfp4_wan_vae(checkpoint_dir, device, dtype)
+    checkpoint_is_fp4 = _is_nvfp4_vae_ckpt(vae_dir)
+    # None means checkpoint-driven selection. An explicit QuantConfig with no
+    # quant_algo requests BF16, including dequantizing a packed FP4 checkpoint.
+    enable_fp4 = checkpoint_is_fp4 if quant_config is None else requested_algo == QuantAlgo.NVFP4
 
-    wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
-    state_dict = WeightLoader(components=PipelineComponent.VAE).load_weights(
-        checkpoint_dir,
-        Mapping(),
-    )
-    wan_vae.load_state_dict(state_dict, strict=True)
+    if checkpoint_is_fp4:
+        return _load_nvfp4_wan_vae(
+            checkpoint_dir,
+            device,
+            dtype,
+            enable_fp4=enable_fp4,
+            quant_config=quant_config,
+        )
 
-    return wan_vae.to(device=device, dtype=dtype).eval()
+    wan_vae = _load_native_wan_vae(checkpoint_dir, device, dtype)
+    if enable_fp4:
+        from .wan_vae import swap_wan_convs_to_fp4
+
+        selected = _select_dynamic_fp4_convs(wan_vae, quant_config)
+        n, n_static = swap_wan_convs_to_fp4(wan_vae, only_names=selected)
+        if n != len(selected):
+            raise ValueError(
+                f"vae_quant_config selected {len(selected)} convolutions, "
+                f"but only {n} were replaced"
+            )
+        logger.info(
+            f"Prepared {n} Wan VAE convolutions for one-time weight quantization "
+            "during warmup (dynamic activations)."
+        )
+        if n_static:
+            raise RuntimeError("Load-time NVFP4 quantization unexpectedly produced static scales")
+    return wan_vae

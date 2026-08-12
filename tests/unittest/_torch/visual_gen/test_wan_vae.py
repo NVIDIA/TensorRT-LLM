@@ -12,6 +12,7 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.visual_gen.models.wan import vae_loader
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
     TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE,
     ParallelVAE_TrtllmWan,
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
     TRTLLM_USE_DIFFUSER_VAE_ENV,
     _is_nvfp4_vae_ckpt,
+    _select_dynamic_fp4_convs,
     _use_native_wan_vae,
     load_wan_vae,
 )
@@ -35,6 +37,8 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     _fp4_align_output_channels,
     swap_wan_convs_to_fp4,
 )
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 DEVICE = "cuda"
 # Parity runs in fp32 to check whether our implementation matches diffusers'
@@ -160,6 +164,67 @@ def test_swap_fp4_respects_checkpoint_module_names():
     assert replaced == static == 1
     assert not isinstance(model[0].conv1, NVFP4WanCausalConv3d)
     assert isinstance(model[0].conv2, NVFP4WanCausalConv3d)
+
+
+def test_dynamic_fp4_selection_reuses_quant_config_exclusions():
+    model = torch.nn.Sequential(WanResidualBlock(8, 8).eval())
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4,
+        exclude_modules=["0.conv1"],
+    )
+
+    assert _select_dynamic_fp4_convs(model, quant_config) == {"0.conv2"}
+
+
+def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
+    model = torch.nn.Sequential(WanResidualBlock(8, 8).eval())
+    monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
+    monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
+    monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)
+
+    loaded = load_wan_vae(
+        "/unused",
+        torch.device("cpu"),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=["0.conv1"],
+        ),
+    )
+
+    assert loaded is model
+    assert not isinstance(model[0].conv1, NVFP4WanCausalConv3d)
+    assert isinstance(model[0].conv2, NVFP4WanCausalConv3d)
+
+
+def test_explicit_bf16_config_dequantizes_fp4_checkpoint(monkeypatch):
+    sentinel = torch.nn.Identity()
+    call: dict[str, object] = {}
+    monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
+    monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: True)
+
+    def _fake_load(*args, **kwargs):
+        call.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(vae_loader, "_load_nvfp4_wan_vae", _fake_load)
+
+    loaded = load_wan_vae(
+        "/unused",
+        torch.device("cpu"),
+        quant_config=QuantConfig(),
+    )
+
+    assert loaded is sentinel
+    assert call["enable_fp4"] is False
+
+
+def test_wan_vae_rejects_unsupported_quantization():
+    with pytest.raises(ValueError, match="supports only NVFP4"):
+        load_wan_vae(
+            "/unused",
+            torch.device("cpu"),
+            quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+        )
 
 
 @pytest.mark.parametrize(
