@@ -23,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
@@ -226,6 +227,29 @@ class LagunaMoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def g_proj_quant_config(model_config, layer_idx: Optional[int]) -> Optional[QuantConfig]:
+    """Resolve g_proj's quant config, dropping it if the checkpoint excludes it.
+
+    g_proj's output dim is the head count, not a multiple of the FP8 block
+    alignment, so a quantised g_proj trips Linear.__init__'s assert under
+    tp_size > 1. __post_init__'s generic exclusion pass runs too late.
+    """
+    quant_config = model_config.get_quant_config()
+    if quant_config is None or layer_idx is None:
+        return quant_config
+
+    name = f"model.layers.{layer_idx}.self_attn.g_proj"
+    if not quant_config.is_module_excluded_from_quantization(name):
+        return quant_config
+
+    # Keep kv_cache_quant_algo: QuantMode derives the KV-cache mode from it, so
+    # dropping it would silently disable FP8 KV cache for this module.
+    return QuantConfig(
+        quant_algo=None,
+        kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+    )
+
+
 class LagunaAttention(QKNormRoPEAttention):
     """Laguna attention with per-head softplus gating, per-layer heads,
     dual RoPE, and sliding window."""
@@ -298,7 +322,7 @@ class LagunaAttention(QKNormRoPEAttention):
                 dtype=config.torch_dtype,
                 mapping=model_config.mapping,
                 tensor_parallel_mode=g_tp_mode,
-                quant_config=model_config.get_quant_config(),
+                quant_config=g_proj_quant_config(model_config, layer_idx),
             )
 
     @staticmethod
@@ -690,9 +714,13 @@ class LagunaHfWeightMapper(HfWeightMapper):
                     .replace("up_proj", "w3")
                     .replace("down_proj", "w2")
                 )
-                if use_fp8_block_rename:
+                if use_fp8_block_rename and "weight_scale_inv" not in new_wn:
                     # ModelOpt uses "weight_scale"; TRT-LLM DeepSeekFP8
                     # quantization expects "weight_scale_inv" (same values).
+                    # Skip names already using "weight_scale_inv"
+                    # (compressed-tensors / DeepSeek style): a blanket replace
+                    # turns it into "weight_scale_inv_inv", which silently
+                    # drops the block scales and leaves them uninitialised.
                     new_wn = new_wn.replace("weight_scale", "weight_scale_inv")
                 # filter_weights strips module prefix leaving "experts.X.w1.weight";
                 # VANILLA mode expects "X.w1.weight" (integer prefix only).
