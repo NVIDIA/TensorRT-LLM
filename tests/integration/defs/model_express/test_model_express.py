@@ -54,6 +54,11 @@ _TRANSFERRED_PARAMS_PATTERN = re.compile(
     r"Rank\s+(\d+):\s+transferred\s+(\d+)\s+params",
     re.IGNORECASE,
 )
+_DONOR_PROCESS_FAILURE_MARKERS = (
+    b"Segfault encountered",
+    b"Primary job terminated normally, but",
+    b"process returned a non-zero exit code",
+)
 _MX_PREFLIGHT_SCRIPT = """
 import importlib.metadata as metadata
 import importlib.util
@@ -284,6 +289,9 @@ def _worker_environment(gpu_ids: tuple[str, ...], transfer_log_dir: Path) -> dic
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "MX_TRANSFER_LOG_DIR": str(transfer_log_dir),
+            # ModelExpress initializes its own NIXL UCX context. Keep OpenMPI
+            # on ob1 so two independently packaged UCX stacks do not coexist.
+            "OMPI_MCA_pml": "ob1",
             "PYTHONUNBUFFERED": "1",
             "TLLM_LOG_LEVEL": "INFO",
         }
@@ -325,12 +333,21 @@ def _wait_for_donor(
     process: subprocess.Popen[bytes], ready_file: Path, log_path: Path, timeout_s: int
 ) -> None:
     deadline = time.monotonic() + timeout_s
+    log_offset = 0
+    failure_window = b""
     while not ready_file.exists():
         returncode = process.poll()
         if returncode is not None:
             pytest.fail(
                 f"MX donor exited before publication with status {returncode}\n{_log_tail(log_path)}"
             )
+        if log_path.exists():
+            with log_path.open("rb") as log_file:
+                log_file.seek(log_offset)
+                failure_window = (failure_window + log_file.read())[-4096:]
+                log_offset = log_file.tell()
+        if any(marker in failure_window for marker in _DONOR_PROCESS_FAILURE_MARKERS):
+            pytest.fail(f"MX donor worker failed before publication\n{_log_tail(log_path)}")
         if time.monotonic() >= deadline:
             pytest.fail(f"MX donor did not become ready within {timeout_s}s\n{_log_tail(log_path)}")
         time.sleep(0.5)
