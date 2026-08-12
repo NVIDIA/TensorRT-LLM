@@ -899,11 +899,6 @@ class _TelemetrySession:
                 return
             self.observed_outcome = outcome
 
-    def get_termination_observation(self) -> Optional[TerminalOutcome]:
-        """Return the first causal terminal observation, if any."""
-        with self.lock:
-            return self.observed_outcome
-
     def _snapshot_unlocked(self) -> dict[str, Any]:
         self._refresh_metadata_unlocked()
         return {
@@ -1245,11 +1240,6 @@ def record_observed_signal(signal_number: int) -> None:
 def record_termination_observation(outcome: TerminalOutcome) -> None:
     """Remember a terminal cause for a surviving authoritative boundary."""
     _session_call(lambda session: session.record_termination_observation(outcome), None)
-
-
-def get_termination_observation() -> Optional[TerminalOutcome]:
-    """Return a pending terminal classification, if one was observed."""
-    return _session_call(lambda session: session.get_termination_observation(), None)
 
 
 def get_observed_signal() -> int:

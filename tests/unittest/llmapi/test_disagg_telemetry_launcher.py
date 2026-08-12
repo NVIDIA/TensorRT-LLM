@@ -315,11 +315,6 @@ def test_fleet_worker_uses_process_wide_telemetry_setting() -> None:
             "get_observed_signal",
             return_value=0,
         ),
-        mock.patch.object(
-            serve._command_telemetry.usage,
-            "get_termination_observation",
-            return_value=None,
-        ),
         mock.patch.object(serve._command_telemetry.usage, "set_lifecycle_phase"),
         mock.patch.object(
             serve._command_telemetry.usage,
