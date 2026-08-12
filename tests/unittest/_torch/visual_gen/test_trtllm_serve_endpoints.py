@@ -2387,6 +2387,19 @@ class TestVideoTensorResponse:
         assert "video" in loaded
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
+    def test_sync_tensor_file_reports_server_timing(self, video_audio_client, fmt):
+        """Tensor payloads carry engine timings, as encoder payloads do.
+
+        A tensor request is what a measurement client makes: it wants the raw
+        frames *and* how long denoising took. Both come from the same
+        generation, so both belong on the same response. The sibling
+        ``path`` case already asserts this; the file payload did not.
+        """
+        resp = self._post_sync(video_audio_client, fmt, "file")
+        assert resp.status_code == 200
+        _assert_visual_gen_server_timing(resp.headers)
+
+    @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
     def test_sync_tensor_path_returns_readable_output_path(self, video_audio_client, fmt):
         resp = self._post_sync(video_audio_client, fmt, "path")
         assert resp.status_code == 200
