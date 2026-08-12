@@ -402,10 +402,6 @@ class WanConv2d(nn.Conv2d):
 # the convolution mathematically.
 # ---------------------------------------------------------------------------
 _FP4_FP8_MAX, _FP4_E2M1_MAX, _FP4_SF_VEC = 448.0, 6.0, 16
-_FP4_CONV_MMA_TILER = (256, 256)
-_FP4_CONV_PREFERRED_CLUSTER = (2, 1)
-_FP4_CONV_FALLBACK_CLUSTER = (2, 1)
-_FP4_CONV_USE_2CTA = True
 _FP4_E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
 
 
@@ -556,7 +552,6 @@ def _fp4_conv_run(
     pad: tuple[int, int, int],
     dil: tuple[int, int, int],
     gs_static: torch.Tensor | None = None,
-    mma: tuple[int, int] = _FP4_CONV_MMA_TILER,
     fuse_silu: bool = False,
     fuse_norm_gamma: torch.Tensor | None = None,
     fuse_norm_scale: float | None = None,
@@ -666,59 +661,84 @@ def _fp4_conv_run(
     alpha = from_dlpack(((1.0 / pq["global_scale"]) / gs).to(torch.float32), assumed_align=4)
     stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     cta_tile_k = min(256, Cp)
-    key = (
-        x.device.index,
-        cta_tile_k,
-        mma,
-        _FP4_CONV_PREFERRED_CLUSTER,
-        _FP4_CONV_FALLBACK_CLUSTER,
-        _FP4_CONV_USE_2CTA,
-        bias_ct is not None,
-        residual_ct is not None,
-        beta,
-    )
-    fn = _fp4_compile_cache.get(key)
-    if fn is None:
-        fn = compile_conv(
-            (N, Cp, D, H, Wd),
-            (Op, T, R, S),
+    from .fp4_conv_autotuner import FP4ConvTactic, run_tuned_fp4_conv
+
+    def compile_tactic(tactic: FP4ConvTactic):
+        key = (
+            x.device.index,
+            cta_tile_k,
+            tactic.mma_tiler,
+            tactic.preferred_cluster,
+            tactic.fallback_cluster,
+            tactic.use_2cta,
+            bias_ct is not None,
+            residual_ct is not None,
+            beta,
+        )
+        fn = _fp4_compile_cache.get(key)
+        if fn is None:
+            fn = compile_conv(
+                (N, Cp, D, H, Wd),
+                (Op, T, R, S),
+                inp,
+                pq["filter"],
+                out_ct,
+                cutlass.Float32,
+                sfa,
+                pq["swizzled_block_scales"],
+                None,
+                alpha,
+                None,
+                bias_ct,
+                residual_ct,
+                beta,
+                _FP4_SF_VEC,
+                cta_tile_k,
+                mma_tiler=tactic.mma_tiler,
+                preferred_cluster_shape_mn=tactic.preferred_cluster,
+                fallback_cluster_shape_mn=tactic.fallback_cluster,
+                use_2cta_instrs=tactic.use_2cta,
+                upper_padding_dhw=pad,
+                lower_padding_dhw=pad,
+                stride_dhw=stride,
+                dilation_dhw=dil,
+            )
+            _fp4_compile_cache[key] = fn
+        return fn
+
+    runtime_geometry = tuple(cutlass.Int32(v) for v in (*pad, *pad, *stride, *dil))
+
+    def launch(fn) -> None:
+        fn(
             inp,
             pq["filter"],
             out_ct,
-            cutlass.Float32,
             sfa,
             pq["swizzled_block_scales"],
-            None,
             alpha,
+            None,
             None,
             bias_ct,
             residual_ct,
-            beta,
-            _FP4_SF_VEC,
-            cta_tile_k,
-            mma_tiler=mma,
-            preferred_cluster_shape_mn=_FP4_CONV_PREFERRED_CLUSTER,
-            fallback_cluster_shape_mn=_FP4_CONV_FALLBACK_CLUSTER,
-            use_2cta_instrs=_FP4_CONV_USE_2CTA,
-            upper_padding_dhw=pad,
-            lower_padding_dhw=pad,
-            stride_dhw=stride,
-            dilation_dhw=dil,
+            *runtime_geometry,
+            stream,
         )
-        _fp4_compile_cache[key] = fn
-    fn(
-        inp,
-        pq["filter"],
-        out_ct,
-        sfa,
-        pq["swizzled_block_scales"],
-        alpha,
-        None,
-        None,
-        bias_ct,
-        residual_ct,
-        *[cutlass.Int32(v) for v in (*pad, *pad, *stride, *dil)],
-        stream,
+
+    out, _ = run_tuned_fp4_conv(
+        signature=(
+            x.device.index,
+            cta_tile_k,
+            tuple(stride),
+            tuple(pad),
+            tuple(dil),
+            bias_ct is not None,
+            residual_ct is not None,
+        ),
+        problem_shape=(N, Cp, D, H, Wd, Op, T, R, S, Z, P, Q),
+        tuning_inputs=(xq, pq["packed_weight"], out, x_sf, bias, residual),
+        compile_tactic=compile_tactic,
+        launch=launch,
+        output=out,
     )
     y = out.permute(0, 4, 1, 2, 3)  # [N,Op,Z,P,Q]
     return y[:, :Oc] if Op != Oc else y  # drop padded out-channels
