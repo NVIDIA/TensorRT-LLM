@@ -68,11 +68,11 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
-    MoE,
     MoEWeightLoadingMode,
     TritonFusedMoE,
     TRTLLMGenFusedMoE,
     create_moe,
+    is_moe_weight_owner,
     resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
@@ -1095,7 +1095,7 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
