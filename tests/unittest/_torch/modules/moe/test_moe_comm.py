@@ -62,7 +62,7 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
@@ -2400,6 +2400,113 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
+    """Exercise stable-VA checkpoint cycles through a captured MoE communication graph."""
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(
+        rank=rank,
+        tp_size=config.ep_size,
+        moe_ep_size=config.ep_size,
+        world_size=config.ep_size,
+    )
+    communication = create_comm_object(config.comm_type, mapping, config)
+    worker_inputs = _prepare_worker_inputs(rank, config)
+    _, local_slot_start, local_slot_end = _compute_ep_partition(
+        config.num_experts, config.ep_size, rank
+    )
+
+    def forward() -> torch.Tensor:
+        dispatch_outputs = _run_worker_dispatch(communication, worker_inputs, config)
+        received_hidden_states = _to_bf16(
+            dispatch_outputs.recv_hs,
+            dispatch_outputs.recv_sf,
+            worker_inputs.global_scale,
+            config.quant_mode,
+        )
+        moe_output = simple_moe(
+            received_hidden_states,
+            dispatch_outputs.recv_slots,
+            dispatch_outputs.recv_scales,
+            local_slot_start,
+            local_slot_end,
+        )
+        return communication.combine(
+            moe_output,
+            all_rank_max_num_tokens=max(config.all_num_tokens),
+        )
+
+    with torch.inference_mode():
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = forward()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+        stable_addresses = (communication.mnnvl_mem.ptr, communication.workspace.data_ptr())
+
+        def allocations_are_mapped() -> bool:
+            return communication.mnnvl_mem.mapped
+
+    else:
+        stable_addresses = (
+            communication.alltoall_workspace.data_ptr(),
+            communication.alltoall_prepare_workspace.data_ptr(),
+        )
+
+        def allocations_are_mapped() -> bool:
+            return all(
+                workspace is None or workspace.mapped
+                for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+            )
+
+        def any_allocation_is_mapped() -> bool:
+            return any(
+                workspace is not None and workspace.mapped
+                for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+            )
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+
+        def any_allocation_is_mapped() -> bool:
+            return communication.mnnvl_mem.mapped
+
+    for cycle in range(3):
+        free_before_prepare = torch.cuda.mem_get_info()[0]
+        communication.checkpoint_prepare()
+        assert not any_allocation_is_mapped()
+        fresh_comm = MPI.COMM_WORLD.Split(0, rank)
+        communication.checkpoint_restore(fresh_comm)
+        assert allocations_are_mapped()
+        memory_drift_bytes = free_before_prepare - torch.cuda.mem_get_info()[0]
+        assert memory_drift_bytes <= 64 * 1024**2
+
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            restored_addresses = (
+                communication.mnnvl_mem.ptr,
+                communication.workspace.data_ptr(),
+            )
+        else:
+            restored_addresses = (
+                communication.alltoall_workspace.data_ptr(),
+                communication.alltoall_prepare_workspace.data_ptr(),
+            )
+        assert restored_addresses == stable_addresses
+
+        with torch.inference_mode():
+            worker_inputs.hs.add_(cycle + 1)
+            expected = forward().clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_output, expected)
+
+    if hasattr(communication, "destroy"):
+        communication.destroy()
+    return True
+
+
 # ============================================================================
 # Test Class
 # ============================================================================
@@ -2452,6 +2559,35 @@ class TestMoEComm:
     def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, group: CommTestGroup):
         """Verify NVLinkOneSided with non-divisible EP (num_experts % ep_size != 0)."""
         _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+    @pytest.mark.parametrize(
+        "comm_type",
+        [COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED],
+    )
+    def test_mnnvl_checkpoint_preserves_moe_graph_addresses(
+        self,
+        mpi_pool_executor,
+        comm_type: str,
+    ) -> None:
+        """Verify repeated checkpoint cycles preserve MoE graph pointers and outputs."""
+        config = CommTestConfig(
+            comm_type=comm_type,
+            ep_size=mpi_pool_executor.num_workers,
+            num_experts=32,
+            top_k=2,
+            hidden_size=128,
+            all_num_tokens=[8] * mpi_pool_executor.num_workers,
+        )
+        skip_reason = _get_skip_reason(config)
+        if skip_reason:
+            pytest.skip(skip_reason)
+        results = mpi_pool_executor.map(
+            _worker_mnnvl_checkpoint_graph_replay,
+            [config] * config.ep_size,
+        )
+        assert all(results)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
