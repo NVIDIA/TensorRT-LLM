@@ -1,16 +1,17 @@
 {
   "_comment": "Auto-derived from a layer-wise nsys trace by tools/gen_module_cases.py. Regenerate rather than hand-edit. share_of_iteration is that shape's fraction of one decode iteration's GPU time on the traced run.",
-  "source": {
-    "artifact": "artifacts\\b40\\lwb",
-    "rank": 0
-  },
-  "workload": {
-    "model": "DeepSeek-V4-Flash-Base",
+  "_case_inputs": "what the pytest case is built from -- these are consumed",
+  "case_inputs": {
     "moe_backend": "DEEPGEMM",
+    "num_tokens": 128,
+    "use_cuda_graph": true
+  },
+  "_provenance": "where the numbers came from. NOT inputs: module perf builds one MoE module on one GPU, it does not run layers. Recorded so a share_of_iteration can be traced back to the run that measured it.",
+  "provenance": {
+    "model": "DeepSeek-V4-Flash-Base",
     "run_type": "GEN",
     "batch_size": 128,
     "seq_len_q": 1,
-    "num_tokens": 128,
     "ep_size": 4,
     "layer_indices": [
       0,
@@ -18,8 +19,9 @@
       2,
       3
     ],
-    "use_cuda_graph": true,
-    "enable_attention_dp": true
+    "enable_attention_dp": true,
+    "artifact": "artifacts\\b40\\lwb",
+    "rank": 0
   },
   "experts_per_rank": 64,
   "gemm_shapes": [

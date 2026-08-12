@@ -142,7 +142,7 @@ def _manifest() -> dict:
 
 
 def _case_id(m: dict) -> str:
-    w, d = m["workload"], m["derived_dims"]
+    w, d = m["case_inputs"], m["derived_dims"]
     return (f"{w['moe_backend'].lower()}_e{m['experts_per_rank']}"
             f"_h{d['hidden_size']}_i{d['intermediate_size']}_t{w['num_tokens']}")
 
@@ -167,7 +167,7 @@ def _build_traced_moe(m: dict):
     from .build import _build_moe_module
     from .specs import BUILT_IN_MODELS, ConfigSpec, ModelSpec
 
-    w, d = m["workload"], m["derived_dims"]
+    w, d = m["case_inputs"], m["derived_dims"]
     # top_k and the routing method are model properties that a kernel-name trace
     # cannot carry, so they come from the checked-in spec for the same model.
     ref = BUILT_IN_MODELS.get("deepseek_v4_flash")
@@ -272,7 +272,7 @@ def test_v4_moe_backend_honored():
     from .build import _backend_name_from_module
 
     m = _manifest()
-    want = m["workload"]["moe_backend"]
+    want = m["case_inputs"]["moe_backend"]
     moe, _model, _rl = _build_traced_moe(m)
     got = _backend_name_from_module(moe)
     assert got == want, (
@@ -297,7 +297,7 @@ def test_v4_moe_traced_gemm_shapes_present(request):
     """
     m = _manifest()
     moe, model, rl = _build_traced_moe(m)
-    kernels = _forward_kernels(request, moe, model, rl, m["workload"]["num_tokens"])
+    kernels = _forward_kernels(request, moe, model, rl, m["case_inputs"]["num_tokens"])
     observed = {s for s in (_deep_gemm_shape(k["name"]) for k in kernels) if s}
 
     # Only the grouped shapes: the num_groups=1 ones come from the dense
@@ -326,7 +326,7 @@ def test_v4_moe_launch_count(request):
     """
     m = _manifest()
     moe, model, rl = _build_traced_moe(m)
-    observed = len(_forward_kernels(request, moe, model, rl, m["workload"]["num_tokens"]))
+    observed = len(_forward_kernels(request, moe, model, rl, m["case_inputs"]["num_tokens"]))
 
     case_id, sm = _case_id(m), _current_sm()
     expected = _EXPECTED_LAUNCH_COUNT.get(case_id, {}).get(sm)
