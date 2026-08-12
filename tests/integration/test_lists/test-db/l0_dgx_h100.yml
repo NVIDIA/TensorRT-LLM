@@ -310,6 +310,7 @@ l0_dgx_h100:
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp1]
+    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp1]
 - condition:
     ranges:
       system_gpu_count:

@@ -2280,12 +2280,19 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str) -> NixlTransferAgent:
+def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
         kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
-    return NixlTransferAgent(name, True, num_threads=num_threads, **kwargs)
+    return NixlTransferAgent(
+        name,
+        True,
+        num_threads=num_threads,
+        rank=rank,
+        world_size=world_size,
+        **kwargs,
+    )
 
 
 def _make_aux_buffer(
@@ -2377,8 +2384,11 @@ class TransferWorker:
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+        mapping = self._config.kv_cache_manager.mapping
         self._agent = _create_nixl_agent(
-            self._rank_info.instance_name + str(self._rank_info.instance_rank)
+            self._rank_info.instance_name + str(self._rank_info.instance_rank),
+            rank=mapping.rank,
+            world_size=mapping.world_size,
         )
         self._registered_mem: list = []
         try:

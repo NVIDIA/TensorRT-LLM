@@ -21,7 +21,7 @@ import traceback
 import uuid
 import weakref
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -1127,6 +1127,35 @@ class AwaitResponseHelper:
             case _:
                 raise NotImplementedError
 
+    def process_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Apply engine callbacks and append deferred submission errors."""
+        responses = list(
+            filter(
+                lambda _: _,
+                [self.worker._engine_response_callback(r) for r in responses]))
+
+        # Drain with get_nowait(): this may run concurrently from the
+        # ManagedThread and RPC fetch_responses(), and empty()+get() can
+        # block forever if another consumer wins the race.
+        while True:
+            try:
+                responses.append(self.temp_error_responses.get_nowait())
+            except Empty:
+                break
+
+        return responses
+
+    def process_and_handle_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Process engine responses and dispatch the client-visible results."""
+        responses = self.process_responses(responses)
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
+            self.responses_handler(responses)
+        return responses
+
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
@@ -1143,20 +1172,7 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
-        # filter since The _engine_response_callback may return None
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
-
-        # append the error responses to the temp_error_responses
-        while not self.temp_error_responses.empty():
-            responses.append(self.temp_error_responses.get())
-
-        with nvtx_range_debug(f"await_response-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-            self.responses_handler(responses)
+        self.process_and_handle_responses(responses)
 
         # Even when await_responses returned normally (e.g. via
         # _await_any_response, whose predicate already includes
