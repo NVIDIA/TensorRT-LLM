@@ -624,7 +624,10 @@ class TestLoraManagerFp8Alignment(unittest.TestCase):
                 manager = self._create_manager(model_config)
 
                 with (
-                    patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                    patch(
+                        "tensorrt_llm._torch.peft.lora.manager.supports_native_fp8_lora",
+                        return_value=True,
+                    ),
                     self.assertRaisesRegex(ValueError, case["match"]),
                 ):
                     manager.load_from_hf(

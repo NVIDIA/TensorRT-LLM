@@ -12,20 +12,21 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
-    "device_capability,kernels_available,expected",
+    "device_capability,expected",
     [
-        ((9, 0), True, True),
-        ((10, 0), True, True),
-        ((10, 0), False, False),
-        ((8, 0), True, False),
-        ((12, 0), True, False),
+        ((9, 0), True),
+        ((10, 0), True),
+        ((10, 3), True),
+        ((8, 0), False),
+        ((12, 0), False),
     ],
 )
-def test_supports_native_fp8_lora(device_capability, kernels_available, expected, monkeypatch):
+def test_supports_native_fp8_lora(device_capability, expected, monkeypatch):
     monkeypatch.setattr(
-        lora_manager,
-        "_native_fp8_lora_kernels_available",
-        lambda _: kernels_available,
+        torch.ops.trtllm,
+        "lora_grouped_gemm_supports_fp8",
+        lambda sm_version: sm_version in {90, 100, 103},
+        raising=False,
     )
     assert supports_native_fp8_lora(device_capability) is expected
 
@@ -50,7 +51,7 @@ def test_missing_native_fp8_lora_capability_query_warns_once(caplog, monkeypatch
     ]
 
 
-@pytest.mark.parametrize("device_capability", [(9, 0), (10, 0)])
+@pytest.mark.parametrize("device_capability", [(9, 0), (10, 0), (10, 3)])
 def test_native_fp8_lora_initializes_fp8_cache(device_capability, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: device_capability)
     monkeypatch.setattr(lora_manager, "_native_fp8_lora_kernels_available", lambda _: True)
@@ -59,9 +60,11 @@ def test_native_fp8_lora_initializes_fp8_cache(device_capability, monkeypatch):
 
 
 @pytest.mark.parametrize("device_capability", [(8, 0), (12, 0)])
-def test_unsupported_device_does_not_initialize_fp8_cache(device_capability, monkeypatch):
+def test_device_without_native_kernels_does_not_initialize_fp8_cache(
+    device_capability, monkeypatch
+):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: device_capability)
-    monkeypatch.setattr(lora_manager, "_native_fp8_lora_kernels_available", lambda _: True)
+    monkeypatch.setattr(lora_manager, "_native_fp8_lora_kernels_available", lambda _: False)
 
     assert _get_initial_lora_data_type(torch.float8_e4m3fn) is None
 

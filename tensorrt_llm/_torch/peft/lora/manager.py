@@ -55,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 
 _FP8_LORA_TMA_ALIGNMENT = 16
-_NATIVE_FP8_LORA_DEVICE_CAPABILITIES = ((9, 0), (10, 0))
 
 
 @lru_cache(maxsize=1)
@@ -77,10 +76,8 @@ def _native_fp8_lora_kernels_available(device_capability: Tuple[int, int]) -> bo
 
 
 def supports_native_fp8_lora(device_capability: Tuple[int, int]) -> bool:
-    """Return whether native FP8 LoRA kernels support a CUDA capability."""
-    return device_capability in _NATIVE_FP8_LORA_DEVICE_CAPABILITIES and (
-        _native_fp8_lora_kernels_available(device_capability)
-    )
+    """Return whether compiled native FP8 LoRA kernels support a CUDA capability."""
+    return _native_fp8_lora_kernels_available(device_capability)
 
 
 def _check_lora_in_out(

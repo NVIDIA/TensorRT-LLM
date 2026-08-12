@@ -39,6 +39,7 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
+#include "fp8GroupedGemmConfig.h"
 #endif // ENABLE_FP8
 
 TRTLLM_NAMESPACE_BEGIN
@@ -200,8 +201,7 @@ void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int pro
 // dimensions already on the GPU and reuses their compatible storage directly.
 // ====================================================================
 
-template <bool kIsSm100, typename ArchTag, typename TileShape, typename ClusterShape, typename KernelSchedule,
-    typename EpilogueSchedule>
+template <typename Config>
 void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
     cudaStream_t stream)
@@ -209,6 +209,12 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     using namespace cute;
+
+    using ArchTag = typename Config::ArchTag;
+    using TileShape = typename Config::TileShape;
+    using ClusterShape = typename Config::ClusterShape;
+    using KernelSchedule = typename Config::KernelSchedule;
+    using EpilogueSchedule = typename Config::EpilogueSchedule;
 
     using ElementA = cutlass::float_e4m3_t;
     using ElementB = cutlass::float_e4m3_t;
@@ -277,10 +283,10 @@ void fp8CudaGraphGroupedGemmImpl(cutlass::gemm::GemmCoord* problemSizesPtr, int 
     hwInfo.device_id = 0;
     cudaGetDevice(&hwInfo.device_id);
     hwInfo.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hwInfo.device_id);
-    if constexpr (kIsSm100)
+    if constexpr (Config::kUsesDynamicClusterShape)
     {
-        hwInfo.cluster_shape = dim3(4, 2, 1);
-        hwInfo.cluster_shape_fallback = dim3(2, 1, 1);
+        hwInfo.cluster_shape = Config::clusterShape();
+        hwInfo.cluster_shape_fallback = Config::clusterShapeFallback();
         hwInfo.max_active_clusters = cutlass::KernelHardwareInfo::query_device_max_active_clusters(hwInfo.cluster_shape,
             GemmKernel::MaxThreadsPerBlock, reinterpret_cast<void const*>(&cutlass::device_kernel<GemmKernel>));
     }
@@ -329,10 +335,7 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     if (smVersion == 90)
     {
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
-        fp8CudaGraphGroupedGemmImpl<false, cutlass::arch::Sm90, cute::Shape<cute::_128, cute::_128, cute::_128>,
-            cute::Shape<cute::_1, cute::_2, cute::_1>,
-            cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum,
-            cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>(
+        fp8CudaGraphGroupedGemmImpl<fp8_grouped_gemm::Sm90Config>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
 #endif
@@ -340,9 +343,7 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     else if (smVersion == 100)
     {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
-        fp8CudaGraphGroupedGemmImpl<true, cutlass::arch::Sm100, cute::Shape<cute::_128, cute::_256, cute::_128>,
-            cute::Shape<int32_t, int32_t, cute::_1>, cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100,
-            cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>(
+        fp8CudaGraphGroupedGemmImpl<fp8_grouped_gemm::Sm100Config>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
 #endif

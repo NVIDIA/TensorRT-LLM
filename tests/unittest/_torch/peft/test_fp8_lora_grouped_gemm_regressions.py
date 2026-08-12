@@ -276,11 +276,8 @@ def test_fp8_grouped_gemm_dispatch_supports_sm90_and_sm100(filename):
     assert "getSMVersion()" in source
     assert "smVersion == 90 || smVersion == 100" in source
     assert "requires Hopper (SM90) or B200 (SM100)" in source
-    assert "cutlass::arch::Sm90" in source
-    assert "cutlass::arch::Sm100" in source
-    assert "KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum" in source
-    assert "KernelPtrArrayTmaWarpSpecialized1SmSm100" in source
-    assert "PtrArrayTmaWarpSpecialized1Sm" in source
+    assert "fp8_grouped_gemm::Sm90Config" in source
+    assert "fp8_grouped_gemm::Sm100Config" in source
     assert "SM120/SM121" in source
 
 
