@@ -61,13 +61,13 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -1587,7 +1587,11 @@ class Receiver(ReceiverBase):
         )
 
     @staticmethod
-    def _fanin_bounce_safe(overlap, peer_ri) -> bool:
+    def _fanin_bounce_safe(
+        overlap: PeerOverlap,
+        peer_ri: RankInfo,
+        receiver_page_table: Optional[KVCachePageTable],
+    ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
           * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
@@ -1607,15 +1611,20 @@ class Receiver(ReceiverBase):
                 return False
         # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
         # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid.
-        if len(overlap.ranks) > 1 and peer_ri.page_table is not None:
-            for layer_group in peer_ri.page_table.layer_groups:
-                for pool_view in getattr(layer_group, "pool_views", ()):
-                    if pool_view.mapper_kind == MapperKind.REPLICATED:
-                        return False
+        # differ in size and the equal split is invalid. Inspect both endpoints:
+        # a masked PP stage may advertise no replicated view even though another
+        # stage owns one that is visible in the receiver's page table.
+        if len(overlap.ranks) > 1:
+            for page_table in (peer_ri.page_table, receiver_page_table):
+                if page_table is None:
+                    continue
+                for layer_group in page_table.layer_groups:
+                    for pool_view in getattr(layer_group, "pool_views", ()):
+                        if pool_view.mapper_kind == MapperKind.REPLICATED:
+                            return False
         return True
 
-    def dispatch_task(self, task: KVRecvTask):
+    def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
             f"Receiver.dispatch_task: unique_rid={task._unique_rid}, ctx_dp_rank={params.ctx_dp_rank}"
@@ -1657,7 +1666,12 @@ class Receiver(ReceiverBase):
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
         allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
+            sender_dp_rank is not None
+            and self._fanin_bounce_safe(
+                topo_overlap,
+                peer_infos,
+                self._registrar.self_extractor.page_table,
+            )
         )
         # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks (the sender
         # appends its MambaPolicy fragments in _build_kv_write_meta), so the bounce region must be

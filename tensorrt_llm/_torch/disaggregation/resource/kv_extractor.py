@@ -326,60 +326,65 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         pool_views = [kv_view]
 
         # Indexer K cache support. The DSA indexer K cache is identical on
-        # every TP rank (single index head), so its view is REPLICATED with
-        # one synthesized buffer entry per local layer: the slot packs the
-        # layers equal-sized in local-layer order.
-        if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
-            local_indexer_mask = getattr(kv_cache_manager, "indexer_k_cache_local_layer_mask", None)
-            if local_indexer_mask is not None and not all(
-                local_indexer_mask[lid] for lid in local_layer_ids
-            ):
-                raise NotImplementedError(
-                    "The Python KV transceiver runtime does not support a "
-                    "per-layer masked indexer k-cache pool yet: "
-                    f"{sum(local_indexer_mask[lid] for lid in local_layer_ids)}"
-                    f" of {len(local_layer_ids)} layers in this layer group "
-                    "own an indexer k-cache. Use the C++ cache transceiver "
-                    "for models with cross-layer indexer sharing (e.g. "
-                    "GLM 5.2)."
+        # every TP rank (single index head), so its view is REPLICATED. With a
+        # per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2)
+        # only the "full" indexer-owning layers get a pool row, so the view
+        # covers that subset: one buffer entry per owning layer, each mapped to
+        # its packed row in the (possibly masked) pool. When the mask is absent
+        # every layer owns a row (dense/legacy layout) and this reduces to the
+        # equal-sized packing in local-layer order.
+        if kv_cache_manager.enable_indexer_k_cache:
+            local_indexer_mask = kv_cache_manager.indexer_k_cache_local_layer_mask
+            owning_layer_ids = [
+                lid
+                for lid in local_layer_ids
+                if local_indexer_mask is None or local_indexer_mask[lid]
+            ]
+            # A layer group whose layers are all masked out owns no indexer pool
+            # row on this rank (the pool getter would raise); skip it so the peer
+            # simply transfers nothing for this rank's indexer.
+            if owning_layer_ids:
+                indexer_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
+                if indexer_pool.shape[1] != len(owning_layer_ids):
+                    raise RuntimeError(
+                        "The DSA indexer K-cache pool row count does not match "
+                        "the number of indexer-owning layers in its layer group: "
+                        f"{indexer_pool.shape[1]} rows for {len(owning_layer_ids)} layers"
+                    )
+                # indexer_pool shape: (numBlocks, numIndexerLayers, kvFactor,
+                # blockSize), dtype=UINT8. numIndexerLayers is the number of
+                # owning layers on this rank (== the attention layer count when
+                # unmasked). slot_bytes packs every owning-layer row.
+                per_block_elems = 1
+                for d in indexer_pool.shape[1:]:  # skip numBlocks dim
+                    per_block_elems *= d
+                indexer_slot_bytes = per_block_elems * indexer_pool.element_size()
+                indexer_bytes_per_layer = indexer_slot_bytes // indexer_pool.shape[1]
+                indexer_physical = PhysicalPool(
+                    base_address=int(indexer_pool.data_ptr()),
+                    slot_bytes=indexer_slot_bytes,
+                    num_slots=num_blocks,
                 )
-            indexer_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
-            # indexer_pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype=UINT8
-            # slot_bytes = numLayers * kvFactor * blockSize * element_size
-            if indexer_pool.shape[1] != len(local_layer_ids):
-                raise NotImplementedError(
-                    "Disaggregated KV transfer does not support a per-layer "
-                    "masked indexer k-cache pool yet: the indexer "
-                    f"pool holds {indexer_pool.shape[1]} layer rows but the "
-                    f"layer group has {len(local_layer_ids)} layers. Disable "
-                    "disaggregated serving for models with cross-layer "
-                    "indexer sharing."
+                indexer_view = PoolView(
+                    pool_idx=len(physical_pools),
+                    buffer_entries=np.array(
+                        [
+                            (
+                                lid,
+                                kv_cache_manager.impl.get_indexer_k_cache_pool_layer_idx(lid)
+                                * indexer_bytes_per_layer,
+                                indexer_bytes_per_layer,
+                            )
+                            for lid in owning_layer_ids
+                        ],
+                        dtype=BUFFER_ENTRY_DTYPE,
+                    ),
+                    pool_role=frozenset({"indexer_k"}),
+                    mapper_kind=MapperKind.REPLICATED,
+                    bytes_per_layer=indexer_bytes_per_layer,
                 )
-            per_block_elems = 1
-            for d in indexer_pool.shape[1:]:  # skip numBlocks dim
-                per_block_elems *= d
-            indexer_slot_bytes = per_block_elems * indexer_pool.element_size()
-            indexer_physical = PhysicalPool(
-                base_address=int(indexer_pool.data_ptr()),
-                slot_bytes=indexer_slot_bytes,
-                num_slots=num_blocks,
-            )
-            indexer_bytes_per_layer = indexer_slot_bytes // len(local_layer_ids)
-            indexer_view = PoolView(
-                pool_idx=1,
-                buffer_entries=np.array(
-                    [
-                        (lid, i * indexer_bytes_per_layer, indexer_bytes_per_layer)
-                        for i, lid in enumerate(local_layer_ids)
-                    ],
-                    dtype=BUFFER_ENTRY_DTYPE,
-                ),
-                pool_role=frozenset({"indexer_k"}),
-                mapper_kind=MapperKind.REPLICATED,
-                bytes_per_layer=indexer_bytes_per_layer,
-            )
-            physical_pools.append(indexer_physical)
-            pool_views.append(indexer_view)
+                physical_pools.append(indexer_physical)
+                pool_views.append(indexer_view)
 
         pool_groups.append(PhysicalPoolGroup(pools=physical_pools))
         local_layers = [
