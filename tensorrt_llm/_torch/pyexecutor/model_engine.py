@@ -45,6 +45,7 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
@@ -2373,17 +2374,8 @@ class PyTorchModelEngine(ModelEngine):
 
         def _run_capture_pass(force_non_greedy: bool, label: str,
                               force_lora_graph: bool) -> None:
-            spec_metadata = self.spec_metadata
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
-            if force_non_greedy and spec_metadata is not None:
-                spec_metadata._force_non_greedy_for_capture = True
-                # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
-                # to build the graph cache key BEFORE populate runs inside
-                # _prepare_inputs. Pre-flip it here so the very first capture
-                # in this pass uses the non-greedy key; populate's override
-                # below will keep it False on every subsequent iteration.
-                spec_metadata.is_all_greedy_sample = False
             try:
                 for bs, draft_len in graphs_to_capture:
                     if bs > self.batch_size:
@@ -2391,9 +2383,13 @@ class PyTorchModelEngine(ModelEngine):
 
                     for max_seq_len in max_seq_len_list:
                         warmup_request = self._create_cuda_graph_warmup_request(
-                            resource_manager, bs, draft_len, max_seq_len)
-                        with self._release_batch_context(
-                                warmup_request, resource_manager) as batch:
+                            resource_manager,
+                            bs,
+                            draft_len,
+                            max_seq_len,
+                            force_non_greedy=force_non_greedy)
+                        with self._release_batch_context(warmup_request,
+                                                        resource_manager) as batch:
                             if batch is None:
                                 # No KV cache space for this batch size. During KV
                                 # cache estimation this makes the profiling peak
@@ -2409,38 +2405,19 @@ class PyTorchModelEngine(ModelEngine):
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}")
                             self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
-                                self.spec_config is not None and
-                                self.spec_config.spec_dec_mode.use_one_engine())
+                                self.spec_config is not None
+                                and self.spec_config.spec_dec_mode.use_one_engine())
                             self._update_draft_inference_state_for_warmup(
                                 batch, draft_len > 0, resource_manager)
                             self.runtime_draft_len = draft_len
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
                             self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                                        new_tensors_device=None,
+                                        resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
-                if force_non_greedy and spec_metadata is not None:
-                    spec_metadata._force_non_greedy_for_capture = False
-                    # The base object is not the only holder of the flag: every
-                    # graph captured during this pass cached its own SHALLOW COPY
-                    # of spec_metadata (create_cuda_graph_metadata -> copy.copy),
-                    # which inherited the flag. Those copies are reseated as the
-                    # live spec_metadata on every later replay, so leaving the
-                    # flag set there makes _scan_one_model_sampling overwrite
-                    # every serving request's sampling params with the synthetic
-                    # capture values (0.7 / 50 / 0.9). Defer cleanup during
-                    # warmup-only because the real capture pass reuses that
-                    # pass's cached metadata.
-                    if not self.cuda_graph_runner.is_warmup_only:
-                        cleared = (self.cuda_graph_runner.
-                                   clear_capture_only_spec_state())
-                        logger.info(
-                            "Cleared capture-only sampling override from "
-                            f"{cleared} cached CUDA graph spec metadata "
-                            "object(s).")
 
         if self.cuda_graph_lora_manager is None:
             lora_graph_cases = [False]
@@ -2479,11 +2456,11 @@ class PyTorchModelEngine(ModelEngine):
                                   force_lora_graph=use_lora_graph)
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
-        # The advanced-sampling capture pass above leaves is_all_greedy_sample
-        # set to False on spec_metadata. Reset it to the default so the first
-        # real iteration's graph-key selection is not seeded with this
-        # capture-only value. (update_is_all_greedy_sample refreshes it every
-        # iteration; this is a defensive guard.)
+        # update_is_all_greedy_sample inside each forward call during the
+        # non-greedy capture pass leaves is_all_greedy_sample=False on
+        # spec_metadata. Reset it so the first real iteration starts clean;
+        # update_is_all_greedy_sample will refresh it on every iteration anyway.
+        # This is a defensive guard.
         if self.spec_metadata is not None:
             self.spec_metadata.is_all_greedy_sample = True
 
@@ -2864,8 +2841,11 @@ class PyTorchModelEngine(ModelEngine):
         max_seq_len: int = None,
         mixed_context_encoder_output_lens: Optional[Sequence[int]] = None,
         mixed_context_query_len: int = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
+        force_non_greedy: bool = False,
     ) -> Optional[ScheduledRequests]:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
+        capture_sampling_params = SamplingParams(
+            temperature=0.7, top_k=50, top_p=0.9) if force_non_greedy else None
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -2906,7 +2886,8 @@ class PyTorchModelEngine(ModelEngine):
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
                 encoder_output_lens=list(mixed_context_encoder_output_lens),
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                capture_sampling_params=capture_sampling_params)
             if context_requests is None:
                 return None
 
@@ -2925,7 +2906,8 @@ class PyTorchModelEngine(ModelEngine):
                     max_beam_width=self.max_beam_width,
                     encoder_output_lens=[max_encoder_output_len] *
                     len(generation_request_ids),
-                    draft_kv_cache_manager=draft_kv_cache_manager)
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                    capture_sampling_params=capture_sampling_params)
                 if generation_requests is None:
                     for request in context_requests:
                         kv_cache_manager.free_resources(request)
@@ -2947,7 +2929,8 @@ class PyTorchModelEngine(ModelEngine):
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
                 encoder_output_lens=encoder_output_lens,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                capture_sampling_params=capture_sampling_params)
             if requests is None:
                 return None
 
@@ -3012,7 +2995,8 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             encoder_output_lens=[max_encoder_output_len]
             if is_enc_dec else None,
-            draft_kv_cache_manager=draft_kv_cache_manager)
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params)
 
         if max_seq_len_request is None:
             free_warmup_requests()
@@ -6353,16 +6337,6 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
-            # The capture-only sampling override must never be live outside CUDA
-            # graph warmup: it replaces every request's sampling params with
-            # synthetic capture values. It leaked here once already (inherited by
-            # the cached graph metadata shallow copies), so assert rather than
-            # trust the teardown.
-            assert self.is_warmup or not getattr(
-                spec_metadata, '_force_non_greedy_for_capture', False
-            ), ("capture-only sampling override (_force_non_greedy_for_capture) "
-                "is set outside CUDA graph warmup; serving requests would be "
-                "silently decoded with the synthetic capture sampling params")
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())

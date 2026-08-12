@@ -1139,17 +1139,6 @@ class SpecMetadata:
         # unset), so this cannot be derived from which filters are in use.
         self.is_all_greedy_sample = not has_non_greedy_requests
 
-        # Warmup-time override: force the advanced-sampling path so the CUDA
-        # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
-        # warmup requests carry no sampling params, so substitute synthetic
-        # non-greedy scalars to populate the GPU buffers.
-        if getattr(self, '_force_non_greedy_for_capture', False):
-            self.is_all_greedy_sample = False
-            per_request_normalized = [
-                (0.7, 50, 0.9, num_tokens)
-                for (_, _, _, num_tokens) in per_request_normalized
-            ]
-
         # Apply the group-synchronized override last (semantics: see the
         # ``group_all_greedy_sample`` field comment). Local contract: the
         # synced value already incorporates any capture override, and rescans
