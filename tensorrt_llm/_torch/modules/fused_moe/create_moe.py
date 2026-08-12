@@ -158,6 +158,19 @@ def get_moe_cls(
             return CutlassFusedMoE
         return DenseGEMMFusedMoE
     elif moe_backend.upper() == "TRTLLM":
+        # TRTLLM-Gen MoE kernels only exist for Blackwell-family GPUs; on other
+        # architectures the backend fails at engine init (autotuner profile
+        # lookup or "No kernel found" during kernel selection). Fall back like
+        # the other arch-gated backends. CutlassFusedMoE matches what AUTO
+        # resolves to for these quantizations on non-SM100 GPUs.
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in TRTLLMGenFusedMoE._SUPPORTED_SM_VERSIONS:
+            logger.warning(
+                f"{layer_prefix}TRTLLMGenFusedMoE only supports SM "
+                f"{list(TRTLLMGenFusedMoE._SUPPORTED_SM_VERSIONS)} "
+                f"(got SM {sm_version}). Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
         has_quant = quant_config is not None and quant_config.quant_mode.has_any_quant(
             exclude_kv_cache=True)
         if has_quant and (quant_config.quant_mode.has_fp8_block_scales()

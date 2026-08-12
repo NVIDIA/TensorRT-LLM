@@ -61,6 +61,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.modules.fused_moe.interface import (
     MoE,
@@ -405,6 +406,31 @@ def test_get_moe_cls_marlin_override_quant_config_per_layer():
         get_moe_cls(cfg, override_quant_config=QuantConfig(quant_algo=None), layer_idx=52)
         is CutlassFusedMoE
     )
+
+
+def _trtllm_model_config(quant_algo=QuantAlgo.FP8_BLOCK_SCALES):
+    cfg = ModelConfig()
+    cfg.moe_backend = "TRTLLM"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+@pytest.mark.parametrize("sm", [90, 89, 120])
+def test_get_moe_cls_trtllm_falls_back_to_cutlass_on_unsupported_sm(sm, monkeypatch):
+    """TRTLLM-Gen MoE kernels only exist for SM100/SM103. Requesting the TRTLLM
+    backend elsewhere (e.g. DeepSeek FP8_BLOCK_SCALES on Hopper) must fall back
+    to Cutlass instead of failing at engine init: on 1.3.0rc7 this crashed with
+    'list assignment index out of range' in AutoTuner._find_nearest_profile,
+    later with 'No kernel found' during trtllm-gen kernel selection."""
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: sm)
+    assert get_moe_cls(_trtllm_model_config()) is CutlassFusedMoE
+
+
+@pytest.mark.parametrize("sm", [100, 103])
+def test_get_moe_cls_trtllm_selects_trtllm_gen_on_blackwell(sm, monkeypatch):
+    """The SM gate must not change selection on Blackwell-family GPUs."""
+    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: sm)
+    assert get_moe_cls(_trtllm_model_config()) is TRTLLMGenFusedMoE
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():

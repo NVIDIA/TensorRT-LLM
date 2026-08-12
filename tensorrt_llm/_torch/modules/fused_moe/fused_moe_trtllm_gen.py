@@ -98,6 +98,10 @@ class TRTLLMGenFusedMoE(MoE):
         onesided_workspace_dtype=torch.bfloat16,
     )
 
+    # SM versions the TRTLLM-Gen MoE kernels are built for (Blackwell family).
+    # Read by create_moe.get_moe_cls to fall back on other architectures.
+    _SUPPORTED_SM_VERSIONS = (100, 103)
+
     # Supported quantization algorithms for TRTLLMGenFusedMoE
     _SUPPORTED_QUANT_ALGOS = {
         QuantAlgo.NVFP4,
@@ -161,7 +165,7 @@ class TRTLLMGenFusedMoE(MoE):
         sm_version = get_sm_version()
 
         # TRTLLMGenFusedMoE requires SM in {100, 103}
-        if sm_version not in {100, 103}:
+        if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             return _warn_and_return(
                 f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
             )
