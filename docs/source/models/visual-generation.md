@@ -319,37 +319,15 @@ parallel_config.n_workers = cfg_size × cp_size × ulysses_size × tp_size
 
 where `cp_size` comes from `attn2d_size` or `ring_size`. The default `parallel_config` has `n_workers = 1`, so every multi-rank launch must pass an explicit `parallel_config` whose product matches the rank count; a mismatch fails fast at startup with the expected rank count in the error. Launch one rank per GPU.
 
-### MGMN Launcher Recipes
+### MGMN Launcher Usage
 
-Single node, OpenMPI:
+Wrap any single program — a Python script, `trtllm-serve`, `trtllm-bench`, or `pytest` — with `trtllm-llmapi-launch` under an MPI launcher, one rank per GPU:
 
 ```bash
 mpirun -n 4 trtllm-llmapi-launch python my_visual_gen_script.py
 ```
 
-Multi-node serving on Slurm (2 nodes × 4 GPUs = 8 ranks), mirroring the LLM recipe in [`examples/llm-api/llm_mgmn_trtllm_serve.sh`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_serve.sh):
-
-```bash
-#!/bin/bash
-#SBATCH -N 2
-#SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-node=4
-
-# The YAML's parallel_config must yield n_workers == 8,
-# e.g. cfg_size: 2, ulysses_size: 4.
-srun --mpi=pmix \
-    --kill-on-bad-exit=1 \
-    --export=ALL \
-    --container-image=${CONTAINER_IMAGE} \
-    --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    trtllm-llmapi-launch \
-      trtllm-serve ${MODEL} \
-        --host 0.0.0.0 --port 8000 \
-        --enable_visual_gen \
-        --visual_gen_args ${VISUAL_GEN_CONFIG}
-```
-
-See [`examples/visual_gen/serve/visual_gen_mgmn_launcher_serve.sh`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/serve/visual_gen_mgmn_launcher_serve.sh) for the full sbatch script. The same pattern wraps `trtllm-bench` and offline generation scripts.
+On Slurm, the same wrapped command runs multi-node under `srun --mpi=pmix`, exactly like the LLM recipe in [`examples/llm-api/llm_mgmn_trtllm_serve.sh`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_serve.sh).
 
 Behavior notes:
 
