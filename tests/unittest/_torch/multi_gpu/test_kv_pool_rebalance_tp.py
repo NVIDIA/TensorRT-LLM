@@ -166,6 +166,48 @@ def _cp_tp_dist(cp_size: int, tp_size: int, rank: int) -> MPIDist:
     )
 
 
+def _pp_dist(world_size: int, rank: int) -> MPIDist:
+    """Build a pure-PP communicator for this rank.
+
+    ``tp_size`` and ``cp_size`` are both 1, so ``pp_broadcast`` alone carries
+    the agreement.  PP ranks hold different layers and therefore different
+    pools, so without this hop they would never agree by construction.
+
+    Args:
+        world_size: Total number of ranks, all of them PP ranks.
+        rank: This process's global rank.
+
+    Returns:
+        An ``MPIDist`` whose mapping has ``pp_size == world_size``.
+    """
+    return MPIDist(Mapping(world_size=world_size, rank=rank, pp_size=world_size))
+
+
+def _tp_pp_dist(tp_size: int, pp_size: int, rank: int) -> MPIDist:
+    """Build a combined TP x PP communicator for this rank.
+
+    Ranks are laid out ``rank == pp_rank * tp_size + tp_rank``, so with
+    ``tp_size == pp_size == 2`` the TP groups are ``[0, 1]`` and ``[2, 3]``
+    while the PP groups are ``[0, 2]`` and ``[1, 3]``.
+
+    Args:
+        tp_size: Tensor-parallel width.
+        pp_size: Pipeline-parallel width.
+        rank: This process's global rank.
+
+    Returns:
+        An ``MPIDist`` over ``tp_size * pp_size`` ranks with both dimensions > 1.
+    """
+    return MPIDist(
+        Mapping(
+            world_size=tp_size * pp_size,
+            rank=rank,
+            tp_size=tp_size,
+            pp_size=pp_size,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-rank work
 # ---------------------------------------------------------------------------
@@ -334,6 +376,135 @@ def run_adp_cp_agreement(
     assert all_decisions == expected, (
         f"ADP+CP decisions were {all_decisions}, expected {expected}: CP ranks "
         "must follow their replica's root while replicas stay independent"
+    )
+
+
+def run_pp_agreement(world_size: int, rank: int, local_flags: list[bool], expected: bool) -> None:
+    """Every PP rank must end up with the first stage's decision, not its own.
+
+    PP ranks hold different layers, so each has its own pools, its own
+    ``need_adjustment`` reading and its own cooldown clock -- left alone they
+    would not agree by construction.  They must agree because rebalancing under
+    PP means draining the microbatch ring, and a rank that stopped feeding the
+    ring while its peers kept going would desynchronize the per-iteration
+    send/recv chain and hang the pipeline.
+
+    Args:
+        world_size: Number of PP ranks.
+        rank: This process's global rank.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: The decision every rank should agree on.
+    """
+    dist = _pp_dist(world_size, rank)
+    # A pure-PP mapping collapses TP and CP, so pp_broadcast alone carries this.
+    assert dist.pp_size > 1 and dist.tp_size == 1 and dist.cp_size == 1, (
+        f"expected a pure-PP mapping, got pp_size={dist.pp_size} "
+        f"tp_size={dist.tp_size} cp_size={dist.cp_size}"
+    )
+    exe = _make_executor(dist, need_adjustment=local_flags[rank])
+
+    got = PyExecutor._agreed_need_adjustment(exe)
+
+    # Collect before asserting -- see run_agreement for why the order matters.
+    all_decisions = dist.allgather(got)
+
+    assert got == expected, (
+        f"rank {rank} (pp_rank={dist.mapping.pp_rank}): local reading was "
+        f"{local_flags[rank]}, the first PP stage said {local_flags[0]}, so the "
+        f"agreed decision should be {expected}, got {got}"
+    )
+    assert len(set(all_decisions)) == 1, f"PP ranks disagreed: {all_decisions}"
+
+
+def run_tp_pp_agreement(
+    world_size: int, rank: int, tp_size: int, local_flags: list[bool], expected: bool
+) -> None:
+    """The TP and PP hops must chain, leaving global rank 0's decision everywhere.
+
+    Ranks are laid out ``rank == pp_rank * tp_size + tp_rank``, so on a 2x2 the
+    TP groups are ``[0, 1]`` and ``[2, 3]`` and the PP groups are ``[0, 2]`` and
+    ``[1, 3]``.  With only global rank 0 reading ``True``:
+
+    * the TP step gives ranks 0 and 1 rank 0's ``True``, and ranks 2 and 3 rank
+      2's ``False``;
+    * the PP step then broadcasts rank 0's ``True`` to rank 2, and rank 1's
+      *post-TP* ``True`` to rank 3.
+
+    So every rank ends ``True`` -- but only if the PP hop consumes the TP hop's
+    result.  Had it broadcast each rank's own local reading, ranks 1 and 3 would
+    come back ``False``, which is exactly what makes this case discriminating.
+
+    Args:
+        world_size: Total ranks, equal to ``tp_size * pp_size``.
+        rank: This process's global rank.
+        tp_size: Tensor-parallel width; PP width is derived from it.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: The decision every rank should agree on.
+    """
+    pp_size = world_size // tp_size
+    dist = _tp_pp_dist(tp_size, pp_size, rank)
+    assert dist.pp_size > 1 and dist.tp_size > 1, (
+        f"this test only means something when both dimensions are > 1, got "
+        f"pp_size={dist.pp_size} tp_size={dist.tp_size}"
+    )
+    exe = _make_executor(dist, need_adjustment=local_flags[rank])
+
+    got = PyExecutor._agreed_need_adjustment(exe)
+
+    # Collect before asserting -- see run_agreement for why the order matters.
+    all_decisions = dist.allgather(got)
+
+    assert got == expected, (
+        f"rank {rank} (tp_rank={dist.mapping.tp_rank}, "
+        f"pp_rank={dist.mapping.pp_rank}): local reading was {local_flags[rank]}, "
+        f"global rank 0 said {local_flags[0]}, so the agreed decision should be "
+        f"{expected}, got {got}"
+    )
+    assert len(set(all_decisions)) == 1, f"TPxPP ranks disagreed: {all_decisions}"
+
+
+def run_adp_pp_agreement(
+    world_size: int, rank: int, tp_size: int, local_flags: list[bool], expected: list[bool]
+) -> None:
+    """Under ADP the TP hop is suppressed but the PP hop must still run.
+
+    ADP replicates along the TP dimension, so each ``tp_rank`` owns an
+    independent request stream -- but a replica's *pipeline stages* all serve
+    that one stream and must drain together or the replica's pipeline hangs.
+    ``pp_group`` for a given ``tp_rank`` holds exactly those stages.
+
+    On a 2x2 with only global rank 0 reading ``True``, the expected outcome is
+    ``[True, False, True, False]``: ranks 0 and 2 form one replica and follow
+    rank 0, ranks 1 and 3 form the other and follow rank 1.  That single vector
+    pins down both halves at once -- rank 2 being ``True`` shows the PP hop ran,
+    and rank 1 staying ``False`` shows the TP hop did not.
+
+    Args:
+        world_size: Total ranks, equal to ``tp_size * pp_size``.
+        rank: This process's global rank.
+        tp_size: Tensor-parallel width; PP width is derived from it.
+        local_flags: Per-rank local ``need_adjustment`` readings.
+        expected: Per-rank agreed decision after the PP-only broadcast.
+    """
+    pp_size = world_size // tp_size
+    dist = _tp_pp_dist(tp_size, pp_size, rank)
+    exe = _make_executor(dist, need_adjustment=local_flags[rank], enable_attention_dp=True)
+
+    got = PyExecutor._agreed_need_adjustment(exe)
+
+    # Collect before asserting -- see run_agreement for why the order matters.
+    all_decisions = dist.allgather(got)
+
+    assert got == expected[rank], (
+        f"rank {rank} (tp_rank={dist.mapping.tp_rank}, "
+        f"pp_rank={dist.mapping.pp_rank}): local reading was {local_flags[rank]}, "
+        f"its replica's first stage read {expected[rank]}, so the agreed decision "
+        f"should be {expected[rank]}, got {got}"
+    )
+    assert all_decisions == expected, (
+        f"ADP+PP decisions were {all_decisions}, expected {expected}: pipeline "
+        "stages must follow their replica's first stage while replicas stay "
+        "independent"
     )
 
 
@@ -512,6 +683,88 @@ def test_cp_and_tp_ranks_agree_on_rebalance_trigger(world_size: int, cp_size: in
         results = ex.map(
             run_single_rank,
             *zip(*[(world_size, run_cp_tp_agreement, cp_size, flags, expected)] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["all_true", "all_false", "only_rank0_true", "only_rank0_false"],
+)
+@pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"pp:{x}")
+def test_pp_ranks_agree_on_rebalance_trigger(world_size: int, case: str) -> None:
+    """The first PP stage's decision wins on every stage of the pipeline.
+
+    Args:
+        world_size: Number of PP ranks to run on.
+        case: Skew scenario name, resolved by ``_flags_for``.
+    """
+    _skip_if_not_enough_gpus(world_size)
+    flags = _flags_for(case, world_size)
+    expected = flags[0]
+
+    with MPIPoolExecutor(max_workers=world_size) as ex:
+        results = ex.map(
+            run_single_rank,
+            *zip(*[(world_size, run_pp_agreement, flags, expected)] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
+@pytest.mark.parametrize("tp_size", [2], ids=lambda x: f"tp:{x}")
+@pytest.mark.parametrize("world_size", [4], ids=lambda x: f"world:{x}")
+def test_tp_and_pp_ranks_agree_on_rebalance_trigger(world_size: int, tp_size: int) -> None:
+    """TP then PP chained: the pair propagates global rank 0's decision.
+
+    ``only_rank0_true`` is the discriminating scenario -- see
+    ``run_tp_pp_agreement`` for the rank-by-rank walk-through.
+
+    Args:
+        world_size: Total ranks; must equal ``tp_size * pp_size``.
+        tp_size: Tensor-parallel width; PP width is ``world_size // tp_size``.
+    """
+    _skip_if_not_enough_gpus(world_size)
+    flags = _flags_for("only_rank0_true", world_size)
+    expected = flags[0]
+    assert flags == [True, False, False, False], (
+        "this case only discriminates the chained broadcast when rank 0 alone "
+        f"reads True, got {flags}"
+    )
+
+    with MPIPoolExecutor(max_workers=world_size) as ex:
+        results = ex.map(
+            run_single_rank,
+            *zip(*[(world_size, run_tp_pp_agreement, tp_size, flags, expected)] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
+@pytest.mark.parametrize("tp_size", [2], ids=lambda x: f"tp:{x}")
+@pytest.mark.parametrize("world_size", [4], ids=lambda x: f"world:{x}")
+def test_attention_dp_still_agrees_across_pp_stages(world_size: int, tp_size: int) -> None:
+    """ADP suppresses the TP hop but must never suppress the PP hop.
+
+    Each DP replica is itself a pipeline whose stages have to drain together;
+    suppressing the PP hop would hang the replica rather than merely let it
+    drift.
+
+    Args:
+        world_size: Total ranks; must equal ``tp_size * pp_size``.
+        tp_size: Tensor-parallel width; PP width is ``world_size // tp_size``.
+    """
+    _skip_if_not_enough_gpus(world_size)
+    flags = _flags_for("only_rank0_true", world_size)
+    # rank = pp_rank * tp_size + tp_rank, so the replicas are {0, 2} and {1, 3}
+    # and each follows its own first stage: rank 0 reads True, rank 1 False.
+    expected = [True, False, True, False]
+
+    with MPIPoolExecutor(max_workers=world_size) as ex:
+        results = ex.map(
+            run_single_rank,
+            *zip(*[(world_size, run_adp_pp_agreement, tp_size, flags, expected)] * world_size),
         )
         for r in results:
             assert r is True

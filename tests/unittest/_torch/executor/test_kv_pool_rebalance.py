@@ -57,6 +57,11 @@ def _make_executor(
     padding_dummies=None,
     has_cuda_graph_runner: bool = True,
     rebalance_check_interval: int = 1,
+    num_micro_batches: int = 1,
+    micro_batches=None,
+    unhandled_batch_counter: int = 0,
+    pp_rebalance_drain_iters=None,
+    pp_multi_stream_sample: bool = False,
 ) -> MagicMock:
     """Construct a MagicMock shaped like PyExecutor with exactly the
     attributes the rebalance code path reads.
@@ -84,9 +89,25 @@ def _make_executor(
     exe._rebalance_check_interval = rebalance_check_interval
     exe.iter_counter = 0
 
+    # Pipeline-parallel microbatch ring.  Only _executor_loop_pp's drain path
+    # reads these; the default is a quiescent depth-1 ring, i.e. the shape the
+    # non-PP loops present.
+    exe.num_micro_batches = num_micro_batches
+    exe.micro_batches = (
+        list(micro_batches) if micro_batches is not None else [None] * num_micro_batches
+    )
+    exe.unhandled_batch_counter = unhandled_batch_counter
+    exe._pp_rebalance_drain_iters = pp_rebalance_drain_iters
+    exe.pp_multi_stream_sample = pp_multi_stream_sample
+
     # Bind the real agreement helper so _maybe_rebalance_kv_pools exercises it
     # rather than getting a truthy MagicMock back.
     exe._agreed_need_adjustment = lambda: PyExecutor._agreed_need_adjustment(exe)
+
+    # Same for the suspend/adjust/resume core, which both the inline path and
+    # the PP drain delegate to.
+    exe._rebalance_kv_pools_now = lambda: PyExecutor._rebalance_kv_pools_now(exe)
+    exe._pp_ring_is_quiescent = lambda: PyExecutor._pp_ring_is_quiescent(exe)
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()
@@ -158,9 +179,15 @@ class TestCanPauseForRebalance:
         exe = _make_executor(enable_kv_pool_rebalance=False)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
-    def test_pp_size_gt_one_returns_false(self):
+    def test_pp_size_gt_one_is_allowed(self):
+        """PP no longer short-circuits the gate.
+
+        Under PP a ``True`` here starts a ring drain rather than rebalancing
+        inline (see ``_start_pp_rebalance_drain``), but the gate itself must
+        let PP through for that to happen at all.
+        """
         exe = _make_executor(pp_size=2)
-        assert PyExecutor._can_pause_for_rebalance(exe) is False
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
 
     def test_transceiver_present_returns_false(self):
         exe = _make_executor(kv_cache_transceiver=MagicMock())
@@ -552,10 +579,53 @@ class TestAgreedNeedAdjustment:
         exe.dist.tp_broadcast.assert_called_once_with(False, root=0)
 
     def test_single_rank_touches_no_collective(self):
-        exe = _make_executor(tp_size=1, cp_size=1, need_adjustment=True)
+        exe = _make_executor(tp_size=1, cp_size=1, pp_size=1, need_adjustment=True)
         assert PyExecutor._agreed_need_adjustment(exe) is True
         exe.dist.cp_broadcast.assert_not_called()
         exe.dist.tp_broadcast.assert_not_called()
+        exe.dist.pp_broadcast.assert_not_called()
+
+    def test_pp_broadcasts_first_stage_decision(self):
+        # PP ranks hold different layers, hence different pools, different
+        # need_adjustment readings and independent cooldown clocks.  They must
+        # still start the ring drain on the same iteration or the pipeline's
+        # per-iteration send/recv chain desynchronizes.
+        exe = _make_executor(pp_size=4, need_adjustment=True)
+        exe.dist.pp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.pp_broadcast.assert_called_once_with(True, root=0)
+
+    def test_pp_hop_is_last_so_global_rank0_wins(self):
+        # CP, then TP, then PP: each hop must consume the previous hop's result,
+        # leaving every rank holding global rank 0's value.  The three return
+        # values differ from the local reading and from each other's inputs so
+        # that a dropped link in the chain fails the assertion.
+        exe = _make_executor(tp_size=2, cp_size=2, pp_size=2, need_adjustment=True)
+        exe.dist.cp_broadcast.return_value = False
+        exe.dist.tp_broadcast.return_value = True
+        exe.dist.pp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.cp_broadcast.assert_called_once_with(True, root=0)
+        exe.dist.tp_broadcast.assert_called_once_with(False, root=0)
+        exe.dist.pp_broadcast.assert_called_once_with(True, root=0)
+
+    def test_pp_hop_survives_attention_dp(self):
+        """ADP suppresses the TP hop but must never suppress the PP hop.
+
+        ADP replicates along the TP dimension, so a replica's pipeline stages
+        all serve that replica's own request stream and have to drain together.
+        ``pp_group`` for a given tp_rank holds exactly those stages, so the
+        broadcast propagates the replica's first-stage decision and nothing
+        wider.
+        """
+        exe = _make_executor(tp_size=2, pp_size=2, enable_attention_dp=True, need_adjustment=True)
+        exe.dist.pp_broadcast.return_value = False
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
+        exe.dist.tp_broadcast.assert_not_called()
+        exe.dist.pp_broadcast.assert_called_once_with(True, root=0)
 
     def test_attention_dp_still_broadcasts_over_cp(self):
         """ADP suppresses the TP hop only -- CP ranks must still agree.
@@ -601,6 +671,165 @@ class TestAgreedNeedAdjustment:
 
         exe.kv_cache_manager.impl.adjust.assert_not_called()
         exe.kv_cache_manager.suspend_request.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline-parallel drain
+# --------------------------------------------------------------------------- #
+
+
+def _batch_state() -> MagicMock:
+    """Stand-in for an in-flight BatchStatePP occupying a ring slot."""
+    return MagicMock()
+
+
+class TestPpRingIsQuiescent:
+    """``adjust()`` may only run when nothing is in flight in the PP ring."""
+
+    def test_empty_ring_with_drain_pending_is_quiescent(self):
+        exe = _make_executor(pp_size=2, num_micro_batches=2, pp_rebalance_drain_iters=1)
+        assert PyExecutor._pp_ring_is_quiescent(exe) is True
+
+    def test_occupied_slot_is_not_quiescent(self):
+        exe = _make_executor(
+            pp_size=2,
+            num_micro_batches=2,
+            micro_batches=[None, _batch_state()],
+            pp_rebalance_drain_iters=1,
+        )
+        assert PyExecutor._pp_ring_is_quiescent(exe) is False
+
+    def test_unhandled_sample_state_is_not_quiescent(self):
+        # The slot is already cleared, but the sample state is still travelling
+        # the relay and has not been applied to its requests yet.
+        exe = _make_executor(
+            pp_size=2, num_micro_batches=2, unhandled_batch_counter=1, pp_rebalance_drain_iters=1
+        )
+        assert PyExecutor._pp_ring_is_quiescent(exe) is False
+
+    def test_no_drain_pending_is_not_quiescent(self):
+        exe = _make_executor(pp_size=2, num_micro_batches=2, pp_rebalance_drain_iters=None)
+        assert PyExecutor._pp_ring_is_quiescent(exe) is False
+
+
+class TestStartPpRebalanceDrain:
+    def test_countdown_covers_the_whole_ring(self):
+        # One slot retires per iteration while nothing new is queued, so a full
+        # ring's worth of iterations empties it.
+        exe = _make_executor(pp_size=4, num_micro_batches=4)
+        PyExecutor._start_pp_rebalance_drain(exe)
+        assert exe._pp_rebalance_drain_iters == 4
+
+
+class TestMaybeFinishPpRebalance:
+    """The drain counts down, then rebalances exactly once."""
+
+    @staticmethod
+    def _exe(monkeypatch, **kwargs):
+        exe = _make_executor(pp_size=2, **kwargs)
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+        return exe
+
+    def test_no_op_when_no_drain_pending(self, monkeypatch):
+        exe = self._exe(monkeypatch, num_micro_batches=2, pp_rebalance_drain_iters=None)
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+
+    def test_does_not_rebalance_before_the_ring_drains(self, monkeypatch):
+        exe = self._exe(monkeypatch, num_micro_batches=4, pp_rebalance_drain_iters=4)
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        assert exe._pp_rebalance_drain_iters == 3
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+
+    def test_rebalances_when_the_countdown_expires(self, monkeypatch):
+        req = _make_request(1)
+        exe = self._exe(
+            monkeypatch, num_micro_batches=2, pp_rebalance_drain_iters=1, active_requests=[req]
+        )
+
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        exe.kv_cache_manager.suspend_request.assert_called_once_with(req)
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
+        exe.kv_cache_manager.resume_request.assert_called_once_with(req)
+        # Cleared, so the next check interval starts a fresh drain.
+        assert exe._pp_rebalance_drain_iters is None
+
+    def test_full_drain_rebalances_exactly_once(self, monkeypatch):
+        exe = self._exe(monkeypatch, num_micro_batches=3, active_requests=[_make_request(1)])
+        PyExecutor._start_pp_rebalance_drain(exe)
+
+        for _ in range(3):
+            PyExecutor._maybe_finish_pp_rebalance(exe)
+        # Extra iterations after the drain must not rebalance again.
+        for _ in range(3):
+            PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
+
+    def test_busy_ring_skips_rather_than_corrupting(self, monkeypatch):
+        # Adjusting underneath a live _KVCache would move pages out from under
+        # it.  Skipping only costs a delay: the auto-tuner still wants the
+        # adjustment and asks again on the next check interval.
+        exe = self._exe(
+            monkeypatch,
+            num_micro_batches=2,
+            micro_batches=[None, _batch_state()],
+            pp_rebalance_drain_iters=1,
+            active_requests=[_make_request(1)],
+        )
+
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        assert exe._pp_rebalance_drain_iters is None
+
+    def test_sample_stream_is_synced_when_multi_stream_sampling(self, monkeypatch):
+        # Sampling for the last microbatch runs on its own stream; its writes
+        # must land before adjust() moves pages underneath them.
+        exe = self._exe(
+            monkeypatch,
+            num_micro_batches=2,
+            pp_rebalance_drain_iters=1,
+            pp_multi_stream_sample=True,
+        )
+        exe.sample_stream = MagicMock()
+
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        exe.sample_stream.synchronize.assert_called_once()
+
+    def test_sample_stream_untouched_without_multi_stream_sampling(self, monkeypatch):
+        exe = self._exe(
+            monkeypatch,
+            num_micro_batches=2,
+            pp_rebalance_drain_iters=1,
+            pp_multi_stream_sample=False,
+        )
+        exe.sample_stream = MagicMock()
+
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        exe.sample_stream.synchronize.assert_not_called()
+
+    def test_previous_batch_is_not_consumed(self, monkeypatch):
+        """The PP path must not run the overlap loop's drain helper.
+
+        Under PP a microbatch is retired by the sample-state relay, not by
+        ``_consume_previous_batch_for_rebalance``; ``previous_batch`` is kept
+        only to synchronize its sampler event.  Running the overlap helper on it
+        would double-handle a batch the ring already completed.
+        """
+        exe = self._exe(
+            monkeypatch, num_micro_batches=2, pp_rebalance_drain_iters=1, previous_batch=MagicMock()
+        )
+
+        PyExecutor._maybe_finish_pp_rebalance(exe)
+
+        exe._consume_previous_batch_for_rebalance.assert_not_called()
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
 
 
 if __name__ == "__main__":
