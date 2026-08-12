@@ -49,9 +49,16 @@ ensure_cuda_driver_stub() {
     if python3 -c "import ctypes; ctypes.CDLL('libcuda.so.1')" 2>/dev/null; then
         return  # A real driver is installed; leave the loader path alone.
     fi
-    local stub
-    stub=$(ls /usr/local/cuda*/targets/*/lib/stubs/libcuda.so \
-              /usr/local/cuda*/lib64/stubs/libcuda.so 2>/dev/null | head -n 1)
+    local stub=""
+    local candidate
+    for candidate in /usr/local/cuda*/targets/*/lib/stubs/libcuda.so \
+                     /usr/local/cuda*/lib64/stubs/libcuda.so; do
+        # Unmatched globs stay literal; the [[ -f ]] test rejects them.
+        if [[ -f "$candidate" ]]; then
+            stub="$candidate"
+            break
+        fi
+    done
     if [[ -z "$stub" ]]; then
         return  # Nothing to offer; the import below reports the real error.
     fi
