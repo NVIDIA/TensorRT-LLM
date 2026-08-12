@@ -426,6 +426,10 @@ def processScanResults(ref) {
                         }
                         rows << sep
                         detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
+                        if (params.scanMode == "monitor") {
+                            echo detectedLicensesTable
+                            currentBuild.description = "⚠️ Non-permissive licenses detected — click 'Console Output' to review"
+                        }
                     }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
@@ -542,6 +546,7 @@ pipeline {
                     if (detectedLicensesTable) {
                         echo detectedLicensesTable
                     }
+                    currentBuild.description = "⚠️ Manual approval required — click 'Console Output' to review licenses, then approve or abort"
                     withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
                         def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
                         writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
