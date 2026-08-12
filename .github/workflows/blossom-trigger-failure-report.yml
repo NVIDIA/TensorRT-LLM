@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Blossom trigger failure report
+
+on:
+  workflow_run:
+    workflows: [Blossom-CI]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: read
+  statuses: write
+
+jobs:
+  report:
+    name: Report trigger failure
+    if: >-
+      github.event.workflow_run.event == 'issue_comment' &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark the trigger failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ACTOR: ${{ github.event.workflow_run.actor.login }}
+          RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+          RUN_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs")"
+          failed_job="$(jq -r '
+            [.jobs[] | select(.conclusion == "failure") | .name]
+            | map(select(. == "Authorization" or
+                         . == "Vulnerability scan" or
+                         . == "Start ci job"))
+            | first // empty
+          ' <<< "${jobs}")"
+
+          if [[ -z "${failed_job}" ]]; then
+            echo "No failed Blossom trigger job was found; skipping the report."
+            exit 0
+          fi
+
+          # workflow_run does not preserve the issue number for issue_comment runs.
+          # Match the triggering actor, time window, command, and exact PR title;
+          # if any part is ambiguous or missing, leave the PR untouched.
+          since="$(date --utc --date="${RUN_CREATED_AT} - 10 minutes" +%Y-%m-%dT%H:%M:%SZ)"
+          comments="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/issues/comments?since=${since}&per_page=100")"
+          mapfile -t candidate_numbers < <(jq -r \
+            --arg actor "${RUN_ACTOR}" \
+            --arg created_at "${RUN_CREATED_AT}" \
+            --arg since "${since}" '
+              [.[][]
+               | select(.user.login == $actor)
+               | select(.created_at >= $since)
+               | select(.created_at <= $created_at)
+               | select(.body | startswith("/bot run") or
+                                startswith("/bot skip --comment") or
+                                startswith("/bot reuse-pipeline") or
+                                startswith("/bot kill"))
+               | .issue_url | split("/") | last]
+              | unique | reverse[]
+            ' <<< "${comments}")
+
+          matching_numbers=()
+          for candidate in "${candidate_numbers[@]}"; do
+            candidate_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${candidate}" 2>/dev/null || true)"
+            candidate_title="$(jq -r '.title // empty' <<< "${candidate_pr}")"
+            if [[ "${candidate_title}" == "${RUN_DISPLAY_TITLE}" ]]; then
+              matching_numbers+=("${candidate}")
+            fi
+          done
+
+          if [[ ${#matching_numbers[@]} -ne 1 ]]; then
+            echo "Blossom run ${RUN_ID} matched ${#matching_numbers[@]} pull requests; skipping the report."
+            exit 0
+          fi
+          pr_number="${matching_numbers[0]}"
+
+          head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
+          description="Blossom-CI trigger failed in ${failed_job}"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${head_sha}" \
+            -f state='failure' \
+            -f context='blossom-ci' \
+            -f description="${description}" \
+            -f target_url="${RUN_URL}"
+
+          body="$(printf '%s\n\n%s\n\n%s' \
+            "❌ **Blossom-CI trigger failed during ${failed_job}.**" \
+            "The trigger workflow did not complete, so this does not indicate a test failure." \
+            "[View the trigger logs](${RUN_URL}) and retry after the infrastructure recovers.")"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
+            -f body="${body}"
