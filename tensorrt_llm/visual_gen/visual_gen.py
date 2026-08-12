@@ -15,6 +15,7 @@
 import asyncio
 import atexit
 import itertools
+import os
 import secrets
 import sys
 import weakref
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm.executor.utils import get_spawn_proxy_process_env
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.output import VisualGenOutput
 from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
@@ -241,39 +243,53 @@ class VisualGen:
         self.model = str(model)
         self.args = (args or VisualGenArgs()).model_copy(update={"model": self.model})
 
-        # In external-launch mode (torchrun/srun), ranks 1..N-1 run as pure
-        # workers and never return to user code.
-        ext = _detect_external_launch()
-        if ext is not None:
-            rank, local_rank, world_size, master_addr, master_port = ext
-            n_workers = self.args.parallel_config.n_workers
-            if world_size != n_workers:
-                raise ValueError(
-                    f"Launcher world_size ({world_size}) does not match "
-                    f"n_workers ({n_workers}). "
-                    "Launch exactly n_workers tasks."
-                )
-            if rank != 0:
+        # MGMN (trtllm-llmapi-launch) wins over external-launch detection:
+        # the launcher strips SLURM_*/OMPI_* from the wrapped program but not
+        # a stale RANK/WORLD_SIZE pair, which _detect_external_launch() would
+        # misread as a torchrun launch. DiffusionRemoteClient dispatches the
+        # MGMN workers itself.
+        if get_spawn_proxy_process_env():
+            if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
                 logger.info(
-                    f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
-                    "starting as worker (external launch mode)"
+                    "VisualGen: MGMN launcher detected; ignoring stale "
+                    "RANK/WORLD_SIZE environment variables"
                 )
-                run_diffusion_worker(
-                    rank=rank,
-                    world_size=n_workers,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    request_queue_addr=None,  # unused: non-zero ranks receive requests via dist.broadcast_object_list
-                    response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
-                    visual_gen_args=self.args,
-                    req_hmac_key=None,
-                    resp_hmac_key=None,
-                    local_rank=local_rank,
+        else:
+            # In external-launch mode (torchrun/srun), ranks 1..N-1 run as
+            # pure workers and never return to user code.
+            ext = _detect_external_launch()
+            if ext is not None:
+                rank, local_rank, world_size, master_addr, master_port = ext
+                n_workers = self.args.parallel_config.n_workers
+                if world_size != n_workers:
+                    raise ValueError(
+                        f"Launcher world_size ({world_size}) does not match "
+                        f"n_workers ({n_workers}). "
+                        "Launch exactly n_workers tasks."
+                    )
+                if rank != 0:
+                    logger.info(
+                        f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
+                        "starting as worker (external launch mode)"
+                    )
+                    run_diffusion_worker(
+                        rank=rank,
+                        world_size=n_workers,
+                        master_addr=master_addr,
+                        master_port=master_port,
+                        # unused: non-zero ranks receive requests via
+                        # dist.broadcast_object_list
+                        request_queue_addr=None,
+                        response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
+                        visual_gen_args=self.args,
+                        req_hmac_key=None,
+                        resp_hmac_key=None,
+                        local_rank=local_rank,
+                    )
+                    sys.exit(0)
+                logger.info(
+                    f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
                 )
-                sys.exit(0)
-            logger.info(
-                f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
-            )
 
         self.executor = DiffusionRemoteClient(
             args=self.args,
