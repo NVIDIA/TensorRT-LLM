@@ -1204,6 +1204,17 @@ def main(*,
             # This breaks the Windows CI/CD pipeline when building
             # and validating python changes in the whl.
             clear_folder(dist_dir)
+            # Without --build_root the setuptools staging tree (build_base)
+            # lives at project_dir/build == dist_dir, so the clear above
+            # already wipes it. With --build_root it moves under
+            # TRTLLM_WHEEL_STAGING_DIR, so clearing dist_dir alone would
+            # leave stale copies of deleted package files there to be
+            # re-packed into the next "clean" wheel. Clear it too.
+            staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+            if staging_dir:
+                staging_build = Path(staging_dir) / "build"
+                if staging_build.exists():
+                    clear_folder(staging_build)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
         plat_name_arg = ""
