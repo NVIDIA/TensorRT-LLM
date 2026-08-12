@@ -4,6 +4,7 @@
 import dataclasses
 import datetime
 import functools
+import math
 import os
 import sys
 import threading
@@ -128,12 +129,25 @@ def _fill_stall_timeout_sec() -> float:
     if raw is None:
         return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning(
             f"Invalid {BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME}={raw!r}; "
             f"using {_BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC:.0f}s")
         return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
+    if not math.isfinite(value):
+        # float() accepts "nan" and "inf", and both break the bound in
+        # opposite directions. Every nan comparison is False, so `nan <= 0`
+        # does not disable it and `stalled_for < nan` does not defer it --
+        # control falls straight through to the raise, firing on the second
+        # consecutive stalled call (~0.1s) instead of after the window. inf
+        # is the mirror: `stalled_for < inf` is always True, so the bound
+        # never fires and is silently equivalent to 0. Reject both.
+        logger.warning(
+            f"Non-finite {BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME}={raw!r}; "
+            f"using {_BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC:.0f}s")
+        return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
+    return value
 
 
 # Environment variable to control which ranks print step logging.

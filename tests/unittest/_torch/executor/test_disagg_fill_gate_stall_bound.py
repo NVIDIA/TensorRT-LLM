@@ -28,7 +28,16 @@ import types
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME,
+    PyExecutor,
+    _fill_stall_timeout_sec,
+)
+
+# Pure monkeypatch: no engine, no GPU. The marker is required, not
+# decorative -- tests/unittest/conftest.py's pytest_ignore_collect drops any
+# file whose source lacks this literal when pytest runs with -m cpu_only.
+pytestmark = pytest.mark.cpu_only
 
 
 class _Clock:
@@ -112,3 +121,28 @@ def test_first_stalled_call_only_arms_the_clock(monkeypatch):
     ex = _executor(5.0, _Clock())
     ex._fail_if_fill_gate_stalled(False)
     assert ex._benchmark_fill_stall_since is not None
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_non_finite_env_falls_back_to_the_default(monkeypatch, raw):
+    """float() accepts nan/inf, and each breaks the bound a different way.
+
+    Every nan comparison is False, so ``nan <= 0`` does not disable the
+    bound and ``stalled_for < nan`` does not defer it: control falls through
+    to the raise, firing on the second consecutive stalled call rather than
+    after the window. ``inf`` is the mirror -- ``stalled_for < inf`` is
+    always True, so the bound never fires and is silently equivalent to 0.
+    """
+    monkeypatch.setenv(BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME, raw)
+    assert _fill_stall_timeout_sec() == 600.0
+
+
+def test_a_valid_env_override_is_honoured(monkeypatch):
+    monkeypatch.setenv(BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME, "42.5")
+    assert _fill_stall_timeout_sec() == 42.5
+
+
+def test_zero_env_is_preserved_as_the_disable_switch(monkeypatch):
+    """0 must survive the finiteness check -- it is the documented opt-out."""
+    monkeypatch.setenv(BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME, "0")
+    assert _fill_stall_timeout_sec() == 0.0
