@@ -102,7 +102,7 @@ def is_inkling(config):
       memory the model may have), so it cannot ask the model class and must key
       off the checkpoint config. ``get_model_defaults`` declares the same thing
       for every launch path, but cannot be the mechanism here.
-    * ``_util._fallback_if_unsupported_kv_cache_manager_v2`` -- refuse to
+    * ``_util._validate_or_fallback_kv_cache_manager_v2`` -- refuse to
       silently downgrade to V1 when a V2-incompatible feature is on. Same
       identity test, opposite direction: it must fire even though the model
       asked for V2.

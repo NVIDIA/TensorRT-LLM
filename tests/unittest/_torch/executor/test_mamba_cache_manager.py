@@ -867,7 +867,7 @@ def test_v2_rejects_cpp_cache_transceiver(transceiver_runtime):
     )
 
     with pytest.raises(NotImplementedError, match="disaggregated serving"):
-        creator._fallback_if_unsupported_kv_cache_manager_v2(
+        creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
         )
 
@@ -876,7 +876,7 @@ def test_v2_cpp_transceiver_message_points_at_the_python_runtime():
     creator = _v2_gate_creator(SimpleNamespace(backend="UCX", transceiver_runtime="CPP"))
 
     with pytest.raises(NotImplementedError) as excinfo:
-        creator._fallback_if_unsupported_kv_cache_manager_v2(
+        creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
         )
 
@@ -889,7 +889,7 @@ def test_v2_allows_the_python_cache_transceiver():
     creator = _v2_gate_creator(SimpleNamespace(backend="NIXL", transceiver_runtime="PYTHON"))
 
     assert (
-        creator._fallback_if_unsupported_kv_cache_manager_v2(
+        creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
         )
         is MambaHybridCacheManagerV2
@@ -902,7 +902,7 @@ def test_v2_allows_a_disabled_cache_transceiver():
     creator = _v2_gate_creator(SimpleNamespace(backend=None, transceiver_runtime=None))
 
     assert (
-        creator._fallback_if_unsupported_kv_cache_manager_v2(
+        creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
         )
         is MambaHybridCacheManagerV2
