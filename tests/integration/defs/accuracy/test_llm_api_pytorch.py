@@ -6219,7 +6219,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
-    def test_bf16_flashinfer(self):
+    def test_bf16_flashinfer(self) -> None:
         model_path = f"{llm_models_root()}/Qwen3.5-4B"
         with LLM(model_path,
                  trust_remote_code=True,
