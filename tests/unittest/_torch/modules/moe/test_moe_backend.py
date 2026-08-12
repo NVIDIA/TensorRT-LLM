@@ -52,6 +52,7 @@ from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
@@ -60,13 +61,20 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    MoE,
+    MoESchedulerKind,
+    MoEWeightLoadingMode,
+)
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
+    NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
@@ -79,6 +87,20 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
+    valid_tactics = [
+        [8, 0],
+        [32, 4],
+        [16, 0],
+        [32, 0],
+    ]
+
+    assert _select_explicit_fallback_tactic(valid_tactics) == [32, 0]
+
+    with pytest.raises(RuntimeError, match="no valid fallback tactic"):
+        _select_explicit_fallback_tactic([])
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
@@ -224,7 +246,7 @@ def test_moe_post_load_weights_uses_idempotent_transform_hook():
         def quantize_input(self, x, **kwargs):
             return x, None
 
-        def run_moe(self, **kwargs):
+        def run_moe(self, ctx, *, workspace=None):
             raise NotImplementedError
 
     moe = HookTestMoE.__new__(HookTestMoE)
@@ -300,7 +322,7 @@ def test_configurable_moe_post_load_weights_uses_backend_staged_hooks():
         def quantize_input(self, x, **kwargs):
             return x, None
 
-        def run_moe(self, **kwargs):
+        def run_moe(self, ctx, *, workspace=None):
             raise NotImplementedError
 
     configurable_moe = HookTestConfigurableMoE.__new__(HookTestConfigurableMoE)
@@ -337,6 +359,11 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert result == "loaded"
     backend.load_weights.assert_called_once_with(weights, True)
     assert configurable_moe._weights_transformed is False
+
+
+def test_moe_nvfp4_activation_quantization_capability():
+    assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
+    assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations
 
 
 def test_marlin_moe_repack_is_transform_stage():
@@ -617,6 +644,7 @@ def run_backend_moe(
         token_final_scales=token_final_scales.to(torch.float32),
         x_sf=x_sf,
     )
+    workspace = None
 
     # Backend-specific overrides
     if backend_type == MoeBackendType.CUTLASS:
@@ -633,12 +661,25 @@ def run_backend_moe(
         import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
-        args["workspace"] = backend.get_workspace(m_max, 128)
+        workspace = backend.get_workspace(m_max, 128)
     elif backend_type in _MEGAMOE_BACKEND_TYPES:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
 
-    return backend.run_moe(**args)
+    # Mirror what each scheduler hands the backend: ExternalCommMoEScheduler
+    # builds a plan on every path, FusedCommMoEScheduler never does because the
+    # fused kernel owns the exchange. Single GPU with no comm strategy, so this
+    # is the no-comm plan: quantize_input ran locally and left the scale factors
+    # swizzled, no alltoall, and no workspace-backed output buffer.
+    if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
+        args["comm_plan"] = MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        )
+
+    return backend.run_moe(MoERunContext(**args), workspace=workspace)
 
 
 # ============================================================================
@@ -805,13 +846,16 @@ def generate_element_wise_test_params() -> List:
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
             [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
-            [None, QuantAlgo.NVFP4],
+            [None, QuantAlgo.NVFP4, QuantAlgo.W8A16],
         ):
             if skip_reason:
                 continue
             if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
                 continue
             if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
+                continue
+            # INT8 weight-only per-channel non-gated MoE is CUTLASS-path only.
+            if quant_algo == QuantAlgo.W8A16 and backend_type != MoeBackendType.CUTLASS:
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (
@@ -1157,7 +1201,12 @@ def _make_bf16_routing_method(routing_kind: str, top_k: int, num_experts: int, d
 )
 @pytest.mark.parametrize("routing_kind", ["deepseekv3", "renormalize"])
 def test_trtllm_bf16_unquantized_moe(
-    routing_kind, activation_type, seq_len, trtllm_use_router_logits
+    routing_kind,
+    activation_type,
+    seq_len,
+    trtllm_use_router_logits,
+    num_experts=_BF16_UNQUANT_NUM_EXPERTS,
+    top_k=_BF16_UNQUANT_TOP_K,
 ):
     """TRTLLM-Gen BF16 (unquantized) MoE accuracy vs the reference impl."""
     backend_type = MoeBackendType.TRTLLM
@@ -1169,8 +1218,6 @@ def test_trtllm_bf16_unquantized_moe(
     if not can_impl:
         pytest.skip(skip_reason)
 
-    num_experts = _BF16_UNQUANT_NUM_EXPERTS
-    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
@@ -1212,6 +1259,12 @@ def test_trtllm_bf16_unquantized_moe(
             mapping=mapping,
             activation_type=activation_type,
         )
+        if trtllm_use_router_logits and backend._routes_outside_the_kernel():
+            # This config only routes outside the kernel, so run_moe drops
+            # router_logits and the scheduler never pairs the two. Asking for
+            # fused routing here tests a combination production cannot reach.
+            pytest.skip("routing happens outside the kernel; fused routing is unreachable")
+
         backend.load_weights([weights])
         backend.post_load_weights()
         backend.cuda()
@@ -1246,6 +1299,24 @@ def test_trtllm_bf16_unquantized_moe(
         with torch.inference_mode():
             output = run_moe()
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.parametrize("seq_len", [1, 8])
+def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
+    """Kimi-K3 routing shape: 896 experts / top_k 16 without expert groups.
+
+    Exercises the (1024, 32) tier of the trtllm-gen DeepSeekV3 routing
+    kernels, including the cooperative small-batch kernel at num_tokens 1,
+    via the fused-routing path (router logits consumed in-kernel).
+    """
+    test_trtllm_bf16_unquantized_moe(
+        routing_kind="deepseekv3",
+        activation_type=ActivationType.Swiglu,
+        seq_len=seq_len,
+        trtllm_use_router_logits=True,
+        num_experts=896,
+        top_k=16,
+    )
 
 
 # ============================================================================

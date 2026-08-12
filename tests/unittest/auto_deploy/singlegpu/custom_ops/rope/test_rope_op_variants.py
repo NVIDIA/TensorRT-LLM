@@ -390,6 +390,7 @@ def test_flashinfer_custom_op_strided_interleaved(dtype, atol, rtol, head_dim):
     torch.testing.assert_close(custom_k_strided, out_k_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_rope_deinterleave_load_hook(has_bias):
     """Test _rope_deinterleave_load_hook permutes weights correctly.

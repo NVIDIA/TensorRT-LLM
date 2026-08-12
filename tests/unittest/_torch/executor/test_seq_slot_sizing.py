@@ -1,30 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4 seq-slot sizing includes overlap headroom.
+"""Disaggregated attention-DP seq-slot sizing includes overlap headroom.
 
 Under the overlap scheduler, requests finished in the previous iteration
 still hold their sequence slots when the next iteration's
 prepare_resources runs, while the V2 scheduler has already dropped them
 from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and
 backfilled their seats. Transient slot demand is therefore
-2 * max_batch_size. The headroom is intentionally limited to DeepSeek-V4;
-other models preserve their established sizing pending separate validation.
+2 * max_batch_size, regardless of whether speculative decoding is enabled.
+The headroom is selected from runtime topology rather than model architecture.
 
 compute_max_num_sequences is the single sizing implementation used both
 for the executor's SeqSlotManager pool (create_py_executor_instance) and
 for the sampler state (create_torch_sampler_args).
 """
 
-from unittest.mock import Mock
-
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import (
     compute_max_num_sequences,
     create_torch_sampler_args,
-    should_enable_dsv4_adp_dummy_fixes,
-    should_enable_dsv4_overlap_headroom,
+    should_enable_adp_dummy_fixes,
+    should_enable_disagg_adp_overlap_headroom,
+    should_enable_non_overlap_adp_forward_intent,
+    should_enable_scheduler_aware_adp_dummy,
 )
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 SIZING_CASES = [
@@ -40,42 +41,64 @@ SIZING_CASES = [
 
 
 @pytest.mark.parametrize(
-    "model_type,has_spec,is_mtp_one_model,pp_size,disable_overlap,expected",
+    "enable_attention_dp,is_disagg,pp_size,disable_overlap,expected",
     [
-        ("deepseek_v4", True, True, 1, False, True),
-        ("deepseek_v3", True, True, 1, False, False),
-        ("deepseek_v4", False, False, 1, False, False),
-        ("deepseek_v4", True, False, 1, False, False),
-        ("deepseek_v4", True, True, 2, False, False),
-        ("deepseek_v4", True, True, 1, True, False),
+        (True, True, 1, False, True),
+        (False, True, 1, False, False),
+        (True, False, 1, False, False),
+        (True, True, 2, False, False),
+        (True, True, 1, True, False),
     ],
 )
-def test_dsv4_overlap_headroom_gate(
-    model_type, has_spec, is_mtp_one_model, pp_size, disable_overlap, expected
+def test_disagg_adp_overlap_headroom_gate(
+    enable_attention_dp, is_disagg, pp_size, disable_overlap, expected
 ):
-    spec_config = None
-    if has_spec:
-        spec_config = Mock()
-        spec_config.spec_dec_mode.is_mtp_eagle_one_model.return_value = is_mtp_one_model
-    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    mapping = Mapping(
+        world_size=pp_size,
+        tp_size=1,
+        pp_size=pp_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+    cache_config = CacheTransceiverConfig(backend="NIXL") if is_disagg else None
 
     assert (
-        should_enable_dsv4_overlap_headroom(model_type, spec_config, mapping, disable_overlap)
+        should_enable_disagg_adp_overlap_headroom(mapping, cache_config, disable_overlap)
         is expected
     )
 
 
+@pytest.mark.parametrize("pp_size,expected", [(1, True), (2, False)])
+def test_adp_dummy_fix_gate(pp_size, expected):
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    assert should_enable_adp_dummy_fixes(mapping) is expected
+
+
 @pytest.mark.parametrize(
-    "model_type,pp_size,expected",
+    "model_type,pp_size,disable_overlap,expected",
     [
-        ("deepseek_v4", 1, True),
-        ("deepseek_v3", 1, False),
-        ("deepseek_v4", 2, False),
+        ("kimi_k2", 1, True, True),
+        ("kimi_k2", 1, False, False),
+        ("deepseek_v4", 1, False, True),
+        ("qwen3_5_moe", 1, False, True),
+        ("deepseek_v4", 2, True, False),
     ],
 )
-def test_dsv4_adp_dummy_fix_gate(model_type, pp_size, expected):
+def test_scheduler_aware_adp_dummy_scope(model_type, pp_size, disable_overlap, expected):
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
-    assert should_enable_dsv4_adp_dummy_fixes(model_type, mapping) is expected
+    assert should_enable_scheduler_aware_adp_dummy(model_type, mapping, disable_overlap) is expected
+
+
+@pytest.mark.parametrize(
+    "pp_size,disable_overlap,expected",
+    [
+        (1, True, True),
+        (1, False, False),
+        (2, True, False),
+    ],
+)
+def test_non_overlap_adp_forward_intent_scope(pp_size, disable_overlap, expected):
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+    assert should_enable_non_overlap_adp_forward_intent(mapping, disable_overlap) is expected
 
 
 @pytest.mark.parametrize(

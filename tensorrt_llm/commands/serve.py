@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -51,8 +51,11 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.visual_gen import VisualGen
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+if TYPE_CHECKING:
+    # Type-only: the visual_gen tree is imported lazily inside the VisualGen
+    # code paths so plain LLM serving never pays its import cost.
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -197,6 +200,7 @@ def get_llm_args(
         custom_tokenizer: Optional[str] = None,
         post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
+        generation_config: str = _LLM_ARGS_FIELDS["generation_config"].default,
         max_beam_width: int = _LLM_ARGS_FIELDS["max_beam_width"].default,
         max_batch_size: int = _LLM_ARGS_FIELDS["max_batch_size"].default,
         max_num_tokens: int = _LLM_ARGS_FIELDS["max_num_tokens"].default,
@@ -247,6 +251,8 @@ def get_llm_args(
         model,
         "backend":
         backend,
+        "generation_config":
+        generation_config,
         "tokenizer":
         tokenizer,
         "custom_tokenizer":
@@ -880,7 +886,7 @@ def launch_visual_gen_server(
         host: str,
         port: int,
         model: str,
-        visual_gen_args: Optional[VisualGenArgs] = None,
+        visual_gen_args: Optional["VisualGenArgs"] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
 ):
@@ -898,6 +904,7 @@ def launch_visual_gen_server(
     # races the same port and all but one die EADDRINUSE. VisualGen() on a
     # worker rank never returns (sys.exit in __init__).
     from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    from tensorrt_llm.visual_gen import VisualGen
     ext = _detect_external_launch()
     if ext is not None and ext[0] != 0:
         VisualGen(model=model, args=visual_gen_args)
@@ -987,8 +994,17 @@ def launch_visual_gen_server(
     "--backend",
     type=click.Choice(["pytorch", "_autodeploy"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.",
-    status="beta")
+    help="The backend to use to serve the model. Default is pytorch backend. "
+    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
+    "in a future release; please use the 'pytorch' backend instead.",
+    status="deprecated")
+@stability_option(
+    "--generation-config",
+    type=click.Choice(["auto", "trtllm"]),
+    default=_LLM_ARGS_FIELDS["generation_config"].default,
+    help="Sampling defaults source. 'auto' loads supported values from the "
+    "model's generation_config.json; 'trtllm' uses TRT-LLM defaults.",
+    status="prototype")
 @stability_option("--custom_module_dirs",
                   type=click.Path(exists=True,
                                   readable=True,
@@ -1277,10 +1293,11 @@ def launch_visual_gen_server(
     status="prototype")
 def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tensor_parallel_size: int, pipeline_parallel_size: int,
-          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          log_level: str, backend: str, generation_config: str,
+          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+          max_seq_len: int, tensor_parallel_size: int,
+          pipeline_parallel_size: int, context_parallel_size: int,
+          moe_expert_parallel_size: Optional[int],
           moe_cluster_parallel_size: Optional[int],
           gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
           kv_cache_dtype: str, num_postprocess_workers: int,
@@ -1304,6 +1321,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if backend == "_autodeploy":
+        logger.warning(
+            "The '_autodeploy' backend is deprecated and will be discontinued in a "
+            "future release. No new features or models will be added. Please migrate "
+            "to the 'pytorch' backend. See "
+            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1367,6 +1391,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             custom_tokenizer=custom_tokenizer,
             post_processor_hook=post_processor_hook,
             backend=backend,
+            generation_config=generation_config,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1502,6 +1527,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
+        from tensorrt_llm.visual_gen.args import VisualGenArgs
+
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
                                   if visual_gen_args is not None else None)
 

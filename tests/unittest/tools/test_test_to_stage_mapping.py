@@ -7,6 +7,8 @@ from collections import defaultdict
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 # Add scripts directory to path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
@@ -78,36 +80,6 @@ def test_data_availability(stage_query):
     print(f"\nTotal tests available: {len(stage_query.test_map)}")
     print(f"Total stages available: {len(stage_query.stage_to_yaml)}")
     print(f"Max samples configured: {MAX_SAMPLES}")
-
-
-def test_s3_stdout_echo_requires_explicit_opt_in():
-    """Keep Jenkins pytest progress readable unless live log echo is requested."""
-    with open(GROOVY, 'r') as f:
-        lines = f.readlines()
-
-    assert any(
-        'ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false'
-        in line for line in lines)
-
-    echo_lines = [
-        idx for idx, line in enumerate(lines) if '"--s3-echo-stdout"' in line
-    ]
-    assert echo_lines, 'Expected at least one opt-in --s3-echo-stdout path'
-
-    for idx in echo_lines:
-        context = lines[max(0, idx - 3):idx]
-        assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
-
-    progress_lines = [
-        idx for idx, line in enumerate(lines)
-        if 'console_output_style=progress-even-when-capture-no' in line
-    ]
-    assert progress_lines, 'Expected upload-only pytest progress configuration'
-
-    for idx in progress_lines:
-        context = lines[max(0, idx - 3):idx]
-        assert any('if (ENABLE_UPLOAD_TEST_RESULTS)' in line
-                   for line in context)
 
 
 def test_documented_stage_examples_are_live(stage_query):

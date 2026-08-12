@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -127,11 +128,25 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
-    shutdown();
+    try
+    {
+        shutdown();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR("%s", e.what());
+    }
+}
+
+void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
+{
+    TLLM_CHECK_WITH_INFO(mLivingKvCaches.empty(),
+        "%s with %zu KV cache(s) still open; close them (or drain the engine) first", api, mLivingKvCaches.size());
 }
 
 void KvCacheManager::shutdown()
 {
+    _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
 
@@ -150,20 +165,21 @@ void KvCacheManager::shutdown()
 
 void KvCacheManager::clearReusableBlocks()
 {
+    _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
     mRadixTree->clear();
 }
 
-std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
-    std::vector<TokenIdExt> const& inputTokens, std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb,
-    std::optional<int> expectedPromptLength)
+std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
+    std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
+    std::optional<bool> textOnly)
 {
     if (!priorityCb)
     {
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
     }
 
-    if (!expectedPromptLength.has_value() && !inputTokens.empty())
+    if (!expectedPromptLength.has_value() && inputTokens.size() != 0)
     {
         expectedPromptLength = static_cast<int>(inputTokens.size());
     }
@@ -172,24 +188,24 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
     // hand it to the KvCache, rather than having the cache re-walk the radix tree.
     // Mirrors Python KVCacheManager.allocate() passing a ReuseMatch into _KVCache.
     std::optional<BlockRadixTree::ReuseMatch> reuseMatch;
-    if (!inputTokens.empty())
+    if (inputTokens.size() != 0)
     {
-        reuseMatch = matchReuse(reuseScope, inputTokens);
+        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength);
+        std::move(priorityCb), expectedPromptLength, textOnly);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
-    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const
+    ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
-    return mRadixTree->match(reuseScope, inputTokens, enablePartialMatch());
+    return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch());
 }
 
-int KvCacheManager::probeReuse(ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens) const
+int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
-    return matchReuse(reuseScope, inputTokens).numTokens;
+    return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
 // ---- Memory pool queries --------------------------------------------------

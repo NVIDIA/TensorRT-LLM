@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import os
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
-from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+
+if TYPE_CHECKING:
+    # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
+    # whole visual_gen tree into every LLM serving process.
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message

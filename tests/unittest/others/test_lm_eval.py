@@ -61,6 +61,9 @@ from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ===========================================================================
 # AIME utils — last_boxed_only_string / remove_boxed / is_equiv / strip_string
 # ===========================================================================
@@ -983,20 +986,22 @@ def test_generate_until_invokes_partial_scorer():
 
 
 # ===========================================================================
-# TLLM_EVAL_SPEC_STATS — speculative-decoding AL stats
+# TLLM_EVAL_SPEC_STATS — speculative-decoding AL/AR stats
 # ===========================================================================
 #
-# Only AL (acceptance length) is reported for now; AR needs the
-# request_perf_metrics.speculative_decoding counters, which the TorchSampler
-# used by one-engine spec-dec does not populate (see _log_spec_stats).
-# AL is iteration-weighted (total decoded tokens / total decode iterations)
-# to agree with the repo's canonical definition in
-# ``bench/dataclasses/reporting.py``.
+# AL (acceptance length) is iteration-weighted (total decoded tokens / total
+# decode iterations) to agree with the repo's canonical definition in
+# ``bench/dataclasses/reporting.py``. AR (acceptance rate) is the corpus
+# ratio of accepted to drafted tokens summed over per-request
+# ``request_perf_metrics.speculative_decoding`` counters, which
+# ``_get_sampling_params`` requests via ``return_perf_metrics=True`` when
+# the stats are enabled.
 
 
 def _make_spec_output(
     tokens_per_iter: float | None = None,
     decoding_iter: int | None = 1,
+    accepted_drafted: tuple[int, int] | None = None,
 ) -> MagicMock:
     """Fake RequestOutput with an optional per-request AL sample.
 
@@ -1004,11 +1009,23 @@ def _make_spec_output(
     metrics (non-spec-dec run, or a response that never reported them).
     ``decoding_iter`` is the AL aggregation weight (decode iterations the
     request ran); None models a result that never populated it.
+    ``accepted_drafted`` populates the request_perf_metrics
+    speculative_decoding counters the AR line reads; None models a request
+    without perf metrics (return_perf_metrics off, or dropped).
     """
     output = MagicMock()
     output.avg_decoded_tokens_per_iter = tokens_per_iter
     output.decoding_iter = decoding_iter
-    output.outputs = [MagicMock()]
+    completion = MagicMock()
+    if accepted_drafted is not None:
+        accepted, drafted = accepted_drafted
+        spec_dec = MagicMock()
+        spec_dec.total_accepted_draft_tokens = accepted
+        spec_dec.total_draft_tokens = drafted
+        completion.request_perf_metrics.speculative_decoding = spec_dec
+    else:
+        completion.request_perf_metrics = None
+    output.outputs = [completion]
     return output
 
 
@@ -1115,6 +1132,67 @@ def test_log_spec_stats_silent_on_non_spec_run():
     with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
         wrapper._log_spec_stats(outputs)
     mock_logger.info.assert_not_called()
+
+
+def test_log_spec_stats_reports_corpus_ar():
+    """AR sums accepted/drafted over requests with populated counters."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0, accepted_drafted=(30, 40)),
+        _make_spec_output(tokens_per_iter=2.0, accepted_drafted=(3, 4)),
+        _make_spec_output(tokens_per_iter=2.0),  # no perf metrics
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 2  # AL line + AR line
+    ar_message = mock_logger.info.call_args_list[1][0][0]
+    assert "AR" in ar_message
+    assert "33/44" in ar_message
+    assert "75.0%" in ar_message
+
+
+def test_log_spec_stats_skips_ar_without_drafted_tokens():
+    """Zeroed counters (no drafting) produce no AR line, only AL."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0, accepted_drafted=(0, 0)),
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 1
+    assert "AL" in mock_logger.info.call_args[0][0]
+
+
+def test_log_spec_stats_ar_without_al_samples():
+    """AR still reports when no request exposed avg_decoded_tokens_per_iter."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [_make_spec_output(accepted_drafted=(1, 2))]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 1
+    ar_message = mock_logger.info.call_args[0][0]
+    assert "AR" in ar_message
+    assert "1/2" in ar_message
+
+
+def test_spec_stats_enables_return_perf_metrics(monkeypatch):
+    """TLLM_EVAL_SPEC_STATS=1 opts sampling params into perf metrics (AR)."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.setenv(SPEC_STATS_ENV_VAR, "1")
+    wrapper = _make_lm_eval_wrapper()
+    out = wrapper._get_sampling_params({"max_gen_toks": 32})
+    assert out.return_perf_metrics is True
+
+
+def test_no_spec_stats_leaves_return_perf_metrics_off(monkeypatch):
+    """Without the env var, perf metrics stay off (zero overhead default)."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.delenv(SPEC_STATS_ENV_VAR, raising=False)
+    wrapper = _make_lm_eval_wrapper()
+    out = wrapper._get_sampling_params({"max_gen_toks": 32})
+    assert out.return_perf_metrics is False
 
 
 def test_generate_until_logs_spec_stats_when_enabled(monkeypatch):
