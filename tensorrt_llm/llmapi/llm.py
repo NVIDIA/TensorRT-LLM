@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import atexit
 import json
 import os
@@ -140,18 +155,33 @@ class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
 
     def __init__(self, *, suppress_token_ids: List[int],
                  begin_suppress_token_ids: List[int]) -> None:
-        # Stored as tuples so the device-indexed caches below can be keyed on
-        # device alone: the ids cannot be mutated in place, so a cached index
-        # tensor can never fall out of step with the list it was built from.
-        self.suppress_token_ids = tuple(
+        # Read-only tuples: the device index caches below are keyed on device
+        # alone, which is only sound if the ids they were built from cannot
+        # change. Exposing them through properties with no setter makes both
+        # in-place mutation and rebinding fail loudly instead of silently
+        # leaving the caches masking a stale set of tokens.
+        self._suppress_token_ids = tuple(
             int(t) for t in suppress_token_ids or [])
-        self.begin_suppress_token_ids = tuple(
+        self._begin_suppress_token_ids = tuple(
             int(t) for t in begin_suppress_token_ids or [])
         # req_id -> prompt length while the begin-suppress window is open, then
         # None once it closes. Don't delete the entry: a missing key would be
         # re-captured at the current length, re-arming begin-suppression
         # mid-sequence.
         self._prompt_len_by_req: Dict[int, Optional[int]] = {}
+        self._reset_index_caches()
+
+    @property
+    def suppress_token_ids(self) -> Tuple[int, ...]:
+        """Tokens masked at every generation step."""
+        return self._suppress_token_ids
+
+    @property
+    def begin_suppress_token_ids(self) -> Tuple[int, ...]:
+        """Tokens masked only when sampling the first token after the prompt."""
+        return self._begin_suppress_token_ids
+
+    def _reset_index_caches(self) -> None:
         # Indexing logits with a Python sequence rebuilds a CPU index tensor and
         # blocking-copies it to the device on every call - once per request per
         # decode step - which serializes the decode loop. Cache the index as a
@@ -159,14 +189,33 @@ class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
         self._suppress_idx: Dict[torch.device, torch.Tensor] = {}
         self._begin_suppress_idx: Dict[torch.device, torch.Tensor] = {}
 
+    def __getstate__(self) -> Dict[str, Any]:
+        # The index caches are derived device state, not configuration. This
+        # object is reachable from SamplingParams.logits_processor, which callers
+        # deep-copy per request (evaluate/interface.py), so carrying them along
+        # would give every copy its own device allocation and make a warmed
+        # processor expensive to copy and impossible to unpickle off-device.
+        state = self.__dict__.copy()
+        state.pop("_suppress_idx", None)
+        state.pop("_begin_suppress_idx", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._reset_index_caches()
+
     @staticmethod
     def _cached_index(cache: Dict[torch.device,
                                   torch.Tensor], token_ids: Tuple[int, ...],
                       device: torch.device) -> torch.Tensor:
         index = cache.get(device)
         if index is None:
-            index = torch.tensor(token_ids, dtype=torch.long, device=device)
-            cache[device] = index
+            # setdefault publishes atomically: tensor construction releases the
+            # GIL, so two threads can race here, and the loser must go on to use
+            # the same tensor the winner stored rather than its own copy.
+            index = cache.setdefault(
+                device, torch.tensor(token_ids, dtype=torch.long,
+                                     device=device))
         return index
 
     def __call__(
