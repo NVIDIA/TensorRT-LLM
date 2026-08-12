@@ -291,6 +291,44 @@ def test_autotuner_try_block():
         m //= 2
 
 
+def test_autotuner_do_preparation_try_block():
+    # do_preparation is another backend call outside the per-tactic try block.
+
+    class CrashedPreparationRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False) -> torch.Tensor:
+            if do_preparation:
+                raise Exception(
+                    "For preparation try block test: do_preparation crash happens."
+                )
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [CrashedPreparationRunner()]
+    tuner = AutoTuner.get()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+    with autotune():
+        runner, tactic = tuner.choose_one(
+            "test_autotuner_do_preparation_try_block", runners, tuning_config,
+            [x, w])
+    assert tactic == -1, \
+        f"Expect the fallback tactic -1, but got tactic {tactic}."
+
+
 def test_autotuner_preparation_try_block():
     # inputs_pre_hook and get_valid_tactics run backend code before the
     # per-tactic try block. A throw there used to escape choose_one().

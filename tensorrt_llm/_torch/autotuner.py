@@ -1225,6 +1225,33 @@ class AutoTuner:
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
 
+    def _record_backend_failure(self, custom_op: str, runner: TunableRunner,
+                                profile: OptimizationProfile,
+                                tuning_config: TuningConfig,
+                                input_tensors: List[torch.Tensor], what: str,
+                                exc: Exception, warning_key: str) -> None:
+        """Record a backend failure raised outside the timed profiling loop."""
+        # Clear any pending CUDA error, same reason as #13469.
+        try:
+            torch.cuda.synchronize()
+        except Exception as sync_exc:
+            logger.debug(
+                f"[Autotuner] CUDA cleanup after {what} failure also failed: {sync_exc}"
+            )
+
+        shapes = self._get_input_sizes(input_tensors)
+        logger.warning_once(
+            f"[Autotuner] {what} failed for custom_op={custom_op}, shapes={shapes}. Error: {exc}",
+            key=(custom_op, warning_key),
+        )
+        self.stats.failed_profiling_count[custom_op].add(
+            self.profiling_cache.get_cache_key(
+                custom_op,
+                runner,
+                profile.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False))
+
     def _profile_runners(
         self,
         custom_op: str,
@@ -1266,7 +1293,8 @@ class AutoTuner:
                 # TODO: use FakeTensor here.
                 runner_arg_names = {
                     p.name
-                    for p in inspect.signature(runner.forward).parameters.values()
+                    for p in inspect.signature(
+                        runner.forward).parameters.values()
                 }
                 all_valid_tactics = runner.get_valid_tactics(
                     input_tensors, profile, **kwargs)
@@ -1274,26 +1302,10 @@ class AutoTuner:
                 candidates.append(
                     (runner_id, runner, runner_arg_names, all_valid_tactics))
         except Exception as e:
-            # Same reason as the tactic-profiling handler below (#13469): clear
-            # any pending CUDA error here, or it surfaces later in an unrelated
-            # call.
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-
-            shapes = self._get_input_sizes(input_tensors)
-            logger.warning_once(
-                f"[Autotuner] Failed while preparing profiling candidates for custom_op={custom_op}, shapes={shapes}. Error: {e}",
-                key=(custom_op, "warning_autotuning_preparation_failure"),
-            )
-            self.stats.failed_profiling_count[custom_op].add(
-                self.profiling_cache.get_cache_key(
-                    custom_op,
-                    runners[0],
-                    profile.get_opt_shapes(),
-                    tuning_config,
-                    apply_map_to_tuning_buckets=False))
+            self._record_backend_failure(
+                custom_op, runners[0], profile, tuning_config, input_tensors,
+                "Profiling candidate preparation", e,
+                "warning_autotuning_preparation_failure")
             return None, None, float('inf'), True
 
         # MERGE/PARALLEL strategies rely on comparing per-rank timings to
@@ -1313,9 +1325,12 @@ class AutoTuner:
             runner_id, runner, runner_arg_names, valid_tactics = next(
                 c for c in candidates if len(c[3]) == 1)
             tac = valid_tactics[0]
-            if "do_preparation" in runner_arg_names:
-                runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
             try:
+                if "do_preparation" in runner_arg_names:
+                    runner(input_tensors,
+                           tactic=-1,
+                           do_preparation=True,
+                           **kwargs)
                 with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
                     runner(input_tensors, tactic=tac, **kwargs)
                 best_runner_id, best_tactic = runner_id, tac
@@ -1344,12 +1359,22 @@ class AutoTuner:
                     tuning_config.distributed_tuning_strategy)
                 if "do_preparation" in runner_arg_names and len(
                         valid_tactics) > 0:
-                    runner(
-                        input_tensors,
-                        tactic=-1,
-                        do_preparation=True,
-                        **kwargs,
-                    )
+                    try:
+                        runner(
+                            input_tensors,
+                            tactic=-1,
+                            do_preparation=True,
+                            **kwargs,
+                        )
+                    except Exception as e:
+                        # Skip this runner rather than the whole op; the other
+                        # runners' tactics are still usable.
+                        self._record_backend_failure(
+                            custom_op, runner, profile, tuning_config,
+                            input_tensors, "do_preparation", e,
+                            "warning_autotuning_do_preparation_failure")
+                        has_tuning_failure_occurred = True
+                        continue
 
                 for tac in valid_tactics:
                     try:
