@@ -1004,3 +1004,14 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
   - 跨 quad:quad2 sched med 43,242(其 notrim 臂死于 walltime)——表面 +15.0%,但同臂跨 quad 差 ~10%(43,242 vs 39,247)暴露强节点效应,**该数字不可引用,以同节点 +4.4% 为准**。
 - **判读**:throughput_1k 在"纯 gen 密度 × bs 深度"双高角落**首次转正**——统一律四格闭合(同负载:agg 混合步 −8%→门控 0%,disagg 浅 bs −8.8%,disagg 深 bs **+4.4%**)。幅度低于 poetry(+24.7%)符合预期:本负载 accept 更高(书文续写 2.3-2.6,被裁 token 更贵)且 sched 3 reps 内有爬升(36,965→40,773),更多 reps 可能收敛到更高中位。
 - 方法论注记:sched 臂 rep 间上行趋势 + 双臂 range 有重叠,+4.4% 的置信度为"方向可靠、幅度 ±3pp";加固需 n≥5 双向臂序(节点已到期,列为可选补测)。
+
+## 【08-12 06:00】256 档深 bs disagg 终局:+7.0%/+15.6%(双向同节点配对);v5 全实测表;bs 深度趋势完整
+
+- **v5 表交付**(`align_pro_table_v5.json`,disagg 256 满批 pin 阶梯 + v4 样本合并):θ 实测覆盖 96→1536 token(θ(1536)=106.4ms),α(256)=14.4ms——32/64/128/256 全档无外推。
+- **数字**(4ctx:1gen,OSL1024,client 2048=1×,v5 表,0 fails,同 gen 节点背靠背、两组臂序对调):
+  - quint2(N→S):notrim 38,561 vs sched **44,561 = +15.6%**;
+  - quint1(S→N):sched 45,551 vs notrim 42,574 = **+7.0%**;
+  - sched 跨节点仅差 2%(45.6k/44.6k),notrim 波动较大(38.6k/42.6k,rep 内有爬升)→ 判读 **+7~+16%,中心 ~+11%**。
+  - 实测 gen bs:notrim med 194(p90 236)、sched med 174——sched 排水快在飞更低,收益是在更浅 bs 下拿到的(锁同 bs 只会更高)。
+- **bs 深度趋势(throughput_1k,同代码同负载)**:29-49/rank **−8.8%** → ~116/rank **+4.4%** → ~174-236/rank **+7~+15.6%**——收益随深度单调走强,统一律的 bs 因子完整成像;256 档已接近 poetry 满批量级(+24.7%)。
+- **新坑入册(backlog)**:client 在飞 4096 > router(uvicorn)默认 backlog 2048 → 半数连接挂死、管道爬行(91% 失败,gen 只 40/rank)。128 档 client 恰好 2048 纯属侥幸。修法:client ≤2048,或给 `trtllm-serve disaggregated` 加 backlog 旋钮(上游项)。被污染的 4096 行已在 summary 以 tag 区分(*b = 干净复测)。
