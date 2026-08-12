@@ -35,5 +35,9 @@ quant_config:
 pipeline_config:
   conditioner_offload: never
   conditioner_device: cuda:1
+torch_compile_config:
+  # The FP8 Triton scalar-promotion fix is tracked separately; keep this
+  # shipped config runnable until that fix is present in the base branch.
+  enable: false
 cuda_graph_config:
   enable: false

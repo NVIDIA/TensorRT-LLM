@@ -93,6 +93,10 @@ _TYPE_MAP = {
     "str": (str,),
     "list": (list,),
     "bytes": (bytes,),
+    # A pipeline may accept a string/bytes image reference or a single-item
+    # list/tuple when the public params model cannot express a model-specific
+    # key as a typed field.
+    "image": (str, bytes, list, tuple),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user

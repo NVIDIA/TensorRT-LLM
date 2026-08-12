@@ -21,6 +21,7 @@ modality, and a follower keyframe is cover-cropped rather than stretched.
 """
 
 import os
+from io import BytesIO
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -121,6 +122,69 @@ class TestKeyframeVaeEncode:
 
         # The stub samples all-zero latents, so (0 - 2) / 4 = -0.5.
         torch.testing.assert_close(conditions[0], torch.full_like(conditions[0], -0.5))
+
+
+class TestKeyframeInputContract:
+    def test_load_keyframe_accepts_bytes_and_single_item_list(self):
+        image = Image.new("RGB", (8, 4), (12, 34, 56))
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        payload = buffer.getvalue()
+
+        decoded = MiniMaxH3Pipeline._load_keyframe([payload], "last")
+
+        assert decoded.mode == "RGB"
+        assert decoded.size == image.size
+        assert decoded.getpixel((0, 0)) == image.getpixel((0, 0))
+
+    def test_load_keyframe_rejects_multiple_keyframes(self):
+        with pytest.raises(ValueError, match="single last keyframe"):
+            MiniMaxH3Pipeline._load_keyframe(["a", "b"], "last")
+
+
+class TestFrameRateContract:
+    def test_fixed_frame_rate_accepts_model_rate(self):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline.fps = 24
+
+        pipeline._validate_frame_rate(24.0)
+
+    def test_fixed_frame_rate_rejects_other_rates(self):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline.fps = 24
+
+        with pytest.raises(ValueError, match="fixed 24 fps"):
+            pipeline._validate_frame_rate(30.0)
+
+
+class TestPromptInputContract:
+    def _pipeline(self):
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline.tokenizer = _StubTokenizer()
+        pipeline.processor = SimpleNamespace(
+            image_processor=_StubImageProcessor(),
+            create_mm_token_type_ids=lambda batch: [[0] * len(batch[0])],
+        )
+        pipeline.text_encoder = SimpleNamespace(
+            config=SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=64)),
+            dtype=torch.float32,
+            model=lambda input_ids, **kwargs: SimpleNamespace(
+                hidden_states=[torch.zeros(1, input_ids.shape[1], 8)] * 51
+            ),
+        )
+        pipeline._conditioner_device = None
+        pipeline._conditioner_offloaded = False
+        pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.zeros(1)]))
+        return pipeline
+
+    def test_single_prompt_list_is_unwrapped(self):
+        text_embeds, _ = self._pipeline()._encode_prompt(["a cat"])
+
+        assert text_embeds.shape[-1] == 8
+
+    def test_multiple_prompts_are_rejected(self):
+        with pytest.raises(ValueError, match="got 2 prompts"):
+            self._pipeline()._encode_prompt(["a cat", "a dog"])
 
 
 class _StubTokenizer:

@@ -72,6 +72,24 @@ class TestRegistration:
             "conditioner_device": "",
         }
 
+    def test_request_defaults_and_extra_key_schema_are_declared(self):
+        pipeline = TestConditionerOffloadKnob._pipeline()
+
+        assert pipeline.default_generation_params["frame_rate"] == 24
+        assert pipeline.extra_param_specs["last_image"].type == "image"
+
+    def test_last_image_reference_types_pass_visual_gen_validation(self):
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        pipeline = TestConditionerOffloadKnob._pipeline()
+        for value in (b"png-bytes", [b"png-bytes"], (b"png-bytes",)):
+            params = VisualGenParams(extra_params={"last_image": value})
+            validate_visual_gen_params(
+                params,
+                declared_defaults=pipeline.default_generation_params,
+                extra_param_specs=pipeline.extra_param_specs,
+            )
+
     def test_detected_from_model_index(self, tmp_path):
         (tmp_path / "model_index.json").write_text(
             json.dumps({"_class_name": "MiniMaxH3ModularPipeline"})

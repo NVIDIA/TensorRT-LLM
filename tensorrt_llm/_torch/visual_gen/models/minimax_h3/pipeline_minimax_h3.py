@@ -29,6 +29,7 @@ as-is; only the transformer runs on the TRT-LLM VisualGen stack.
 """
 
 from contextlib import contextmanager
+from io import BytesIO
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -553,9 +554,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         """
         return {
             "last_image": ExtraParamSchema(
-                type="str",
+                type="image",
                 default=None,
-                description="Last keyframe for fl2va end-frame conditioning (MiniMax-H3).",
+                description=(
+                    "Last keyframe for fl2va end-frame conditioning. Accepts a path, URL, "
+                    "data URI, image bytes, or a single-item list/tuple (MiniMax-H3)."
+                ),
             )
         }
 
@@ -711,7 +715,7 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @torch.no_grad()
     def _encode_prompt(
-        self, prompt: str, keyframes: Optional[List[Image.Image]] = None
+        self, prompt: str | List[str], keyframes: Optional[List[Image.Image]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize the prompt and encode it with the Qwen3-VL conditioner.
 
@@ -724,6 +728,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         `(1, num_text_tokens, text_dim)` read after decoder layer
         `text_encoder_layer`.
         """
+        if isinstance(prompt, list):
+            if len(prompt) != 1:
+                raise ValueError(
+                    f"MiniMax-H3 packs one request into one sequence, got {len(prompt)} prompts."
+                )
+            prompt = prompt[0]
         if not isinstance(prompt, str):
             raise ValueError(
                 "MiniMax-H3 packs one request into one sequence, so `prompt` must be a single string, got "
@@ -839,11 +849,10 @@ class MiniMaxH3Pipeline(BasePipeline):
     def _load_keyframe(keyframe, anchor: str) -> Image.Image:
         """Decode one request keyframe to RGB PIL.
 
-        Requests carry keyframes as a path, URL, data URI, or a one-element
-        list of those; a already-decoded ``PIL.Image`` is passed through so
-        in-process callers can hand one over directly. An undecodable
-        reference is the client's fault, so PIL's ``OSError`` becomes a
-        ``ValueError`` rather than surfacing as a server fault.
+        Validated requests carry keyframes as a path, URL, data URI, bytes, or
+        a one-element list/tuple of those. Direct in-process callers may also
+        pass an already-decoded ``PIL.Image``. An undecodable reference is the
+        client's fault, so decode errors become ``ValueError``.
         """
         if isinstance(keyframe, (list, tuple)):
             if len(keyframe) != 1:
@@ -852,12 +861,21 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
             keyframe = keyframe[0]
         try:
+            if isinstance(keyframe, bytes):
+                return Image.open(BytesIO(keyframe)).convert("RGB")
             return load_image(keyframe, format="pil")
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"The {anchor} keyframe could not be decoded; it may be truncated, "
                 f"corrupt, or in an unsupported format: {exc}"
             ) from exc
+
+    def _validate_frame_rate(self, frame_rate: Optional[float]) -> None:
+        """Reject requests that cannot be represented by H3's fixed-rate output."""
+        if frame_rate is not None and frame_rate != self.fps:
+            raise ValueError(
+                f"MiniMax-H3 generates at a fixed {self.fps} fps; got frame_rate={frame_rate}."
+            )
 
     # ------------------------------------------------------------------
     # Inference
@@ -868,6 +886,8 @@ class MiniMaxH3Pipeline(BasePipeline):
     def infer(self, req) -> PipelineOutput:
         params = req.params
         prompt = req.prompt
+
+        self._validate_frame_rate(params.frame_rate)
 
         seed = params.seed if params.seed is not None else 0
         generator = torch.Generator(device=self.device).manual_seed(seed)
