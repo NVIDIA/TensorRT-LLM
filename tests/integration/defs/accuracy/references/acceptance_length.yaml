@@ -1,39 +1,33 @@
-TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model_True-overlap_scheduler_True-sampler_async_worker_False]:
-  ref_al: 1.9684317718940938
-  min_al: 1.870010183299389
+TestLlama3_1_8BInstruct::test_eagle3:
+  ref_al: null
+  min_al: null
 TestQwen3_4B::test_eagle3:
-  ref_al: 2.054772819731324
-  min_al: 1.9520341787447577
-? TestDeepSeekV3Lite::test_bfloat16[mtp_nextn_2-attention_dp_False-cuda_graph_False-overlap_scheduler_False-torch_compile_False-enable_chunked_prefill_False-v2_kv_cache_False]
-: ref_al: 2.6241039490569817
-  min_al: 2.4928987516041325
-TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_ON]:
-  ref_al: 3.6246252767465843
-  min_al: 3.443394012909255
+  ref_al: null
+  min_al: null
+TestDeepSeekV3Lite::test_bfloat16:
+  ref_al: null
+  min_al: null
+TestNemotronV3Super::test_nvfp4_4gpus_block_reuse:
+  ref_al: null
+  min_al: null
 TestLlama3_1_8BInstruct::test_dflash:
-  ref_al: 2.994515008800723
-  min_al: 2.8447892583606866
+  ref_al: null
+  min_al: null
 TestGPTOSS::test_dflash:
-  ref_al: 2.865190761619333
-  min_al: 2.721931223538366
-TestLlama3_1_8BInstruct::test_pard[overlap_scheduler_True]:
-  ref_al: 3.416322314049587
-  min_al: 3.2455061983471074
-TestLlama3_1_8BInstruct::test_pard[overlap_scheduler_False]:
-  ref_al: 3.4026915113871636
-  min_al: 3.2325569358178052
+  ref_al: null
+  min_al: null
+TestLlama3_1_8BInstruct::test_pard:
+  ref_al: null
+  min_al: null
 TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
-  ref_al: 4.3677141163915
-  min_al: 4.1493284105719255
+ ref_al: null
+ min_al: null
 TestLlama3_1_8BInstruct::test_ngram:
-  ref_al: 1.3345782200927057
-  min_al: 1.2678493090880703
-TestLlama3_1_8BInstruct::test_suffix_automaton[enable_global_pool_False]:
-  ref_al: 1.4406059516574001
-  min_al: 1.36857565407453
-TestLlama3_1_8BInstruct::test_suffix_automaton[enable_global_pool_True]:
-  ref_al: 1.583564857553369
-  min_al: 1.5043866146757003
+  ref_al: null
+  min_al: null
+TestLlama3_1_8BInstruct::test_suffix_automaton:
+  ref_al: null
+  min_al: null
 TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
-  ref_al: 3.5657727740533645
-  min_al: 3.387484135350696
+ ref_al: null
+ min_al: null

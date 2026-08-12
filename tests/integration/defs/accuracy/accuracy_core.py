@@ -129,15 +129,18 @@ def assert_acceptance_length(test_key: str, al_value: float) -> None:
     """Assert acceptance length meets the registered minimum.
 
     Reads ``references/acceptance_length.yaml`` and checks
-    ``al_value >= entry["min_al"]``.  Mirrors the TRTLLM_ACCURACY_NO_REFERENCE
-    escape hatch used by AccuracyTask: when the env var is ``"1"`` the check is
-    skipped entirely, which allows baseline-collection runs to complete before
-    reference values have been populated in the YAML.
+    ``al_value >= entry["min_al"]``.
 
     Args:
         test_key: Key in acceptance_length.yaml identifying the test variant,
             e.g. ``"TestLlama3_1_8BInstruct::test_dflash"``.
         al_value: Observed mean acceptance length to check.
+
+    Population:
+        Set ``TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1`` to write the observed
+        value as ``ref_al`` and set ``min_al`` to 95% of it. The YAML key
+        must already exist; add a ``ref_al: null`` / ``min_al: null`` stub
+        when introducing a new test baseline.
 
     Raises:
         KeyError: If test_key is absent from the YAML.
