@@ -45,6 +45,21 @@ public:
     {
     }
 
+    //! \brief Constructor taking an explicit host collective backend.
+    //! \param bufSize The total size of the buffer in bytes.
+    //! \param groupSize The number of ranks in the communication group.
+    //! \param groupRank The rank of the local process within the group.
+    //! \param deviceIdx The CUDA device for buffer allocation.
+    //! \param mnNvlink Flag indicating if multi-node NVLink is used.
+    //! \param groupComm Collective used to exchange the CUDA memory handles.
+    McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t deviceIdx, bool mnNvlink,
+        std::shared_ptr<McastGroupComm> groupComm)
+        : mMcastDeviceMemory(bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm))
+        , mBufSize(bufSize)
+        , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
+    {
+    }
+
     //! \brief Returns a PyTorch tensor view of the unicast buffer portion for a specific rank.
     //! \param rank The target rank for the unicast pointer.
     //! \param sizes The desired shape (dimensions) of the tensor.

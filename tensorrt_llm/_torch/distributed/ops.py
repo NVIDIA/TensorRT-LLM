@@ -28,7 +28,7 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
-from tensorrt_llm._utils import mpi_comm, mpi_disabled
+from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -96,7 +96,11 @@ class _MnnvlWorkspace(TypedDict):
     uc_buffer: torch.Tensor
     buffer_flags: torch.Tensor
     buffer_size_bytes: int
-    mpi_comm: Optional[_MpiCommProtocol]
+    # The TP-group communicator the handles were exchanged over: an mpi4py
+    # communicator under MPI, the TP ProcessGroup under a non-MPI orchestrator
+    # (Ray). None while detached by checkpoint_prepare().
+    mpi_comm: Optional[Union[_MpiCommProtocol,
+                             "torch.distributed.ProcessGroup"]]
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -131,6 +135,77 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+def _get_mnnvl_workspace_comm(mapping: Mapping):
+    """Return the TP-group communicator used to set up an MNNVL workspace.
+
+    Under MPI this is a fresh split of the session communicator keyed on TP rank. Under a non-MPI
+    orchestrator (Ray) there is no MPI communicator, so the TP ProcessGroup from the mapping's
+    device mesh plays the same role.
+    """
+    if mpi_disabled():
+        pg = mapping.tp_group_pg
+        assert pg is not None, "TP ProcessGroup not initialised"
+        return pg
+    return mpi_comm().Split(
+        int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
+        mapping.tp_rank)
+
+
+def _mnnvl_workspace_all_succeeded(comm, succeeded: bool) -> bool:
+    """Whether every rank of the workspace communicator reports ``succeeded``.
+
+    Mirrors the per-phase convergence of the C++ allocation so that all ranks take the same
+    branch after a step that may fail on only some of them.
+    """
+    if mpi_disabled():
+        # MNNVL workspaces are created while models may be under MetaInitMode,
+        # which redirects dispatched ``empty`` calls to the meta device and then
+        # rejects the collective that consumes them. Keep this host-only setup
+        # collective out of the dispatcher: ``full`` is not an init op, and the
+        # group's CPU backend (Ray builds the TP group with ``cuda:nccl,cpu:gloo``)
+        # is called directly rather than through the public c10d operator.
+        flag = torch.full((1, ), int(succeeded), dtype=torch.int32)
+        opts = torch.distributed.AllreduceOptions()
+        opts.reduceOp = torch.distributed.ReduceOp.MIN
+        comm._get_backend(torch.device("cpu")).allreduce([flag], opts).wait()
+        return bool(flag.item())
+    return comm.allreduce(int(succeeded)) == comm.Get_size()
+
+
+def _mnnvl_device_index(mapping: Mapping) -> int:
+    """CUDA device index backing this rank's MNNVL buffers.
+
+    Ray workers pick their device with torch.cuda.set_device() and may run under a remapped
+    CUDA_VISIBLE_DEVICES, so the current device is authoritative there. Under MPI keep using the
+    mapping's local rank.
+    """
+    return torch.cuda.current_device() if mpi_disabled() else mapping.local_rank
+
+
+def _make_mnnvl_mcast_buffer(comm, workspace_size_bytes: int, mapping: Mapping,
+                             use_fabric_handle: bool) -> McastGPUBuffer:
+    """Allocate the multicast workspace, handing C++ whichever communicator flavor we have."""
+    if mpi_disabled():
+        return McastGPUBuffer(
+            workspace_size_bytes,
+            mapping.tp_size,
+            mapping.tp_rank,
+            _mnnvl_device_index(mapping),
+            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+            process_group=comm,
+            pybind11_abi=torch_pybind11_abi(),
+        )
+    # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
+    return McastGPUBuffer(
+        workspace_size_bytes,
+        mapping.tp_size,
+        mapping.tp_rank,
+        _mnnvl_device_index(mapping),
+        use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+        comm.py2f(),  # Fortran handle for the MPI communicator
+    )
+
+
 def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace,
                                          *,
                                          converge_errors: bool = True) -> None:
@@ -157,8 +232,7 @@ def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace,
     if converge_errors:
         comm = workspace["mpi_comm"]
         assert comm is not None
-        success_count = comm.allreduce(int(local_error is None))
-        if success_count != comm.Get_size():
+        if not _mnnvl_workspace_all_succeeded(comm, local_error is None):
             raise RuntimeError(
                 "MNNVL all-reduce protocol reset failed on at least one rank"
             ) from local_error
@@ -198,9 +272,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
         # Creating the workspace if it doesn't exist
         if mapping not in allreduce_mnnvl_workspaces:
             # Do the communicator split if there is no communicator in the workspace
-            comm = mpi_comm().Split(
-                int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
-                mapping.tp_rank)
+            comm = _get_mnnvl_workspace_comm(mapping)
             # Use the predefined buffer size if no buffer size is provided
             buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
@@ -224,16 +296,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
         try:
             # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
             workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-            # Pass the pre-split MPI communicator's Fortran handle to avoid
-            # redundant splitting in C++.
-            mcast_buf_handle = McastGPUBuffer(
-                workspace_size_bytes,
-                mapping.tp_size,
-                mapping.tp_rank,
-                mapping.local_rank,
-                use_fabric_handle,
-                comm.py2f(),
-            )
+            mcast_buf_handle = _make_mnnvl_mcast_buffer(comm,
+                                                        workspace_size_bytes,
+                                                        mapping,
+                                                        use_fabric_handle)
             buffer = mcast_buf_handle.get_uc_buffer(
                 mapping.tp_rank,
                 (workspace_size_bytes // torch.float32.itemsize, ),
@@ -245,7 +311,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
             buffer_flags = torch.tensor(
                 [0] * 9,
                 dtype=torch.uint32,
-                device=torch.device("cuda", mapping.local_rank),
+                device=torch.device("cuda", _mnnvl_device_index(mapping)),
             )
             candidate_workspace = {
                 "handle": mcast_buf_handle,
@@ -257,8 +323,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
         except Exception as error:
             candidate_error = error
 
-        candidate_success_count = comm.allreduce(int(candidate_error is None))
-        if candidate_success_count != comm.Get_size():
+        if not _mnnvl_workspace_all_succeeded(comm, candidate_error is None):
             raise RuntimeError(
                 "MNNVL workspace construction failed on at least one rank"
             ) from candidate_error
@@ -679,17 +744,29 @@ class MNNVLAllReduce(nn.Module):
 
     # Check if MNNVL is supported
     @staticmethod
-    def is_mnnvl(mapping: Mapping, dtype: torch.dtype) -> bool:
+    def is_mnnvl(mapping: Mapping,
+                 dtype: torch.dtype,
+                 explicitly_requested: bool = False) -> bool:
+        """Whether MNNVL AllReduce can and should be used for this mapping.
+
+        Args:
+            explicitly_requested: True when the caller asked for AllReduceStrategy.MNNVL by name
+                rather than letting AUTO decide. AUTO only opts in when the group spans nodes,
+                where MNNVL is the clear win; an explicit request is honoured on a single node too,
+                as long as the hardware supports it.
+        """
         from tensorrt_llm._mnnvl_utils import MnnvlMemory
 
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
         # Add a bypass so that we can run the unittest on single-node
         is_testing = os.environ.get("TLLM_TEST_MNNVL", "0") == "1"
-        return is_testing or (dtype in MNNVLAllReduce.get_supported_dtypes() and
-                              not mapping.has_cp() and mapping.is_multi_node()
-                              and MnnvlMemory.supports_mnnvl()
-                              and is_on_aarch64)
+        if is_testing:
+            return True
+        supported = (dtype in MNNVLAllReduce.get_supported_dtypes()
+                     and not mapping.has_cp() and MnnvlMemory.supports_mnnvl()
+                     and is_on_aarch64)
+        return supported and (explicitly_requested or mapping.is_multi_node())
 
     @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
@@ -944,7 +1021,10 @@ class AllReduce(nn.Module):
             if self.strategy in (AllReduceStrategy.AUTO,
                                  AllReduceStrategy.MNNVL):
                 # Try to initialize MNNVL
-                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+                if MNNVLAllReduce.is_mnnvl(self.mapping,
+                                           dtype,
+                                           explicitly_requested=self.strategy ==
+                                           AllReduceStrategy.MNNVL):
                     # ALWAYS capture the exception when creating this instance
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(
