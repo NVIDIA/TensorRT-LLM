@@ -239,7 +239,10 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                # An empty argument object is falsy but still has to be streamed and
+                # completed, otherwise a zero-argument tool call never finishes and its
+                # text stays in the buffer forever.
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
