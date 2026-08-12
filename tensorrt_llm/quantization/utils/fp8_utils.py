@@ -395,6 +395,8 @@ def _silu_and_mul_post_quant_kernel(
 
     token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
 
+    # Inductor binds Python float scalars as fp64; pin to fp32 so output_s stays
+    # 32-bit for the UE8M0 exponent bitcast below.
     fp8_max = tl.cast(fp8_max, dtype=tl.float32)
     fp8_min = tl.cast(fp8_min, dtype=tl.float32)
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
@@ -573,6 +575,8 @@ def _per_token_quant_and_transform_kernel(
 
     block_num_per_expert = tl.num_programs(1)
 
+    # Inductor binds Python float scalars as fp64; pin to fp32 so output_s stays
+    # 32-bit for the UE8M0 exponent bitcast below.
     fp8_max = tl.cast(fp8_max, dtype=tl.float32)
     fp8_min = tl.cast(fp8_min, dtype=tl.float32)
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)

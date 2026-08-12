@@ -67,6 +67,12 @@ def _masked_index_copy_group_quant_fp8(
     elem_offsets = group_block * group_size * 4 + tl.arange(0, BLOCK)
     output_s_offs = out_s_ptr + group_block * aligned_col
 
+    # Inductor binds Python float scalars as fp64; pin both to fp32 so output_s
+    # stays 32-bit for the UE8M0 exponent bitcast below. eps needs it too
+    # because it feeds _absmax, which propagates into output_s.
+    fp8_max = tl.cast(fp8_max, dtype=tl.float32)
+    eps = tl.cast(eps, dtype=tl.float32)
+
     # process tokens
     for token_index in tl.range(token_block,
                                 num_tokens,
@@ -224,6 +230,12 @@ def _fused_expand_group_quant_fp8(
     num_tokens = tl.load(start_offsets_ptr + row_size)
     elem_offsets = group_block * group_size * 4 + tl.arange(0, BLOCK)
     output_s_offs = out_s_ptr + group_block * aligned_col
+
+    # Inductor binds Python float scalars as fp64; pin both to fp32 so output_s
+    # stays 32-bit for the UE8M0 exponent bitcast below. eps needs it too
+    # because it feeds _absmax, which propagates into output_s.
+    fp8_max = tl.cast(fp8_max, dtype=tl.float32)
+    eps = tl.cast(eps, dtype=tl.float32)
 
     # process tokens
     for token_index in tl.range(token_block,

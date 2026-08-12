@@ -199,3 +199,73 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
             f"{q_mismatch} FP8 byte mismatches, "
             f"{s_mismatch} int32 scale mismatches"
         )
+
+
+@skip_unsupported
+@pytest.mark.parametrize("kernel", ["masked_index_copy", "fused_expand"], ids=lambda k: k)
+def test_group_quant_fp8_under_torch_compile(kernel: str) -> None:
+    """Both group-quant kernels have to survive TorchInductor.
+
+    Inductor binds the host-side Python ``float`` args (``fp8_max``, ``eps``) as
+    fp64 scalars. Unpinned, ``_absmax / fp8_max`` promotes ``output_s`` to
+    float64 and the UE8M0 exponent ``bitcast`` to int32 fails to compile
+    ("Cannot bitcast data-type of size 64 to data-type of size 32"). Both
+    kernels pin the two scalars to fp32.
+
+    Note ``eps`` matters as much as ``fp8_max`` here: it feeds ``_absmax``, which
+    propagates into ``output_s``, so pinning ``fp8_max`` alone still compiles to
+    an fp64 ``output_s``.
+
+    This is a Triton/Inductor codegen behavior, not an architecture one --
+    reproduced on triton 3.7.1 but not triton 3.6.0 on the same GPU -- so the
+    guard only bites on runners carrying the newer toolchain.
+
+    ``fullgraph=True`` keeps a future graph break from turning this into a silent
+    pass that never reaches Inductor.
+    """
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(4321)
+
+    num_rows, hidden, num_experts, top_k = 8, 512, 2, 2
+    num_expanded = num_rows * top_k
+    m_max = _align(num_rows, 128)
+
+    x = torch.randn((num_rows, hidden), device=device, dtype=torch.float32, generator=gen)
+    # Two equally-sized experts over the expanded rows; the maps only have to be
+    # self-consistent for a compile guard, not model-realistic.
+    start_offsets = torch.tensor(
+        [0, num_expanded // 2, num_expanded], device=device, dtype=torch.int64
+    )
+    row_indices = torch.repeat_interleave(
+        torch.arange(num_experts, device=device, dtype=torch.int32), num_expanded // num_experts
+    )
+    perm_to_unperm = torch.arange(num_expanded, device=device, dtype=torch.int32)
+    expanded = x.repeat(top_k, 1)
+
+    def run():
+        out_q, out_s = _alloc_outputs(num_experts, m_max, hidden, device=device)
+        if kernel == "masked_index_copy":
+            masked_index_copy_group_quant_fp8(
+                out_q, out_s, expanded, start_offsets, row_indices, group_size=GROUP_SIZE
+            )
+        else:
+            fused_expand_group_quant_fp8(
+                out_q,
+                out_s,
+                x,
+                perm_to_unperm,
+                start_offsets,
+                row_indices,
+                experts_per_token=top_k,
+                group_size=GROUP_SIZE,
+            )
+        return out_q, out_s
+
+    eager_q, eager_s = run()
+    compiled_q, compiled_s = torch.compile(run, dynamic=True, fullgraph=True)()
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager_q.view(torch.int8), compiled_q.view(torch.int8)), (
+        f"[{kernel}] compiled FP8 output differs from eager"
+    )
+    assert torch.equal(eager_s, compiled_s), f"[{kernel}] compiled int32 scales differ from eager"
