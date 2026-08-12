@@ -12,8 +12,6 @@ l0_b200_visual_gen_multi_nodes:
     wildcards:
       gpu:
       - '*b200*'
-      linux_distribution_name: ubuntu*
-      cpu: x86_64
     terms:
       stage: post_merge
       backend: pytorch
