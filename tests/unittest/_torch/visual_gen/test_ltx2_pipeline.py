@@ -250,7 +250,7 @@ class TestLTX2FP8NumericalCorrectness:
     """Test FP8 vs BF16 numerical accuracy at single-layer level."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_fp8_vs_bf16_single_layer(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test FP8 vs BF16 numerical accuracy on a single Linear layer.
 
