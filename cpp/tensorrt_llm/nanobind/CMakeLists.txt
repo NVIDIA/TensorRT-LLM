@@ -51,6 +51,9 @@ endif()
 # compilation of kvCacheManagerV2.cpp.
 target_include_directories(
   ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+target_include_directories(${TRTLLM_NB_MODULE}
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+add_dependencies(${TRTLLM_NB_MODULE} ${TRTLLM_FMHA_PARAMS_GENERATED_TARGET})
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 

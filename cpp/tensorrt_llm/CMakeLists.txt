@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -21,6 +21,26 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
+
+get_filename_component(TRTLLM_REPO_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+                       ABSOLUTE)
+set(TRTLLM_FMHA_PARAMS_GENERATOR
+    "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
+set(TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(TRTLLM_FMHA_PARAMS_FIELDS_INC
+    "${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR}/tensorrt_llm/thop/fmha_params_fields.inc"
+)
+set(TRTLLM_FMHA_PARAMS_GENERATED_TARGET trtllm_generate_fmha_params)
+add_custom_command(
+  OUTPUT ${TRTLLM_FMHA_PARAMS_FIELDS_INC}
+  COMMAND "${Python3_EXECUTABLE}" "${TRTLLM_FMHA_PARAMS_GENERATOR}" --out-dir
+          "${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR}/tensorrt_llm/thop"
+  DEPENDS "${TRTLLM_FMHA_PARAMS_GENERATOR}"
+  COMMENT "Generating FmhaParams field include"
+  VERBATIM)
+add_custom_target(${TRTLLM_FMHA_PARAMS_GENERATED_TARGET}
+                  DEPENDS ${TRTLLM_FMHA_PARAMS_FIELDS_INC})
 
 set(TARGET_ARCH "unknown")
 

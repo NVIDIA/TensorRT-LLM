@@ -33,69 +33,23 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-/**
- * @brief Attention operation for TensorRT-LLM
- *
- * This function performs multi-head attention computation in-place, supporting both
- * context and generation phases with various optimization features including:
- * - Fused QKV processing
- * - KV cache management
- * - Multiple position embedding types (RoPE, ALiBi, etc.)
- * - Quantization support (FP8, FP4, etc.)
- * - Multi-layer attention (MLA)
- * - Speculative decoding
- */
-void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
-    std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
-    torch::Tensor host_past_key_value_lengths, torch::Tensor host_total_kv_lens, torch::Tensor context_lengths,
-    torch::Tensor host_context_lengths, torch::Tensor host_request_types,
-    std::optional<int64_t> max_context_q_len_override, std::optional<torch::Tensor> kv_cache_block_offsets,
-    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
-    std::optional<torch::Tensor> cache_indirection, std::optional<torch::Tensor> kv_scale_orig_quant,
-    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> out_scale,
-    std::optional<torch::Tensor> rotary_inv_freq, std::optional<torch::Tensor> rotary_cos_sin,
-    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_pe,
-    std::optional<torch::Tensor> block_ids_per_seq, std::optional<torch::Tensor> attention_sinks,
-    bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
-    int64_t const local_layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
-    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
-    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type,
-    int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim,
-    double const rope_base, int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
-    double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
-    bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
-    std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
-    std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
-    std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
-    std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
-    std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
-    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
-    bool const is_spec_decoding_enabled, bool const use_spec_decoding, bool const is_spec_dec_tree,
-    std::optional<torch::Tensor> spec_decoding_generation_lengths,
-    std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
-    std::optional<torch::Tensor> spec_decoding_packed_mask,
-    std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
-    std::optional<torch::Tensor> spec_decoding_bl_tree_mask,
-    std::optional<torch::Tensor> spec_bl_tree_first_sparse_mask_offset_kv,
-    std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
-    std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
-    int64_t const sparse_attn_indices_block_size, std::optional<int64_t> num_sparse_topk,
-    std::optional<torch::Tensor> sparse_attn_kv_lens, std::optional<double> skip_softmax_threshold_scale_factor_prefill,
-    std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
-    std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
-    std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
-    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata = std::nullopt,
-    std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt, int64_t sage_attn_num_elts_per_blk_q = 0,
-    int64_t sage_attn_num_elts_per_blk_k = 0, int64_t sage_attn_num_elts_per_blk_v = 0, bool sage_attn_qk_int8 = false,
-    int64_t num_contexts = 0, int64_t num_ctx_tokens = 0, bool trtllm_gen_jit_warmup = false,
-    std::optional<int64_t> aux_kv_cache_pool_ptr = std::nullopt, bool const is_cross = false,
-    std::optional<torch::Tensor> cross_kv = std::nullopt,
-    std::optional<torch::Tensor> relative_attention_bias = std::nullopt, int64_t relative_attention_max_distance = 0,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens = std::nullopt,
-    std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt, bool enable_dsv4_epilogue_fusion = false,
-    bool const force_prepare_spec_dec_tree_mask = false, std::optional<int64_t> const max_num_sequences = std::nullopt);
+struct FmhaParams
+{
+#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type, py_type, cpp_default, py_default) cpp_type name cpp_default;
+#include "tensorrt_llm/thop/fmha_params_fields.inc"
+#undef TRTLLM_FMHA_PARAM_FIELD
+
+#define TRTLLM_FMHA_PARAM_GETTERS
+#include "tensorrt_llm/thop/fmha_params_fields.inc"
+#undef TRTLLM_FMHA_PARAM_GETTERS
+};
+
+int64_t get_attention_workspace_size(FmhaParams const& params, int64_t num_tokens, int64_t max_attention_window_size,
+    int64_t num_gen_tokens, int64_t max_blocks_per_sequence, int64_t ctx_total_kv_len);
+
+void run_context(FmhaParams const& params);
+void run_generation(FmhaParams const& params);
+void run_mla_generation(FmhaParams const& params);
 
 struct KvCachePoolPointers
 {

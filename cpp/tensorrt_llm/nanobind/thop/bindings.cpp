@@ -26,6 +26,7 @@
 #include <tensorrt_llm/thop/outputTensor.h>
 #include <tensorrt_llm/thop/trtllmGenFusedOps.h>
 #include <torch/extension.h>
+#include <type_traits>
 
 namespace nb = nanobind;
 
@@ -43,6 +44,93 @@ nb::object optionalToObject(std::optional<T> const& value)
         return nb::cast(*value);
     }
     return nb::none();
+}
+
+template <typename T>
+struct OptionalInner
+{
+};
+
+template <typename T>
+struct OptionalInner<std::optional<T>>
+{
+    using Type = T;
+};
+
+template <typename T>
+inline constexpr bool kIsOptional = false;
+
+template <typename T>
+inline constexpr bool kIsOptional<std::optional<T>> = true;
+
+template <typename T>
+nb::object fmhaFieldToObject(T const& value)
+{
+    if constexpr (std::is_enum_v<T>)
+    {
+        return nb::cast(static_cast<int64_t>(static_cast<std::underlying_type_t<T>>(value)));
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::common::QuantMode>)
+    {
+        return nb::cast(static_cast<int64_t>(value.value()));
+    }
+    else
+    {
+        return nb::cast(value);
+    }
+}
+
+template <typename T>
+nb::object fmhaFieldToObject(std::optional<T> const& value)
+{
+    if (value.has_value())
+    {
+        return fmhaFieldToObject(*value);
+    }
+    return nb::none();
+}
+
+template <typename T>
+T castFmhaField(nb::object value)
+{
+    if constexpr (std::is_enum_v<T>)
+    {
+        return static_cast<T>(static_cast<std::underlying_type_t<T>>(nb::cast<int64_t>(value)));
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::common::QuantMode>)
+    {
+        return T(static_cast<typename T::BaseType>(nb::cast<int64_t>(value)));
+    }
+    else
+    {
+        return nb::cast<T>(value);
+    }
+}
+
+template <typename FieldT>
+void bindFmhaParamField(nb::class_<torch_ext::FmhaParams>& cls, char const* name, FieldT torch_ext::FmhaParams::*member)
+{
+    cls.def_prop_rw(
+        name, [member](torch_ext::FmhaParams const& self) { return fmhaFieldToObject(self.*member); },
+        [member](torch_ext::FmhaParams& self, nb::object value)
+        {
+            if constexpr (kIsOptional<FieldT>)
+            {
+                if (value.is_none())
+                {
+                    self.*member = std::nullopt;
+                }
+                else
+                {
+                    using InnerT = typename OptionalInner<FieldT>::Type;
+                    self.*member = castFmhaField<InnerT>(value);
+                }
+            }
+            else
+            {
+                self.*member = castFmhaField<FieldT>(value);
+            }
+        });
 }
 
 nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tensor workspace,
@@ -133,55 +221,23 @@ void initBindings(nb::module_& m)
         m.attr(kv.first) = kv.second;
     }
 
-    m.def("attention", &torch_ext::attention,
-        // Parameters with default values: using std::nullopt for trailing optional arguments (omittable)
-        // and .none() for optional arguments followed by parameters without default values (not omittable).
-        nb::arg("q"), nb::arg("k").none(), nb::arg("v").none(), nb::arg("output"), nb::arg("output_sf").none(),
-        nb::arg("workspace_").none(), nb::arg("sequence_length"), nb::arg("host_past_key_value_lengths"),
-        nb::arg("host_total_kv_lens"), nb::arg("context_lengths"), nb::arg("host_context_lengths"),
-        nb::arg("host_request_types"), nb::arg("max_context_q_len_override").none(),
-        nb::arg("kv_cache_block_offsets").none(), nb::arg("host_kv_cache_pool_pointers").none(),
-        nb::arg("host_kv_cache_pool_mapping").none(), nb::arg("cache_indirection").none(),
-        nb::arg("kv_scale_orig_quant").none(), nb::arg("kv_scale_quant_orig").none(), nb::arg("out_scale").none(),
-        nb::arg("rotary_inv_freq").none(), nb::arg("rotary_cos_sin").none(), nb::arg("latent_cache").none(),
-        nb::arg("q_pe").none(), nb::arg("block_ids_per_seq").none(), nb::arg("attention_sinks").none(),
-        nb::arg("is_fused_qkv"), nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"),
-        nb::arg("local_layer_idx"), nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
-        nb::arg("tokens_per_block").none(), nb::arg("max_num_requests"), nb::arg("max_context_length"),
-        nb::arg("max_seq_len"), nb::arg("attention_window_size"), nb::arg("beam_width"), nb::arg("mask_type"),
-        nb::arg("quant_mode"), nb::arg("q_scaling"), nb::arg("position_embedding_type"), nb::arg("rope_dim"),
-        nb::arg("rope_base"), nb::arg("rope_scale_type"), nb::arg("rope_scale"), nb::arg("rope_short_m_scale"),
-        nb::arg("rope_long_m_scale"), nb::arg("rope_max_positions"), nb::arg("rope_original_max_positions"),
-        nb::arg("use_paged_context_fmha"), nb::arg("attention_input_type").none(), nb::arg("is_mla_enable"),
-        nb::arg("chunked_prefill_buffer_batch_size").none(), nb::arg("q_lora_rank").none(),
-        nb::arg("kv_lora_rank").none(), nb::arg("qk_nope_head_dim").none(), nb::arg("qk_rope_head_dim").none(),
-        nb::arg("v_head_dim").none(), nb::arg("rope_append").none(), nb::arg("mrope_rotary_cos_sin").none(),
-        nb::arg("mrope_position_deltas").none(), nb::arg("helix_position_offsets").none(),
-        nb::arg("helix_is_inactive_rank").none(), nb::arg("attention_chunk_size").none(),
-        nb::arg("softmax_stats_tensor").none(), nb::arg("is_spec_decoding_enabled"), nb::arg("use_spec_decoding"),
-        nb::arg("is_spec_dec_tree"), nb::arg("spec_decoding_generation_lengths").none(),
-        nb::arg("spec_decoding_position_offsets_for_cpp").none(), nb::arg("spec_decoding_packed_mask").none(),
-        nb::arg("spec_decoding_bl_tree_mask_offset").none(), nb::arg("spec_decoding_bl_tree_mask").none(),
-        nb::arg("spec_bl_tree_first_sparse_mask_offset_kv").none(), nb::arg("sparse_kv_indices").none(),
-        nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
-        nb::arg("sparse_attn_offsets").none(), nb::arg("sparse_attn_indices_block_size"),
-        nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_attn_kv_lens") = std::nullopt,
-        nb::arg("skip_softmax_threshold_scale_factor_prefill") = std::nullopt,
-        nb::arg("skip_softmax_threshold_scale_factor_decode") = std::nullopt,
-        nb::arg("skip_softmax_stat") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
-        nb::arg("cu_kv_seqlens") = std::nullopt, nb::arg("fmha_scheduler_counter") = std::nullopt,
-        nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
-        nb::arg("quant_q_buffer") = std::nullopt, nb::arg("flash_mla_tile_scheduler_metadata") = std::nullopt,
-        nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
-        nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
-        nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("aux_kv_cache_pool_ptr") = std::nullopt,
-        nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
-        nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
-        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
-        nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
-        nb::arg("force_prepare_spec_dec_tree_mask") = false, nb::arg("max_num_sequences") = std::nullopt,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+    // ---- Phased attention API ----
+    auto fmhaParams = nb::class_<torch_ext::FmhaParams>(m, "FmhaParams").def(nb::init<>());
+#define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type, py_type, cpp_default, py_default)                                      \
+    bindFmhaParamField(fmhaParams, #name, &torch_ext::FmhaParams::name);
+#include "tensorrt_llm/thop/fmha_params_fields.inc"
+#undef TRTLLM_FMHA_PARAM_FIELD
+
+    m.def("run_context", &torch_ext::run_context, nb::arg("params"), "Phased attention run_context.",
+        nb::call_guard<nb::gil_scoped_release>());
+    m.def("run_generation", &torch_ext::run_generation, nb::arg("params"), "Phased attention run_generation.",
+        nb::call_guard<nb::gil_scoped_release>());
+    m.def("run_mla_generation", &torch_ext::run_mla_generation, nb::arg("params"),
+        "Phased attention run_mla_generation.", nb::call_guard<nb::gil_scoped_release>());
+    m.def("get_attention_workspace_size", &torch_ext::get_attention_workspace_size, nb::arg("params"),
+        nb::arg("num_tokens"), nb::arg("max_attention_window_size"), nb::arg("num_gen_tokens"),
+        nb::arg("max_blocks_per_sequence"), nb::arg("ctx_total_kv_len") = 0,
+        "Max of the context/generation workspace byte requirements for sizing FmhaParams.workspace.");
 
     m.def(
         "get_helix_workspace_size_per_rank",

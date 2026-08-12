@@ -913,9 +913,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             max_kv_len,
             window_left,
         ) = thop.trtllm_gen_context_preprocess(
-            params.qkv_input,  # qkv_input
+            params.qkv_or_q,  # qkv_input
             params.workspace,  # workspace
-            params.sequence_lengths,  # sequence_lengths
+            params.sequence_length,  # sequence_lengths
             params.context_lengths,  # context_lengths
             meta.kv_cache_block_offsets,  # kv_cache_block_offsets
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
@@ -936,7 +936,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.max_attention_window_size,  # max_attention_window_size
             params.cyclic_attention_window_size,  # cyclic_attention_window_size
             params.num_tokens,  # num_tokens
-            params.batch_size,  # batch_size
+            params.num_seqs,  # batch_size
             params.input_seq_length,  # input_seq_length
             params.max_past_kv_length,  # max_past_kv_length
             rope_params.dim,  # rotary_embedding_dim
@@ -983,16 +983,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
+            seq_lens=params.sequence_length,
             max_q_len=max_q_len,
             max_kv_len=max_kv_len,
             bmm1_scale=ctx_bmm1_scale,
             bmm2_scale=ctx_bmm2_scale,
-            batch_size=params.batch_size,
+            batch_size=params.num_seqs,
             cum_seq_lens_q=cu_q_seqlens,
             cum_seq_lens_kv=cu_kv_seqlens,
             window_left=window_left,
-            out=params.context_buf,
+            out=params.output,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
             sinks=fwd.attention_sinks,
@@ -1006,9 +1006,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return
 
         thop.trtllm_gen_context_postprocess(
-            params.qkv_input,  # qkv_input
+            params.qkv_or_q,  # qkv_input
             params.workspace,  # workspace
-            params.sequence_lengths,  # sequence_lengths
+            params.sequence_length,  # sequence_lengths
             params.context_lengths,  # context_lengths
             meta.kv_cache_block_offsets,  # kv_cache_block_offsets
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
@@ -1028,7 +1028,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.max_attention_window_size,  # max_attention_window_size
             params.cyclic_attention_window_size,  # cyclic_attention_window_size
             params.num_tokens,  # num_tokens
-            params.batch_size,  # batch_size
+            params.num_seqs,  # batch_size
             params.input_seq_length,  # input_seq_length
             params.max_past_kv_length,  # max_past_kv_length
             rope_params.dim,  # rotary_embedding_dim
@@ -1070,11 +1070,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             window_left,
             is_multi_token_gen,
         ) = thop.trtllm_gen_generation_preprocess(
-            params.qkv_input,  # qkv_input
+            params.qkv_or_q,  # qkv_input
             params.workspace,  # workspace
-            params.sequence_lengths,  # sequence_lengths
+            params.sequence_length,  # sequence_lengths
             params.spec_decoding_generation_lengths,  # spec_decoding_generation_lengths
-            params.spec_decoding_position_offsets,  # spec_decoding_position_offsets
+            params.spec_decoding_position_offsets_for_cpp,  # spec_decoding_position_offsets
             meta.kv_cache_block_offsets,  # kv_cache_block_offsets
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1139,12 +1139,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_cache=(kv_pool, kv_pool),
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
+            seq_lens=params.sequence_length,
             max_seq_len=max_kv_len,
             bmm1_scale=gen_bmm1_scale,
             bmm2_scale=gen_bmm2_scale,
             window_left=window_left,
-            out=params.context_buf,
+            out=params.output,
             sinks=fwd.attention_sinks,
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
@@ -1178,8 +1178,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * meta.beam_width
-        if params.attention_input is None:
-            raise RuntimeError("MLA generation requires attention_input.")
+        if params.qkv_or_q is None:
+            raise RuntimeError("MLA generation requires qkv_or_q.")
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1193,7 +1193,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.quant_mode,  # kv_cache_quant_mode
             params.seq_offset,  # batch_start
             batch_beam,  # batch_size
-            params.attention_input.dtype,  # dtype
+            params.qkv_or_q.dtype,  # dtype
         )
 
         kv_lora_rank = attn.kv_lora_rank or 0
@@ -1234,9 +1234,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale = bmm1_scale_buffer.flatten()[:1]
             bmm2_scale = bmm2_scale_buffer.flatten()[:1]
         else:
-            query = params.qkv_input.view(
-                batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk
-            )
+            query = params.qkv_or_q.view(batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk)
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
         workspace_buffer = params.workspace.view(-1, 4)
@@ -1249,10 +1247,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_lora_rank,  # kv_lora_rank
             qk_rope_head_dim,  # qk_rope_head_dim
             block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
+            params.sequence_length,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
-            params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
+            params.output.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
             bmm1_scale,  # bmm1_scale
             bmm2_scale,  # bmm2_scale
             fwd.attention_sinks,  # sinks

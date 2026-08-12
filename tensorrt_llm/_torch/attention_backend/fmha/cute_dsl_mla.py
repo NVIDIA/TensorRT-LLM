@@ -412,7 +412,7 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        cache_seqs_base = params.sequence_length.to(torch.int32)
         page_table = page_table_layer[meta.num_contexts :].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
@@ -479,20 +479,20 @@ class CuteDslMlaFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
-        if params.qkv_input is None:
-            raise RuntimeError("CuTe DSL MLA generation requires qkv_input.")
-        if params.context_buf is None:
-            raise RuntimeError("CuTe DSL MLA generation requires context_buf.")
-        if params.sequence_lengths is None:
+        if params.qkv_or_q is None:
+            raise RuntimeError("CuTe DSL MLA generation requires qkv_or_q.")
+        if params.output is None:
+            raise RuntimeError("CuTe DSL MLA generation requires output.")
+        if params.sequence_length is None:
             raise RuntimeError("CuTe DSL MLA generation requires sequence lengths.")
 
-        kernel_dtype = self._get_kernel_dtype(params.attn, params.qkv_input)
+        kernel_dtype = self._get_kernel_dtype(params.attn, params.qkv_or_q)
         if kernel_dtype is None:
             raise RuntimeError("CuTe DSL MLA generation was selected for an unsupported dtype.")
 
         self._run_mla_decode(
-            params.qkv_input,
-            params.context_buf,
+            params.qkv_or_q,
+            params.output,
             params,
             kernel_dtype,
         )
