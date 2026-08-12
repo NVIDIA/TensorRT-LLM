@@ -1244,29 +1244,57 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
-        # If the inputs_pre_hook is provided, it will be called before profiling.
-        if tuning_config.inputs_pre_hook is not None:
-            input_tensors = tuning_config.inputs_pre_hook(input_tensors)
 
-        # Pre-walk the runners so we know the total candidate (runner, tactic)
-        # pair count before deciding whether to short-circuit profiling. The
-        # count is taken BEFORE distributed-strategy splitting; the PARALLEL
-        # strategy can leave a rank with one tactic locally even though the
-        # full set has several, and that case must still go through the
-        # timed profile path so the merge picks a real winner.
-        candidates = []
-        total_pairs = 0
-        for runner_id, runner in enumerate(runners):
-            # TODO: use FakeTensor here.
-            runner_arg_names = {
-                p.name
-                for p in inspect.signature(runner.forward).parameters.values()
-            }
-            all_valid_tactics = runner.get_valid_tactics(
-                input_tensors, profile, **kwargs)
-            total_pairs += len(all_valid_tactics)
-            candidates.append(
-                (runner_id, runner, runner_arg_names, all_valid_tactics))
+        # inputs_pre_hook and get_valid_tactics run backend-supplied code outside
+        # the per-tactic guard below. Treat a failure here like any other
+        # profiling failure rather than letting it abort the process: when every
+        # rank tunes, one abort strands the rest in _maybe_sync_cache_data().
+        try:
+            # If the inputs_pre_hook is provided, it will be called before profiling.
+            if tuning_config.inputs_pre_hook is not None:
+                input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+
+            # Pre-walk the runners so we know the total candidate (runner, tactic)
+            # pair count before deciding whether to short-circuit profiling. The
+            # count is taken BEFORE distributed-strategy splitting; the PARALLEL
+            # strategy can leave a rank with one tactic locally even though the
+            # full set has several, and that case must still go through the
+            # timed profile path so the merge picks a real winner.
+            candidates = []
+            total_pairs = 0
+            for runner_id, runner in enumerate(runners):
+                # TODO: use FakeTensor here.
+                runner_arg_names = {
+                    p.name
+                    for p in inspect.signature(runner.forward).parameters.values()
+                }
+                all_valid_tactics = runner.get_valid_tactics(
+                    input_tensors, profile, **kwargs)
+                total_pairs += len(all_valid_tactics)
+                candidates.append(
+                    (runner_id, runner, runner_arg_names, all_valid_tactics))
+        except Exception as e:
+            # Same reason as the tactic-profiling handler below (#13469): clear
+            # any pending CUDA error here, or it surfaces later in an unrelated
+            # call.
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+            shapes = self._get_input_sizes(input_tensors)
+            logger.warning_once(
+                f"[Autotuner] Failed while preparing profiling candidates for custom_op={custom_op}, shapes={shapes}. Error: {e}",
+                key=(custom_op, "warning_autotuning_preparation_failure"),
+            )
+            self.stats.failed_profiling_count[custom_op].add(
+                self.profiling_cache.get_cache_key(
+                    custom_op,
+                    runners[0],
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False))
+            return None, None, float('inf'), True
 
         # MERGE/PARALLEL strategies rely on comparing per-rank timings to
         # pick the winning tactic across ranks. If a rank's local set of
