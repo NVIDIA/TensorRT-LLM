@@ -267,10 +267,12 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     // request must never throw out of submitTransferRequests — it either runs on bounce or is
     // routed to the standard per-descriptor NIXL path.
     std::uint64_t totalBytes = 0;
+    // BounceTransport may clamp the configured cap further to the buddy allocator's usable capacity.
+    auto const maxChunkSizeBytes = mBounce->transport->maxChunkSizeBytes();
     for (std::size_t i = 0; i < srcs.size(); ++i)
     {
         auto const len = srcs[i].getLen();
-        if (len != dsts[i].getLen() || len > cfg.maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
+        if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
             || dsts[i].getDeviceId() != destinationDeviceId)
         {
             return false;
