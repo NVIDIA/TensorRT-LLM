@@ -1094,10 +1094,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
-                // Stamp the owner tag so L0_ResourceJanitor can reap this SLURM job if
-                // the whole build dies (best-effort; leaves the command untouched if it
-                // cannot inject safely).
-                slurmCommandWithExclusion = addSlurmOwnerComment(slurmCommandWithExclusion, "${SLURM_OWNER_TAG_KEY}=${env.BUILD_URL}")
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 if (slurmExcludeArg) {
                     if (slurmCommandWithExclusion != slurmCommand) {
@@ -1106,6 +1102,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         echo "[INFRA-RETRY] ${stageName}: could not inject ${slurmExcludeArg} into generated SLURM agent command; submitting without node exclusion"
                     }
                 }
+
+                // Stamp the owner tag so L0_ResourceJanitor can reap this SLURM job if
+                // the whole build dies (best-effort; leaves the command untouched if it
+                // cannot inject safely). Applied after the exclude-injection check above
+                // so it does not perturb that comparison.
+                slurmCommandWithExclusion = addSlurmOwnerComment(slurmCommandWithExclusion, "${SLURM_OWNER_TAG_KEY}=${env.BUILD_URL}")
 
                 def slurmSubmitCommand = slurmCommandWithExclusion
                 if (enrootConfigDir) {

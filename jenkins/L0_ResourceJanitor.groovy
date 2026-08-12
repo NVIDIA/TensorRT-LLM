@@ -73,6 +73,31 @@ OWNER_TAG_KEY = "trtllm-ci-owner"
 // SLURM account the CI jobs run under; only this user's jobs are ever considered.
 SLURM_CI_USER = "svc_tensorrt"
 
+// Janitor pod image: must have curl + an ssh client, since it queries the Jenkins
+// API and reaches the SLURM login nodes over ssh (via CloudManager). Reuse a
+// TRT-LLM CI image + its pull secret rather than a bare alpine (no curl/ssh).
+// INFRA-TODO: confirm this image + secret match the SLURM dispatcher pool.
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
+// Owner build URLs come from job comments (attacker-influenceable), so before use
+// they are validated against this Jenkins host allowlist + a conservative charset,
+// AND passed to curl via an environment variable rather than interpolated into the
+// shell -- a crafted comment cannot inject shell code into the janitor pod.
+// INFRA-TODO: confirm the full set of Jenkins hosts (multi-server).
+JENKINS_HOST_ALLOWLIST = ["prod.blsm.nvidia.com"]
+
+// True only for a plain https Jenkins build URL on an allowed host whose path uses
+// a shell-safe charset (no metacharacters). Defense-in-depth over env-var passing.
+@NonCPS
+boolean isAllowedJenkinsBuildUrl(String url) {
+    if (!url) {
+        return false
+    }
+    def m = (url =~ /^https:\/\/([A-Za-z0-9.-]+)\/[A-Za-z0-9._~:\/%-]*$/)
+    return m.matches() && JENKINS_HOST_ALLOWLIST.contains(m.group(1))
+}
+
 def createKubernetesPodConfig()
 {
     // A small CPU pod that can reach the SLURM login nodes. Mirrors the SLURM
@@ -87,17 +112,19 @@ def createKubernetesPodConfig()
             kind: Pod
             spec:
                 qosClass: Guaranteed
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
                 containers:
                   - name: trt-llm
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: ${DOCKER_IMAGE}
                     command: ['cat']
                     tty: true
                     resources:
-                      requests: { cpu: '1', memory: 2Gi, ephemeral-storage: 5Gi }
-                      limits:   { cpu: '1', memory: 2Gi, ephemeral-storage: 5Gi }
+                      requests: { cpu: '1', memory: 2Gi, ephemeral-storage: 25Gi }
+                      limits:   { cpu: '1', memory: 2Gi, ephemeral-storage: 25Gi }
                     imagePullPolicy: Always
                   - name: jnlp
                     image: ${jnlpImage}
@@ -118,22 +145,34 @@ boolean isOwnerBuildRunning(pipeline, String buildUrl) {
     if (!buildUrl) {
         return true
     }
+    if (!isAllowedJenkinsBuildUrl(buildUrl)) {
+        pipeline.echo "[JANITOR] owner tag is not an allowed Jenkins build URL; leaving job (not reaping)."
+        return true   // fail safe -- never reap on an untrusted / garbled owner tag
+    }
     try {
         // credentialsId placeholder -- see INFRA-TODO above.
         return pipeline.withCredentials([pipeline.usernamePassword(
                 credentialsId: 'TOP_1_TOKEN', usernameVariable: 'J_USER', passwordVariable: 'J_TOKEN')]) {
-            def json = pipeline.sh(
-                script: "curl -sf -u \"\${J_USER}:\${J_TOKEN}\" \"${buildUrl}api/json?tree=building\" || true",
-                returnStdout: true).trim()
-            if (!json) {
-                pipeline.echo "[JANITOR] owner-alive check inconclusive for ${buildUrl}; assuming RUNNING (leave)."
-                return true
+            // Pass the (validated) URL via the environment and reference it quoted in
+            // a single-quoted script -- the comment-sourced value is never interpolated
+            // into the shell command text, so it cannot inject even if validation is
+            // ever loosened. Bounded timeouts keep a stalled controller from blocking
+            // the whole serial scan; || true keeps a timeout fail-safe (inconclusive).
+            return pipeline.withEnv(["OWNER_BUILD_URL=${buildUrl}"]) {
+                def json = pipeline.sh(
+                    script: 'curl -sf --connect-timeout 10 --max-time 30 ' +
+                            '-u "${J_USER}:${J_TOKEN}" "${OWNER_BUILD_URL}api/json?tree=building" || true',
+                    returnStdout: true).trim()
+                if (!json) {
+                    pipeline.echo "[JANITOR] owner-alive check inconclusive; assuming RUNNING (leave)."
+                    return true
+                }
+                // Reap only on an explicit building:false.
+                return !(json =~ /"building"\s*:\s*false/)
             }
-            // Reap only on an explicit building:false.
-            return !(json =~ /"building"\s*:\s*false/)
         }
     } catch (Exception e) {
-        pipeline.echo "[JANITOR] owner-alive check failed for ${buildUrl} (${e}); assuming RUNNING (leave)."
+        pipeline.echo "[JANITOR] owner-alive check failed (${e}); assuming RUNNING (leave)."
         return true
     }
 }
@@ -157,8 +196,11 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
         CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
             // %i=jobid, %k=comment, %M=elapsed. -h: no header. Only our CI user.
             // INFRA-TODO: confirm %k carries the full comment on this Slurm version.
+            // No `|| true`: a squeue / controller failure must surface to the
+            // per-cluster handler below (logged as a failed scan) rather than look
+            // like "no jobs" and silently skip reaping.
             def raw = Utils.exec(pipeline,
-                script: Utils.sshUserCmd(remote, "\"squeue -u ${SLURM_CI_USER} -h -o '%i|%k|%M' || true\""),
+                script: Utils.sshUserCmd(remote, "\"squeue -u ${SLURM_CI_USER} -h -o '%i|%k|%M'\""),
                 returnStdout: true).trim()
 
             raw.readLines().each { line ->
@@ -168,6 +210,12 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
                 }
                 summary.scanned++
                 def jobId = parts[0].trim()
+                // jobId is SLURM-sourced (%i), not from the comment, but validate it
+                // before interpolating into scancel.
+                if (!(jobId ==~ /\d+(?:_\d+)?/)) {
+                    pipeline.echo "[JANITOR] ${clusterName}: skipping unexpected job id '${jobId}'."
+                    return
+                }
                 def ownerUrl = parseOwnerBuildUrl(parts[1])
                 def ageMin = parseElapsedMinutes(parts[2])
                 if (!ownerUrl) {
@@ -182,13 +230,20 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
                 summary.orphans++
                 if (dryRun) {
                     pipeline.echo "[JANITOR] DRY_RUN ${clusterName}: would scancel job ${jobId} " +
-                                  "(owner ${ownerUrl} not running, age=${ageMin}m)."
+                                  "(owner not running, age=${ageMin}m)."
                     return
                 }
-                pipeline.echo "[JANITOR] ${clusterName}: reaping orphaned job ${jobId} (owner ${ownerUrl} not running)."
-                Utils.exec(pipeline, script: Utils.sshUserCmd(remote,
-                    "\"scancel ${jobId} || true; sacct -j ${jobId} --format=JobID,State,ExitCode -Pn || true\""))
-                summary.reaped++
+                pipeline.echo "[JANITOR] ${clusterName}: reaping orphaned job ${jobId} (owner not running)."
+                // Confirm the cancel actually succeeded before counting it reaped; a
+                // failed scancel is logged and retried on the next run.
+                def scancelOut = Utils.exec(pipeline, returnStdout: true, script: Utils.sshUserCmd(remote,
+                    "\"scancel ${jobId} && echo JANITOR_SCANCEL_OK || echo JANITOR_SCANCEL_FAIL; " +
+                    "sacct -j ${jobId} --format=JobID,State,ExitCode -Pn || true\""))
+                if (scancelOut?.contains('JANITOR_SCANCEL_OK')) {
+                    summary.reaped++
+                } else {
+                    pipeline.echo "[JANITOR] ${clusterName}: scancel of ${jobId} did not confirm success; will retry next run."
+                }
             }
         }
     } catch (Exception e) {
@@ -253,7 +308,17 @@ pipeline {
                 container("trt-llm") {
                     script {
                         boolean dryRun = params.DRY_RUN
-                        int staleMinutes = (params.STALE_MINUTES ?: '120').toInteger()
+                        int staleMinutes
+                        try {
+                            staleMinutes = (params.STALE_MINUTES ?: '120').toInteger()
+                        } catch (NumberFormatException nfe) {
+                            echo "[JANITOR] invalid STALE_MINUTES='${params.STALE_MINUTES}'; defaulting to 120."
+                            staleMinutes = 120
+                        }
+                        if (staleMinutes < 0) {
+                            echo "[JANITOR] STALE_MINUTES ${staleMinutes} is negative; clamping to 0 (no negative grace)."
+                            staleMinutes = 0
+                        }
                         def summaries = []
 
                         def clusters = SlurmConfig.clusterConfig.findAll { name, cfg ->
