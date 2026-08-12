@@ -1031,11 +1031,15 @@ def forward_sparse_attn(
     def _q_b_layernorm_fused_fp8(
         q_proj: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Rope args leave `q_pe` unwritten, and only `_fused_kv_norm_active` makes
+        # generation skip the un-fused RoPE that would read it. Dropping just the rope
+        # args keeps the standalone q_nope FP8 quant, correct without the fold.
+        coupled = self._fused_kv_norm_active
         return _deepseek_v4_q_b_layernorm_fused_fp8(
             self,
             q_proj,
-            self._fused_q_rope_cos_sin,
-            self._fused_q_rope_specs_cached,
+            self._fused_q_rope_cos_sin if coupled else None,
+            self._fused_q_rope_specs_cached if coupled else None,
         )
 
     def _q_branch():
