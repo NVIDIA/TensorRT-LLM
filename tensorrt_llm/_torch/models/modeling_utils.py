@@ -622,6 +622,27 @@ class DecoderModelForCausalLM(nn.Module,
                                 name.replace('qkv_proj', 'k_proj'),
                                 name.replace('qkv_proj', 'v_proj')
                             ]
+                    elif isinstance(module, (MoE, VanillaMoE)):
+                        # Fused MoE: a checkpoint's ignore list names the
+                        # per-expert weights (re:...experts.[0-9]+.gate_proj),
+                        # but the fused module has no per-expert child, so such
+                        # a rule never matches and those experts get quantized
+                        # despite being bf16 in the checkpoint. Offer
+                        # representative per-expert names, mirroring the Linear
+                        # expansion above.
+                        #
+                        # Strip a trailing ".backend": ConfigurableMoE wraps the
+                        # module that actually owns the weights, and excluding
+                        # only the wrapper does nothing because create_weights()
+                        # delegates to the backend. Without this the backend
+                        # stays quantized and the output is still degenerate.
+                        base = (name[:-len('.backend')]
+                                if name.endswith('.backend') else name)
+                        candidates += [
+                            f'{base}.0.gate_proj',
+                            f'{base}.0.up_proj',
+                            f'{base}.0.down_proj',
+                        ]
                     is_excluded = any(
                         quant_config.is_module_excluded_from_quantization(n)
                         for n in candidates)
