@@ -26,6 +26,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from tensorrt_llm.usage import usage_lib
+from tensorrt_llm.usage.config import UsageContext
 
 pytestmark = pytest.mark.cpu_only
 @pytest.fixture(autouse=True)
@@ -296,8 +297,7 @@ class TestIngressPointReporter:
         mock_thread = MagicMock()
         mock_config = MagicMock()
         mock_config.disabled = False
-        mock_config.usage_context = MagicMock()
-        mock_config.usage_context.value = "cli_serve"
+        mock_config.usage_context = UsageContext.CLI_SERVE
 
         with patch(
             "tensorrt_llm.usage.usage_lib.threading.Thread",
@@ -321,23 +321,19 @@ class TestIngressPointReporter:
             call_args = thread_cls.call_args
             assert call_args.kwargs["args"][2] == ""
 
-    def test_report_usage_context_without_value_falls_back_to_str(
-        self, monkeypatch, enable_telemetry
-    ):
-        """usage_context without .value attribute falls back to str()."""
-        monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
-        usage_lib._NOTIFICATION_SHOWN.set()
+    @pytest.mark.parametrize(
+        "invalid_context",
+        ["plain_string", SimpleNamespace(value="cli_serve"), object()],
+    )
+    def test_arbitrary_usage_context_falls_back(self, invalid_context):
+        """Only enum-backed categorical ingress values reach telemetry."""
+        disabled, usage_context = usage_lib._telemetry_settings(
+            SimpleNamespace(disabled=False, usage_context=invalid_context),
+            default_usage_context=UsageContext.LLM_CLASS.value,
+        )
 
-        mock_thread = MagicMock()
-        mock_config = SimpleNamespace(disabled=False, usage_context="plain_string")
-
-        with patch(
-            "tensorrt_llm.usage.usage_lib.threading.Thread",
-            return_value=mock_thread,
-        ) as thread_cls:
-            usage_lib.report_usage(telemetry_config=mock_config)
-            call_args = thread_cls.call_args
-            assert call_args.kwargs["args"][2] == "plain_string"
+        assert disabled is False
+        assert usage_context == UsageContext.LLM_CLASS.value
 
     def test_report_usage_disabled_via_telemetry_config(self, monkeypatch):
         """report_usage with TelemetryConfig(disabled=True) is a no-op."""
@@ -840,9 +836,11 @@ class TestProcessTelemetrySession:
 
         with patch.object(usage_lib, "_is_reporting_rank", return_value=False):
             assert not usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=1,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
             )
 
         sent = []
@@ -851,9 +849,11 @@ class TestProcessTelemetrySession:
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
         ):
             assert usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=1,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
             )
 
         assert len(sent) == 1
@@ -862,32 +862,41 @@ class TestProcessTelemetrySession:
         """A later shutdown symptom cannot replace the original failure cause."""
         assert usage_lib.start_usage_session()
         usage_lib.record_termination_observation(
-            "worker_failure",
-            "engine_worker",
-            "executor_proxy",
+            usage_lib.TerminalOutcome(
+                termination_kind="worker_failure",
+                component="engine_worker",
+                reporting_source="executor_proxy",
+                exit_code_known=True,
+                exit_code=137,
+                signal_number=9,
+            )
+        )
+        usage_lib.record_termination_observation(
+            usage_lib.TerminalOutcome(
+                termination_kind="signal",
+                component="server",
+            )
+        )
+
+        assert usage_lib.get_termination_observation() == usage_lib.TerminalOutcome(
+            termination_kind="worker_failure",
+            component="engine_worker",
+            reporting_source="executor_proxy",
             exit_code_known=True,
             exit_code=137,
             signal_number=9,
         )
-        usage_lib.record_termination_observation("signal", "server", "self")
-
-        assert usage_lib.get_termination_observation() == {
-            "termination_kind": "worker_failure",
-            "component": "engine_worker",
-            "reporting_source": "executor_proxy",
-            "exit_code_known": True,
-            "exit_code": 137,
-            "signal_number": 9,
-        }
 
     def test_terminal_observer_does_not_create_a_missing_session(self, enable_telemetry):
         """Late observers cannot bypass an earlier opt-out or rank decision."""
         assert not usage_lib.report_exit(
-            exit_code_known=True,
-            exit_code=1,
-            termination_kind="exception",
+            usage_lib.TerminalOutcome(
+                termination_kind="exception",
+                component="server",
+                exit_code_known=True,
+                exit_code=1,
+            ),
             lifecycle_phase="serving",
-            component="server",
         )
         assert usage_lib._SESSION is None
 
@@ -902,13 +911,14 @@ class TestProcessTelemetrySession:
         mock_thread = MagicMock()
         with patch.object(usage_lib.threading, "Thread", return_value=mock_thread) as thread_cls:
             assert usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=130,
-                signal_number=2,
-                termination_kind="signal",
+                usage_lib.TerminalOutcome(
+                    termination_kind="signal",
+                    component="server",
+                    exit_code_known=True,
+                    exit_code=130,
+                    signal_number=2,
+                ),
                 lifecycle_phase="serving",
-                component="server",
-                reporting_source="self",
                 telemetry_config=telemetry_config,
             )
 
@@ -931,11 +941,13 @@ class TestProcessTelemetrySession:
         sent = []
         with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
             assert usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=1,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="disagg_worker",
+                    exit_code_known=True,
+                    exit_code=1,
+                ),
                 lifecycle_phase="model_initialization",
-                component="disagg_worker",
             )
 
         params = sent[0]["events"][0]["parameters"]
@@ -952,9 +964,11 @@ class TestProcessTelemetrySession:
 
         with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
             assert usage_lib.report_exit(
-                exit_code_known=False,
-                exit_code=137,
-                termination_kind="unknown",
+                usage_lib.TerminalOutcome(
+                    termination_kind="unknown",
+                    exit_code_known=False,
+                    exit_code=137,
+                )
             )
 
         params = sent[0]["events"][0]["parameters"]
@@ -970,23 +984,21 @@ class TestProcessTelemetrySession:
 
         with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
             first = usage_lib.report_exit(
-                exit_code_known=False,
-                exit_code=0,
-                signal_number=0,
-                termination_kind="clean",
+                usage_lib.TerminalOutcome(
+                    termination_kind="clean",
+                    component="llm",
+                    exit_code_known=False,
+                ),
                 lifecycle_phase="shutdown",
-                component="llm",
-                reporting_source="self",
                 telemetry_config=telemetry_config,
             )
             second = usage_lib.report_exit(
-                exit_code_known=False,
-                exit_code=0,
-                signal_number=0,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="llm",
+                    exit_code_known=False,
+                ),
                 lifecycle_phase="shutdown",
-                component="llm",
-                reporting_source="self",
                 telemetry_config=telemetry_config,
             )
 
@@ -1001,15 +1013,18 @@ class TestProcessTelemetrySession:
 
         with patch.object(usage_lib.threading, "Thread", side_effect=RuntimeError("no threads")):
             assert usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=1,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
             )
 
         assert not usage_lib.report_exit(
-            exit_code_known=True,
-            exit_code=0,
-            termination_kind="clean",
+            usage_lib.TerminalOutcome(
+                termination_kind="clean",
+                exit_code_known=True,
+            )
         )
 
     def test_terminal_wait_is_bounded(self, monkeypatch, enable_telemetry):
@@ -1026,13 +1041,13 @@ class TestProcessTelemetrySession:
         started = time.monotonic()
         with patch.object(usage_lib, "_send_to_gxt", side_effect=blocking_send):
             assert usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=1,
-                signal_number=0,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="llm",
+                    exit_code_known=True,
+                    exit_code=1,
+                ),
                 lifecycle_phase="model_initialization",
-                component="llm",
-                reporting_source="self",
                 default_usage_context="llm_class",
             )
         elapsed = time.monotonic() - started
@@ -1053,9 +1068,10 @@ class TestProcessTelemetrySession:
             patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
         ):
             assert usage_lib.report_exit(
-                exit_code_known=False,
-                exit_code=0,
-                termination_kind="unknown",
+                usage_lib.TerminalOutcome(
+                    termination_kind="unknown",
+                    exit_code_known=False,
+                )
             )
             thread_cls.assert_not_called()
             assert usage_lib._PENDING_TERMINAL is not None
@@ -1081,13 +1097,13 @@ class TestProcessTelemetrySession:
         def call_report_exit():
             barrier.wait()
             result = usage_lib.report_exit(
-                exit_code_known=True,
-                exit_code=1,
-                signal_number=0,
-                termination_kind="exception",
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="server",
+                    exit_code_known=True,
+                    exit_code=1,
+                ),
                 lifecycle_phase="serving",
-                component="server",
-                reporting_source="self",
                 default_usage_context="cli_serve",
             )
             with sent_lock:

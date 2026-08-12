@@ -32,6 +32,7 @@ from tensorrt_llm.usage import usage_lib as _usage_lib
 TelemetryConfig = _config.TelemetryConfig
 TelemetryField = _config.TelemetryField
 UsageContext = _config.UsageContext
+TerminalOutcome = _usage_lib.TerminalOutcome
 report_usage = _usage_lib.report_usage
 report_exit = _usage_lib.report_exit
 start_usage_session = _usage_lib.start_usage_session
@@ -50,6 +51,7 @@ is_usage_stats_enabled = _usage_lib.is_usage_stats_enabled
 __all__ = [
     "TelemetryConfig",
     "TelemetryField",
+    "TerminalOutcome",
     "UsageContext",
     "get_observed_signal",
     "get_termination_observation",

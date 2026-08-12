@@ -52,10 +52,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
+from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
 from tensorrt_llm.usage.llmapi_config import (
     collect_llm_api_config_payloads as _collect_llm_api_config_payloads,
@@ -73,15 +75,41 @@ _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
 _MAX_HEARTBEATS = 1000
 _TERMINAL_FLUSH_TIMEOUT = 0.5
-_ALLOWED_USAGE_CONTEXTS = {
-    "",
-    "unknown",
-    "llm_class",
-    "cli_serve",
-    "cli_bench",
-    "cli_eval",
-    "disaggregated",
-}
+_ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class TerminalOutcome:
+    """One typed process-boundary or previously observed terminal outcome."""
+
+    termination_kind: schema.TerminationKind
+    component: Optional[schema.TerminationComponent] = None
+    reporting_source: schema.ReportingSource = "self"
+    exit_code_known: Optional[bool] = None
+    exit_code: int = 0
+    signal_number: int = 0
+
+    def with_observation(
+        self, observation: Optional["TerminalOutcome"]
+    ) -> "TerminalOutcome":
+        """Prefer an earlier causal observation over boundary classification."""
+        if observation is None:
+            return self
+        if observation.exit_code_known is None:
+            exit_code_known = self.exit_code_known
+            exit_code = self.exit_code
+        else:
+            exit_code_known = observation.exit_code_known
+            exit_code = observation.exit_code
+        return TerminalOutcome(
+            termination_kind=observation.termination_kind,
+            component=observation.component or self.component,
+            reporting_source=observation.reporting_source,
+            exit_code_known=exit_code_known,
+            exit_code=exit_code,
+            signal_number=observation.signal_number,
+        )
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -663,21 +691,11 @@ def _background_reporter(
             dtype=_clamp_str(trtllm_config.get("dtype") or "", _S),
             quantizationAlgo=_clamp_str(trtllm_config.get("quantization_algo") or "", _S),
             kvCacheDtype=_clamp_str(trtllm_config.get("kv_cache_dtype") or "", _S),
-            # Ingress point
-            ingressPoint=event_snapshot["ingressPoint"],
             # Feature flags
             featuresJson=features_json,
             llmApiConfigJson=llm_api_config_json,
             llmApiConfigMetaJson=llm_api_config_meta_json,
-            # Disaggregated serving
-            disaggRole=event_snapshot["disaggRole"],
-            deploymentId=event_snapshot["deploymentId"],
-            # Aggregate LLM lifecycle counters
-            llmInitializationAttempts=event_snapshot["llmInitializationAttempts"],
-            llmInstancesCreated=event_snapshot["llmInstancesCreated"],
-            activeLlmInstances=event_snapshot["activeLlmInstances"],
-            maxConcurrentLlmInstances=event_snapshot["maxConcurrentLlmInstances"],
-            llmInitializationFailures=event_snapshot["llmInitializationFailures"],
+            **_session_event_fields(event_snapshot),
         )
 
         # --- Send initial report ---
@@ -700,14 +718,7 @@ def _background_reporter(
                 event_snapshot = _event_snapshot(usage_context)
                 heartbeat_event = schema.TrtllmHeartbeat(
                     seq=seq,
-                    ingressPoint=event_snapshot["ingressPoint"],
-                    disaggRole=event_snapshot["disaggRole"],
-                    deploymentId=event_snapshot["deploymentId"],
-                    llmInitializationAttempts=event_snapshot["llmInitializationAttempts"],
-                    llmInstancesCreated=event_snapshot["llmInstancesCreated"],
-                    activeLlmInstances=event_snapshot["activeLlmInstances"],
-                    maxConcurrentLlmInstances=event_snapshot["maxConcurrentLlmInstances"],
-                    llmInitializationFailures=event_snapshot["llmInitializationFailures"],
+                    **_session_event_fields(event_snapshot),
                 )
                 heartbeat_payload = schema.build_gxt_payload(
                     event=heartbeat_event,
@@ -764,12 +775,7 @@ class _TelemetrySession:
         self.component = component
         self.lifecycle_phase = lifecycle_phase
         self.observed_signal = 0
-        self.observed_termination_kind: Optional[schema.TerminationKind] = None
-        self.observed_component: Optional[schema.TerminationComponent] = None
-        self.observed_reporting_source: Optional[schema.ReportingSource] = None
-        self.observed_exit_code_known: Optional[bool] = None
-        self.observed_exit_code = 0
-        self.observed_termination_signal = 0
+        self.observed_outcome: Optional[TerminalOutcome] = None
 
         self.llm_initialization_attempts = 0
         self.llm_instances_created = 0
@@ -888,29 +894,17 @@ class _TelemetrySession:
             if not self.disabled and not self.terminal_reported:
                 self.observed_signal = signal_number
 
-    def record_termination_observation(
-        self,
-        termination_kind: schema.TerminationKind,
-        component: schema.TerminationComponent,
-        reporting_source: schema.ReportingSource,
-        exit_code_known: Optional[bool] = None,
-        exit_code: int = 0,
-        signal_number: int = 0,
-    ) -> None:
+    def record_termination_observation(self, outcome: TerminalOutcome) -> None:
         """Remember a causal classification until the process actually exits."""
         with self.lock:
-            if (
-                self.disabled
-                or self.terminal_reported
-                or self.observed_termination_kind is not None
-            ):
+            if self.disabled or self.terminal_reported or self.observed_outcome is not None:
                 return
-            self.observed_termination_kind = termination_kind
-            self.observed_component = component
-            self.observed_reporting_source = reporting_source
-            self.observed_exit_code_known = exit_code_known
-            self.observed_exit_code = exit_code if exit_code_known else 0
-            self.observed_termination_signal = signal_number
+            self.observed_outcome = outcome
+
+    def get_termination_observation(self) -> Optional[TerminalOutcome]:
+        """Return the first causal terminal observation, if any."""
+        with self.lock:
+            return self.observed_outcome
 
     def _snapshot_unlocked(self) -> dict[str, Any]:
         self._refresh_metadata_unlocked()
@@ -926,12 +920,6 @@ class _TelemetrySession:
             "lifecyclePhase": self.lifecycle_phase,
             "component": self.component,
             "observedSignal": self.observed_signal,
-            "observedTerminationKind": self.observed_termination_kind,
-            "observedComponent": self.observed_component,
-            "observedReportingSource": self.observed_reporting_source,
-            "observedExitCodeKnown": self.observed_exit_code_known,
-            "observedExitCode": self.observed_exit_code,
-            "observedTerminationSignal": self.observed_termination_signal,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -1032,12 +1020,6 @@ def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
         "lifecyclePhase": "unknown",
         "component": "unknown",
         "observedSignal": 0,
-        "observedTerminationKind": None,
-        "observedComponent": None,
-        "observedReportingSource": None,
-        "observedExitCodeKnown": None,
-        "observedExitCode": 0,
-        "observedTerminationSignal": 0,
     }
 
 
@@ -1045,6 +1027,29 @@ def _event_snapshot(usage_context: str = "") -> dict[str, Any]:
     """Return the current session snapshot or schema defaults."""
     session = _get_session()
     return session.snapshot() if session is not None else _empty_event_snapshot(usage_context)
+
+
+def _session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Select correlation and lifecycle counters shared by all events."""
+    return {
+        "ingressPoint": snapshot["ingressPoint"],
+        "disaggRole": snapshot["disaggRole"],
+        "deploymentId": snapshot["deploymentId"],
+        "llmInitializationAttempts": snapshot["llmInitializationAttempts"],
+        "llmInstancesCreated": snapshot["llmInstancesCreated"],
+        "activeLlmInstances": snapshot["activeLlmInstances"],
+        "maxConcurrentLlmInstances": snapshot["maxConcurrentLlmInstances"],
+        "llmInitializationFailures": snapshot["llmInitializationFailures"],
+    }
+
+
+def _validated_usage_context(value: Any) -> str:
+    """Return a bounded ingress category or the unset sentinel."""
+    if isinstance(value, UsageContext):
+        return value.value
+    if isinstance(value, str) and value in _ALLOWED_USAGE_CONTEXTS:
+        return value
+    return ""
 
 
 def _telemetry_settings(
@@ -1073,15 +1078,10 @@ def _telemetry_settings(
         else:
             disabled = True
 
-        if usage_context_value is not None:
-            usage_context = (
-                usage_context_value.value
-                if hasattr(usage_context_value, "value")
-                else str(usage_context_value)
-            )
+        usage_context = _validated_usage_context(usage_context_value)
 
     if usage_context in ("", "unknown"):
-        usage_context = default_usage_context
+        usage_context = _validated_usage_context(default_usage_context)
     return disabled, usage_context
 
 
@@ -1110,18 +1110,16 @@ def _report_process_exit() -> None:
 
         snapshot = session.snapshot()
         signal_number = snapshot["observedSignal"]
-        observed_kind = snapshot["observedTerminationKind"]
-        observed_exit_code_known = snapshot["observedExitCodeKnown"]
+        observation = session.get_termination_observation()
+        outcome = TerminalOutcome(
+            exit_code_known=False,
+            exit_code=0,
+            signal_number=signal_number,
+            termination_kind="signal" if signal_number else "unknown",
+        ).with_observation(observation)
         report_exit(
-            exit_code_known=observed_exit_code_known is True,
-            exit_code=snapshot["observedExitCode"],
-            signal_number=(
-                snapshot["observedTerminationSignal"] if observed_kind else signal_number
-            ),
-            termination_kind=observed_kind or ("signal" if signal_number else "unknown"),
+            outcome,
             lifecycle_phase=None,
-            component=snapshot["observedComponent"],
-            reporting_source=snapshot["observedReportingSource"] or "self",
         )
     except Exception:
         pass
@@ -1181,145 +1179,85 @@ def start_usage_session(
         return False
 
 
+def _session_call(
+    operation: Callable[[_TelemetrySession], _T],
+    default: _T,
+) -> _T:
+    """Call an existing process session without affecting the application."""
+    try:
+        session = _get_session()
+        if session is None:
+            return default
+        return operation(session)
+    except Exception:
+        return default
+
+
 def record_llm_initialization_attempt(
     telemetry_config: Any = None,
     *,
     default_usage_context: str = "llm_class",
 ) -> bool:
     """Start local tracking and record entry into an LLM constructor."""
-    try:
-        if not start_usage_session(
-            telemetry_config,
-            default_usage_context=default_usage_context,
-            component="llm",
-            lifecycle_phase="model_initialization",
-        ):
-            return False
-        session = _get_session()
-        return session.record_llm_initialization_attempt() if session is not None else False
-    except Exception:
+    if not start_usage_session(
+        telemetry_config,
+        default_usage_context=default_usage_context,
+        component="llm",
+        lifecycle_phase="model_initialization",
+    ):
         return False
+    return _session_call(
+        lambda session: session.record_llm_initialization_attempt(),
+        False,
+    )
 
 
 def record_llm_initialization_failure() -> None:
     """Record a handled Python exception from an LLM constructor."""
-    try:
-        session = _get_session()
-        if session is not None:
-            session.record_llm_initialization_failure()
-    except Exception:
-        pass
+    _session_call(lambda session: session.record_llm_initialization_failure(), None)
 
 
 def record_llm_initialized() -> bool:
     """Record one successfully constructed LLM object."""
-    try:
-        session = _get_session()
-        return session.record_llm_initialized() if session is not None else False
-    except Exception:
-        return False
+    return _session_call(lambda session: session.record_llm_initialized(), False)
 
 
 def record_llm_shutdown() -> None:
     """Mark one successfully tracked LLM object inactive."""
-    try:
-        session = _get_session()
-        if session is not None:
-            session.record_llm_shutdown()
-    except Exception:
-        pass
+    _session_call(lambda session: session.record_llm_shutdown(), None)
 
 
 def set_lifecycle_phase(lifecycle_phase: schema.LifecyclePhase) -> None:
     """Update the best-known phase for an outer process boundary."""
-    try:
-        session = _get_session()
-        if session is not None:
-            session.set_lifecycle_phase(lifecycle_phase)
-    except Exception:
-        pass
+    _session_call(lambda session: session.set_lifecycle_phase(lifecycle_phase), None)
 
 
 def set_usage_context(usage_context: str) -> None:
     """Set a known process ingress after command resolution."""
-    try:
-        session = _get_session()
-        if session is not None:
-            session.set_usage_context(usage_context)
-    except Exception:
-        pass
+    _session_call(lambda session: session.set_usage_context(usage_context), None)
 
 
 def record_observed_signal(signal_number: int) -> None:
     """Remember a handled signal without reporting an exit prematurely."""
-    try:
-        session = _get_session()
-        if session is not None:
-            session.record_observed_signal(signal_number)
-    except Exception:
-        pass
+    _session_call(lambda session: session.record_observed_signal(signal_number), None)
 
 
-def record_termination_observation(
-    termination_kind: schema.TerminationKind,
-    component: schema.TerminationComponent,
-    reporting_source: schema.ReportingSource,
-    *,
-    exit_code_known: Optional[bool] = None,
-    exit_code: int = 0,
-    signal_number: int = 0,
-) -> None:
+def record_termination_observation(outcome: TerminalOutcome) -> None:
     """Remember a terminal cause for a surviving authoritative boundary."""
-    try:
-        session = _get_session()
-        if session is not None:
-            session.record_termination_observation(
-                termination_kind,
-                component,
-                reporting_source,
-                exit_code_known,
-                exit_code,
-                signal_number,
-            )
-    except Exception:
-        pass
+    _session_call(lambda session: session.record_termination_observation(outcome), None)
 
 
-def get_termination_observation() -> dict[str, Any]:
+def get_termination_observation() -> Optional[TerminalOutcome]:
     """Return a pending terminal classification, if one was observed."""
-    try:
-        session = _get_session()
-        if session is not None:
-            snapshot = session.snapshot()
-            return {
-                "termination_kind": snapshot["observedTerminationKind"],
-                "component": snapshot["observedComponent"],
-                "reporting_source": snapshot["observedReportingSource"],
-                "exit_code_known": snapshot["observedExitCodeKnown"],
-                "exit_code": snapshot["observedExitCode"],
-                "signal_number": snapshot["observedTerminationSignal"],
-            }
-    except Exception:
-        pass
-    return {
-        "termination_kind": None,
-        "component": None,
-        "reporting_source": None,
-        "exit_code_known": None,
-        "exit_code": 0,
-        "signal_number": 0,
-    }
+    return _session_call(lambda session: session.get_termination_observation(), None)
 
 
 def get_observed_signal() -> int:
     """Return the signal observed by the current process, if any."""
-    try:
-        session = _get_session()
-        if session is not None:
-            return int(session.snapshot()["observedSignal"])
-    except Exception:
-        pass
-    return 0
+    return _session_call(
+        lambda session: int(session.snapshot()["observedSignal"]),
+        0,
+    )
 
 
 def _send_terminal_event(payload: dict, completion: threading.Event) -> None:
@@ -1348,14 +1286,9 @@ def _finish_background_reporter() -> None:
 
 
 def report_exit(
+    outcome: TerminalOutcome,
     *,
-    exit_code_known: bool,
-    exit_code: int,
-    signal_number: int = 0,
-    termination_kind: schema.TerminationKind,
     lifecycle_phase: Optional[schema.LifecyclePhase] = None,
-    component: Optional[schema.TerminationComponent] = None,
-    reporting_source: schema.ReportingSource = "self",
     telemetry_config: Any = None,
     default_usage_context: str = "",
 ) -> bool:
@@ -1390,6 +1323,9 @@ def report_exit(
         claimed = True
         _show_usage_notification()
 
+        exit_code_known = outcome.exit_code_known is True
+        exit_code = outcome.exit_code
+        signal_number = outcome.signal_number
         if not exit_code_known:
             exit_code = 0
         elif not isinstance(exit_code, int) or not 0 <= exit_code <= schema._UINT32_MAX:
@@ -1402,18 +1338,11 @@ def report_exit(
             exitCodeKnown=exit_code_known,
             exitCode=exit_code,
             signalNumber=signal_number,
-            terminationKind=termination_kind,
+            terminationKind=outcome.termination_kind,
             lifecyclePhase=lifecycle_phase or snapshot["lifecyclePhase"],
-            component=component or snapshot["component"],
-            reportingSource=reporting_source,
-            ingressPoint=snapshot["ingressPoint"],
-            disaggRole=snapshot["disaggRole"],
-            deploymentId=snapshot["deploymentId"],
-            llmInitializationAttempts=snapshot["llmInitializationAttempts"],
-            llmInstancesCreated=snapshot["llmInstancesCreated"],
-            activeLlmInstances=snapshot["activeLlmInstances"],
-            maxConcurrentLlmInstances=snapshot["maxConcurrentLlmInstances"],
-            llmInitializationFailures=snapshot["llmInitializationFailures"],
+            component=outcome.component or snapshot["component"],
+            reportingSource=outcome.reporting_source,
+            **_session_event_fields(snapshot),
         )
         payload = schema.build_gxt_payload(
             event=event,

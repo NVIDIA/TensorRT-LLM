@@ -106,7 +106,8 @@ from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import (
     cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
-from tensorrt_llm.usage import record_termination_observation
+from tensorrt_llm.usage import (TerminalOutcome,
+                                record_termination_observation)
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
@@ -254,11 +255,13 @@ def _record_generator_termination(generator) -> None:
     except Exception:
         pass
     record_termination_observation(
-        termination_kind=termination_kind,
-        component=component,
-        reporting_source=reporting_source,
-        exit_code_known=False if termination_kind == "worker_failure" else None,
-    )
+        TerminalOutcome(
+            termination_kind=termination_kind,
+            component=component,
+            reporting_source=reporting_source,
+            exit_code_known=False
+            if termination_kind == "worker_failure" else None,
+        ))
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):

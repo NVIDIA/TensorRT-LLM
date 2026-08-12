@@ -288,7 +288,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `<class 'int'>` | `value` |  |  |
 | `stream_interval` | `<class 'int'>` | `value` |  |  |
 | `telemetry_config.disabled` | `<class 'bool'>` | `value` |  |  |
-| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval` |
+| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `tokenizer_mode` | `Literal['auto', 'slow']` | `categorical` |  | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |

@@ -2174,7 +2174,8 @@
         "llm_class",
         "cli_serve",
         "cli_bench",
-        "cli_eval"
+        "cli_eval",
+        "disaggregated"
       ],
       "annotation": "<enum 'UsageContext'>",
       "converter": "",
