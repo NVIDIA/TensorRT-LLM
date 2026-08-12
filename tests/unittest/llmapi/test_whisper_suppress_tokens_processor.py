@@ -163,21 +163,35 @@ def test_empty_lists_mask_nothing():
 
 
 @cpu_only
-def test_racing_callers_share_one_published_index():
+def test_racing_callers_share_one_published_index(monkeypatch):
     """Threads that race the lazy fill must end up using the same tensor.
 
     Tensor construction releases the GIL, so two threads can both miss the
     cache; publication via setdefault means the loser goes on to use the entry
     the winner stored rather than masking through a private duplicate.
+
+    The rendezvous is inside the tensor factory, not before the call: a barrier
+    placed ahead of ``_cached_index`` lets one thread publish before the other
+    even looks, which a plain check-then-assign implementation also survives.
+    Blocking both threads mid-construction is what forces two misses and makes
+    this sensitive to how the result is published.
     """
     proc = _make(suppress=(3, 5), begin=())
     cache = proc._suppress_idx
     device = torch.zeros(1).device
-    start = threading.Barrier(2)
+    both_missed = threading.Barrier(2, timeout=30)
+    real_tensor = torch.tensor
+    builds = []
+
+    def rendezvous_tensor(*args, **kwargs):
+        builds.append(None)
+        both_missed.wait()
+        return real_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", rendezvous_tensor)
     seen = []
 
     def fill():
-        start.wait()
         seen.append(proc._cached_index(cache, proc.suppress_token_ids, device))
 
     threads = [threading.Thread(target=fill) for _ in range(2)]
@@ -186,6 +200,9 @@ def test_racing_callers_share_one_published_index():
     for t in threads:
         t.join()
 
+    # Both raced into the factory, so this really is the contended path...
+    assert len(builds) == 2
+    # ...and both callers must come out holding the single published tensor.
     assert len(cache) == 1
     assert seen[0] is seen[1]
     assert seen[0] is cache[device]
