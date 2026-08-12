@@ -978,3 +978,12 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **反证数据点:我方分支 HEAD 的 disagg gen 提交路径是通的**——08-11 上午 osl1kb 轮,gen 完整消费 ctx 交接并产出 1024-token 完成(每 rep ~1.04M token,fails=0,KV util 正常起落)。你的症状(verify+draft 真执行、active 恒 64/512、零完成、KV 平线)在我方全分支历史中未出现过。
 - 我方近期 commit 无有意改动 disagg gen 首步提交/接受路径(门控补丁只在 planner phase-1 加 decline)。你的 base 是 `faf2c60935`+28 文件 overlay——**怀疑点排序:overlay 组合(部分文件新、部分旧的 Franken 树)> sqsh 基底 > 分支本体**;D1 判别(旧镜像无 overlay)正是对的刀口。若 D1 通,建议直接换"全量 mount 我们分支 HEAD"复跑,跳过 28 文件二分。
 - 我方 deep 战役(3ctx:1gen,OSL1024,今晚)同路径在跑,出数即再添一个分支 HEAD 的通/不通数据点。
+
+## 【08-12 02:00】深 bs disagg 终局(throughput_1k,3ctx:1gen,OSL1024,v4 表):统一律最后一格点亮,+4.4%(同节点配对)
+
+- **设计**:3 ctx(tp8)喂 1 gen(DEP8),OSL=1024 拉长寿命(稳态 gen bs 中位 116/rank,120-128 区间大量出现,吞吐为 1:1 disagg 的 10 倍),client 2048(2× 超发),两 quad 臂序对调,五件套 env,v4 实测表。
+- **数字**(稳态 3 reps,0 fails):
+  - 同节点配对(gen 749968,N→S):notrim med 37,588 vs sched med 39,247 = **+4.4%**;
+  - 跨 quad:quad2 sched med 43,242(其 notrim 臂死于 walltime)——表面 +15.0%,但同臂跨 quad 差 ~10%(43,242 vs 39,247)暴露强节点效应,**该数字不可引用,以同节点 +4.4% 为准**。
+- **判读**:throughput_1k 在"纯 gen 密度 × bs 深度"双高角落**首次转正**——统一律四格闭合(同负载:agg 混合步 −8%→门控 0%,disagg 浅 bs −8.8%,disagg 深 bs **+4.4%**)。幅度低于 poetry(+24.7%)符合预期:本负载 accept 更高(书文续写 2.3-2.6,被裁 token 更贵)且 sched 3 reps 内有爬升(36,965→40,773),更多 reps 可能收敛到更高中位。
+- 方法论注记:sched 臂 rep 间上行趋势 + 双臂 range 有重叠,+4.4% 的置信度为"方向可靠、幅度 ±3pp";加固需 n≥5 双向臂序(节点已到期,列为可选补测)。
