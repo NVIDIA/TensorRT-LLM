@@ -1,3 +1,4 @@
+Wrapper: `DGX_B200-PyTorch-2/test_unittests.py::test_unittests_v2[unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py] SKIP (bug pending, tracked in PR 17524)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2] SKIP (https://nvbugs/6567057)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/6427411)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/6428069)
