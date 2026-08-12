@@ -21,6 +21,8 @@ from typing import NoReturn
 
 from defs.conftest import tests_path
 
+_MAX_CULPRITS = 20
+
 
 def merge_report(base_file, extra_file, output_file, is_retry=False):
     import xml.etree.ElementTree as ElementTree
@@ -128,7 +130,11 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
     except (OSError, UnicodeDecodeError):
         pass
     if culprits:
-        reason += "; culprit test(s): " + ", ".join(culprits)
+        displayed_culprits = ", ".join(culprits[:_MAX_CULPRITS])
+        omitted_culprits = len(culprits) - _MAX_CULPRITS
+        if omitted_culprits > 0:
+            displayed_culprits += f" (+{omitted_culprits} more)"
+        reason += "; culprit test(s): " + displayed_culprits
     raise AssertionError(reason)
 
 

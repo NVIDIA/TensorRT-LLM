@@ -158,3 +158,13 @@ def test_fail_unittests_normalizes_test_selector_to_its_case_path(tmp_path: Path
     assert "IN-FLIGHT unittest/foo/test_target.py::test_other" in message
     assert "test_target.pyx" not in message
     assert "unittest/other" not in message
+
+
+def test_fail_unittests_caps_culprit_list(tmp_path: Path) -> None:
+    nodeids = [f"unittest/foo/test_{index}.py::test_case" for index in range(22)]
+
+    message = _unfinished_failure(tmp_path, "unittest/foo", nodeids)
+
+    assert "IN-FLIGHT unittest/foo/test_19.py::test_case" in message
+    assert "IN-FLIGHT unittest/foo/test_20.py::test_case" not in message
+    assert message.endswith("(+2 more)")
