@@ -60,6 +60,14 @@ def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
     with LLM(model=f"{llm_models_root()}/{model_path}",
              max_batch_size=8,
              max_seq_len=4224) as llm:
+        prompt = llm.tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": prompt
+            }],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         outputs = llm.generate([prompt], sampling_params=sampling_params)
 
     completions = outputs[0].outputs
