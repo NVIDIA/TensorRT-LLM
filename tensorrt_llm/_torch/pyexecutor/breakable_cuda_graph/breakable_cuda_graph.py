@@ -251,7 +251,11 @@ class BreakableCUDAGraphCapture:
         self._capture_token = _current_capture.set(self)
         self._stream_token = _current_stream.set(self._stream or torch.cuda.current_stream())
         self._forked_token = _forked_streams.set(set())
-        self._begin_new_segment()
+        try:
+            self._begin_new_segment()
+        except Exception:
+            _uninstall_wait_stream_hook()
+            raise
         return self
 
     def __exit__(self, *args: object) -> bool:

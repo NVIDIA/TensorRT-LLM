@@ -108,6 +108,7 @@ class BreakableCUDAGraphRunner:
                 graph.reset()
             if created_memory_pool and not self._graphs:
                 self._memory_pool = None
+                self._shared_output = None
             raise
         finally:
             self._active_graph = None
