@@ -95,8 +95,10 @@ runTestsArgs=(
     --working-dir "$llmSrcNode/tests/integration/defs"
     --fail-signatures "${failSignaturesList:-}"
     --max-rerun-tests 5
-    ${testDurationsPath:+--durations-path "$testDurationsPath"}
 )
+if [ -n "${testDurationsPath:-}" ]; then
+    runTestsArgs+=(--durations-path "$testDurationsPath")
+fi
 if [ "$perfMode" = "true" ]; then
     runTestsArgs+=(--perf-mode)
 fi
@@ -113,6 +115,8 @@ else
 fi
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} run_tests.py finished execution with exit code $pytest_exit_code"
+python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+    --drain-spool "$jobWorkspace" || true
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.

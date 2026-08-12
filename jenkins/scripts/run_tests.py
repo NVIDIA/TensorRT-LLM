@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -170,7 +170,7 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode, durati
         if result.stderr:
             print(f"pytest --collect-only stderr:\n{result.stderr}")
 
-        if result.returncode != 0 and not output:
+        if result.returncode != 0:
             print(f"Error: pytest --collect-only failed with exit code {result.returncode}")
             print(f"stderr: {result.stderr}")
             sys.exit(1)
@@ -313,7 +313,7 @@ def print_xml_failure_summary(xml_path, tail_lines=None):
         return
     try:
         root = ET.parse(xml_path).getroot()
-    except ET.ParseError as exc:
+    except (OSError, ET.ParseError) as exc:
         print(f"  [Could not parse result XML: {exc}]")
         return
 
@@ -490,7 +490,7 @@ def check_and_rerun(
         unfinished_test_file,
     )
 
-    # Step 2: Count total failed tests
+    # Step 2: Count total failed tests and enforce the cap
     valid_count = 0
     for times in [1, 2]:
         rerun_file = os.path.join(rerun_dir, f"rerun_{times}.txt")
@@ -499,6 +499,13 @@ def check_and_rerun(
             count = len(lines)
             print(f"Found {count} {rerun_tag} tests to rerun {times} time(s)")
             valid_count += count
+
+    if valid_count > max_rerun_tests:
+        print(
+            f"Too many {rerun_tag} tests to rerun ({valid_count} > max_rerun_tests={max_rerun_tests}). "
+            "Skipping rerun."
+        )
+        return False
 
     # Step 3: Execute reruns
     is_rerun_failed = False

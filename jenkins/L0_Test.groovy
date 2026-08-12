@@ -1535,7 +1535,7 @@ def getPytestBaseCommandLine(
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
-    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
+    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr=\"${unittestMarkExpr}\""]
     if (ENABLE_UPLOAD_TEST_RESULTS) {
         testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
@@ -4533,23 +4533,32 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
                 // Use unified run_tests.py for render + regular + isolated + rerun + merge
-                sh """
-                    rm -rf ${stageName}/ && \
-                    cd ${llmSrc}/tests/integration/defs && \
-                    python3 ${llmSrc}/jenkins/scripts/run_tests.py \
-                        --render \
-                        --test-db-list ${testDBList} \
-                        --splits ${splits} \
-                        --group ${splitId} \
-                        ${perfMode ? '--perf-mode' : ''} \
-                        --pytest-base-cmd '${pytestCommand.join(" ")}' \
-                        --stage-name ${stageName} \
-                        --output-dir ${WORKSPACE}/${stageName} \
-                        --working-dir ${llmSrc}/tests/integration/defs \
-                        --fail-signatures '${failSignaturesList}' \
-                        --max-rerun-tests 5 \
-                        ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
-                """
+                try {
+                    sh """
+                        rm -rf ${stageName}/ && \
+                        cd ${llmSrc}/tests/integration/defs && \
+                        python3 ${llmSrc}/jenkins/scripts/run_tests.py \
+                            --render \
+                            --test-db-list ${testDBList} \
+                            --splits ${splits} \
+                            --group ${splitId} \
+                            ${perfMode ? '--perf-mode' : ''} \
+                            --pytest-base-cmd '${pytestCommand.join(" ")}' \
+                            --stage-name ${stageName} \
+                            --output-dir ${WORKSPACE}/${stageName} \
+                            --working-dir ${llmSrc}/tests/integration/defs \
+                            --fail-signatures '${failSignaturesList}' \
+                            --max-rerun-tests 5 \
+                            ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
+                    """
+                } finally {
+                    if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
+                        sh """
+                            python3 ${llmSrc}/tests/test_common/s3_output.py \
+                                --drain-spool "${WORKSPACE}/${stageName}" || true
+                        """
+                    }
+                }
             }
 
             // CBTS coverage liveness signal: log this stage's touch counts (no artifacts); never fails the stage (|| true).
