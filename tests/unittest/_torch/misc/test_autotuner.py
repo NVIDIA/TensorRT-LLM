@@ -291,6 +291,68 @@ def test_autotuner_try_block():
         m //= 2
 
 
+def test_autotuner_preparation_try_block():
+    # inputs_pre_hook and get_valid_tactics run backend code before the
+    # per-tactic try block. A throw there used to escape choose_one().
+
+    class CrashedPreHookRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    def crashed_pre_hook(inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        raise Exception(
+            "For preparation try block test: inputs_pre_hook crash happens.")
+
+    class CrashedTacticsRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            raise Exception(
+                "For preparation try block test: get_valid_tactics crash happens."
+            )
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    tuner = AutoTuner.get()
+    dynamic_tensor_specs = (DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), )
+
+    for name, runners, tuning_config in (
+        ("test_autotuner_pre_hook_crash", [CrashedPreHookRunner()],
+         TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
+                      inputs_pre_hook=crashed_pre_hook)),
+        ("test_autotuner_get_valid_tactics_crash", [CrashedTacticsRunner()],
+         TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs)),
+    ):
+        with autotune():
+            runner, tactic = tuner.choose_one(name, runners, tuning_config,
+                                              [x, w])
+        assert tactic == -1, \
+            f"{name}: expect the fallback tactic -1, but got tactic {tactic}."
+        assert runner is runners[0], \
+            f"{name}: expect the fallback runner, but got {runner}."
+
+
 @torch.library.custom_op("autotuner_test::recursive_get_best_gemm_tactic",
                          mutates_args=())
 def recursive_get_best_gemm_tactic(x: torch.Tensor, w1: torch.Tensor,
