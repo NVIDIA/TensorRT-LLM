@@ -227,7 +227,7 @@ def submit_source_code_licenses(
                 "s_bdsa": "N/A",
                 "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
-                "s_component_type": component.get("type"),
+                "s_package_type": component.get("type"),
                 "s_ticket_url": triaged_deps.get(package_name, ""),
             }
             if not is_preapproved(map_preapproved, package_name, "pypi"):
