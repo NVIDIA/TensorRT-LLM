@@ -109,7 +109,7 @@ With `--build_root <dir>` set, the following default under `<dir>` instead of th
 
 Conan's `cpp/CMakeUserPresets.json` convenience file is also skipped in this mode, since it would reference the (possibly ephemeral) out-of-tree build directory.
 
-Only final artifacts are still written into the checkout: `tensorrt_llm/libs`, `tensorrt_llm/include`, Python bindings and stubs, generated FMHA kernel sources, and the `.whl` output directory (`--dist_dir`).
+Only final artifacts are still written into the checkout: `tensorrt_llm/libs`, `tensorrt_llm/include`, Python bindings and stubs, generated FMHA kernel sources, the configured `cpp/include/tensorrt_llm/executor/version.h`, and the `.whl` output directory (`--dist_dir`).
 
 Related knobs for shared-storage workflows:
 
