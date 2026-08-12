@@ -58,9 +58,15 @@ UCX_ENV_RULES = [
         "export UCX_NET_DEVICES="
         "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1",
     ),
-    # aws-cmh: UCX transport auto-selection hangs on this fabric; pin the
-    # working transport set explicitly.
-    ("aws-cmh*", "*", "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp"),
+    # aws-cmh: UCX transport and network-device auto-selection hangs on this
+    # fabric; pin the working transport set and devices explicitly.
+    (
+        "aws-cmh*",
+        "*",
+        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp "
+        "UCX_NET_DEVICES=eth0,mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,"
+        "mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1",
+    ),
     # aws-dfw: gdr_copy is broken on this cluster; exclude it.
     ("aws-dfw*", "*", "export UCX_TLS=^gdr_copy"),
     # Default: base unset only.
