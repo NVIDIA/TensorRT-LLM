@@ -1421,7 +1421,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
         kv_cache_config = kwargs.get("kv_cache_config")
-        use_fp8_ds_mla = kv_cache_config is not None and kv_cache_config.dtype == "fp8_ds_mla"
+        use_fp8_ds_mla = (
+            kv_cache_config is not None
+            and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+        )
         non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
             head_dim,
             index_head_dim,

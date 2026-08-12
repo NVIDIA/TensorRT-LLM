@@ -98,6 +98,18 @@ def test_fp8_ds_mla_layout_resolves_shared_inline_scale_module():
     assert storage_head_dim == 328
 
 
+def test_fp8_ds_mla_layout_treats_binding_config_as_auto():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        BindingKvCacheConfig(),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is False
+    assert storage_head_dim == 576
+
+
 def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     sparse_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=[1, 4, 128],

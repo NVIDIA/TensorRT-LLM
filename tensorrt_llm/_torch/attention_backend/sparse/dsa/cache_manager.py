@@ -45,7 +45,10 @@ def _resolve_fp8_ds_mla_head_dim(
     dtype: DataType,
 ) -> Tuple[bool, int]:
     """Validate and lower the inline-scale cache layout to storage elements."""
-    use_fp8_ds_mla = kv_cache_config.dtype == "fp8_ds_mla"
+    # The Python LLM API config owns ``dtype``; direct cache-manager users and
+    # older fixtures may still pass the mirrored pybind config, which does not
+    # expose Python-only fields.
+    use_fp8_ds_mla = getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
     if not use_fp8_ds_mla:
         return False, head_dim
 
@@ -293,7 +296,10 @@ class DSACacheManager(KVCacheManager):
             model_config, mapping, num_layers
         )
         kv_cache_config = kwargs.get("kv_cache_config")
-        if kv_cache_config is not None and kv_cache_config.dtype == "fp8_ds_mla":
+        if (
+            kv_cache_config is not None
+            and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+        ):
             from ..inline_scale_kv import TOKEN_BYTES
 
             mem_per_token = num_attention_layers * TOKEN_BYTES

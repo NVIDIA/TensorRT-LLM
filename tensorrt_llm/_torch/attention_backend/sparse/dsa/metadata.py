@@ -149,7 +149,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "DSAtrtllmAttentionMetadata requires DSACacheManager-compatible "
                 f"cache manager, got {type(self.kv_cache_manager)}"
             )
-        self.use_fp8_ds_mla = self.kv_cache_manager.use_fp8_ds_mla
+        self.use_fp8_ds_mla = getattr(self.kv_cache_manager, "use_fp8_ds_mla", False)
 
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):

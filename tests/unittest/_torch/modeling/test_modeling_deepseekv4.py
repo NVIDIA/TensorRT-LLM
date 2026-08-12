@@ -879,6 +879,12 @@ def test_deepseek_v4_sanity(
     binding_dtype: tensorrt_llm.bindings.DataType,
 ) -> None:
     config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
+    if kv_cache_dtype == "fp8_ds_mla":
+        # Sparse MLA coverage does not depend on the MoE intermediate width.
+        # Preserve 256 experts because the real routing kernel requires that
+        # topology, but keep its weights small enough for an RTX Pro 6000D.
+        config_dict["moe_intermediate_size"] = 128
+        config_dict["vocab_size"] = 1024
     config = DeepseekV4Config(**config_dict)
     config.dtype = torch.bfloat16
     config.mapping = Mapping(world_size=1, tp_size=1, rank=0)
