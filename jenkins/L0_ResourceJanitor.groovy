@@ -197,7 +197,7 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
     return summary
 }
 
-// Approximate SLURM elapsed "[[D-]HH:]MM:SS" -> minutes, or null if unparseable.
+// Approximate SLURM elapsed "[[D-]HH:]MM:SS" -> minutes, or null if unparsable.
 @NonCPS
 Integer parseElapsedMinutes(String elapsed) {
     if (!elapsed?.trim()) {
