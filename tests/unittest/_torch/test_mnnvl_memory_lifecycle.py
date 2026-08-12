@@ -161,6 +161,49 @@ def test_checkpoint_restore_failure_is_terminal_and_fails_closed(memory, monkeyp
         obj.checkpoint_restore(_FakeComm())
 
 
+def test_failed_frontend_restore_releases_unpublished_handles(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(return_value=[33, 44]),
+    )
+
+    assert obj.checkpoint_restore(_FakeComm())
+    obj._checkpoint_restore_failed()
+
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    assert record.mem_handles == [None, None]
+    assert record.pending_comm is None
+    assert [call.args[0] for call in mnnvl.cuda.cuMemUnmap.call_args_list[-2:]] == [1032, 1288]
+    assert [call.args[0] for call in mnnvl.cuda.cuMemRelease.call_args_list[-2:]] == [33, 44]
+
+
+def test_failed_frontend_restore_cleanup_continues_after_cuda_errors(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(return_value=[33, 44]),
+    )
+
+    assert obj.checkpoint_restore(_FakeComm())
+    mnnvl.cuda.cuMemUnmap.reset_mock()
+    mnnvl.cuda.cuMemRelease.reset_mock()
+    mnnvl.cuda.cuMemUnmap.side_effect = [RuntimeError("unmap failed"), None]
+    mnnvl.cuda.cuMemRelease.side_effect = [RuntimeError("release failed"), None]
+
+    obj._checkpoint_restore_failed()
+
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    assert record.mem_handles == [33, None]
+    assert record.pending_comm is None
+    assert [call.args[0] for call in mnnvl.cuda.cuMemUnmap.call_args_list] == [1032, 1288]
+    assert [call.args[0] for call in mnnvl.cuda.cuMemRelease.call_args_list] == [33, 44]
+
+
 def test_checkpoint_restore_rejects_changed_rank_layout(memory):
     obj, _ = memory
     obj.checkpoint_prepare()

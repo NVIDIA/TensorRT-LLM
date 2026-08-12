@@ -479,6 +479,28 @@ class MnnvlMemory:
         """Make a failed frontend restore terminal and fail closed."""
         record = type(self).allocated_map[self.ptr]
         if record.state is _MnnvlAllocationState.RESTORING:
+            for rank, handle in enumerate(record.mem_handles):
+                rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+                except RuntimeError as error:
+                    logger.warning(
+                        "Failed to unmap unpublished MNNVL restore for rank %d: %s",
+                        rank,
+                        error,
+                    )
+                if handle is None:
+                    continue
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    logger.warning(
+                        "Failed to release unpublished MNNVL restore handle for rank %d: %s",
+                        rank,
+                        error,
+                    )
+                else:
+                    record.mem_handles[rank] = None
             record.state = _MnnvlAllocationState.BROKEN
             record.pending_comm = None
 
