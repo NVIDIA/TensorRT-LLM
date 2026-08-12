@@ -513,15 +513,14 @@ class TestKVCacheFailuresGen:
         # gen99 evicted as victim for gen1; gen1 self-evicts after
         assert set(ids(out.paused_requests)) == {1, 99}
 
-    def test_host_tier_recompute_pause_delays_retry(self):
-        """host-tier victim is recompute-paused before gen self-evicts."""
+    def test_host_tier_recompute_pause_retries_immediately(self):
+        """Full teardown is retried without conservatively waiting one pass."""
         call_count = [0]
 
         def alloc_fn(req):
             call_count[0] += 1
-            # Only gen0 succeeds. A fourth call would mean the scheduler retried
-            # allocation immediately after recompute-pausing the suspended
-            # victim, which should not happen because it frees no GPU pages.
+            # gen0 succeeds, then gen1 succeeds only on the immediate retry
+            # after its ordinary victim is upgraded to full recompute teardown.
             return call_count[0] in (1, 4)
 
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, has_host_tier=True)
@@ -529,10 +528,10 @@ class TestKVCacheFailuresGen:
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.generation_requests) == [0]
-        assert ids(out.paused_requests) == [1]
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.paused_requests) == []
         assert ids(out.recompute_paused_requests) == [99]
-        assert call_count[0] == 3
+        assert call_count[0] == 4
         mgr.free_resources.assert_called_once_with(victim)
 
     def test_recompute_pause_skips_multimodal_victim(self):
@@ -558,6 +557,113 @@ class TestKVCacheFailuresGen:
         assert ids(out.paused_requests) == [0]
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
+
+    def test_recompute_frontier_survives_ordinary_frontier_shrink(self):
+        """Recompute still sees a suspended tail after ordinary eviction skips it."""
+        attempts = {}
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            request_id = req.request_id
+            attempts[request_id] = attempts.get(request_id, 0) + 1
+            if request_id == 0:
+                return attempts[request_id] == 2
+            if request_id == 1:
+                return 3 in freed_request_ids
+            raise AssertionError(f"Evicted request {request_id} was revisited")
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            has_host_tier=True,
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        current = make_gen_request(0)
+        next_request = make_gen_request(1)
+        active_victim = make_gen_request(2)
+        suspended_tail = make_gen_request(3)
+        mgr.kv_cache_map[suspended_tail.py_request_id].is_active = False
+
+        out = sched.schedule_request(
+            [current, next_request, active_victim, suspended_tail],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.paused_requests) == [2]
+        assert ids(out.recompute_paused_requests) == [3]
+        mgr.suspend_request.assert_called_once_with(active_victim)
+        mgr.free_resources.assert_called_once_with(suspended_tail)
+
+    def test_recompute_frontier_falls_back_to_evicted_victim(self):
+        """Host-tier fallback sees an evicted victim outside the frontier."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
+
+        victim = make_gen_request(0)
+        current = make_gen_request(1)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: True,
+            has_host_tier=True,
+        )
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        evicted = [victim]
+        recompute_paused = []
+        recompute_pause_state = _RecomputePauseState(frontier=1)
+
+        req_it_end, success = sched._try_recompute_pause_for_gen(
+            current,
+            [victim, current],
+            req_it=1,
+            req_it_end=1,
+            recompute_pause_state=recompute_pause_state,
+            evicted=evicted,
+            recompute_paused=recompute_paused,
+            inflight_request_ids=set(),
+        )
+
+        assert success
+        assert req_it_end == 1
+        assert evicted == []
+        assert recompute_paused == [victim]
+        assert recompute_pause_state.frontier == 0
+        assert recompute_pause_state.victim_indices == {0}
+        mgr.free_resources.assert_called_once_with(victim)
+        mgr.try_allocate_generation.assert_called_once_with(current)
+
+    def test_recompute_pause_does_not_shrink_scheduling_range(self):
+        """Only the recompute victim is skipped; later work stays eligible."""
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            if req.request_id != 0:
+                raise AssertionError(f"Recompute victim {req.request_id} was revisited")
+            return 1 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+
+        current = make_gen_request(0)
+        suspended_victim = make_gen_request(1)
+        trailing_context = make_ctx_request(2, context_remaining_length=10)
+        mgr.kv_cache_map[suspended_victim.py_request_id].is_active = False
+
+        out = sched.schedule_request(
+            [current, suspended_victim, trailing_context],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == []
+        assert ids(out.recompute_paused_requests) == [1]
+        assert ids(out.context_requests) == [2]
+        assert [call.args[0].request_id for call in mgr.try_allocate_generation.call_args_list] == [
+            0,
+            0,
+        ]
+        mgr.free_resources.assert_called_once_with(suspended_victim)
 
     def test_multiple_evictions_needed(self):
         """gen fails, 2 victims needed to free enough space."""

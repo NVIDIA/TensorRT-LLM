@@ -40,6 +40,14 @@ class ScheduleAction(enum.Enum):
     STOP = "stop"  # stop the scheduling loop
 
 
+class _RecomputePauseState:
+    """Candidate frontier and exact victims for one scheduling iteration."""
+
+    def __init__(self, frontier: int):
+        self.frontier = frontier
+        self.victim_indices: set[int] = set()
+
+
 class BudgetTracker:
     """Tracks token, request, and PEFT budgets for one scheduling iteration.
 
@@ -298,6 +306,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         req_it_end = len(requests_list)
+        recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
 
         # Context requests are always deferred to a second phase so that
@@ -323,6 +332,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
             req = requests_list[req_it]
+
+            if req_it in recompute_pause_state.victim_indices:
+                req_it += 1
+                continue
 
             # --- Filter ---
             if req.request_id in inflight_request_ids:
@@ -396,6 +409,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     requests_list,
                     req_it,
                     req_it_end,
+                    recompute_pause_state,
                     evicted,
                     recompute_paused,
                     inflight_request_ids,
@@ -950,6 +964,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         requests_list: list,
         req_it: int,
         req_it_end: int,
+        recompute_pause_state: _RecomputePauseState,
         evicted: RequestList,
         recompute_paused: RequestList,
         inflight_request_ids: set[int],
@@ -984,6 +999,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 requests_list,
                 req_it,
                 req_it_end,
+                recompute_pause_state,
                 evicted,
                 recompute_paused,
                 inflight_request_ids,
@@ -1107,66 +1123,79 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def _try_recompute_pause_for_gen(
         self,
-        req,
-        requests_list,
-        req_it,
-        req_it_end,
-        evicted,
-        recompute_paused,
-        inflight_request_ids,
-    ):
+        req: LlmRequest,
+        requests_list: RequestList,
+        req_it: int,
+        req_it_end: int,
+        recompute_pause_state: _RecomputePauseState,
+        evicted: RequestList,
+        recompute_paused: RequestList,
+        inflight_request_ids: set[int],
+    ) -> tuple[int, bool]:
         """Use destructive recompute pause when ordinary suspend is insufficient.
 
-        Prefer requests already suspended during this allocation attempt. These
-        victims have no active GPU pages, so freeing them can only make room for
-        subsequent ordinary suspends to offload more active GPU pages. If
-        suspended victims are not enough, destructively pause active non-inflight
-        victims from the unprocessed tail.
+        The recompute frontier is independent from the ordinary-eviction frontier.
+        This keeps previously-suspended started requests visible even when ordinary
+        eviction skips over them and shrinks its frontier to an earlier victim.
+        Recompute pause does not shrink the ordinary scheduling frontier; exact
+        victim indices prevent destructively-freed requests from being revisited.
         """
-        if self.kv_cache_manager.has_host_cache_tier:
-            # Treat ``evicted`` as a FIFO work queue here.  _try_evict_for_gen
-            # may append newly suspended victims; they are either consumed by
-            # this loop for recompute pause or left in ``evicted`` as ordinary
-            # paused requests when allocation succeeds.
-            while evicted:
-                victim = evicted.pop(0)
-                assert self._is_recompute_pause_candidate(victim, inflight_request_ids), (
-                    "Evicted requests must remain eligible for recompute pause "
-                    f"after suspension, got request {victim.py_request_id}."
-                )
-                logger.debug(
-                    f"[V2Scheduler] Recompute-pausing suspended request {victim.py_request_id} "
-                    f"before evicting more requests for request {req.py_request_id}"
-                )
-                self._recompute_pause_request(victim)
-                recompute_paused.append(victim)
-
-                req_it_end, success = self._try_evict_for_gen(
-                    req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
-                )
-                if success:
-                    return req_it_end, True
-
-        while req_it_end > req_it:
+        while True:
             victim_idx = None
-            for i in range(req_it_end - 1, req_it, -1):
-                if self._is_recompute_pause_candidate(requests_list[i], inflight_request_ids):
+            for i in range(recompute_pause_state.frontier - 1, req_it, -1):
+                if i in recompute_pause_state.victim_indices:
+                    continue
+                candidate = requests_list[i]
+                was_evicted = any(evicted_req is candidate for evicted_req in evicted)
+                if (
+                    self.kv_cache_manager.has_host_cache_tier or not was_evicted
+                ) and self._is_recompute_pause_candidate(candidate, inflight_request_ids):
                     victim_idx = i
                     break
 
-            if victim_idx is None:
+            if victim_idx is None and self.kv_cache_manager.has_host_cache_tier:
+                victim = next(
+                    (
+                        candidate
+                        for candidate in evicted
+                        if self._is_recompute_pause_candidate(candidate, inflight_request_ids)
+                    ),
+                    None,
+                )
+                if victim is None:
+                    break
+                victim_idx = next(
+                    i for i, candidate in enumerate(requests_list) if candidate is victim
+                )
+            elif victim_idx is not None:
+                victim = requests_list[victim_idx]
+            else:
                 break
 
-            victim = requests_list[victim_idx]
+            evicted_victim_pos = next(
+                (i for i, candidate in enumerate(evicted) if candidate is victim), None
+            )
+            if evicted_victim_pos is not None:
+                evicted.pop(evicted_victim_pos)
             logger.debug(
-                f"[V2Scheduler] Recompute-pausing active request {victim.py_request_id} "
+                f"[V2Scheduler] Recompute-pausing request {victim.py_request_id} "
                 f"to free pages for request {req.py_request_id}"
             )
             self._recompute_pause_request(victim)
             recompute_paused.append(victim)
-            req_it_end = victim_idx
+            recompute_pause_state.victim_indices.add(victim_idx)
+            recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
 
-            if self.kv_cache_manager.try_allocate_generation(req):
+            # Retry immediately: full teardown can make the allocation fit even
+            # for an already-suspended victim. If it still fails, use any host
+            # capacity just released to ordinary-suspend another active victim.
+            success = self.kv_cache_manager.try_allocate_generation(req)
+            if not success and self.kv_cache_manager.has_host_cache_tier:
+                req_it_end, success = self._try_evict_for_gen(
+                    req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
+                )
+
+            if success:
                 return req_it_end, True
 
         return req_it_end, False
