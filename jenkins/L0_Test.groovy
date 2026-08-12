@@ -5076,7 +5076,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-PyTorch-M3-1": ["auto:dgx-b200-flex", "l0_b200_m3", 1, 1, 1, 1, true],
         // M3 4-GPU accuracy tests (B200)
         "DGX_B200-4_GPUs-PyTorch-M3-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3", 1, 1, 4, 1, true],
-        // M3 8-GPU head-mismatched disaggregated tests (B200)
+        // M3 head-mismatched disaggregated test uses 6/8 GPUs; two remain available for future coverage.
         "DGX_B200-8_GPUs-PyTorch-M3-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_8gpu", 1, 1, 8, 1, true],
     ]
     /*

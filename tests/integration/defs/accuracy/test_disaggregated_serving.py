@@ -2481,6 +2481,10 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
 class TestMiniMaxM3(LlmapiAccuracyTestHarness):
+    # MSA operates on 128-token sparse blocks, so the KV page size is pinned
+    # to 128 as well. TRTLLM MoE is the production backend; combined with FP8
+    # main/indexer caches and the fused projection below, this also exercises
+    # the horizontal QK-norm, RoPE, and KV-write producer.
     MODEL_NAME = "nvidia/MiniMax-M3-NVFP4"
     MODEL_PATH = f"{llm_models_root()}/MiniMax-M3-NVFP4"
 
@@ -2488,9 +2492,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         pytest.param(
             2, 2, marks=pytest.mark.skip_less_device(4), id="head_matched"),
         pytest.param(
-            2, 4, marks=pytest.mark.skip_less_device(8), id="head_mismatched"),
+            2, 4, marks=pytest.mark.skip_less_device(6), id="head_mismatched"),
     ])
-    def test_nvfp4_msa_nixl_python(self, ctx_tp, gen_tp):
+    def test_nvfp4_msa_nixl_python(self, ctx_tp: int, gen_tp: int) -> None:
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.6,
             "enable_block_reuse": False,
@@ -2509,14 +2513,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "indexer_kv_dtype": "fp8",
             "fuse_qkv_index_projection": True,
         }
-        moe_config = {"backend": "CUTLASS"}
-        ctx_server_config = {
-            "tensor_parallel_size": ctx_tp,
+        moe_config = {"backend": "TRTLLM"}
+        base_server_config = {
             "pipeline_parallel_size": 1,
-            "moe_expert_parallel_size": ctx_tp,
-            "disable_overlap_scheduler": True,
             "enable_chunked_prefill": True,
-            "cuda_graph_config": None,
             "trust_remote_code": True,
             "max_num_tokens": 8192,
             "max_seq_len": 4096,
@@ -2526,21 +2526,34 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "sparse_attention_config": sparse_attention_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
-        gen_server_config = {
-            "tensor_parallel_size": gen_tp,
-            "pipeline_parallel_size": 1,
-            "moe_expert_parallel_size": gen_tp,
+
+        def _server_config(tp_size: int) -> dict[str, Any]:
+            return {
+                **base_server_config,
+                "tensor_parallel_size": tp_size,
+                "moe_expert_parallel_size": tp_size,
+            }
+
+        ctx_server_config = {
+            **_server_config(ctx_tp),
             "disable_overlap_scheduler": True,
-            "enable_chunked_prefill": True,
-            "cuda_graph_config": None,
-            "trust_remote_code": True,
-            "max_num_tokens": 8192,
-            "max_seq_len": 4096,
-            "max_batch_size": 32,
-            "kv_cache_config": kv_cache_config,
-            "moe_config": moe_config,
-            "sparse_attention_config": sparse_attention_config,
-            "cache_transceiver_config": cache_transceiver_config,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 12, 16, 24, 32],
+            },
+            "torch_compile_config": {
+                "enable_piecewise_cuda_graph": True,
+                "capture_num_tokens": [1, 2048],
+                "max_num_streams": 3,
+            },
+        }
+        gen_server_config = {
+            **_server_config(gen_tp),
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 12, 16, 24, 32],
+            },
         }
         disaggregated_server_config = {
             "hostname": "localhost",
