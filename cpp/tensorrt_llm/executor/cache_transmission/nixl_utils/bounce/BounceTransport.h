@@ -238,8 +238,9 @@ public:
     void checkTimeouts();
     /// A peer is gone: fail any in-flight request targeting it so its wait() returns.
     void forget(std::string const& peer);
-    /// Shutdown: fail every still-pending request (releasing in-flight handles + exec contexts) and
-    /// release deferred orphan-local handles. Called after the device has been synced.
+    /// Shutdown: fail every still-pending request and invoke the transfer engine's bounded
+    /// cancel/release operation for active writes. Does not recycle regions or send new grants.
+    /// Called after the IO/workers are joined and local CUDA work has been synced.
     void failAll();
 
     /// True while a local gather region is held or an orphan-local write is in flight (drives the IO
