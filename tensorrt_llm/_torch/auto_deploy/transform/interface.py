@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """The interface for all transforms.
 
 This module defines the base classes and interfaces for all transforms.
@@ -107,7 +121,6 @@ class Stages(Enum):
     POST_LOAD_FUSION = "post_load_fusion"  # post-loading fusion and perf optimizations of the graph
     CACHE_INIT = "cache_init"  # initialization of cached attention + (KV) cache initialization
     VISUALIZE = "visualize"  # visualization of the graph
-    EXPORT_ONNX = "export_onnx"  # export the graph to onnx
     COMPILE = "compile"  # graph compilation stage using low-level compilers like torch.compile
 
     def __lt__(self, other):
@@ -782,13 +795,24 @@ class BaseTransform(ABC):
         )
 
     def _add_or_retrieve_input(
-        self, gm: GraphModule, cm: CachedSequenceInterface, name: str
+        self, gm: GraphModule, cm: CachedSequenceInterface, name: str, init_val: bool = False
     ) -> Node:
         """Add or retrieve an input node from the graph."""
         input_nodes = gm.graph.find_nodes(op="placeholder", target=name)
         if len(input_nodes) == 0:
             cm.info.activate_arg(name)
-            return add_graph_input(gm, name)
+            if init_val:
+                # Pass the runtime tensor so add_graph_input populates the
+                # placeholder's meta["val"] with a proper FakeTensor (shape +
+                # dtype propagated via fake_mode.from_tensor). Leaving meta empty
+                # (the default _NO_VAL path) causes downstream transforms that
+                # look up node.meta["val"] (FX export, fuse_fp8_linear's pattern
+                # matcher) to silently misbehave -- e.g. an adjacent
+                # fc2_latent_proj ends up with None in its input slot and the FP8
+                # fake impl crashes on `input.dtype`.
+                return add_graph_input(gm, name, val=cm.info.get_arg(name))
+            else:
+                return add_graph_input(gm, name)
         elif len(input_nodes) == 1:
             return input_nodes[0]
         else:

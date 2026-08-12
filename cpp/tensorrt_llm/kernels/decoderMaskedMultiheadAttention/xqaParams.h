@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,12 +63,18 @@ struct XQAParams
     int64_t* spec_decoding_bl_tree_mask_offset;        // for blackwell spec-dec tree mask offset
     uint32_t* spec_decoding_bl_tree_mask;              // for blackwell spec-dec tree mask
     int32_t* spec_bl_tree_first_sparse_mask_offset_kv; // for blackwell spec-dec tree first sparse mask offset kv
+    bool force_prepare_spec_dec_tree_mask = false;
     int32_t const* mrope_position_deltas = nullptr;
     // Helix parallelism params.
     int32_t const* helix_position_offsets = nullptr;
     bool const* helix_is_inactive_rank = nullptr;
     // Softmax stats output buffer for Helix parallelism (max and LSE per head).
     float2* softmax_stats = nullptr;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllm_gen_jit_warmup = false;
+    int32_t trtllm_gen_jit_warmup_max_num_requests = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_q = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_kv = 0;
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.

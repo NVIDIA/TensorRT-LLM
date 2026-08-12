@@ -98,9 +98,10 @@ Its `forward` accepts the following arguments:
 | k | Tensor | Key tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
 | v | Tensor | Value tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
 | metadata | AttentionMetadata | Metadata for the attention operation. |
-| attention_mask | AttentionMask | Optional attention mask. If None, causal mask is applied. |
+| forward_args | AttentionForwardArgs | Optional per-forward arguments such as the attention mask, output buffers and scales, RoPE and MRoPE inputs, MLA buffers, and sparse-attention inputs. |
+| **kwargs | Any | Temporary compatibility path for fields declared by `AttentionForwardArgs`; unknown fields raise an error. |
 
-For example, the Flashinfer backend calls `append_paged_kv_cache` and then `wrapper.run` to perform the attention operation here.
+For example, the FlashInfer backend calls `append_paged_kv_cache` when it owns the KV-cache update, then calls the prefill, decode, or ragged-prefill wrapper's `run` method using the plan cached in `FlashInferAttentionMetadata`.
 
 
 ## The Features of the `TrtllmAttention` Backend
@@ -299,24 +300,6 @@ dealing with very long sequences.
 
 _Note that the cyclic kv cache feature doesn't work with beam searching currently as
 the context kv cache are shared across beams.
-
-### StreamingLLM
-
-The StreamingLLM feature uses a window attention to perform efficient and stable LLM
-on long texts, which means that only `N` tokens need to be stored in the KV cache.
-Similar to the cyclic KV cache feature in TensorRT LLM, `attention_window_size`
-parameter is used to determine `N`. Different from the cyclic KV cache feature,
-the first `S` tokens, called sink tokens, are always kept in the attention window,
-where `S` is determined by `sink_token_length` parameter.
-But in context phase, the self-attentions are dense in the official implementation of
-StreamingLLM. It uses all of the tokens for computation and only saves `N` tokens
-to the KV cache.
-
-In addition, the relative position embedding is also changed in StreamingLLM.
-When determining the relative distance and adding positional information to tokens,
-StreamingLLM uses the positions within the cache rather than those in the original text.
-
-`sink_token_length` is also used to enable this feature.
 
 ### Beam-Search
 

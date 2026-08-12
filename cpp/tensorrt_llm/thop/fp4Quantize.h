@@ -35,6 +35,9 @@ at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<a
 
 std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
     at::Tensor const& X, at::Tensor const& input_scale, at::Tensor const& reorder_index, int64_t KE, bool is_act);
+
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_residual(
+    at::Tensor const& X, at::Tensor const& input_scale, int64_t KE, bool is_act);
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END

@@ -46,7 +46,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import MLA
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping
@@ -385,7 +385,7 @@ def _run_mla_distributed(
     ctx_output = input_ctx_rank.new_empty(
         [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
-    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, output=ctx_output)
+    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, attn_output=[ctx_output])
 
     # For non-last rank, generate the right latent cache for generation.
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)

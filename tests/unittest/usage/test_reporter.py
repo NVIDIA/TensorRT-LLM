@@ -14,10 +14,13 @@
 # limitations under the License.
 """Tests for report_usage(), background reporter, thread lifecycle, and heartbeat."""
 
+import json
 import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from pydantic import BaseModel, Field
 
 from tensorrt_llm.usage import usage_lib
 
@@ -395,6 +398,40 @@ class TestDisaggMetadata:
         params = captured["events"][0]["parameters"]
         assert params["disaggRole"] == "context"
         assert params["deploymentId"] == "abc123"
+
+    def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch):
+        """Disagg payloads retain sanitized LLM API config JSON fields."""
+
+        class _DisaggTelemetryArgs(BaseModel):
+            tensor_parallel_size: int = Field(
+                default=2, json_schema_extra={"telemetry": {"kind": "value"}}
+            )
+
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "deploy123")
+
+        captured = {}
+
+        def fake_send(payload):
+            captured.update(payload)
+
+        stop_event = threading.Event()
+        stop_event.set()
+
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
+            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+        ):
+            usage_lib._background_reporter(_DisaggTelemetryArgs(), None, "cli_serve")
+
+        assert captured, "No payload was captured"
+        params = captured["events"][0]["parameters"]
+        assert params["disaggRole"] == "generation"
+        assert params["deploymentId"] == "deploy123"
+        assert json.loads(params["llmApiConfigJson"]) == {"tensor_parallel_size": 2}
+        meta = json.loads(params["llmApiConfigMetaJson"])
+        assert meta["capture_succeeded"] is True
+        assert meta["args_class"] == "_DisaggTelemetryArgs"
 
 
 class TestDisaggMetadataEmpty:

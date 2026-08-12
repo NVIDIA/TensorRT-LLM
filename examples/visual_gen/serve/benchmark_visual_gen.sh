@@ -15,9 +15,6 @@
 #   # Run the benchmark
 #   ./benchmark_visual_gen.sh
 #
-# Requirements:
-#   pip install "diffusers>=0.37.0"
-#
 # Optional (for MP4/H.264 video output):
 #   apt-get install ffmpeg   # or: conda install ffmpeg
 #   Without ffmpeg, videos are saved as AVI/MJPEG using a pure-Python encoder.
@@ -113,7 +110,7 @@ echo ""
 # Step 1: Start server
 SERVER_CMD="trtllm-serve ${MODEL} --host ${HOST} --port ${PORT}"
 if [ -n "$SERVER_CONFIG" ]; then
-    SERVER_CMD="${SERVER_CMD} --extra_visual_gen_options ${SERVER_CONFIG}"
+    SERVER_CMD="${SERVER_CMD} --visual_gen_args ${SERVER_CONFIG}"
 fi
 
 echo "Step 1: Starting server..."

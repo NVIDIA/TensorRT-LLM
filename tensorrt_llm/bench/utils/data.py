@@ -1,14 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 from functools import partial
 from typing import List, TextIO, Tuple
 
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer
+
+
+class DatasetFormatError(ValueError):
+    """Raised when the input dataset stream is empty, corrupted, or incorrectly formatted."""
 
 
 def initialize_tokenizer(model_name: str,
@@ -19,9 +38,9 @@ def initialize_tokenizer(model_name: str,
         model_name (str): The name of the HuggingFace model to pull a
         tokenizer from.
         custom_tokenizer (str, optional): A built-in alias (e.g.,
-        'deepseek_v32', 'glm_moe_dsa') or a fully-qualified
-        'module.path.ClassName' for models whose HF tokenizer_config.json
-        is incompatible with AutoTokenizer.
+        'deepseek_v32') or a fully-qualified 'module.path.ClassName' for
+        models whose HF tokenizer_config.json is incompatible with
+        AutoTokenizer.
 
     Returns:
         PreTrainedTokenizer: An initialized HuggingFace tokenizer.
@@ -44,9 +63,15 @@ def initialize_tokenizer(model_name: str,
                 f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
                 "Expected alias or 'module.path.ClassName'.") from e
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                                  padding_side="left",
-                                                  trust_remote_code=True)
+        # Route through TransformersTokenizer so trtllm-bench inherits its
+        # post-load fixes -- in particular ``maybe_fix_byte_level_tokenizer``,
+        # which reloads DeepSeek-V3-style models that would otherwise come
+        # back with a Metaspace pre-tokenizer that silently strips spaces
+        # ("hello world" -> "helloworld") on transformers >= 5.x. Peel off
+        # the wrapper to return the raw HF tokenizer the rest of bench code
+        # expects.
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_name, padding_side="left", trust_remote_code=True).tokenizer
 
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -167,6 +192,14 @@ def create_dataset_from_stream(
             lora_requests.append(lora_request)
         else:
             lora_requests.append(None)
+
+    # Early validation: check if any data was actually read from the stream
+    if len(prompts) == 0:
+        raise DatasetFormatError(
+            "No data was read from the dataset stream. "
+            "The dataset file may be empty, corrupted, or in an incorrect format. "
+            "Expected JSON lines with at least 'prompt', 'task_id' and 'output_tokens' fields."
+        )
 
     if modality is not None:
         # Multimodal data need extra preprocessing

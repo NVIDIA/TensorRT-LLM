@@ -10,10 +10,10 @@ import torch
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
 
-from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
+from .impl_contract import MoEInputRequirement, MoERunContext, require_comm_plan
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
@@ -102,6 +102,8 @@ class DenseGEMMFusedMoE(MoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
     # Memory buffer pool for CUDA graph compatibility
     buffers = get_memory_buffers()
 
@@ -157,7 +159,6 @@ class DenseGEMMFusedMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type=None,
     ):
         # DenseGEMM CuTe DSL kernels only support SM100 and SM103.
@@ -192,10 +193,18 @@ class DenseGEMMFusedMoE(MoE):
             f"when weight_per_expert is not MMA tile-K aligned."
         )
 
+        # DenseGEMM only supports TP; EP requires alltoall communication not implemented here.
+        ep_size = model_config.mapping.moe_ep_size
+        assert ep_size == 1, (
+            f"DenseGEMMFusedMoE does not support Expert Parallelism "
+            f"(got ep_size={ep_size}). Use a different MoE backend (e.g. CutlassFusedMoE) "
+            f"when EP is enabled."
+        )
+
         # Call MoE base class directly (not CutlassFusedMoE).
-        # Note: `without_comm` and `apply_router_weight_on_input` are accepted
-        # for API compatibility with create_moe_backend() but are not passed to
-        # MoE.__init__() since DenseGEMM does not use alltoall communication.
+        # Note: `apply_router_weight_on_input` is accepted for API
+        # compatibility with create_moe_backend() but is not passed to
+        # MoE.__init__().
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -289,9 +298,6 @@ class DenseGEMMFusedMoE(MoE):
                     f"{self.__class__.__name__} only supports nvfp4 quantization, "
                     f"got {self.quant_config.quant_mode}."
                 )
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
 
     def _transform_w2_weight_scale_for_min_latency(self):
         """Transform w2_weight_scale for minimum latency path optimization."""
@@ -420,18 +426,20 @@ class DenseGEMMFusedMoE(MoE):
             )
 
             # FC1: GEMM + SwiGLU with post-SwiGLU alpha scaling (fused fc2_alpha)
-            fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
-                x,
-                self.w3_w1_weight.view(torch.uint8),
-                x_sf,
-                self.w3_w1_weight_scale,
-                self.fc31_alpha,
-                fc2_alpha_normalized,  # Pass normalized fc2_alpha as alpha_post
-                self.fc2_input_scale,
-                expert_count=self.expert_size_per_partition,
-                weight_per_expert=2 * self.intermediate_size_per_partition,
-                output_dtype=torch.float4_e2m1fn_x2,
-                scaling_vector_size=self.scaling_vector_size,
+            fc1_output, fc1_output_sf = (
+                torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
+                    x,
+                    self.w3_w1_weight.view(torch.uint8),
+                    x_sf,
+                    self.w3_w1_weight_scale,
+                    self.fc31_alpha,
+                    fc2_alpha_normalized,  # Pass normalized fc2_alpha as alpha_post
+                    self.fc2_input_scale,
+                    expert_count=self.expert_size_per_partition,
+                    weight_per_expert=2 * self.intermediate_size_per_partition,
+                    output_dtype=torch.float4_e2m1fn_x2,
+                    scaling_vector_size=self.scaling_vector_size,
+                )
             )
 
             # FC2: Standard nvfp4_gemm with scalar alpha = fc2_alpha_max
@@ -442,7 +450,6 @@ class DenseGEMMFusedMoE(MoE):
                 self.w2_weight_scale.view(torch.uint8),
                 self.fc2_alpha_max,
                 torch.bfloat16,
-                to_userbuffers=False,
                 allowed_backends="cutlass,cublaslt,cutedsl,cuda_core",
             )
         else:
@@ -451,18 +458,20 @@ class DenseGEMMFusedMoE(MoE):
             x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
 
             # FC1: GEMM + SwiGLU, output is fp4 quantized
-            fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
-                x,
-                self.w3_w1_weight.view(torch.uint8),
-                x_sf,
-                self.w3_w1_weight_scale,
-                self.fc31_alpha,
-                None,  # alpha_post: no post-SwiGLU scaling
-                self.fc2_input_scale,
-                expert_count=self.expert_size_per_partition,
-                weight_per_expert=2 * self.intermediate_size_per_partition,
-                output_dtype=torch.float4_e2m1fn_x2,
-                scaling_vector_size=self.scaling_vector_size,
+            fc1_output, fc1_output_sf = (
+                torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
+                    x,
+                    self.w3_w1_weight.view(torch.uint8),
+                    x_sf,
+                    self.w3_w1_weight_scale,
+                    self.fc31_alpha,
+                    None,  # alpha_post: no post-SwiGLU scaling
+                    self.fc2_input_scale,
+                    expert_count=self.expert_size_per_partition,
+                    weight_per_expert=2 * self.intermediate_size_per_partition,
+                    output_dtype=torch.float4_e2m1fn_x2,
+                    scaling_vector_size=self.scaling_vector_size,
+                )
             )
 
             with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):
@@ -494,28 +503,23 @@ class DenseGEMMFusedMoE(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        enable_alltoall: bool = False,
-        **kwargs,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with DenseGEMM backend (NVFP4 only).
 
-        Args:
-            x: Input hidden states (pre-quantized to NVFP4)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors for NVFP4
-            enable_alltoall: Whether alltoall communication is enabled.
-            **kwargs: Additional arguments for forward compatibility.
-
         Returns:
             final_hidden_states tensor.
         """
+        del workspace  # DenseGEMM allocates its own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        enable_alltoall = plan.enable_alltoall
         assert self.has_nvfp4, (
             f"{self.__class__.__name__} only supports nvfp4 quantization, "
             f"got {self.quant_config.quant_mode}."
@@ -527,77 +531,3 @@ class DenseGEMMFusedMoE(MoE):
             x_sf=x_sf,
             enable_alltoall=enable_alltoall,
         )
-
-    def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: tuple = (True, True),
-    ) -> torch.Tensor:
-        # Currently, the default path is that ConfigurableMoE calls DenseGEMMFusedMoE.run_moe.
-        # This forward_chunk method is a reference implementation of the legacy path.
-        # Apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
-        assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
-
-        x, x_sf = self.quantize_input(x)
-
-        if self.use_dp and self.parallel_size > 1:
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens,
-            )
-
-        x = self.run_moe(
-            x=x,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            x_sf=x_sf,
-            enable_alltoall=False,
-        )
-        return x
-
-    def forward_impl(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        do_finalize: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        assert do_finalize, "DenseGEMMFusedMoE does not support do_finalize=False"
-
-        is_first_call = self.repeat_idx == 0
-        is_last_call = self.repeat_idx == self.repeat_count - 1
-
-        outputs = self.forward_chunk(
-            x,
-            router_logits,
-            output_dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-            repeating_info=(is_first_call, is_last_call),
-        )
-        outputs = self.reducescatter_or_allreduce(
-            outputs,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-        )
-
-        if self.use_dp and self.parallel_size > 1:
-            rank = self.parallel_rank
-            outputs = outputs[: all_rank_num_tokens[rank]]
-        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
-        return outputs

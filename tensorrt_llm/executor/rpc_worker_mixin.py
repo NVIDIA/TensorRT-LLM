@@ -26,7 +26,7 @@ class RpcWorkerMixin:
     # This can be overridden by setting num_workers in the inheriting class
     NUM_WORKERS = 6
 
-    def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: Optional[bytes] = None):
+    def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: bytes):
         if rpc_addr is None:
             raise RuntimeError("RPC mode enabled but no rpc_addr provided to worker")
 
@@ -146,6 +146,11 @@ class RpcWorkerMixin:
         stats = await asyncio.to_thread(self.fetch_stats)
         # Serialize stats before sending over RPC (IterationStats objects are not picklable)
         return [self._stats_serializer(s) for s in stats]
+
+    async def fetch_kv_cache_capacity_async(self) -> str:
+        """Async version of fetch_kv_cache_capacity using asyncio.to_thread."""
+        capacity = await asyncio.to_thread(self.fetch_kv_cache_capacity)
+        return self._kv_cache_capacity_serializer(capacity)
 
     async def fetch_kv_cache_events_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_kv_cache_events using asyncio.to_thread.

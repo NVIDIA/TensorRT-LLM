@@ -24,7 +24,7 @@ from torch import nn
 
 from ..torch_libs.float8_python_api import addmm_float8_unwrapped
 
-TRTLLM_FP4_OP_AVAILABLE = True
+TRTLLM_FP4_OP_AVAILABLE = hasattr(torch.ops, "trtllm")
 
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
 TRTLLM_NVFP4_ROW_SIZE = 128
@@ -109,7 +109,8 @@ def _trtllm_fp8_prequant_linear_core(
     enable_cuda_core = False
     if torch.cuda.is_available():
         capability = torch.cuda.get_device_capability(0)
-        enable_cuda_core = capability == (8, 9) or capability == (12, 0)
+        # enable cuda core for sm89, sm120, and sm121
+        enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
 
     if x.shape[0] <= 8 and enable_cuda_core:
         output = torch.ops.trtllm.cuda_scaled_mm(

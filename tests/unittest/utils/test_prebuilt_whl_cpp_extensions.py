@@ -4,6 +4,10 @@ Test that prebuilt wheel extraction includes all necessary Python files.
 """
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 
 def test_cpp_extension_wrapper_files_exist():
     """Verify that C++ extension wrapper Python files were extracted from prebuilt wheel."""

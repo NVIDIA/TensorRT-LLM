@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for basic graph sharding."""
 
 import copy
@@ -16,6 +30,7 @@ from _torch_test_utils import fp4_compatible, trtllm_ops_available
 from torch._inductor.pattern_matcher import stable_topological_sort
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy._compat import AllReduceStrategy
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
@@ -24,10 +39,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FP8WeightShardingInfo,
     LayerType,
     ShardingTransformConfig,
-    SplitDimension,
     WeightShardingInfo,
     _update_node_args,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import SplitDimension
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
@@ -35,7 +50,6 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
-from tensorrt_llm.functional import AllReduceStrategy
 
 
 class GQA_Block(nn.Module):
@@ -125,11 +139,12 @@ class FP8MLP(nn.Module):
         pytest.param(576, 4, 128, id="non_aligned_uneven_n-N576-ws4"),
     ],
 )
-def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, block_n):
-    """Tests _compute_shard_bounds and _expand_scale_per_row for all shard boundary cases.
+@pytest.mark.cpu_only
+def test_finegrained_fp8_get_sharded_scale(weight_original_n, world_size, block_n):
+    """Tests FineGrained FP8 scale sharding for all shard boundary cases.
 
-    Verifies that _compute_shard_bounds matches torch.tensor_split semantics and that
-    _expand_scale_per_row assigns the correct scale block to every weight row:
+    Verifies that _get_sharded_scale assigns the correct scale block to every
+    weight row:
     - Aligned shards: compact scale slice with block_n preserved for the FP8 GEMM kernel.
     - Non-aligned shards: per-row expansion so each weight row gets its correct block index.
     - N not divisible by block_n: clamp to last scale row avoids out-of-bounds indexing.
@@ -139,23 +154,18 @@ def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, blo
     chunks = torch.tensor_split(torch.arange(weight_original_n), world_size)
 
     for rank in range(world_size):
-        row_start, n_shard = FineGrainedFP8WeightShardingInfo._compute_shard_bounds(
-            weight_original_n, rank, world_size
-        )
-        # _compute_shard_bounds must match torch.tensor_split
-        assert n_shard == len(chunks[rank]), (
-            f"rank={rank}: n_shard={n_shard} != {len(chunks[rank])}"
-        )
-        if len(chunks[rank]) > 0:
-            assert row_start == int(chunks[rank][0]), (
-                f"rank={rank}: row_start={row_start} != {int(chunks[rank][0])}"
-            )
-
+        shard_rows = chunks[rank]
+        n_shard = len(shard_rows)
         if n_shard == 0:
             continue
+        row_start = int(shard_rows[0])
 
-        sharded = FineGrainedFP8WeightShardingInfo._expand_scale_per_row(
-            scale, dim=0, row_start=row_start, n_shard=n_shard
+        sharded = FineGrainedFP8WeightShardingInfo._get_sharded_scale(
+            scale,
+            weight_original_n=weight_original_n,
+            dim=0,
+            rank=rank,
+            world_size=world_size,
         )
 
         aligned = (row_start % block_n == 0) and (n_shard % block_n == 0)
@@ -472,6 +482,7 @@ class SymbolicShapeView(nn.Module):
         return torch.ops.aten.view.default(x, (b, s, 32, 128))
 
 
+@pytest.mark.cpu_only
 def test_update_node_args_preserves_nested_symbolic_shape_nodes():
     gm = torch.fx.symbolic_trace(SymbolicShapeView())
     view_node = next(node for node in gm.graph.nodes if is_op(node, [torch.ops.aten.view]))
@@ -986,6 +997,18 @@ def _run_pattern_detection_job(
                         )
                     )
                 elif is_op(node, torch.ops.auto_deploy.torch_ssm):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=None,
+                        )
+                    )
+                elif is_op(node, torch.ops.auto_deploy.torch_rmsnorm_gated):
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,

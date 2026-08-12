@@ -63,7 +63,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param out_scale           Output scale data [num_tokens, scale_size] contiguous
  * @param k_token_start       Start offset into slot_mapping arrays
  * @param num_tokens          Number of tokens to gather
- * @param head_dim            Head dimension (must be 128)
+ * @param head_dim            Payload byte width (128 for FP8, 64 for packed FP4)
  * @param scale_size          Scale size in bytes (must be 4)
  * @param cache_stride_0      Stride for k_cache dimension 0 (in bytes)
  * @param cache_stride_1      Stride for k_cache dimension 1 (in bytes)
@@ -137,17 +137,18 @@ void invokeIndexerKCacheGather(uint8_t const* k_cache, int64_t const* slot_mappi
         return;
     }
 
-    // Assertions for DeepSeek-V3.2 configuration
-    constexpr int32_t QUANT_BLOCK_SIZE = 128;
-    TLLM_CHECK_WITH_INFO(
-        head_dim == QUANT_BLOCK_SIZE, "head_dim must equal 128 for DeepSeek-V3 indexer cache (got %d)", head_dim);
-    TLLM_CHECK_WITH_INFO(
-        scale_size == 4, "scale_size must equal 4 bytes (1 float32 scale per token, got %d)", scale_size);
+    // Each thread reads 4 bytes; head_dim is the byte-width of one token in
+    // the cache (128 for FP8, 64 for FP4 packed). Scale is a single 4-byte word.
+    constexpr int32_t VEC_SIZE = 4;
+    TLLM_CHECK_WITH_INFO(head_dim == 128 || head_dim == 64,
+        "head_dim must be 128 (FP8) or 64 (FP4 packed) for the indexer cache (got %d)", head_dim);
+    TLLM_CHECK_WITH_INFO(head_dim % VEC_SIZE == 0, "head_dim (%d) must be a multiple of %d", head_dim, VEC_SIZE);
+    TLLM_CHECK_WITH_INFO(scale_size == 4,
+        "scale_size must equal 4 bytes (packed UE8M0 x4 for FP4, 1 float32 for FP8, got %d)", scale_size);
 
-    // For head_dim=128, we use 32 threads to handle 128 bytes per token and extra 4 bytes for scale
-    constexpr int32_t THREADS_PER_BLOCK = 32;
+    int32_t const threads_per_block = head_dim / VEC_SIZE;
 
-    dim3 block(THREADS_PER_BLOCK);
+    dim3 block(threads_per_block);
     dim3 grid(num_tokens);
 
     indexerKCacheGatherUnifiedKernel<<<grid, block, 0, stream>>>(k_cache, slot_mapping_fp8, slot_mapping_scale, out_fp8,

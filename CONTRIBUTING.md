@@ -121,9 +121,9 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 
 ## Tests and Code Review for Protected APIs
 
-Some APIs are committed to be stable; any breaking changes to these APIs require careful design and review.
+Some APIs are committed to be stable; breaking changes to these APIs should be avoided and require careful design and review.
 
-This repo contains an [API stability testsuite](./tests/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
+This repo contains an [API stability testsuite](./tests/unittest/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
 
 ```txt
 def test_signature(self):
@@ -138,6 +138,7 @@ tests/api_stability/test_api_stability.py:241: AssertionError
 ```
 
 As the error message suggests, please ask for reviews from the code owners of the corresponding APIs.
+If API stability reference files change, classify the accepted LLM API contract change with `api-compatible` or `api-breaking`; `api-breaking` also requires `BREAKING` in the PR title. See the [API change guide](./docs/source/developer-guide/api-change.md) for details.
 
 
 ## Signing Your Work

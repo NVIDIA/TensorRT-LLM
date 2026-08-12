@@ -301,4 +301,4 @@ class MistralTokenizer(TransformersTokenizer):
     def apply_chat_template(
         self, conversation: Union[list[dict[str, str]], list[list[dict[str, str]]]], *args, **kwargs
     ) -> Union[str, list[int], list[str], list[list[int]]]:
-        raise NotImplementedError
+        return self.transformers_tokenizer.apply_chat_template(conversation, *args, **kwargs)

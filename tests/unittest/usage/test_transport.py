@@ -214,7 +214,7 @@ class TestStagingEndpoint:
             quantizationAlgo="",
             kvCacheDtype="",
             ingressPoint="cli_serve",
-            featuresJson='{"lora":false,"speculative_decoding":false,"prefix_caching":false,"cuda_graphs":false,"chunked_context":false,"data_parallel_size":1}',
+            featuresJson='{"lora":false,"speculative_decoding":false,"prefix_caching":false,"cuda_graphs":false,"chunked_context":false,"data_parallel_size":1,"checkpoint_format":"HF","load_format":"AUTO"}',
             disaggRole="",
             deploymentId="",
         )

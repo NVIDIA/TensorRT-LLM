@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -71,6 +74,7 @@ class ExtractorConfig:
         guidance_param_name: Parameter name for guidance if used (default: None)
         forward_params: List of parameter names (None = auto-introspect from forward signature)
         return_dict_default: Default value for return_dict parameter (default: True)
+        return_tuple_when_return_dict_false: Whether return_dict=False uses a one-element tuple
         output_model_class: Output class name for return type (default: "Transformer2DModelOutput")
     """
 
@@ -80,6 +84,7 @@ class ExtractorConfig:
     guidance_param_name: Optional[str] = None
     forward_params: Optional[List[str]] = None
     return_dict_default: bool = True
+    return_tuple_when_return_dict_false: bool = False
     output_model_class: str = "Transformer2DModelOutput"
 
 
@@ -154,10 +159,8 @@ class GenericExtractor:
                 if isinstance(output, tuple):
                     return output
                 return Transformer2DModelOutput(sample=output)
-            # For return_dict=False, unwrap single-element tuple to raw tensor
-            if isinstance(output, tuple) and len(output) == 1:
-                return output[0]
-            # Return raw tensor as-is (TeaCacheHook always passes tensors to postprocess)
+            if self.config.return_tuple_when_return_dict_false:
+                return (output,)
             return output
 
         return CacheContext(
@@ -204,6 +207,11 @@ class TeaCacheHook:
         # Polynomial function to rescale embedding distances
         self.rescale_func = np.poly1d(config.coefficients)
         self.extractor_fn = None
+
+        # Runtime warmup/cutoff bounds, derived per-generation by
+        # TeaCacheBackend.refresh from num_inference_steps.
+        self.ret_steps: Optional[int] = None
+        self.cutoff_steps: Optional[int] = None
 
         # Separate cache state for conditional (pos) and unconditional (neg) branches
         self.state_pos = self._new_state()
@@ -293,12 +301,12 @@ class TeaCacheHook:
         Returns True to compute, False to use cache.
         """
         # Warmup: Always compute first few steps to build stable cache
-        if self.config.ret_steps is not None and state["cnt"] < self.config.ret_steps:
+        if self.ret_steps is not None and state["cnt"] < self.ret_steps:
             state["acc_dist"] = 0.0
             return True
 
         # Cooldown: Always compute last few steps for quality
-        if self.config.cutoff_steps is not None and state["cnt"] >= self.config.cutoff_steps:
+        if self.cutoff_steps is not None and state["cnt"] >= self.cutoff_steps:
             return True
 
         # First step: no previous input to compare
@@ -374,20 +382,17 @@ class TeaCacheBackend:
         # Reset cache state (clears previous residuals and counters)
         self.hook.reset_state()
 
-        # Derive warmup/cutoff from mode (use_ret_steps)
+        # Derive warmup/cutoff from mode (use_ret_steps).
         # Aligns with TeaCache repo settings for Wan 2.1
         # (ref: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4Wan2.1/teacache_generate.py)
-        if self.config.ret_steps is None:
-            self.config.ret_steps = 5 if self.config.use_ret_steps else 1
-        self.config.cutoff_steps = (
-            num_inference_steps if self.config.use_ret_steps else num_inference_steps - 1
-        )
-
-        self.config.num_steps = num_inference_steps
+        ret_steps = 5 if self.config.use_ret_steps else 1
+        cutoff_steps = num_inference_steps if self.config.use_ret_steps else num_inference_steps - 1
+        self.hook.ret_steps = ret_steps
+        self.hook.cutoff_steps = cutoff_steps
 
         logger.info(
             f"TeaCache: {num_inference_steps} steps | "
-            f"warmup: {self.config.ret_steps}, cutoff: {self.config.cutoff_steps}, "
+            f"warmup: {ret_steps}, cutoff: {cutoff_steps}, "
             f"thresh: {self.config.teacache_thresh}"
         )
 

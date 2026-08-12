@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+metadata:
+  model_name: super_bf16
+  supported_gpus:
+  - GB200
+  - B200
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # 1k1k config - AutoDeploy backend, 4 GPUs
+  - name: "super_mtp_ad_ws4_1k1k"
+    model_name: "super_bf16"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/super_v3_mtp.yaml"
+    world_size: 4
+    client_configs:
+      - name: "con32_iter10_1k1k"
+        concurrency: 32
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"

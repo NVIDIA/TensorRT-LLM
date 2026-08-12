@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +24,7 @@ import pytest
 import torch
 from PIL import Image
 
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
 from tensorrt_llm.grpc.grpc_request_manager import (
     GrpcRequestManager,
@@ -46,6 +46,7 @@ skip_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+@pytest.mark.cpu_only
 class TestSamplingParamsConversion:
     """Tests for proto to SamplingParams conversion."""
 
@@ -167,6 +168,7 @@ class TestSamplingParamsConversion:
         assert params.guided_decoding.regex is not None
 
 
+@pytest.mark.cpu_only
 class TestLoraRequestConversion:
     """Tests for proto to LoRARequest conversion."""
 
@@ -185,6 +187,7 @@ class TestLoraRequestConversion:
         assert request is None
 
 
+@pytest.mark.cpu_only
 class TestDisaggregatedParamsConversion:
     """Tests for proto to DisaggregatedParams conversion."""
 
@@ -245,6 +248,7 @@ class TestDisaggregatedParamsConversion:
         assert params is None
 
 
+@pytest.mark.cpu_only
 class TestProtoMessages:
     """Tests for proto message structure."""
 
@@ -311,13 +315,13 @@ class TestProtoMessages:
     def test_model_info_response(self):
         """Test GetModelInfoResponse message."""
         response = pb2.GetModelInfoResponse(
-            model_id="meta-llama/Llama-2-7b",
+            model_id="meta-llama/Meta-Llama-3-8B",
             max_input_len=4096,
             max_seq_len=8192,
             vocab_size=32000,
         )
 
-        assert response.model_id == "meta-llama/Llama-2-7b"
+        assert response.model_id == "meta-llama/Meta-Llama-3-8B"
         assert response.max_input_len == 4096
         assert response.max_seq_len == 8192
         assert response.vocab_size == 32000
@@ -369,6 +373,7 @@ class TestProtoMessages:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestComprehensiveSamplingParamsConversion:
     """Comprehensive test covering all proto fields for SamplingParams conversion.
 
@@ -471,6 +476,17 @@ class TestComprehensiveSamplingParamsConversion:
         assert params.embedding_bias is not None
         assert len(params.embedding_bias) == 12
 
+    def test_embedding_bias_must_match_vocab_size(self):
+        """Embedding bias is rejected when it cannot match model vocabulary."""
+        with pytest.raises(ValueError, match="embedding_bias length"):
+            create_sampling_params_from_proto(
+                proto_config=pb2.SamplingConfig(),
+                output_config=pb2.OutputConfig(),
+                max_tokens=16,
+                embedding_bias=[0.0, 0.0, 0.0],
+                vocab_size=4,
+            )
+
     def test_ignore_eos_flag(self):
         """Test that ignore_eos=True correctly sets ignore_eos on SamplingParams."""
         proto_config = pb2.SamplingConfig(temperature=0.7)
@@ -570,6 +586,7 @@ class TestComprehensiveSamplingParamsConversion:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestGenerateValidation:
     """Test that invalid gRPC requests return INVALID_ARGUMENT status.
 
@@ -632,13 +649,10 @@ def grpc_service():
     Uses TinyLlama-1.1B for minimal GPU resource usage.
     Shared across all tests in this module.
     """
-    from tensorrt_llm._tensorrt_engine import LLM
-
     model_path = get_model_path(default_model_name)
     llm = LLM(
         model=model_path,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        fast_build=True,
     )
     tokenizer = llm.tokenizer
 
@@ -817,7 +831,6 @@ def grpc_vlm_service():
     llm = LLM(
         model=model_path,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6),
-        fast_build=True,
         load_format="dummy",
     )
     tokenizer = llm.tokenizer

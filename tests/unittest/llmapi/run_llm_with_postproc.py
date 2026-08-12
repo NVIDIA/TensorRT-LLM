@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import asyncio
 import json
-import os
 from typing import Optional
 
 import click
 
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.utils import print_colored
@@ -17,12 +16,11 @@ from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
 @click.command()
 @click.option("--model_dir", type=str, required=True)
 @click.option("--tp_size", type=int, required=True)
-@click.option("--engine_dir", type=str, default=None)
 @click.option("--n", type=int, default=1)
 @click.option("--best_of", type=int, default=None)
 @click.option("--top_k", type=int, default=1)
-def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
-         best_of: Optional[int], top_k: int):
+def main(model_dir: str, tp_size: int, n: int, best_of: Optional[int],
+         top_k: int):
 
     # Simplified postprocessing configuration
     postproc_config = {
@@ -36,10 +34,6 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
               tensor_parallel_size=tp_size,
               kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
               **postproc_config)
-
-    if engine_dir is not None and os.path.abspath(
-            engine_dir) != os.path.abspath(model_dir):
-        llm.save(engine_dir)
 
     sampling_params = SamplingParams(max_tokens=10,
                                      end_id=-1,

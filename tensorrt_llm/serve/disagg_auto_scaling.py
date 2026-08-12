@@ -1,3 +1,17 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import json
 import os
@@ -245,7 +259,9 @@ class DisaggClusterManager:
 
     async def is_ready_with_router(self, router_ctx_worker_num: int,
                                    router_gen_worker_num: int) -> bool:
-        return router_ctx_worker_num >= self._minimal_ctx_worker_num and router_gen_worker_num >= self._minimal_gen_worker_num
+        return (await self.is_ready()
+                and router_ctx_worker_num >= self._minimal_ctx_worker_num
+                and router_gen_worker_num >= self._minimal_gen_worker_num)
 
 
 class DisaggClusterWorker:

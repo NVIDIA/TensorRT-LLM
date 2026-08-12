@@ -31,6 +31,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -50,7 +52,7 @@ struct KernelParams {
 
   // The output pointer (used by STG for last tile).
   void* ptrO;
-  // The output SF pointer (used for FP4 output).
+  // The output SF pointer (used for block-scaled output).
   void* ptrSfO;
   // The attention sinks pointer (additional value per head in the denominator of the softmax).
   float const* ptrAttentionSinks;
@@ -64,6 +66,10 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue fusion
+  float const* ptrDsv4InvRopeCosSinCache;
+  // Dsv4 output block-scaled tensor, only for epilogue fusion
+  float* ptrDsv4OScaleFp32;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -91,8 +97,7 @@ struct KernelParams {
   // The SF scale for Kv on device. Only needed by trt-llm kernels as the scales have to be on the
   // device currently.
   float const* ptrScaleSfKv;
-  // The SF scale for O on device. Only needed by trt-llm kernels as the scales have to be on the
-  // device currently.
+  // The scalar scale for block-scaled output O on device.
   float const* ptrScaleSfO;
   // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
   // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
@@ -104,6 +109,9 @@ struct KernelParams {
   int32_t* ptrSkipSoftmaxStats;
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparseMla topK lengths with shape of [numTokensQ]
+  //  where each tokenQ has a corresponding topK length.
+  int32_t const* ptrSparseMlaTopKLens;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -111,6 +119,8 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // Padded token dimension for the DSv4 fused FP32 scale layout.
+  int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
   float mInflateMax;
@@ -146,20 +156,22 @@ struct KernelParams {
   int32_t mNumTokensPerCtaQ;
   // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
   int32_t mNumTokensPerPageLog2;
+  // The runtime K/V TMA box reshape factor selected by host descriptor setup.
+  int32_t mReshapeFactorKv;
   // The output scale for FP8 quantization.
   float mOutputScale;
   // The scaling factor for softmax (multiplied by log2 to use faster exp2).
   float mScaleSoftmaxLog2;
   // The SF scale for Kv.
   float mScaleSfKv;
-  // The SF scale for O.
+  // The scalar SF scale for output O.
   float mScaleSfO;
   // Threshold to decide whether warp skips softmax ops
   float mSkipSoftmaxThresholdScaleFactor;
   // The sparse attention topK value.
   int32_t mSparseAttnTopK;
-  // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
-  // kernel when inflight batching is enabled in TRT-LLM.
+  // The start token index in the output SF tensor. Used for block-scaled output SF offset
+  // calculation in generation phase kernels when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
