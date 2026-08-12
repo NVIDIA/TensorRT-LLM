@@ -15,10 +15,12 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -31,6 +33,7 @@
 
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
+namespace tc = tensorrt_llm::common;
 
 #pragma once
 
@@ -222,18 +225,10 @@ private:
     std::unordered_map<std::uint64_t, int> mSpillRemaining;
     std::vector<std::uint64_t> mCompletedSpills;
     bool mDiskWriterStop{false};
-    std::size_t const mDiskWriteQueueMax{[]
-        {
-            auto* e = std::getenv("TLLM_KV_DISK_WRITE_QUEUE");
-            return e ? std::stoul(e) : 1024UL;
-        }()};
+    std::size_t const mDiskWriteQueueMax{
+        std::max<std::size_t>(1, tc::getUInt64Env("TLLM_KV_DISK_WRITE_QUEUE").value_or(1024))};
     // Number of background writer threads draining the shared queue (TLLM_KV_DISK_WRITERS, default 1).
-    std::size_t const mNumDiskWriters{[]
-        {
-            auto* e = std::getenv("TLLM_KV_DISK_WRITERS");
-            auto n = e ? std::stoul(e) : 1UL;
-            return n < 1UL ? 1UL : n;
-        }()};
+    std::size_t const mNumDiskWriters{std::max<std::size_t>(1, tc::getUInt64Env("TLLM_KV_DISK_WRITERS").value_or(1))};
 
     void diskWriterLoop();
     void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes);
@@ -255,11 +250,7 @@ private:
         std::vector<std::size_t> bytes; // byte count, per pool
     };
 
-    std::size_t const mNumDiskReaders{[]
-        {
-            auto* e = std::getenv("TLLM_KV_DISK_READERS");
-            return e ? std::stoul(e) : 0UL;
-        }()};
+    std::size_t const mNumDiskReaders{tc::getUInt64Env("TLLM_KV_DISK_READERS").value_or(0)};
     std::vector<std::thread> mDiskReaders;
     std::mutex mReadMutex;
     std::condition_variable mReadQueueCv;

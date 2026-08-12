@@ -111,16 +111,6 @@ public:
     {
         transferManager.enqueueDiskWriteUnstaged(std::move(filename), src, bytes, spillId);
     }
-
-    // Unblock a producer parked in the enqueue backpressure wait, so the test can join it before teardown.
-    static void requestWriterStop(tbk::KVCacheTransferManager& transferManager)
-    {
-        {
-            std::lock_guard<std::mutex> lock(transferManager.mDiskMutex);
-            transferManager.mDiskWriterStop = true;
-        }
-        transferManager.mDiskQueueCv.notify_all();
-    }
 };
 } // namespace tensorrt_llm::testing
 
@@ -11756,7 +11746,6 @@ TEST_F(KVCacheManagerTest, DiskTierShutdownWithQueuedWorkTest)
     pool.secondaryPtr
         = tr::BufferManager::pinned(tr::ITensor::makeShape({2 * nSlots, blockSize}), tensorrt_llm::DataType::kFLOAT);
 
-    // Seed host slots and write them to disk (synchronous) so the queued reads below have files to read.
     float* secBase = tr::bufferCast<float>(*pool.secondaryPtr);
     for (int k = 0; k < nSlots; ++k)
     {
