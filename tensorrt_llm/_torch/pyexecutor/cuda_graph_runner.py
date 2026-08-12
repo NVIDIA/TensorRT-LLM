@@ -1154,7 +1154,9 @@ class EncoderCUDAGraphRunner:
         # split-K GEMM captured into one graph spins forever in
         # cutlass::Semaphore::wait() once the other graph's matmuls leave that
         # region non-zero, because the captured graph has no node that re-zeroes
-        # it. Capture on our own stream instead.
+        # it. Capture on our own stream instead. The coupling is a property of
+        # the shared capture stream, not of the capture mode, so this applies to
+        # the token encoder path (T5/BART) as much as to feature mode.
         self._capture_stream: Optional[torch.cuda.Stream] = None
 
         # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
@@ -1523,8 +1525,9 @@ class EncoderCUDAGraphRunner:
             # [1, 2] the Whisper integration test configures, `enable_padding`
             # is therefore inert and only exact batch sizes replay - which is
             # what `_waiting_encoder_requests` forms microbatches to hit.
-            # Padding only becomes reachable with a dense list such as
-            # [1, 2, 3, 4].
+            # Padding is reachable only when a non-bucket batch has the next
+            # bucket within 12.5%, which first happens at a batch of 8 padding
+            # to a configured bucket of 9.
             if (batch_size == 0 or padded_batch_size
                     > batch_size * self.MAX_FEATURE_PADDING_RATIO):
                 yield inputs

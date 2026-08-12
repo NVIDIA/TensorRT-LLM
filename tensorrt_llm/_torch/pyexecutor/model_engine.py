@@ -577,25 +577,8 @@ class PyTorchModelEngine(ModelEngine):
             self.encoder_cuda_graph_config.enable_padding
             if self.encoder_cuda_graph_config is not None else False)
 
-        # A fixed-shape feature encoder derives both bucket lists from the
-        # model's encoder output length, so only a token-driven encoder needs
-        # the user to supply them.
-        if (self.encoder_cuda_graph_config is not None
-                and self._model_encoder_graph_spec() is None
-                and (not encoder_cuda_graph_num_tokens
-                     or not encoder_cuda_graph_seq_lens)):
-            missing = []
-            if not encoder_cuda_graph_num_tokens:
-                missing.append("num_tokens/max_num_token")
-            if not encoder_cuda_graph_seq_lens:
-                missing.append("seq_lens/max_seq_len")
-            logger.warning(
-                f"Encoder CUDA graph configuration has "
-                f"{' and '.join(missing)} unset. Encoder CUDA graphs require "
-                f"both dimensions and will be disabled. "
-                f"To enable them, specify e.g. "
-                f"EncodeCudaGraphConfig(max_batch_size=64, num_tokens=[128, 256, "
-                f"512], max_seq_len=128, enable_padding=True).")
+        self._check_encoder_graph_bucket_config(encoder_cuda_graph_num_tokens,
+                                                encoder_cuda_graph_seq_lens)
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
@@ -944,7 +927,9 @@ class PyTorchModelEngine(ModelEngine):
             # The encoder runner takes its own graph pool. Encoder replay runs
             # on `encoder_stream`, device-concurrent with decoder replay, and
             # torch's pool-sharing contract assumes replays from a shared pool
-            # are not concurrent.
+            # are not concurrent. That concurrency exists for every
+            # encoder-decoder model, so the token encoder path (T5/BART) stops
+            # sharing the decoder pool too, at the cost of its own allocation.
             cuda_graph_mem_pool=None,
             is_encoder_decoder=self._is_encoder_decoder_model(),
             use_fixed_sequence_slots=(self._is_encoder_decoder_model()
@@ -3735,6 +3720,35 @@ class PyTorchModelEngine(ModelEngine):
             self._cached_model_encoder_graph_spec = (spec_fn() if spec_fn
                                                      is not None else None)
         return self._cached_model_encoder_graph_spec
+
+    def _check_encoder_graph_bucket_config(
+            self, encoder_cuda_graph_num_tokens: List[int],
+            encoder_cuda_graph_seq_lens: List[int]) -> None:
+        """Reject an encoder graph config the model cannot complete.
+
+        A fixed-shape feature encoder derives both bucket lists from the
+        model's encoder output length, so only a token-driven encoder needs the
+        user to supply them — and for that encoder the buckets are the whole
+        key space, so a config missing them can only ever run eager. Raise
+        rather than degrade silently: the request to capture was explicit.
+        """
+        if (self.encoder_cuda_graph_config is None
+                or self._model_encoder_graph_spec() is not None):
+            return
+        missing = []
+        if not encoder_cuda_graph_num_tokens:
+            missing.append("num_tokens/max_num_token")
+        if not encoder_cuda_graph_seq_lens:
+            missing.append("seq_lens/max_seq_len")
+        if not missing:
+            return
+        raise ValueError(
+            f"Encoder CUDA graph configuration has {' and '.join(missing)} "
+            f"unset. This model's encoder consumes packed tokens, so it needs "
+            f"both dimensions: specify e.g. "
+            f"EncodeCudaGraphConfig(max_batch_size=64, num_tokens=[128, 256, "
+            f"512], max_seq_len=128, enable_padding=True), or drop "
+            f"encoder_cuda_graph_config to run the encoder eagerly.")
 
     def _encoder_graph_spec(
         self
@@ -7983,8 +7997,12 @@ class PyTorchModelEngine(ModelEngine):
         features: List[torch.Tensor] = []
         for request in encoder_requests:
             f = request.py_encoder_input_features
+            # Exactly one row per request: `_replay_features` copies
+            # `f.shape[0]` rows per request into a mirror slice the bucket
+            # sizes at one row per request, so a multi-row feature would
+            # overrun it.
             if (f is None or int(request.encoder_output_len) != fixed
-                    or f.shape[1:] != runner.config.feature_shape
+                    or tuple(f.shape) != (1, *runner.config.feature_shape)
                     or f.dtype != runner.config.feature_dtype):
                 return None
             features.append(f)

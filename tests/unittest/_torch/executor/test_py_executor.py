@@ -327,6 +327,21 @@ def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
     assert executor.encoder_batch_wait_iters_count == 0
 
 
+def test_encoder_microbatch_admission_skips_uncaptured_padded_size():
+    # An `encoder_max_batch_size` above `max_batch_size` leaves a captured
+    # bucket beyond the admission limit. Padding admission up to the limit
+    # itself is a token-path move: a feature batch of 8 would have to pad to
+    # the captured 16, which `pad_batch` refuses, so it must target 4 instead.
+    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 16], encoder_max_batch_size=16)
+    executor.max_batch_size = 8
+    encoder_requests = [object() for _ in range(12)]
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [object()] * 2)
+
+    assert scheduled == encoder_requests[:4]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
 def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
     # supported_batch_sizes stays populated from the config even when capture
     # was declined (TP > 1, or no bucket fits), so waiting on those shapes

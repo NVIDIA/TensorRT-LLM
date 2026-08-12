@@ -1164,6 +1164,42 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 self.assertEqual(engine._encoder_graph_spec(),
                                  expected if expected is not None else spec)
 
+    def test_encoder_graph_bucket_config_is_required_for_token_encoders(
+            self) -> None:
+        # A token encoder's num_tokens/seq_lens buckets are the whole key
+        # space, so a config missing them can only run eager — a loud failure,
+        # not a silent perf regression. A feature encoder derives both from the
+        # model, so the same config is complete there.
+        engine, _ = self._encoder_spec_engine(
+            EncodeCudaGraphConfig(batch_sizes=[1, 2]), declares_spec=False)
+        with self.assertRaisesRegex(
+                ValueError, "num_tokens/max_num_token and "
+                "seq_lens/max_seq_len"):
+            engine._check_encoder_graph_bucket_config([], [])
+
+        engine, _ = self._encoder_spec_engine(EncodeCudaGraphConfig(
+            batch_sizes=[1, 2], num_tokens=[1500]),
+                                              declares_spec=False)
+        with self.assertRaisesRegex(ValueError, "seq_lens/max_seq_len unset"):
+            engine._check_encoder_graph_bucket_config([1500], [])
+
+        for name, config, declares_spec in [
+            ("token model with both buckets",
+             EncodeCudaGraphConfig(batch_sizes=[1],
+                                   num_tokens=[1500],
+                                   seq_lens=[1500]), False),
+            ("feature model derives both",
+             EncodeCudaGraphConfig(batch_sizes=[1, 2]), True),
+            ("no config", None, False),
+        ]:
+            with self.subTest(name):
+                engine, _ = self._encoder_spec_engine(
+                    config, declares_spec=declares_spec)
+                num_tokens = config.num_tokens if config else []
+                seq_lens = config.seq_lens if config else []
+                engine._check_encoder_graph_bucket_config(
+                    num_tokens or [], seq_lens or [])
+
     def test_encoder_cuda_graph_stages_and_restores_fixed_sequence_slots(
             self) -> None:
         runner = EncoderCUDAGraphRunner.__new__(EncoderCUDAGraphRunner)

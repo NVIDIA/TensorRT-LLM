@@ -295,8 +295,11 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
     # Capture alone is not enough: `pad_batch` and the shape checks in
     # `_maybe_forward_encoder_graph` can route every request to the eager
     # encoder while `graphs` stays populated, and that silent fallback would
-    # pass every output assertion above. Only the replay counter rules it out.
-    assert encoder_runner.num_feature_replays > 0
+    # pass every output assertion above. Only the replay counter rules it out,
+    # and only against the warmup baseline: the capture pass replays each key
+    # once immediately after capturing it, so anything at or below
+    # `len(graphs)` is still explainable by warmup alone.
+    assert encoder_runner.num_feature_replays > len(encoder_runner.graphs)
 
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:

@@ -5525,7 +5525,14 @@ class PyExecutor:
                 batch_size for batch_size in configured_batch_sizes
                 if batch_size <= encoder_batch_size_limit
             ]
-            if (encoder_cuda_graph_config.enable_padding
+            # Targeting a size the runner never captured only pays off on the
+            # token path, where the pads are single tokens and the batch still
+            # rounds up into a captured bucket. A feature pad slot is a whole
+            # fixed_seq_len request, so `pad_batch` refuses any gap wider than
+            # 12.5% and such a batch would run eager; target the largest
+            # captured size within the limit instead.
+            if (not is_feature_encoder
+                    and encoder_cuda_graph_config.enable_padding
                     and any(batch_size > encoder_batch_size_limit
                             for batch_size in configured_batch_sizes) and
                 (not supported_batch_sizes
