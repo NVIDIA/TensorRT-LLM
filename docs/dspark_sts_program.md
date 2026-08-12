@@ -965,3 +965,16 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **v4 表**(`align_pro_table_v4.json`,与 v3 的 32/64 样本合并拟合):OSL=512 长寿命客户端在 agg 稳住 bs=128 纯 gen 步(1,385 iter 实测样本,"早完成者"问题根治),θ 实测到 768 token 工作点。**v3 线性外推在 M=768 高估 ~17%**(≈63 外推 vs 53.8ms 实测)——bs128 过度裁剪的定量来源;α(128)=5.0ms 补齐。
 - **终局配对判决**(同节点背靠背、双向臂序,原始对齐协议 maxbs=128/mnt=8192/client=1024):notrim 4,306/4,293 vs sched(v4+`SKIP_MIXED_TRIM`)4,322/4,365 = **+0.4%/+1.7%**;对照原矩阵同格 −1.2%(v2 表、无门控)。**修正表 + 门控把本负载 agg 从负拉回打平/微正**;上限受限于 50% 混合步不可裁 + 纯 gen 步等效 bs ~89 的浅 θ。
 - t32 档未复测(门控主导,预期 ≈0);disagg 深 bs(ctx≥2:gen1 + OSL1024 + v4)仍是唯一可能的显著正收益格,待明日节点。
+
+## 【08-12 00:10】主线 → laliao 侧:arena burst 语义对表 + disagg gen 提交路径 provenance(回应两问)
+
+**① arena 臂语义**(profinal,+6.8/+5.9% 的那轮)——原件都在 `docs/dspark_bench_assets/`:
+- 客户端 `p25fix_bench.py` 逐字:arena-hard-v0.1 全集 500 题循环取 `prompt`;`max_tokens=768, temperature=0.7`,**无 ignore_eos**(自然停止允许,实测均值 ~760 ≈ 多数打满 cap);burst-drain = asyncio.gather 一次性 N 发全下、全完成计 wall;每 (dataset,bs) 首 rep 为 warm(rep=-1 丢弃)+ 5 计量 reps;指标 = Σcompletion_tokens/wall。
+- serve:`pro_sched_arm.yaml` 原件已推;graphs [1,8,32,64,128]+padding(非全阶梯),maxbs 256、mnt 4096。
+- 你 arena ≈0 vs 我 +6.8/+5.9 的候选还有一个:**臂间同节点纪律**——arena 的节点噪声你自己测过 3.8pp(08-09 工程沉淀),profinal 是同节点臂序对调;若你 arena 双臂跨节点,±4pp 即可吞掉信号。
+
+**② disagg gen 提交路径 provenance**(你的 no-commit 回归协查):
+- 我方 disagg gen = **sqsh `dspark-p0/trtllm.sqsh` + 全量仓库 mount**(非 overlay):R6/osl1k 轮 = 分支树 ≈ `9c5d203766`+门控补丁;今晚 deep 战役 = `1a48727867`。
+- **反证数据点:我方分支 HEAD 的 disagg gen 提交路径是通的**——08-11 上午 osl1kb 轮,gen 完整消费 ctx 交接并产出 1024-token 完成(每 rep ~1.04M token,fails=0,KV util 正常起落)。你的症状(verify+draft 真执行、active 恒 64/512、零完成、KV 平线)在我方全分支历史中未出现过。
+- 我方近期 commit 无有意改动 disagg gen 首步提交/接受路径(门控补丁只在 planner phase-1 加 decline)。你的 base 是 `faf2c60935`+28 文件 overlay——**怀疑点排序:overlay 组合(部分文件新、部分旧的 Franken 树)> sqsh 基底 > 分支本体**;D1 判别(旧镜像无 overlay)正是对的刀口。若 D1 通,建议直接换"全量 mount 我们分支 HEAD"复跑,跳过 28 文件二分。
+- 我方 deep 战役(3ctx:1gen,OSL1024,今晚)同路径在跑,出数即再添一个分支 HEAD 的通/不通数据点。
