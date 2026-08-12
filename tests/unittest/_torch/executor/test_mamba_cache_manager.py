@@ -1781,7 +1781,8 @@ def test_flashinfer_hybrid_page_tables_use_attention_layer(
         ) as get_indices:
             metadata.prepare()
 
-        assert metadata._primary_kv_layer_idx == 1
+        assert metadata._get_pp_attention_layer_ids() == [1]
+        assert metadata._default_kv_layer_idx == 1
         assert get_indices.call_count >= 1
         assert all(call.kwargs.get("layer_idx") == 1 for call in get_indices.call_args_list)
         assert torch.all(metadata.paged_kv_indices >= 0)
@@ -1830,7 +1831,7 @@ def test_flashinfer_metadata_skips_paged_kv_on_recurrent_only_rank() -> None:
 
         metadata.prepare()
 
-        assert metadata._primary_kv_layer_idx is None
+        assert metadata._default_kv_layer_idx is None
         assert metadata.paged_kv_indices.numel() == 0
         assert metadata.num_blocks == [0]
     finally:
