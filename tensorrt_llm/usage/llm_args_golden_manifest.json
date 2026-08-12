@@ -426,6 +426,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "enable_iter_perf_stats"
     },
     {
