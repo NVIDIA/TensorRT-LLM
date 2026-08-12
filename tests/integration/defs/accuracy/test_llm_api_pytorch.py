@@ -571,8 +571,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             acceptance_length = _compute_acceptance_length(llm)
             print(f"[AL] test_pard acceptance_length = {acceptance_length:.3f}")
-            assert_acceptance_length(
-                "TestLlama3_1_8BInstruct::test_pard", acceptance_length)
+            assert_acceptance_length("TestLlama3_1_8BInstruct::test_pard",
+                                     acceptance_length)
 
     @skip_pre_hopper
     def test_pard_sa(self):
