@@ -29,8 +29,11 @@
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels::fp8_grouped_gemm
+namespace kernels::fp8GroupedGemmConfig
 {
+
+inline constexpr int kSm90 = 90;
+inline constexpr int kSm100 = 100;
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 struct Sm90Config
@@ -68,6 +71,6 @@ struct Sm100Config
 };
 #endif
 
-} // namespace kernels::fp8_grouped_gemm
+} // namespace kernels::fp8GroupedGemmConfig
 
 TRTLLM_NAMESPACE_END

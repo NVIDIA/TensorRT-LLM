@@ -21,6 +21,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/kernel/gemm_grouped.h"
+#include "fp8GroupedGemmConfig.h"
 
 #ifdef ENABLE_FP8
 #include "cute/tensor.hpp"
@@ -31,7 +32,6 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
-#include "fp8GroupedGemmConfig.h"
 #endif // ENABLE_FP8
 
 #include "groupGemm.h"
@@ -48,13 +48,13 @@ namespace kernels
 {
 bool supportsFp8GroupedGemm(int smVersion)
 {
-    if (smVersion == 90)
+    if (smVersion == fp8GroupedGemmConfig::kSm90)
     {
 #if defined(ENABLE_FP8) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
         return true;
 #endif
     }
-    else if (smVersion == 100)
+    else if (smVersion == fp8GroupedGemmConfig::kSm100)
     {
 #if defined(ENABLE_FP8) && defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
         return true;
@@ -72,7 +72,7 @@ void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& p
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
     // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
-    TLLM_CHECK_WITH_INFO(smVersion == 90 || smVersion == 100,
+    TLLM_CHECK_WITH_INFO(smVersion == fp8GroupedGemmConfig::kSm90 || smVersion == fp8GroupedGemmConfig::kSm100,
         "%s requires Hopper (SM90) or B200 (SM100), but the current device is SM%d", kernelName, smVersion);
 
     for (size_t problemIdx = 0; problemIdx < problemSizes.size(); ++problemIdx)
@@ -501,18 +501,18 @@ void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, s
     cudaStream_t stream)
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
-    if (smVersion == 90)
+    if (smVersion == fp8GroupedGemmConfig::kSm90)
     {
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
-        fp8GroupedGemmImpl<fp8_grouped_gemm::Sm90Config>(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace,
+        fp8GroupedGemmImpl<fp8GroupedGemmConfig::Sm90Config>(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace,
             gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, stream);
         return;
 #endif
     }
-    else if (smVersion == 100)
+    else if (smVersion == fp8GroupedGemmConfig::kSm100)
     {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
-        fp8GroupedGemmImpl<fp8_grouped_gemm::Sm100Config>(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace,
+        fp8GroupedGemmImpl<fp8GroupedGemmConfig::Sm100Config>(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace,
             gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, stream);
         return;
 #endif

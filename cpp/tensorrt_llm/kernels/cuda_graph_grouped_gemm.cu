@@ -15,6 +15,7 @@
  */
 
 #include "cuda_graph_grouped_gemm.h"
+#include "fp8GroupedGemmConfig.h"
 #include "groupGemm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -39,7 +40,6 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
-#include "fp8GroupedGemmConfig.h"
 #endif // ENABLE_FP8
 
 TRTLLM_NAMESPACE_BEGIN
@@ -56,7 +56,7 @@ void checkFp8CudaGraphAlignment(
 {
     static int const smVersion = tensorrt_llm::common::getSMVersion();
     // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
-    TLLM_CHECK_WITH_INFO(smVersion == 90 || smVersion == 100,
+    TLLM_CHECK_WITH_INFO(smVersion == fp8GroupedGemmConfig::kSm90 || smVersion == fp8GroupedGemmConfig::kSm100,
         "%s requires Hopper (SM90) or B200 (SM100), but the current device is SM%d", kernelName, smVersion);
 
     TLLM_CHECK_WITH_INFO(minKN >= kFp8TmaAlignment && minKN % kFp8TmaAlignment == 0,
@@ -332,18 +332,18 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     cudaStream_t stream)
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
-    if (smVersion == 90)
+    if (smVersion == fp8GroupedGemmConfig::kSm90)
     {
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
-        fp8CudaGraphGroupedGemmImpl<fp8_grouped_gemm::Sm90Config>(
+        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm90Config>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
 #endif
     }
-    else if (smVersion == 100)
+    else if (smVersion == fp8GroupedGemmConfig::kSm100)
     {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
-        fp8CudaGraphGroupedGemmImpl<fp8_grouped_gemm::Sm100Config>(
+        fp8CudaGraphGroupedGemmImpl<fp8GroupedGemmConfig::Sm100Config>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu, stream);
         return;
 #endif
