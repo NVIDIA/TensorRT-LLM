@@ -40,10 +40,19 @@ Run:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 import torch
+
+# Positions in deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl's template list, from the
+# pinned upstream header (3rdparty/fetch_content.json -> deepgemm f8e8fb58,
+# deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh:16). Zero-based:
+#   0 kMajorA  1 kMajorB  2 kGranKA  3 kGranKB  4 kKAlignment
+#   5 SHAPE_M  6 SHAPE_N  7 SHAPE_K  8 BLOCK_M  9 BLOCK_N  10 BLOCK_K
+#   11 kNumGroups  ... 25 a_dtype  26 b_dtype  27 cd_dtype  28 epilogue
+_DG_ARITY, _DG_N, _DG_K, _DG_GROUPS = 29, 6, 7, 11
 
 _MANIFEST_PATH = Path(__file__).parent / "v4_trace_cases.json"
 
@@ -54,6 +63,52 @@ _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU"
 # and SKIP, so a new arch bootstraps instead of false-firing. Pinning a value is
 # an explicit, reviewed decision -- confirm zero variance over K runs first.
 _EXPECTED_LAUNCH_COUNT: dict[str, dict[str, int]] = {}
+
+
+def _split_template_args(s: str) -> list[str]:
+    """Split a template argument list on commas that are not nested."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip()); cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur).strip())
+    return out
+
+
+def _deep_gemm_shape(demangled: str):
+    """(N, K, num_groups) for one deep_gemm instantiation, or None.
+
+    Matching on formatted substrings does not work: the two demanglers in play
+    print the same value differently. nsys writes ``(unsigned int)4096`` while
+    cxxfilt -- what the CUPTI path uses -- writes ``4096u``, so a needle built
+    from one format silently fails to find a kernel that is right there. Build
+    #45 failed exactly that way, reporting the two dominant GEMMs as absent
+    while printing them in the very same message. Parse positionally and compare
+    numbers instead.
+
+    Returns None when the arity does not match the pinned header, because a
+    changed parameter list shifts every position after it and a best-effort read
+    would compare the wrong fields.
+    """
+    m = re.search(r"deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(.*)>\s*\(", demangled, re.S)
+    if not m:
+        return None
+    args = _split_template_args(m.group(1))
+    if len(args) != _DG_ARITY:
+        return None
+    def _int(a):
+        v = re.sub(r"^\((?:unsigned )?int\)\s*", "", a.strip())   # nsys form
+        v = re.sub(r"[uU]+$", "", v.strip())                       # cxxfilt form
+        return int(v) if re.fullmatch(r"-?\d+", v) else None
+    n, k, g = _int(args[_DG_N]), _int(args[_DG_K]), _int(args[_DG_GROUPS])
+    return None if None in (n, k, g) else (n, k, g)
 
 
 def _current_sm() -> str:
@@ -235,23 +290,22 @@ def test_v4_moe_traced_gemm_shapes_present(request):
     m = _manifest()
     moe, model, rl = _build_traced_moe(m)
     kernels = _forward_kernels(request, moe, model, rl, m["workload"]["num_tokens"])
-    names = "\n".join(k["name"] for k in kernels)
+    observed = {s for s in (_deep_gemm_shape(k["name"]) for k in kernels) if s}
 
     # Only the grouped shapes: the num_groups=1 ones come from the dense
     # GatedMLP branch, which this single-expert-group build does not exercise.
     wanted = [g for g in m["gemm_shapes"] if g["num_groups"] > 1]
-    missing = []
-    for g in wanted:
-        needle = (f"(unsigned int){g['N']}, (unsigned int){g['K']}")
-        if needle not in names:
-            missing.append(g)
+    missing = [g for g in wanted
+               if (g["N"], g["K"], g["num_groups"]) not in observed]
 
     assert not missing, (
         "GEMM shapes present in the traced run are absent from this build: "
         + ", ".join(f"N={g['N']} K={g['K']} groups={g['num_groups']} "
                     f"({g['share_of_iteration']*100:.1f}% of a traced iteration)"
                     for g in missing)
-        + f"\nobserved kernels:\n{names}")
+        + "\nobserved deep_gemm shapes (N, K, groups): "
+        + (", ".join(str(s) for s in sorted(observed)) or "none")
+        + "\nall kernels:\n" + "\n".join(k["name"] for k in kernels))
 
 
 @_GPU
