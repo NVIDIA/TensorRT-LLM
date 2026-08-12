@@ -579,7 +579,9 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
     print(f"-- Staging python package sources into {staging_dir} ...")
     staging_dir.mkdir(parents=True, exist_ok=True)
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
-    for tree in ("tensorrt_llm", "triton_kernels",
+    # examples: setup.py's root-level find_packages() ships the
+    # examples.configs.database package from it.
+    for tree in ("tensorrt_llm", "triton_kernels", "examples",
                  "3rdparty/MSA/python/fmha_sm100"):
         dst = staging_dir / tree
         if dst.exists():
