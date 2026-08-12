@@ -18,7 +18,7 @@ import os
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import (

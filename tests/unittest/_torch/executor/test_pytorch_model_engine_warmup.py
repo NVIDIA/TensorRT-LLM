@@ -158,7 +158,7 @@ def _run_warmup_tracked(
 def _capture_tllm_logs():
     """Capture logger.info calls emitted from the model_engine module.
 
-    tensorrt_llm.logger.logger is a custom Singleton (not a stdlib
+    tensorrt_llm.observability.logging.logger is a custom Singleton (not a stdlib
     logging.Logger) and does not route through stdlib logging by default,
     so a logging.Handler attached to logging.getLogger("tensorrt_llm")
     sees nothing. Patch the logger.info bound on the model_engine module

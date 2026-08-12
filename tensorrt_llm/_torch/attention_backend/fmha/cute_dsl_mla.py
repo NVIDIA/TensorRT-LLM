@@ -26,7 +26,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .phased import FmhaParams, PhasedFmha
 

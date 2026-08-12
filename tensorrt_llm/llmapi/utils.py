@@ -30,7 +30,7 @@ from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 from tqdm.auto import tqdm
 
-from tensorrt_llm.logger import Singleton, logger
+from tensorrt_llm.observability.logging import Singleton, logger
 
 
 class StrictBaseModel(BaseModel):

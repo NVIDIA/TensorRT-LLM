@@ -79,8 +79,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCache
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
-from ...logger import logger
 from ...mapping import CpType, Mapping
+from ...observability.logging import logger
 from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (

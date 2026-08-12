@@ -30,7 +30,7 @@ from typing import Any, Callable
 from ._utils import temporary_sys_path
 
 if "tensorrt_llm" in sys.modules:
-    from tensorrt_llm.logger import logger
+    from tensorrt_llm.observability.logging import logger
     from tensorrt_llm.runtime.kv_cache_hash import (
         KV_CACHE_HASH_ALGO_AUTO,
         KV_CACHE_HASH_ALGO_DEFAULT,

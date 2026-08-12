@@ -18,7 +18,7 @@ import time
 from enum import Enum
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Import base classes for type compatibility
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus

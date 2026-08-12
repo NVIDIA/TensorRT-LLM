@@ -67,7 +67,7 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 ENV_STATS_DIR = "TLLM_DFLASH_ACCEPT_STATS_DIR"
 ENV_FLUSH_EVERY = "TLLM_DFLASH_ACCEPT_STATS_FLUSH_EVERY"

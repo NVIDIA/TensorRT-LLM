@@ -34,11 +34,11 @@ from tensorrt_llm.llmapi.llm_args import (
     SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
     TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
-from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.observability.logging import logger
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch

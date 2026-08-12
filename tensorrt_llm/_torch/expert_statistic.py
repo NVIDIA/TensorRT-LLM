@@ -4,7 +4,7 @@ import os
 import safetensors
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class ExpertStatistic:

@@ -22,8 +22,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.observability.logging import logger
 
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize

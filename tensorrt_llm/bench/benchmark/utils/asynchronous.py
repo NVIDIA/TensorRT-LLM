@@ -32,7 +32,7 @@ from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class LlmManager:

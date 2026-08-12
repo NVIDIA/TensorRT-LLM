@@ -25,10 +25,10 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
-from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
+from ..observability.logging import logger
 from ..sampling_params import LogprobParams, SamplingParams
 from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
 from .utils import (EngineDeadError, ErrorResponse, has_event_loop,

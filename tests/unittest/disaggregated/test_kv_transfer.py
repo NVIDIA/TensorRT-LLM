@@ -54,7 +54,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
 KV_TRANSFER_TEST_NUM_THREADS = 4
@@ -1017,7 +1017,7 @@ WINDOW_SIZE_TEST_CONFIGS = [
 )
 def test_transfer_worker_v1(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla):
     """Test transfer worker with KVCacheManager (V1)."""
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
     logger.info("Test transfer worker V1 with parallel configurations")
 
     setup = create_transfer_worker_setup(
@@ -1051,7 +1051,7 @@ def test_transfer_worker_v1(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
 )
 def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla):
     """Test transfer worker with KVCacheManagerV2 (V2)."""
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
     logger.info("Test transfer worker V2 with parallel configurations")
 
     setup = create_transfer_worker_setup(
@@ -1087,7 +1087,7 @@ def test_transfer_worker_v2_with_window(
     ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, max_attention_window_vec
 ):
     """Test V2 transfer worker with sliding window attention."""
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
     logger.info("Test transfer worker V2 with sliding window attention")
 
     setup = create_transfer_worker_setup(
@@ -1122,7 +1122,7 @@ def test_transfer_with_gen_prefix_offset(use_v2):
     gen only provides the suffix block list. The receiver-side prefix is
     implicit in the block count; the sender derives dst_start from it.
     """
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
     tokens_per_block = 8
     request_len = 32  # 4 blocks
     prefix_blocks = 2  # gen has 2 blocks already cached
@@ -1319,7 +1319,7 @@ def test_session_cancel_before_send():
 @pytest.mark.timeout(60)
 def test_session_cancel_after_send():
     """TxSession cancelled after send() queues INIT tasks; future raises."""
-    tensorrt_llm.logger.set_level("debug")
+    tensorrt_llm.observability.logging.set_level("debug")
     setup = create_transfer_worker_setup(
         ctx_tp=1,
         ctx_pp=1,

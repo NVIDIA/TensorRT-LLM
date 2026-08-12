@@ -25,9 +25,9 @@ from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,

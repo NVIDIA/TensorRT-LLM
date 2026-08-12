@@ -24,7 +24,7 @@ from typing import Generic, NamedTuple, TypeVar
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 K = TypeVar("K", bound=Hashable)
 

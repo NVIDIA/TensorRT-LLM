@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 GUARDRAIL_HF_REPO = "nvidia/Cosmos-1.0-Guardrail"
 GUARDRAIL_REVISION = "cf03c0395fac8c4de386c0bdab12cc4fc8d66362"

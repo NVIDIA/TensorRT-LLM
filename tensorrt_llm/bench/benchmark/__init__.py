@@ -11,7 +11,7 @@ from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.tuning.settings import get_model_config
 from tensorrt_llm.commands.utils import \
     collect_explicit_cli_keys as _collect_explicit_cli_keys
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Map trtllm-bench Click parameter names to the LlmArgs field name (or
 # merge-function CLI scalar name) used by `update_llm_args_with_extra_options`.

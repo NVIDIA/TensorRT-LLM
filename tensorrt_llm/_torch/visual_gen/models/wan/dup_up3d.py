@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 _BLOCK_SIZE = 256
 _NUM_WARPS = 8

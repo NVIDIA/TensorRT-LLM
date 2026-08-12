@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, Hashable, List, Optional, Protocol, Tupl
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..utils import make_weak_ref
 

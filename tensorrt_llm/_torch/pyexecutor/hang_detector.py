@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import Callable, Optional
 
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137

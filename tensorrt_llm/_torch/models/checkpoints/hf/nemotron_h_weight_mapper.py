@@ -4,11 +4,11 @@ from typing import Optional
 import torch
 from torch import nn
 
-import tensorrt_llm.logger as logger
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.observability.logging import logger
 
 
 @register_mapper("HF", "NemotronHPuzzleForCausalLM")

@@ -24,7 +24,7 @@ from blake3 import blake3
 
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest

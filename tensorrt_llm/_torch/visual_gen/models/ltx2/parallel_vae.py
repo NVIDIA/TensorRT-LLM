@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .ltx2_core.types import VideoLatentShape
 

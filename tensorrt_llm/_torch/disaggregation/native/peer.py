@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
@@ -36,6 +35,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_to_layer_group,
     get_pool_view_global_layer_ids,
 )
+from tensorrt_llm.observability.logging import logger
 
 # Type alias for (lg_idx, pool_idx) pair
 LGPoolKey = Tuple[int, int]

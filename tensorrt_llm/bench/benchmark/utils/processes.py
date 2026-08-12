@@ -8,7 +8,7 @@ from typing import Optional, Union
 
 from zmq import PULL, Context
 
-from tensorrt_llm import logger
+from tensorrt_llm.observability.logging import logger
 
 
 # The IterationWriter class implements a multi-process logging system that captures and writes

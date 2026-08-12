@@ -26,7 +26,7 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter

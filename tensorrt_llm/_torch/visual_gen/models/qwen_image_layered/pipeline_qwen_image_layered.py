@@ -25,7 +25,7 @@ import torch
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .transformer_qwen_image_layered import QwenImageLayeredTransformer2DModel
 

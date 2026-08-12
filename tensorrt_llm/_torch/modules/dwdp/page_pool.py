@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .vmm import (
     align_up,

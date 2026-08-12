@@ -29,7 +29,7 @@ import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
 from .grpc_request_manager import (

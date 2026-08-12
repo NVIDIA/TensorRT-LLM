@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, RequestStats
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
 

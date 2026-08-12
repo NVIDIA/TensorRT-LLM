@@ -244,7 +244,7 @@ def worker_fn(
 
     # Initialize distributed (use gloo for single GPU compatibility)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
 
     ctx_instance_num = ctx_tp * ctx_pp
     gen_instance_num = gen_tp * gen_pp

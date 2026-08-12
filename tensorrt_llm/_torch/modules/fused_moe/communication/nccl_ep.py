@@ -38,8 +38,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 from .base import Communication
 

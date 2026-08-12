@@ -27,7 +27,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager

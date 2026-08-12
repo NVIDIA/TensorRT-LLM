@@ -40,7 +40,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor,
                        support_multimodal_disaggregated)
-from ...logger import logger
+from ...observability.logging import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams

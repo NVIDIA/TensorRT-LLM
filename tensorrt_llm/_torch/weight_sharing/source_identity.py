@@ -72,7 +72,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 if TYPE_CHECKING:
     from torch import nn

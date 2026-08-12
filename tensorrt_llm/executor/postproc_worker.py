@@ -11,7 +11,7 @@ from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
-from ..logger import logger
+from ..observability.logging import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
 from .postprocessor_hook import load_post_processor_hook

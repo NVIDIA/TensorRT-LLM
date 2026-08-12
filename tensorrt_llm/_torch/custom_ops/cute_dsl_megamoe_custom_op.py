@@ -37,7 +37,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..._utils import get_sm_version
 from ...math_utils import ceil_div, pad_up

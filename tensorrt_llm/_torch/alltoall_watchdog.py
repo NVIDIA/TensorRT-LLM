@@ -39,7 +39,7 @@ from typing import Protocol
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.logger import logger as tllm_logger
+from tensorrt_llm.observability.logging import logger as tllm_logger
 
 DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S = 5.0
 DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S = 0.1

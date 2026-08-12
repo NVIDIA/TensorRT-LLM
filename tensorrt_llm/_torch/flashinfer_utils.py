@@ -2,7 +2,7 @@ import os
 import platform
 import traceback
 
-from ..logger import logger
+from ..observability.logging import logger
 
 IS_FLASHINFER_AVAILABLE = False
 

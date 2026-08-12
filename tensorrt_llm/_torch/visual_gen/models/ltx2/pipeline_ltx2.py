@@ -23,7 +23,7 @@ from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
 from .ltx2_core.connector import Embeddings1DConnectorConfigurator, GemmaFeaturesExtractorProjLinear

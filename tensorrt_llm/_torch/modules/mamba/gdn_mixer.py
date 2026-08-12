@@ -25,8 +25,8 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduceParams

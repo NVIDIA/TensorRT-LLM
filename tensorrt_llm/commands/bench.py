@@ -8,7 +8,7 @@ from tensorrt_llm.bench.benchmark.throughput import throughput_command
 from tensorrt_llm.bench.benchmark.visual_gen import visual_gen_command
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataset.prepare_dataset import prepare_dataset
-from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.observability.logging import logger, severity_map
 from tensorrt_llm.usage import config as _telemetry_config
 
 

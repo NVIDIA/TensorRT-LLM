@@ -26,7 +26,7 @@ from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_atte
     CUTE_AVAILABLE,
 )
 from tensorrt_llm.llmapi.utils import download_hf_model
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 from .config import DiffusionPipelineConfig

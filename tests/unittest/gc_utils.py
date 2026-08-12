@@ -4,7 +4,7 @@ import types
 import weakref
 from contextlib import contextmanager
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 @contextmanager

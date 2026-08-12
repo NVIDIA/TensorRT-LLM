@@ -19,7 +19,7 @@ import re
 from functools import lru_cache
 from typing import List, NamedTuple, Optional, Tuple
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 try:
     import nvMatmulHeuristics as _nvmmh

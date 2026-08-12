@@ -7,7 +7,7 @@ from typing import Dict, List
 import torch
 from torch.fx import Graph, GraphModule, Node
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..utils import inplace_info
 

@@ -9,7 +9,7 @@ from typing import List, Optional
 
 import zmq
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm

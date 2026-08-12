@@ -12,7 +12,7 @@ from blake3 import blake3
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
                                                  serialize_item)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Default hasher
 default_hasher = blake3

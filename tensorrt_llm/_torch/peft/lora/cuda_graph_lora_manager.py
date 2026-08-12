@@ -18,8 +18,8 @@ from typing import Dict, Optional
 import torch
 
 from ...._utils import nvtx_range
-from ....logger import logger
 from ....lora_manager import LoraManager, LoraModelConfig
+from ....observability.logging import logger
 from ...attention_backend.interface import AttentionMetadata
 from ...pyexecutor.resource_manager import PeftCacheManager
 from ...pyexecutor.scheduler import ScheduledRequests

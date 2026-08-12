@@ -25,7 +25,7 @@ from typing import Any, NamedTuple, Tuple
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention_backend.interface import PredefinedAttentionMask

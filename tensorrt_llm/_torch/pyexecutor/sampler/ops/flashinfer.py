@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode

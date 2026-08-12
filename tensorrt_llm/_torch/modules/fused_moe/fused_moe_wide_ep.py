@@ -21,8 +21,8 @@ import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import is_sm_100f, local_mpi_size
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ...distributed import allgather, reducescatter

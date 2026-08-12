@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings
-from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
@@ -58,6 +57,7 @@ from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):

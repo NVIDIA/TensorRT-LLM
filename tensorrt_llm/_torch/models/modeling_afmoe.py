@@ -36,7 +36,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from tensorrt_llm.functional import PositionEmbeddingType
 
-from ...logger import logger
+from ...observability.logging import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce

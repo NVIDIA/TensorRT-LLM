@@ -19,7 +19,7 @@ from io import StringIO
 
 import pytest
 
-from tensorrt_llm.logger import (
+from tensorrt_llm.observability.logging import (
     Logger,
     _extract_module,
     _format_module,
@@ -57,7 +57,16 @@ class TestExtractModule:
         assert _extract_module("tensorrt_llm._torch.pyexecutor.foo") == "_torch"
 
     def test_top_level_module(self):
-        assert _extract_module("tensorrt_llm.logger") == "logger"
+        # A module directly under the package reports its own name.
+        assert _extract_module("tensorrt_llm.version") == "version"
+
+    def test_module_inside_subpackage_reports_the_subpackage(self):
+        assert _extract_module("tensorrt_llm.observability.logging") == "observability"
+
+    def test_relocated_module_keeps_its_label(self):
+        # Pinned label: the profiler's records stay tagged as before, so
+        # TLLM_LOG_LEVEL_BY_MODULE="debug:profiler" keeps matching them.
+        assert _extract_module("tensorrt_llm.observability.profiling") == "profiler"
 
     def test_no_tensorrt_llm_prefix(self):
         assert _extract_module("__main__") == ""
@@ -186,7 +195,7 @@ class TestLoggerOutput:
             "__file__": "/fake/tensorrt_llm/serve/router.py",
         }
         code = compile(
-            "from tensorrt_llm.logger import logger; logger.info('from serve')",
+            "from tensorrt_llm.observability.logging import logger; logger.info('from serve')",
             "/fake/tensorrt_llm/serve/router.py",
             "exec",
         )
@@ -195,6 +204,26 @@ class TestLoggerOutput:
         output = capture_log.getvalue()
         assert "[serve]" in output
         assert "from serve" in output
+
+    def test_log_from_relocated_profiler(self, capture_log):
+        """Records emitted from inside the moved profiler keep the `profiler` tag."""
+        singleton = Logger()
+        singleton._min_severity = "info"
+
+        fake_globals = {
+            "__name__": "tensorrt_llm.observability.profiling",
+            "__file__": "/fake/tensorrt_llm/observability/profiling.py",
+        }
+        code = compile(
+            "from tensorrt_llm.observability.logging import logger; logger.info('from profiler')",
+            "/fake/tensorrt_llm/observability/profiling.py",
+            "exec",
+        )
+        exec(code, fake_globals)
+
+        output = capture_log.getvalue()
+        assert "[profiler]" in output
+        assert "from profiler" in output
 
 
 class TestModuleLevelFiltering:
@@ -224,6 +253,20 @@ class TestModuleLevelFiltering:
 
         assert singleton.is_severity_enabled(Logger.INFO, "serve") is False
         assert singleton.is_severity_enabled(Logger.ERROR, "serve") is True
+
+        # Cleanup
+        singleton._module_levels = {}
+
+    def test_legacy_profiler_filter_key_still_matches(self):
+        # An existing TLLM_LOG_LEVEL_BY_MODULE="debug:profiler" must keep
+        # controlling the profiler's own records after the move.
+        singleton = Logger()
+        singleton._min_severity = "error"
+        singleton._module_levels = _parse_module_levels("debug:profiler")
+
+        module = _extract_module("tensorrt_llm.observability.profiling")
+        assert singleton.is_severity_enabled(Logger.INFO, module) is True
+        assert singleton.is_severity_enabled(Logger.DEBUG, module) is True
 
         # Cleanup
         singleton._module_levels = {}

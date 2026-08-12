@@ -15,7 +15,7 @@ from tensorrt_llm.bench.tuning.dataclasses import (NemotronHybridConfig,
                                                    Qwen3HybridConfig)
 from tensorrt_llm.bench.tuning.settings import (get_benchmark_engine_settings,
                                                 get_model_config)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.version import __version__
 

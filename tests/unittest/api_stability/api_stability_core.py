@@ -31,7 +31,7 @@ from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  RequestOutput, SamplingParams)
 from tensorrt_llm.llmapi.llm_args import SamplerType
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
-from tensorrt_llm.logger import Singleton
+from tensorrt_llm.observability.logging import Singleton
 from tensorrt_llm.sampling_params import LogprobMode
 
 

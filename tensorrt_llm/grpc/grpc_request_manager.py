@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +32,7 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.request import LoRARequest, PromptAdapterRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from . import trtllm_service_pb2 as pb2

@@ -55,7 +55,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_bindi
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .phased import FmhaParams, PhasedFmha

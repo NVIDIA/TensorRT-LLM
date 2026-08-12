@@ -5,7 +5,7 @@ import pytest
 from apps.fastapi_server import LLM, LlmServer
 from fastapi.testclient import TestClient
 
-import tensorrt_llm.profiler as profiler
+import tensorrt_llm.observability.profiling as profiler
 
 from ..test_llm import llama_model_path
 

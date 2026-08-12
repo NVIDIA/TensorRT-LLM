@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.bindings.internal.thop import BufferKind
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up

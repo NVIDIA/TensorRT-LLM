@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 from examples.scaffolding.mcp.fetch_webpage import VisitController, VisitTask
 from examples.scaffolding.mcp.tavily_search import TavilyController, TavilyTask
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.scaffolding.controller import Controller, NativeGenerationController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.task import (

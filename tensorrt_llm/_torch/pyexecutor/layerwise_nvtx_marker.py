@@ -1,7 +1,7 @@
 import torch
 import torch.cuda.nvtx as nvtx
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class LayerwiseNvtxMarker(object):

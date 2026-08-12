@@ -8,7 +8,7 @@ from typing import Any
 
 from examples.scaffolding.mcp.fetch_webpage import VisitController, VisitTask
 from examples.scaffolding.mcp.tavily_search import TavilyController, TavilyTask
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.scaffolding.controller import (
     Controller,
     NativeGenerationController,

@@ -40,7 +40,7 @@ from typing import Any, Optional
 import numpy as np
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Distilled checkpoints bake classifier-free guidance into the weights; the
 # only valid scale is 1.0 ("off": a single conditional forward per step).

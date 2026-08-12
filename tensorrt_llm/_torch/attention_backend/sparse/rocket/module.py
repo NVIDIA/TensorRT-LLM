@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..hooks import AttentionSparseHooks, register_attention_sparse_hooks
 

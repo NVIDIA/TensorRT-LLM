@@ -31,7 +31,7 @@ import json
 import re
 from typing import Any, Dict, List
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .base_tool_parser import BaseToolParser

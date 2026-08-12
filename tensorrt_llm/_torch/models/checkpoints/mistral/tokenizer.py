@@ -9,7 +9,7 @@ from transformers.tokenization_mistral_common import (
 )
 
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 # Adapted from:

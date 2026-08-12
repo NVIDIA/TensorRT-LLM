@@ -6,7 +6,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed.device_mesh import init_device_mesh
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import MappingBase as _MappingBaseForTypeCheck

@@ -43,7 +43,7 @@ import torch
 
 # Try to use tensorrt_llm logger if available, otherwise use standard logging
 try:
-    from tensorrt_llm.logger import logger
+    from tensorrt_llm.observability.logging import logger
 except ImportError:
     logger = logging.getLogger(__name__)
 

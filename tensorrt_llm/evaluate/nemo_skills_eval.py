@@ -51,7 +51,7 @@ from typing import Any, Iterable, List, Optional
 import click
 
 from ..llmapi import RequestOutput
-from ..logger import logger
+from ..observability.logging import logger
 from ..sampling_params import SamplingParams
 from .interface import Evaluator
 

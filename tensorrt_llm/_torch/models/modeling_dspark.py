@@ -44,7 +44,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..distributed import AllReduceParams

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.logger import logger, set_level
+from tensorrt_llm.observability.logging import logger, set_level
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm

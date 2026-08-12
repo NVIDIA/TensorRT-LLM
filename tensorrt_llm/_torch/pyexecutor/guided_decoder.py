@@ -10,7 +10,7 @@ from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 from ..._utils import nvtx_range, prefer_pinned
 from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
-from ...logger import logger
+from ...observability.logging import logger
 from ..hostfunc import hostfunc
 from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)

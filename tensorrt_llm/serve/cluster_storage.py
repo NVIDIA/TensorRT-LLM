@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 def is_loopback_host(host: Optional[str]) -> bool:

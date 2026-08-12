@@ -10,8 +10,8 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig)
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed

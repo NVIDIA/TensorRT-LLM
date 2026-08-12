@@ -16,7 +16,7 @@ from typing import Any, Dict
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 class EncoderExecutor:

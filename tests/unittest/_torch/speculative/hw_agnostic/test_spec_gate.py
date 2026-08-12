@@ -10,7 +10,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
 from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 

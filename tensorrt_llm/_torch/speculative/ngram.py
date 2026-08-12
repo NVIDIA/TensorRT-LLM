@@ -3,7 +3,7 @@ from typing import Optional
 from ordered_set import OrderedSet
 
 from tensorrt_llm.llmapi import NGramDecodingConfig
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager

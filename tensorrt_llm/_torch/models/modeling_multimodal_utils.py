@@ -30,7 +30,7 @@ from torchvision.transforms import Normalize, Resize, ToTensor
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 

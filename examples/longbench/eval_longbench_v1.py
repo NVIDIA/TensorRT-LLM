@@ -38,7 +38,7 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig,
                                  RocketSparseAttentionConfig)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 LONGBENCH_DATASETS = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
                         "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \

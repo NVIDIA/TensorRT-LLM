@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Environment variable to enable line_profiler output path.
 LINE_PROFILER_PATH_ENV_VAR = "TLLM_LINE_PROFILER_PATH"

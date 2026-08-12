@@ -1,6 +1,6 @@
 import platform
 
-from ..logger import logger
+from ..observability.logging import logger
 
 IS_CUTLASS_DSL_AVAILABLE = False
 

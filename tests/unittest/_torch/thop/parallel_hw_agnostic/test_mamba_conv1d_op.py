@@ -12,7 +12,7 @@ import tensorrt_llm
 
 class TestFunctional(unittest.TestCase):
     def setUp(self):
-        tensorrt_llm.logger.set_level("error")
+        tensorrt_llm.observability.logging.set_level("error")
 
     def tearDown(self):
         torch.cuda.empty_cache()

@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from functools import wraps
 
-from tensorrt_llm import profiler
+from tensorrt_llm.observability import profiling as profiler
 
 
 def profile(tag):

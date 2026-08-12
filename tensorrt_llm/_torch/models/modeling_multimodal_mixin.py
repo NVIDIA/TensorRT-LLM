@@ -40,7 +40,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 from .modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,

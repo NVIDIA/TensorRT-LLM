@@ -11,7 +11,6 @@ import torch
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     MemoryDescs,
     MemoryType,
@@ -21,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+from tensorrt_llm.observability.logging import logger
 
 try:
     from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import (

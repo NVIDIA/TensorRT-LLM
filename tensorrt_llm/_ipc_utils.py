@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,8 @@ try:
 except ImportError:
     from cuda import cuda, cudart
 
-from .logger import logger
 from .mapping import Mapping
+from .observability.logging import logger
 
 
 def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):

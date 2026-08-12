@@ -31,7 +31,7 @@ from tensorrt_llm import Mapping
 from tensorrt_llm._torch.distributed import MiniMaxAllReduceRMS
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._utils import local_mpi_rank, local_mpi_size, mpi_barrier
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # MiniMax all-reduce only uses D (hidden_size) 128 and 1536 in practice.
 ALLOWED_HIDDEN_SIZES = (256, 1536)

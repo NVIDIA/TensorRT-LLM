@@ -68,10 +68,10 @@ from ..bindings.executor import (BatchingType as _BatchingType,
 from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
 # isort: on
 
-# yapf: enable
-from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
+# yapf: enable
+from ..observability.logging import logger
 from ..sampling_params import BatchedLogitsProcessor
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField

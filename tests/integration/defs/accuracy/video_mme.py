@@ -20,7 +20,7 @@ from typing import Any, Iterable, NamedTuple, Optional
 
 from tqdm import tqdm
 
-import tensorrt_llm.profiler as profiler
+import tensorrt_llm.observability.profiling as profiler
 from tensorrt_llm.evaluate.interface import (
     Evaluator,
     dump_inference_results,
@@ -38,7 +38,7 @@ from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.utils import _resolve_content_format, resolve_hf_chat_template
 from tensorrt_llm.inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from tensorrt_llm.llmapi import RequestOutput
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 PROMPT_PREAMBLE = (

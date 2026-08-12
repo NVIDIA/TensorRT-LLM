@@ -1565,7 +1565,7 @@ def main(argv=None):
             f"{args.role} server step."
         )
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    tensorrt_llm.logger.set_level("debug" if debug else "info")
+    tensorrt_llm.observability.logging.set_level("debug" if debug else "info")
 
     ucx_env = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("UCX_"))
     print(

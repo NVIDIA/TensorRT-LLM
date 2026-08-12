@@ -56,8 +56,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.weight_sharing import SourceIdentity
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.observability.logging import logger
 
 
 @runtime_checkable

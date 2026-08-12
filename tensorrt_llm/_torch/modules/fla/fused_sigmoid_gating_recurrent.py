@@ -11,7 +11,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
 from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 try:
     # A missing build raises ImportError; a CuTe/CUTLASS mismatch raises

@@ -9,7 +9,7 @@ import os
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 _GIB = 1 << 30
 

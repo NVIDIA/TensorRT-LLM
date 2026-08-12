@@ -8,7 +8,7 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 
 def is_gemma4_hybrid(config):

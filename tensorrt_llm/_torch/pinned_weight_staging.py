@@ -19,7 +19,7 @@ import threading
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 _lock = threading.RLock()
 _depth = 0

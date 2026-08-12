@@ -16,7 +16,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from PIL import Image
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.observability.logging import logger
 
 # Video encoder availability flags (cached after first check).
 _FFMPEG_PATH: Optional[str] = None

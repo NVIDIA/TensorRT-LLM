@@ -23,8 +23,8 @@ from transformers import PretrainedConfig, WhisperConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.observability.logging import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 ###################

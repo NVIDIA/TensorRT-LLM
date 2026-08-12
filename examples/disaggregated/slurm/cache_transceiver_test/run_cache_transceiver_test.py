@@ -511,7 +511,7 @@ def main():
     is_leader = rank == 0
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.observability.logging.set_level("info")
     ucx_env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("UCX_")}
     ucx_env_str = " ".join(f"{k}={v}" for k, v in ucx_env.items()) or "<none>"
     print(f"[sweep={sweep_name} {role} rank={rank}] UCX env: {ucx_env_str}", flush=True)

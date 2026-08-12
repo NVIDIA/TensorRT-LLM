@@ -21,7 +21,7 @@
 # torch ahead of the environment preparation it performs.
 import sys
 
-from ._bootstrap import _init, _prepare_environment
+from ._bootstrap import _init, _pin_shadowed_reexports, _prepare_environment
 
 # Phase 1: DLL search path, Python-library preload and vendored triton_kernels
 # precedence. Must run before torch and before any TensorRT-LLM shared object.
@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
-from .logger import logger
+from .observability.logging import logger
 from .version import __version__
 
 if TYPE_CHECKING:
@@ -175,6 +175,11 @@ __all__ = [
     'VisualGenParams',
     '__version__',
 ]
+
+# `logger` above is the Logger singleton, and `logger.py` is a deprecated shim
+# under the same name. Pin the re-export so importing the shim cannot replace
+# the singleton with the module.
+_pin_shadowed_reexports()
 
 _init()
 

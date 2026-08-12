@@ -21,7 +21,7 @@ import shutil
 
 import torch
 
-from ..logger import logger
+from ..observability.logging import logger
 
 IS_CUDA_TILE_AVAILABLE = False
 

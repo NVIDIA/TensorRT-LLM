@@ -16,7 +16,7 @@ from typing import Optional
 
 import click
 
-import tensorrt_llm.profiler as profiler
+import tensorrt_llm.observability.profiling as profiler
 
 from .. import LLM as PyTorchLLM
 from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
@@ -27,7 +27,7 @@ from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
-from ..logger import logger, severity_map
+from ..observability.logging import logger, severity_map
 from ..usage import config as _telemetry_config
 from .utils import collect_explicit_cli_keys
 

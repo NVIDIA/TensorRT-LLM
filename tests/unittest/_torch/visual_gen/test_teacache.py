@@ -256,7 +256,7 @@ class TestSetupTeacache:
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
         # Only ret_steps; standard mode requested (use_ret_steps=False)
         coefficients = {"dev": {"ret_steps": [9.0, 8.0]}}
-        # tensorrt_llm.logger does not propagate to the root logger, so pytest caplog
+        # tensorrt_llm.observability.logging does not propagate to the root logger, so pytest caplog
         # does not see these records; assert via the pipeline module's logger.warning.
         with patch("tensorrt_llm._torch.visual_gen.pipeline.logger.warning") as mock_warning:
             with pytest.raises(ValueError, match="No coefficients found"):
