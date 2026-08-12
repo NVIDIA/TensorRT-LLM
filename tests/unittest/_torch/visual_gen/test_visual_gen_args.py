@@ -313,6 +313,26 @@ class TestVisualGenArgsFromDict:
         assert "dynamic_weight_quant" not in dumped
         assert "force_dynamic_quantization" not in dumped
 
+    def test_runtime_lora_rejects_quantized_visual_gen_config(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+        model_dir = tmp_path / "model"
+        transformer_dir = model_dir / "transformer"
+        transformer_dir.mkdir(parents=True)
+        (model_dir / "model_index.json").write_text(
+            '{"transformer": ["diffusers", "WanTransformer3DModel"]}'
+        )
+        (transformer_dir / "config.json").write_text("{}")
+
+        args = VisualGenArgs(
+            model=str(model_dir),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+        )
+
+        with pytest.raises(ValueError, match="runtime_lora_config.*weight quantization"):
+            DiffusionPipelineConfig.from_pretrained(model_dir, args=args)
+
 
 class TestVisualGenArgsFromYaml:
     """from_yaml round-trips through a YAML file."""
@@ -420,6 +440,7 @@ class TestVisualGenArgsPickle:
             parallel_config=ParallelConfig(cfg_size=2, ulysses_size=1),
             attention_config=AttentionConfig(backend="TRTLLM"),
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
         )
         data = pickle.dumps(args)
         restored = pickle.loads(data)

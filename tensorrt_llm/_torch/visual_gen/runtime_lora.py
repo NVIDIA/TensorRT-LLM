@@ -23,7 +23,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import safetensors.torch
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
@@ -70,152 +69,6 @@ class _RuntimeLoRAAdapter:
         return self.output_start + self.b.shape[0]
 
 
-class RuntimeLoRALinear(nn.Module):
-    """Wrap a linear-like module and add a startup-loaded LoRA delta in forward."""
-
-    def __init__(
-        self,
-        base_layer: nn.Module,
-        adapters: Iterable[_RuntimeLoRAAdapter],
-        *,
-        module_name: str,
-    ) -> None:
-        super().__init__()
-        adapters = list(adapters)
-        if not adapters:
-            raise ValueError(f"Runtime LoRA target '{module_name}' has no adapters")
-
-        self.base_layer = base_layer
-        self.module_name = module_name
-        self.in_features = int(getattr(base_layer, "in_features", adapters[0].a.shape[1]))
-        self.out_features = int(getattr(base_layer, "out_features", adapters[0].b.shape[0]))
-        self._tp_mode = _tp_mode_value(getattr(base_layer, "tp_mode", None))
-        self._tp_size = int(getattr(base_layer, "tp_size", 1) or 1)
-        self._reduce_output = bool(getattr(base_layer, "reduce_output", False))
-        self._gather_output = bool(getattr(base_layer, "gather_output", False))
-        self._adapter_specs: List[Tuple[str, str, float, Optional[int], Optional[int]]] = []
-
-        device, dtype = _infer_module_device_dtype(base_layer)
-        for idx, adapter in enumerate(adapters):
-            local_adapter = _shard_adapter(base_layer, adapter, module_name, device)
-            self._validate_adapter(local_adapter)
-
-            a_name = f"lora_A_{idx}"
-            b_name = f"lora_B_{idx}"
-            self.register_buffer(
-                a_name, local_adapter.a.to(device=device, dtype=dtype).contiguous()
-            )
-            self.register_buffer(
-                b_name, local_adapter.b.to(device=device, dtype=dtype).contiguous()
-            )
-            self._adapter_specs.append(
-                (
-                    a_name,
-                    b_name,
-                    float(local_adapter.scale),
-                    local_adapter.output_start,
-                    local_adapter.output_end,
-                )
-            )
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError as exc:
-            modules = self.__dict__.get("_modules", {})
-            base_layer = modules.get("base_layer")
-            if base_layer is not None and hasattr(base_layer, name):
-                return getattr(base_layer, name)
-            raise exc
-
-    def _validate_adapter(self, adapter: _RuntimeLoRAAdapter) -> None:
-        if adapter.a.ndim != 2 or adapter.b.ndim != 2:
-            raise ValueError(
-                f"Runtime LoRA target '{self.module_name}' requires 2D A/B tensors, "
-                f"got A={tuple(adapter.a.shape)}, B={tuple(adapter.b.shape)}"
-            )
-        if adapter.a.shape[0] != adapter.b.shape[1]:
-            raise ValueError(
-                f"Runtime LoRA rank mismatch for '{self.module_name}': "
-                f"A rank {adapter.a.shape[0]} != B rank {adapter.b.shape[1]}"
-            )
-        if adapter.a.shape[1] != self.in_features:
-            raise ValueError(
-                f"Runtime LoRA input mismatch for '{self.module_name}': "
-                f"A has {adapter.a.shape[1]} columns, layer expects {self.in_features}"
-            )
-
-        if adapter.output_start is None:
-            if adapter.b.shape[0] != self.out_features:
-                raise ValueError(
-                    f"Runtime LoRA output mismatch for '{self.module_name}': "
-                    f"B has {adapter.b.shape[0]} rows, expected {self.out_features}"
-                )
-            return
-
-        if adapter.output_start < 0 or adapter.output_end is None:
-            raise ValueError(f"Invalid Runtime LoRA output span for '{self.module_name}'")
-        if adapter.output_end > self.out_features:
-            raise ValueError(
-                f"Runtime LoRA output span for '{self.module_name}' exceeds layer output: "
-                f"end={adapter.output_end}, out_features={self.out_features}"
-            )
-
-    def _apply_lora_delta(self, input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
-        if input.shape[-1] != self.in_features:
-            raise ValueError(
-                f"Runtime LoRA input for '{self.module_name}' has last dim {input.shape[-1]}, "
-                f"expected {self.in_features}"
-            )
-
-        delta_total: Optional[torch.Tensor] = None
-        for a_name, b_name, scale, output_start, output_end in self._adapter_specs:
-            lora_a = getattr(self, a_name)
-            lora_b = getattr(self, b_name)
-            x = input.to(dtype=lora_a.dtype)
-            delta = F.linear(F.linear(x, lora_a), lora_b) * scale
-            delta = self._apply_tensor_parallel_collectives(delta)
-            delta = delta.to(dtype=output.dtype)
-
-            if output_start is None:
-                delta_total = delta if delta_total is None else delta_total + delta
-                continue
-
-            if delta_total is None:
-                delta_total = torch.zeros_like(output)
-            delta_total[..., output_start:output_end] = (
-                delta_total[..., output_start:output_end] + delta
-            )
-
-        if delta_total is None:
-            return output
-        return output + delta_total
-
-    def _apply_tensor_parallel_collectives(self, delta: torch.Tensor) -> torch.Tensor:
-        if self._tp_size <= 1:
-            return delta
-        if self._tp_mode == "row" and self._reduce_output:
-            all_reduce = getattr(self.base_layer, "all_reduce", None)
-            if all_reduce is None:
-                raise RuntimeError(
-                    f"Runtime LoRA target '{self.module_name}' is row-parallel but has no all_reduce"
-                )
-            return all_reduce(delta)
-        if self._tp_mode == "column" and self._gather_output:
-            from tensorrt_llm._torch.distributed import allgather
-
-            return allgather(delta, self.base_layer.mapping)
-        return delta
-
-    def forward(self, input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        if not isinstance(input, torch.Tensor):
-            raise RuntimeError(
-                f"Runtime LoRA target '{self.module_name}' only supports torch.Tensor inputs"
-            )
-        output = self.base_layer(input, *args, **kwargs)
-        return self._apply_lora_delta(input, output)
-
-
 def apply_runtime_lora(
     transformer: nn.Module,
     config: RuntimeLoRAConfig,
@@ -224,6 +77,11 @@ def apply_runtime_lora(
     raise_on_no_matches: bool = True,
 ) -> RuntimeLoRAApplication:
     """Fuse startup LoRA deltas into matching transformer module weights."""
+
+    if not isinstance(transformer, nn.Module):
+        raise ValueError(
+            f"Runtime LoRA requires an nn.Module target, got {type(transformer).__name__}"
+        )
 
     raw_tensors = _load_lora_tensors(config.path)
     pairs, skipped_incomplete = _extract_lora_pairs(raw_tensors, config)
@@ -236,6 +94,7 @@ def apply_runtime_lora(
     )
 
     qkv_groups: Dict[str, Dict[str, _LoRAPair]] = {}
+    incomplete_qkv_names: List[str] = []
     for pair in pairs:
         target_name, fused_suffix = _resolve_target_name(
             pair.name,
@@ -258,6 +117,7 @@ def apply_runtime_lora(
     for target_name, parts in qkv_groups.items():
         if not all(suffix in parts for suffix in _QKV_SUFFIXES):
             skipped_incomplete += len(parts)
+            incomplete_qkv_names.append(target_name)
             continue
         output_start = 0
         for suffix in _QKV_SUFFIXES:
@@ -270,8 +130,6 @@ def apply_runtime_lora(
     applied_modules: List[str] = []
     for module_name, adapters in targets.items():
         base_module = modules[module_name]
-        if isinstance(base_module, RuntimeLoRALinear):
-            raise ValueError(f"Runtime LoRA target '{module_name}' is already wrapped")
         if getattr(base_module, "_trtllm_runtime_lora_fused", False):
             raise ValueError(f"Runtime LoRA target '{module_name}' is already fused")
         if not _is_linear_like(base_module):
@@ -285,12 +143,19 @@ def apply_runtime_lora(
 
         try:
             _fuse_lora_into_linear(base_module, adapters, module_name)
-        except (RuntimeError, ValueError):
+        except ValueError:
             if config.strict:
                 raise
             skipped_non_targets += len(adapters)
             continue
         applied_modules.append(module_name)
+
+    if config.strict and incomplete_qkv_names:
+        raise ValueError(
+            "Runtime LoRA found incomplete fused-QKV adapter groups for "
+            f"{incomplete_qkv_names}. Provide all to_q/to_k/to_v tensors, "
+            "disable fuse_qkv, or set strict=False."
+        )
 
     if not applied_modules and raise_on_no_matches and config.strict:
         raise ValueError(
@@ -326,22 +191,16 @@ def _fuse_lora_into_linear(
     in_features = int(getattr(base_layer, "in_features", 0))
     out_features = int(getattr(base_layer, "out_features", 0))
     device = weight.device
-    prepared_deltas: List[Tuple[_RuntimeLoRAAdapter, torch.Tensor]] = []
+    prepared_adapters: List[_RuntimeLoRAAdapter] = []
     with torch.no_grad():
         for adapter in adapters:
             local_adapter = _shard_adapter(base_layer, adapter, module_name, device)
-            _validate_adapter_for_fusion(
-                local_adapter, module_name, in_features, out_features
-            )
+            _validate_adapter_for_fusion(local_adapter, module_name, in_features, out_features)
+            _validate_lora_delta_shape_for_adapter(weight, local_adapter, module_name)
+            prepared_adapters.append(local_adapter)
+        for local_adapter in prepared_adapters:
             delta = _compute_lora_weight_delta(local_adapter, device, weight.dtype)
-            prepared_delta = _prepare_lora_delta_for_weight(
-                weight, delta, local_adapter, module_name
-            )
-            _validate_lora_delta_for_weight(
-                weight, prepared_delta, local_adapter, module_name
-            )
-            prepared_deltas.append((local_adapter, prepared_delta))
-        for local_adapter, delta in prepared_deltas:
+            delta = _prepare_lora_delta_for_weight(weight, delta, local_adapter, module_name)
             _add_lora_delta_to_weight(weight, delta, local_adapter, module_name)
     setattr(base_layer, "_trtllm_runtime_lora_fused", True)
 
@@ -402,7 +261,7 @@ def _add_lora_delta_to_weight(
     module_name: str,
 ) -> None:
     target = _lora_weight_target(weight, adapter, module_name)
-    _validate_lora_delta_shape(delta, target, adapter, module_name)
+    _validate_lora_delta_shape(tuple(delta.shape), tuple(target.shape), adapter, module_name)
     target.add_(delta)
 
 
@@ -418,19 +277,26 @@ def _prepare_lora_delta_for_weight(
         return delta.t().unsqueeze(0)
 
     raise ValueError(
-        f"Runtime LoRA target '{module_name}' has unsupported weight shape "
-        f"{tuple(weight.shape)}"
+        f"Runtime LoRA target '{module_name}' has unsupported weight shape {tuple(weight.shape)}"
     )
 
 
-def _validate_lora_delta_for_weight(
+def _validate_lora_delta_shape_for_adapter(
     weight: torch.Tensor,
-    delta: torch.Tensor,
     adapter: _RuntimeLoRAAdapter,
     module_name: str,
 ) -> None:
     target = _lora_weight_target(weight, adapter, module_name)
-    _validate_lora_delta_shape(delta, target, adapter, module_name)
+    if weight.ndim == 2:
+        delta_shape = (adapter.b.shape[0], adapter.a.shape[1])
+    elif weight.ndim == 3 and weight.shape[0] == 1:
+        delta_shape = (1, adapter.a.shape[1], adapter.b.shape[0])
+    else:
+        raise ValueError(
+            f"Runtime LoRA target '{module_name}' has unsupported weight shape "
+            f"{tuple(weight.shape)}"
+        )
+    _validate_lora_delta_shape(delta_shape, tuple(target.shape), adapter, module_name)
 
 
 def _lora_weight_target(
@@ -451,27 +317,26 @@ def _lora_weight_target(
         return weight[:, :, output_start:output_end]
 
     raise ValueError(
-        f"Runtime LoRA target '{module_name}' has unsupported weight shape "
-        f"{tuple(weight.shape)}"
+        f"Runtime LoRA target '{module_name}' has unsupported weight shape {tuple(weight.shape)}"
     )
 
 
 def _validate_lora_delta_shape(
-    delta: torch.Tensor,
-    target: torch.Tensor,
+    delta_shape: Tuple[int, ...],
+    target_shape: Tuple[int, ...],
     adapter: _RuntimeLoRAAdapter,
     module_name: str,
 ) -> None:
-    if delta.shape == target.shape:
+    if delta_shape == target_shape:
         return
     if adapter.output_start is None:
         raise ValueError(
             f"Runtime LoRA delta shape mismatch for '{module_name}': "
-            f"delta={tuple(delta.shape)}, weight={tuple(target.shape)}"
+            f"delta={delta_shape}, weight={target_shape}"
         )
     raise ValueError(
         f"Runtime LoRA fused span mismatch for '{module_name}': "
-        f"delta={tuple(delta.shape)}, span={tuple(target.shape)}"
+        f"delta={delta_shape}, span={target_shape}"
     )
 
 
@@ -583,7 +448,7 @@ def _candidate_names(
 
 def _normalize_common_name(name: str) -> str:
     normalized = name
-    for ff_prefix in (".ff.", ".audio_ff."):
+    for ff_prefix in (".ff.", ".audio_ff.", ".ffn."):
         if ff_prefix + "net.0.proj" in normalized:
             normalized = normalized.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
         elif ff_prefix + "net.2" in normalized:
@@ -627,22 +492,6 @@ def _is_linear_like(module: nn.Module) -> bool:
         and hasattr(module, "in_features")
         and hasattr(module, "out_features")
     )
-
-
-def _set_submodule(root: nn.Module, module_name: str, module: nn.Module) -> None:
-    parent_name, _, child_name = module_name.rpartition(".")
-    parent = root.get_submodule(parent_name) if parent_name else root
-    setattr(parent, child_name, module)
-
-
-def _infer_module_device_dtype(module: nn.Module) -> Tuple[torch.device, torch.dtype]:
-    weight = getattr(module, "weight", None)
-    if isinstance(weight, torch.Tensor) and not weight.is_meta:
-        return weight.device, weight.dtype
-    for tensor in list(module.parameters(recurse=False)) + list(module.buffers(recurse=False)):
-        if isinstance(tensor, torch.Tensor) and not tensor.is_meta:
-            return tensor.device, tensor.dtype
-    return torch.device("cpu"), torch.float32
 
 
 def _tp_mode_value(tp_mode) -> Optional[str]:

@@ -409,7 +409,6 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
-        self._setup_runtime_lora()
 
     def _setup_runtime_lora(self) -> None:
         runtime_lora = getattr(self.pipeline_config, "runtime_lora", None)
@@ -418,10 +417,22 @@ class BasePipeline(nn.Module):
 
         from .runtime_lora import apply_runtime_lora
 
-        component_names = runtime_lora.target_components or self.transformer_components
+        transformer_components = set(self.transformer_components)
+        component_names = runtime_lora.target_components or list(transformer_components)
         total_applied = 0
         applications = []
         for component_name in component_names:
+            if component_name not in transformer_components:
+                if runtime_lora.strict:
+                    raise ValueError(
+                        "runtime_lora_config target component "
+                        f"'{component_name}' is not in transformer_components "
+                        f"{sorted(transformer_components)}"
+                    )
+                logger.warning(
+                    f"Runtime LoRA skipping non-transformer component '{component_name}'"
+                )
+                continue
             component = getattr(self, component_name, None)
             if component is None:
                 if runtime_lora.strict:
@@ -429,6 +440,13 @@ class BasePipeline(nn.Module):
                         f"runtime_lora_config requested missing component '{component_name}'"
                     )
                 logger.warning(f"Runtime LoRA skipping missing component '{component_name}'")
+                continue
+            if not isinstance(component, nn.Module):
+                if runtime_lora.strict:
+                    raise ValueError(
+                        f"runtime_lora_config requested non-module component '{component_name}'"
+                    )
+                logger.warning(f"Runtime LoRA skipping non-module component '{component_name}'")
                 continue
 
             component_prefixes = [f"{component_name}.", f"model.{component_name}."]
@@ -442,8 +460,7 @@ class BasePipeline(nn.Module):
             total_applied += len(application.applied_modules)
             if application.applied_modules:
                 logger.info(
-                    f"Runtime LoRA fused into {component_name}: "
-                    f"{list(application.applied_modules)}"
+                    f"Runtime LoRA fused into {component_name}: {list(application.applied_modules)}"
                 )
 
         if total_applied == 0 and runtime_lora.strict:

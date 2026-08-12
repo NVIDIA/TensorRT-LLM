@@ -611,6 +611,13 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
             NVFP4LinearMethod.use_tunable_quantize = True
 
+        if runtime_lora_cfg is not None and quant_config.quant_algo is not None:
+            raise ValueError(
+                "runtime_lora_config does not currently support VisualGen weight "
+                f"quantization ({quant_config.quant_algo}). Fuse the adapter into "
+                "a full-precision checkpoint first, or disable quantization."
+            )
+
         attention_metadata_state = (
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
         )

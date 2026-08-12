@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.runtime_lora import apply_runtime_lora
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
 
@@ -14,6 +17,15 @@ class TinyTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(2, 3, bias=False)
+
+
+class TinyWanFFNTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = nn.Module()
+        self.block.ffn = nn.Module()
+        self.block.ffn.up_proj = nn.Linear(2, 3, bias=False)
+        self.block.ffn.down_proj = nn.Linear(2, 3, bias=False)
 
 
 class TinyAttention(nn.Module):
@@ -40,6 +52,34 @@ class TinyTritonTransformer(nn.Module):
         self.proj = TinyTritonLikeLinear()
 
 
+class TinyPipeline(BasePipeline):
+    def __init__(self, runtime_lora_config):
+        self._runtime_lora_applications = []
+        self.pipeline_config = MagicMock()
+        self.pipeline_config.runtime_lora = runtime_lora_config
+        self.transformer = nn.Linear(2, 3, bias=False)
+        self._profiler = object()
+
+    @property
+    def transformer_components(self):
+        return ["transformer", "_profiler"]
+
+    def forward(self, *args, **kwargs):
+        pass
+
+    def _init_transformer(self):
+        pass
+
+    def infer(self, req):
+        pass
+
+
+class TinyPipelineWithTransformerOnly(TinyPipeline):
+    @property
+    def transformer_components(self):
+        return ["transformer"]
+
+
 def test_runtime_lora_fuses_delta_into_weight(tmp_path):
     model = TinyTransformer()
     with torch.no_grad():
@@ -59,9 +99,7 @@ def test_runtime_lora_fuses_delta_into_weight(tmp_path):
     report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
     assert report.applied_modules == ("proj",)
-    expected_weight = original_weight + torch.tensor(
-        [[0.5, 1.0], [1.0, 2.0], [1.5, 3.0]]
-    )
+    expected_weight = original_weight + torch.tensor([[0.5, 1.0], [1.0, 2.0], [1.5, 3.0]])
     torch.testing.assert_close(model.proj.weight, expected_weight)
 
     x = torch.tensor([[3.0, 4.0]])
@@ -116,6 +154,36 @@ def test_runtime_lora_strips_prefix_and_uses_key_map(tmp_path):
     torch.testing.assert_close(model.proj(torch.tensor([[2.0, 4.0]])), torch.full((1, 3), 2.0))
 
 
+def test_runtime_lora_maps_wan_ffn_names(tmp_path):
+    model = TinyWanFFNTransformer()
+    with torch.no_grad():
+        model.block.ffn.up_proj.weight.zero_()
+        model.block.ffn.down_proj.weight.zero_()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "block.ffn.net.0.proj.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "block.ffn.net.0.proj.lora_B.weight": torch.ones(3, 1),
+            "block.ffn.net.2.lora_A.weight": torch.tensor([[0.0, 1.0]]),
+            "block.ffn.net.2.lora_B.weight": torch.full((3, 1), 2.0),
+        },
+        str(lora_path),
+    )
+
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+    assert report.applied_modules == ("block.ffn.up_proj", "block.ffn.down_proj")
+    torch.testing.assert_close(
+        model.block.ffn.up_proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 5.0),
+    )
+    torch.testing.assert_close(
+        model.block.ffn.down_proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 14.0),
+    )
+
+
 def test_runtime_lora_fuses_qkv_segments(tmp_path):
     model = TinyAttention()
     with torch.no_grad():
@@ -150,6 +218,44 @@ def test_runtime_lora_fuses_qkv_segments(tmp_path):
     out = model.attn.qkv_proj(torch.tensor([[5.0, 7.0]]))
     expected = torch.tensor([[5.0, 5.0, 5.0, 10.0, 10.0, 10.0, 15.0, 15.0, 15.0]])
     torch.testing.assert_close(out, expected)
+
+
+def test_runtime_lora_rejects_incomplete_qkv_in_strict_mode(tmp_path):
+    model = TinyAttention()
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "attn.to_q.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "attn.to_q.lora_B.weight": torch.ones(3, 1),
+            "attn.to_k.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "attn.to_k.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    with pytest.raises(ValueError, match="incomplete fused-QKV"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+
+def test_runtime_lora_allows_incomplete_qkv_when_not_strict(tmp_path):
+    model = TinyAttention()
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "attn.to_q.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "attn.to_q.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    report = apply_runtime_lora(
+        model,
+        RuntimeLoRAConfig(path=str(lora_path), strict=False),
+        raise_on_no_matches=False,
+    )
+
+    assert report.applied_modules == ()
+    assert report.skipped_incomplete == 1
 
 
 def test_runtime_lora_fuses_triton_weight_layout(tmp_path):
@@ -243,3 +349,41 @@ def test_runtime_lora_raises_on_shape_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="input mismatch"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+
+def test_pipeline_runtime_lora_rejects_non_module_target_component():
+    pipe = TinyPipeline(
+        RuntimeLoRAConfig(
+            path="/tmp/lora.safetensors",
+            target_components=["_profiler"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="non-module component"):
+        pipe._setup_runtime_lora()
+
+
+def test_pipeline_runtime_lora_skips_non_module_target_component_when_not_strict():
+    pipe = TinyPipeline(
+        RuntimeLoRAConfig(
+            path="/tmp/lora.safetensors",
+            target_components=["_profiler"],
+            strict=False,
+        )
+    )
+
+    pipe._setup_runtime_lora()
+
+    assert pipe._runtime_lora_applications == []
+
+
+def test_pipeline_runtime_lora_rejects_component_outside_transformer_surface():
+    pipe = TinyPipelineWithTransformerOnly(
+        RuntimeLoRAConfig(
+            path="/tmp/lora.safetensors",
+            target_components=["_profiler"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="not in transformer_components"):
+        pipe._setup_runtime_lora()
