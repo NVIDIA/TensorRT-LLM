@@ -36,6 +36,9 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import (
     KimiK3MoERuntime,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
+from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
+    _MEGA_MOE_SYMM_BUFFER_CACHE,
+)
 from tensorrt_llm._torch.modules.kimi_k3_moe import KimiK3SparseMoeBlock
 from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
     is_native_situ_supported,
@@ -68,6 +71,7 @@ def _single_rank_nccl_process_group(monkeypatch):
     try:
         yield
     finally:
+        _MEGA_MOE_SYMM_BUFFER_CACHE.clear()
         if dist.is_initialized():
             dist.destroy_process_group()
 
