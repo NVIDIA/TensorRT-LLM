@@ -192,7 +192,7 @@ class TestSplitGpuBudgetForDraft:
 
         c._create_kv_cache_manager = Mock(side_effect=create_target_manager)
         mocker.patch(
-            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls", return_value=Mock()
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls", return_value=Mock
         )
         create_manager = mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager", return_value=Mock()
