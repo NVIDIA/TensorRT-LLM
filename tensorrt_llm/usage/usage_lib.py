@@ -90,9 +90,7 @@ class TerminalOutcome:
     exit_code: int = 0
     signal_number: int = 0
 
-    def with_observation(
-        self, observation: Optional["TerminalOutcome"]
-    ) -> "TerminalOutcome":
+    def with_observation(self, observation: Optional["TerminalOutcome"]) -> "TerminalOutcome":
         """Prefer an earlier causal observation over boundary classification."""
         if observation is None:
             return self
@@ -927,13 +925,16 @@ class _TelemetrySession:
         with self.lock:
             return self._snapshot_unlocked()
 
-    def claim_terminal(self) -> Optional[dict[str, Any]]:
-        """Claim the single terminal slot and return its final snapshot."""
+    def claim_terminal(
+        self, outcome: TerminalOutcome
+    ) -> Optional[tuple[dict[str, Any], TerminalOutcome]]:
+        """Atomically merge causal context and claim the terminal slot."""
         with self.lock:
             if self.disabled or self.terminal_reported:
                 return None
+            outcome = outcome.with_observation(self.observed_outcome)
             self.terminal_reported = True
-            return self._snapshot_unlocked()
+            return self._snapshot_unlocked(), outcome
 
     def claim_initial(self) -> bool:
         """Claim the success-only initial report before network delivery."""
@@ -1110,13 +1111,12 @@ def _report_process_exit() -> None:
 
         snapshot = session.snapshot()
         signal_number = snapshot["observedSignal"]
-        observation = session.get_termination_observation()
         outcome = TerminalOutcome(
             exit_code_known=False,
             exit_code=0,
             signal_number=signal_number,
             termination_kind="signal" if signal_number else "unknown",
-        ).with_observation(observation)
+        )
         report_exit(
             outcome,
             lifecycle_phase=None,
@@ -1317,9 +1317,10 @@ def report_exit(
         if not _is_reporting_rank():
             return False
 
-        snapshot = session.claim_terminal()
-        if snapshot is None:
+        terminal = session.claim_terminal(outcome)
+        if terminal is None:
             return False
+        snapshot, outcome = terminal
         claimed = True
         _show_usage_notification()
 

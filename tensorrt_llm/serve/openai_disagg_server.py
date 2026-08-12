@@ -53,8 +53,7 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
-from tensorrt_llm.usage import (TerminalOutcome,
-                                record_termination_observation)
+from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
