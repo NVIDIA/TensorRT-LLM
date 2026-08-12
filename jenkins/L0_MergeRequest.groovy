@@ -25,6 +25,7 @@ import com.nvidia.bloom.Constants
 import com.nvidia.bloom.Logger
 import com.nvidia.bloom.JobBuilder
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 
@@ -1303,6 +1304,14 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                     }
                 }
             })
+        }
+    } catch (FlowInterruptedException e) {
+        // The 15-minute timeout above is non-fatal; user aborts and upstream
+        // pipeline interruptions must keep propagating.
+        if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
+            echo "CBTS early coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
+        } else {
+            throw e
         }
     } catch (InterruptedException e) {
         throw e
