@@ -25,6 +25,13 @@ fields each method reads.
 The accuracy of pool rebalancing itself (i.e., that suspend/adjust/resume
 preserves generated tokens) is covered by the integration accuracy test;
 here we only verify the call chain and gate logic.
+
+``TestPpLoopDrainWiring`` is the one exception to the "no real executor"
+rule.  The pipeline-parallel drain is not a method that can be called in
+isolation -- it is spread across three points inside
+``_executor_loop_pp`` -- so that class drives the real loop over an
+``object.__new__(PyExecutor)`` instance, the same way
+``test_py_executor.py`` does for the PP scheduling path.
 """
 
 from unittest.mock import MagicMock
@@ -830,6 +837,197 @@ class TestMaybeFinishPpRebalance:
 
         exe._consume_previous_batch_for_rebalance.assert_not_called()
         exe.kv_cache_manager.impl.adjust.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline-parallel loop wiring
+# --------------------------------------------------------------------------- #
+
+
+class _ReachedForward(RuntimeError):
+    """Raised from the mocked forward to stop the loop and prove it queued."""
+
+
+def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True, False)):
+    """A PyExecutor real enough to run ``_executor_loop_pp``.
+
+    The drain is not reachable through a single method: it is started at the
+    top of the iteration, enforced where ``can_queue`` is computed, and
+    completed in Stage 3.4.  Only the real loop exercises all three, so this
+    builds a bare instance and fills in exactly the attributes one iteration
+    touches -- the same approach ``test_py_executor.py`` takes for the PP
+    scheduling path.
+
+    ``_can_queue`` deliberately returns True.  Every iteration therefore
+    *wants* to queue, so a slot left empty can only be the drain's doing.
+    """
+    exe = object.__new__(PyExecutor)
+
+    profiler = MagicMock()
+    profiler.__enter__.return_value = MagicMock()
+    exe._profiler = MagicMock(return_value=profiler)
+    exe.hang_detector = MagicMock()
+    exe.device_id = 0
+    exe.enable_iter_perf_stats = False
+    exe.iter_counter = 0
+
+    # Rebalance state.  _uses_kv_manager_v2() reads the explicit flag first.
+    exe._is_kv_manager_v2 = True
+    exe._pp_rebalance_drain_iters = None
+    exe.pp_multi_stream_sample = False
+    exe._can_pause_for_rebalance = MagicMock(return_value=True)
+    exe._agreed_need_adjustment = MagicMock(side_effect=list(agreement))
+    # The suspend/adjust/resume core is covered by its own tests; here we only
+    # care that the loop reaches it, and on which iteration.
+    exe._rebalance_kv_pools_now = MagicMock()
+
+    # Per-iteration no-ops.
+    exe._handle_disagg_cache_errors_synced = MagicMock()
+    exe._handle_control_request = MagicMock()
+    exe._pad_attention_dp_dummy_request = MagicMock()
+    exe._revert_gen_alloc = MagicMock()
+    exe._add_inflight_ids = MagicMock()
+    exe._handle_dynamic_draft_len = MagicMock()
+    exe.resource_manager = MagicMock()
+    exe.wait_on_pp_send_handles = MagicMock()
+    exe.kv_cache_transceiver = None
+
+    # Loop termination: the loop breaks when should_stop_processing goes true,
+    # which is a property over these three.
+    exe.is_shutdown = False
+    exe.active_requests = []
+    exe.waiting_queue = []
+
+    # Safety net.  These tests normally end when the forward raises, but a
+    # drain that never completes would queue nothing, never reach the forward,
+    # and spin forever -- turning a clean assertion failure into a hung test.
+    # Shutting the loop down after a generous bound keeps such a regression a
+    # *failure* rather than a hang.
+    iterations = []
+
+    def _fetch_new_requests():
+        iterations.append(1)
+        if len(iterations) > 8 * num_micro_batches:
+            exe.is_shutdown = True
+        return []
+
+    exe._fetch_and_activate_new_requests = MagicMock(side_effect=_fetch_new_requests)
+
+    scheduled_batch = MagicMock()
+    scheduled_batch.batch_size = 1
+    scheduled_batch.num_encoder_requests = 0
+    scheduled_batch.num_context_requests = 1
+    scheduled_batch.num_generation_requests = 0
+    scheduled_batch.encoder_requests = []
+    scheduled_batch.generation_requests = []
+    exe._pp_schedule_and_propagate = MagicMock(return_value=(scheduled_batch, [], 0, False))
+    exe._can_queue = MagicMock(return_value=(True, True))
+
+    # First PP rank of a two-stage pipeline, so the loop takes the
+    # inter-stage forward and the first-rank branch of the ring broadcast.
+    exe.dist = MagicMock(
+        rank=0,
+        pp_rank=0,
+        pp_size=2,
+        tp_size=1,
+        cp_size=1,
+        is_first_pp_rank=True,
+        is_last_pp_rank=False,
+    )
+
+    # Microbatch ring, empty and quiescent to begin with.
+    exe.num_micro_batches = num_micro_batches
+    exe.micro_batches = [None] * num_micro_batches
+    exe.send_handles = [None] * num_micro_batches
+    exe.send_expected_batch_num_handles = [None] * num_micro_batches
+    exe.unhandled_batch_counter = 0
+    exe.previous_batch = None
+    exe.pp_async_broadcast_sample_state = False
+    exe.executed_batch_response_queue = MagicMock()
+    exe.executed_batch_response_queue.empty.return_value = True
+
+    # Reaching the forward means this iteration queued a microbatch, which is
+    # exactly what the drain must prevent.  Raising there both records the
+    # fact and ends the loop.
+    exe._forward_step_inter_pp = MagicMock(side_effect=_ReachedForward)
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", MagicMock()
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice", MagicMock()
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", MagicMock())
+    return exe
+
+
+class TestPpLoopDrainWiring:
+    """The three points in ``_executor_loop_pp`` that make the drain work."""
+
+    def test_loop_queues_normally_when_no_rebalance_is_pending(self, monkeypatch):
+        """Control case: without a drain the loop reaches the forward.
+
+        Without this the drain test below would pass even if ``can_queue`` were
+        never honored -- e.g. if the loop simply never queued anything.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, agreement=(False,))
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        exe._forward_step_inter_pp.assert_called_once()
+        exe._rebalance_kv_pools_now.assert_not_called()
+
+    def test_drain_suppresses_queueing_then_rebalances_and_resumes(self, monkeypatch):
+        """The whole wiring in one pass, over a two-slot ring.
+
+        Iterations 1 and 2 must queue nothing even though ``_can_queue`` says
+        they could; the rebalance must land at the end of iteration 2, once the
+        ring has had a full cycle to empty; and iteration 3 must go back to
+        queueing, which the forward's exception reports.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(True, False))
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        # Two drain iterations queued nothing, the third one did.
+        exe._forward_step_inter_pp.assert_called_once()
+        assert exe._revert_gen_alloc.call_count == 2
+        assert exe.micro_batches == [None, None]
+
+        # And the rebalance ran exactly once, at the end of the drain.
+        exe._rebalance_kv_pools_now.assert_called_once()
+        assert exe._pp_rebalance_drain_iters is None
+
+    def test_drain_length_follows_the_ring_depth(self, monkeypatch):
+        """A deeper ring drains for longer before rebalancing.
+
+        Pins the countdown to ``num_micro_batches`` rather than to a constant:
+        with four slots the loop must skip four iterations, not two.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=4, agreement=(True, False))
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        assert exe._revert_gen_alloc.call_count == 4
+        exe._rebalance_kv_pools_now.assert_called_once()
+
+    def test_no_drain_is_started_while_one_is_pending(self, monkeypatch):
+        """The decision is taken once per rebalance, not once per iteration.
+
+        ``_agreed_need_adjustment`` runs a collective, so re-entering it
+        mid-drain would put this rank into a broadcast its peers are not in.
+        """
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=4, agreement=(True, False))
+
+        with pytest.raises(_ReachedForward):
+            PyExecutor._executor_loop_pp(exe)
+
+        # Once to start the drain, once on the iteration after it finished --
+        # never on the three iterations in between.
+        assert exe._agreed_need_adjustment.call_count == 2
 
 
 if __name__ == "__main__":
