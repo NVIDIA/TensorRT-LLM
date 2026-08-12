@@ -36,8 +36,18 @@ from __future__ import annotations
 import sys
 import types
 from abc import ABCMeta
+from collections.abc import Callable, Iterator, Sequence
+from importlib import abc
 from importlib.machinery import ModuleSpec
 from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
+
+if TYPE_CHECKING:
+    import pytest
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 # ---------------------------------------------------------------------------
 # Escape hatch
@@ -53,19 +63,19 @@ class LookaheadDecodingConfig:
     """Explicit stub: real defaults consumed by ``llm_args`` at class-body time."""
 
     @staticmethod
-    def get_default_lookahead_decoding_window():
+    def get_default_lookahead_decoding_window() -> int:
         return 4
 
     @staticmethod
-    def get_default_lookahead_decoding_ngram():
+    def get_default_lookahead_decoding_ngram() -> int:
         return 3
 
     @staticmethod
-    def get_default_lookahead_decoding_verification_set():
+    def get_default_lookahead_decoding_verification_set() -> int:
         return 4
 
 
-_EXPLICIT: dict[str, object] = {
+_EXPLICIT: dict[str, type[LookaheadDecodingConfig]] = {
     "tensorrt_llm.bindings.executor.LookaheadDecodingConfig": LookaheadDecodingConfig,
 }
 
@@ -108,13 +118,16 @@ class _StubMeta(ABCMeta):
     binding type and an ABC without a metaclass conflict.
     """
 
-    def __getattr__(cls, name: str):
+    def __getattr__(cls, name: str) -> type[_StubBase]:
         # Never fabricate dunders: Python and pydantic probe them to decide
         # which protocols a type supports.
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
 
-        children = cls.__dict__.get("_stub_children")
+        children = cast(
+            dict[str, type[_StubBase]] | None,
+            cls.__dict__.get("_stub_children"),
+        )
         if children is None:
             children = {}
             type.__setattr__(cls, "_stub_children", children)
@@ -125,72 +138,84 @@ class _StubMeta(ABCMeta):
         return children[name]
 
     @property
-    def __members__(cls):
+    def __members__(cls) -> dict[str, type[_StubBase]]:
         # PybindMirror.mirror_pybind_enum iterates the C++ members and requires
         # each to exist on the Python enum; an empty mapping trivially passes.
         return {}
 
-    def __iter__(cls):
+    def __iter__(cls) -> Iterator[type[_StubBase]]:
         # Product code materializes some binding sequences at import time
         # (e.g. tuple(KVCacheIterationStatsDelta._field_names)).
         return iter(())
 
-    def __int__(cls):
+    def __int__(cls) -> int:
         # Stubbed enum members are coerced at import time
         # (e.g. int(BufferKind.DEFAULT) in cute_dsl_custom_ops.py).
         return 0
 
-    def __index__(cls):
+    def __index__(cls) -> int:
         return 0
 
 
 class _StubBase(metaclass=_StubMeta):
     """Base for fabricated binding classes; only dunders, so ``dir()`` is clean."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> type[_StubBase]:
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         return _make_stub_class(f"{type(self).__name__}.{name}", type(self).__module__)
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: object, **kwargs: object) -> bool:
         return False
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return False
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[type[_StubBase]]:
         return iter(())
 
-    def __int__(self):
+    def __int__(self) -> int:
         return 0
 
-    def __index__(self):
+    def __index__(self) -> int:
         return 0
 
 
-def _make_stub_class(name: str, module: str) -> type:
-    return _StubMeta(name, (_StubBase,), {"__module__": module})
+def _make_stub_class(name: str, module: str) -> type[_StubBase]:
+    return cast(
+        type[_StubBase],
+        _StubMeta(name, (_StubBase,), {"__module__": module}),
+    )
 
 
 class StubModule(types.ModuleType):
     """Fake (sub)module of a stubbed root, resolving attributes on demand."""
 
-    def __init__(self, fullname: str):
+    def __init__(self, fullname: str) -> None:
         super().__init__(fullname)
         self.__file__ = f"<bindings stub: {fullname}>"
         self.__package__ = fullname
         self.__path__ = []  # marks this as a package for nested imports
         object.__setattr__(self, "_stub_cache", {})
 
-    def __getattr__(self, name: str):
-        cache = object.__getattribute__(self, "_stub_cache")
+    def __getattr__(
+        self, name: str
+    ) -> int | type[LookaheadDecodingConfig] | type[_StubBase] | StubModule:
+        cache = cast(
+            dict[
+                str,
+                int | type[LookaheadDecodingConfig] | type[_StubBase] | StubModule,
+            ],
+            object.__getattribute__(self, "_stub_cache"),
+        )
         if name in cache:
             return cache[name]
 
         fq = f"{self.__name__}.{name}"
+        value: int | type[LookaheadDecodingConfig] | type[_StubBase] | StubModule
         if fq in _EXPLICIT:
             value = _EXPLICIT[fq]
         elif name.isupper():
@@ -208,17 +233,17 @@ class StubModule(types.ModuleType):
         cache[name] = value
         return value
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: object, **kwargs: object) -> bool:
         return False
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return False
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<StubModule {self.__name__}>"
 
 
-class _StubFinder:
+class _StubFinder(abc.MetaPathFinder):
     """Meta path finder fabricating any module under a stubbed root.
 
     Attribute access alone is not enough: ``import a.b.c`` and
@@ -227,20 +252,25 @@ class _StubFinder:
     """
 
     @staticmethod
-    def find_spec(fullname, path=None, target=None):
+    def find_spec(
+        fullname: str,
+        path: Sequence[str] | None = None,
+        target: ModuleType | None = None,
+    ) -> ModuleSpec | None:
+        del path, target
         if not any(fullname == root or fullname.startswith(f"{root}.") for root in _STUB_ROOTS):
             return None
         return ModuleSpec(fullname, _StubLoader(), is_package=True)
 
 
-class _StubLoader:
+class _StubLoader(abc.Loader):
     @staticmethod
-    def create_module(spec):
+    def create_module(spec: ModuleSpec) -> StubModule:
         return StubModule(spec.name)
 
     @staticmethod
-    def exec_module(module):
-        pass
+    def exec_module(module: ModuleType) -> None:
+        del module
 
 
 def _real_bindings_present() -> bool:
@@ -295,7 +325,9 @@ def install_bindings_stub() -> StubModule | None:
         if isinstance(parent, StubModule):
             object.__getattribute__(parent, "_stub_cache")[attr] = child
 
-    return sys.modules[_BINDINGS]
+    bindings = sys.modules[_BINDINGS]
+    assert isinstance(bindings, StubModule)
+    return bindings
 
 
 def stub_torch_extensions() -> None:
@@ -318,10 +350,15 @@ def stub_torch_extensions() -> None:
     if getattr(register_fake, "_trtllm_collection_stub", False):
         return
 
-    def tolerant_register_fake(op, func=None, /, **kwargs):
-        def apply(fn):
+    def tolerant_register_fake(
+        op: str,
+        func: Callable[_P, _R] | None = None,
+        /,
+        **kwargs: object,
+    ) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        def apply(fn: Callable[_P, _R]) -> Callable[_P, _R]:
             try:
-                return register_fake(op, fn, **kwargs)
+                return cast(Callable[_P, _R], register_fake(op, fn, **kwargs))
             except RuntimeError as exc:
                 if "does not exist" not in str(exc):
                     raise
@@ -329,7 +366,7 @@ def stub_torch_extensions() -> None:
 
         return apply(func) if func is not None else apply
 
-    tolerant_register_fake._trtllm_collection_stub = True
+    setattr(tolerant_register_fake, "_trtllm_collection_stub", True)
     torch.library.register_fake = tolerant_register_fake
 
 
@@ -338,7 +375,8 @@ def stub_torch_extensions() -> None:
 install_bindings_stub()
 
 
-def pytest_configure(config):
+def pytest_configure(config: pytest.Config) -> None:
     """Re-assert the stubs early in the pytest session."""
+    del config
     install_bindings_stub()
     stub_torch_extensions()

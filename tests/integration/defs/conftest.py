@@ -30,7 +30,7 @@ import urllib.request
 import warnings
 from functools import wraps
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import defs.ci_profiler
 import psutil
@@ -39,6 +39,7 @@ import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
+from _pytest.mark.structures import MarkDecorator
 # Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
 # non-top-level conftest: a repo-root invocation like `pytest tests` loads
 # this file as a NESTED conftest and would fail collection; and not via "-p"
@@ -1667,7 +1668,9 @@ skip_device_contain_gb200 = pytest.mark.skipif(
 )
 
 
-def skip_no_nvls(func=None):
+def skip_no_nvls(
+    func: Callable[..., object] | None = None
+) -> Callable[..., object] | MarkDecorator:
     """Skip when NVLS is unsupported.
 
     Deferred so importing conftest does not call into bindings.

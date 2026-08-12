@@ -533,7 +533,7 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
 # =============================================================================
 
 
-def _get_trt_test_db_version():
+def _get_trt_test_db_version() -> str:
     """Read TRT_TEST_DB_VERSION from jenkins/ci_versions.properties."""
     props_file = Path(
         __file__).resolve().parent.parent / "jenkins" / "ci_versions.properties"
@@ -545,7 +545,7 @@ def _get_trt_test_db_version():
     raise RuntimeError(f"TRT_TEST_DB_VERSION not found in {props_file}")
 
 
-def install_python_dependencies(llm_src):
+def install_python_dependencies(llm_src: str) -> None:
     """Install Python deps for collection — no TRT-LLM wheel or compile."""
     subprocess.run(f"cd {llm_src} && pip3 install -r requirements-dev.txt",
                    shell=True,
@@ -559,7 +559,7 @@ def install_python_dependencies(llm_src):
         check=True)
 
 
-def _collection_pytest_env(llm_src):
+def _collection_pytest_env(llm_src: str) -> dict[str, str]:
     """Env for stubbed ``pytest --co``: PYTHONPATH + placeholder models root."""
     # The stubify_bindings plugin needs to be in the PYTHONPATH so it can be imported by pytest.
     defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
@@ -575,7 +575,7 @@ def _collection_pytest_env(llm_src):
     }
 
 
-def _run_collection_pytest(llm_src, test_list):
+def _run_collection_pytest(llm_src: str, test_list: str) -> None:
     """Run pytest --co with the collection bindings stub plugin."""
     env = _collection_pytest_env(llm_src)
     subprocess.run(
