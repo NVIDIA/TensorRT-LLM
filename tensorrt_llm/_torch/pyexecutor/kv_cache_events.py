@@ -329,7 +329,14 @@ class ZmqEventPublisher(EventPublisher):
                 raise ValueError(f"TCP KV event endpoint must include a port: {endpoint!r}")
             last_colon_idx = endpoint.rfind(":")
             base_addr = endpoint[:last_colon_idx]
-            base_port = int(endpoint[last_colon_idx + 1 :])
+            port_text = endpoint[last_colon_idx + 1 :]
+            # Validate the port value up front so a bad port names the endpoint
+            # instead of surfacing as an opaque int()/ZeroMQ bind error on ranks > 0.
+            if not (port_text.isdigit() and 1 <= int(port_text) <= 65_535):
+                raise ValueError(
+                    f"TCP KV event endpoint must have a port in [1, 65535]: {endpoint!r}"
+                )
+            base_port = int(port_text)
             new_port = base_port + data_parallel_rank
             if new_port > 65_535:
                 raise ValueError(

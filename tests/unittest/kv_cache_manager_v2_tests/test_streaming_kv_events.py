@@ -90,7 +90,9 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
         first_wire_hash = int.from_bytes(first_hash[:8], "big")
         second_wire_hash = int.from_bytes(second_hash[:8], "big")
         first_wire_hash = first_wire_hash - 2**64 if first_wire_hash >= 2**63 else first_wire_hash
-        second_wire_hash = second_wire_hash - 2**64 if second_wire_hash >= 2**63 else second_wire_hash
+        second_wire_hash = (
+            second_wire_hash - 2**64 if second_wire_hash >= 2**63 else second_wire_hash
+        )
         first = block(first_hash, [1, 2, 3, 4], root)
         partial = block(partial_hash, [5, 6], first)
         second = block(second_hash, [5, 6, 7, 8], first)
@@ -241,3 +243,8 @@ def test_offset_endpoint_port_rejects_bad_input() -> None:
     # int() error on the scheme colon.
     with pytest.raises(ValueError):
         ZmqEventPublisher.offset_endpoint_port("tcp://host", 1)
+    # Non-numeric or out-of-range ports are rejected with an endpoint-naming
+    # error instead of an opaque int()/bind failure.
+    for bad in ("tcp://host:abc", "tcp://host:0", "tcp://host:-5"):
+        with pytest.raises(ValueError):
+            ZmqEventPublisher.offset_endpoint_port(bad, 1)
