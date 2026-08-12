@@ -702,7 +702,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 destination[:total_blocks].copy_(source[:total_blocks],
                                                  non_blocking=True)
                 self._vswa_pool_indices_cache[pool_id] = destination
-            default_pool_id = self._vswa_layer_to_pool.get(
+            default_pool_id = target._vswa_layer_to_pool.get(
                 target._default_kv_layer_idx, 0)
             self._vswa_active_pool_id = default_pool_id
             self._host_paged_kv_indices = self._host_pool_indices[
@@ -950,11 +950,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             pp_attention_layer_ids = self._get_pp_attention_layer_ids()
             self._default_kv_layer_idx = next(iter(pp_attention_layer_ids),
                                               None)
+            if self._default_kv_layer_idx is None:
+                logger.info_once(
+                    "FlashInfer: no attention-backed KV layer on this rank; "
+                    "paged KV metadata disabled",
+                    key="flashinfer_no_attention_backed_kv_layer",
+                )
             max_num_blocks = 0
-            for layer_idx in pp_attention_layer_ids:
-                layer_buffer = self.kv_cache_manager.get_buffers(layer_idx)
-                if layer_buffer is not None:
-                    max_num_blocks = max(max_num_blocks, layer_buffer.shape[0])
+            get_buffers = getattr(self.kv_cache_manager, "get_buffers", None)
+            if get_buffers is not None:
+                for layer_idx in pp_attention_layer_ids:
+                    layer_buffer = get_buffers(layer_idx)
+                    if layer_buffer is not None:
+                        max_num_blocks = max(max_num_blocks,
+                                             layer_buffer.shape[0])
+            if pp_attention_layer_ids and max_num_blocks == 0:
+                max_num_blocks = int(
+                    getattr(self.kv_cache_manager, "blocks_in_primary_pool", 0))
             self._paged_kv_indices = self.get_empty(
                 buffers,
                 (max_num_blocks, ),
@@ -1432,6 +1444,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.num_generation_blocks = 0
             self.num_ctx_cached_tokens = 0
             self._cached_token_lens[:self.num_seqs].zero_()
+            self.paged_kv_indptr_decode[:self.num_seqs + 1].zero_()
+            self.paged_kv_indptr_prefill[:self.num_seqs + 1].zero_()
+            self.paged_kv_indptr = self.paged_kv_indptr_decode[:self.num_seqs +
+                                                               1]
+            self._paged_kv_last_page_len[:self.num_seqs].zero_()
             self._clean_cached_plans(defer_plan=False)
             return
 

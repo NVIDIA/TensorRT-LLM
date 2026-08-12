@@ -1811,11 +1811,51 @@ def test_flashinfer_hybrid_page_tables_use_attention_layer(
 
 @skip_no_cuda
 @skip_no_flashinfer
-def test_flashinfer_metadata_skips_paged_kv_on_recurrent_only_rank() -> None:
-    manager = _build_v2_hybrid_with_mamba_layer(max_batch_size=1, num_attention_layers=0)
+def test_flashinfer_metadata_falls_back_to_primary_pool_sizing() -> None:
+    manager = _build_v2_hybrid_with_mamba_layer(max_batch_size=1)
+    try:
+        with patch.object(manager, "get_buffers", None):
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.tensor([1], dtype=torch.int32),
+                num_contexts=1,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[0],
+                ),
+                max_num_requests=1,
+                max_num_tokens=1,
+                kv_cache_manager=manager,
+                request_ids=[123],
+            )
+
+        assert metadata._paged_kv_indices.numel() == manager.blocks_in_primary_pool
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("manager_factory", "manager_kwargs"),
+    [
+        (
+            _build_hybrid_with_mamba_layer,
+            {
+                "mamba_layer_mask": [True],
+                "attention_layer_mask": [False],
+            },
+        ),
+        (_build_v2_hybrid_with_mamba_layer, {"num_attention_layers": 0}),
+    ],
+)
+@skip_no_cuda
+@skip_no_flashinfer
+def test_flashinfer_metadata_skips_paged_kv_on_recurrent_only_rank(
+    manager_factory: Callable[..., CppMambaHybridCacheManager | MambaHybridCacheManagerV2],
+    manager_kwargs: dict[str, object],
+) -> None:
+    manager = manager_factory(max_batch_size=1, **manager_kwargs)
     try:
         request_ids = [123]
-        manager.add_dummy_requests(request_ids, token_nums=[8], is_gen=False)
+        # Isolate FlashInfer's no-attention path from recurrent-state setup.
         metadata = FlashInferAttentionMetadata(
             seq_lens=torch.tensor([8], dtype=torch.int32),
             num_contexts=1,
@@ -1827,6 +1867,7 @@ def test_flashinfer_metadata_skips_paged_kv_on_recurrent_only_rank() -> None:
             max_num_tokens=8,
             kv_cache_manager=manager,
             request_ids=request_ids,
+            mamba_metadata=False,
         )
 
         metadata.prepare()
@@ -1834,6 +1875,8 @@ def test_flashinfer_metadata_skips_paged_kv_on_recurrent_only_rank() -> None:
         assert metadata._default_kv_layer_idx is None
         assert metadata.paged_kv_indices.numel() == 0
         assert metadata.num_blocks == [0]
+        assert torch.count_nonzero(metadata.paged_kv_indptr) == 0
+        assert torch.count_nonzero(metadata.paged_kv_last_page_len) == 0
     finally:
         manager.shutdown()
 
