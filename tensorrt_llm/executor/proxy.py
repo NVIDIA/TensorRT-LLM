@@ -687,7 +687,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
                 # Backward compatibility for workers that only publish their
                 # identities together with READY.
-                if not worker_processes_registered:
+                if (signal == self.READY_SIGNAL
+                        and not worker_processes_registered):
                     self._register_worker_processes(status)
                 return status
 
@@ -711,7 +712,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._worker_process_monitor.register(worker_process_identities)
 
     def _can_monitor_worker_processes(self) -> bool:
-        """Return whether this proxy owns locally spawned MPI workers."""
+        """Return whether the session uses locally spawned MPI workers."""
         return not isinstance(
             self.mpi_session,
             (MpiCommSession, RemoteMpiCommSessionClient),
