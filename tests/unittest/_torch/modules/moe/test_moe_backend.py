@@ -415,13 +415,15 @@ def _trtllm_model_config(quant_algo=QuantAlgo.FP8_BLOCK_SCALES):
     return cfg
 
 
-@pytest.mark.parametrize("sm", [90, 89, 120])
+@pytest.mark.parametrize("sm", [90, 120])
 def test_get_moe_cls_trtllm_falls_back_to_cutlass_on_unsupported_sm(sm, monkeypatch):
     """TRTLLM-Gen MoE kernels only exist for SM100/SM103. Requesting the TRTLLM
     backend elsewhere (e.g. DeepSeek FP8_BLOCK_SCALES on Hopper) must fall back
     to Cutlass instead of failing at engine init: on 1.3.0rc7 this crashed with
     'list assignment index out of range' in AutoTuner._find_nearest_profile,
-    later with 'No kernel found' during trtllm-gen kernel selection."""
+    later with 'No kernel found' during trtllm-gen kernel selection.
+    The parametrized SMs are ones CutlassFusedMoE supports for FP8_BLOCK_SCALES,
+    so the fallback selection is also runnable."""
     monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: sm)
     assert get_moe_cls(_trtllm_model_config()) is CutlassFusedMoE
 
