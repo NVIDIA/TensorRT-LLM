@@ -885,6 +885,28 @@ explicit_package_bases = true
 namespace_packages = true
 strict = true
 show_error_codes = true
+# Files checked when mypy runs with no explicit paths (the CI build stage invokes
+# scripts/run_mypy.sh directly, without pre-commit). Keep this list in sync with
+# the `static-analysis-files` anchor in .pre-commit-config.yaml, which drives the
+# same check for local pre-commit runs. (pre-commit passes the matched files
+# explicitly on the command line, which override this list, so the two paths check
+# the same set.)
+files = [
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_strategy.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/finish_reasons.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/top_p_decay.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/penalties.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
+    "tests/unittest/_torch/sampler/test_torch_sampler.py",
+    "tests/unittest/_torch/sampler/test_token_ban.py",
+    "tests/unittest/_torch/sampler/test_beam_search.py",
+    "tests/unittest/_torch/sampler/test_beam_search_util.py",
+]
 # NB:
 #   .   -> 'tensorrt_llm'
 #   tests/unittest   -> 'utils'
