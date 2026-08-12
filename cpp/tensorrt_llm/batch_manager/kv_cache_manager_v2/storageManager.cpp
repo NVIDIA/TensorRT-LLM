@@ -147,7 +147,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // Build one CacheLevelManager per tier.
     TLLM_CHECK_DEBUG(!config.cacheTiers.empty());
     TLLM_CHECK_DEBUG_WITH_INFO(
-        std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kGpuLevel]), "First cache tier must be GPU");
+        std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]), "First cache tier must be GPU");
 
     // Compute slot size lists for all pool groups.
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists;
@@ -157,7 +157,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         slotSizeLists.push_back(sd.slotSizeList());
     }
 
-    size_t gpuQuota = cacheTierQuota(config.cacheTiers[kGpuLevel]);
+    size_t gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
     size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
     // Constraints stay feasibility floors even under an explicit initial pool
@@ -307,7 +307,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newGpuSlots(
     TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
     DropRecorder const& dropRecorder)
 {
-    return newSlots(kGpuLevel, numSlotsPerLc, migrationRecorder, dropRecorder);
+    return newSlots(kHotLevel, numSlotsPerLc, migrationRecorder, dropRecorder);
 }
 
 std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
@@ -722,13 +722,13 @@ void StorageManager::batchedMigrateToGpu(
     std::map<std::pair<CacheLevel, PoolGroupIndex>, std::vector<SharedPtr<Page>>> groups;
     for (auto const& t : targets)
     {
-        if (t.page->cacheLevel == kGpuLevel)
+        if (t.page->cacheLevel == kHotLevel)
             continue;
         PoolGroupIndex pg = mLifeCycleGrouping.at(t.lifeCycle);
         groups[{t.page->cacheLevel, pg}].push_back(t.page);
     }
     for (auto& [key, pages] : groups)
-        _batchedMigrate(key.second, kGpuLevel, key.first, pages, /*updateSrc=*/true, migrationRecorder);
+        _batchedMigrate(key.second, kHotLevel, key.first, pages, /*updateSrc=*/true, migrationRecorder);
 }
 
 void StorageManager::prefetch(
@@ -833,12 +833,12 @@ MemAddress StorageManager::getMemPoolBaseAddress(LayerId layerId, DataRole role)
         throw std::out_of_range("Unknown BufferId");
     auto const& attr = it->second;
     PoolGroupIndex pgIdx = mLifeCycleGrouping.at(attr.lifeCycleId);
-    return mLevels[kGpuLevel].storage->getBaseAddress(pgIdx, attr.poolIndex, SlotId{0}) + attr.offset;
+    return mLevels[kHotLevel].storage->getBaseAddress(pgIdx, attr.poolIndex, SlotId{0}) + attr.offset;
 }
 
 MemAddress StorageManager::getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
 {
-    return mLevels[kGpuLevel].storage->getBaseAddress(pgIdx, poolIdx, SlotId{0});
+    return mLevels[kHotLevel].storage->getBaseAddress(pgIdx, poolIdx, SlotId{0});
 }
 
 LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
@@ -1282,7 +1282,7 @@ size_t StorageManager::minQuotaForLevel(
 
 TypedVec<PoolGroupIndex, float> StorageManager::constrainRatio(TypedVec<PoolGroupIndex, float> const& ratio) const
 {
-    auto& gpuStorage = *mLevels[kGpuLevel].storage;
+    auto& gpuStorage = *mLevels[kHotLevel].storage;
     size_t granularity = gpuStorage.poolSizeGranularity();
     auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
     auto numBytes = slotsToBytes(slotCountList, granularity);

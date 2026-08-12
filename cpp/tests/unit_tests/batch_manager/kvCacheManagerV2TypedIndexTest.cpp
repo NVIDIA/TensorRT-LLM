@@ -188,7 +188,7 @@ TEST(KvCacheManagerV2TypedIndexTest, StrongIndexSupportsValueTypeUpperBoundCompa
 
 TEST(KvCacheManagerV2TypedIndexTest, StrongIndexDefaultsMatchSentinels)
 {
-    static_assert(CacheLevel{}.value() == kGpuLevel.value(), "CacheLevel default should name the GPU level");
+    static_assert(CacheLevel{}.value() == kHotLevel.value(), "CacheLevel default should name the hot level");
     static_assert(BeamIndex{}.value() == kDefaultBeamIndex.value(), "BeamIndex default should name the default beam");
     static_assert(BlockOrdinal{}.value() == kBadBlockOrdinal.value(), "BlockOrdinal default should be invalid");
     static_assert(PageIndex{}.value() == kBadPageIndex.value(), "PageIndex default should be invalid");

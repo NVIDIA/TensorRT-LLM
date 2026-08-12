@@ -264,7 +264,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kGpuLevel);
+    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {
@@ -362,7 +362,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
-                storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
+                storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
         }
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
@@ -413,7 +413,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             srcLocks.push_back(lock);
 
             PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
-            copySlotData(storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            copySlotData(storageMgr, kHotLevel, kHotLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
@@ -461,7 +461,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 blockOrdinal = lastOrdinal;
             }
 
-            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kGpuLevel, beamIdx);
+            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
@@ -482,7 +482,7 @@ bool KvCache::prefetch(CacheLevel target)
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
-    TLLM_CHECK_DEBUG(kGpuLevel <= target && target < numTiers);
+    TLLM_CHECK_DEBUG(kHotLevel <= target && target < numTiers);
 
     PoolGroupIndex const numPoolGroups = storageMgr.numPoolGroups();
     TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
@@ -659,12 +659,12 @@ void KvCache::_recordMigratedSlots(
 
         KVCacheStatsDelta stats;
         KVCacheIterationStatsDelta iterationStats;
-        if (srcLevel == kGpuLevel && dstLevel > kGpuLevel)
+        if (srcLevel == kHotLevel && dstLevel > kHotLevel)
         {
             iterationStats.iterOffloadBlocks = 1;
             iterationStats.iterOffloadBytes = pageSize;
         }
-        else if (dstLevel == kGpuLevel)
+        else if (dstLevel == kHotLevel)
         {
             // Global cache-hit accounting is attention-only. SSM movement is
             // reported by lifecycle/pool-group iteration statistics instead.
@@ -675,12 +675,12 @@ void KvCache::_recordMigratedSlots(
             }
             iterationStats.iterAllocTotalBlocks = 1;
             iterationStats.iterAllocNewBlocks = 1;
-            if (srcLevel > kGpuLevel)
+            if (srcLevel > kHotLevel)
             {
                 iterationStats.iterOnboardBlocks = 1;
                 iterationStats.iterOnboardBytes = pageSize;
             }
-            else if (srcLevel == kGpuLevel)
+            else if (srcLevel == kHotLevel)
             {
                 iterationStats.iterIntraDeviceCopyBlocks = 1;
                 iterationStats.iterIntraDeviceCopyBytes = pageSize;
@@ -1117,7 +1117,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
                     slot.readyEvent = finishEvent();
-                    mManager->storage().releaseSlot(lc, kGpuLevel, std::move(slot));
+                    mManager->storage().releaseSlot(lc, kHotLevel, std::move(slot));
                 }
             }
         }
@@ -1198,7 +1198,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     }
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
-                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, bi);
+                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
                     page->setSlot(slot);
                     sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true);
                 }
@@ -1363,7 +1363,7 @@ void KvCache::_increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength)
 
             size_t si = slotCounters[lc]++;
             auto& slot = allSlots[lc][si];
-            auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, kDefaultBeamIndex);
+            auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, kDefaultBeamIndex);
             page->setSlot(slot);
             sb.pages[kDefaultBeamIndex][lc] = page->lock(*this, kDefaultBeamIndex, ord, lc);
         }

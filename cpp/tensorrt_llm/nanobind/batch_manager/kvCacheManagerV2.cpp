@@ -1731,7 +1731,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     continue;
                 }
                 auto page = kv::makeShared<kv::CommittedPage>(
-                    &manager.storage(), block, lifeCycle, kv::kGpuLevel, coverage, kv::kPriorityDefault);
+                    &manager.storage(), block, lifeCycle, kv::kHotLevel, coverage, kv::kPriorityDefault);
                 page->setSlot(slots[lifeCycle].front());
                 block->storage[lifeCycle] = page.get();
                 pages.push_back(std::move(page));
@@ -1780,7 +1780,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "current_gpu_ratio",
         [](kv::KvCacheManager& manager)
         {
-            auto ratio = manager.storage().getRatioList(kv::kGpuLevel);
+            auto ratio = manager.storage().getRatioList(kv::kHotLevel);
             return std::move(ratio.raw());
         },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
@@ -1810,7 +1810,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             auto stats = kv::KvCacheIntrospection::storageStatistics(manager, kv::CacheLevel{cacheLevel});
             return std::move(stats.raw());
         },
-        nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "life_cycle_pool_group_indices",
         [](kv::KvCacheManager& manager)
@@ -1940,7 +1940,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             auto utilization = manager.storage().getUtilization(kv::CacheLevel{cacheLevel});
             return std::move(utilization.raw());
         },
-        nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity)

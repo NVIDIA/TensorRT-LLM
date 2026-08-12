@@ -221,7 +221,7 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
         }
         auto block = addOrGetExistingBlock(previous, std::move(tokens), /*knownNoDigest=*/true);
         auto page = makeShared<CommittedPage>(
-            &storage, block, lifeCycle, kGpuLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
+            &storage, block, lifeCycle, kHotLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
         page->setSlot(slot);
         block->storage[lifeCycle] = page.get();
         storage.scheduleForEviction(*page);
@@ -237,7 +237,7 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
     manager->clearReusableBlocks();
     pages.clear();
 
-    auto primaryPeak = manager->getAndResetIterationPeakBlockStats(kGpuLevel);
+    auto primaryPeak = manager->getAndResetIterationPeakBlockStats(kHotLevel);
     auto secondaryPeak = manager->getAndResetIterationPeakBlockStats(CacheLevel{1});
     ASSERT_EQ(primaryPeak.size(), PoolGroupIndex{1});
     ASSERT_EQ(secondaryPeak.size(), PoolGroupIndex{1});
@@ -248,7 +248,7 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
     EXPECT_EQ(secondaryPeak[PoolGroupIndex{0}].unavailable, 1);
     EXPECT_EQ(secondaryPeak[PoolGroupIndex{0}].evictable, 0);
 
-    primaryPeak = manager->getAndResetIterationPeakBlockStats(kGpuLevel);
+    primaryPeak = manager->getAndResetIterationPeakBlockStats(kHotLevel);
     secondaryPeak = manager->getAndResetIterationPeakBlockStats(CacheLevel{1});
     EXPECT_EQ(primaryPeak[PoolGroupIndex{0}].available, 2);
     EXPECT_EQ(primaryPeak[PoolGroupIndex{0}].unavailable, 0);
@@ -257,10 +257,10 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
     EXPECT_EQ(secondaryPeak[PoolGroupIndex{0}].unavailable, 0);
     EXPECT_EQ(secondaryPeak[PoolGroupIndex{0}].evictable, 0);
 
-    auto nextIntervalSlots = storage.newSlots(kGpuLevel, oneSlot);
+    auto nextIntervalSlots = storage.newSlots(kHotLevel, oneSlot);
     manager->commitStats({});
-    storage.releaseSlot(lifeCycle, kGpuLevel, std::move(nextIntervalSlots[lifeCycle].front()));
-    primaryPeak = manager->getAndResetIterationPeakBlockStats(kGpuLevel);
+    storage.releaseSlot(lifeCycle, kHotLevel, std::move(nextIntervalSlots[lifeCycle].front()));
+    primaryPeak = manager->getAndResetIterationPeakBlockStats(kHotLevel);
     EXPECT_EQ(primaryPeak[PoolGroupIndex{0}].available, 2);
     EXPECT_EQ(primaryPeak[PoolGroupIndex{0}].unavailable, 1);
     EXPECT_EQ(primaryPeak[PoolGroupIndex{0}].evictable, 0);
@@ -272,7 +272,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     auto manager = std::make_shared<KvCacheManager>(makeTieredConfig());
     auto& storage = manager->storage();
     LifeCycleId const lifeCycle{0};
-    ASSERT_EQ(storage.getStatistics(kGpuLevel).total, 2);
+    ASSERT_EQ(storage.getStatistics(kHotLevel).total, 2);
     ASSERT_EQ(storage.getStatistics(CacheLevel{1}).total, 2);
 
     int offloaded = 0;
@@ -283,11 +283,11 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
               CacheLevel dstLevel)
     {
         EXPECT_EQ(pages.size(), slots.size());
-        if (srcLevel == kGpuLevel && dstLevel == CacheLevel{1})
+        if (srcLevel == kHotLevel && dstLevel == CacheLevel{1})
         {
             offloaded += static_cast<int>(pages.size());
         }
-        else if (srcLevel == CacheLevel{1} && dstLevel == kGpuLevel)
+        else if (srcLevel == CacheLevel{1} && dstLevel == kHotLevel)
         {
             onboarded += static_cast<int>(pages.size());
         }
@@ -313,7 +313,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
             }
             auto block = addOrGetExistingBlock(previous, std::move(tokens), /*knownNoDigest=*/true);
             auto page = makeShared<CommittedPage>(
-                &storage, block, lifeCycle, kGpuLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
+                &storage, block, lifeCycle, kHotLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
             page->setSlot(slot);
             block->storage[lifeCycle] = page.get();
             storage.scheduleForEviction(*page);
@@ -333,7 +333,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     EXPECT_EQ(dropped, 0);
     for (auto& slot : temporarySlots[lifeCycle])
     {
-        storage.releaseSlot(lifeCycle, kGpuLevel, std::move(slot));
+        storage.releaseSlot(lifeCycle, kHotLevel, std::move(slot));
     }
 
     auto cache = manager->createKvCache();
@@ -365,7 +365,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     EXPECT_EQ(dropped, 2);
     for (auto& slot : finalSlots[lifeCycle])
     {
-        storage.releaseSlot(lifeCycle, kGpuLevel, std::move(slot));
+        storage.releaseSlot(lifeCycle, kHotLevel, std::move(slot));
     }
     cache->close();
 }

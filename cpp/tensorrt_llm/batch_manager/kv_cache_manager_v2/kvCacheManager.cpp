@@ -244,7 +244,7 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     LifeCycleId lc = attr.lifeCycleId;
     PoolGroupIndex pg = mStorage->getPoolGroupIndex(lc);
-    SlotCount const numSlots = mStorage->numSlots(pg, kGpuLevel);
+    SlotCount const numSlots = mStorage->numSlots(pg, kHotLevel);
     auto slotSizes = mStorage->slotSize(pg);
     size_t slotSize = slotSizes.at(attr.poolIndex);
     return (exactDiv(slotSize, attr.size) * slotCountToSizeT(numSlots) - exactDiv(attr.offset, attr.size))
@@ -367,7 +367,7 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
                 PoolDesc{poolIdx, mStorage->getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
         }
 
-        result.push_back(PoolGroupDesc{pgIdx, mStorage->numSlots(pgIdx, kGpuLevel), slotDesc, std::move(pools)});
+        result.push_back(PoolGroupDesc{pgIdx, mStorage->numSlots(pgIdx, kHotLevel), slotDesc, std::move(pools)});
     }
 
     return result;
@@ -798,7 +798,7 @@ void KvCacheManager::tryUpdateTargetRatios()
 
 TypedVec<PoolGroupIndex, float> KvCacheManager::_currentGpuRatio() const
 {
-    return mStorage->getRatioList(kGpuLevel);
+    return mStorage->getRatioList(kHotLevel);
 }
 
 TypedVec<PoolGroupIndex, float> KvCacheManager::_currentOtherRatios() const
@@ -830,13 +830,13 @@ TypedVec<PoolGroupIndex, float> KvCacheManager::_currentOtherRatios() const
 
 TypedVec<PoolGroupIndex, float> const& KvCacheManager::_getTargetRatioList(CacheLevel level) const
 {
-    return (level == kGpuLevel) ? mTargetRatioListGpu : mTargetRatioListOther;
+    return (level == kHotLevel) ? mTargetRatioListGpu : mTargetRatioListOther;
 }
 
 bool KvCacheManager::_needAdjustment(CacheLevel level) const
 {
     auto const& target = _getTargetRatioList(level);
-    auto current = (level == kGpuLevel) ? _currentGpuRatio() : _currentOtherRatios();
+    auto current = (level == kHotLevel) ? _currentGpuRatio() : _currentOtherRatios();
     constexpr float kThreshold = 1.25f;
     for (PoolGroupIndex pgIdx{0}; pgIdx < target.size() && pgIdx < current.size(); ++pgIdx)
     {
@@ -856,7 +856,7 @@ bool KvCacheManager::needAdjustment() const
     if (now - mLastAdjustmentTime < 120.0)
         return false;
     CacheLevel lastLevel = mStorage->numCacheLevels() - 1;
-    return _needAdjustment(kGpuLevel) || _needAdjustment(lastLevel);
+    return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);
 }
 
 void KvCacheManager::adjust()

@@ -76,9 +76,10 @@ enum class PageIndexMode : int
 // Strongly-typed integer aliases (mirroring Python NewType wrappers).
 // ---------------------------------------------------------------------------
 
-// Index of a cache level (0 = GPU, 1 = host, 2 = disk, ...).
+// Index of a cache level (0 = hot; subsequent levels are colder storage tiers).
 using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
-inline constexpr CacheLevel kGpuLevel{0};
+// The kernel-facing hot level; colder levels may also use GPU memory.
+inline constexpr CacheLevel kHotLevel{0};
 
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;

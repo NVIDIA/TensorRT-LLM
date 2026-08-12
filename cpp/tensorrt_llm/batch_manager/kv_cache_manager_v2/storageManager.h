@@ -238,12 +238,12 @@ public:
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
-    StorageStatistics getStatistics(CacheLevel level = kGpuLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0}) const;
-    TypedVec<PoolGroupIndex, float> getUtilization(CacheLevel level = kGpuLevel) const;
-    float getOverallUtilization(CacheLevel level = kGpuLevel) const;
+    StorageStatistics getStatistics(CacheLevel level = kHotLevel, PoolGroupIndex pgIdx = PoolGroupIndex{0}) const;
+    TypedVec<PoolGroupIndex, float> getUtilization(CacheLevel level = kHotLevel) const;
+    float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).
-    SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kGpuLevel) const;
+    SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
