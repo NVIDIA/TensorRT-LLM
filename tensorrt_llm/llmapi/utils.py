@@ -228,7 +228,9 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
-def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
+def download_hf_model(model: str,
+                      revision: Optional[str] = None,
+                      subfolder: Optional[str] = None) -> Path:
     ignore_patterns = ["original/**/*"]
     logger.info(f"Downloading model {model} from HuggingFace")
     with get_file_lock(model):
@@ -236,10 +238,11 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             ignore_patterns=ignore_patterns,
+            allow_patterns=[f"{subfolder}/*"] if subfolder else None,
             revision=revision,
             tqdm_class=DisabledTqdm)
     logger.info(f"Finished downloading model {model} from HuggingFace")
-    return Path(hf_folder)
+    return Path(hf_folder) / subfolder if subfolder else Path(hf_folder)
 
 
 def download_hf_partial(model: str,

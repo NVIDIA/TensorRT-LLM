@@ -407,8 +407,12 @@ class CachedModelLoader:
             model_dirs = self._submit_to_all_workers(
                 CachedModelLoader._node_download_hf_model,
                 model=model_obj.model_name,
-                revision=revision)
+                revision=revision,
+                subfolder=model_obj.subfolder)
             model_dir = next((d for d in model_dirs if d is not None), None)
+            # download_hf_model already returns the path with the subfolder
+            # appended, so drop it here to stop model_dir joining it twice.
+            model_obj.subfolder = None
             model_obj.model_dir = model_dir
             return model_dir
         return model_obj.model_dir
@@ -419,9 +423,14 @@ class CachedModelLoader:
         if (self.llm_args.speculative_config is not None and
                 self.llm_args.speculative_config.speculative_model is not None):
             spec_model_obj = _ModelWrapper(
-                self.llm_args.speculative_config.speculative_model)
+                self.llm_args.speculative_config.speculative_model,
+                subfolder=self.llm_args.speculative_config.
+                speculative_model_subfolder)
             spec_model_dir = self._download_hf_model_if_needed(spec_model_obj)
+            # Resolved to an absolute dir here, so every downstream consumer
+            # keeps seeing a plain path and needs no subfolder awareness.
             self.llm_args.speculative_config.speculative_model = spec_model_dir
+            self.llm_args.speculative_config.speculative_model_subfolder = None
 
         # AutoDeploy doesn't use ModelLoader
         if self.llm_args.backend == "_autodeploy":
@@ -452,9 +461,10 @@ class CachedModelLoader:
     def _node_download_hf_model(
         model: str,
         revision: Optional[str] = None,
+        subfolder: Optional[str] = None,
     ) -> Optional[Path]:
         if local_mpi_rank() == 0:
-            return download_hf_model(model, revision)
+            return download_hf_model(model, revision, subfolder=subfolder)
         else:
             return None
 
