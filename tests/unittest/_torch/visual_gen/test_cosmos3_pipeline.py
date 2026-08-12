@@ -56,6 +56,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -668,6 +669,9 @@ def cosmos3_pipeline():
 @pytest.mark.cosmos3_t2v
 @pytest.mark.high_cuda_memory
 class TestCosmos3T2V:
+    def test_native_wan_vae_is_default(self, cosmos3_pipeline):
+        assert isinstance(cosmos3_pipeline.vae, WanVAE)
+
     def test_t2v_smoke(self, cosmos3_pipeline):
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
