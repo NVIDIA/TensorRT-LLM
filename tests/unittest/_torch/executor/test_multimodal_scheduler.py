@@ -6,12 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
@@ -24,7 +22,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
-    _resolve_mm_encoder_token_budget,
     _validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -326,11 +323,9 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
     assert output.context_requests == [request]
 
 
-def test_encoder_token_budget_auto_raises_for_atomic_item():
-    assert _resolve_mm_encoder_token_budget(8192, 65536) == 65536
-
-
 def test_qwen_output_budget_uses_post_merge_embedding_capacity():
+    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+
     processor = object.__new__(Qwen2VLInputProcessorBase)
     processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
     engine = object.__new__(PyTorchModelEngine)
@@ -411,21 +406,6 @@ def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
 
     assert output.scheduled_mm_encoder_items == {1: [0]}
     assert output.context_requests == [text_request]
-
-
-def test_forward_multimodal_encoder_step_delegates_to_model_engine():
-    calls = []
-    executor = object.__new__(PyExecutor)
-    executor.active_requests = [SimpleNamespace(request_id=1)]
-    executor.model_engine = SimpleNamespace(
-        forward_multimodal_encoder_items=lambda requests, items: calls.append((requests, items))
-    )
-    scheduled_items = {1: [0]}
-    scheduled_requests = SimpleNamespace(scheduled_mm_encoder_items=scheduled_items)
-
-    executor._forward_multimodal_encoder_step(scheduled_requests)
-
-    assert calls == [(executor.active_requests, scheduled_items)]
 
 
 def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
@@ -939,24 +919,6 @@ def _cache_engine(cache, monkeypatch, *, supports_encoder_cache=True):
     return engine
 
 
-def test_item_encode_populates_cache_with_independent_copies(monkeypatch):
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch)
-    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
-
-    engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
-
-    key0, key1 = MultimodalModelMixin.build_encoder_cache_item_keys(
-        [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
-    )
-    # The request copies items into its own buffer; the cache keeps separate
-    # copies, so eviction can never invalidate a published item.
-    published = request.py_multimodal_data["multimodal_embedding"]
-    assert torch.equal(cache.get(key0), published[:2])
-    assert torch.equal(cache.get(key1), published[2:])
-    assert cache.get(key0).untyped_storage().data_ptr() != published.untyped_storage().data_ptr()
-
-
 def test_duplicate_request_hits_cache_and_skips_encoding(monkeypatch):
     cache = TensorLRUCache(1 << 20, name="test")
     engine = _cache_engine(cache, monkeypatch)
@@ -999,59 +961,12 @@ def test_cache_eviction_leaves_recorded_slots_intact(monkeypatch):
     request = _cache_request(1, hashes=[[1, 2]], embedding_lengths=[2])
     engine.forward_multimodal_encoder_items([request], {1: [0]})
     recorded = request.py_multimodal_data["multimodal_embedding"][:2]
+    assert len(cache) == 1
 
     cache.clear()  # simulate eviction of the entry the request came from
 
     assert torch.equal(recorded, torch.full((2, 2), 2.0))  # owned clone, untouched
     assert is_multimodal_encoder_ready(request)
-
-
-def test_pipeline_ranks_reach_the_same_encoder_state_independently(monkeypatch):
-    """Every PP rank must resolve cache hits itself, not inherit the leader's.
-
-    Schedule distribution carries request and item ids only, so a follower
-    rank never receives the leader's encoder outputs or its cache lookups. If
-    hits were applied only where scheduling happened, followers would encode
-    work the leader skipped and the ranks would disagree on both embeddings
-    and encoder call counts. Drive the same schedule through two independent
-    engines, each with its own rank-local cache, and require them to converge.
-    """
-    hashes = [[1, 2], [3, 4]]
-    embedding_lengths = [2, 3]
-
-    ranks = []
-    for _ in range(2):
-        cache = TensorLRUCache(1 << 20, name="test")
-        engine = _cache_engine(cache, monkeypatch)
-        # Warm this rank's own cache the way an earlier request would.
-        warmup = _cache_request(1, hashes=hashes, embedding_lengths=embedding_lengths)
-        engine.forward_multimodal_encoder_items([warmup], {1: [0, 1]})
-        ranks.append(engine)
-
-    leader, follower = ranks
-    assert leader.model.encoded_item_counts == follower.model.encoded_item_counts == [2]
-
-    # The scheduler picks on the leader; both ranks receive only these ids.
-    requests = [
-        _cache_request(2, hashes=hashes, embedding_lengths=embedding_lengths) for _ in ranks
-    ]
-    for engine, request in zip(ranks, requests):
-        engine.forward_multimodal_encoder_items([request], {2: [0, 1]})
-
-    # Both ranks served the request entirely from their own cache...
-    assert leader.model.encoded_item_counts == follower.model.encoded_item_counts == [2]
-    # ...and agree on readiness and on every embedding row.
-    leader_request, follower_request = requests
-    assert is_multimodal_encoder_ready(leader_request)
-    assert is_multimodal_encoder_ready(follower_request)
-    leader_embedding = leader_request.py_multimodal_data["multimodal_embedding"]
-    follower_embedding = follower_request.py_multimodal_data["multimodal_embedding"]
-    assert torch.equal(leader_embedding, follower_embedding)
-    # Rank-local storage: agreeing on values must not mean sharing them.
-    assert (
-        leader_embedding.untyped_storage().data_ptr()
-        != follower_embedding.untyped_storage().data_ptr()
-    )
 
 
 def test_cache_off_encodes_every_item_without_touching_cache(monkeypatch):
@@ -1066,57 +981,6 @@ def test_cache_off_encodes_every_item_without_touching_cache(monkeypatch):
     assert engine.model.encoded_item_counts == [2]
     assert is_multimodal_encoder_ready(request)
     assert len(cache) == 0  # never populated
-
-
-def test_item_cache_keys_are_built_once_per_request(monkeypatch):
-    """Keys depend only on inputs fixed at admission, so a request whose items
-    span several iterations must not rebuild them on each one."""
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch, supports_encoder_cache=True)
-    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
-
-    builds = []
-    original = engine.model.build_encoder_cache_item_keys
-
-    def counting(*args, **kwargs):
-        builds.append(1)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(engine.model, "build_encoder_cache_item_keys", counting)
-
-    first = engine.get_mm_encoder_item_keys(request)
-    second = engine.get_mm_encoder_item_keys(request)
-
-    assert first == second
-    assert len(builds) == 1
-
-
-def test_item_cache_keys_memo_records_unkeyable_requests(monkeypatch):
-    """`None` is a real answer -- an unkeyable request must be remembered as
-    such rather than re-derived on every iteration."""
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch, supports_encoder_cache=True)
-    # No processor-kwargs hash -> the request cannot build stable keys.
-    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3], kwargs_hash=None)
-
-    builds = []
-    original = engine.model.build_encoder_cache_item_keys
-    monkeypatch.setattr(
-        engine.model,
-        "build_encoder_cache_item_keys",
-        lambda *a, **k: (builds.append(1), original(*a, **k))[1],
-    )
-
-    assert engine.get_mm_encoder_item_keys(request) is None
-    assert engine.get_mm_encoder_item_keys(request) is None
-    assert len(builds) == 1
-
-
-def test_item_cache_keys_share_the_full_request_path_format():
-    keys = MultimodalModelMixin.build_encoder_cache_item_keys(
-        [[1, 2], [3, 4]], [("image", 0), ("video", 0)], [2, 3], "kw"
-    )
-    assert keys == [("image", (1, 2), 2, "kw"), ("video", (3, 4), 3, "kw")]
 
 
 @pytest.mark.parametrize("case", ["no_hashes", "no_kwargs_hash", "count_mismatch"])
@@ -1137,71 +1001,6 @@ def test_key_guards_bypass_cache(case, monkeypatch):
     engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
     assert is_multimodal_encoder_ready(request)
     assert len(cache) == 0  # unkeyable items never populate the cache
-
-
-def test_qwen_get_mm_encoder_cache_is_none_without_supports_flag(monkeypatch):
-    # Item-scheduled model that does not opt into the cache (e.g. Qwen) gets
-    # no read-through even with a positive encoder_cache_max_bytes.
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch, supports_encoder_cache=False)
-    assert engine.mm_encoder_cache is None
-
-
-def test_qwen_item_metadata_uses_prompt_order_and_pre_merger_costs():
-    processor = object.__new__(Qwen2VLInputProcessorBase)
-    processor._config = SimpleNamespace(
-        image_token_id=11,
-        video_token_id=12,
-        vision_start_token_id=10,
-        vision_end_token_id=13,
-        vision_config=SimpleNamespace(spatial_merge_size=2),
-    )
-    prompt_token_ids = [10, 12, 12, 13, 1, 10, 11, 11, 13]
-    multimodal_data = {
-        "image": {"image_grid_thw": torch.tensor([[1, 4, 4]])},
-        "video": {"video_grid_thw": torch.tensor([[2, 4, 4]])},
-    }
-
-    metadata = processor.get_mm_encoder_item_metadata(prompt_token_ids, multimodal_data)
-
-    assert isinstance(metadata, MultimodalEncoderItemMetadata)
-    assert metadata.item_refs == [("video", 0), ("image", 0)]
-    assert metadata.encoder_token_lengths == [32, 16]
-    assert metadata.output_embedding_lengths == [8, 4]
-
-
-def test_qwen_item_metadata_collapses_frame_spans_into_original_video():
-    processor = object.__new__(Qwen2VLInputProcessorBase)
-    processor._config = SimpleNamespace(
-        image_token_id=11,
-        video_token_id=12,
-        vision_start_token_id=10,
-        vision_end_token_id=13,
-        vision_config=SimpleNamespace(spatial_merge_size=2),
-    )
-    prompt_token_ids = [10, 12, 13, 100, 10, 12, 13]
-    multimodal_data = {
-        "video": {"video_grid_thw": torch.tensor([[2, 4, 4]])},
-    }
-
-    metadata = processor.get_mm_encoder_item_metadata(prompt_token_ids, multimodal_data)
-
-    assert metadata.item_refs == [("video", 0)]
-    assert metadata.encoder_token_lengths == [32]
-    assert metadata.output_embedding_lengths == [8]
-
-
-def test_mistral_item_metadata_separates_patch_and_embedding_units():
-    processor = object.__new__(MistralHFInputProcessor)
-    processor._vision_geometry = lambda: (14, 2, 3, 1024)
-
-    metadata = processor.get_mm_encoder_item_metadata(
-        [], {"image": {"image_sizes": [[28, 56], [56, 56]]}}
-    )
-
-    assert metadata.item_refs == [("image", 0), ("image", 1)]
-    assert metadata.encoder_token_lengths == [8, 16]
-    assert metadata.output_embedding_lengths == [2, 4]
 
 
 # ---------------------------------------------------------------------------

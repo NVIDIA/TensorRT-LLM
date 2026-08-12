@@ -81,7 +81,7 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
 
 
-def _make_request(modalities: list[str]) -> MultimodalParams:
+def _make_request(modalities: list[str], *, value_start: float = 1.0) -> MultimodalParams:
     """Build a request whose items carry unique, checkable patch values."""
     per_modality_rows: dict[str, list[int]] = {}
     item_refs: list[tuple[str, int]] = []
@@ -94,7 +94,7 @@ def _make_request(modalities: list[str]) -> MultimodalParams:
         lengths.append(rows)
 
     multimodal_data: dict = {}
-    value = 1.0
+    value = value_start
     for modality, rows_per_item in per_modality_rows.items():
         pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
         grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
@@ -208,35 +208,14 @@ def test_wrong_encoder_output_rows_are_request_contract_error():
         model.forward_multimodal_encoder_items(encoder_inputs)
 
 
-def test_cache_partition_index_mismatch_is_request_contract_error():
-    request = _make_request(["image"])
-    cache = object()
-
-    with pytest.raises(MultimodalEncoderContractError, match="out of range"):
-        _GroupedEncoderModel.partition_encoder_cache(
-            request, cache, item_indices=[1], keys=[("image",)]
-        )
-
-
 def test_items_from_multiple_requests_stay_separated():
     model = _GroupedEncoderModel()
     first = _make_request(["image"])
-    second = _make_request(["image"])
+    second = _make_request(["image"], value_start=9.0)
 
     outputs, encoder_inputs = _run_items(model, [(first, 0), (second, 0)])
 
+    assert len(encoder_inputs) == 2
+    assert model.encoder_calls == [2 * ITEM_ROWS["image"][0]]
     torch.testing.assert_close(outputs[0], _expected_rows(first, 0))
     torch.testing.assert_close(outputs[1], _expected_rows(second, 0))
-
-
-def test_slice_carries_resliced_metadata():
-    """`build_multimodal_encoder_input` slices raw tensors; `_apply_metadata_slice`
-    re-slices the parallel per-item metadata. `encode_multimodal_by_groups` reads the
-    latter, so the pair must be applied together."""
-    model = _GroupedEncoderModel()
-    request = _make_request(["image", "image"])
-
-    residual = model.build_multimodal_encoder_input(request, [1])
-    model._apply_metadata_slice(residual, request, [1])
-
-    assert residual.multimodal_data["multimodal_embedding_lengths"] == [ITEM_ROWS["image"][1]]

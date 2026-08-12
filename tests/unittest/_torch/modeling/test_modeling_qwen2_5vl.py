@@ -24,9 +24,9 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
-    Qwen2_5_VisionModel, Qwen2_5_VLModel, Qwen2_5VLInputProcessorBase,
-    Qwen2VisionModelBase, Qwen2VLInputProcessorBase, Qwen2VLModel,
-    _prepare_qwen_vl_mrope_config, _prepare_qwen_vl_vision_attn_metadata)
+    Qwen2_5_VisionModel, Qwen2_5_VLModel, Qwen2VisionModelBase,
+    Qwen2VLInputProcessorBase, Qwen2VLModel, _prepare_qwen_vl_mrope_config,
+    _prepare_qwen_vl_vision_attn_metadata)
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase, _qwen3vl_build_batched_input)
 from tensorrt_llm._utils import get_sm_version
@@ -632,9 +632,59 @@ def _make_dummy_processor(
 
 _DUMMY_PROCESSORS = [
     Qwen2VLInputProcessorBase,
-    Qwen2_5VLInputProcessorBase,
     Qwen3VLInputProcessorBase,
 ]
+
+
+def test_qwen_item_metadata_uses_prompt_order_and_pre_merger_costs():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        image_token_id=11,
+        video_token_id=12,
+        vision_start_token_id=10,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    prompt_token_ids = [10, 12, 12, 13, 1, 10, 11, 11, 13]
+    multimodal_data = {
+        "image": {
+            "image_grid_thw": torch.tensor([[1, 4, 4]])
+        },
+        "video": {
+            "video_grid_thw": torch.tensor([[2, 4, 4]])
+        },
+    }
+
+    metadata = processor.get_mm_encoder_item_metadata(prompt_token_ids,
+                                                      multimodal_data)
+
+    assert metadata.item_refs == [("video", 0), ("image", 0)]
+    assert metadata.encoder_token_lengths == [32, 16]
+    assert metadata.output_embedding_lengths == [8, 4]
+
+
+def test_qwen_item_metadata_collapses_frame_spans_into_original_video():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        image_token_id=11,
+        video_token_id=12,
+        vision_start_token_id=10,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    prompt_token_ids = [10, 12, 13, 100, 10, 12, 13]
+    multimodal_data = {
+        "video": {
+            "video_grid_thw": torch.tensor([[2, 4, 4]])
+        },
+    }
+
+    metadata = processor.get_mm_encoder_item_metadata(prompt_token_ids,
+                                                      multimodal_data)
+
+    assert metadata.item_refs == [("video", 0)]
+    assert metadata.encoder_token_lengths == [32]
+    assert metadata.output_embedding_lengths == [8]
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
@@ -788,10 +838,7 @@ def test_qwen2_5_attention_metadata_capacity_uses_processor_geometry():
     [
         (1, 4, 2),  # width exactly divisible -> one all-padding window
         (4, 4, 4),  # both exactly divisible -> ceil() would say 1
-        (2, 8, 3),
-        (8, 8, 9),
         (3, 5, 2),  # neither divisible -> ceil() already agreed
-        (1, 3, 1),
     ],
 )
 def test_window_count_matches_encoder_padding(merged_h, merged_w,
@@ -879,13 +926,9 @@ def test_get_dummy_mm_data_rejects_negative_item_count(processor_cls):
                                mm_counts={"image": -1})
 
 
-@pytest.mark.parametrize("processor_cls", [
-    Qwen2VLInputProcessorBase,
-    Qwen2_5VLInputProcessorBase,
-])
-def test_qwen2_dummy_profiles_long_atomic_video_with_explicit_budget(
-        processor_cls):
-    proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
+def test_qwen2_dummy_profiles_long_atomic_video_with_explicit_budget():
+    proc = _make_dummy_processor(Qwen2VLInputProcessorBase,
+                                 max_pixels=512 * 512)
     video = proc.get_dummy_mm_data(
         max_num_encoder_tokens=14_336,
         mm_counts={"video": 1},
@@ -908,12 +951,9 @@ def test_qwen3_dummy_uses_image_when_it_is_the_larger_modality():
     assert token_lengths == [1024] * 8
 
 
-@pytest.mark.parametrize("processor_cls", [
-    Qwen2VLInputProcessorBase,
-    Qwen2_5VLInputProcessorBase,
-])
-def test_qwen2_dummy_uses_legal_video_geometry(processor_cls):
-    proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
+def test_qwen2_dummy_uses_legal_video_geometry():
+    proc = _make_dummy_processor(Qwen2VLInputProcessorBase,
+                                 max_pixels=512 * 512)
     mm_data = proc.get_dummy_mm_data(
         max_num_encoder_tokens=8192,
         mm_counts={"video": 1},

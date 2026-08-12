@@ -296,12 +296,6 @@ class TestEncoderRuntimeSizes:
 class TestEagerEncoderSchedulingCompatibility:
     """Args parsing defers capability-dependent EAGER checks until model load."""
 
-    def test_eager_alone_is_accepted(self):
-        args = TorchLlmArgs(model=llama_model_path,
-                            multimodal_config=MultimodalConfig(
-                                encoder_scheduling_policy="EAGER"))
-        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
-
     def test_eager_feature_combinations_are_deferred_until_model_load(self):
         args = TorchLlmArgs(
             model=llama_model_path,

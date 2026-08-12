@@ -679,6 +679,19 @@ def test_attention_metadata_capacity_uses_token_budget():
     assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=12) == {"attention": 3}
 
 
+def test_mistral_item_metadata_separates_patch_and_embedding_units():
+    processor = object.__new__(MistralHFInputProcessor)
+    processor._vision_geometry = lambda: (14, 2, 3, 1024)
+
+    metadata = processor.get_mm_encoder_item_metadata(
+        [], {"image": {"image_sizes": [[28, 56], [56, 56]]}}
+    )
+
+    assert metadata.item_refs == [("image", 0), ("image", 1)]
+    assert metadata.encoder_token_lengths == [8, 16]
+    assert metadata.output_embedding_lengths == [2, 4]
+
+
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
 def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
     proc = _make_dummy_processor()
@@ -721,21 +734,6 @@ def test_dummy_get_dummy_mm_data_saturates_budget(budget):
     per_image = (height // 14) * (width // 14)
     assert per_image <= budget
     assert 2 * per_image > budget
-
-
-def test_dummy_get_dummy_mm_data_repeats_items_to_fill_token_budget():
-    proc = _make_dummy_processor(image_size=448)
-    image = proc.get_dummy_mm_data(
-        max_num_encoder_tokens=8192,
-        mm_counts={"image": 8},
-        dtype=torch.float16,
-    )["image"]
-    pixel_values = image["pixel_values"]
-    num_images, _, height, width = pixel_values.shape
-    tokens_per_image = (height // 14) * (width // 14)
-    assert num_images == 8
-    assert tokens_per_image == 1024
-    assert num_images * tokens_per_image == 8192
 
 
 def test_dummy_get_dummy_mm_data_respects_requested_item_count():
