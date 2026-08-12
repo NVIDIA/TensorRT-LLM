@@ -896,6 +896,26 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **agg scheduled 复证首轮为负(−4~−12%)——但发现协议违规**:我的 config 挂了旧 `sts_v1_reconstructed.json`,主线 Pro 的 +9.9~+24.7% 是**裸 sigmoid**;过时温度扭曲排序即乱裁。v2(去 STS,协议逐字对齐)已重排。⚠️ 若 v2 仍负,则分歧升级为真(候选:表绝对值差异/图集 [1,8,32,64,128] vs 全阶梯/客户端 burst 语义),将请主线共享 `pro_sched_arm.yaml` 逐键对表。
 - stage A 第一波在队:poetry lbs{64,128} × {pin2..5, notrim+STS 采集},disagg 表与 STS 原地重采。
 
+## 【08-11 22:30】agg 独立复证闭环:客户端语义定罪 + 统一律三面验证;disagg 发现 gen 不提交进度的疑似分支回归(laliao 侧)
+
+**agg 复证故事线完整闭环**(全部修复后代码、我自己重采的表、到达性逐字验证):
+
+| 轮 | 客户端 | scheduled vs notrim | 判读 |
+|---|---|---|---|
+| schedv2 | 3× 补位闭环(混合步 11%) | poetry −6.3/−6.5%,arena −7.7/−9.8% | 分歧真实但根因在负载形态 |
+| **schedv3-burst** | **单波 burst-drain(混合步 ~1%,对齐主线协议)** | **poetry +4.6%/+7.8%**,arena +0.4/−2.4% | **定性复现主线翻案**;唯一变量是客户端 |
+| schedv3-gate | 补位 + SKIP_MIXED_TRIM | 门控只回收 +0.5~+2.6pp | 补位损失大头 = 纯 gen 密度稀释(regime 本身),错误裁剪只占小头 |
+
+- 到达性与混合步密度均 iter-log 直测:两臂 gen 行数众数逐字打满(64/128),补位客户端 11% 的 gen 步带 prefill,burst ~1%。**统一律(收益=纯 gen 密度×bs 深度)在独立环境三面验证:同机同表,换负载形态即可让收益在 +7.8% 与 −10% 间摆动。**
+- 遗留:poetry 幅度差(我 +7.8 vs 主线 +24.7 @1024;候选:表绝对步时 1.45× 差(76 vs 110ms bs128 满窗,KV 深度/采集负载不同)、图集 [1..256] 全阶梯 vs [1,8,32,64,128]、burst 计量细节);arena ≈0 vs 主线 +6.8/+5.9(请主线提供 arena 臂的 burst 语义与 OSL cap 细节对表)。
+- frac04 机械裁补格判决(前报)与 schedv3 合并看:**Pro 的收益只有 scheduled+修复后表+纯 gen regime 三者同时成立才兑现**。
+
+**disagg 疑似分支回归(阻塞我方 disagg 战役,请主线协查)**:
+- 症状:gen server 每步执行真实完整 verify+draft(102ms 设备时间、384 tok/步)但**永不提交进度**——KV util 0.005 平线 129k 步、active 恒 64/512、零完成;1024 请求完整走过 router→ctx→传输→gen,全链无错。pin/sched/FRAC 各臂均复现,与置信度调度开关无关。
+- 反证:我 08-10 旧镜像(b8bc42c3ae,同 harness 同 gen_only 模式,DSpark mtp6)完成流通;主线 Flash disagg cell 亦通。判别局 D1(同 poetry cell × 旧镜像无 overlay)在跑:通则回归定罪(faf2c60935+overlay 代码代的 disagg gen 接受提交路径),再二分 overlay 28 文件 vs sqsh 基底。
+- 附:到达性机制无懈可击(6 个僵尸 pin cell 的 mode 全部逐字满档),disagg 表/STS/三臂在 bug 后面排队。
+- ⚠️ 请主线看一眼:你们 disagg gen 侧用的 commit/镜像与 gen 第一步(消费 ctx 交接后)的提交路径,近期有无已知改动?
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
