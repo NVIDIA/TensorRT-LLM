@@ -1797,9 +1797,15 @@ def _build_per_layer_num_kv_heads(
         draft_pretrained, 'num_key_value_heads',
         getattr(draft_pretrained, 'num_attention_heads', None))
 
-    if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
+    if draft_num_kv_heads is None:
         return num_key_value_heads
 
+    # Return the extended per-layer list even when the drafter's head count
+    # equals the target's: the list's draft tail is what tells shared-draft
+    # managers that the appended layers exist. An equal-head drafter (e.g.
+    # MiniMax-M3's GQA Eagle head, 4 KV heads like the target) otherwise
+    # disappears into the target's layer range and gets routed through the
+    # target's attention machinery.
     num_spec_layers = get_num_spec_layers(spec_config)
     logger.info(f"Per-layer KV heads for speculative decoding: "
                 f"target={num_key_value_heads} x {num_hidden_layers} layers, "
@@ -1980,6 +1986,19 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        # One-model spec with shared draft layers appends the drafter's
+        # layers to this manager; tell the manager how many. Anchor on the
+        # pretrained TARGET layer count — local num_hidden_layers may already
+        # include the draft tail. Consumed by managers with a draft sub-page
+        # view (MiniMax-M3); others ignore it. Masked/cross flows yield a
+        # non-positive delta and correctly report 0.
+        target_num_layers = getattr(config, "num_hidden_layers", None)
+        num_appended_draft_layers = (len(per_layer_num_kv_heads) -
+                                     target_num_layers
+                                     if isinstance(per_layer_num_kv_heads, list)
+                                     and target_num_layers is not None else 0)
+        manager_extra_kwargs["num_one_model_draft_layers"] = max(
+            0, num_appended_draft_layers)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

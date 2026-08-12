@@ -7850,8 +7850,194 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task = GSM8K(model_name)
                 task.evaluate(llm)
 
+    def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
+                                 inferencemax, attention_dp, overlap_scheduler,
+                                 use_msa, cuda_graph):
+        """Disaggregated arm of test_nvfp4_eagle3.
+
+        CI coverage for Eagle3 + the unified (shared) draft KV cache
+        crossing the disaggregated transceiver on one 4-GPU node: context
+        TEP2 -> generation TEP2 over NIXL, block reuse on the context
+        server. ``attention_dp`` selects the generation flavor: True is
+        the AgentX-submission shape (attention-DP generation), False the
+        TEP production-candidate shape. Every path-gating knob mirrors
+        the production disaggregated configs (fix15a production-candidate
+        sweep, GB300); values that are workload-tuned (1M-context sizes)
+        or GPU-generation-tuned (memory fractions) are CI-adjusted and
+        called out inline. Accuracy is asserted through the router; the
+        drafter's KV rides the shared logical blocks, so a corrupted or
+        dropped drafter cache collapses accuracy. Acceptance stats stay
+        with the aggregated arm, which exercises the same view code.
+        """
+        if not (overlap_scheduler and cuda_graph and use_msa):
+            pytest.skip("the disagg arm pins the production serving shape "
+                        "(overlap scheduler + CUDA graphs + MSA)")
+        from .test_disaggregated_serving import launch_disaggregated_llm
+        speculative_config = {
+            "decoding_type": "Eagle3",
+            "max_draft_len": max_draft_len,
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+            "eagle3_one_model": True,
+        }
+        common_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "speculative_config": speculative_config,
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "fuse_qkv_index_projection": True,
+                "indexer_kv_dtype": "fp8",
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "kv_cache_bounce_size_mb": 0,
+                "kv_transfer_timeout_ms": 600000,
+            },
+            "moe_config": {
+                "backend": "TRTLLM"
+            },
+            "scheduler_config": {
+                "capacity_scheduler_policy": "MAX_UTILIZATION"
+            },
+            "enable_autotuner": True,
+            "return_perf_metrics": True,
+            "perf_metrics_max_requests": 1000,
+            # The InferenceMAX protocol needs room for thinking output;
+            # production serves 1M-token contexts here.
+            "max_seq_len": 16384 if inferencemax else 4096,
+            "trust_remote_code": True,
+        }
+        kv_cache_common = {
+            "dtype": "fp8",
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+            "event_buffer_max_size": 0,
+            # Production runs 0.7 (ctx) / 0.9 (gen) on GB300; one derated
+            # value keeps headroom on the B200 CI stage.
+            "free_gpu_memory_fraction": 0.7,
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "enable_attention_dp": False,
+            "enable_chunked_prefill": True,
+            "attention_dp_config": {
+                "enable_kv_cache_aware_routing": False,
+                "kv_cache_routing_conversation_affinity": True,
+                "kv_cache_routing_max_sessions": 65536,
+            },
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": True
+            },
+            "max_batch_size": 4,
+            "max_num_tokens": 32768,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "enable_attention_dp": attention_dp,
+            "enable_lm_head_tp_in_adp": False,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": False
+            },
+            "max_batch_size": 16,
+            # Decode-only token budget: (1 + draft_len) verify tokens per
+            # request x max_batch_size (the production sweep's value is
+            # its no-spec arm's).
+            "max_num_tokens": (1 + max_draft_len) * 16,
+            "num_postprocess_workers": 4,
+            "stream_interval": 100,
+            "enable_iter_perf_stats": True,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16],
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      model_path,
+                                      server_waiting_timeout=1800) as llm:
+            # The launcher stamps quant_algo=NVFP4 from the model name; the
+            # checkpoint's hf_quant_config is MIXED_PRECISION (which is what
+            # the in-process arm asserts and the accuracy references key on).
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            task = (GSM8KInferenceMax(model_name)
+                    if inferencemax else GSM8K(model_name))
+            task.evaluate(llm)
+
+            # Chat-format acceptance probe — the same workload and
+            # thresholds as the aggregated arm's (200 GSM8K questions,
+            # chat template, greedy, 512 tokens; drafter card reference
+            # rate 0.839 / length 3.518). The disagg fixture has no
+            # get_stats, so the probe window comes from the generation
+            # worker's /metrics buffer (enable_iter_perf_stats), drained
+            # right before the probe; the dataset loads from the models
+            # root so the probe works offline like the eval does.
+            import requests
+            info = requests.get(f"{llm.router_url}/cluster_info",
+                                timeout=30).json()
+            gen_worker = info["current_workers"]["generation_servers"][0]
+            gen_url = f'{gen_worker["host"]}:{gen_worker["port"]}'
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            requests.get(f"http://{gen_url}/metrics", timeout=30)  # drain
+            probe_params = SamplingParams(max_tokens=512, temperature=0)
+            for future in [
+                    llm.generate_async(prompt, probe_params)
+                    for prompt in chat_prompts
+            ]:
+                future.result()
+            records = requests.get(f"http://{gen_url}/metrics",
+                                   timeout=30).json()
+            drafted = accepted = steps = 0
+            for record in records:
+                stats = record.get("specDecodingStats") or {}
+                drafted += stats.get("numDraftTokens", 0)
+                accepted += stats.get("numAcceptedTokens", 0)
+                steps += stats.get("numRequestsWithDraftTokens", 0)
+            assert steps > 0, "no speculative iterations in /metrics"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.78, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: " \
+                f"{chat_rate:.3f} (threshold 0.78, reference 0.839 from " \
+                f"the drafter card)"
+            assert chat_length > 3.3, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.3, reference 3.518 from " \
+                f"the drafter card)"
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("disagg", [False, True])
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
@@ -7859,7 +8045,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa, cuda_graph, eval_mode):
+                          overlap_scheduler, use_msa, cuda_graph, eval_mode,
+                          disagg):
         if use_msa:
             from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
                 msa_package_available
@@ -7869,6 +8056,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
+        if disagg:
+            self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
+                                          inferencemax, attention_dp,
+                                          overlap_scheduler, use_msa,
+                                          cuda_graph)
+            return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",

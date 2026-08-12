@@ -32,8 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import BaseResourceManager
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -2109,12 +2108,13 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def get_draft_kv_cache_manager(self, resource_manager):
         """
-        Get the draft KV cache manager if using separate KV cache layouts.
+        Get the draft-side KV manager (separate manager or the target
+        manager's draft sub-page view); see resolve_draft_kv_cache_manager.
         """
-        if self.use_separate_draft_kv_cache and resource_manager is not None:
-            return resource_manager.get_resource_manager(
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        return None
+        if resource_manager is None:
+            return None
+        from .utils import resolve_draft_kv_cache_manager
+        return resolve_draft_kv_cache_manager(resource_manager)
 
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):

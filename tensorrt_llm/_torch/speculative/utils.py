@@ -523,19 +523,41 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
-def get_draft_kv_cache_manager(spec_config, resource_manager):
-    """
-    Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache.
+def resolve_draft_kv_cache_manager(resource_manager):
+    """Resolve the draft-side KV manager for one-model speculative decoding.
+
+    The registered separate manager is the ground truth when present;
+    otherwise ask the target manager for its draft sub-page view (managers
+    without one — e.g. same-geometry shared drafters — resolve to None and
+    the drafter attends the shared manager directly).
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
+    draft_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if draft_manager is not None:
+        return draft_manager
+    target_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    # getattr fetches the method without executing it, so a failure inside
+    # view construction propagates from the call itself instead of being
+    # silently swallowed into "no view".
+    get_view = getattr(target_manager, "get_draft_subpage_view", None)
+    return get_view() if get_view is not None else None
+
+
+def get_draft_kv_cache_manager(spec_config, resource_manager):
+    """
+    Returns the draft KV cache manager only in one-model speculative decoding
+    mode: the separate manager when the target manages one, or the target
+    manager's draft sub-page view when shared draft layers run at a smaller
+    kernel page size (e.g. MiniMax-M3). See resolve_draft_kv_cache_manager.
+    """
     if spec_config is None:
         return None
     if not spec_config.spec_dec_mode.use_one_engine():
         return None
-    return resource_manager.get_resource_manager(
-        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    return resolve_draft_kv_cache_manager(resource_manager)
 
 
 def update_spec_config_from_model_config(spec_config, model_config):
