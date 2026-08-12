@@ -180,12 +180,15 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         command += ["--run-ray"]
 
     s3_secret_key = None
+    s3_output_module = None
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
     if s3_upload_path:
+        from test_common import s3_output as s3_output_module
+
         inner_output_dir = os.path.join(output_dir, "inner-s3", case_fn)
         inner_upload_path = os.path.join(s3_upload_path, "inner", case_fn)
         command += [
-            "-s",
+            "--capture=fd",
             f"--output-dir={inner_output_dir}",
             f"--s3-upload-path={inner_upload_path}",
             "--s3-upload-mode=deferred",
@@ -262,6 +265,18 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 )
             print(f"{'='*60}\n")
             return False
+        finally:
+            if s3_output_module is not None:
+                try:
+                    drained = s3_output_module.drain_pending_uploads(
+                        inner_output_dir,
+                        secret_key=s3_secret_key,
+                    )
+                except Exception as e:
+                    print(f"Failed to drain pending S3 test logs: {e}")
+                else:
+                    if not drained:
+                        print("Some pending S3 test logs could not be drained")
         return True
 
     if num_workers == 1:

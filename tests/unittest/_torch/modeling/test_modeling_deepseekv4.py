@@ -16,15 +16,13 @@ from transformers import PretrainedConfig
 # from utils.util import default_dtype
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
-)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -152,19 +150,16 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_model_defaults():
-    class LlmArgs:
-        pass
-
-    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
+def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
 
     assert defaults == {
         "kv_cache_config": {
             "tokens_per_block": 128,
-            "use_kv_cache_manager_v2": True,
             "enable_swa_scratch_reuse": True,
         }
     }
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
@@ -371,18 +366,39 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
 
 
 def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+        forward_sparse_attn,
+        initialize_sparse_attn,
+    )
     from tensorrt_llm._torch.modules.mla import MLA
 
-    init_src = inspect.getsource(MLA.__init__)
-    helper_src = inspect.getsource(MLA._deepseek_v4_q_b_layernorm)
-    forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
+    mla_init_src = inspect.getsource(MLA.__init__)
+    init_src = inspect.getsource(initialize_sparse_attn)
+    forward_src = inspect.getsource(forward_sparse_attn)
+    forward_src_dedented = textwrap.dedent(forward_src)
+    q_norm_node = next(
+        node
+        for node in ast.walk(ast.parse(forward_src_dedented))
+        if isinstance(node, ast.FunctionDef) and node.name == "_q_b_layernorm"
+    )
+    fused_q_norm_node = next(
+        node
+        for node in ast.walk(ast.parse(forward_src_dedented))
+        if isinstance(node, ast.FunctionDef) and node.name == "_q_b_layernorm_fused_fp8"
+    )
+    helper_src = ast.get_source_segment(forward_src_dedented, q_norm_node)
+    fused_helper_src = ast.get_source_segment(forward_src_dedented, fused_q_norm_node)
+    assert helper_src is not None
+    assert fused_helper_src is not None
     init_src_no_ws = "".join(init_src.split())
+    fused_helper_src_no_ws = "".join(fused_helper_src.split())
 
     assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws
     assert "has_weights=False" in init_src
-    assert "kv_a_layernorm_hidden_size = (" in init_src
     assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
-    assert "self.kv_a_layernorm=RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src_no_ws
+    assert "self.kv_a_layernorm=RMSNorm(" in init_src_no_ws
+    assert "self.sparse_attn_hooks.initialize(" in mla_init_src
+    assert "deepseek_v4" not in mla_init_src
     assert "q.dim() == 2" in helper_src
     assert "self.num_heads_tp * self.qk_head_dim" in helper_src
     assert "torch.ops.trtllm.deepseek_v4_q_norm" in helper_src
@@ -391,7 +407,11 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "q.dtype" not in helper_src
     assert "total_rows" not in helper_src
     assert "self.q_b_layernorm(" not in helper_src
-    assert "self._deepseek_v4_q_b_layernorm(q_proj)" in _source_calls(forward_src)
+    assert "_q_b_layernorm(q_proj)" in _source_calls(forward_src)
+    assert "q_pe=q_proj.new_empty((num_q_tokens,self.num_heads_tp,rope_dim))" in (
+        fused_helper_src_no_ws
+    )
+    assert "torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(" in fused_helper_src
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():

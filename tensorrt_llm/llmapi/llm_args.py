@@ -1062,6 +1062,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 return getattr(pretrained_config, name, default)
             return default
 
+        num_layers = getattr(pretrained_config, "num_hidden_layers", None)
+        has_shared_indexer_layers = (num_layers is not None and any(
+            not self._is_full_indexer_layer(pretrained_config, layer_idx)
+            for layer_idx in range(num_layers)))
+
         return DSAMetadataParams(
             indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
             max_sparse_topk=_value("index_topk"),
@@ -1071,6 +1076,9 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
+            has_shared_indexer_layers=has_shared_indexer_layers,
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
 
@@ -2093,8 +2101,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = Field(
         default=True,
         description=
-        "Whether to use the faster one-model implementation (draft as submodule) or the two-model implementation."
-    )
+        "Always uses the one-model implementation (draft as submodule). "
+        "Setting False is ignored and falls back to True; the two-model path "
+        "is deprecated and will be removed in a future release.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2126,8 +2135,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("max_draft_len must be > 0 for Eagle")
         if not self.eagle3_one_model:
             logger.warning(
-                "Eagle3 2-model is deprecated and will be removed in release 1.4."
-            )
+                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
+                "ignored; falling back to eagle3_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.eagle3_one_model = True
 
         self.num_eagle_layers = self.max_draft_len
 
@@ -2535,8 +2546,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     mtp_eagle_one_model: bool = Field(
         default=True,
         description=
-        "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
-    )
+        "When using EAGLE-style MTP, always uses the one-model implementation "
+        "(drafter as submodule). Setting False is ignored and falls back to "
+        "True; the two-model path is deprecated and will be removed in a "
+        "future release.")
 
     use_dynamic_tree: bool = Field(
         default=False,
@@ -2641,8 +2654,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated and will be removed in release 1.4."
-            )
+                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
+                "and ignored; falling back to mtp_eagle_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.mtp_eagle_one_model = True
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -3618,11 +3633,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
     )
-    model_path: str = Field(
-        min_length=1,
-        description="Checkpoint path used to derive RoPE tables when converting "
-        "the official calibration and to classify kernel-masked sliding-attention "
-        "layers.")
     calibration_path: str = Field(
         min_length=1,
         description="Path to the official TriAttention calibration `.pt` "
@@ -3720,21 +3730,29 @@ class MambaStateConfig(StrictBaseModel):
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
 
-    block_reuse_policy: Literal[
-        "all_reusable", "per_request", "per_conversation"] = Field(
-            default="all_reusable",
-            status="prototype",
-            description="KV cache manager v2 block reuse policy. "
-            "'all_reusable' commits reusable blocks after every context chunk; "
-            "'per_request' commits them only after the final context chunk; "
-            "'per_conversation' uses 'per_request' commits and retains committed "
-            "SWA-window blocks and Mamba stable-boundary state for up to "
-            "`max_num_turns` completed turns. Periodic Mamba state snapshots "
-            "are disabled with 'per_conversation'. All reusable blocks remain "
-            "subject to normal cache eviction. "
-            "Requests without conversation params use 'per_request' behavior. When "
-            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
-            "blocks are committed for reuse.")
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_renamed_block_reuse_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "block_reuse_policy" in data:
+            raise ValueError(
+                "'kv_cache_config.block_reuse_config.block_reuse_policy' was "
+                "renamed to 'kv_cache_config.block_reuse_config.policy'.")
+        return data
+
+    policy: Literal["all_reusable", "per_request", "per_conversation"] = Field(
+        default="all_reusable",
+        status="prototype",
+        description="KV cache manager v2 block reuse policy. "
+        "'all_reusable' commits reusable blocks after every context chunk; "
+        "'per_request' commits them only after the final context chunk; "
+        "'per_conversation' uses 'per_request' commits and retains committed "
+        "SWA-window blocks and Mamba stable-boundary state for up to "
+        "`max_num_turns` completed turns. Periodic Mamba state snapshots "
+        "are disabled with 'per_conversation'. All reusable blocks remain "
+        "subject to normal cache eviction. "
+        "Requests without conversation params use 'per_request' behavior. When "
+        "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+        "blocks are committed for reuse.")
 
     max_num_turns: PositiveInt = Field(
         default=1,
@@ -3743,7 +3761,7 @@ class BlockReuseConfig(StrictBaseModel):
         "Maximum number of completed conversation turns whose committed SWA-window "
         "blocks and Mamba stable-boundary state are retained by KV cache manager v2. "
         "Only used when "
-        "`block_reuse_policy` is 'per_conversation'.")
+        "`policy` is 'per_conversation'.")
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -3907,8 +3925,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "Whether to use the KV cache manager v2 (experimental). 'auto' uses "
-        "the model-specific default and falls back to False when the model "
-        "does not specify one.")
+        "the model-specific preference and falls back to False when the model "
+        "does not declare one.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     enable_swa_scratch_reuse: bool = Field(
@@ -4089,14 +4107,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     def disable_periodic_mamba_snapshots_for_conversations(
             self) -> 'KvCacheConfig':
         """Use only explicit stable boundaries for conversation reuse."""
-        if (self.block_reuse_config.block_reuse_policy == "per_conversation"
+        if (self.block_reuse_config.policy == "per_conversation"
                 and self.mamba_state_config.periodic_snapshot_interval != 0):
             interval = self.mamba_state_config.periodic_snapshot_interval
             logger.warning(
                 f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
                 "is ignored because "
-                "'kv_cache_config.block_reuse_config."
-                "block_reuse_policy=per_conversation' disables "
+                "'kv_cache_config.block_reuse_config.policy=per_conversation' disables "
                 "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})
@@ -4230,14 +4247,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
         default=60000,
         description=
-        "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
-    )
+        "KV cache transfer timeout in milliseconds. Blocking sender waits use "
+        "it as an absolute deadline; blocking receive task waits use it per "
+        "task. The Python V2 transceiver requires a finite value; None remains "
+        "available to other runtimes. It is distinct from the sender future "
+        "wait slice.")
 
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,
         description=
-        "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
-    )
+        "Duration in milliseconds of each bounded sender future wait slice "
+        "while polling KV transfer completion. It does not set the overall "
+        "transfer deadline.")
 
     kv_transfer_poll_interval_ms: Optional[PositiveInt] = Field(
         default=5000,
@@ -4597,8 +4618,9 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="The parser to separate reasoning content from output.",
         status="prototype",
-        telemetry=TelemetryField.categorical('auto', 'deepseek-r1', 'laguna',
-                                             'qwen3', 'qwen3_5', 'minimax_m2',
+        telemetry=TelemetryField.categorical('auto', 'deepseek-r1',
+                                             'poolside_v1', 'laguna', 'qwen3',
+                                             'qwen3_5', 'minimax_m2',
                                              'minimax_m2_append_think',
                                              'nano-v3', 'gemma4', 'kimi_k2',
                                              'kimi_k25'))
@@ -5057,6 +5079,17 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    generation_config: Literal["auto", "trtllm"] = Field(
+        default="trtllm",
+        description=
+        "Controls whether sampling defaults are loaded from the model's "
+        "generation_config.json. 'auto' applies supported values when the "
+        "request does not specify them; 'trtllm' preserves TRT-LLM defaults. "
+        "Precedence is request values, generation_config.json values, then "
+        "TRT-LLM defaults.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'trtllm']"})
+
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
@@ -5073,6 +5106,25 @@ class TorchLlmArgs(BaseLlmArgs):
         since the input shapes are a function of the sequence lengths).\
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
+
+    encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig] = Field(
+        default=None,
+        description=(
+            "CUDA graph configuration for the encoder forward pass of an "
+            "encoder-decoder model. Use `cuda_graph_config` for the decoder "
+            "and this field for the encoder. Encoder CUDA graphs require "
+            "`encoder_max_batch_size` to be set."),
+        status="prototype")
+
+    enable_encoder_decoder_mixed_cuda_graph: bool = Field(
+        default=True,
+        description=(
+            "Enable the mixed-batch CUDA graph performance optimization for "
+            "encoder-decoder models. The graph handles decoder iterations "
+            "containing both context and generation requests. It is enabled "
+            "by default when both `cuda_graph_config` and "
+            "`encoder_cuda_graph_config` produce usable graph shapes."),
+        status="prototype")
 
     @field_validator('cuda_graph_config', mode='before')
     @classmethod
@@ -5127,21 +5179,21 @@ class TorchLlmArgs(BaseLlmArgs):
 
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
-            "Falls back to `max_batch_size` when unset. This budget is shared "
-            "proportionately across all modalities the model encodes, not set "
-            "per modality; per-modality knobs may be added later."),
+        description=
+        ("Maximum encoder batch size. For encoder-decoder models, this also "
+         "controls encoder microbatch admission and limits encoder CUDA graph "
+         "batch sizes. For multimodal models, this is the shared "
+         "AttentionMetadata budget across all encoded modalities. Falls back "
+         "to `max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
         description=(
-            "Maximum number of tokens for the multimodal encoder's "
-            "AttentionMetadata. Falls back to `max_num_tokens` when unset. This "
-            "budget is shared proportionately across all modalities the model "
-            "encodes, not set per modality; per-modality knobs may be added "
-            "later."),
+            "Maximum number of encoder tokens. For encoder-decoder models, this "
+            "limits encoder CUDA graph total-token buckets. For multimodal "
+            "models, this is the shared AttentionMetadata budget across all "
+            "encoded modalities. Falls back to `max_num_tokens` when unset."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
@@ -5150,6 +5202,28 @@ class TorchLlmArgs(BaseLlmArgs):
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer when set")
         return v
+
+    @model_validator(mode="after")
+    def validate_encoder_cuda_graph_config(self) -> 'TorchLlmArgs':
+        if self.encoder_cuda_graph_config is None:
+            return self
+        if self.encode_only:
+            raise ValueError(
+                "Use cuda_graph_config=EncodeCudaGraphConfig(...) when "
+                "encode_only=True; encoder_cuda_graph_config is for "
+                "encoder-decoder models.")
+        if self.encoder_max_batch_size is None:
+            raise ValueError(
+                "encoder_cuda_graph_config requires encoder_max_batch_size.")
+        missing = []
+        if not self.encoder_cuda_graph_config.num_tokens:
+            missing.append("num_tokens/max_num_token")
+        if not self.encoder_cuda_graph_config.seq_lens:
+            missing.append("seq_lens/max_seq_len")
+        if missing:
+            raise ValueError("encoder_cuda_graph_config requires "
+                             f"{' and '.join(missing)}.")
+        return self
 
     attn_backend: str = Field(
         default='TRTLLM',
@@ -5822,8 +5896,6 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
-                if self.backend == "_autodeploy":
-                    self.speculative_config._draft_target_one_model = False
 
             # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
             # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.

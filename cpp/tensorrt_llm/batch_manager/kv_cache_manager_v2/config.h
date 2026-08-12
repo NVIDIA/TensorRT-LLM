@@ -293,6 +293,12 @@ struct KVCacheManagerConfig
     // Collect V2 KV cache allocation, reuse, and transfer statistics.
     bool enableStats = true;
 
+    // Deployment-level guarantee that no request carries multi-modal content, so token
+    // sequences never contain digests. Lets block-key hashing take the digest-free fast
+    // path without scanning. A per-KvCache text_only override may only tighten this
+    // (a text-only deployment forbids a request claiming otherwise). Default false.
+    bool textOnly = false;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

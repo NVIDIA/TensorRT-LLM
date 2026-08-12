@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import socket
+import sys
 import time
 import traceback
 import uuid
@@ -18,8 +19,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
-                    Optional, Union)
+from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
+                    AsyncIterator, List, Optional, Union)
 
 import uvicorn
 from fastapi import Body, FastAPI, Request
@@ -50,6 +51,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig as _KvRetention
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -106,10 +108,27 @@ from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
 from tensorrt_llm.version import __version__ as VERSION
-from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
+
+if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen import VisualGen
+
+
+def _is_visual_gen_instance(obj) -> bool:
+    """isinstance(obj, VisualGen) without importing the visual_gen tree.
+
+    Probes the module that defines the class, not the (lazily loaded)
+    package: a process that only imported config leaves like
+    tensorrt_llm.visual_gen.args has the package in sys.modules, but
+    reading VisualGen off it would import the whole runtime tree via
+    __getattr__. If the defining module was never imported, obj cannot
+    be a VisualGen instance, so the LLM serving path never pays the
+    visual_gen import cost.
+    """
+    visual_gen = sys.modules.get("tensorrt_llm.visual_gen.visual_gen")
+    return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 
 def _disk_retention_config(request):
@@ -176,6 +195,60 @@ if _MSGSPEC_ENABLED:
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+_warned_unresolvable_thinking = False
+
+
+def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
+    """Warn when a generation worker cannot learn the reasoning mode.
+
+    Nothing was rendered here and the context worker relayed no value, so
+    every request on this deployment is parsed in a possibly wrong mode with
+    nothing in the response saying so. Reachable via a rolling upgrade where
+    the context worker predates `resolved_thinking`, a hand-crafted
+    `generation_only` request, or an orchestration path that does not go
+    through `_get_ctx_request`.
+    """
+    global _warned_unresolvable_thinking
+    if _warned_unresolvable_thinking:
+        return
+    _warned_unresolvable_thinking = True
+    logger.warning(
+        f"Reasoning parser {reasoning_parser!r} resolves its mode from the "
+        "rendered prompt, but this request had neither a rendered prompt nor "
+        "a relayed mode from a context worker. Reasoning content will not be "
+        "separated correctly. Check that the context worker is running a "
+        "build that relays 'resolved_thinking'.")
+
+
+def _configure_parser_special_token_decoding(
+        sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
+        tool_parser_name: Optional[str], has_tools: bool) -> None:
+    """Configure detokenization for parsers that consume special tokens."""
+    needs_compact_special_tokens = False
+    if reasoning_parser_name and ReasoningParserFactory.needs_raw_special_tokens(
+            reasoning_parser_name):
+        # Unlike the tool-parser flag below, this applies to every chat
+        # request: reasoning delimiters are special tokens regardless of
+        # whether tools are attached.
+        sampling_params.skip_special_tokens = False
+        needs_compact_special_tokens = reasoning_parser_name.lower(
+        ) == "kimi_k3"
+
+    if tool_parser_name and has_tools:
+        tool_parser_cls = ToolParserFactory.parsers.get(
+            tool_parser_name.lower())
+        if tool_parser_cls and getattr(tool_parser_cls,
+                                       'needs_raw_special_tokens', False):
+            sampling_params.skip_special_tokens = False
+            needs_compact_special_tokens |= tool_parser_name.lower(
+            ) == "kimi_k3"
+
+    if needs_compact_special_tokens:
+        # K3 XTML places ordinary-text tag names directly between special
+        # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
+        # changes the protocol and prevents the K3 parsers from matching it.
+        sampling_params.spaces_between_special_tokens = False
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -275,7 +348,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def __init__(
             self,
-            generator: Union[LLM, MultimodalEncoder, VisualGen],
+            generator: Union[LLM, MultimodalEncoder, "VisualGen"],
             model: str,
             tool_parser: Optional[str],
             server_role: Optional[ServerRole],
@@ -290,7 +363,7 @@ class OpenAIServer(_VideoRoutesMixin):
             media_load_workers: int = 8,
             internal_disagg_auth_key: Optional[str] = None):
         self.generator = generator
-        self._is_visual_gen = isinstance(generator, VisualGen)
+        self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
@@ -407,7 +480,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.disagg_cluster_config, self.disagg_cluster_storage)
 
             # VisualGen has no args
-            if not isinstance(self.generator, VisualGen):
+            if not self._is_visual_gen:
                 # Start energy monitoring if enabled
                 if getattr(self.generator.args, "enable_energy_metrics", False):
                     try:
@@ -494,9 +567,8 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
-            assert isinstance(
-                self.generator, VisualGen
-            ), "generator must be a VisualGen for VISUAL_GEN server"
+            assert self._is_visual_gen, \
+                "generator must be a VisualGen for VISUAL_GEN server"
             self.register_visual_gen_routes()
         elif self.server_role is ServerRole.MM_ENCODER:
             assert isinstance(
@@ -768,9 +840,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 f"{raw_request.client} is disconnected, abort {promise.request_id}"
             )
 
+    @functools.cached_property
+    def _is_visual_gen(self) -> bool:
+        # __init__ pre-caches this (so a probe patched during construction
+        # sticks); computing on demand keeps instances built without
+        # __init__ (unit tests use OpenAIServer.__new__) working.
+        return _is_visual_gen_instance(self.generator)
+
     @property
     def postproc_worker_enabled(self) -> bool:
-        if isinstance(self.generator, VisualGen):
+        if self._is_visual_gen:
             return False
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
@@ -1494,18 +1573,22 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Pre-render, so the mode may be unresolved. Safe because the
+            # boundary lookup reads the parser class attributes, not the
+            # branch `__init__` picked.
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
+            reasoning_parser_name = self.generator.args.reasoning_parser
+            _configure_parser_special_token_decoding(
+                sampling_params,
+                reasoning_parser_name=reasoning_parser_name,
+                tool_parser_name=self.tool_parser,
+                has_tools=bool(request.tools))
             if self.tool_parser and request.tools:
-                tool_parser_cls = ToolParserFactory.parsers.get(
-                    self.tool_parser.lower())
-                if tool_parser_cls and getattr(
-                        tool_parser_cls, 'needs_raw_special_tokens', False):
-                    sampling_params.skip_special_tokens = False
                 # When strict=True on any tool, apply constrained decoding
                 # via structural tags (only if response_format doesn't already
                 # set guided decoding).
@@ -1544,6 +1627,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     base64.b64decode(request.prompt_token_ids_b64),
                     dtype=np.int32).tolist()
 
+            rendered_prompt = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -1561,6 +1645,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
+                if isinstance(prompt, str):
+                    rendered_prompt = prompt
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -1580,6 +1666,31 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
+            # Templates that prefill <think>/</think> leave the marker in the
+            # prompt, so the request kwargs alone cannot tell the parser which
+            # mode was rendered. Take it from the prompt instead.
+            if postproc_args.reasoning_parser and (
+                    ReasoningParserFactory.resolves_thinking_from_prompt(
+                        postproc_args.reasoning_parser)):
+                thinking = None
+                if rendered_prompt and request.add_generation_prompt:
+                    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+                        postproc_args.reasoning_parser, rendered_prompt)
+                if thinking is None and request.disaggregated_params is not None:
+                    # Generation worker: it never rendered, so use the mode the
+                    # context worker resolved and relayed.
+                    thinking = request.disaggregated_params.resolved_thinking
+                    if thinking is None:
+                        _warn_unresolvable_thinking_once(
+                            postproc_args.reasoning_parser)
+                if thinking is not None:
+                    # Both keys, because the parser ORs them: leaving a stale
+                    # `thinking` in place would override what we resolved.
+                    postproc_args.chat_template_kwargs = {
+                        **(request.chat_template_kwargs or {}),
+                        "thinking": thinking,
+                        "enable_thinking": thinking,
+                    }
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(

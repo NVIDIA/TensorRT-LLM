@@ -59,6 +59,46 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    @torch.library.register_fake("trtllm::autotuned_allreduce")
+    def _(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        strategy: int,
+        op: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ) -> List[torch.Tensor]:
+        return allreduce(input, residual, norm_weight, scale, bias, workspace,
+                         group, strategy, op, eps, trigger_completion_at_end)
+
+    @torch.library.register_fake("trtllm::register_allreduce_tactic")
+    def _(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        op: int,
+        bucket: int,
+        tactic: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
+    def _(buckets: List[int]) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::clear_allreduce_tactic_cache")
+    def _() -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce_pg")
     def _(
         input: torch.Tensor,
@@ -139,6 +179,23 @@ def _register_fake():
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
+
+    @torch.library.register_fake("trtllm::attn_res_fwd")
+    def _(
+        layer_residual: torch.Tensor, block_residual: torch.Tensor,
+        res_weight: torch.Tensor, rms_weight: torch.Tensor, rms_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # layer_residual: [T, B, H] bf16; block_residual: [N - 1, T, B, H].
+        num_candidates = block_residual.shape[0] + 1
+        seq_len, batch_size = layer_residual.shape[0], layer_residual.shape[1]
+        output = torch.empty_like(layer_residual)
+        rsigma = layer_residual.new_empty((num_candidates, seq_len, batch_size),
+                                          dtype=torch.float32)
+        probs = layer_residual.new_empty((num_candidates, seq_len, batch_size),
+                                         dtype=torch.float32)
+        logits = layer_residual.new_empty((num_candidates, seq_len, batch_size),
+                                          dtype=torch.float32)
+        return output, rsigma, probs, logits
 
     @torch.library.register_fake("trtllm::fused_inv_rope_fp8_quant_vllm_port")
     def _(o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor,
@@ -277,11 +334,39 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::kda_decode")
-    def _(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v,
-          conv_state_q, conv_state_k, conv_state_v, a_log, g, dt_bias, beta,
-          onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state,
-          apply_onorm, update_conv_cache, use_lower_bound, apply_beta_sigmoid,
-          lower_bound, scale, onorm_eps):
+    def _(x_q: torch.Tensor,
+          x_k: torch.Tensor,
+          x_v: torch.Tensor,
+          w_q_t: torch.Tensor,
+          w_k_t: torch.Tensor,
+          w_v_t: torch.Tensor,
+          bias_q: torch.Tensor,
+          bias_k: torch.Tensor,
+          bias_v: torch.Tensor,
+          conv_state_q: torch.Tensor,
+          conv_state_k: torch.Tensor,
+          conv_state_v: torch.Tensor,
+          a_log: torch.Tensor,
+          g: torch.Tensor,
+          dt_bias: torch.Tensor,
+          beta: torch.Tensor,
+          onorm_g: torch.Tensor,
+          onorm_weight: torch.Tensor,
+          ssm_state_indices: Optional[torch.Tensor],
+          cu_seqlens: torch.Tensor,
+          state: torch.Tensor,
+          apply_onorm: bool,
+          update_conv_cache: bool,
+          use_lower_bound: bool,
+          apply_beta_sigmoid: bool,
+          lower_bound: float,
+          scale: float,
+          onorm_eps: float,
+          output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Mirror the CUDA impl: write into the caller-provided output when
+        # given (schema returns Tensor(e!)), else allocate.
+        if output is not None:
+            return output
         # x_q is [1, tokens, H, 128]; the kernel emits one row per token.
         return x_q.new_empty((x_q.size(1), 1, x_v.size(2), x_v.size(3)))
 

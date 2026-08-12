@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # --------------------------------------------------
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
@@ -832,8 +835,6 @@ class DeepseekV32Attention(MLA):
                          aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
-
-        self.indexer = self.mqa.indexer
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
@@ -1900,36 +1901,31 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for this model implementation."""
+        return "V2"
+
+    @classmethod
     def get_preferred_transceiver_runtime(
             cls,
             pretrained_config: Any = None
     ) -> Optional[Literal["CPP", "PYTHON"]]:
-        """Preferred KV-cache transceiver runtime, differentiated per checkpoint.
+        """Preferred KV-cache transceiver runtime.
 
-        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` use MLA attention, which transfers
-        a large latent KV that the Python (v2) transceiver handles better in disaggregated
-        serving, so they prefer the Python transceiver. GLM 5.2 (``GlmMoeDsaForCausalLM`` /
-        ``glm_moe_dsa``) uses a per-layer masked DSA indexer k-cache pool (cross-layer indexer
-        sharing) that the Python transceiver does not support, so GLM checkpoints must use the
-        C++ transceiver, which handles both the masked pool and dense indexer layouts. Applied
-        only when ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
+        ``DeepseekV3ForCausalLM`` and ``DeepseekV32ForCausalLM`` use MLA
+        attention, which transfers a large latent KV that the Python (v2)
+        transceiver handles better in disaggregated serving. Applied only when
+        ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
         is always respected.
         """
-        if pretrained_config is not None:
-            architectures = getattr(pretrained_config, 'architectures',
-                                    None) or []
-            # model_type is checked as a fallback: it is 'glm_moe_dsa' on GLM
-            # checkpoints until __init__ rewrites it to 'deepseek_v32'.
-            if ("GlmMoeDsaForCausalLM" in architectures or getattr(
-                    pretrained_config, 'model_type', None) == 'glm_moe_dsa'):
-                return "CPP"
         return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
@@ -2095,3 +2091,16 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                         layer.mlp.experts.fuse_shared_expert(
                             layer.mlp.shared_experts)
                         layer.mlp.shared_experts = None
+
+
+@register_auto_model("GlmMoeDsaForCausalLM")
+class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
+    """GLM 5.2 model flavor with an independent transceiver preference."""
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer Python for GLM 5.2's masked DSA indexer K-cache transfer."""
+        return "PYTHON"
