@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any, Dict, Literal, Optional
 
 import torch
@@ -551,6 +554,27 @@ class Transformer(DecoderModel):
 
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for the model's VSWA layout.
+
+        GPT-OSS applies a sliding window to every other layer
+        (see ``AttentionBlock.__init__``), so the KV cache is VSWA: two
+        distinct attention window sizes. V2 groups layers by lifecycle and
+        coalesces buffers within each pool group, which sizes the
+        sliding-window and full-attention pools independently instead of
+        statically dividing memory between them.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Two-model
+        speculative decoding demotes it to V1 because V2 sizes both the target
+        and draft KV cache managers from the full budget; an explicit ``True``
+        is rejected by ``llm_utils._resolve_kv_cache_manager_v2_auto``.
+        """
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(

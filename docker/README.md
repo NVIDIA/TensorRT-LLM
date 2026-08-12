@@ -35,7 +35,7 @@ make -C docker release_run
 The full image name and tag can be controlled by supplying `IMAGE_WITH_TAG` to `make`:
 
 ```bash
-make -C docker devel_push IMAGE_WITH_TAG="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:dev"
+make -C docker devel_push IMAGE_WITH_TAG="artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:dev"
 ```
 
 Containers can be started with the local user instead of `root` by appending `LOCAL_USER=1` to the run target:
@@ -105,7 +105,7 @@ Start a new container using the same image as Jenkins using your local user acco
 make -C docker jenkins_run LOCAL_USER=1
 ```
 
-If you do not have access to the [internal artifact repository](https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/), you can instead either use the [NGC Develop
+If you do not have access to the [internal artifact repository](https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm/), you can instead either use the [NGC Develop
 image](#ngc-integration) or [build an image locally](#building-docker-images-with-gnu-make).
 
 #### Release images based on Jenkins image
@@ -117,10 +117,10 @@ make -C docker trtllm_build CUDA_ARCHS="80-real;90-real"
 ```
 
 Note that the above requires access to the Jenkins development image from the
-[internal artifact repository](https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/).
+[internal artifact repository](https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm/).
 
 The resulting images can be pushed to
-the [internal artifact repository](https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm-staging/release/):
+the [internal artifact repository](https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm-staging/release/):
 
 ```bash
 make -C docker trtllm_push

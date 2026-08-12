@@ -381,6 +381,8 @@ struct BaseAgentConfig
     bool useListenThread;
     bool enableTelemetry;
     std::unordered_map<std::string, std::string> backendParams;
+    std::optional<int> rank;
+    std::optional<int> worldSize;
 };
 
 class BaseTransferAgent
@@ -443,6 +445,14 @@ public:
     virtual ~BaseLoopbackAgent() = default;
     virtual void executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
 };
+
+/// @brief Promote the shared library containing this code (libtensorrt_llm.so) to the
+/// process's global symbol scope. The KV cache transfer-agent wrapper libraries
+/// (libtensorrt_llm_{nixl,ucx,mooncake}_wrapper.so) intentionally carry no DT_NEEDED on
+/// libtensorrt_llm.so (the dependency would be circular) and resolve its symbols from the
+/// global symbol table, while Python extension modules and their dependencies load with
+/// RTLD_LOCAL. Idempotent; a no-op when the code is statically linked (e.g. unit tests).
+void promoteHostLibraryToGlobalScope();
 
 class DynLibLoader final
 {

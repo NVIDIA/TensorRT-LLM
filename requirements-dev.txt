@@ -1,9 +1,12 @@
 -r requirements.txt
-# VisualGen LPIPS goldens were recorded with this version. Install it before
-# pytest collection so already-imported Diffusers modules match the package files.
-diffusers==0.38.0
+# Pin the exact diffusers version VisualGen LPIPS tests run against; install it
+# before pytest collection so already-imported Diffusers modules match the
+# package files. 0.39.0 matches the runtime floor in requirements.txt.
+diffusers==0.39.0
 boto3
 einops
+# Reference implementation for KDA kernel parity tests.
+flash-linear-attention==0.5.2
 lpips
 graphviz
 mypy==1.19.1

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -788,6 +788,41 @@ TEST_F(LlmRequestTest, createResultDisaggContextComplete)
         << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";
     EXPECT_EQ(response->contextPhaseParams->getReqId(), requestId);
     EXPECT_TRUE(response->isSequenceFinal);
+}
+
+TEST_F(LlmRequestTest, generationOnlyRequestAdoptsContextPhaseDraftTokens)
+{
+    VecTokens inputTokens{1, 2, 3, 4, 5};
+    VecTokens firstGenTokens{100};
+    VecTokens draftTokens{101, 102, 103};
+    SizeType32 maxNewTokens{10};
+    texec::IdType requestId{42};
+
+    texec::Request execReq(inputTokens, maxNewTokens);
+    execReq.setRequestType(texec::RequestType::REQUEST_TYPE_GENERATION_ONLY);
+    execReq.setContextPhaseParams(
+        texec::ContextPhaseParams{firstGenTokens, requestId, static_cast<void*>(nullptr), draftTokens});
+    auto const expectedContextPhaseTokens = static_cast<SizeType32>(firstGenTokens.size() + draftTokens.size());
+    auto const expectedDraftTokens = static_cast<SizeType32>(draftTokens.size());
+
+    tb::LlmRequest llmReq(requestId, execReq);
+
+    EXPECT_TRUE(llmReq.isGenerationOnlyRequest());
+    EXPECT_EQ(llmReq.getNumDraftTokens(), expectedDraftTokens);
+    EXPECT_EQ(*llmReq.getDraftTokens(), draftTokens);
+    EXPECT_EQ(llmReq.getNumContextPhaseGenerationTokens(), expectedContextPhaseTokens);
+
+    texec::Request lateExecReq(inputTokens, maxNewTokens);
+    lateExecReq.setRequestType(texec::RequestType::REQUEST_TYPE_GENERATION_ONLY);
+    tb::LlmRequest lateLlmReq(requestId, lateExecReq);
+    EXPECT_EQ(lateLlmReq.getNumDraftTokens(), 0);
+
+    lateLlmReq.setContextPhaseParams(
+        texec::ContextPhaseParams{firstGenTokens, requestId, static_cast<void*>(nullptr), draftTokens});
+
+    EXPECT_EQ(lateLlmReq.getNumDraftTokens(), expectedDraftTokens);
+    EXPECT_EQ(*lateLlmReq.getDraftTokens(), draftTokens);
+    EXPECT_EQ(lateLlmReq.getNumContextPhaseGenerationTokens(), expectedContextPhaseTokens);
 }
 
 INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,

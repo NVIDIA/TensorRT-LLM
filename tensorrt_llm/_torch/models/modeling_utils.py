@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import importlib
 import inspect
 import math
 import os
@@ -32,6 +33,7 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
+from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
 
 
 @contextlib.contextmanager
@@ -378,6 +380,72 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    @staticmethod
+    def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
+        """Whether the checkpoint stores a quantized lm_head (a weight scale).
+
+        Used to decide lm_head quantization for homogeneous checkpoints, which
+        carry no explicit per-layer quant entry. Reads only the safetensors
+        header for ``lm_head.weight_scale`` (no weight load).
+        """
+        checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
+                                 None)
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            return False
+        return ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, "lm_head.weight_scale") is not None
+
+    @staticmethod
+    def _resolve_lm_head_quant_config(
+            config: ModelConfig[TConfig]) -> Optional[QuantConfig]:
+        """Resolve the quant config for lm_head, or None to keep it unquantized.
+
+        lm_head is quantized only when the checkpoint actually stores a
+        quantized lm_head: MIXED_PRECISION checkpoints carry an explicit
+        per-layer entry in ``quant_config_dict``; homogeneous checkpoints have
+        no per-layer entry, so we additionally require the checkpoint to carry
+        an ``lm_head`` weight scale. (A bf16 lm_head is commonly left OUT of
+        ``exclude_modules``, so "not excluded" alone must NOT imply quantized —
+        otherwise a homogeneous checkpoint with a bf16 lm_head would be built
+        quantized and fail / change its logits.) Several further cases force it
+        back to unquantized.
+        """
+        if config.quant_config_dict is not None:
+            quant_config = config.quant_config_dict.get("lm_head")
+        elif (config.quant_config is not None
+              and config.quant_config.quant_algo is not None and
+              DecoderModelForCausalLM._checkpoint_has_lm_head_scale(config)):
+            quant_config = config.quant_config
+        else:
+            quant_config = None
+        if quant_config is None:
+            return None
+
+        # exclude_modules always wins (an FP16 lm_head is listed there).
+        if (config.quant_config is not None
+                and config.quant_config.is_module_excluded_from_quantization(
+                    "lm_head")):
+            return None
+
+        # Tied embeddings replace lm_head.weight with the dense bf16 embedding
+        # weight, which would silently clash with a quantized (packed) weight.
+        if getattr(config.pretrained_config, 'tie_word_embeddings', False):
+            logger.info("Ignoring lm_head quant entry: tie_word_embeddings "
+                        "shares the dense embedding weight, so lm_head stays "
+                        "unquantized")
+            return None
+
+        # lm_head TP in ADP slices the dense weight at forward time for the
+        # spec-decoding head (see LMHead.forward), which is incompatible with
+        # quantized (packed) weights — LMHead rejects that at construction.
+        if (config.mapping.enable_attention_dp
+                and config.mapping.enable_lm_head_tp_in_adp):
+            logger.info("Ignoring lm_head quant entry: lm_head TP in ADP "
+                        "slices the dense weight, so lm_head stays unquantized")
+            return None
+
+        return quant_config
+
     def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
                  hidden_size: int, vocab_size: int):
         super().__init__()
@@ -387,39 +455,9 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
-        # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
-        # checkpoints that quantize lm_head to NVFP4). Model-specific
-        # config normalizers opt in by keeping/synthesizing this entry;
-        # exclude_modules still wins. Applies to both the attention-DP
-        # (replicated) and TP lm_head below.
-        lm_head_quant_config = None
-        if config.quant_config_dict is not None:
-            lm_head_quant_config = config.quant_config_dict.get("lm_head")
-            if (lm_head_quant_config is not None
-                    and config.quant_config is not None and config.quant_config.
-                    is_module_excluded_from_quantization("lm_head")):
-                lm_head_quant_config = None
-            if (lm_head_quant_config is not None and getattr(
-                    config.pretrained_config, 'tie_word_embeddings', False)):
-                # Tied embeddings replace lm_head.weight with the dense
-                # bf16 embedding weight below, which would silently clash
-                # with a quantized (packed) weight and its quant method.
-                logger.info(
-                    "Ignoring lm_head quant entry: tie_word_embeddings "
-                    "shares the dense embedding weight, so lm_head stays "
-                    "unquantized")
-                lm_head_quant_config = None
-            if (lm_head_quant_config is not None
-                    and config.mapping.enable_attention_dp
-                    and config.mapping.enable_lm_head_tp_in_adp):
-                # lm_head TP in ADP slices the dense weight at forward time
-                # for the spec-decoding head (see LMHead.forward), which is
-                # incompatible with quantized (packed) weights — LMHead
-                # rejects that combination at construction.
-                logger.info(
-                    "Ignoring lm_head quant entry: lm_head TP in ADP "
-                    "slices the dense weight, so lm_head stays unquantized")
-                lm_head_quant_config = None
+        # Quant config for lm_head (applies to both the attention-DP replicated
+        # and TP lm_head below); None keeps it unquantized.
+        lm_head_quant_config = self._resolve_lm_head_quant_config(config)
 
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
@@ -586,16 +624,10 @@ class DecoderModelForCausalLM(nn.Module,
                         # Reset _weights_created so create_weights() in
                         # __post_init__ will re-create this module's weights
                         # with the updated (non-quantized) config. Some
-                        # wrappers (e.g. ConfigurableMoE) expose
-                        # _weights_created as a read-only property that
-                        # delegates to a child backend module — that backend
-                        # is itself an nn.Module child and will be visited
-                        # separately, so swallow the resulting AttributeError.
+                        # Wrappers such as ConfigurableMoE delegate this state
+                        # update to their child backend.
                         if hasattr(module, '_weights_created'):
-                            try:
-                                module._weights_created = False
-                            except AttributeError:
-                                pass
+                            module._weights_created = False
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()
@@ -632,6 +664,23 @@ class DecoderModelForCausalLM(nn.Module,
         :meth:`get_preferred_transceiver_runtime` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+            cls,
+            pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
+        """Return the model's preferred KV cache manager version.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
+        ``None`` to use the built-in V1 fallback.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config. Shared model
+                implementations can inspect it to select a preference for the
+                original checkpoint architecture.
+        """
+        return None
 
     @classmethod
     def get_preferred_transceiver_runtime(
@@ -819,13 +868,113 @@ MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
+# Registration priority under lazy loading: on main the built-in zoo imported
+# first and external code (--custom_module_dirs, user modules) overrode it
+# later. With the zoo imported lazily, built-in modules may run their
+# decorators *after* an external registration, so every registry applies one
+# rule: built-in registrations only fill empty slots, never overwrite.
+# Anything already present outranks a built-in — it is either an external
+# registration (which must keep its main-order priority) or another built-in
+# (no architecture is double-registered among built-ins, so filling empty
+# slots is equivalent to main). External registrations always overwrite.
+def _is_builtin_model_class(cls) -> bool:
+    return is_builtin_zoo_module(getattr(cls, "__module__", ""))
+
+
+# Architecture names each decorated class declared via ``register_auto_model``,
+# kept per class (``cls.__dict__``, never inherited). Recorded even when the
+# class loses the ``MODEL_CLASS_MAPPING`` slot to an external registration, so
+# stacked decorators (``register_vision_encoder``) can still map the class to
+# its architectures instead of scanning the mapping by identity.
+_REGISTERED_ARCHS_ATTR = "_registered_architectures"
+
+
 def register_auto_model(name: str):
 
     def decorator(cls):
+        archs = cls.__dict__.get(_REGISTERED_ARCHS_ATTR)
+        if archs is None:
+            archs = set()
+            setattr(cls, _REGISTERED_ARCHS_ATTR, archs)
+        archs.add(name)
+
+        existing = MODEL_CLASS_MAPPING.get(name)
+        if (existing is not None and existing is not cls
+                and _is_builtin_model_class(cls)):
+            logger.info(
+                f"Keeping existing registration "
+                f"{existing.__module__}.{existing.__name__} for architecture "
+                f"{name}; built-in {cls.__module__}.{cls.__name__} not "
+                f"registered.")
+            return cls
         MODEL_CLASS_MAPPING[name] = cls
         return cls
 
     return decorator
+
+
+def _ensure_model_registered(model_arch: str) -> None:
+    """Import the module that provides ``model_arch``, if it isn't loaded yet.
+
+    Model implementations register themselves in ``MODEL_CLASS_MAPPING`` (and
+    the sibling registries) as an import side effect. With the model zoo
+    imported lazily, this is the hook that turns an architecture name into
+    "the decorators have run". Architectures missing from the static index
+    (e.g. registered dynamically by user code) are left to the caller's
+    normal missing-architecture handling.
+
+    Internal: consumers go through ``get_registered_model_class`` /
+    ``get_registered_vision_encoder`` instead of pairing this with a raw
+    registry read. Each resolver short-circuits on *its own* registry only:
+    an external registration satisfies the model-class lookup without
+    importing the built-in provider, but a lookup in a sibling registry
+    (vision encoder, placeholder metadata) still triggers the import when
+    its slot is empty. Priority on that import is enforced inside each
+    registration decorator; the import itself is idempotent via
+    ``sys.modules``.
+    """
+    module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+    if module_name is None:
+        return
+    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Only swallow "the providing module itself is missing" (stale index
+        # entry); a missing dependency *inside* the module is a real error
+        # and must not be masked as "unknown architecture".
+        if e.name != full_name:
+            raise
+        logger.warning(f"Lazy import of {module_name} for architecture "
+                       f"{model_arch} failed: {e!r}")
+
+
+def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
+    """Resolve ``model_arch`` to its registered model class, or ``None``.
+
+    The single entry point for architecture lookups: the model zoo is
+    imported lazily, so this resolves the built-in provider on demand before
+    reading the registry. Do not read ``MODEL_CLASS_MAPPING`` directly for
+    lookups — a raw ``.get()`` silently misses every not-yet-imported
+    built-in model.
+    """
+    if model_arch not in MODEL_CLASS_MAPPING:
+        _ensure_model_registered(model_arch)
+    return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def get_registered_vision_encoder(
+        model_arch: str) -> Optional[Tuple[Type[nn.Module], Optional[Type]]]:
+    """Resolve ``model_arch`` to its ``(vision_encoder_cls, vlm_base_model)``.
+
+    Same on-demand resolution as ``get_registered_model_class``, for the
+    vision-encoder sibling registry: the provider import triggers when
+    *this* registry misses, even if an external class holds the
+    model-class slot.
+    """
+    if model_arch not in MODEL_CLASS_VISION_ENCODER_MAPPING:
+        _ensure_model_registered(model_arch)
+    return MODEL_CLASS_VISION_ENCODER_MAPPING.get(model_arch)
 
 
 def register_vision_encoder(
@@ -844,17 +993,34 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
-        registered = False
-        for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls is model_cls:
-                MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
-                    vision_encoder_cls, vlm_base_model)
-                registered = True
-        if not registered:
+        # The architectures this class declared via register_auto_model. Do
+        # not scan MODEL_CLASS_MAPPING by identity: a built-in class may have
+        # lost its mapping slot to an external registration, and its module
+        # must still import cleanly.
+        archs = model_cls.__dict__.get(_REGISTERED_ARCHS_ATTR)
+        if not archs:
+            # Fallback for classes placed into the mapping directly instead
+            # of via the register_auto_model decorator.
+            archs = {
+                arch_name
+                for arch_name, registered_cls in MODEL_CLASS_MAPPING.items()
+                if registered_cls is model_cls
+            }
+        if not archs:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."
             )
+        for arch_name in archs:
+            if (arch_name in MODEL_CLASS_VISION_ENCODER_MAPPING
+                    and _is_builtin_model_class(model_cls)):
+                # Built-in registrations only fill empty slots (see the
+                # priority rule above register_auto_model).
+                logger.info(f"Keeping existing vision encoder registration for "
+                            f"architecture {arch_name}.")
+                continue
+            MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls,
+                                                             vlm_base_model)
 
         return model_cls
 
@@ -926,7 +1092,7 @@ def get_model_architecture(
     cls = None
     if model_config.architectures is not None and len(
             model_config.architectures) > 0:
-        cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
+        cls = get_registered_model_class(model_config.architectures[0])
     else:
         raise RuntimeError("Model architecture is not provided.")
 
@@ -1148,16 +1314,28 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading)
+                        loaded_own_params = None
                     else:
+                        loaded_own_params = []
                         for n, p in module.named_parameters(recurse=False):
                             if not allow_partial_loading:
                                 assert n in module_weights
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
+                                loaded_own_params.append(n)
 
-                    # Mark consumed weights
+                    # Only a module handed the full `name.*` subtree may
+                    # consume it wholesale. Otherwise just its own
+                    # `recurse=False` params were loaded, and since
+                    # `named_modules()` is pre-order, consuming the subtree
+                    # would drop weights its descendants have not loaded yet --
+                    # they would silently keep uninitialized weights.
                     if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+                        if loaded_own_params is None:
+                            weights.mark_consumed(name)
+                        elif loaded_own_params:
+                            weights.mark_consumed_keys(
+                                f'{name}.{n}' for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
@@ -1249,6 +1427,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             module_name,
                             module_weights,
                             allow_partial_loading=allow_partial_loading)
+                        # Handed the full subtree, like the `load_weights` case.
+                        loaded_own_params = None
                     elif hasattr(module, 'load_weights'):
                         if "linear_attn.conv1d" in name:
                             module_weights['weight'] = module_weights[
@@ -1261,7 +1441,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading)
+                        loaded_own_params = None
                     else:
+                        loaded_own_params = []
                         for n, p in module.named_parameters(recurse=False):
                             weight_mapper.handle_manual_copy(
                                 module_name,
@@ -1269,10 +1451,16 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 n,
                                 p,
                                 allow_partial_loading=allow_partial_loading)
+                            loaded_own_params.append(n)
 
-                    # Mark consumed weights
+                    # Consume precisely what was loaded; see the matching
+                    # comment in `_load_weights_impl`.
                     if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+                        if loaded_own_params is None:
+                            weights.mark_consumed(name)
+                        elif loaded_own_params:
+                            weights.mark_consumed_keys(
+                                f'{name}.{n}' for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:

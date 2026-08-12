@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-269 captured fields.
+270 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -43,6 +43,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_load_balance_weight` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_match_rate_threshold` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
+| `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
@@ -105,7 +106,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `kv_cache_config.block_reuse_policy` | `Literal['all_reusable', 'per_request', 'per_conversation']` | `categorical` |  | `all_reusable`, `per_request`, `per_conversation` |
+| `kv_cache_config.block_reuse_config.policy` | `Literal['all_reusable', 'per_request', 'per_conversation']` | `categorical` |  | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
@@ -123,7 +124,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
-| `kv_cache_config.mamba_state_cache_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_attention_window` | `Optional[List[int]]` | `value` |  |  |
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |
@@ -191,7 +192,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `ray_placement_config.defer_workers_init` | `<class 'bool'>` | `value` |  |  |
 | `ray_placement_config.per_worker_gpu_share` | `Optional[float]` | `value` |  |  |
 | `ray_placement_config.placement_bundle_indices` | `Optional[List[List[int]]]` | `value` |  |  |
-| `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
+| `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `poolside_v1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
 | `reorder_policy_config.policy_args.agent_inflight_seq_num` | `<class 'int'>` | `value` |  |  |
 | `reorder_policy_config.policy_args.agent_percentage` | `<class 'float'>` | `value` |  |  |
 | `reorder_policy_config.policy_name` | `Optional[Literal['AgentTree']]` | `categorical` |  | `AgentTree` |

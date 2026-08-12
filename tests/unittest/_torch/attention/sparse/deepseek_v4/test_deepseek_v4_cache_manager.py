@@ -21,7 +21,7 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -48,6 +48,16 @@ _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
+
+
+@pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
+def test_typical_seq_len_preserves_deepseek_v4_fallback(
+    avg_seq_len: int | None, expected: int
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.max_seq_len = 1024
+
+    assert manager._get_typical_seq_len(KvCacheConfig(avg_seq_len=avg_seq_len)) == expected
 
 
 def test_cache_size_estimation_uses_model_attention_layer_count():

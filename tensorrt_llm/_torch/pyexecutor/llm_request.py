@@ -47,7 +47,7 @@ REQUEST_TYPE_MAPPING = {
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 if TYPE_CHECKING:
-    from .sampler.sampling_utils import Strategy
+    from .sampler.sampler_strategy import Strategy
 
 
 @dataclass(slots=True)
@@ -593,6 +593,11 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # Cumulative (accepted, drafted) speculative-decoding draft-token
+        # totals from the PyTorch executor; used to backfill
+        # RequestPerfMetrics.speculative_decoding on the client side
+        # (GenerationResultBase._handle_sequence). None when no drafting ran.
+        self.spec_dec_totals = None
         # Context-worker usage for gen-first disagg, delivered via the
         # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
         self.ctx_usage = None
@@ -680,6 +685,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
+        # Python-side handle to the encoder feature tensor (audio enc-dec
+        # models): the C++ binding takes the kwarg but exposes no getter, so
+        # the encoder step reads it here. Kept for the request's lifetime —
+        # pause() re-enters ENCODER_INIT and re-runs the encoder from it.
+        self.py_encoder_input_features = kwargs.get("encoder_input_features")
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
         if return_encoder_output:
             kwargs["return_encoder_output"] = False
@@ -747,6 +757,30 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
+        # Cumulative spec-decode counters backing
+        # RequestPerfMetrics.speculative_decoding for return_perf_metrics. The
+        # C++ runtime fills that section in updateNumTokensPerIteration(),
+        # which the PyTorch flow (TorchSampler) never calls, so the PyTorch
+        # executor accumulates these instead (exact, unlike the per-pos arrays
+        # capped at MAX_SPEC_DECODE_POSITIONS) and attaches them to the
+        # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
+        self.py_total_draft_tokens = 0
+        self.py_total_accepted_draft_tokens = 0
+        # Denominator paired with py_num_accepted_draft_tokens: the number of
+        # genuinely proposed draft tokens the sampler verified in the step it
+        # wrote that numerator for (CUDA-graph padding excluded). Written by
+        # the samplers' update_requests, consumed (and reset to 0) by
+        # PyExecutor._accumulate_spec_dec_stats so each verified step is
+        # counted exactly once. py_draft_tokens itself cannot serve as the
+        # denominator: it is padded for CUDA graphs and, in the one-model
+        # flow, already holds the NEXT step's drafts by response time.
+        self.py_num_draft_tokens_verified = 0
+        # Number of real draft tokens installed for the upcoming step,
+        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
+        # py_draft_tokens to the static max. None when no drafter recorded a
+        # count (e.g. one-model flow, which tracks lengths in its sample
+        # state instead).
+        self.py_draft_tokens_effective_len = None
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
@@ -833,6 +867,38 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
+
+    def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
+        """Beam width of the current (or next) decoding step.
+
+        Mirrors the C++ binding for Variable-Beam-Width-Search, clamping the
+        decoding-iteration index with the array's own length so that decoding
+        past the end of the array holds its last width.
+
+        The C++ implementation used to clamp with the global
+        kMaxBeamWidthArrayLength constant instead, reading past the end of
+        the user array and returning arbitrary widths; that is fixed in
+        llmRequest.cpp and the two now agree. This override is kept because
+        the C++ method is neither virtual nor trampolined, so Python callers
+        would otherwise bind to whatever libtensorrt_llm.so happens to
+        provide -- including a prebuilt one from before that fix, against
+        which the mismatch starves the request in the micro-batch scheduler
+        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
+        pins the agreement.
+
+        An empty array (``[]`` or ``[[]]``) falls through to the base
+        implementation rather than indexing it, matching the two emptiness
+        guards the C++ side checks before reading element 0.
+        """
+        beam_width_array = self.sampling_config.beam_width_array
+        if beam_width_array:
+            if isinstance(beam_width_array[0], (list, tuple)):
+                beam_width_array = beam_width_array[0]
+        if beam_width_array:
+            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            index = max(min(iteration, len(beam_width_array)) - 1, 0)
+            return int(beam_width_array[index])
+        return super().get_beam_width_by_iter(for_next_iteration)
 
     def set_exclude_last_generation_logits(
             self, exclude_last_generation_logits: bool):
@@ -1115,6 +1181,29 @@ def executor_request_to_llm_request(
     if getattr(executor_request, "py_scheduling_params", None) is not None:
         agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
+    # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
+    # feature tensor, not encoder token ids. Route it into the request's native
+    # encoder_input_features / encoder_output_len fields so the C++ state machine
+    # admits it to the encoder step and cross-KV sizing sees the post-encoder
+    # length rather than a token count.
+    encoder_input_features = None
+    encoder_output_len = None
+    py_mm_data = getattr(executor_request, "py_multimodal_data", None) or {}
+    audio_mm_data = py_mm_data.get("audio") or {}
+    if isinstance(audio_mm_data, dict):
+        # Only enc-dec input processors emit encoder_input_features (decoder-only
+        # audio models use the generic HF input_features), so its presence is a
+        # safe routing signal.
+        encoder_input_features = audio_mm_data.get("encoder_input_features")
+        if encoder_input_features is not None:
+            if "encoder_output_len" not in audio_mm_data:
+                raise ValueError(
+                    "multimodal_data['audio'] carries encoder_input_features "
+                    "without encoder_output_len; encoder-decoder input "
+                    "processors must emit both (the post-encoder length "
+                    "sizes the cross-KV cache).")
+            encoder_output_len = int(audio_mm_data["encoder_output_len"])
+
     llm_request = LlmRequest(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
@@ -1174,6 +1263,8 @@ def executor_request_to_llm_request(
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
         encoder_input_tokens=executor_request.encoder_input_token_ids,
+        encoder_input_features=encoder_input_features,
+        encoder_output_len=encoder_output_len,
         return_encoder_output=executor_request.output_config.
         return_encoder_output,
         client_id=executor_request.client_id
@@ -1200,6 +1291,13 @@ def executor_request_to_llm_request(
     llm_request.py_bad_words = [
         list(word) for word in executor_request.bad_words
     ] if executor_request.bad_words else None
+
+    # No-repeat-ngram size for the TorchSampler path, normalized once here so
+    # the per-step sampler gate is a plain attribute read. The C++
+    # SamplingConfig rejects negative values up front and 0 means disabled
+    # (same convention as the C++ banRepeatNgram kernel), so falsy == off.
+    ngram_size = executor_request.sampling_config.no_repeat_ngram_size
+    llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 
     llm_request.py_original_end_id = getattr(executor_request,
                                              "py_original_end_id",

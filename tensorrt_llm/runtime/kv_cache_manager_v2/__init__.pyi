@@ -93,6 +93,18 @@ class KVCacheIterationStatsDelta:
     iter_host_dropped_blocks: int = 0
     iter_host_dropped_bytes: int = 0
 
+@dataclass(slots=True)
+class SsmSnapshotIterationStatsDelta:
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+    @property
+    def iter_snapshot_hit_rate(self) -> float: ...
+
 @dataclass(slots=True, frozen=True)
 class PoolGroupPeakBlockStats:
     available: int
@@ -179,6 +191,7 @@ class KVCacheManagerConfig:
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     commit_min_snapshot: bool = False
     enable_stats: bool = True
+    text_only: bool = False
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -275,13 +288,18 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# From _block_radix_tree.py
+# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
     num_tokens: int,
     token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
+def sequence_to_blockchain_keys(
+    tokens_per_block: int,
+    reuse_scope: ReuseScope,
+    tokens: Sequence[TokenIdExt],
+) -> Iterator[tuple[list[TokenIdExt], bytes]]: ...
 
 # From _core/_kv_cache.py
 class _Status(enum.Enum):
@@ -301,6 +319,8 @@ class _KVCache:
         reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
+        expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -364,6 +384,10 @@ class _KVCache:
     def enable_swa_scratch_reuse(self) -> bool: ...
     @enable_swa_scratch_reuse.setter
     def enable_swa_scratch_reuse(self, enable: bool) -> None: ...
+    @property
+    def text_only(self) -> bool: ...
+    @text_only.setter
+    def text_only(self, text_only: bool) -> None: ...
     def supports_index_mode(self, mode: PageIndexMode) -> bool: ...
     @property
     def status(self) -> _Status: ...
@@ -475,6 +499,7 @@ class KVCacheManager:
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
         expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,
@@ -485,6 +510,9 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def get_and_reset_ssm_snapshot_iteration_stats(
+        self,
+    ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]: ...
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> Sequence[PoolGroupPeakBlockStats]: ...

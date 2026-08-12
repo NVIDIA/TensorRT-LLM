@@ -1,6 +1,9 @@
+import pytest
 import torch
 
-from tensorrt_llm import serialization
+from tensorrt_llm.llmapi import serialization
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestClass:

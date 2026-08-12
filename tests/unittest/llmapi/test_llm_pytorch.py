@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import json
 import pathlib
@@ -247,6 +250,34 @@ def test_llm_perf_metrics():
         assert perf_metrics.first_iter is not None
         assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
         assert perf_metrics.last_iter == perf_metrics.iter
+
+
+@skip_ray
+@pytest.mark.part3
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+def test_llm_prefix_cache_reuse(attn_backend):
+    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0,
+                                     max_tokens=5,
+                                     return_perf_metrics=True)
+
+    with LLM(
+            model=model_path,
+            attn_backend=attn_backend,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            cuda_graph_config=None,
+    ) as llm:
+        cold_output = llm.generate(prompt, sampling_params).outputs[0]
+        warm_output = llm.generate(prompt, sampling_params).outputs[0]
+
+    cold_metrics = cold_output.request_perf_metrics
+    warm_metrics = warm_output.request_perf_metrics
+    assert cold_metrics is not None
+    assert warm_metrics is not None
+    assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
+    assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
+    assert cold_output.token_ids == warm_output.token_ids
 
 
 @skip_ray
@@ -695,59 +726,6 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
         llm.shutdown()
 
 
-@skip_gpu_memory_less_than_80gb
-@pytest.mark.part2
-@test_lora_with_and_without_cuda_graph
-def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
-    model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
-
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
-
-    # Set up temporary directory for LoRA adapters
-    with tempfile.TemporaryDirectory() as lora_dir:
-        print("Creating dummy LoRAs...")
-
-        model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     dtype=torch.bfloat16,
-                                                     device_map="auto")
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-        peft_lora_config = PeftLoraConfig(r=8,
-                                          target_modules=hf_modules,
-                                          bias="none",
-                                          task_type="CAUSAL_LM")
-        lora_paths = []
-        for i in range(2):
-            lora_model = get_peft_model(model, peft_lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        trtllm_lora_config = LoraConfig(lora_target_modules=target_modules,
-                                        max_lora_rank=8,
-                                        max_loras=2,
-                                        max_cpu_loras=2)
-        llm = LLM(model_dir,
-                  lora_config=trtllm_lora_config,
-                  cuda_graph_config=cuda_graph_config)
-
-        prompts = [
-            "Kim był Mikołaj Kopernik i z czego zasłynął?",
-            "Gdzie znajduje się stolica Polski?",
-        ]
-        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
-        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
-        lora_requests = [lora_req1, lora_req2]
-        sampling_params = SamplingParams(max_tokens=200)
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_requests)
-
-        assert len(outputs) == 2
-
-
 @pytest.mark.part2
 @test_lora_with_and_without_cuda_graph
 def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
@@ -1187,7 +1165,7 @@ def test_min_tokens(use_speculative: bool):
 def test_min_tokens_long_prompt():
     """Check min_tokens is respected when prompt is longer than min_tokens.
 
-    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    Regression test for NVBug 5823135: the min-length EOS suppression compared
     total token count (prompt + generated) against the raw min_tokens value
     instead of comparing generated token count only.  When prompt_len >=
     min_tokens the EOS suppression was never activated, allowing early

@@ -15,10 +15,12 @@
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
+    _build_v2_mamba_state_pool,
     build_page_table,
     build_page_table_from_manager,
 )
@@ -30,6 +32,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_num_layer_groups,
     get_num_layers,
     get_physical_pool,
+    get_slot_address,
     get_unique_layers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
@@ -205,8 +208,17 @@ def test_build_page_table():
     manager.shutdown()
 
 
-def _make_v1_dsa_manager(pp_size: int = 1, pp_rank: int = 0) -> KVCacheManager:
-    """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style)."""
+def _make_v1_dsa_manager(
+    pp_size: int = 1,
+    pp_rank: int = 0,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
+) -> KVCacheManager:
+    """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style).
+
+    ``indexer_k_cache_layer_mask`` is a global per-model ``list[bool]`` marking
+    the "full" indexer-owning layers (cross-layer indexer sharing, e.g. GLM
+    5.2); ``None`` keeps the dense layout where every layer owns an indexer row.
+    """
     return KVCacheManager(
         kv_cache_config=KvCacheConfig(
             max_tokens=512,
@@ -225,6 +237,7 @@ def _make_v1_dsa_manager(pp_size: int = 1, pp_rank: int = 0) -> KVCacheManager:
         enable_indexer_k_cache=True,
         indexer_k_cache_quant_block_size=128,
         indexer_k_cache_index_head_dim=128,
+        indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
     )
 
 
@@ -261,8 +274,67 @@ def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
 
 
 @pytest.mark.cuda
-def test_v1_dsa_indexer_replicated_transfer_across_pp():
-    """PP1 ctx sends the DSA indexer K cache into two PP2 gen ranks.
+def test_v1_dsa_masked_indexer_page_table_covers_owning_layers() -> None:
+    """The masked indexer view covers only the owning layers.
+
+    A per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2) gives
+    only the owning layers a pool row, so the REPLICATED indexer view covers
+    exactly that subset -- one entry per owning layer mapped to its packed row
+    -- instead of one entry per LG layer.
+    """
+    # Of the 4 layers, only local layers 0 and 2 own an indexer K cache row.
+    manager = _make_v1_dsa_manager(indexer_k_cache_layer_mask=[True, False, True, False])
+    try:
+        page_table = build_page_table(manager)
+        lg = page_table.layer_groups[0]
+        assert len(lg.pool_views) == 2
+        _, idx_view = lg.pool_views
+        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.pool_role == frozenset({"indexer_k"})
+
+        # Only the two owning layers appear -- a strict subset of the LG.
+        owning = sorted(int(e["local_layer_id"]) for e in idx_view.buffer_entries)
+        assert owning == [0, 2]
+
+        # The pool holds one row per owning layer; entries pack contiguously in
+        # owning (local-layer) order, so layer 0 -> row 0, layer 2 -> row 1.
+        idx_pool = get_physical_pool(page_table, 0, idx_view.pool_idx)
+        sizes = {int(e["size"]) for e in idx_view.buffer_entries}
+        assert len(sizes) == 1
+        per_layer = sizes.pop()
+        assert per_layer * len(idx_view.buffer_entries) == idx_pool.slot_bytes
+        offset_by_layer = {
+            int(e["local_layer_id"]): int(e["offset"]) for e in idx_view.buffer_entries
+        }
+        assert offset_by_layer == {0: 0, 2: per_layer}
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_v1_dsa_fully_masked_indexer_group_omits_pool() -> None:
+    """A PP stage without an indexer-owning layer advertises no indexer pool."""
+    manager = _make_v1_dsa_manager(indexer_k_cache_layer_mask=[False] * 4)
+    try:
+        page_table = build_page_table(manager)
+        assert len(page_table.layer_groups[0].pool_views) == 1
+        assert len(page_table.pool_groups[0].pools) == 1
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "indexer_k_cache_layer_mask",
+    [
+        pytest.param(None, id="dense"),
+        pytest.param([True, False, True, False], id="masked"),
+    ],
+)
+def test_v1_dsa_indexer_replicated_transfer_across_pp(
+    indexer_k_cache_layer_mask: list[bool] | None,
+) -> None:
+    """PP1 ctx sends a dense or masked DSA indexer K cache into two PP2 gen ranks.
 
     Exercises the full python path on real V1 managers: page-table build,
     role-set matching, ReplicatedMapper layer-strided offsets, and a
@@ -275,8 +347,15 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
     from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
-    ctx = _make_v1_dsa_manager()
-    gens = [_make_v1_dsa_manager(pp_size=2, pp_rank=r) for r in range(2)]
+    ctx = _make_v1_dsa_manager(indexer_k_cache_layer_mask=indexer_k_cache_layer_mask)
+    gens = [
+        _make_v1_dsa_manager(
+            pp_size=2,
+            pp_rank=r,
+            indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
+        )
+        for r in range(2)
+    ]
     try:
         ctx_extractor = KVRegionExtractorV1(ctx)
         ctx_ri = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
@@ -292,8 +371,10 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
         block_ids = np.array([0, 2, 3], dtype=np.int64)
         ctx_pt = ctx_extractor.page_table
         idx_pool = get_physical_pool(ctx_pt, 0, 1)
-        layers_per_gen = 2
-        per_layer = idx_pool.slot_bytes // 4
+        num_indexer_layers = int(ctx_pool_tensor.shape[1])
+        assert num_indexer_layers % len(gens) == 0
+        layers_per_gen = num_indexer_layers // len(gens)
+        per_layer = idx_pool.slot_bytes // num_indexer_layers
 
         for gen_pp_rank, gen in enumerate(gens):
             gen_ri = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
@@ -310,9 +391,8 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
                 ctx_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
                 gen_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
             )
-            # This gen rank holds 2 of the 4 layers; the fragment is the
-            # contiguous 2-layer range at this PP stage's offset within
-            # the ctx slot.
+            # Each gen rank holds a contiguous subset of the owning layers;
+            # masked-out layers do not consume bytes in either pool.
             assert pair.src.memory.bytes_per_region == layers_per_gen * per_layer
             expected_src_off = gen_pp_rank * layers_per_gen * per_layer
             base_ptrs = idx_pool.base_address + block_ids * idx_pool.slot_bytes
@@ -341,6 +421,7 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
             gen.shutdown()
 
 
+@pytest.mark.cpu_only
 def test_layer_group_meta_serialization():
     import numpy as np
 
@@ -578,11 +659,24 @@ def test_v2_builder_validates_role_mapper_declaration():
     assert views[0].mapper_kind == MapperKind.INDEXED
 
 
+@pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
     from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
 
-    conv_pool = PhysicalPool(base_address=1000, slot_bytes=128, num_slots=10)
-    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=256, num_slots=8)
+    conv_pool = PhysicalPool(
+        base_address=1000,
+        slot_bytes=128,
+        num_slots=10,
+        slot_stride_bytes=512,
+        layer_stride_bytes=256,
+    )
+    ssm_pool = PhysicalPool(
+        base_address=8000,
+        slot_bytes=256,
+        num_slots=8,
+        slot_stride_bytes=1024,
+        layer_stride_bytes=512,
+    )
     mlg = MambaLayerGroup(
         pool_group_idx=1,
         mamba_layer_offsets={10: 0, 11: 1, 12: 2},
@@ -602,15 +696,130 @@ def test_mamba_layer_group_serialization():
     assert isinstance(restored, MambaLayerGroup)
     assert restored.mamba_layer_offsets == {10: 0, 11: 1, 12: 2}
     assert restored.conv_states.base_address == 1000
-    assert restored.conv_states.slot_bytes == 128
-    assert restored.conv_states.num_slots == 10
+    assert restored.conv_states.slot_stride_bytes == 512
+    assert get_slot_address(restored.conv_states, 3) == 1000 + 3 * 512
     assert restored.ssm_states.base_address == 8000
-    assert restored.ssm_states.slot_bytes == 256
-    assert restored.ssm_states.num_slots == 8
+    assert restored.ssm_states.slot_stride_bytes == 1024
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
 
+    legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
+    assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
+    assert legacy_pool.layer_stride_bytes == legacy_pool.num_slots * legacy_pool.slot_bytes
 
+
+def test_v2_mamba_state_pool_uses_affine_layer_and_slot_strides():
+    num_slots = 3
+    state_bytes = 64
+    storage = torch.empty((num_slots, 4, state_bytes), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 2, :]]
+
+    pool = _build_v2_mamba_state_pool(states)
+
+    assert pool.base_address == states[0].data_ptr()
+    assert pool.slot_bytes == state_bytes
+    assert pool.num_slots == num_slots
+    assert pool.slot_stride_bytes == 4 * state_bytes
+    assert pool.layer_stride_bytes == 2 * state_bytes
+
+
+def test_v2_mamba_single_layer_pool_preserves_shared_role_footprint():
+    state_bytes = 64
+    storage = torch.empty((3, 2, state_bytes), dtype=torch.uint8)
+
+    pool = _build_v2_mamba_state_pool([storage[:, 1, :]])
+
+    assert pool.slot_bytes == state_bytes
+    assert pool.slot_stride_bytes == 2 * state_bytes
+    assert pool.layer_stride_bytes == 2 * state_bytes
+
+
+def test_v2_mamba_state_pool_rejects_non_affine_layer_offsets():
+    storage = torch.empty((3, 6, 64), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 2, :], storage[:, 5, :]]
+
+    with pytest.raises(ValueError, match="uniform layer stride"):
+        _build_v2_mamba_state_pool(states)
+
+
+def test_v2_mamba_registration_uses_coalesced_physical_pool():
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        KVCachePageTable,
+        MambaLayerGroup,
+        PhysicalPool,
+        PhysicalPoolGroup,
+    )
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    state_bytes = 64
+    num_layers = 2
+    num_slots = 8
+    # Equal-sized SSM and convolution states share one interleaved V2 pool.
+    physical_slot_bytes = state_bytes * num_layers * 2
+    physical_pool = PhysicalPool(
+        base_address=1000,
+        slot_bytes=physical_slot_bytes,
+        num_slots=num_slots,
+    )
+    mamba_group = MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={1: 0, 2: 1},
+        conv_states=PhysicalPool(
+            base_address=1000 + state_bytes,
+            slot_bytes=state_bytes,
+            num_slots=num_slots,
+            slot_stride_bytes=physical_slot_bytes,
+            layer_stride_bytes=2 * state_bytes,
+        ),
+        ssm_states=PhysicalPool(
+            base_address=1000,
+            slot_bytes=state_bytes,
+            num_slots=num_slots,
+            slot_stride_bytes=physical_slot_bytes,
+            layer_stride_bytes=2 * state_bytes,
+        ),
+    )
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[mamba_group],
+        pool_groups=[PhysicalPoolGroup(pools=[physical_pool])],
+    )
+
+    assert get_unique_pool_memory_descs(page_table, device_id=3) == [
+        (1000, physical_slot_bytes * num_slots, 3, "kv_cache_memory_pool0")
+    ]
+
+
+def test_legacy_mamba_registration_uses_layer_major_pools():
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        KVCachePageTable,
+        MambaLayerGroup,
+        PhysicalPool,
+    )
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    num_layers = 3
+    conv_pool = PhysicalPool(base_address=1000, slot_bytes=128, num_slots=10)
+    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=256, num_slots=8)
+    mamba_group = MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={10: 0, 11: 1, 12: 2},
+        conv_states=conv_pool,
+        ssm_states=ssm_pool,
+    )
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[mamba_group],
+        pool_groups=[],
+    )
+
+    assert get_unique_pool_memory_descs(page_table, device_id=3) == [
+        (1000, num_layers * conv_pool.num_slots * conv_pool.slot_bytes, 3, "kv_cache_memory_pool0"),
+        (8000, num_layers * ssm_pool.num_slots * ssm_pool.slot_bytes, 3, "kv_cache_memory_pool1"),
+    ]
+
+
+@pytest.mark.cpu_only
 def test_mixed_page_table_serialization():
     import numpy as np
 

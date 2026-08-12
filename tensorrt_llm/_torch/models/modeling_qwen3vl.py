@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -19,7 +19,10 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    _is_mm_disagg,
+    filter_mm_token_from_input_ids,
+)
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
@@ -37,6 +40,7 @@ from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
+from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -45,13 +49,11 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import MultimodalModelMixin
-from .modeling_multimodal_utils import (
-    filter_mm_token_from_input_ids,
-    find_input_mm_embeds,
-    fuse_input_embeds,
-    get_attached_multimodal_embeddings,
-    get_multimodal_embeddings,
+from .modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalModelMixin,
+    PreparedLlmInputs,
+    encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
@@ -303,11 +305,23 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
-        if videos and isinstance(videos[0][0], torch.Tensor):
-            do_rescale = False
+        # HF's Qwen3-VL processor takes a single `do_rescale` kwarg that is
+        # applied to both images and videos. Mixed pre-rescale states leave
+        # the raw side at 0-255 while the pre-rescaled side gets skipped —
+        # the ViT then produces garbage for the raw modality. Fail fast; the
+        # default `get_preferred_media_io_kwargs` ships `np` for both, so a
+        # divergence here means a caller override drifted.
+        image_is_pre = bool(images) and isinstance(images[0], torch.Tensor)
+        video_is_pre = bool(videos) and isinstance(videos[0][0], torch.Tensor)
+        if images and videos and image_is_pre != video_is_pre:
+            raise ValueError(
+                "Qwen3-VL requires image and video items to arrive in the same "
+                "pre-rescaled state (both torch.Tensor, or both uint8 numpy). "
+                f"Got image_is_pre_rescaled={image_is_pre}, "
+                f"video_is_pre_rescaled={video_is_pre}. Configure consistent "
+                "formats via `media_io_kwargs`."
+            )
+        do_rescale = not (image_is_pre if images else video_is_pre)
 
         do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
@@ -398,9 +412,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC frames let the HF processor rescale/permute once, skipping
-        # the per-frame CHW-float conversion in the IO loader.
-        return {"video": {"format": "np"}}
+        # uint8 HWC arrays for both modalities so the HF processor rescales
+        # and normalizes uniformly in one pass. A single `do_rescale` kwarg
+        # controls both modalities; if they arrive in mismatched
+        # pre-rescale states (e.g. image=Tensor pre-rescaled, video=uint8
+        # np), the raw side is left at 0-255 and the ViT sees garbage.
+        return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
@@ -792,6 +809,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self.metadata_cls = get_attention_backend(self.model_config.attn_backend).Metadata
 
         self.attn_metadata: Optional[AttentionMetadata] = None
+        self._fixed_max_seq_len = self.model_config.max_num_tokens
 
         # Vision block's `rope_position_ids` scratch. Registered empty here;
         # `setup_attn_metadata` allocates it as an `arange` (see there).
@@ -817,6 +835,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+        self.set_attn_max_seq_len(max_num_tokens)
         # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
         # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
         # code just slices ``[:seq_len]`` instead of allocating a fresh
@@ -825,6 +844,13 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
+            )
+        self._fixed_max_seq_len = max_seq_len
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -944,13 +970,15 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self,
         seq_lens: List[int],
         attn_metadata: Optional[AttentionMetadata] = None,
-    ):
+    ) -> AttentionMetadata:
         if attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
                 "It must be set up before the encoder forward runs."
             )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=self._fixed_max_seq_len
+        )
 
     @torch.inference_mode()
     def forward(
@@ -1008,6 +1036,28 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states, deepstack_feature_lists
 
 
+def _qwen3vl_build_batched_input(
+    multimodal_params: list[MultimodalParams],
+) -> dict[str, Any]:
+    """Cat image items then video items across requests (matching the
+    ``EncoderGroup.modalities`` order) into one ViT input."""
+    pixels: list[torch.Tensor] = []
+    grids: list[torch.Tensor] = []
+    for m, pv_key, thw_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        for mp in multimodal_params:
+            bucket = mp.multimodal_data.get(m)
+            if bucket is not None:
+                pixels.append(bucket[pv_key])
+                grids.append(bucket[thw_key])
+    return {
+        "pixel_values": torch.cat(pixels, dim=0),
+        "grid_thw": torch.cat(grids, dim=0),
+    }
+
+
 class Qwen3VisionModelBase(nn.Module):
     def __init__(
         self,
@@ -1032,7 +1082,11 @@ class Qwen3VisionModelBase(nn.Module):
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
 
-    def load_weights(self, weights: Dict[str, torch.Tensor]):
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        allow_partial_loading: bool = False,
+    ):
         visual_weights = filter_weights("model.visual", weights)
         converted_weights = {}
 
@@ -1057,169 +1111,59 @@ class Qwen3VisionModelBase(nn.Module):
             r"(.*?)mlp.linear_fc2.(.*)": r"\1mlp.down_proj.\2",
         }
         self.visual.config.num_attention_heads = self.visual.config.num_heads
-        _load_weights_impl(self.visual, converted_weights, params_map=pattern_mapping)
-
-    def _parse_and_batch_multimodal_data(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
-        # Only the request itself knows how its image and video items
-        # interleave in the prompt, so a mixed request must carry a manifest.
-        for mp in multimodal_params:
-            data = mp.multimodal_data or {}
-            if (
-                data.get("image") is not None
-                and data.get("video") is not None
-                and not mp.mm_item_order
-            ):
-                raise ValueError(
-                    "Qwen3-VL mixed-modality requests must carry mm_item_order on MultimodalParams."
-                )
-
-        # Any batch that contains both modalities — whether within a single
-        # request or spread across heterogeneous single-modality requests —
-        # goes through the modality-blind ViT via one cat'd stream.
-        has_image = any(mp.multimodal_data.get("image") is not None for mp in multimodal_params)
-        has_video = any(mp.multimodal_data.get("video") is not None for mp in multimodal_params)
-        if has_image and has_video:
-            return self._interleave_multimodal_data(multimodal_params)
-
-        pixel_values_list = []
-        pixel_values_videos_list = []
-        image_grid_thw_list = []
-        video_grid_thw_list = []
-
-        for multimodal_param in multimodal_params:
-            multimodal_data = multimodal_param.multimodal_data
-            # Process images if present
-            if multimodal_data.get("image") is not None:
-                pixel_values_list.append(multimodal_data["image"]["pixel_values"])
-                image_grid_thw_list.append(multimodal_data["image"]["image_grid_thw"])
-
-            # Process videos if present
-            if multimodal_data.get("video") is not None:
-                pixel_values_videos_list.append(multimodal_data["video"]["pixel_values_videos"])
-                video_grid_thw_list.append(multimodal_data["video"]["video_grid_thw"])
-
-        # Concatenate tensors
-        mm_content_dict = {}
-        if pixel_values_list:
-            mm_content_dict["pixel_values"] = (
-                torch.cat(pixel_values_list, dim=0)
-                if len(pixel_values_list) > 1
-                else pixel_values_list[0]
-            )
-        if pixel_values_videos_list:
-            mm_content_dict["pixel_values_videos"] = (
-                torch.cat(pixel_values_videos_list, dim=0)
-                if len(pixel_values_videos_list) > 1
-                else pixel_values_videos_list[0]
-            )
-
-        # Prepare extra data
-        mm_extra_data = {}
-        if image_grid_thw_list:
-            mm_extra_data["image_grid_thw"] = (
-                torch.cat(image_grid_thw_list, dim=0)
-                if len(image_grid_thw_list) > 1
-                else image_grid_thw_list[0]
-            )
-        if video_grid_thw_list:
-            mm_extra_data["video_grid_thw"] = (
-                torch.cat(video_grid_thw_list, dim=0)
-                if len(video_grid_thw_list) > 1
-                else video_grid_thw_list[0]
-            )
-
-        return mm_content_dict, mm_extra_data
-
-    def _interleave_multimodal_data(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Build one prompt-order pixel_values + grid_thw for mixed batches.
-
-        The ViT is modality-blind (image = grid_thw row with t=1, video = t>1),
-        so we cat everything into a single stream in prompt order. Emits only
-        the "pixel_values" + "image_grid_thw" keys so forward() takes its
-        image branch uniformly over both modalities.
-        """
-        pixels: List[torch.Tensor] = []
-        grids: List[torch.Tensor] = []
-        for mp in multimodal_params:
-            data = mp.multimodal_data
-            order = mp.mm_item_order or []
-            img = data.get("image") or {}
-            vid = data.get("video") or {}
-            img_pv, img_thw = img.get("pixel_values"), img.get("image_grid_thw")
-            vid_pv = vid.get("pixel_values_videos")
-            vid_thw = vid.get("video_grid_thw")
-
-            # Single-modality request in a mixed batch — no interleave
-            # needed, just append its rows.
-            if not order or img_pv is None or vid_pv is None:
-                if img_pv is not None:
-                    pixels.append(img_pv)
-                    grids.append(img_thw)
-                if vid_pv is not None:
-                    pixels.append(vid_pv)
-                    grids.append(vid_thw)
-                continue
-
-            img_off = vid_off = 0
-            for entry in order:
-                modality = entry["modality"]
-                idx = entry["index"]
-                if modality == "image":
-                    thw = img_thw[idx]
-                    n = int(thw.prod().item())
-                    pixels.append(img_pv[img_off : img_off + n])
-                    img_off += n
-                elif modality == "video":
-                    thw = vid_thw[idx]
-                    n = int(thw.prod().item())
-                    pixels.append(vid_pv[vid_off : vid_off + n])
-                    vid_off += n
-                else:
-                    raise ValueError(f"Unknown modality in mm_item_order: {modality}")
-                grids.append(thw.unsqueeze(0))
-
-        return (
-            {"pixel_values": torch.cat(pixels, dim=0)},
-            {"image_grid_thw": torch.cat(grids, dim=0)},
+        _load_weights_impl(
+            self.visual,
+            converted_weights,
+            params_map=pattern_mapping,
+            allow_partial_loading=allow_partial_loading,
         )
 
     @torch.inference_mode()
+    def encode_batched(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the ViT on one concat'd batch and fold deepstack streams into
+        the hidden dim. Modality-agnostic — image and video items are
+        distinguished only by ``grid_thw`` rows (image ``t=1``, video ``t>1``).
+        """
+        pixel_values = pixel_values.to(self.model_dtype)
+        embeds, deepstack = self.visual(pixel_values, grid_thw=grid_thw)
+        # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
+        return torch.cat([embeds] + deepstack, dim=1)
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """Single source of truth for Qwen3-VL's encoder-batching group.
+
+        One modality-blind ViT handles both image and video (image has
+        `grid_thw.t==1`, video `t>1`), so both modalities share one call.
+        Both the aggregated path (via `Qwen3VLModelBase.mm_encoder_groups`,
+        which delegates here) and the mm-encoder-only `forward` consume this.
+        """
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                build_batched_input=_qwen3vl_build_batched_input,
+            ),
+        )
+
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
-        pixel_values = mm_content_data.get("pixel_values", None)
-        pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
+        """Standalone mm-encoder-only executor entry.
 
-        image_grid_thw = mm_extra_data.get("image_grid_thw", None)
-        video_grid_thw = mm_extra_data.get("video_grid_thw", None)
-
-        embeds: List[torch.Tensor] = []
-        if pixel_values is not None:
-            pixel_values = pixel_values.to(self.model_dtype)
-            image_embeds, deepstack_image_embeds = self.visual(
-                pixel_values, grid_thw=image_grid_thw
-            )
-            # NOTE: We concatenate deepstack_embeds to mm_embeds
-            # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
-            mixed_image_embeds = torch.cat([image_embeds] + deepstack_image_embeds, dim=1)
-            embeds.append(mixed_image_embeds)
-
-        if pixel_values_videos is not None:
-            pixel_values_videos = pixel_values_videos.to(self.model_dtype)
-            video_embeds, deepstack_video_embeds = self.visual(
-                pixel_values_videos, grid_thw=video_grid_thw
-            )
-            # NOTE: We concatenate deepstack_embeds to mm_embeds
-            # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
-            mixed_video_embeds = torch.cat([video_embeds] + deepstack_video_embeds, dim=1)
-            embeds.append(mixed_video_embeds)
-        return embeds
+        `_forward_step_mm_encoder_only` invokes this and then splits the
+        returned tensor request-by-request using request-ordered
+        `split_lengths`, so the rows must be in request-then-prompt order.
+        Delegating to `encode_multimodal_by_groups` runs the same
+        modality-batched ViT the aggregated path uses and applies the
+        per-request `mm_item_order` reorder before returning.
+        """
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
-class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
+class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:
@@ -1227,13 +1171,17 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
         Runs the vision encoder over ``multimodal_params`` and returns the
         embeddings as a single tensor (Qwen3-VL folds deepstack streams into
-        the hidden dim, so the single-tensor contract holds). Used by the
-        startup memory profiler to invoke the encoder directly; the model's
-        own ``forward`` keeps its custom deepstack fusion path.
+        the hidden dim, so the single-tensor contract holds).
         """
-        mm_embeds = get_multimodal_embeddings(
-            encoder_forward_fn=self.mm_encoder.forward, multimodal_params=list(multimodal_params)
-        )
+        if self.mm_encoder is None:
+            raise ValueError("Raw multimodal inputs require a local multimodal encoder.")
+
+        mm_embeds = self.mm_encoder.forward(list(multimodal_params), **encoder_kwargs)
+        if len(mm_embeds) != 1:
+            raise ValueError(
+                "Qwen3-VL multimodal encoder must return one packed embedding tensor, "
+                f"but returned {len(mm_embeds)} tensors."
+            )
         return mm_embeds[0]
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
@@ -1333,6 +1281,9 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
+            # Reuse the encoder's own group definition so the aggregated and
+            # mm-encoder-only paths share a single source of truth.
+            self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups
         elif model_config.disable_mm_encoder:
             logger.info(
                 f"{type(self).__name__}: multimodal encoder disabled "
@@ -1343,11 +1294,10 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         self.deepstack_num_level = (
             len(config.vision_config.deepstack_visual_indexes) if self.use_deepstack else 0
         )
-        if self.use_deepstack:
-            # Pre-allocated `(L, max_num_tokens, hidden)` scratch buffer for
-            # per-layer deepstack embeddings; replaces `L` fresh
-            # `torch.zeros` + `L` scatters per prefill.
-            # `persistent=False` keeps it out of `state_dict`.
+        if self.deepstack_num_level > 0:
+            # Reuse one `(L, max_num_tokens, hidden)` scratch allocation for
+            # per-layer deepstack embeddings. The generic extra-embedding path
+            # allocates and scatters one full-sequence tensor per level.
             self.register_buffer(
                 "deepstack_input_embeds",
                 torch.zeros(
@@ -1375,20 +1325,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         self.post_config()
 
     @property
-    def mm_token_ids(self) -> torch.Tensor:
+    def multimodal_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
 
-    def post_config(self):
-        # use llm.config as config for pytorch model engine
-        self.model_config.pretrained_config = self.llm.config
-        self.config = self.model_config.pretrained_config
-
     @property
-    def vocab_size_padded(self) -> int:
-        return self.llm.vocab_size_padded
-
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
+    def language_model(self) -> torch.nn.Module:
+        return self.llm
 
     # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
     # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
@@ -1409,6 +1351,23 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
     def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
         return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
+
+    @property
+    def text_embedding_layer(self) -> Embedding:
+        return self.llm.model.embed_tokens
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.text_embedding_layer.embedding_dim * (self.deepstack_num_level + 1)
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.text_embedding_layer.weight.dtype
+
+    def post_config(self):
+        # use llm.config as config for pytorch model engine
+        self.model_config.pretrained_config = self.llm.config
+        self.config = self.model_config.pretrained_config
 
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
@@ -1459,138 +1418,137 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         mm_embed_chunks = torch.split(mm_embed, [num_elements] * (deepstack_num_level + 1), dim=1)
         return mm_embed_chunks[0], list(mm_embed_chunks[1:])
 
-    @torch.inference_mode()
-    def forward(
+    def select_multimodal_params(
         self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.IntTensor] = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        input_embeds: Optional[torch.Tensor] = None,
-        return_context_logits: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        VLM forward logic with inflight batching support.
-        """
-        num_context_requests, num_generation_requests = (
-            attn_metadata.num_contexts,
-            attn_metadata.num_generations,
+        multimodal_params: List[MultimodalParams],
+        num_context_requests: int,
+    ) -> List[MultimodalParams]:
+        """Select requests with image/video embeddings for the current context batch."""
+        context_params = super().select_multimodal_params(multimodal_params, num_context_requests)
+        multimodal_params, has_raw_image_or_video_data = self._get_requests_with_mm_data(
+            context_params
         )
-
-        multimodal_params = kwargs.get("multimodal_params", [])
-        mm_embeds = []
-        mrope_config = {}
-        deepstack_embeds = []
-
-        # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts,
-        # so we need to separate the mm_multimodal_params from the text-only prompts.
-        if num_context_requests > 0:
-            mm_multimodal_params, has_raw_image_or_video_data = self._get_requests_with_mm_data(
-                multimodal_params[:num_context_requests]
+        if not multimodal_params:
+            return []
+        if has_raw_image_or_video_data and self.mm_encoder is None:
+            raise ValueError(
+                "Raw multimodal inputs require a local multimodal encoder on this "
+                "worker, or multimodal_embedding handles from an encoder handoff."
             )
-        else:
-            mm_multimodal_params = []
-            has_raw_image_or_video_data = False
-        if len(mm_multimodal_params) > 0:
-            # Raw image/video tensors: run local encoder.
-            if has_raw_image_or_video_data and self.mm_encoder is not None:
-                mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=mm_multimodal_params,
-                )
-            # Raw image/video tensors on a worker with no encoder: bad route.
-            elif has_raw_image_or_video_data:
-                raise ValueError(
-                    "Raw multimodal inputs require a local multimodal encoder on this "
-                    "worker, or multimodal_embedding handles from an encoder handoff."
-                )
-            # support_mm_disagg is only set in subclasses of Qwen3VLModelBase that support EPD
-            elif not getattr(self, "support_mm_disagg", False):
-                raise NotImplementedError(
-                    f"{type(self)} does not support disaggregated inference yet. Please unset "
-                    "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
-                )
-            # E/P prefill: encoder already ran; use attached embeddings.
-            else:
-                mm_embeds = get_attached_multimodal_embeddings(mm_multimodal_params)
-            mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
+        if not has_raw_image_or_video_data and not getattr(self, "support_mm_disagg", False):
+            raise NotImplementedError(
+                f"{type(self)} does not support disaggregated inference yet. Please unset "
+                "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+            )
+        return multimodal_params
 
-            if self.use_deepstack:
-                for i, mm_embed in enumerate(mm_embeds):
-                    mm_embed, deepstack_embed = self.split_mm_embeds(
-                        mm_embed, self.deepstack_num_level
-                    )
-                    mm_embeds[i] = mm_embed
-                    deepstack_embeds.extend(deepstack_embed)
+    def after_active_multimodal_embeddings(
+        self,
+        *,
+        active_embeddings: List[torch.Tensor],
+        multimodal_params: List[MultimodalParams],
+        **forward_kwargs: Any,
+    ) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Separate Qwen3-VL's packed deepstack streams from primary embeddings."""
+        if not self.use_deepstack:
+            return active_embeddings, []
 
+        deepstack_embeds = []
+        for index, mm_embed in enumerate(active_embeddings):
+            active_embeddings[index], deepstack_embed = self.split_mm_embeds(
+                mm_embed, self.deepstack_num_level
+            )
+            deepstack_embeds.extend(deepstack_embed)
+        return active_embeddings, deepstack_embeds
+
+    def _fuse_multimodal_embeddings(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: List[torch.Tensor],
+        mm_token_ids: Optional[Sequence[int] | torch.Tensor],
+        embedding_layer,
+        extra_embeds: Sequence[torch.Tensor],
+        text_token_indices: Optional[torch.Tensor] = None,
+        mm_token_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Sequence[torch.Tensor]]:
+        """Fuse primary embeddings and expand deepstack features in reusable scratch."""
+        # Qwen only needs the explicit MM indices below when deepstack features
+        # must be scattered into its reusable buffer. Without extra embeds,
+        # `fuse_input_embeds` performs its normal index fallback inside `super()`.
+        if extra_embeds and (text_token_indices is None or mm_token_indices is None):
+            text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+                input_ids,
+                vocab_size=embedding_layer.num_embeddings,
+                mm_token_ids=mm_token_ids,
+            )
+
+        fused_input_ids, inputs_embeds, _ = super()._fuse_multimodal_embeddings(
+            input_ids=input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            mm_token_ids=mm_token_ids,
+            embedding_layer=embedding_layer,
+            # Keep auxiliary fusion out of the generic path: passing non-empty
+            # `extra_embeds` would allocate and scatter one full-sequence tensor
+            # per deepstack level before Qwen replaces them with its buffer views.
+            extra_embeds=(),
+            text_token_indices=text_token_indices,
+            mm_token_indices=mm_token_indices,
+        )
+        if not extra_embeds:
+            return fused_input_ids, inputs_embeds, ()
+
+        # Expand the per-level deepstack mm embeddings into the pre-allocated
+        # `(L, max_num_tokens, H)` buffer with a single packed scatter, avoiding `L` fresh
+        # `torch.zeros` + `L` scatters inside `fuse_input_embeds`.
+        deepstack_buffer = self.deepstack_input_embeds[:, : input_ids.shape[0], :]
+        deepstack_buffer.zero_()
+        packed_deepstack = torch.stack(tuple(extra_embeds), dim=0)
+        deepstack_buffer[:, mm_token_indices, :] = packed_deepstack.to(
+            dtype=deepstack_buffer.dtype,
+            device=deepstack_buffer.device,
+        )
+        return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
+
+    def get_language_model_extra_forward_kwargs(
+        self,
+        *,
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        multimodal_params: List[MultimodalParams],
+        num_generation_requests: int,
+        spec_metadata: Any,
+        resource_manager: Any = None,
+        mrope_delta_write_seq_slots: Optional[torch.Tensor] = None,
+        mrope_delta_read_seq_slots: Optional[torch.Tensor] = None,
+        mm_token_indices: Optional[torch.Tensor] = None,
+        **forward_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Build Qwen3-VL-specific language-model forward arguments."""
+        mrope_config = {}
         if not self.model_config.pretrained_config.disable_fuse_rope:
             mrope_config = self.prepare_mrope_config(
                 multimodal_params,
                 num_generation_requests,
                 position_ids,
-                mrope_delta_write_seq_slots=kwargs.get("mrope_delta_write_seq_slots"),
-                mrope_delta_read_seq_slots=kwargs.get("mrope_delta_read_seq_slots"),
+                mrope_delta_write_seq_slots=mrope_delta_write_seq_slots,
+                mrope_delta_read_seq_slots=mrope_delta_read_seq_slots,
             )
 
-        # Prefer the indices the executor already computed (CPU-side
-        # `filter_mm_token_from_input_ids` + async H2D) and forwarded via
-        # kwargs; fall back to filtering only on engine-bypass paths
-        # (e.g., direct `forward` calls in unit tests).
-        text_token_indices = kwargs.get("text_token_indices")
-        mm_token_indices = kwargs.get("mm_token_indices")
-        if len(mm_embeds) > 0 and (text_token_indices is None or mm_token_indices is None):
-            text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
-                input_ids,
-                vocab_size=self.llm.model.embed_tokens.num_embeddings,
-                mm_token_ids=self.mm_token_ids,
-            )
+        deepstack_embeds = list(mm_inputs.extra_embeds)
+        # `prepare_multimodal_inputs` passes these through `fuse_input_embeds`, which has already
+        # expanded each packed deepstack feature to the full input sequence. Do not scatter them
+        # a second time here: their leading dimension is now `num_tokens`, not the number of
+        # multimodal placeholders.
 
-        # Expand the per-level deepstack mm embeddings into the pre-allocated
-        # `(L, max_num_tokens, H)` buffer with a single packed scatter,
-        # avoiding `L` fresh `torch.zeros` + `L` scatters inside
-        # `fuse_input_embeds`.
-        if self.use_deepstack and len(deepstack_embeds) > 0:
-            num_tokens = input_ids.shape[0]
-            deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
-            deepstack_buffer.zero_()
-            packed_deepstack = torch.stack(deepstack_embeds, dim=0)
-            deepstack_buffer[:, mm_token_indices, :] = packed_deepstack.to(
-                dtype=deepstack_buffer.dtype, device=deepstack_buffer.device
-            )
-            deepstack_embeds = list(deepstack_buffer.unbind(0))
-
-        # Preserve the pre-fusion token IDs. `fuse_input_embeds` collapses
-        # input_ids -> None when MM embeddings are fused in, but spec
-        # decoding (MTP / Eagle) still needs the original prompt token
-        # IDs for drafter context preparation; pass them through as a
-        # dedicated kwarg consumed by `SpecDecOneEngineForCausalLM.forward`.
-        orig_input_ids = input_ids
-
-        input_ids, input_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens,
-            input_ids,
-            mm_embeds,
-            text_token_indices=text_token_indices,
-            mm_token_indices=mm_token_indices,
-        )
-
-        output_prob = self.llm.forward(
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=input_embeds,
-            return_context_logits=return_context_logits,
-            deepstack_embeds=deepstack_embeds,
-            mrope_config=mrope_config,
-            spec_metadata=kwargs.get("spec_metadata"),
-            resource_manager=kwargs.get("resource_manager"),
-            orig_input_ids=orig_input_ids,
-        )
-        # Spec-decoding (MTP / Eagle) returns a dict (accepted tokens,
-        # draft tokens, logits); plain forward returns a tensor.
-        if hasattr(output_prob, "shape"):
-            logger.debug(f"output shape: {output_prob.shape}")
-        return output_prob
+        return {
+            "deepstack_embeds": deepstack_embeds,
+            "mrope_config": mrope_config,
+            "spec_metadata": spec_metadata,
+            "resource_manager": resource_manager,
+            "orig_input_ids": raw_input_ids,
+        }
 
     def _get_requests_with_mm_data(self, multimodal_params):
         mm_multimodal_params = []
@@ -1629,6 +1587,8 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):
+    supports_encoder_cache = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
         kwargs["vision_model_class"] = Qwen3VisionModel

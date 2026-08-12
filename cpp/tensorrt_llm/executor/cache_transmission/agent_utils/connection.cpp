@@ -18,11 +18,16 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <limits>
+#include <numeric>
 #include <random>
 #include <string>
 #include <unistd.h>
 #include <utility>
+
+using tensorrt_llm::pg_utils::get_world_pg;
+using tensorrt_llm::pg_utils::PgHelper;
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -390,9 +395,36 @@ AgentConnectionManager::AgentConnectionManager(
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 
+    c10::intrusive_ptr<c10d::ProcessGroup> worldPg;
+    if (useMPI())
+    {
+        mRank = mpi::MpiComm::session().getRank();
+        mWorldSize = mpi::MpiComm::session().getSize();
+    }
+    else
+    {
+        worldPg = get_world_pg();
+        if (worldPg)
+        {
+            mRank = worldPg->getRank();
+            mWorldSize = worldPg->getSize();
+            TLLM_LOG_DEBUG(
+                mRank, "Cache transceiver using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "Torch process group is not initialized while MPI is disabled; cache transceiver defaults to one "
+                "process. For multi-rank execution, initialize the Torch process group before constructing the cache "
+                "transceiver, or unset TLLM_DISABLE_MPI to use MPI");
+        }
+    }
+
     mAgentName = genUniqueAgentName();
     // Create Agent
     BaseAgentConfig config{mAgentName, true, false, true};
+    config.rank = mRank;
+    config.worldSize = mWorldSize;
     m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     mBufferKinds.reserve(mCacheTransBufferManagers.size());
@@ -418,49 +450,71 @@ AgentConnectionManager::AgentConnectionManager(
     m_Agent->registerMemory(mRegMemDescs);
 
     AgentState localAgentState{mAgentName, m_Agent->getLocalConnectionInfo()};
-    std::vector<AgentState> agentStates(mpi::MpiComm::session().getSize());
-    if (mpi::MpiComm::session().getSize() > 1)
+    std::vector<AgentState> agentStates(mWorldSize);
+    if (mWorldSize > 1)
     {
-
-        mpi::MpiComm::session().barrier();
         namespace su = executor::serialize_utils;
 
         std::ostringstream oStream;
         su::serialize(localAgentState, oStream);
         auto str = oStream.str();
         std::vector<char> buffer(str.begin(), str.end());
-        std::vector<SizeType32> sizeofBuffer(mpi::MpiComm::session().getSize());
+        std::vector<SizeType32> sizeofBuffer(mWorldSize);
         SizeType32 bufferSize = buffer.size();
-        mpi::MpiComm::session().allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
-        SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
-        std::vector<char> recvBuffer(recvBufferSize);
-        std::vector<int> displs(mpi::MpiComm::session().getSize());
-        for (int r = 0; r < mpi::MpiComm::session().getSize(); r++)
-        {
-            displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
-        }
-        mpi::MpiComm::session().allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
-            sizeofBuffer, displs, mpi::MpiType::kCHAR);
 
-        // deserialize
-        for (int i = 0; i < mpi::MpiComm::session().getSize(); i++)
+        if (useMPI())
         {
-            std::vector<char> serBuffer(
-                recvBuffer.begin() + displs[i], recvBuffer.begin() + (displs[i] + sizeofBuffer[i]));
-            su::VectorWrapBuf<char> strbuf(serBuffer);
-            std::istream is(&strbuf);
-            agentStates[i] = su::deserialize<executor::kv_cache::AgentState>(is);
-            TLLM_LOG_DEBUG(
-                mpi::MpiComm::world().getRank(), " recv  agentStates[%d]: %s", i, agentStates[i].toString().c_str());
+            mpi::MpiComm::session().barrier();
+            mpi::MpiComm::session().allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
+            SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+            std::vector<char> recvBuffer(recvBufferSize);
+            std::vector<int> displs(mWorldSize);
+            for (int r = 0; r < mWorldSize; r++)
+            {
+                displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
+            }
+            mpi::MpiComm::session().allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
+                sizeofBuffer, displs, mpi::MpiType::kCHAR);
+
+            for (int r = 0; r < mWorldSize; r++)
+            {
+                std::vector<char> serBuffer(
+                    recvBuffer.begin() + displs[r], recvBuffer.begin() + (displs[r] + sizeofBuffer[r]));
+                su::VectorWrapBuf<char> strbuf(serBuffer);
+                std::istream is(&strbuf);
+                agentStates[r] = su::deserialize<executor::kv_cache::AgentState>(is);
+                TLLM_LOG_DEBUG(mRank, " recv agentStates[%d]: %s", r, agentStates[r].toString().c_str());
+            }
+        }
+        else
+        {
+            PgHelper pgHelper{worldPg};
+            PGCHECK_THROW(worldPg->barrier());
+            PGCHECK_THROW(pgHelper.allgather(&bufferSize, std::ref(sizeofBuffer), {}));
+
+            SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+            std::vector<char> recvBuffer(recvBufferSize);
+            PGCHECK_THROW(pgHelper.allgatherv(std::ref(buffer), std::ref(recvBuffer), std::cref(sizeofBuffer), {}));
+
+            char* begin = recvBuffer.data();
+            for (int r = 0; r < mWorldSize; r++)
+            {
+                std::vector<char> serBuffer(begin, begin + sizeofBuffer[r]);
+                begin += sizeofBuffer[r];
+                su::VectorWrapBuf<char> strbuf(serBuffer);
+                std::istream is(&strbuf);
+                agentStates[r] = su::deserialize<executor::kv_cache::AgentState>(is);
+                TLLM_LOG_DEBUG(mRank, " recv agentStates[%d]: %s", r, agentStates[r].toString().c_str());
+            }
         }
     }
     else
     {
         agentStates[0] = localAgentState;
     }
-    mCommState = CommState(agentStates, mpi::MpiComm::session().getRank());
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        " ***** AgentConnectionManager::AgentConnectionManager    mCommState: %s", mCommState.toString().c_str());
+    mCommState = CommState(agentStates, mRank);
+    TLLM_LOG_DEBUG(
+        mRank, " ***** AgentConnectionManager::AgentConnectionManager mCommState: %s", mCommState.toString().c_str());
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
@@ -562,6 +616,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
 
                     std::optional<std::pair<size_t, size_t>> kvOffsetRatio;
+                    std::optional<std::pair<size_t, size_t>> indexerOffsetRatio;
                     std::optional<std::pair<size_t, size_t>> rnnOffsetRatio;
                     std::vector<std::pair<size_t, size_t>> offsetRatios;
                     offsetRatios.reserve(bufferDescs.size());
@@ -572,7 +627,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         switch (kind)
                         {
                         case batch_manager::BufferKind::kKV:
-                        case batch_manager::BufferKind::kKV_INDEXER:
                         {
                             if (!kvOffsetRatio)
                             {
@@ -583,6 +637,24 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                                 kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
                             }
                             offsetRatios.push_back(*kvOffsetRatio);
+                            break;
+                        }
+                        case batch_manager::BufferKind::kKV_INDEXER:
+                        {
+                            if (!indexerOffsetRatio)
+                            {
+                                // The indexer K cache pass runs in "indexer layer space": with a
+                                // masked indexer pool (per-layer indexer mask) the receiver
+                                // slices its recv buffer at indexer-layer prefix offsets, so the
+                                // write offset must use the indexer layer counts (identical to
+                                // the attention counts for dense models).
+                                auto indexerTargetInfo = targetIRanksForIndexerKCache(mCacheState,
+                                    requestInfo.getTransState().getCacheState().value(),
+                                    requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, indexerTargetInfo, "IndexerK", remoteAgentName);
+                                indexerOffsetRatio = computeSendOffsetRatio(indexerTargetInfo, connectionIdx);
+                            }
+                            offsetRatios.push_back(*indexerOffsetRatio);
                             break;
                         }
                         case batch_manager::BufferKind::kRNN:
@@ -680,8 +752,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     std::optional<std::string> metadata, bool isSender)
 {
 
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
+    TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
     std::scoped_lock lock(mConnectionsMutex);
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
@@ -697,7 +768,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
         {
             m_Agent->invalidateRemoteAgent(remoteAgentName);
             it->second->setHasLoadRemoteAgent(true);
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "set has load remote agent to true");
+            TLLM_LOG_DEBUG(mRank, "set has load remote agent to true");
             m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
         }
         return it->second.get();
@@ -707,16 +778,16 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     {
         if (metadata.has_value())
         {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
-                mAgentName.c_str(), remoteAgentName.c_str());
+            TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
+                remoteAgentName.c_str());
             m_Agent->loadRemoteAgent(remoteAgentName, AgentDesc{metadata.value()});
             hasLoadRemoteAgent = true;
         }
         else
         {
             TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call loadRemoteAgent");
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "mAgentName: %s connect to %s with loadRemoteAgent",
-                mAgentName.c_str(), remoteAgentName.c_str());
+            TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
+                remoteAgentName.c_str());
             m_Agent->loadRemoteAgent(remoteAgentName, connectionInfo);
         }
     }

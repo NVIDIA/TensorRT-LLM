@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Tuple
 import pytest
 from utils.llm_data import llm_models_root
 
+pytestmark = pytest.mark.cpu_only
+
 # Constants for test configuration
 _DEFAULT_NUM_REQUESTS = 3
 _DEFAULT_INPUT_MEAN = 100
@@ -70,7 +72,8 @@ class TestPrepareDatasetLora:
         tokenizer_dir = model_cache / _TOKENIZER_SUBPATH
         cmd.extend(["--model", str(tokenizer_dir)])
 
-        # Always add --stdout flag since we parse stdout output
+        # Write to a file via --output rather than --stdout: trtllm-bench prints
+        # an import-time banner on stdout that would corrupt the parsed output.
         cmd.extend(["prepare-dataset", "--output", f"{output_path}"])
 
         return cmd
