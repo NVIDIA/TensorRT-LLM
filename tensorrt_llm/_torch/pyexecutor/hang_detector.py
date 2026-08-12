@@ -367,10 +367,12 @@ class HangDetector:
                     "HangDetector.start() called while already active; ignoring."
                 )
                 return
+            # Disarmed until the first checkpoint so startup does not lapse.
+            # Stored before ``active`` is published so a checkpoint racing this
+            # call cannot have its arm overwritten here.
+            self._deadline = math.inf
             self.active = True
 
-        # Disarmed until the first checkpoint so startup does not lapse.
-        self._deadline = math.inf
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=run_loop, daemon=True, name="hang_detector_loop")
         self.loop_thread.start()
