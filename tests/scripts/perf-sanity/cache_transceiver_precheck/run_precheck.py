@@ -85,6 +85,7 @@ import precheck_config as pcfg  # noqa: E402
 # requests of a session; the peer stride only separates sessions, which talk
 # to distinct agents and therefore cannot alias tags with each other.
 RID_PEER_STRIDE = 1 << 24
+ABORT_COORDINATION_TIMEOUT_S = 2.0
 
 
 class _Timeout(Exception):
@@ -95,12 +96,39 @@ class _TransferError(Exception):
     pass
 
 
+class _FatalTransferError(_TransferError):
+    """Transfer quiescence is unproven; finalizers must not release its memory."""
+
+
 class _PeerAbort(Exception):
     pass
 
 
 def _alarm_handler(signum, frame):
     raise _Timeout()
+
+
+def _coordinate_abort_after_leader_flush(comm):
+    """Bounded best-effort rendezvous after the leader writes its verdict."""
+    try:
+        request = comm.Ibarrier()
+        deadline = time.monotonic() + ABORT_COORDINATION_TIMEOUT_S
+        while not request.Test():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+    except Exception:  # noqa: BLE001 - abort remains the mandatory fallback
+        return
+
+
+def _hard_abort_process(comm):
+    """Terminate without running transceiver/KV-manager finalizers."""
+    try:
+        comm.Abort(137)
+    except Exception:  # noqa: BLE001 - SIGKILL is the mandatory fallback
+        pass
+    os.kill(os.getpid(), signal.SIGKILL)
+    raise RuntimeError("SIGKILL unexpectedly returned")
 
 
 def make_rid(ctx_idx, gen_idx, num_ctx, seq):
@@ -214,6 +242,7 @@ def load_internal_apis():
         CacheTransceiverConfig,
         KvCacheConfig,
         MTPDecodingConfig,
+        TorchLlmArgs,
     )
     from tensorrt_llm.llmapi.llm_utils import (
         _resolve_kv_cache_manager_v2_auto,
@@ -242,6 +271,7 @@ def load_internal_apis():
         CacheTransceiverConfig=CacheTransceiverConfig,
         KvCacheConfig=KvCacheConfig,
         MTPDecodingConfig=MTPDecodingConfig,
+        TorchLlmArgs=TorchLlmArgs,
         resolve_kv_cache_manager_v2_auto=_resolve_kv_cache_manager_v2_auto,
         resolve_transceiver_runtime_auto=_resolve_transceiver_runtime_auto,
         Mapping=Mapping,
@@ -271,28 +301,39 @@ def _pattern_like(shape, dtype, device, seed):
     return rnd.to(dtype).to(device).expand(nb, kv, heads, tok, dim)
 
 
-def _request_block_views(kvm, rid):
-    """Yield (global_layer, buffer, valid_block_indices) for this rank."""
+def _request_block_views(kvm, rid, prompt_len):
+    """Yield the prompt blocks transferred for this request on this rank."""
+    num_prompt_blocks = (prompt_len + kvm.tokens_per_block - 1) // kvm.tokens_per_block
     for global_layer in kvm.pp_layers:
         blocks = kvm.get_batch_cache_indices([rid], layer_idx=global_layer)[0]
+        # V2 may reserve extra KV tokens for speculative decoding. At an exact
+        # block boundary those tokens allocate an additional page, but the
+        # transceiver intentionally trims its slice to prompt_len blocks.
+        # Verify the same payload range instead of the untransferred page.
         valid = [b for b in blocks if b >= 0]
+        if len(valid) < num_prompt_blocks:
+            raise _TransferError(
+                f"KV under-allocation for rid={rid} layer={global_layer}: "
+                f"required={num_prompt_blocks} available={len(valid)}"
+            )
+        valid = valid[:num_prompt_blocks]
         if not valid:
             continue
         buf = kvm.get_buffers(global_layer, kv_layout="HND")
         yield global_layer, buf, valid
 
 
-def fill_request(kvm, rid):
-    for global_layer, buf, valid in _request_block_views(kvm, rid):
+def fill_request(kvm, rid, prompt_len):
+    for global_layer, buf, valid in _request_block_views(kvm, rid, prompt_len):
         shape = (len(valid), *buf.shape[1:])
         buf[valid] = _pattern_like(shape, buf.dtype, buf.device, seed_for(rid, global_layer))
 
 
-def verify_request(kvm, rid):
+def verify_request(kvm, rid, prompt_len):
     """Returns (ok, detail) comparing received blocks to the expected pattern."""
     import torch
 
-    for global_layer, buf, valid in _request_block_views(kvm, rid):
+    for global_layer, buf, valid in _request_block_views(kvm, rid, prompt_len):
         recv = buf[valid]
         exp = _pattern_like(recv.shape, recv.dtype, recv.device, seed_for(rid, global_layer))
         recv_f, exp_f = recv.float(), exp.float()  # fp8 lacks direct compare ops
@@ -320,8 +361,8 @@ def _lookup_model_cls(model_dir):
 def resolve_model_prefs(model_dir, side, cache_cfg):
     """Mirror serving's model-preference resolution (PR #15823 semantics).
 
-    - use_kv_cache_manager_v2 == "auto" (yaml absent): adopt the model
-      class's get_model_defaults() value, default False
+    - use_kv_cache_manager_v2 == "auto" (yaml absent): require the model
+      class and adopt its get_preferred_kv_cache_manager_version() value
       (llm_utils._resolve_kv_cache_manager_v2_auto).
     - cache_cfg.transceiver_runtime == "auto": adopt
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
@@ -333,6 +374,12 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
+    setting = side["use_kv_cache_manager_v2"]
+    if setting == "auto" and model_cls is None:
+        raise RuntimeError(
+            "use_kv_cache_manager_v2 is 'auto', but the precheck could not resolve "
+            f"a registered model class from model_dir={model_dir!r}; refusing to assume V1"
+        )
 
     # Runtime BEFORE V2, like serving: the V2 resolver's disagg gating reads
     # cache_cfg.transceiver_runtime and treats an unresolved "auto" as non-PYTHON.
@@ -340,39 +387,34 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             shim = types.SimpleNamespace(cache_transceiver_config=cache_cfg)
             api.resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
-        except Exception as e:  # noqa: BLE001 - fall back to the create() default (CPP)
-            print(
-                f"[precheck] WARNING: transceiver_runtime 'auto' resolution failed "
-                f"({e!r}); create_kv_cache_transceiver will fall back to CPP",
-                flush=True,
-            )
+        except Exception as e:  # noqa: BLE001 - resolver spans model extension hooks
+            raise RuntimeError(
+                "transceiver_runtime 'auto' resolution failed; refusing to validate "
+                "a runtime that may differ from serving"
+            ) from e
 
-    setting = side["use_kv_cache_manager_v2"]
     if setting == "auto":
-        defaults = {}
-        if model_cls is not None:
-            try:
-                defaults = model_cls.get_model_defaults(None) or {}
-            except Exception as e:  # noqa: BLE001 - model hooks may need llm_args
-                print(
-                    f"[precheck] WARNING: get_model_defaults failed ({e!r}); assuming V1",
-                    flush=True,
-                )
         try:
-            # The REAL serving resolver, via the same shim pattern as the
-            # runtime resolution below -- one owner for the 'auto' semantics.
-            # cache_transceiver_config feeds the resolver's disagg gating
-            # (a V2 model default requires the NIXL Python transceiver).
-            shim = types.SimpleNamespace(
-                kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto"),
-                cache_transceiver_config=cache_cfg,
-            )
-            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, defaults))
-        except Exception as e:  # noqa: BLE001 - fall back like a missing model
-            print(
-                f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); assuming V1", flush=True
-            )
-            use_v2 = False
+            parallel = side["parallel"]
+            llm_args_kwargs = {
+                "model": model_dir,
+                "tensor_parallel_size": parallel["tp"],
+                "pipeline_parallel_size": parallel["pp"],
+                "context_parallel_size": parallel["cp"],
+                "kv_cache_config": {"use_kv_cache_manager_v2": setting},
+                "cache_transceiver_config": cache_cfg,
+            }
+            num_nextn = int(side.get("num_nextn_predict_layers", 0) or 0)
+            if num_nextn > 0:
+                llm_args_kwargs["speculative_config"] = api.MTPDecodingConfig(
+                    num_nextn_predict_layers=num_nextn
+                )
+            resolver_args = api.TorchLlmArgs(**llm_args_kwargs)
+            # Use the real serving arguments so the resolver sees the same
+            # disaggregation, parallelism, and speculative-decoding inputs.
+            use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(resolver_args, model_cls, hf_view))
+        except Exception as e:  # noqa: BLE001 - resolver spans model extension hooks
+            raise RuntimeError("V2 'auto' resolution failed; refusing to assume V1") from e
     else:
         use_v2 = bool(setting)
     return use_v2
@@ -508,7 +550,8 @@ def free_sequence(kvm, req, use_v2):
 def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
     """Block until this gen request's receive finishes (or errors).
 
-    PYTHON transceiver: check_gen_transfer_status(None) blocks for all. C++:
+    The Python transceiver is handled once per wave in gen_run_wave(), where
+    its returned request IDs can be checked before releasing KV pages. For C++,
     the int API can return before THIS request completes on a cold link, so
     poll for a terminal state (bounded by signal.alarm + hang detector).
     Logs periodic progress so a stalled transfer shows WHICH request is stuck
@@ -516,8 +559,7 @@ def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
     "RDMA write never completed").
     """
     if runtime == "PYTHON":
-        xcvr.check_gen_transfer_status(None)
-        return
+        raise ValueError("Python generation waves must be checked as a batch")
     terminal = (
         llm_request_state.DISAGG_GENERATION_TRANS_COMPLETE,
         llm_request_state.DISAGG_TRANS_ERROR,
@@ -820,7 +862,7 @@ class PrecheckRunner:
         self.kvm = None
         self.xcvr = None
         self.runtime = "CPP"
-        # Resolved in setup(): "auto" needs the model class (get_model_defaults).
+        # Resolved in setup(): "auto" needs the model preference hook.
         self.use_v2 = False
         self.mapping = None
         self.llm_request_state = None
@@ -924,47 +966,60 @@ class PrecheckRunner:
                 rid = self._pair_rid(peer_idx, li, rep, pair)
                 req = make_request(True, rid, req_len, self.runtime)
                 add_sequence(self.kvm, req, req_len, self.use_v2)
-                fill_request(self.kvm, rid)
+                # Track ownership as soon as allocation succeeds. A later
+                # setup failure must retain the pages rather than free storage
+                # that an asynchronously dispatched sender may still read.
+                reqs[pair] = req
+                fill_request(self.kvm, rid, req_len)
                 tensorrt_llm.logger.info(
                     f"[ctx{self.server_idx} r{self.rank}] rid={rid} len={req_len}: send START"
                 )
                 self.xcvr.respond_and_send_async(req)
-                reqs[pair] = req
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001 - relayed to gen, then raised
             local_err = e
-        reason = self._consensus_error(local_err)
+        try:
+            reason = self._consensus_error(local_err)
 
-        # Params for pair k come from its owning dp rank at pp stage 0 with
-        # attention DP; without DP every rank sends the same request, and the
-        # instance leader's params are the ones the real server would return.
-        if self.side["parallel"]["enable_attention_dp"]:
-            contributes = self.mapping.pp_rank == 0
-        else:
-            contributes = self.is_leader
-        contrib = (
-            {p: r.context_phase_params for p, r in reqs.items()}
-            if local_err is None and contributes
-            else {}
-        )
-        gathered = self.comm.gather(contrib, root=0)
-        params_by_pair = {}
-        if self.is_leader:
-            for d in gathered:
-                params_by_pair.update(d or {})
-            if reason is None:
-                missing = [p for p in wave if p not in params_by_pair]
-                if missing:
-                    reason = f"missing context_phase_params for pairs {missing}"
-        # The missing-params check runs only on the leader (only it holds the
-        # gathered params). Broadcast the verdict so EVERY rank raises together:
-        # otherwise the leader raises here while the other ranks return and enter
-        # ctx_finish_wave's collective, the collective sequence diverges, and the
-        # step deadlocks until the watchdog SIGKILLs it (misreported as TIMEOUT).
-        reason = self.comm.bcast(reason, root=0)
+            # Params for pair k come from its owning dp rank at pp stage 0 with
+            # attention DP; without DP every rank sends the same request, and the
+            # instance leader's params are the ones the real server would return.
+            if self.side["parallel"]["enable_attention_dp"]:
+                contributes = self.mapping.pp_rank == 0
+            else:
+                contributes = self.is_leader
+            contrib = (
+                {p: r.context_phase_params for p, r in reqs.items()}
+                if local_err is None and contributes
+                else {}
+            )
+            gathered = self.comm.gather(contrib, root=0)
+            params_by_pair = {}
+            if self.is_leader:
+                for d in gathered:
+                    params_by_pair.update(d or {})
+                if reason is None:
+                    missing = [p for p in wave if p not in params_by_pair]
+                    if missing:
+                        reason = f"missing context_phase_params for pairs {missing}"
+            # The missing-params check runs only on the leader (only it holds the
+            # gathered params). Broadcast the verdict so EVERY rank raises together:
+            # otherwise the leader raises here while the other ranks return and enter
+            # ctx_finish_wave's collective, the collective sequence diverges, and the
+            # step deadlocks until the watchdog SIGKILLs it (misreported as TIMEOUT).
+            reason = self.comm.bcast(reason, root=0)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - sends may already be in flight
+            raise _FatalTransferError(f"ctx send ownership consensus failed: {e!r}") from e
 
         if reason is not None:
-            self._free_all(reqs)
-            raise _TransferError(f"ctx send setup failed: {reason}")
+            # Send setup can fail asymmetrically after another rank dispatched
+            # work. A block-all collective is not safe from that state, and
+            # orderly teardown can deregister memory while a worker still owns
+            # it. Conservatively abort without running finalizers.
+            raise _FatalTransferError(f"ctx send setup failed: {reason}")
         return params_by_pair, reqs
 
     def ctx_finish_wave(self, reqs):
@@ -974,24 +1029,48 @@ class PrecheckRunner:
         t0 = time.monotonic()
         local_err = None
         try:
-            self.xcvr.check_context_transfer_status(None)  # block-all
+            completed, failed = self.xcvr.check_context_transfer_status(None)  # block-all
+            completed_rids = set(completed)
+            failed_rids = set(failed)
+            missing = [
+                p
+                for p, req in reqs.items()
+                if req.py_request_id not in completed_rids | failed_rids
+            ]
+            if missing:
+                raise _TransferError(
+                    f"block-all returned before terminal status for pairs {missing}"
+                )
+            failed_pairs = [p for p, req in reqs.items() if req.py_request_id in failed_rids]
+            if failed_pairs:
+                raise _TransferError(f"ctx transfer failed for pairs {failed_pairs}")
             bad = [
                 p for p, r in reqs.items() if r.state == self.llm_request_state.DISAGG_TRANS_ERROR
             ]
             if bad:
-                local_err = _TransferError(f"ctx DISAGG_TRANS_ERROR on pairs {bad}")
+                raise _TransferError(f"ctx DISAGG_TRANS_ERROR on pairs {bad}")
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001
             local_err = e
-        finally:
-            self._free_all(reqs)
-        states = {p: str(r.state) for p, r in reqs.items()}
-        tensorrt_llm.logger.info(
-            f"[ctx{self.server_idx} r{self.rank}] wave sends finished in "
-            f"{time.monotonic() - t0:.1f}s states={states}"
-        )
-        reason = self._consensus_error(local_err)
+        try:
+            states = {p: str(r.state) for p, r in reqs.items()}
+            tensorrt_llm.logger.info(
+                f"[ctx{self.server_idx} r{self.rank}] wave sends finished in "
+                f"{time.monotonic() - t0:.1f}s states={states}"
+            )
+            reason = self._consensus_error(local_err)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - release proof is incomplete
+            raise _FatalTransferError(f"ctx transfer ownership consensus failed: {e!r}") from e
         if reason is not None:
-            raise _TransferError(f"ctx transfer failed: {reason}")
+            # Failed/cancelled/missing results do not prove that every NIXL
+            # reader has relinquished the source pages. Do not proceed to the
+            # ordinary shutdown path, which deregisters those pages.
+            raise _FatalTransferError(f"ctx transfer failed: {reason}")
+        # Every rank proved exact completion before any rank recycles pages.
+        self._free_all(reqs)
 
     def gen_run_wave(self, peer_idx, li, req_len, rep, wave, params_by_pair):
         """Receive + verify owned pairs. Returns (ok, mismatch_detail).
@@ -1012,23 +1091,49 @@ class PrecheckRunner:
                     False, rid, req_len, self.runtime, ctx_params=params_by_pair[pair]
                 )
                 add_sequence(self.kvm, req, req_len, self.use_v2)
+                # Track every allocated sequence before receive dispatch. On
+                # setup failure, retain all pages and bypass normal teardown.
+                reqs[pair] = req
                 tensorrt_llm.logger.info(
                     f"[gen{self.server_idx} r{self.rank}] rid={rid} len={req_len}: recv START"
                 )
                 self.xcvr.request_and_receive_async(req)
-                reqs[pair] = req
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001
             local_err = e
-        reason = self._consensus_error(local_err)
+        try:
+            reason = self._consensus_error(local_err)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - ctx sender is already live
+            raise _FatalTransferError(f"gen receive setup consensus failed: {e!r}") from e
         if reason is not None:
-            self._free_all(reqs)
-            raise _TransferError(f"gen receive setup failed: {reason}")
+            # The context sender is already live, and receive setup can fail
+            # after partially dispatching local work. Quiescence is unknown.
+            raise _FatalTransferError(f"gen receive setup failed: {reason}")
 
         mismatch = ""
         t0 = time.monotonic()
+        transfer_error = None
         try:
-            for pair, req in reqs.items():
-                _wait_gen_complete(self.xcvr, req, self.runtime, self.llm_request_state)
+            if self.runtime == "PYTHON":
+                completed, failed, cancelled = self.xcvr.check_gen_transfer_status(None)
+                completed_rids = set(completed)
+                failed_rids = set(failed)
+                cancelled_rids = {req.py_request_id for req in cancelled}
+                expected_rids = {req.py_request_id for req in reqs.values()}
+                missing_rids = expected_rids - completed_rids - failed_rids - cancelled_rids
+                if failed_rids or cancelled_rids or missing_rids:
+                    raise _TransferError(
+                        "Python gen block-all did not complete every request: "
+                        f"failed={sorted(failed_rids)} "
+                        f"cancelled={sorted(cancelled_rids)} "
+                        f"missing={sorted(missing_rids)}"
+                    )
+            else:
+                for req in reqs.values():
+                    _wait_gen_complete(self.xcvr, req, self.runtime, self.llm_request_state)
             if reqs:
                 tensorrt_llm.logger.info(
                     f"[gen{self.server_idx} r{self.rank}] wave recvs finished in "
@@ -1039,20 +1144,48 @@ class PrecheckRunner:
                 p for p, r in reqs.items() if r.state == self.llm_request_state.DISAGG_TRANS_ERROR
             ]
             if bad:
-                local_err = _TransferError(f"gen DISAGG_TRANS_ERROR on pairs {bad}")
-            elif self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
+                raise _TransferError(f"gen DISAGG_TRANS_ERROR on pairs {bad}")
+            incomplete = [
+                p
+                for p, r in reqs.items()
+                if r.state != self.llm_request_state.DISAGG_GENERATION_TRANS_COMPLETE
+            ]
+            if incomplete:
+                raise _TransferError(f"gen requests not complete for pairs {incomplete}")
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001
+            transfer_error = e
+        try:
+            reason = self._consensus_error(transfer_error)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - release proof is incomplete
+            raise _FatalTransferError(f"gen transfer ownership consensus failed: {e!r}") from e
+        if reason is not None:
+            # Exact completion plus CUDA stream synchronization is the release
+            # proof. Do not let a locally successful rank free while another
+            # rank still has transport-owned pages.
+            raise _FatalTransferError(f"gen transfer failed: {reason}")
+
+        # Remote writes and local CUDA work are complete on every rank. Later
+        # byte-verification failures do not invalidate the ownership proof.
+        verification_error = None
+        try:
+            if self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
                 for pair, req in reqs.items():
-                    ok, detail = verify_request(self.kvm, req.py_request_id)
+                    ok, detail = verify_request(self.kvm, req.py_request_id, req_len)
                     if not ok:
                         mismatch = f"pair={pair} {detail}"
                         break
+        except _Timeout:
+            raise
         except Exception as e:  # noqa: BLE001
-            local_err = e
-        finally:
-            self._free_all(reqs)
-        reason = self._consensus_error(local_err)
+            verification_error = e
+        self._free_all(reqs)
+        reason = self._consensus_error(verification_error)
         if reason is not None:
-            raise _TransferError(f"gen transfer failed: {reason}")
+            raise _TransferError(f"gen verification failed: {reason}")
         mismatches = [m for m in self.comm.allgather(mismatch) if m]
         return (not mismatches, "; ".join(mismatches[:4]))
 
@@ -1079,13 +1212,19 @@ class PrecheckRunner:
         """REQ round-trip on the gen leader; broadcast the reply to all ranks."""
         reply = None
         err = None
+        timed_out = False
         if self.is_leader:
             try:
                 sock.send(pack_msg(obj, key))
                 reply = unpack_msg(sock.recv(), key)
+            except _Timeout as e:
+                timed_out = True
+                err = repr(e)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
-        err, reply = self.comm.bcast((err, reply), root=0)
+        timed_out, err, reply = self.comm.bcast((timed_out, err, reply), root=0)
+        if timed_out:
+            raise _Timeout(err)
         if err:
             raise _TransferError(f"ZMQ control channel failed: {err}")
         return reply
@@ -1151,13 +1290,18 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     comm = runner.comm
 
     def leader_recv():
-        msg, err = None, None
+        msg, err, timed_out = None, None, False
         if runner.is_leader:
             try:
                 msg = unpack_msg(sock.recv(), key)
+            except _Timeout as e:
+                timed_out = True
+                err = repr(e)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
-        err, msg = comm.bcast((err, msg), root=0)
+        timed_out, err, msg = comm.bcast((timed_out, err, msg), root=0)
+        if timed_out:
+            raise _Timeout(err)
         if err:
             raise _TransferError(f"ZMQ recv from gen_{peer_idx} failed: {err}")
         return msg
@@ -1187,12 +1331,39 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
             )
         try:
             params_by_pair, reqs = runner.ctx_run_wave(peer_idx, li, req_len, rep, wave)
+        except _FatalTransferError as e:
+            try:
+                leader_reply(("abort", str(e)))
+            except Exception:  # noqa: BLE001 - preserve ownership-fatal outcome
+                pass
+            raise
         except _TransferError as e:
             leader_reply(("abort", str(e)))
             raise
+        except Exception as e:  # noqa: BLE001 - dispatch may have started
+            fatal = _FatalTransferError(f"ctx send path failed with ownership unknown: {e!r}")
+            try:
+                leader_reply(("abort", str(fatal)))
+            except Exception:  # noqa: BLE001 - preserve ownership-fatal outcome
+                pass
+            raise fatal from e
         # JSON object keys are strings; the gen side converts back to int.
-        leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
-        runner.ctx_finish_wave(reqs)
+        try:
+            leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - sends may already be in flight
+            raise _FatalTransferError(
+                f"failed to publish params to gen_{peer_idx} after send dispatch: {e!r}"
+            ) from e
+        try:
+            runner.ctx_finish_wave(reqs)
+        except (_Timeout, _FatalTransferError, _TransferError):
+            raise
+        except Exception as e:  # noqa: BLE001 - send quiescence is unknown
+            raise _FatalTransferError(
+                f"ctx completion proof failed with ownership unknown: {e!r}"
+            ) from e
 
     # The gen defers "done" until it has finished the schedules of ALL its
     # ctx peers, so every ctx instance stays alive for the whole precheck --
@@ -1284,13 +1455,33 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
         case_ok = {}
         for li, req_len, rep, wave in _schedule(plan):
             arm(f"ctx_{peer_idx} len={req_len} rep={rep}", seconds=wave_timeout_s(plan, li, rep))
-            reply = runner._leader_send_recv(
-                sock, ("go", {"li": li, "rep": rep, "wave": wave[0]}), key
-            )
-            if reply[0] == "abort":
-                raise _TransferError(f"ctx_{peer_idx} aborted: {reply[1]}")
-            params_by_pair = {int(p): params_from_wire(v) for p, v in reply[1].items()}
-            ok, detail = runner.gen_run_wave(peer_idx, li, req_len, rep, wave, params_by_pair)
+            try:
+                reply = runner._leader_send_recv(
+                    sock, ("go", {"li": li, "rep": rep, "wave": wave[0]}), key
+                )
+                if reply[0] == "abort":
+                    raise _FatalTransferError(f"ctx_{peer_idx} aborted: {reply[1]}")
+                if reply[0] != "params":
+                    raise _FatalTransferError(
+                        f"unexpected wave reply from ctx_{peer_idx}: {reply[:1]}"
+                    )
+                params_by_pair = {int(p): params_from_wire(v) for p, v in reply[1].items()}
+            except _Timeout:
+                raise
+            except _FatalTransferError:
+                raise
+            except Exception as e:  # noqa: BLE001 - ctx may have dispatched sends
+                raise _FatalTransferError(
+                    f"wave control failed after ctx_{peer_idx} may have dispatched sends: {e!r}"
+                ) from e
+            try:
+                ok, detail = runner.gen_run_wave(peer_idx, li, req_len, rep, wave, params_by_pair)
+            except (_Timeout, _FatalTransferError, _TransferError):
+                raise
+            except Exception as e:  # noqa: BLE001 - receive quiescence is unknown
+                raise _FatalTransferError(
+                    f"gen completion proof failed with ownership unknown: {e!r}"
+                ) from e
             if rep >= plan["warmup_requests"]:
                 prev_ok, prev_detail = case_ok.get(req_len, (True, ""))
                 case_ok[req_len] = (prev_ok and ok, prev_detail or detail)
@@ -1386,14 +1577,26 @@ def _install_watchdog(runner, plan, rank):
     current_cell = {"what": "startup"}
 
     def _on_hang():
-        runner.recorder.record("-", 0, "TIMEOUT", f"hang detected during {current_cell['what']}")
-        runner.recorder.finalize()
-        sys.stderr.write(
-            f"[precheck {runner.role}_{runner.server_idx} r{rank}] WATCHDOG_KILL "
-            f"{current_cell['what']}\n"
-        )
-        sys.stderr.flush()
-        os.kill(os.getpid(), signal.SIGKILL)
+        if runner.is_leader:
+            try:
+                runner.recorder.record(
+                    "-", 0, "TIMEOUT", f"hang detected during {current_cell['what']}"
+                )
+                runner.recorder.finalize()
+            except Exception:  # noqa: BLE001 - SIGKILL must still happen
+                pass
+        else:
+            # Let the leader's concurrently armed watchdog replace its status
+            # files before this rank's bad exit tears down the srun step.
+            time.sleep(ABORT_COORDINATION_TIMEOUT_S)
+        try:
+            sys.stderr.write(
+                f"[precheck {runner.role}_{runner.server_idx} r{rank}] WATCHDOG_KILL "
+                f"{current_cell['what']}\n"
+            )
+            sys.stderr.flush()
+        finally:
+            os.kill(os.getpid(), signal.SIGKILL)
 
     # The detector must outlast the LONGEST legitimate wait (peer handshakes
     # are serialized across sessions); per-cell alarms are the tighter bound
@@ -1442,6 +1645,43 @@ def _make_peer_failure_recorder(runner, disarm, current_cell):
     return record_peer_failure
 
 
+def _hard_abort_unquiesced(runner, current_cell, exc):
+    """Persist the ownership-fatal verdict, then exit without teardown."""
+    try:
+        signal.alarm(0)
+    except Exception:  # noqa: BLE001 - abort must still happen
+        pass
+    if isinstance(exc, _Timeout):
+        status = "TIMEOUT"
+        reason = f"exceeded the budget during {current_cell['what']}"
+    else:
+        status = "TRANSFER_ERROR"
+        reason = str(exc)
+    if runner.is_leader:
+        try:
+            peer = current_cell["what"]
+            runner.recorder.record(peer, 0, status, reason)
+            raise_abort_flag(runner.work_dir, f"{peer} {status}: {reason}")
+            runner.recorder.finalize(
+                extra={
+                    "kv_cache_manager": "V2" if runner.use_v2 else "V1",
+                    "transceiver_runtime": runner.runtime,
+                }
+            )
+        except Exception:  # noqa: BLE001 - abort must still happen
+            pass
+    # Fatal transfer paths first reach instance-wide consensus. This bounded
+    # rendezvous lets the leader finish replacing the status files before a
+    # nonleader aborts MPI, but does not rely on coordination for rank-local
+    # signal timeouts.
+    _coordinate_abort_after_leader_flush(runner.comm)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        _hard_abort_process(runner.comm)
+
+
 def _consensus_abort_reason(runner):
     """Instance-wide agreed view of the fail-fast flag (leader reads, bcast).
 
@@ -1483,6 +1723,8 @@ def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
         try:
             ctx_serve_peer(runner, socks.get(gj), gj, arm, disarm, keys.get(gj))
             runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
+        except (_FatalTransferError, _Timeout):
+            raise
         except _PeerAbort as e:
             # A gen driver that failed elsewhere aborts our session as part of
             # fail-fast: record a (non-failing) SKIP, not our own failure --
@@ -1525,6 +1767,8 @@ def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
         try:
             sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
             open_sessions.append((ci, sock, sess_key))
+        except (_FatalTransferError, _Timeout):
+            raise
         except Exception as e:  # noqa: BLE001 - failure sets the fail-fast flag
             record_peer_failure(f"ctx_{ci}", e)
     for ci, sock, sess_key in open_sessions:
@@ -1628,6 +1872,16 @@ def main(argv=None):
             _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure)
         else:
             _drive_ctx_peers(runner, arm, disarm, record_peer_failure)
+    except (_FatalTransferError, _Timeout) as e:
+        try:
+            print(
+                f"[precheck {runner.role}_{runner.server_idx} r{rank}] OWNERSHIP_FATAL: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 - abort must still happen
+            pass
+        _hard_abort_unquiesced(runner, current_cell, e)
     finally:
         stop_watchdog()
 

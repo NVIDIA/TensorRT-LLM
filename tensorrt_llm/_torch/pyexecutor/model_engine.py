@@ -391,12 +391,15 @@ class PyTorchModelEngine(ModelEngine):
         # Disaggregated attention-DP can backfill a batch before the overlap
         # scheduler releases the previous batch's terminal sequence slots.
         from ._util import (compute_max_num_sequences,
+                            should_enable_adp_dummy_fixes,
                             should_enable_disagg_adp_overlap_headroom,
-                            should_enable_dsv4_adp_dummy_fixes)
+                            should_enable_non_overlap_adp_forward_intent,
+                            should_enable_scheduler_aware_adp_dummy)
         self._enable_disagg_adp_overlap_headroom = (
             should_enable_disagg_adp_overlap_headroom(
                 mapping, llm_args.cache_transceiver_config,
                 llm_args.disable_overlap_scheduler))
+        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,
             self.batch_size,
@@ -486,8 +489,12 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        self._enable_dsv4_adp_dummy_fixes = should_enable_dsv4_adp_dummy_fixes(
-            model_type, mapping)
+        self._enable_scheduler_aware_adp_dummy = (
+            should_enable_scheduler_aware_adp_dummy(
+                model_type, mapping, llm_args.disable_overlap_scheduler))
+        self._enable_non_overlap_adp_forward_intent = (
+            should_enable_non_overlap_adp_forward_intent(
+                mapping, llm_args.disable_overlap_scheduler))
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -5227,8 +5234,49 @@ class PyTorchModelEngine(ModelEngine):
         _has_any_multimodal_request = any(r.py_multimodal_data is not None
                                           for r in generation_requests)
         if _n_gen > 0:
-            # All generation requests have the same beam width
+            # The whole batch is laid out with request 0's beam width: every
+            # generation request contributes exactly this many rows to
+            # input_ids / position_ids / sequence_lengths and to the logits the
+            # model returns. The sampler, in turn, locates a request's logits by
+            # accumulating the *per-request* beam widths
+            # (TorchSampler._select_generated_logits ->
+            # calculate_request_offsets). Both agree only while every request in
+            # the batch has the same beam width.
+            #
+            # Mixing widths would desynchronize the two: the sampler would read
+            # a request's rows at the wrong offset, and `logits.view(batch,
+            # beam_width_in, vocab)` succeeds for any shape whose element count
+            # divides, so the result is silently wrong rather than an error.
+            # Supporting mixed widths needs the forward path to emit a fixed
+            # max_beam_width stride and the sampler offsets to match; until
+            # then, fail loudly.
             beam_width = generation_requests[0].py_beam_width
+            # Admission pins every request to max_beam_width, but a
+            # variable-beam-width request narrows or widens per iteration, so
+            # the widths can still diverge mid-batch. Compare the
+            # *per-iteration* width: py_beam_width is fixed at admission and
+            # would be identical across those requests. Dummy requests are
+            # excluded -- they carry no user request and are built at their own
+            # width (CUDA-graph padding at the engine width, attention-DP and
+            # warmup dummies at width one), so they would otherwise trip this
+            # on an ordinary padded batch.
+            real_requests = [
+                req for req in generation_requests if not req.is_dummy
+            ]
+            iter_widths = {
+                req.get_beam_width_by_iter()
+                for req in real_requests
+            }
+            if len(iter_widths) > 1:
+                # NB: this aborts the whole batch, not just the offending
+                # requests -- ModelEngine has no per-request failure channel,
+                # and by this point the batch is already scheduled. Scoping the
+                # failure needs the scheduler to group by beam width in the
+                # first place, so that no such batch is formed; TRTLLM-14792.
+                raise ValueError(
+                    "Generation requests in one batch must all have the same "
+                    f"beam width; got {sorted(iter_widths)}. Mixed beam widths "
+                    "within a batch are not supported yet (TRTLLM-14792).")
 
             # Pre-extend constant-value lists to avoid per-request append
             # overhead (saves ~3 append calls per request).
@@ -7199,7 +7247,8 @@ class PyTorchModelEngine(ModelEngine):
                     if self.cuda_graph_runner.is_warmup_only:
                         outputs = capture_outputs
                     elif needs_capture:
-                        # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
+                        # Refresh attention metadata for the current batch's
+                        # draft cache before replaying the captured graph.
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
                         try:
@@ -7842,9 +7891,17 @@ class PyTorchModelEngine(ModelEngine):
             for request in requests:
                 if is_context_request:
                     beam_width = 1
+                    row_stride = 1
                 else:
+                    # Generation rows are laid out at the static admission
+                    # width, so that is the stride between requests, while
+                    # only the leading beam_width rows hold live beams under
+                    # a variable beam width array. Advancing the offset by the
+                    # narrower width would make every request after the first
+                    # rewrite another request's logits rows in place.
                     beam_width = request.get_beam_width_by_iter(
                         for_next_iteration=False)
+                    row_stride = request.py_beam_width
 
                 logits_processors = getattr(request,
                                             "py_logits_post_processors", None)
@@ -7857,13 +7914,13 @@ class PyTorchModelEngine(ModelEngine):
                     if (is_context_request
                             and request.py_orig_prompt_len < len(token_ids[0])):
                         # Skip as we only need to apply logit processor on the last context request
-                        logits_row_offset += beam_width
+                        logits_row_offset += row_stride
                         continue
 
                     self._apply_logits_processors(request, logits_processors,
                                                   logits_tensor, beam_width,
                                                   token_ids, logits_row_offset)
-                logits_row_offset += beam_width
+                logits_row_offset += row_stride
 
     def wait_for_input_copy(self):
         """

@@ -205,6 +205,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # MicroBatchScheduler. For encoder-decoder models, caller should pass
         # no_schedule_until_state=ENCODER_INIT to widen the range (same as
         # C++ trtEncoderModel which passes kENCODER_INIT).
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
         self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
@@ -219,6 +221,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+
+    @property
+    def scheduling_state_range(
+        self,
+    ) -> tuple[LlmRequestState, LlmRequestState]:
+        return self.no_schedule_until_state, self.no_schedule_after_state
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]

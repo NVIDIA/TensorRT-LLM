@@ -29,7 +29,10 @@ from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_s
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.llm_utils import (
+    _resolve_kv_cache_manager_v2_auto,
+    apply_model_defaults_to_llm_args,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -187,6 +190,7 @@ def test_qwen35_moe_model_defaults(
         llm_args.quant_config = QuantConfig(quant_algo=quant_algo)
         defaults = model_cls.get_model_defaults(llm_args)
         apply_model_defaults_to_llm_args(llm_args, defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
 
         assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True

@@ -4,6 +4,7 @@ import inspect
 import itertools
 import os
 import weakref
+from dataclasses import replace
 from enum import IntEnum
 from typing import Optional
 
@@ -297,19 +298,11 @@ def make_balanced_run_moe(
     dp_rank,
     ep_size,
 ):
-    def balanced_run_moe(
-        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
-    ):
+    def balanced_run_moe(ctx, *, workspace=None):
         if moe_module._routing_results_replaced_at is not None:
-            return run_moe_orig(
-                x,
-                token_selected_experts,
-                token_final_scales,
-                x_sf,
-                router_logits,
-                do_finalize,
-                moe_output,
-            )
+            return run_moe_orig(ctx, workspace=workspace)
+        x = ctx.x
+        do_finalize = ctx.do_finalize
         logger.warning_once(
             'Layer-wise benchmarks: Specifying routing results of "TRTLLM" MoE backend in TEP cases leads to different'
             " execution path around the topk kernel",
@@ -355,15 +348,14 @@ def make_balanced_run_moe(
         token_final_scales = get_token_final_scales(
             token_selected_experts.shape, token_selected_experts.device
         )
-        router_logits = None
         final_hidden_states = run_moe_orig(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            x_sf,
-            router_logits,
-            do_finalize,
-            moe_output,
+            replace(
+                ctx,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                router_logits=None,
+            ),
+            workspace=workspace,
         )
         if not do_finalize:
             final_hidden_states = (

@@ -453,6 +453,44 @@ class DSparkWorker(SpecWorkerBase):
         )
         return block_logits
 
+    def _sample_draft_tokens_guided(
+        self,
+        gen_logits: torch.Tensor,
+        spec_metadata: "DSparkSpecMetadata",
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        K: int,
+    ):
+        """
+        Grammar-constrained draft sampling for the guided-decoding path.
+        """
+        vocab = gen_logits.shape[-1]
+        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
+        # a contiguous [batch, vocab] tensor.
+        if num_contexts > 0:
+            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
+            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
+        else:
+            full_logits = gen_logits.transpose(0, 1).contiguous()
+
+        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
+        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
+
+        gen_draft_tokens = []
+        for k in range(K):
+            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
+            step_logits = full_logits[k]
+            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
+            step_tokens = self.sample_draft_tokens(
+                step_logits, spec_metadata, batch_size, draft_step=k
+            )
+            gen_draft_tokens.append(step_tokens[num_contexts:])
+            new_tokens = step_tokens
+        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
+        return gen_draft_tokens
+
     def _forward_impl(
         self,
         input_ids,
@@ -557,12 +595,21 @@ class DSparkWorker(SpecWorkerBase):
                 all_rank_num_tokens=all_rank_draft_tokens,
             )
             if gen_logits is not None:
-                # SpecWorkerBase samples the draft tokens (greedy argmax, or
-                # rejection sampling for a non-greedy batch), performs the TP
-                # gather, and scatters the proposal distribution into draft_probs.
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
-                )
+                if self.guided_decoder is not None:
+                    gen_draft_tokens = self._sample_draft_tokens_guided(
+                        gen_logits,
+                        spec_metadata,
+                        accepted_tokens,
+                        num_accepted_tokens,
+                        num_contexts,
+                        batch_size,
+                        K,
+                    )
+                else:
+                    # SpecWorkerBase samples the draft tokens.
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+                    )
                 # The context one-hot must match the width the gen scatter just
                 # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
                 # draft logits are vocab-sharded and sample_draft_tokens gathers

@@ -666,6 +666,23 @@ class DecoderModelForCausalLM(nn.Module,
         return {}
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(
+            cls,
+            pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
+        """Return the model's preferred KV cache manager version.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
+        ``None`` to use the built-in V1 fallback.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config. Shared model
+                implementations can inspect it to select a preference for the
+                original checkpoint architecture.
+        """
+        return None
+
+    @classmethod
     def get_preferred_transceiver_runtime(
             cls,
             pretrained_config: Any = None
