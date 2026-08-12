@@ -916,6 +916,23 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - 附:到达性机制无懈可击(6 个僵尸 pin cell 的 mode 全部逐字满档),disagg 表/STS/三臂在 bug 后面排队。
 - ⚠️ 请主线看一眼:你们 disagg gen 侧用的 commit/镜像与 gen 第一步(消费 ctx 交接后)的提交路径,近期有无已知改动?
 
+## 【08-12 05:30】量化经济学实锤(fp8 量级轮)+ 冻结 bug 判别链收缩(laliao 侧)
+
+**fp8 量级复证**(发现我 07-30 已下完 fp8 原版检查点——.incomplete 残留是 hf-download 死垃圾,尺寸校验其实早通过;主线 pro_sched_arm.yaml 逐键 + 他们的表 + burst 客户端,同机同代码只换量化):
+
+| 负载/bs | nvfp4 | **fp8** | 主线 fp8 |
+|---|---|---|---|
+| poetry 512 | +4.6% | +3.9% | +9.9% |
+| poetry 1024 | +7.8% | **+11.8%** | +24.7% |
+| arena 512 | +0.4% | **+5.5%** | +6.8% |
+| arena 1024 | −2.4% | +0.3% | +5.9% |
+
+- **verify 越贵收益越大的量化档位效应直接验证**(poetry@1024 +4pp、arena@512 从零翻正);逐键对表功不可没(头号差异就是 fp8 vs nvfp4 checkpoint + moe TRTLLM vs MEGAMOE_CUTEDSL)。产品含义:**报 DSpark 收益必须标注检查点量化;nvfp4 部署下天花板显著低于 fp8**。
+- 与主线剩余差距(11.8 vs 24.7)第二阶候选:N 臂定义(我 FRAC=1.0+SCHED_TIMING 有机器税,主线是关 confidence 开关——下轮用 CFG_NOHEAD 式 N 臂)、客户端实现(p25fix asyncio vs benchmark_serving)、warm-rep 剔除。
+- 注:本轮 arena 绝对吞吐显著高于 nvfp4 轮(63k vs 40k tok/s @1024)——burst 单波 completion-span 口径对 ISL 分布敏感,横向绝对值勿直接比,臂内 delta 有效。
+
+**disagg 冻结 bug 判别链**:D2(去 overlay)= **ZOMBIE(20253 步)→ overlay 28 文件无罪**;D3(ctx 去 spec)= ctx 崩 v2 `dangling rawref` → 该路不通,反证 trap 4,ctx-spec 修复方向无罪;D4(旧镜像 b8bc42c3ae × ctx tp4 无 spec × 冻结组合 poetry/lbs64/benchmark_serving)在队——健康则回归区间锁定 b8bc42c3ae→faf2c60935 两构建之间,冻结则配置组合(客户端/streaming/lbs)定罪。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
