@@ -20,7 +20,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 GEMMA3_1B_CONFIG = {
     "architectures": ["Gemma3ForCausalLM"],

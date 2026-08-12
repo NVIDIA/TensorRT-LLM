@@ -11,8 +11,8 @@ from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
-from tensorrt_llm.mapping import Mapping
 
 
 class TestMoeLoadBalancer(unittest.TestCase):

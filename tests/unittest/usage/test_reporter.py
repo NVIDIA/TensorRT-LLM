@@ -484,7 +484,7 @@ class TestRankGuard:
         self._setup_reporter(monkeypatch)
 
         with patch("tensorrt_llm.usage.usage_lib.threading.Thread") as thread_cls:
-            with patch("tensorrt_llm._utils.mpi_rank", return_value=1):
+            with patch("tensorrt_llm.distributed.mpi.mpi_rank", return_value=1):
                 usage_lib.report_usage()
             thread_cls.assert_not_called()
 
@@ -497,7 +497,7 @@ class TestRankGuard:
             "tensorrt_llm.usage.usage_lib.threading.Thread",
             return_value=mock_thread,
         ) as thread_cls:
-            with patch("tensorrt_llm._utils.mpi_rank", return_value=0):
+            with patch("tensorrt_llm.distributed.mpi.mpi_rank", return_value=0):
                 usage_lib.report_usage()
             thread_cls.assert_called_once()
             mock_thread.start.assert_called_once()
@@ -613,7 +613,7 @@ class TestConcurrentReporterStart:
                 "threading",
                 wraps=threading,
             ) as mock_threading_mod,
-            patch("tensorrt_llm._utils.mpi_rank", return_value=0),
+            patch("tensorrt_llm.distributed.mpi.mpi_rank", return_value=0),
         ):
             mock_threading_mod.Thread = MagicMock(side_effect=counting_thread)
             mock_threading_mod.Lock = threading.Lock

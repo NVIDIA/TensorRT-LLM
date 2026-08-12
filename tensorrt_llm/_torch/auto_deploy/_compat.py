@@ -45,7 +45,7 @@ import torch
 # A stub tensorrt_llm package (used in CI standalone tests) won't have this,
 # so the probe correctly returns False in that environment.
 try:
-    from tensorrt_llm import mapping as _  # noqa: F401
+    from tensorrt_llm.distributed import mapping as _  # noqa: F401
 
     TRTLLM_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):

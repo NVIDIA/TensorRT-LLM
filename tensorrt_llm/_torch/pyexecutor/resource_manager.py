@@ -48,8 +48,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
+from ...distributed.mapping import CpType, Mapping
 from ...logger import logger
-from ...mapping import CpType, Mapping
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,

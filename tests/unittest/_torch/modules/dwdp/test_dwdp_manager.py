@@ -34,8 +34,8 @@ from tensorrt_llm._torch.pyexecutor.dwdp import (
     get_global_dwdp_manager,
     set_global_dwdp_manager,
 )
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
-from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 

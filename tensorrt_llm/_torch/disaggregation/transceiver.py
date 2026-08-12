@@ -56,8 +56,8 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
-from tensorrt_llm.mapping import Mapping
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):

@@ -17,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _compute_deterministic_mamba_seed,
     _mamba_rank_offset,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 def test_deterministic_seed_is_pure_function():

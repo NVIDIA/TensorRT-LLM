@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_mixtral import (MixtralAttention,
                                                          MixtralForCausalLM)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 MIXTRAL_8X7B_CONFIG = {

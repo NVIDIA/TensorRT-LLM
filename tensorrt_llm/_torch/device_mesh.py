@@ -9,7 +9,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
-    from tensorrt_llm.mapping import MappingBase as _MappingBaseForTypeCheck
+    from tensorrt_llm.distributed.mapping import \
+        MappingBase as _MappingBaseForTypeCheck
 else:
     _MappingBaseForTypeCheck = object
 

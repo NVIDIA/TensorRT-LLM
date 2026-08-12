@@ -20,7 +20,7 @@ from tensorrt_llm._torch.models.modeling_qwen import (
 from _torch.helpers import create_mock_cuda_graph_runner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from utils.llm_data import llm_models_root

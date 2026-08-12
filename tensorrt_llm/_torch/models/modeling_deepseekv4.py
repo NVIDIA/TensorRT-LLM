@@ -46,8 +46,8 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 

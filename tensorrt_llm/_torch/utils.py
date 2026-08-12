@@ -14,7 +14,7 @@ from torch.nn import functional as F
 
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_sm_version, torch_dtype_to_str)
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 

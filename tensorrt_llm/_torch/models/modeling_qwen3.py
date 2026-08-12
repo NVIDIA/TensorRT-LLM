@@ -5,8 +5,8 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams

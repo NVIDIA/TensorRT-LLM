@@ -9,7 +9,7 @@ from tensorrt_llm._torch import virtual_memory
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 @pytest.fixture(scope="function", autouse=True)

@@ -26,7 +26,7 @@ from tensorrt_llm._torch.speculative.interface import (SpecMetadata,
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 LLAMA_3_1_8B_CONFIG = {

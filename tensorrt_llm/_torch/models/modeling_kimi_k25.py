@@ -49,8 +49,8 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
-from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
 from ...inputs import (

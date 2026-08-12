@@ -30,8 +30,8 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata

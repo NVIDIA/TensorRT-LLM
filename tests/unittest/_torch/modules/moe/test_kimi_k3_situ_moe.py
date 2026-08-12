@@ -50,7 +50,7 @@ from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
 from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import get_free_port
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 situ_supported = pytest.mark.skipif(
     not is_native_situ_supported(),

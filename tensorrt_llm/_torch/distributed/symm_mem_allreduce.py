@@ -14,8 +14,8 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as torch_symm_mem
 from torch import nn
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 
 class SymmetricMemoryAllReduce(nn.Module):

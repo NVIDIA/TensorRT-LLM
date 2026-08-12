@@ -37,8 +37,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType, LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
 
 # Small geometry so each sequence spans several blocks and the two batches get
 # visibly different physical block indices.

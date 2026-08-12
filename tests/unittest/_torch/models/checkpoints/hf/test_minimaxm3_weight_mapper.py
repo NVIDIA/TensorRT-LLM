@@ -31,7 +31,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3VLForConditionalGeneration,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 _NUM_KV_HEADS = 4

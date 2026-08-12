@@ -29,10 +29,10 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from tensorrt_llm import mapping
 from tensorrt_llm._torch import distributed
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm.bindings import BuildInfo
+from tensorrt_llm.distributed import mapping
 
 pytestmark = pytest.mark.cpu_only
 

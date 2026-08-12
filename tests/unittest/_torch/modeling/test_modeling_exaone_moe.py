@@ -14,7 +14,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.exaone_moe_weight_mapper import E
 from tensorrt_llm._torch.models.modeling_exaone_moe import ExaoneMoeForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from utils.util import getSMVersion  # isort: skip

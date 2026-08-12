@@ -20,8 +20,8 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl, SingleProcessGroup
 from tensorrt_llm._torch.distributed.communicator import Distributed, TorchDist
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 # Legacy mesh: single CP dimension (ring or unused placeholder size 1).
 _DEVICE_MESH_DIM_ORDER_LEGACY = "cfg-tp-cp-ulysses"

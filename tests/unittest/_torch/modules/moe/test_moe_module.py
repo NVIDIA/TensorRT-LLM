@@ -110,8 +110,8 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     WInt4AFP8FusedMoEMethod,
 )
 from tensorrt_llm._utils import get_sm_version, mpi_rank
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 G_LOGGER = logging.getLogger(__name__)

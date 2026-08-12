@@ -22,7 +22,7 @@ import triton
 
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._utils import get_sm_version, nvtx_range
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig

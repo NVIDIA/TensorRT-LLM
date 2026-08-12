@@ -43,11 +43,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.distributed.mapping import CpType, Mapping
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor)
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
-from tensorrt_llm.mapping import CpType, Mapping
 
 
 @dataclass

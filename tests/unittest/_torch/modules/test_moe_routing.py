@@ -21,7 +21,7 @@ from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
 from tensorrt_llm._torch.modules.fused_moe.routing import \
     get_cached_perfect_router_logits
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 def verify_load_balanced_logits(

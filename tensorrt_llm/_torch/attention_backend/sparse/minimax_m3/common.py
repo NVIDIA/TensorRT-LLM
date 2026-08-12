@@ -18,7 +18,7 @@ import torch
 from ..params import SparseMetadataParams, SparseParams
 
 if TYPE_CHECKING:
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
 # Sentinel scores that force init and local blocks into the top-k regardless
 # of their computed score. Init outranks local.

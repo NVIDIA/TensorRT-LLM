@@ -12,7 +12,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import Cohere2ForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 # Using a dummy configuration due to the large size of public models.
 # Key parameter differences from 'CohereLabs/c4ai-command-a-03-2025':

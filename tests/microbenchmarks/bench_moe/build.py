@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, ensure_cute_dsl_importable_for_benchmark

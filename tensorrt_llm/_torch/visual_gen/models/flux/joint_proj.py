@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 class FluxJointAttnMLPProj(nn.Module):

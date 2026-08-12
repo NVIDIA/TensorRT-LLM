@@ -28,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.mapping import CpType
+from tensorrt_llm.distributed.mapping import CpType
 
 pytestmark = pytest.mark.cpu_only
 

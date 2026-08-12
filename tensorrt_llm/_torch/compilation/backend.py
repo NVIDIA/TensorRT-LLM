@@ -28,7 +28,7 @@ from torch.fx import GraphModule
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .patterns import MATCHER_SUBSYSTEM

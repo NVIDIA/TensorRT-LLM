@@ -238,6 +238,7 @@ def load_internal_apis():
         LlmRequestType,
     )
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.distributed.mapping import Mapping
     from tensorrt_llm.llmapi.llm_args import (
         CacheTransceiverConfig,
         KvCacheConfig,
@@ -248,7 +249,6 @@ def load_internal_apis():
         _resolve_kv_cache_manager_v2_auto,
         _resolve_transceiver_runtime_auto,
     )
-    from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.sampling_params import SamplingParams
 
     _INTERNAL_APIS = types.SimpleNamespace(

@@ -48,8 +48,8 @@ from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm.distributed.mapping import CpType, Mapping
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.mapping import CpType, Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 cloudpickle.register_pickle_by_value(helix_utils)

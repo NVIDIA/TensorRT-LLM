@@ -17,8 +17,8 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, PageIndexMode
 
 from .params import DSAParams

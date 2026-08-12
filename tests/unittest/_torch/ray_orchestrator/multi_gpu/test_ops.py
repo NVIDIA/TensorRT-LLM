@@ -11,8 +11,8 @@ except ModuleNotFoundError:
     from tensorrt_llm.executor.ray import stub as ray
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
-from tensorrt_llm.mapping import Mapping
 
 
 @ray.remote(num_gpus=1)

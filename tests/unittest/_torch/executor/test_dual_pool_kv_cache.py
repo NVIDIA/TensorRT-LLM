@@ -32,8 +32,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
-from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 

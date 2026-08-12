@@ -5,8 +5,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.resource_manager import BaseResourceManager

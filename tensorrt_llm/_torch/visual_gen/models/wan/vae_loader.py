@@ -22,8 +22,8 @@ from diffusers import AutoencoderKLWan
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from .wan_vae import WanVAE, WanVAEConfig
 

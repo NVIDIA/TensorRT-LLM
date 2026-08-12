@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_mllama import \
     MllamaForConditionalGeneration
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 LLAMA_3_2_11B_VISION_CONFIG = {
     'architectures': ['MllamaForConditionalGeneration'],

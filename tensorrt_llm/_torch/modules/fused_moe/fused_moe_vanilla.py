@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 import torch
 from torch import nn
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp4_utils
 
 from ...distributed import allgather, reducescatter

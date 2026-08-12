@@ -31,7 +31,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])

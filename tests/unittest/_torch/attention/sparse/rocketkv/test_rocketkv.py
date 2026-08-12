@@ -20,8 +20,8 @@ from tensorrt_llm._torch.attention_backend.sparse.rocket import (
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, RocketSparseAttentionConfig
-from tensorrt_llm.mapping import Mapping
 
 
 @pytest.mark.skipif(getSMVersion() < 100, reason="RocketKV requires SM100 (Blackwell)")

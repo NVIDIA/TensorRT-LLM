@@ -8,8 +8,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
                                  FlashInferAttentionMetadata,

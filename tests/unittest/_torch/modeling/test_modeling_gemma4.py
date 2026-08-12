@@ -46,7 +46,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextScaledWordEmbedding,
 )
 from tensorrt_llm._utils import is_sm_100f
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2

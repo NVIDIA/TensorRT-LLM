@@ -65,13 +65,13 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig as BindingKvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
     DeepSeekV4SparseAttentionConfig,
     KvCacheConfig,
 )
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
 
 

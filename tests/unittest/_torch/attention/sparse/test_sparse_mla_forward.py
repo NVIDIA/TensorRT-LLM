@@ -44,11 +44,11 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           KvCacheConfig)
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 

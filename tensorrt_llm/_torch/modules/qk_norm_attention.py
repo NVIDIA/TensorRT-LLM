@@ -19,8 +19,8 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import RotaryScalingType
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig

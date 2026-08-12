@@ -25,6 +25,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
+from tensorrt_llm.distributed.mapping import CpType, Mapping
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
@@ -44,7 +45,6 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
-from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)

@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import get_free_port
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 class TestMapping(unittest.TestCase):

@@ -24,7 +24,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PredefinedAttentionMask

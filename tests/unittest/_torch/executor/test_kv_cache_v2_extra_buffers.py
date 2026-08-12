@@ -19,8 +19,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 
 DataType = tensorrt_llm.bindings.DataType

@@ -294,6 +294,12 @@
     "D212": 2,
     "D415": 5
   },
+  "tensorrt_llm/distributed/mapping.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 4
+  },
   "tensorrt_llm/evaluate/lm_eval.py": {
     "D200": 1,
     "D205": 1,
@@ -462,12 +468,6 @@
     "D212": 5,
     "D300": 7,
     "E722": 1
-  },
-  "tensorrt_llm/mapping.py": {
-    "D205": 1,
-    "D212": 1,
-    "D300": 1,
-    "D415": 4
   },
   "tensorrt_llm/models/convert_utils.py": {
     "D200": 2,

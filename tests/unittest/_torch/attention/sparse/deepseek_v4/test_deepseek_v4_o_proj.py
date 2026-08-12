@@ -32,9 +32,9 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 

@@ -15,9 +15,9 @@ import transformers
 from transformers.models.pixtral import modeling_pixtral as hf_modeling_pixtral
 
 import tensorrt_llm
-from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_pixtral
+from tensorrt_llm.distributed import mapping as mapping_lib
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])

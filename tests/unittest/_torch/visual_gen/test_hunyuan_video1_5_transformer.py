@@ -22,8 +22,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen import DiffusionModelConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi import QuantConfig
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen import AttentionConfig
 
 CONFIG = {

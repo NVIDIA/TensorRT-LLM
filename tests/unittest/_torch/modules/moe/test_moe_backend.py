@@ -79,7 +79,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 logger = logging.getLogger(__name__)

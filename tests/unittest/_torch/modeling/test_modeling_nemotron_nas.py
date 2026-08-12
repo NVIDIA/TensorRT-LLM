@@ -18,7 +18,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nas import \
     NemotronNASForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 # Setup NEED_SETUP_CACHE_CLASSES_MAPPING to an empty dict for modeling_nemotron_nas.py
 transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING = dict()

@@ -18,7 +18,7 @@ from tensorrt_llm._utils import get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from .params import RocketKVParams
 

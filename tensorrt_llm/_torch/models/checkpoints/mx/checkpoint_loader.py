@@ -47,8 +47,8 @@ from tensorrt_llm._torch.weight_sharing import (
     SourceIdentity,
     check_weight_sharing_compatibility,
 )
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 # Defensive default for the upstream `MX_SOURCE_QUERY_TIMEOUT` env var.
 # The upstream `MxLiveWeightLoader` polls the MX server every 5 s for up

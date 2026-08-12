@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from torch import nn
 
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
 # Bump when the fingerprint projection changes in a way that makes previously
 # stored identities incomparable. Two identities with different format versions

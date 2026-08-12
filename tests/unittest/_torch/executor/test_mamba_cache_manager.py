@@ -54,6 +54,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
@@ -66,7 +67,6 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_kv_cache_manager_v2_auto,
     _resolve_transceiver_runtime_auto,
 )
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,

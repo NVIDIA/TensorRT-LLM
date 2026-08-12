@@ -23,7 +23,7 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 

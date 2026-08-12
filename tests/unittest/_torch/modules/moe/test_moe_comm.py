@@ -78,7 +78,7 @@ from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installe
 from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import is_nccl_ep_installed
 from tensorrt_llm.deep_ep.buffer import Buffer
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(

@@ -108,7 +108,7 @@ BASE_EXAMPLE_CLASSES = {
     ["CachedModelLoader._node_build_task", "LlmBuildStats"],
     "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
     "tensorrt_llm.lora_manager": ["LoraConfig"],
-    "tensorrt_llm.mapping": ["Mapping"],
+    "tensorrt_llm.distributed.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
     ["QuantConfig", "SpeculativeDecodingMode"],
     "tensorrt_llm.sampling_params":

@@ -20,8 +20,8 @@ from torch import nn
 
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.modules.linear import Linear  # for Linear._calc_shard
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.mapping import Mapping
 
 
 class RMSNormTPAware(nn.Module):

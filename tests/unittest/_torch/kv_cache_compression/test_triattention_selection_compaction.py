@@ -401,8 +401,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     import tensorrt_llm
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.distributed.mapping import Mapping
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-    from tensorrt_llm.mapping import Mapping
 
     device = torch.device("cuda", torch.cuda.current_device())
     request_id = 7

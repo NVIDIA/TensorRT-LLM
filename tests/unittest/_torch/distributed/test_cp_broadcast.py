@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.distributed import MPIDist
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 

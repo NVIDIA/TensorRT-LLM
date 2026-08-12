@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._utils import mpi_comm
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 try:
     from tensorrt_llm.deep_ep import Buffer

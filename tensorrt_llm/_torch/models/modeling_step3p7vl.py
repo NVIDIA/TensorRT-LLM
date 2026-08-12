@@ -33,8 +33,8 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range, prefer_pinned
 from ...inputs import (
