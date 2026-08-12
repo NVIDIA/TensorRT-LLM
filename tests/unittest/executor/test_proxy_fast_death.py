@@ -27,6 +27,7 @@ from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
 
 
 def test_engine_dead_error_is_importable_and_carries_root_cause():
@@ -115,6 +116,80 @@ def test_register_worker_processes_with_session_reuse_factory(monkeypatch):
     proxy._register_worker_processes((proxy.READY_SIGNAL, None, identities))
 
     proxy._worker_process_monitor.register.assert_called_once_with(identities)
+
+
+class _FakeWorkerInitStatusQueue:
+    """Worker status queue that returns a fixed message sequence."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.acks = []
+
+    def poll(self, timeout):
+        return bool(self._messages)
+
+    def get(self):
+        return self._messages.pop(0)
+
+    def put(self, message):
+        self.acks.append(message)
+
+
+class _DeadAfterRegistrationMonitor:
+    """Report a worker death only after the proxy registers identities."""
+
+    def __init__(self):
+        self.identities = []
+
+    def register(self, identities):
+        self.identities = identities
+
+    def find_dead_worker(self):
+        return self.identities[0] if self.identities else None
+
+
+def test_worker_death_before_ready_is_reported_from_registered_identity():
+    """A pre-READY worker death must not depend on its MPI future finishing."""
+    identity = WorkerProcessIdentity(
+        rank=3, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    identity_status = (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, [identity])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([identity_status])
+    proxy._worker_process_monitor = _DeadAfterRegistrationMonitor()
+    proxy.mpi_futures = [_Future()]  # Deliberately remains pending.
+    proxy._fatal_error = None
+    proxy.doing_shutdown = False
+    proxy.pre_shutdown = _Mock()
+    proxy._handle_background_error = _Mock()
+
+    with pytest.raises(RuntimeError, match=r"rank 3 \(pid 12345\) exited unexpectedly"):
+        proxy._wait_for_executor_workers_ready()
+
+    assert not proxy.mpi_futures[0].done()
+    assert proxy.worker_init_status_queue.acks == ["ACK"]
+    proxy.pre_shutdown.assert_called_once_with()
+
+
+def test_worker_identities_are_registered_once_before_ready():
+    identity = WorkerProcessIdentity(
+        rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    identity_status = (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, [identity])
+    ready_status = (GenerationExecutorProxy.READY_SIGNAL, None, [identity])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([identity_status, ready_status])
+    proxy._worker_process_monitor = _Mock()
+    proxy.mpi_futures = [_Future()]
+    proxy._handle_background_error = _Mock()
+
+    assert proxy._wait_for_executor_workers_ready() == ready_status
+    proxy._worker_process_monitor.register.assert_called_once_with([identity])
+    assert proxy.worker_init_status_queue.acks == ["ACK", "ACK"]
 
 
 def test_result_step_raises_on_engine_dead():
