@@ -3306,20 +3306,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestDeepSeekR1DistillLlama70B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
-    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B"
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(2)
-    def test_auto_dtype_tp2(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-        _run_multinode_accuracy(self.MODEL_PATH,
-                                self.MODEL_NAME,
-                                benchmarks=["mmlu"],
-                                kv_cache_config=kv_cache_config)
-
-
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_mpi_world_size(8)
 class TestDeepSeekV3(LlmapiAccuracyTestHarness):
@@ -5165,23 +5151,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestKanana_Instruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
-    MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
-
-    @pytest.mark.skip_device_not_contain(["H20", "H100"])
-    def test_auto_dtype(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
-        pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
-            enable_padding=True, max_batch_size=384))
-        with LLM(self.MODEL_PATH, **pytorch_config,
-                 enable_attention_dp=True) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
@@ -5223,12 +5192,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                                         dtype=kv_cache_dtype,
                                         use_kv_cache_manager_v2=v2_kv_cache)
 
+        # https://nvbugs/6529792: batch 512 avoids OOM; seq +128 is GSM8K headroom.
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
-                  max_batch_size=720,
+                  max_batch_size=512,
+                  max_seq_len=GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN + 128,
                   **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
 

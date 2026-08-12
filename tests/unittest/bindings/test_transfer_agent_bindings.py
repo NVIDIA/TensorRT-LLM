@@ -293,6 +293,8 @@ def test_base_agent_config_default():
     config = tab.BaseAgentConfig()
     # Default values should be set
     assert config is not None
+    assert config.rank is None
+    assert config.world_size is None
 
 
 @pytest.mark.cpu_only
@@ -304,6 +306,8 @@ def test_base_agent_config_custom():
     use_listen_thread = True
     enable_telemetry = True
     backend_params = {"key1": "value1", "key2": "value2"}
+    rank = 2
+    world_size = 4
 
     config = tab.BaseAgentConfig(
         name=name,
@@ -312,6 +316,8 @@ def test_base_agent_config_custom():
         use_listen_thread=use_listen_thread,
         enable_telemetry=enable_telemetry,
         backend_params=backend_params,
+        rank=rank,
+        world_size=world_size,
     )
 
     assert config.name == name
@@ -320,6 +326,8 @@ def test_base_agent_config_custom():
     assert config.use_listen_thread == use_listen_thread
     assert config.enable_telemetry == enable_telemetry
     assert config.backend_params == backend_params
+    assert config.rank == rank
+    assert config.world_size == world_size
 
 
 @pytest.mark.cpu_only
@@ -344,6 +352,12 @@ def test_base_agent_config_readwrite():
 
     config.backend_params = {"test_key": "test_value"}
     assert config.backend_params == {"test_key": "test_value"}
+
+    config.rank = 1
+    assert config.rank == 1
+
+    config.world_size = 2
+    assert config.world_size == 2
 
 
 @pytest.mark.cpu_only

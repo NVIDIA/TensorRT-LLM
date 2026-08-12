@@ -67,6 +67,11 @@ class MoEImplBase(nn.Module, abc.ABC):
         self, x: "torch.Tensor | Fp4QuantizedTensor", **kwargs: object
     ) -> "tuple[torch.Tensor, torch.Tensor | None] | dict": ...
 
+    # Narrower than ``MoE.run_moe``, which also takes a keyword-only
+    # ``workspace``. Not a drift: the scheduler only hands out scratch because
+    # no impl allocates its own yet, and this signature is the state after
+    # ``get_workspaces`` below takes over. Impls moving onto this base
+    # (TRTLLM-14958, TRTLLM-14960..14969) drop the parameter as they arrive.
     @abc.abstractmethod
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
 

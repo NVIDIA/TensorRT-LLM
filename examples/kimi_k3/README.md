@@ -113,6 +113,21 @@ approximately:
 The expected average accuracy is approximately 96.47. Small differences are
 possible with different checkpoint or dependency revisions.
 
+To evaluate with suffix-automaton (SA) speculative decoding, add `--sa`:
+
+```bash
+sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh \
+    --sa
+```
+
+This selects `eval_extra_llm_options_sa.yaml` (see Current limitations
+below for what SA changes) and logs a speculative-decoding acceptance
+summary at the end of the run. SA is lossless, so the scores should match
+the non-SA run within noise. Speedup is workload-dependent, proportional
+to the n-gram repetition in the generated output.
+
 For serving performance, use the standard sweep under
 `examples/kimi_k3/perf_sweep/` (this supersedes the older
 `run_serving_benchmark_kimi_k3.sbatch` single-recipe benchmark). It submits
@@ -208,4 +223,4 @@ default cache manager.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
-- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). Combining speculation with disaggregated serving is not yet supported.
+- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Combining speculation with disaggregated serving is not yet supported.

@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
@@ -72,6 +72,9 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
+
+if TYPE_CHECKING:
+    import transformers
 
 GB = 1 << 30
 
@@ -2556,6 +2559,16 @@ def _create_kv_cache_manager(
     # via cache_layer_idx — shared layers use target layer's index for
     # get_buffers(). No layer_offsets remapping needed here.
 
+    # Propagate the finalized chunked-prefill flag so KVCacheManager.fit_token_budget
+    # only shrinks context chunks when the attention backend can consume a
+    # partial context chunk. The flag is read from attn_runtime_features, which
+    # py_executor_creator finalizes (including the SM-version /
+    # attention-backend overrides) before build_managers runs.
+    if isinstance(kv_cache_manager,
+                  KVCacheManager) and model_engine is not None:
+        kv_cache_manager.enable_chunked_prefill = bool(
+            model_engine.attn_runtime_features.chunked_prefill)
+
     return kv_cache_manager
 
 
@@ -2588,6 +2601,7 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
 ) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2609,6 +2623,7 @@ def create_kv_cache_compression_manager(
             config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=pretrained_config,
         )
 
     logger.warning(
@@ -2881,6 +2896,7 @@ def create_py_executor_instance(
             kv_cache_compression_config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (

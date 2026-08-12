@@ -3626,11 +3626,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
     )
-    model_path: str = Field(
-        min_length=1,
-        description="Checkpoint path used to derive RoPE tables when converting "
-        "the official calibration and to classify kernel-masked sliding-attention "
-        "layers.")
     calibration_path: str = Field(
         min_length=1,
         description="Path to the official TriAttention calibration `.pt` "
@@ -4595,8 +4590,9 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="The parser to separate reasoning content from output.",
         status="prototype",
-        telemetry=TelemetryField.categorical('auto', 'deepseek-r1', 'laguna',
-                                             'qwen3', 'qwen3_5', 'minimax_m2',
+        telemetry=TelemetryField.categorical('auto', 'deepseek-r1',
+                                             'poolside_v1', 'laguna', 'qwen3',
+                                             'qwen3_5', 'minimax_m2',
                                              'minimax_m2_append_think',
                                              'nano-v3', 'gemma4', 'kimi_k2',
                                              'kimi_k25'))

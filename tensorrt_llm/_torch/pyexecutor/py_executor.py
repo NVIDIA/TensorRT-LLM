@@ -4581,6 +4581,7 @@ class PyExecutor:
             if mgr.is_request_active(req.py_request_id):
                 mgr.suspend_request(req)
                 paused.append(req)
+        paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
 
         try:
             mgr.impl.adjust()
@@ -4589,6 +4590,66 @@ class PyExecutor:
 
         for req in paused:
             mgr.resume_request(req)
+        self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+
+    def _suspend_padding_dummies_for_rebalance(
+            self, mgr: KVCacheManagerV2) -> List[Tuple[int, LlmRequest]]:
+        """Suspend the CUDA-graph padding dummies before ``adjust()``.
+
+        ``CUDAGraphRunner`` retains one padding dummy per captured draft
+        length, whose KV cache stays ACTIVE across iterations but never
+        appears in ``active_requests`` -- so the suspend loop above never
+        reaches them and ``adjust()`` fails its all-caches-suspended
+        precondition, terminating the executor event loop.
+
+        Suspending is what the precondition actually asks for: it tears
+        down the cache's base-page-index buffers and releases its page
+        locks, which is exactly what makes the pages safe to migrate.  The
+        dummies are deliberately *not* freed -- they are pre-allocated at
+        warmup because re-allocating one from a loaded KV cache can fail
+        and silently drop padded batches to eager mode for the rest of the
+        process lifetime.
+
+        Returns the ``(draft_len, dummy)`` pairs that were suspended.
+        """
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is None:
+            return []
+        suspended: List[Tuple[int, LlmRequest]] = []
+        for draft_len, dummy in runner.padding_dummy_requests.items():
+            if mgr.is_request_active(dummy.py_request_id):
+                mgr.suspend_request(dummy)
+                suspended.append((draft_len, dummy))
+        return suspended
+
+    def _resume_padding_dummies_after_rebalance(
+            self, mgr: KVCacheManagerV2,
+            suspended: List[Tuple[int, LlmRequest]]) -> None:
+        """Resume the padding dummies suspended for ``adjust()``.
+
+        A real request that fails to resume is left suspended for the
+        scheduler to reactivate, but nothing reschedules a padding dummy,
+        and ``_get_or_create_padding_dummy`` returns a cached dummy without
+        checking that its cache is live.  A dummy left suspended would
+        therefore be padded into a batch with a torn-down block table, so
+        one that cannot be resumed is released and dropped from the runner
+        instead, falling back to lazy re-creation on a later padded step.
+
+        The release goes through ``CUDAGraphRunner.release_padding_dummy`` so
+        that every manager the dummy was registered with is covered, not just
+        the main KV cache manager.
+        """
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is None:
+            return
+        for draft_len, dummy in suspended:
+            if mgr.resume_request(dummy):
+                continue
+            logger.warning(
+                "Could not resume the CUDA graph padding dummy request "
+                f"(draft_len={draft_len}) after a KV pool rebalance; "
+                "releasing it and falling back to lazy re-creation.")
+            runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
     def control_action(self,
@@ -5091,11 +5152,57 @@ class PyExecutor:
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
+            # Requests must run at exactly max_beam_width.
+            #
+            # TorchSampler can sample a narrower request (buffers are allocated
+            # at max_beam_width and it slices to the per-request width), but the
+            # layers around it are not ready: the attention metadata is stamped
+            # with max_beam_width while the generation rows are laid out at the
+            # per-request width, and the scheduler is not beam-width aware, so a
+            # narrower request can be batched with a wider one and fail at
+            # forward time. Keep rejecting until those agree; TRTLLM-14792.
             if sampling_config.beam_width != self.max_beam_width:
                 raise ValueError(
                     f"Request beam width {sampling_config.beam_width} "
-                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-                )
+                    f"is not equal to max_beam_width {self.max_beam_width}. "
+                    "This is not supported!")
+
+            # Variable-Beam-Width-Search is only defined for a non-decreasing
+            # array. The documented semantics (see getBeamWidthByIter in
+            # llmRequest.h) only cover widening, ending at the full width, and
+            # both samplers rely on that: the per-step ops write the leading
+            # beam_width_out rows while finalize reads py_beam_width (the
+            # array maximum) of them, so a narrowing array leaves the trailing
+            # rows holding ancestry from an earlier, wider step. The C++
+            # finalize path has the same gap -- it indexes with nBeamWidth
+            # only. Reject rather than emit silently stale beams; narrowing
+            # can be allowed once its semantics are defined (TRTLLM-14792).
+            beam_width_array = sampling_config.beam_width_array
+            if beam_width_array:
+                if isinstance(beam_width_array[0], (list, tuple)):
+                    beam_width_array = beam_width_array[0]
+                if any(b < a
+                       for a, b in zip(beam_width_array, beam_width_array[1:])):
+                    raise ValueError(
+                        f"beam_width_array {list(beam_width_array)} decreases; "
+                        "only non-decreasing arrays are supported for "
+                        "Variable-Beam-Width-Search.")
+
+            # length_penalty is an exponent on the generated length, and the
+            # ranking assumes it only ever shrinks the magnitude of a negative
+            # cum_log_prob. A negative exponent inverts that: dividing by
+            # length**negative multiplies instead, so longer beams score
+            # higher and the beam order is reversed.
+            length_penalty = sampling_config.length_penalty
+            if length_penalty is not None:
+                if isinstance(length_penalty, (list, tuple)):
+                    invalid = [p for p in length_penalty if p < 0]
+                else:
+                    invalid = [length_penalty] if length_penalty < 0 else []
+                if invalid:
+                    raise ValueError(
+                        f"length_penalty {invalid} is negative; only "
+                        "non-negative values are supported.")
 
         # Check token ID ranges
         self._validate_token_id_range(request)
@@ -6495,6 +6602,16 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
+            # Reporting this mini-batch to the KV connector used to happen
+            # inside KVCacheManager.prepare_resources; it now runs after the
+            # token-budget trim, which this path does not go through. Kept here
+            # so the connector's per-request state advances exactly as before.
+            kv_cache_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
+                kv_cache_manager.publish_connector_scheduler_output(
+                    disagg_gen_init_to_prepare)
+
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
@@ -6562,7 +6679,16 @@ class PyExecutor:
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
-        """Update beam sampler state with context-side first-token data."""
+        """Update beam sampler state with context-side first-token data.
+
+        Seeds this side's beam state from the handoff: the per-beam token, its
+        cumulative log-prob, and an identity cache indirection. A beam whose
+        token is the end id finished during prefill and is latched for harvest
+        so the first CBA step pools it here -- the context server's own pool is
+        not transferred (TRTLLM-14792), which is why its end id is masked for
+        the CBA op so such a token stays in the beam slot and survives the
+        handoff.
+        """
         if beam_width <= 1:
             return True
 
@@ -6637,6 +6763,31 @@ class PyExecutor:
                               device=cum_log_probs.device,
                               dtype=cum_log_probs.dtype)
         cum_log_probs[seq_slot, :beam_width].copy_(values)
+
+        # The handoff carries one token already produced upstream, seeded above
+        # at index prompt_len. No generated-length counter needs seeding to
+        # match: length_penalty normalizes by seq_lens - prompt_lens, which
+        # counts that token because it occupies the first generated slot.
+
+        # A beam whose handed-off token is the end id finished during prefill.
+        # The context server keeps such a token in its beam slot rather than
+        # pooling it (its end id is masked for the CBA op, see
+        # _group_requests_with_metadata), precisely so it survives the handoff
+        # and can be pooled here instead. Raise the harvest latch and the first
+        # CBA step folds the path into this side's pool and frees the slot --
+        # the same route stop words take.
+        end_id = req.py_end_id
+        if end_id is not None and end_id >= 0:
+            finished_beams = [
+                beam_idx for beam_idx in range(beam_width)
+                if first_gen_tokens[beam_idx] == end_id
+            ]
+            if finished_beams:
+                pending_harvest = beam_search_store.pending_harvest
+                pending_harvest[seq_slot,
+                                torch.tensor(finished_beams,
+                                             device=pending_harvest.device,
+                                             dtype=torch.long)] = True
         return True
 
     @staticmethod
@@ -7087,6 +7238,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
+    @torch.inference_mode()
     def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)
@@ -7681,30 +7833,47 @@ class PyExecutor:
         Only requests that sample new tokens should be added to the inflight set since their next iteration depends
         on these new tokens, so they should be skipped in the scheduler until the new tokens are generated.
         This includes context requests that finish context phase and generation requests.
+
+        The inserted ids are recorded on ``scheduled_requests`` so the paired
+        ``_remove_inflight_ids`` erases exactly what was added, rather than
+        re-deriving the set from a batch that has changed in between. An id left
+        behind is not recoverable: the scheduler skips inflight ids, so the
+        request is never scheduled again while still holding its KV blocks and
+        sequence slot.
+
+        This is load-bearing, not defensive. In this loop the next step is
+        ``resource_manager.prepare_resources``, which runs
+        ``ResourceManager.maybe_fit_token_budget`` at its end -- and that can
+        shrink a context request out of ``context_requests_last_chunk``. By
+        removal time the batch no longer agrees with what was inserted here.
         """
+        added: List[int] = []
         for req in scheduled_requests.context_requests_last_chunk:
             logger.debug(
                 f"Context request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
         for req in scheduled_requests.generation_requests:
             logger.debug(
                 f"Generation request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
+        scheduled_requests.added_inflight_req_ids = added
 
     def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
-        """Remove request IDs of current sampling requests from self.inflight_req_ids."""
-        for req in scheduled_requests.context_requests_last_chunk:
+        """Remove the request IDs this batch added to self.inflight_req_ids.
+
+        Erases the ids recorded by ``_add_inflight_ids`` rather than re-deriving
+        them from the batch, which may have been trimmed since (see there).
+        """
+        for req_id in scheduled_requests.added_inflight_req_ids:
             logger.debug(
-                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
+                f"Request with ID {req_id} removed from DECODER model inflight set"
             )
-            self.inflight_req_ids.erase(req.request_id)
-        for req in scheduled_requests.generation_requests:
-            logger.debug(
-                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
-            )
-            self.inflight_req_ids.erase(req.request_id)
+            self.inflight_req_ids.erase(req_id)
+        scheduled_requests.added_inflight_req_ids = []
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
