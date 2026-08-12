@@ -3369,14 +3369,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
         // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
         // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
-        // Redis is a native sidecar. A one-shot init container waits for Redis because
-        // the CI cluster rejects probe fields on restartable init containers.
-        serviceInitContainerConfig = """
-                initContainers:
+        // Use regular containers because the Jenkins Kubernetes launcher does not
+        // reliably attach to pods containing restartable init-container sidecars.
+        // The server waits for Redis, and the E2E preflight waits for port 8001.
+        serviceContainerConfig = """
                   - name: redis
                     image: ${MODEL_EXPRESS_REDIS_IMAGE}
                     args: ["--save", "", "--appendonly", "no"]
-                    restartPolicy: Always
                     ports:
                     - containerPort: 6379
                     resources:
@@ -3389,37 +3388,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         memory: 4Gi
                         ephemeral-storage: 2Gi
                     imagePullPolicy: Always
-                  - name: wait-for-redis
-                    image: ${MODEL_EXPRESS_REDIS_IMAGE}
-                    command: ["/bin/sh", "-c"]
-                    args:
-                    - |
-                      attempt=0
-                      until redis-cli -h 127.0.0.1 ping | grep -q PONG; do
-                        attempt=\$((attempt + 1))
-                        if [ "\$attempt" -ge 30 ]; then
-                          exit 1
-                        fi
-                        sleep 1
-                      done
-                    resources:
-                      requests:
-                        cpu: 100m
-                        memory: 64Mi
-                        ephemeral-storage: 1Gi
-                      limits:
-                        cpu: 100m
-                        memory: 64Mi
-                        ephemeral-storage: 1Gi
-                    imagePullPolicy: Always
-        """
-        // The E2E preflight waits for port 8001. A readiness probe here would keep
-        // Jenkins from attaching and hide startup errors behind a pod timeout.
-        serviceContainerConfig = """
                   - name: model-express-server
                     image: ${MODEL_EXPRESS_SERVER_IMAGE}
-                    command: ["/app/modelexpress-server"]
-                    args: ["--port", "8001"]
+                    command: ["/bin/bash", "-c"]
+                    args:
+                    - |
+                      until (echo > /dev/tcp/127.0.0.1/6379) >/dev/null 2>&1; do
+                        sleep 1
+                      done
+                      exec /app/modelexpress-server --port 8001
                     env:
                     - name: MX_METADATA_BACKEND
                       value: "redis"
@@ -3427,11 +3404,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                       value: "redis://127.0.0.1:6379"
                     ports:
                     - containerPort: 8001
-                    livenessProbe:
-                      tcpSocket:
-                        port: 8001
-                      initialDelaySeconds: 10
-                      periodSeconds: 10
                     resources:
                       requests:
                         cpu: '4'
