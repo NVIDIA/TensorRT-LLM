@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import ctypes
 import os
-import subprocess
+import subprocess  # nosec B404
 from typing import Dict, List, Optional
 
 from tensorrt_llm.logger import logger
