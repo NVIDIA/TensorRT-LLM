@@ -1,0 +1,302 @@
+{
+  "token_counts": [
+    96,
+    128,
+    192,
+    256,
+    320,
+    384,
+    640,
+    768
+  ],
+  "step_time_ms": [
+    5.332674,
+    7.125582,
+    19.072141,
+    22.564258,
+    30.341472,
+    32.343115,
+    54.299678,
+    61.859097
+  ],
+  "fixed_overhead_ms": 39.296781,
+  "batch_sizes": [
+    32,
+    64,
+    128
+  ],
+  "batch_overhead_ms": [
+    0.0,
+    3.221512,
+    9.122014
+  ],
+  "_meta": {
+    "lookup": "interp",
+    "encoding": "decomposed",
+    "note": "step_time_ms is theta(M) only -- the trimmable term. The non-trimmable floor is fixed_overhead_ms + batch_overhead_ms[bs]. Do not read step_time_ms as whole-step time.",
+    "token_unit": "total_verify_tokens = num_requests * (verify_len + 1); the bonus token is included",
+    "cells": [
+      {
+        "batch_size": 32,
+        "verify_len": 2,
+        "total_verify_tokens": 96,
+        "step_time_ms": 44.629455,
+        "num_samples": 114,
+        "p10_ms": 42.656446,
+        "p90_ms": 45.921993
+      },
+      {
+        "batch_size": 32,
+        "verify_len": 3,
+        "total_verify_tokens": 128,
+        "step_time_ms": 46.422362,
+        "num_samples": 252,
+        "p10_ms": 44.540524,
+        "p90_ms": 48.05913
+      },
+      {
+        "batch_size": 32,
+        "verify_len": 5,
+        "total_verify_tokens": 192,
+        "step_time_ms": 58.368921,
+        "num_samples": 71,
+        "p10_ms": 56.812048,
+        "p90_ms": 60.264587
+      },
+      {
+        "batch_size": 64,
+        "verify_len": 2,
+        "total_verify_tokens": 192,
+        "step_time_ms": 61.590433,
+        "num_samples": 87,
+        "p10_ms": 60.002756,
+        "p90_ms": 63.626337
+      },
+      {
+        "batch_size": 64,
+        "verify_len": 3,
+        "total_verify_tokens": 256,
+        "step_time_ms": 65.08255,
+        "num_samples": 77,
+        "p10_ms": 63.558149,
+        "p90_ms": 67.810392
+      },
+      {
+        "batch_size": 64,
+        "verify_len": 4,
+        "total_verify_tokens": 320,
+        "step_time_ms": 72.859764,
+        "num_samples": 54,
+        "p10_ms": 71.078515,
+        "p90_ms": 74.275923
+      },
+      {
+        "batch_size": 64,
+        "verify_len": 5,
+        "total_verify_tokens": 384,
+        "step_time_ms": 74.861407,
+        "num_samples": 70,
+        "p10_ms": 72.710967,
+        "p90_ms": 76.689982
+      },
+      {
+        "batch_size": 128,
+        "verify_len": 2,
+        "total_verify_tokens": 384,
+        "step_time_ms": 80.761909,
+        "num_samples": 81,
+        "p10_ms": 78.371763,
+        "p90_ms": 82.598686
+      },
+      {
+        "batch_size": 128,
+        "verify_len": 3,
+        "total_verify_tokens": 512,
+        "step_time_ms": 90.330839,
+        "num_samples": 47,
+        "p10_ms": 87.460041,
+        "p90_ms": 92.462635
+      },
+      {
+        "batch_size": 128,
+        "verify_len": 4,
+        "total_verify_tokens": 640,
+        "step_time_ms": 102.718472,
+        "num_samples": 46,
+        "p10_ms": 99.931121,
+        "p90_ms": 105.115652
+      },
+      {
+        "batch_size": 128,
+        "verify_len": 5,
+        "total_verify_tokens": 768,
+        "step_time_ms": 110.277891,
+        "num_samples": 53,
+        "p10_ms": 108.377361,
+        "p90_ms": 113.493729
+      }
+    ],
+    "fit": {
+      "max_abs_residual_ms": 0.0,
+      "max_rel_residual": 0.0,
+      "additive_tolerance": 0.02,
+      "riser_tolerance": 0.01,
+      "min_riser_ms": 0.728598,
+      "typical_step_ms": 72.859764,
+      "warnings": []
+    },
+    "block_size": 5,
+    "min_verify_len": 1,
+    "modal_batch_size": 128,
+    "warmup_steps_discarded": 128,
+    "statistic": "median",
+    "source": "iter_log",
+    "logs": [
+      "/lustre/fsw/coreai_comparch_trtllm/laliao/dspark-runs/protbl_744692_filtered.log",
+      "/lustre/fsw/coreai_comparch_trtllm/laliao/dspark-runs/protbl_744693_filtered.log"
+    ],
+    "recommended_confidence_verify_len_tiers": [
+      1,
+      3,
+      5
+    ],
+    "recommended_tiers_note": "Nothing reads this from the table file. Copy it into DSparkDecodingConfig.confidence_verify_len_tiers, which is also what sizes the captured CUDA graph set.",
+    "diagnostics": {
+      "step_time_spread_by_batch_size": {
+        "32": 0.307856,
+        "64": 0.507969,
+        "128": 0.553581
+      },
+      "best_step_time_spread": 0.553581,
+      "profitability_probe": [
+        {
+          "batch_size": 32,
+          "acceptance_rate": 0.3,
+          "chosen_verify_len": 3,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 32,
+          "acceptance_rate": 0.5,
+          "chosen_verify_len": 3,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 32,
+          "acceptance_rate": 0.7,
+          "chosen_verify_len": 3,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 32,
+          "acceptance_rate": 0.8,
+          "chosen_verify_len": 3,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 32,
+          "acceptance_rate": 0.9,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 32,
+          "acceptance_rate": 0.95,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 64,
+          "acceptance_rate": 0.3,
+          "chosen_verify_len": 1,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 64,
+          "acceptance_rate": 0.5,
+          "chosen_verify_len": 1,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 64,
+          "acceptance_rate": 0.7,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 64,
+          "acceptance_rate": 0.8,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 64,
+          "acceptance_rate": 0.9,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 64,
+          "acceptance_rate": 0.95,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 128,
+          "acceptance_rate": 0.3,
+          "chosen_verify_len": 1,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 128,
+          "acceptance_rate": 0.5,
+          "chosen_verify_len": 1,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 128,
+          "acceptance_rate": 0.7,
+          "chosen_verify_len": 3,
+          "max_tier": 5,
+          "trims": true
+        },
+        {
+          "batch_size": 128,
+          "acceptance_rate": 0.8,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 128,
+          "acceptance_rate": 0.9,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        },
+        {
+          "batch_size": 128,
+          "acceptance_rate": 0.95,
+          "chosen_verify_len": 5,
+          "max_tier": 5,
+          "trims": false
+        }
+      ],
+      "trims_somewhere": true
+    }
+  }
+}

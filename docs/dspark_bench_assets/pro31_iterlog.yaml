@@ -1,0 +1,21 @@
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 5
+  speculative_model: /lustre/fsw/coreai_comparch_trtllm/laliao/llm-models/DeepSeek-V4-Pro-DSpark
+  enable_confidence_scheduling: false
+moe_config:
+  backend: TRTLLM
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.5
+enable_attention_dp: true
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 8
+  - 32
+  - 64
+  - 128
+disable_overlap_scheduler: false
+print_iter_log: true
