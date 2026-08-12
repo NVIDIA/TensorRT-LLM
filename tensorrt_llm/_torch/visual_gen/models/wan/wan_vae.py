@@ -633,7 +633,9 @@ def _fp4_conv_run(
     sf_ka = (Cp + _FP4_SF_VEC - 1) // _FP4_SF_VEC
     if sf_ka % 4 != 0:
         raise ValueError(f"FP4 Conv3d requires a four-aligned SFA K dimension, got {sf_ka}")
-    sfa = from_dlpack(x_sf.reshape(M, sf_ka, 1).view(torch.float8_e4m3fn), assumed_align=16)
+    sfa = from_dlpack(
+        x_sf.reshape(M, sf_ka, 1).view(torch.float8_e4m3fn), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=1)
     out = torch.empty((N, Z, P, Q, Op), dtype=torch.bfloat16, device=x.device)
     out_ct = from_dlpack(out, assumed_align=16).mark_layout_dynamic(leading_dim=4)
     if bias is not None:
@@ -663,20 +665,10 @@ def _fp4_conv_run(
         beta = 0.0
     alpha = from_dlpack(((1.0 / pq["global_scale"]) / gs).to(torch.float32), assumed_align=4)
     stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    cta_tile_k = min(256, Cp)
     key = (
         x.device.index,
-        Cp,
-        Op,
-        N,
-        D,
-        H,
-        Wd,
-        Z,
-        P,
-        Q,
-        tuple(stride),
-        tuple(pad),
-        tuple(dil),
+        cta_tile_k,
         mma,
         _FP4_CONV_PREFERRED_CLUSTER,
         _FP4_CONV_FALLBACK_CLUSTER,
@@ -703,6 +695,7 @@ def _fp4_conv_run(
             residual_ct,
             beta,
             _FP4_SF_VEC,
+            cta_tile_k,
             mma_tiler=mma,
             preferred_cluster_shape_mn=_FP4_CONV_PREFERRED_CLUSTER,
             fallback_cluster_shape_mn=_FP4_CONV_FALLBACK_CLUSTER,
