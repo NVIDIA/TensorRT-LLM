@@ -1793,10 +1793,13 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
         ["Use ", "<", "div> for a block element."],
         # A delta that ends on such a prefix after other text.
         ["The condition is a <", " b, so it holds."],
+        # Text that starts like a start token and then diverges from it.
+        ["Use <｜DSML｜function", "ality"],
     ],
 )
-def test_deepseek_streaming_preserves_withheld_text(sample_tools, parser_cls,
-                                                    deltas):
+def test_deepseek_streaming_preserves_withheld_text(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
     """Withholding a delta may delay text but must never drop it."""
     parser = parser_cls()
 

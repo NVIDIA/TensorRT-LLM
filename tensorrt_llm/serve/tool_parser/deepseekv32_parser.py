@@ -172,18 +172,24 @@ class DeepSeekV32Parser(BaseToolParser):
         # If we see these markers anywhere, we should keep buffering
         has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+        # Hold the buffer back only while its tail could still complete into one of
+        # the DSML delimiters. Testing whether a marker appears anywhere instead
+        # would keep the buffer forever once ordinary text diverges from a delimiter,
+        # for example "<｜DSML｜function" followed by "ality".
+        partial_tokens = [
+            self.bot_token,
+            "<｜DSML｜invoke",
+            self.eot_token,
+            self.invoke_end_token,
+            self._eos_token,
+        ]
+        ends_with_partial_token = any(
+            self._ends_with_partial_token(current_text, token) for token in partial_tokens
+        )
 
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
-
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
-            # The guards above withhold the whole buffer, so the buffer is what has
-            # to be emitted once they clear; returning only the latest delta would
+        if not has_tool_call and not ends_with_partial_token:
+            # The guard above withholds the whole buffer, so the buffer is what has
+            # to be emitted once it clears; returning only the latest delta would
             # drop everything withheld by an earlier increment.
             normal_text = current_text
             self._buffer = ""
