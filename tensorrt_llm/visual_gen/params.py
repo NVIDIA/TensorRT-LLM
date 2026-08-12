@@ -315,12 +315,13 @@ def validate_visual_gen_params(
     # already normalized to ``list[*Ref]`` by the field validators.
     if ref_slot_specs:
         for field in ("image_reference", "video_reference", "audio_reference"):
-            refs = getattr(params, field, None)
-            if not refs:
-                continue
+            refs = getattr(params, field, None) or []
             spec = ref_slot_specs.get(field)
             if spec is None:
-                messages.append(f"'{field}' is not accepted by the loaded pipeline.")
+                # An undeclared slot is only an error if the client actually
+                # sent one; an absent undeclared slot is fine.
+                if refs:
+                    messages.append(f"'{field}' is not accepted by the loaded pipeline.")
                 continue
             role_specs = list(spec.roles)
             allowed = {rs.role for rs in role_specs}
@@ -342,6 +343,9 @@ def validate_visual_gen_params(
                     )
                     continue
                 counts[role] = counts.get(role, 0) + 1
+            # Arity runs even for an absent slot: a role with ``min >= 1`` is a
+            # required reference, enforced here as a clean 400 instead of a deep
+            # worker crash. ``min == 0`` leaves the slot optional.
             for rs in role_specs:
                 n = counts.get(rs.role, 0)
                 if n < rs.min or (rs.max is not None and n > rs.max):

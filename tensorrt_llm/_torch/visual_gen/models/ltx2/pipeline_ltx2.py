@@ -1384,7 +1384,8 @@ class LTX2Pipeline(BasePipeline):
         return {
             "image_reference": RefSlotSpec(
                 modality="image",
-                roles=[RoleSpec(role="first_frame", min=1, max=1)],
+                # Optional first-frame conditioning (min=0); LTX-2 also runs T2V.
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
             ),
         }
 

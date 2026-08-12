@@ -430,7 +430,7 @@ class WanPipeline(BasePipeline):
         return {
             "image_reference": RefSlotSpec(
                 modality="image",
-                roles=[RoleSpec(role="first_frame", min=1, max=1)],
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
             )
         }
 

@@ -372,11 +372,12 @@ class Flux2Pipeline(BasePipeline):
 
     @property
     def ref_slot_specs(self):
-        # Reference image(s): single "reference" role, count 1..N (multi-subject).
+        # Optional reference image(s): "reference" role, count 0..N (multi-subject);
+        # FLUX.2 also runs plain text-to-image with none.
         return {
             "image_reference": RefSlotSpec(
                 modality="image",
-                roles=[RoleSpec(role="reference", min=1, max=None)],
+                roles=[RoleSpec(role="reference", min=0, max=None)],
             )
         }
 

@@ -606,13 +606,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     @property
     def ref_slot_specs(self):
         return {
+            # image (I2V) and video (V2V) are both optional; Cosmos3 also runs
+            # T2V with neither.
             "image_reference": RefSlotSpec(
                 modality="image",
-                roles=[RoleSpec(role="first_frame", min=1, max=1)],
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
             ),
             "video_reference": RefSlotSpec(
                 modality="video",
-                roles=[RoleSpec(role="reference", min=1, max=1)],
+                roles=[RoleSpec(role="reference", min=0, max=1)],
             ),
         }
 

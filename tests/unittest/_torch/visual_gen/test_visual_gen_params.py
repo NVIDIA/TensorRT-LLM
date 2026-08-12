@@ -948,6 +948,42 @@ class TestRequestValidation:
         req = self._make_request(image_reference="/path/to/img.png")
         self._merge_and_validate(executor, req)
 
+    def test_ref_slot_required_vs_optional(self):
+        """``min >= 1`` marks a required reference (clean error when absent);
+        ``min == 0`` leaves the slot optional; an undeclared absent slot is
+        fine, but an unsolicited one is rejected."""
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        required = {
+            "image_reference": RefSlotSpec(
+                modality="image", roles=[RoleSpec(role="reference", min=1, max=1)]
+            )
+        }
+        optional = {
+            "image_reference": RefSlotSpec(
+                modality="image", roles=[RoleSpec(role="first_frame", min=0, max=1)]
+            )
+        }
+
+        def run(params, spec):
+            validate_visual_gen_params(
+                params, declared_defaults=None, extra_param_specs={}, ref_slot_specs=spec
+            )
+
+        # Required slot, no image -> clean 400 here instead of a worker crash.
+        with pytest.raises(ValueError, match=r"expected 1\.\.1, got 0"):
+            run(VisualGenParams(), required)
+        # Optional slot, no image -> allowed (e.g. text-to-video).
+        run(VisualGenParams(), optional)
+        # Required slot with the image present -> allowed.
+        run(VisualGenParams(image_reference="a.png"), required)
+        # Undeclared slot left absent -> no spurious "not accepted".
+        run(VisualGenParams(), optional)
+        # Undeclared slot actually sent -> rejected.
+        with pytest.raises(ValueError, match=r"video_reference.*not accepted"):
+            run(VisualGenParams(video_reference="v.mp4"), optional)
+
     def test_none_fields_not_flagged(self):
         """Fields left as None should never trigger unsupported-field errors."""
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
