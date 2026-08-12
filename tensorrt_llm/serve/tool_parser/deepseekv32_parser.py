@@ -65,6 +65,10 @@ class DeepSeekV32Parser(BaseToolParser):
 
     _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
+    # Shortest prefix of an invoke header that ordinary text cannot reproduce by
+    # accident; everything after it is the arbitrary function name.
+    _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
@@ -167,10 +171,11 @@ class DeepSeekV32Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+        # An invoke header counts as a tool call once its opening quote is in, since
+        # the function name that follows is arbitrary text. Matching the bare
+        # "<｜DSML｜invoke" prefix instead would also match ordinary text that merely
+        # starts like the token, such as "<｜DSML｜invokeality".
+        has_tool_call = self.bot_token in current_text or self._INVOKE_HEADER_PREFIX in current_text
 
         # Hold the buffer back only while its tail could still complete into one of
         # the DSML delimiters. Testing whether a marker appears anywhere instead
@@ -178,7 +183,7 @@ class DeepSeekV32Parser(BaseToolParser):
         # for example "<｜DSML｜function" followed by "ality".
         partial_tokens = [
             self.bot_token,
-            "<｜DSML｜invoke",
+            self._INVOKE_HEADER_PREFIX,
             self.eot_token,
             self.invoke_end_token,
             self._eos_token,

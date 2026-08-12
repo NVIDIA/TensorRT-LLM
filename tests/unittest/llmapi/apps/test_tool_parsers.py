@@ -1793,8 +1793,9 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
         ["Use ", "<", "div> for a block element."],
         # A delta that ends on such a prefix after other text.
         ["The condition is a <", " b, so it holds."],
-        # Text that starts like a start token and then diverges from it.
-        ["Use <｜DSML｜function", "ality"],
+        # Text that starts like a start token and then diverges from it, for
+        # both of the tokens the V3.2 and V4 parsers look for.
+        ["Use <｜DSML｜function", "ality and <｜DSML｜invoke", "ality"],
     ],
 )
 def test_deepseek_streaming_preserves_withheld_text(
