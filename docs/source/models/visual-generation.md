@@ -119,6 +119,61 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 
 `response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
+### Reference Inputs
+
+Conditioning references are supplied through the typed, per-modality fields `image_reference`, `video_reference`, and `audio_reference`. These fields share the **same names and shapes** across the Python API (`VisualGenParams`) and the serve request (`VideoGenerationRequest`), and each accepts a path, raw bytes, a single reference, or a list. Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`; a request is validated against that declaration before generation begins, so a missing required reference, an excess reference, or an unsupported role is rejected at the boundary. When served, references are carried on the video endpoints and are materialized (base64, `data:` URI, or uploaded file) to a local path before reaching the worker.
+
+Most models take a single reference whose role is unambiguous, so no `role` is specified:
+
+```python
+from tensorrt_llm import VisualGen
+
+# The image conditions the generated video's first frame.
+vg = VisualGen(model="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+params = vg.default_params
+params.image_reference = "start.png"
+output = vg.generate(inputs="the scene comes alive with gentle motion", params=params)
+
+# Cosmos conditions generation on a reference video.
+vg = VisualGen(model="nvidia/Cosmos3-Super")
+params = vg.default_params
+params.video_reference = "clip.mp4"
+```
+
+The equivalent serve request uploads the file, or sends a base64 string or `data:` URI in a JSON body:
+
+```bash
+curl http://localhost:8000/v1/videos -F "prompt=the scene comes alive" -F "image_reference=@start.png"
+curl http://localhost:8000/v1/videos -F "prompt=continue the scene" -F "video_reference=@clip.mp4"
+```
+
+When a model accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame — the `role` is required to disambiguate:
+
+```python
+from tensorrt_llm import VisualGen, ImageRef  # VideoRef and AudioRef are also exported
+
+vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
+params = vg.default_params
+params.image_reference = [
+    ImageRef(image="start.png", role="first_frame"),
+    ImageRef(image="end.png", role="last_frame"),  # optional
+]
+```
+
+A JSON serve request carries the role and lists; a multipart upload is limited to a single file with no role:
+
+```bash
+curl http://localhost:8000/v1/videos -H 'content-type: application/json' -d '{
+  "prompt": "the subject comes alive",
+  "image_reference": [
+    {"image": "<base64>", "role": "first_frame"},
+    {"image": "<base64>", "role": "last_frame"}
+  ]
+}'
+```
+
+FLUX.2 and Qwen-Image-Edit accept multiple reference images as a list on the same `image_reference` field through the Python API.
+
 ## Optimizations
 
 ### Quantization
