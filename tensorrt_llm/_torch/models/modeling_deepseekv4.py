@@ -2548,6 +2548,19 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         """Prefer KV cache manager V2 for DeepSeek-V4."""
         return "V2"
 
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        DeepSeek-V4 runs DeepseekV4CacheManager, a KVCacheManagerV2
+        subclass that the C++ transceiver cannot drive; the disaggregated
+        tests pin NIXL + PYTHON for the same reason. This routes the
+        fully-'auto' path to that combination.
+        """
+        return "PYTHON"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)
         self.mapping_with_cp = None

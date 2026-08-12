@@ -718,6 +718,8 @@ class TestKvCacheManagerV2AutoResolution:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
             "Gemma3ForCausalLM",
             "Gemma3ForConditionalGeneration",
             "Gemma4ForCausalLM",
@@ -728,6 +730,55 @@ class TestKvCacheManagerV2AutoResolution:
             model_cls = get_registered_model_class(architecture)
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+    def test_registered_models_keep_v2_on_nixl(self):
+        """Models preferring V2 and the Python transceiver keep V2 on NIXL.
+
+        Both sentinels start at 'auto'; production resolves the transceiver
+        runtime first, then the KV cache manager. Models absent from this
+        list: MiniMax-M2 silently resolves to V1 on this route (its
+        disaggregated serving is unvalidated -- the missing preference is
+        deliberate); GLM 5.2 prefers the C++ transceiver for now.
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "GptOssForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "DeepseekV4ForCausalLM",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None, architecture
+
+            llm_args = TorchLlmArgs(
+                model="/tmp/dummy_model",
+                cache_transceiver_config=CacheTransceiverConfig(
+                    backend="NIXL", transceiver_runtime="auto"),
+            )
+            _resolve_transceiver_runtime_auto(llm_args, model_cls)
+            assert _resolve_kv_cache_manager_v2_auto(
+                llm_args, model_cls) is True, architecture
+            assert (llm_args.cache_transceiver_config.transceiver_runtime ==
+                    "PYTHON"), architecture
 
 
 @pytest.mark.cpu_only

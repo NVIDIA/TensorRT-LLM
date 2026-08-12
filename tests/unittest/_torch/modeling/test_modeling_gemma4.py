@@ -26,7 +26,6 @@ from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-import pytest
 import torch
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
 
@@ -46,16 +45,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
-from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
-from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._utils import is_sm_100f
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, TorchLlmArgs
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmapiKvCacheConfig
-from tensorrt_llm.llmapi.llm_utils import (
-    _resolve_kv_cache_manager_v2_auto,
-    _resolve_transceiver_runtime_auto,
-    apply_model_defaults_to_llm_args,
-)
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -4071,45 +4061,6 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
             "the caller no longer loops per-image, so the metadata must allow "
             "cross-image batching.",
         )
-
-
-@pytest.mark.parametrize(
-    ("architecture", "model_cls"),
-    [
-        ("Gemma4ForCausalLM", Gemma4ForCausalLM),
-        ("Gemma4ForConditionalGeneration", Gemma4ForConditionalGeneration),
-    ],
-)
-def test_gemma4_preference_resolves_to_v2(architecture: str, model_cls: type) -> None:
-    """The checkpoint's architectures[0] must map to the class carrying the
-    V2 preference, and the preference must survive the production resolution
-    ordering (defaults merge, transceiver, then KV-cache manager) on the NIXL
-    disaggregated route — the route where a missing transceiver preference
-    silently downgrades V2 back to V1."""
-    assert get_registered_model_class(architecture) is model_cls
-
-    llm_args = TorchLlmArgs(
-        model="/tmp/dummy_model",
-        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL", transceiver_runtime="auto"),
-    )
-    defaults = model_cls.get_model_defaults(llm_args)
-    apply_model_defaults_to_llm_args(llm_args, defaults)
-    _resolve_transceiver_runtime_auto(llm_args, model_cls)
-    assert _resolve_kv_cache_manager_v2_auto(llm_args, model_cls) is True
-
-    assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
-    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
-    assert llm_args.attn_backend == "FLASHINFER"
-
-
-@pytest.mark.parametrize("user_setting", [False, True])
-@pytest.mark.parametrize("model_cls", [Gemma4ForCausalLM, Gemma4ForConditionalGeneration])
-def test_gemma4_explicit_setting_wins(model_cls: type, user_setting: bool) -> None:
-    llm_args = TorchLlmArgs(
-        model="/tmp/dummy_model",
-        kv_cache_config=LlmapiKvCacheConfig(use_kv_cache_manager_v2=user_setting),
-    )
-    assert _resolve_kv_cache_manager_v2_auto(llm_args, model_cls) is user_setting
 
 
 if __name__ == "__main__":

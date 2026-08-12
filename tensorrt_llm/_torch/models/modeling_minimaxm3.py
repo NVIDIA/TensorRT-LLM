@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -2003,6 +2003,27 @@ def _fold_gemma_boundary_norm_weights(weights):
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax-M3.
+
+        Sparse attention already routes M3 to a V2-core manager
+        unconditionally; declaring the preference keeps
+        ``kv_cache_config.use_kv_cache_manager_v2`` consistent with the
+        manager actually in use.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config: Any = None) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        M3 runs a V2-core cache manager, which the C++ transceiver cannot
+        drive; the KV-transfer unit test exercises the Python transceiver
+        directly. This routes the fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config
