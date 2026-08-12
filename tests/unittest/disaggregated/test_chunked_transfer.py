@@ -779,6 +779,66 @@ def test_pipelined_transfer_allows_generation_only_request():
     executor.sampler.validate_request.assert_called_once_with(request)
 
 
+def test_send_kv_cache_early_only_sends_reused_prefixes():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+    executor.kv_cache_manager.tokens_per_block = 32
+
+    def make_request(
+        rid, *, is_first_chunk, prepopulated, cancelled=False, last_chunk=(None, None)
+    ):
+        return SimpleNamespace(
+            py_request_id=rid,
+            is_context_only_request=True,
+            is_finished_due_to_cancellation=cancelled,
+            is_first_context_chunk=is_first_chunk,
+            prepopulated_prompt_len=prepopulated,
+            py_last_context_chunk=last_chunk,
+            py_kv_prefix_sent=False,
+        )
+
+    completed = make_request(1, is_first_chunk=False, prepopulated=0, last_chunk=(0, 64))
+    first_chunk = make_request(2, is_first_chunk=True, prepopulated=0)
+    reused_prefix = make_request(3, is_first_chunk=True, prepopulated=128)
+    cancelled = make_request(4, is_first_chunk=True, prepopulated=128, cancelled=True)
+
+    result = PyExecutor._send_kv_cache_early(
+        executor, [completed, first_chunk, reused_prefix, cancelled]
+    )
+
+    executor._send_kv_async.assert_called_once_with([reused_prefix])
+    assert reused_prefix.py_last_context_chunk == (0, 128)
+    assert reused_prefix.py_kv_prefix_sent
+    assert not first_chunk.py_kv_prefix_sent
+    assert not cancelled.py_kv_prefix_sent
+    assert result is None
+
+    # A partial-block or full-prefix hit reports an unaligned prepopulated
+    # length; only whole blocks may be shipped ahead of the forward.
+    executor._send_kv_async.reset_mock()
+    unaligned = make_request(5, is_first_chunk=True, prepopulated=3894)
+    below_one_block = make_request(6, is_first_chunk=True, prepopulated=31)
+
+    PyExecutor._send_kv_cache_early(executor, [unaligned, below_one_block])
+
+    executor._send_kv_async.assert_called_once_with([unaligned])
+    assert unaligned.py_last_context_chunk == (0, 3872)
+    assert below_one_block.py_last_context_chunk == (None, None)
+    assert not below_one_block.py_kv_prefix_sent
+
+
+def test_send_kv_cache_early_requires_pipelined_transfer():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = False
+
+    assert PyExecutor._send_kv_cache_early(executor, []) is None
+    executor._send_kv_async.assert_not_called()
+
+
 def test_pipelined_last_chunk_sends_and_finalizes():
     """respond_and_send_async sends the built chunk and finalizes on the last chunk."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -952,6 +1012,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         py_beam_width=1,
         py_kv_send_session_retired=False,
         prepopulated_prompt_len=0,
+        py_kv_prefix_sent=False,
         is_generation_only_request=lambda: False,
         set_kv_cache_transfer_start=lambda _ts: None,
         state=LlmRequestState.CONTEXT_INIT,
@@ -1001,6 +1062,7 @@ def _build_prefill_chunk_tokens_for(
     resident_blocks=None,
     sliding_window_size=_REUSE_TOTAL_BLOCKS * _REUSE_TPB,
     source_block_ids=None,
+    prefix_sent=False,
 ):
     """Drive the real _build_prefill_chunk for one chunk, in token coordinates.
 
@@ -1013,6 +1075,8 @@ def _build_prefill_chunk_tokens_for(
     out, so a full-attention group carries max_attention_window. V2 spells the
     same thing as None. Passing a window shorter than the prompt makes the group
     genuinely windowed.
+    ``prefix_sent`` models the executor having already shipped the reused prefix
+    early.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -1039,6 +1103,7 @@ def _build_prefill_chunk_tokens_for(
     req.py_beam_width = 1
     req.prompt_len = _REUSE_TOTAL_BLOCKS * _REUSE_TPB
     req.prepopulated_prompt_len = prepopulated_tokens
+    req.py_kv_prefix_sent = prefix_sent
     req.py_last_context_chunk = (chunk_start_pos, chunk_end_pos)
     req.context_remaining_length = req.prompt_len - chunk_end_pos
 
@@ -1050,6 +1115,7 @@ def _build_prefill_chunk_for(
     chunk_start_block,
     chunk_end_block,
     resident_blocks=None,
+    prefix_sent=False,
 ):
     """Drive the real _build_prefill_chunk for one block-aligned chunk."""
     return _build_prefill_chunk_tokens_for(
@@ -1057,6 +1123,7 @@ def _build_prefill_chunk_for(
         chunk_start_pos=chunk_start_block * _REUSE_TPB,
         chunk_end_pos=chunk_end_block * _REUSE_TPB,
         resident_blocks=chunk_end_block if resident_blocks is None else resident_blocks,
+        prefix_sent=prefix_sent,
     )
 
 
@@ -1189,6 +1256,20 @@ def test_first_chunk_covers_ctx_prefix_reuse():
     assert kv_slice.token_range == _reuse_token_range(0, 6)
     assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(6, dtype=np.int64))
     assert kv_slice.is_last_slice is False
+
+
+def test_first_chunk_skips_prefix_already_sent_early():
+    """An early prefix send owns blocks [0, 3), so slice 0 starts at its own block."""
+    kv_slice = _build_prefill_chunk_for(
+        prepopulated_blocks=3,
+        chunk_start_block=3,
+        chunk_end_block=6,
+        resident_blocks=6,
+        prefix_sent=True,
+    )
+
+    assert kv_slice.token_range == _reuse_token_range(3, 6)
+    assert np.array_equal(kv_slice.block_ids_per_layer_groups[0], np.arange(3, 6, dtype=np.int64))
 
 
 @pytest.mark.parametrize(

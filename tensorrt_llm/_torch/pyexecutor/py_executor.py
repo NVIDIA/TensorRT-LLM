@@ -4415,6 +4415,8 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
+                    self._send_kv_cache_early(scheduled_batch.context_requests)
+
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
@@ -5221,6 +5223,7 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
+                    self._send_kv_cache_early(scheduled_batch.context_requests)
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -7639,6 +7642,45 @@ class PyExecutor:
         self._check_disagg_gen_cache_transfer_status(0)
 
         return
+
+    @nvtx_range("_send_kv_cache_early")
+    def _send_kv_cache_early(self,
+                             scheduled_requests: List[LlmRequest]) -> None:
+        """Send reused prefix blocks before the first context forward."""
+        if (self.kv_cache_transceiver is None
+                or not self.kv_cache_transceiver.pipeline_transfer_enabled):
+            return
+
+        tokens_per_block = self.kv_cache_manager.tokens_per_block
+        requests = []
+        for req in scheduled_requests:
+            if (not req.is_context_only_request
+                    or req.is_finished_due_to_cancellation):
+                continue
+
+            if (not req.is_first_context_chunk
+                    or req.prepopulated_prompt_len <= 0):
+                continue
+
+            # prepopulated_prompt_len is not block-aligned in general: partial
+            # block reuse matches mid-block, and a full prefix hit reports
+            # prompt_len - 1 because at least one token must be recomputed.
+            # Round down so only fully populated blocks go out early; the block
+            # straddling the boundary is still being written by this forward and
+            # is covered by the first chunk, whose start floors to the same
+            # block.
+            prefix_end = (req.prepopulated_prompt_len // tokens_per_block *
+                          tokens_per_block)
+            if prefix_end == 0:
+                continue
+            req.py_last_context_chunk = (0, prefix_end)
+            req.py_kv_prefix_sent = True
+            requests.append(req)
+
+        if not requests:
+            return
+
+        self._send_kv_async(requests)
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
