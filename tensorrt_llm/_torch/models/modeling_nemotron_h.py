@@ -912,8 +912,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
-            has_external_mtp = (model_config.spec_config.speculative_model
-                                is not None)
+            has_external_mtp = (
+                model_config.spec_config.loads_mtp_from_separate_checkpoint)
             assert ckpt_nextn > 0 or has_external_mtp, (
                 "There are not MTP modules in the checkpoint. "
                 "Set speculative_config.speculative_model to a separate MTP "

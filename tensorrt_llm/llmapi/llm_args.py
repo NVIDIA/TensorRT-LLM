@@ -1732,7 +1732,8 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory. "
-        "For MTP, when set, loads MTP heads from this checkpoint instead of any embedded mtp.* weights in the target."
+        "For MTP, when set to a checkpoint other than the target model, loads MTP heads from it instead of any "
+        "embedded mtp.* weights in the target; pointing it at the target model keeps the embedded heads."
     )
 
     max_concurrency: Optional[PositiveInt] = Field(
@@ -1812,6 +1813,9 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # If set, the draft model attends directly over the target model KV cache.
     _use_shared_kv_cache: bool = PrivateAttr(False)
+    # If set, speculative_model resolves to the target checkpoint, so one-model
+    # MTP loads its heads from the target weights instead of a separate file.
+    _mtp_heads_in_target_checkpoint: bool = PrivateAttr(False)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -1923,6 +1927,18 @@ class DecodingBaseConfig(StrictBaseModel):
         return True
 
     @property
+    def loads_mtp_from_separate_checkpoint(self) -> bool:
+        """Whether one-model MTP heads come from ``speculative_model``.
+
+        False when ``speculative_model`` resolves to the target checkpoint:
+        the heads are then loaded from the target weights, as they were
+        before separate MTP checkpoints were supported.
+        """
+        return (self.spec_dec_mode.is_mtp_one_model()
+                and self.speculative_model is not None
+                and not self._mtp_heads_in_target_checkpoint)
+
+    @property
     def needs_separate_draft_weights(self) -> bool:
         """Whether draft weights must be loaded from ``speculative_model``.
 
@@ -1932,8 +1948,7 @@ class DecodingBaseConfig(StrictBaseModel):
         if (self.spec_dec_mode.need_load_draft_weights()
                 or self._use_shared_kv_cache):
             return True
-        return (self.spec_dec_mode.is_mtp_one_model()
-                and self.speculative_model is not None)
+        return self.loads_mtp_from_separate_checkpoint
 
     @property
     def spec_dec_mode(self):

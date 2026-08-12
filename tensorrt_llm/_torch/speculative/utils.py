@@ -186,8 +186,45 @@ def loads_mtp_from_speculative_model(spec_config) -> bool:
     """True when one-model MTP should load heads from ``speculative_model``."""
     if spec_config is None:
         return False
-    return (spec_config.spec_dec_mode.is_mtp_one_model()
-            and spec_config.speculative_model is not None)
+    return spec_config.loads_mtp_from_separate_checkpoint
+
+
+def _refers_to_same_checkpoint(lhs, rhs) -> bool:
+    """True when two model references point at the same checkpoint."""
+    if lhs is None or rhs is None:
+        return False
+    if str(lhs) == str(rhs):
+        return True
+    try:
+        return os.path.samefile(str(lhs), str(rhs))
+    except OSError:
+        # At least one side is not an existing local directory (e.g. a Hub
+        # model id), so string equality above was the only comparison.
+        return False
+
+
+def resolve_mtp_checkpoint_source(spec_config, checkpoint_dir) -> None:
+    """Keep one-model MTP on the target checkpoint when both paths match.
+
+    Before separate MTP checkpoints were supported, ``speculative_model`` was
+    ignored for one-model MTP and the heads always came from the target
+    weights. Configs that point ``speculative_model`` at the target checkpoint
+    keep that behavior instead of switching to the separate-heads load path,
+    which the target checkpoint's key layout may not even satisfy.
+    """
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return
+    if spec_config.speculative_model is None:
+        return
+    if not _refers_to_same_checkpoint(spec_config.speculative_model,
+                                      checkpoint_dir):
+        return
+    if not spec_config._mtp_heads_in_target_checkpoint:
+        logger.info(
+            "speculative_model points at the target checkpoint "
+            f"({checkpoint_dir}); loading MTP heads from the target weights.")
+        spec_config._mtp_heads_in_target_checkpoint = True
 
 
 def _load_speculative_model_config_dict(spec_config) -> Optional[dict]:

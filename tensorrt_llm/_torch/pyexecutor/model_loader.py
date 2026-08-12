@@ -412,6 +412,11 @@ class ModelLoader:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
         if llm_args.speculative_config:
+            from tensorrt_llm._torch.speculative.utils import \
+                resolve_mtp_checkpoint_source
+
+            resolve_mtp_checkpoint_source(llm_args.speculative_config,
+                                          checkpoint_dir)
             config_kwargs['spec_config'] = llm_args.speculative_config
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
@@ -1359,6 +1364,12 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
+        from tensorrt_llm._torch.speculative.utils import (
+            loads_mtp_from_speculative_model, resolve_mtp_checkpoint_source,
+            update_spec_config_from_model_config)
+
+        resolve_mtp_checkpoint_source(self.spec_config, checkpoint_dir)
+
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
             trust_remote_code=self.llm_args.trust_remote_code,
@@ -1402,10 +1413,6 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
-
-        from tensorrt_llm._torch.speculative.utils import (
-            loads_mtp_from_speculative_model,
-            update_spec_config_from_model_config)
 
         if loads_mtp_from_speculative_model(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a

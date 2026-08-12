@@ -12,6 +12,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.nemotron_h_weight_mapper import (
 from tensorrt_llm._torch.speculative.utils import (
     filter_mtp_checkpoint_weights,
     loads_mtp_from_speculative_model,
+    resolve_mtp_checkpoint_source,
     select_mtp_checkpoint_weights,
     skip_modules_for_separate_mtp_checkpoint,
     update_spec_config_from_model_config,
@@ -41,6 +42,54 @@ def test_loads_mtp_from_speculative_model_helper():
     )
     assert loads_mtp_from_speculative_model(MTPDecodingConfig(max_draft_len=3)) is False
     assert loads_mtp_from_speculative_model(None) is False
+
+
+def test_speculative_model_equal_to_target_keeps_embedded_mtp(tmp_path):
+    """speculative_model == the target checkpoint is the pre-feature API usage."""
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+
+    cfg = MTPDecodingConfig(max_draft_len=3, speculative_model=str(target_dir))
+    assert loads_mtp_from_speculative_model(cfg) is True
+
+    resolve_mtp_checkpoint_source(cfg, str(target_dir))
+    assert loads_mtp_from_speculative_model(cfg) is False
+    assert cfg.needs_separate_draft_weights is False
+    # The user-provided value is left untouched.
+    assert cfg.speculative_model == str(target_dir)
+
+
+def test_speculative_model_equal_to_target_matches_equivalent_paths(tmp_path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    link_dir = tmp_path / "target_link"
+    link_dir.symlink_to(target_dir, target_is_directory=True)
+
+    cfg = MTPDecodingConfig(max_draft_len=3, speculative_model=str(link_dir))
+    resolve_mtp_checkpoint_source(cfg, str(target_dir) + "/")
+    assert loads_mtp_from_speculative_model(cfg) is False
+
+
+def test_separate_mtp_checkpoint_survives_resolution(tmp_path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    mtp_dir = tmp_path / "mtp_heads"
+    mtp_dir.mkdir()
+
+    cfg = MTPDecodingConfig(max_draft_len=3, speculative_model=str(mtp_dir))
+    resolve_mtp_checkpoint_source(cfg, str(target_dir))
+    assert loads_mtp_from_speculative_model(cfg) is True
+    assert cfg.needs_separate_draft_weights is True
+
+
+def test_resolution_does_not_affect_eagle3(tmp_path):
+    """Eagle3 always loads its draft from speculative_model, same dir or not."""
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+
+    cfg = Eagle3DecodingConfig(max_draft_len=3, speculative_model=str(target_dir))
+    resolve_mtp_checkpoint_source(cfg, str(target_dir))
+    assert cfg.needs_separate_draft_weights is True
 
 
 def test_filter_and_select_mtp_checkpoint_weights():
@@ -252,6 +301,21 @@ def test_embedded_mtp_target_load_is_unchanged(monkeypatch):
     assert captured["skip_modules"] == ["draft_model"]
     assert captured["allow_partial_loading"] is False
     # Embedded heads still load from the target checkpoint.
+    assert "mtp.layers.0.enorm.weight" in captured["weights"]
+
+
+def test_target_load_keeps_heads_when_speculative_model_is_target(monkeypatch, tmp_path):
+    captured = _capture_parent_load_weights(monkeypatch)
+
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=str(target_dir))
+    resolve_mtp_checkpoint_source(spec_config, str(target_dir))
+
+    model = _make_one_engine_stub(spec_config)
+    model.load_weights(weights={"mtp.layers.0.enorm.weight": torch.ones(4)})
+
+    assert captured["skip_modules"] == ["draft_model"]
     assert "mtp.layers.0.enorm.weight" in captured["weights"]
 
 
