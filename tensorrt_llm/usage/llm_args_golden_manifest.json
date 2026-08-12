@@ -207,10 +207,11 @@
     },
     {
       "allowed_values": [
+        "auto",
         "native",
         "rank_striped_read_ahead"
       ],
-      "annotation": "Literal['native', 'rank_striped_read_ahead']",
+      "annotation": "Literal['auto', 'native', 'rank_striped_read_ahead']",
       "converter": "",
       "kind": "categorical",
       "path": "checkpoint_io_policy"

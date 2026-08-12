@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.checkpoint_loader import MistralCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
@@ -34,27 +35,127 @@ def test_hf_subclasses_keep_polymorphic_load_weights(loader_cls):
     )
 
 
-def test_construct_checkpoint_loader_configures_only_builtin_hf():
-    striped = _construct_checkpoint_loader(
+@pytest.mark.parametrize("requested", ["auto", "rank_striped_read_ahead"])
+def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(requested):
+    loader = _construct_checkpoint_loader(
+        "pytorch",
+        None,
+        "HF",
+        checkpoint_io_policy=requested,
+    )
+
+    assert isinstance(loader.weight_loader, HfWeightLoader)
+    assert loader.weight_loader.checkpoint_io_policy == "rank_striped_read_ahead"
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == requested
+    assert status.selected == "rank_striped_read_ahead"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        ({"checkpoint_format": "MX"}, "checkpoint_format='HF'"),
+        ({"load_format": "dummy"}, "load_format='auto'"),
+        ({"partial_model_loading": True}, "partial model loading"),
+    ],
+)
+def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
+    monkeypatch, kwargs, reason
+):
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    options = dict(kwargs)
+    checkpoint_format = options.pop("checkpoint_format", "HF")
+
+    loader = _construct_checkpoint_loader(
+        "pytorch",
+        None,
+        checkpoint_format,
+        checkpoint_io_policy="rank_striped_read_ahead",
+        **options,
+    )
+
+    assert loader.weight_loader.checkpoint_io_policy == "native"
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == "rank_striped_read_ahead"
+    assert status.selected == "native"
+    assert reason in status.fallback_reason
+    warning.assert_called_once()
+    assert "selected=native" in warning.call_args.args[0]
+
+
+def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(monkeypatch):
+    provided_loader = HfCheckpointLoader(
+        weight_loader=HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+
+    loader = _construct_checkpoint_loader(
+        "pytorch",
+        provided_loader,
+        "HF",
+        checkpoint_io_policy="rank_striped_read_ahead",
+    )
+
+    assert loader is provided_loader
+    assert provided_loader.weight_loader.checkpoint_io_policy == "native"
+    status = provided_loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == "rank_striped_read_ahead"
+    assert status.selected == "native"
+    assert "explicit checkpoint loader" in status.fallback_reason
+    warning.assert_called_once()
+    assert "explicit checkpoint loader" in warning.call_args.args[0]
+
+    native_weights = {"native": object()}
+    native_load = MagicMock(return_value=native_weights)
+    active_communicator = MagicMock(side_effect=AssertionError("rank-striped setup must not run"))
+    monkeypatch.setattr(provided_loader.weight_loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(provided_loader.weight_loader, "_active_communicator", active_communicator)
+    with loader.open_weight_session("/checkpoint", mapping=Mapping()) as weights:
+        assert weights is native_weights
+    active_communicator.assert_not_called()
+
+
+def test_auto_selects_native_for_incompatible_config_without_warning(monkeypatch):
+    warning = MagicMock()
+    info = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    monkeypatch.setattr(model_loader_module.logger, "info", info)
+
+    loader = _construct_checkpoint_loader(
+        "pytorch",
+        None,
+        "MX",
+        checkpoint_io_policy="auto",
+    )
+
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == "auto"
+    assert status.selected == "native"
+    warning.assert_not_called()
+    assert any("selected=native" in call.args[0] for call in info.call_args_list)
+
+
+def test_static_native_selection_skips_rank_striped_setup(monkeypatch):
+    loader = _construct_checkpoint_loader(
         "pytorch",
         None,
         "HF",
         checkpoint_io_policy="rank_striped_read_ahead",
         partial_model_loading=True,
     )
-    mx = _construct_checkpoint_loader(
-        "pytorch",
-        None,
-        "MX",
-        checkpoint_io_policy="rank_striped_read_ahead",
-        partial_model_loading=True,
-    )
+    native_weights = {"native": object()}
+    native_load = MagicMock(return_value=native_weights)
+    active_communicator = MagicMock(side_effect=AssertionError("rank-striped setup must not run"))
+    monkeypatch.setattr(loader.weight_loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(loader.weight_loader, "_active_communicator", active_communicator)
 
-    assert isinstance(striped.weight_loader, HfWeightLoader)
-    assert striped.weight_loader.checkpoint_io_policy == "rank_striped_read_ahead"
-    assert striped.weight_loader._partial_model_loading
-    assert mx.checkpoint_format == "MX"
-    assert mx.weight_loader.checkpoint_io_policy == "native"
+    weights = loader.weight_loader.load_weights("/checkpoint", mapping=Mapping())
+
+    assert weights is native_weights
+    native_load.assert_called_once()
+    active_communicator.assert_not_called()
 
 
 def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(monkeypatch):
@@ -73,13 +174,42 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(monkeypat
         assert list(weights) == ["custom.weight"]
     loader.weight_loader.load_weights.assert_called_once_with("/checkpoint", mapping=mapping)
 
-    with pytest.raises(ValueError, match="built-in HfWeightLoader"):
-        _construct_checkpoint_loader(
-            "pytorch",
-            None,
-            "HF",
-            checkpoint_io_policy="rank_striped_read_ahead",
-        )
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    fallback_loader = _construct_checkpoint_loader(
+        "pytorch",
+        None,
+        "HF",
+        checkpoint_io_policy="rank_striped_read_ahead",
+    )
+    assert isinstance(fallback_loader.weight_loader, _CustomWeightLoader)
+    warning.assert_called_once()
+    assert "selected=native" in warning.call_args.args[0]
+
+
+def test_construct_checkpoint_loader_detects_custom_hf_wrapper(monkeypatch):
+    class _CustomCheckpointLoader(HfCheckpointLoader):
+        pass
+
+    monkeypatch.setitem(
+        modeling_utils.CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
+        "HF",
+        _CustomCheckpointLoader,
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+
+    loader = _construct_checkpoint_loader(
+        "pytorch",
+        None,
+        "HF",
+        checkpoint_io_policy="rank_striped_read_ahead",
+    )
+
+    assert isinstance(loader, _CustomCheckpointLoader)
+    assert loader.weight_loader.checkpoint_io_policy == "native"
+    warning.assert_called_once()
+    assert "checkpoint loader is not the built-in" in warning.call_args.args[0]
 
 
 class _SessionCheckpointLoader:

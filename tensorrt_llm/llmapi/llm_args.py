@@ -5493,18 +5493,21 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_io_policy: Literal["native", "rank_striped_read_ahead"] = Field(
-        default="native",
-        description=
-        "Controls checkpoint storage I/O independently of checkpoint format. "
-        "'native' preserves the existing loader. "
-        "'rank_striped_read_ahead' lets node-local ranks read disjoint "
-        "SafeTensors extents while native mapping, materialization, and H2D "
-        "continue. It requires the automatically constructed HF loader "
-        "(checkpoint_loader must be unset). Ineligible loads fall back to "
-        "native before model mutation.",
-        status="prototype",
-    )
+    checkpoint_io_policy: Literal[
+        "auto", "native", "rank_striped_read_ahead"] = Field(
+            default="auto",
+            description=
+            "Controls checkpoint storage I/O independently of checkpoint format. "
+            "'auto' selects rank-striped read-ahead for compatible built-in "
+            "PyTorch/HF loads and selects native I/O otherwise. "
+            "'native' preserves the existing loader. "
+            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+            "SafeTensors extents while native mapping, materialization, and H2D "
+            "continue. Incompatible configurations select native I/O before "
+            "optimized reader or collective setup. Runtime-ineligible loads fall "
+            "back to native before model mutation.",
+            status="prototype",
+        )
 
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
@@ -6113,20 +6116,17 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
-    def validate_checkpoint_io_policy(self) -> 'TorchLlmArgs':
-        if self.checkpoint_io_policy == "native":
-            return self
-        if self.backend != "pytorch":
-            raise ValueError(
-                "rank-striped checkpoint I/O requires the PyTorch backend")
-        if self.checkpoint_loader is not None or self.checkpoint_format != "HF":
-            raise ValueError(
-                "rank-striped checkpoint I/O requires the automatically "
-                "constructed HF loader and checkpoint_loader must be unset")
-        load_format = getattr(self.load_format, "name", self.load_format)
-        if str(load_format).lower() != "auto":
-            raise ValueError(
-                "rank-striped checkpoint I/O requires load_format='auto'")
+    def resolve_non_pytorch_checkpoint_io_policy(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader, so its explicit
+        # best-effort request is resolved here. PyTorch requests are resolved
+        # at loader construction, where the actual format and registered
+        # loader implementations are known.
+        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+                and self.backend != "pytorch"):
+            logger.warning(
+                "Checkpoint I/O policy resolved before loading: "
+                "requested=rank_striped_read_ahead, selected=native, "
+                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")
