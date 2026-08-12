@@ -41,6 +41,9 @@ class MoEStaticCapability:
     supports_moe_lora: bool = False
     # Legacy gate: CuteDslFusedMoE isinstance check in ConfigurableMoE DWDP.
     supports_dwdp: bool = False
+    # Whether the backend can consume DeepEP's expert-major receive counts
+    # directly, without materializing token-major adapter metadata.
+    supports_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)

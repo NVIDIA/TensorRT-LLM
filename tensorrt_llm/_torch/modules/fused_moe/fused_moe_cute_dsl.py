@@ -424,8 +424,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     # ``supports_dwdp`` is the capability this backend adds. CuteDslB12xFusedMoE
     # derives from here and needs both, but must spell them out again: setting
     # the attribute replaces the whole object rather than one field.
-    capabilities = MoEStaticCapability(supports_moe_lora=False,
-                                       supports_dwdp=True)
+    capabilities = MoEStaticCapability(
+        supports_moe_lora=False,
+        supports_dwdp=True,
+        supports_deep_ep_direct_metadata=True,
+    )
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
