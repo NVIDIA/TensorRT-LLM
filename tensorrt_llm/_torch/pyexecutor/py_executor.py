@@ -4581,6 +4581,7 @@ class PyExecutor:
             if mgr.is_request_active(req.py_request_id):
                 mgr.suspend_request(req)
                 paused.append(req)
+        paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
 
         try:
             mgr.impl.adjust()
@@ -4589,6 +4590,66 @@ class PyExecutor:
 
         for req in paused:
             mgr.resume_request(req)
+        self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+
+    def _suspend_padding_dummies_for_rebalance(
+            self, mgr: KVCacheManagerV2) -> List[Tuple[int, LlmRequest]]:
+        """Suspend the CUDA-graph padding dummies before ``adjust()``.
+
+        ``CUDAGraphRunner`` retains one padding dummy per captured draft
+        length, whose KV cache stays ACTIVE across iterations but never
+        appears in ``active_requests`` -- so the suspend loop above never
+        reaches them and ``adjust()`` fails its all-caches-suspended
+        precondition, terminating the executor event loop.
+
+        Suspending is what the precondition actually asks for: it tears
+        down the cache's base-page-index buffers and releases its page
+        locks, which is exactly what makes the pages safe to migrate.  The
+        dummies are deliberately *not* freed -- they are pre-allocated at
+        warmup because re-allocating one from a loaded KV cache can fail
+        and silently drop padded batches to eager mode for the rest of the
+        process lifetime.
+
+        Returns the ``(draft_len, dummy)`` pairs that were suspended.
+        """
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is None:
+            return []
+        suspended: List[Tuple[int, LlmRequest]] = []
+        for draft_len, dummy in runner.padding_dummy_requests.items():
+            if mgr.is_request_active(dummy.py_request_id):
+                mgr.suspend_request(dummy)
+                suspended.append((draft_len, dummy))
+        return suspended
+
+    def _resume_padding_dummies_after_rebalance(
+            self, mgr: KVCacheManagerV2,
+            suspended: List[Tuple[int, LlmRequest]]) -> None:
+        """Resume the padding dummies suspended for ``adjust()``.
+
+        A real request that fails to resume is left suspended for the
+        scheduler to reactivate, but nothing reschedules a padding dummy,
+        and ``_get_or_create_padding_dummy`` returns a cached dummy without
+        checking that its cache is live.  A dummy left suspended would
+        therefore be padded into a batch with a torn-down block table, so
+        one that cannot be resumed is released and dropped from the runner
+        instead, falling back to lazy re-creation on a later padded step.
+
+        The release goes through ``CUDAGraphRunner.release_padding_dummy`` so
+        that every manager the dummy was registered with is covered, not just
+        the main KV cache manager.
+        """
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is None:
+            return
+        for draft_len, dummy in suspended:
+            if mgr.resume_request(dummy):
+                continue
+            logger.warning(
+                "Could not resume the CUDA graph padding dummy request "
+                f"(draft_len={draft_len}) after a KV pool rebalance; "
+                "releasing it and falling back to lazy re-creation.")
+            runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
     def control_action(self,

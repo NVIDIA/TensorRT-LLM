@@ -1649,6 +1649,49 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 kv_cache_manager.free_resources(dummy)
             kv_cache_manager.shutdown()
 
+    def test_release_padding_dummy_covers_every_manager(self):
+        # A padding dummy's request ID is spread across several managers, so
+        # releasing only the main KV cache manager leaves the others holding
+        # it — and re-creation reuses the same ID.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        spec_manager = Mock()
+        cross_manager = Mock()
+        resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            kv_cache_manager,
+            ResourceManagerType.SPEC_RESOURCE_MANAGER:
+            spec_manager,
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER:
+            cross_manager,
+        })
+
+        runner = model_engine.cuda_graph_runner
+        try:
+            self.assertIsNotNone(
+                runner._get_or_create_padding_dummy(resource_manager, 0))
+            dummy = runner.padding_dummy_requests[0]
+
+            self.assertTrue(runner.release_padding_dummy(resource_manager, 0))
+
+            # Dropped from the runner so the lazy path re-creates it...
+            self.assertEqual({}, runner.padding_dummy_requests)
+            # ...and the spec resource manager slot is released too, not just
+            # the main KV cache manager.
+            spec_manager.free_resources.assert_called_once_with(dummy)
+            # The cross-KV manager is only involved for encoder-decoder, which
+            # this engine is not.
+            self.assertFalse(runner.is_encoder_decoder)
+            cross_manager.free_resources.assert_not_called()
+
+            # Releasing again is a no-op rather than a double free.
+            self.assertFalse(runner.release_padding_dummy(resource_manager, 0))
+            spec_manager.free_resources.assert_called_once()
+        finally:
+            for dummy in runner.padding_dummy_requests.values():
+                kv_cache_manager.free_resources(dummy)
+            runner.padding_dummy_requests.clear()
+            kv_cache_manager.shutdown()
+
     def test_layerwise_nvtx_marker(self):
         llm_args = TorchLlmArgs(
             model="dummy",
