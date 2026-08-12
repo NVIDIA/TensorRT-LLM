@@ -266,7 +266,7 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize("_repeat", range(160, 260), ids=lambda i: f"rep{i:02d}")
+    @pytest.mark.parametrize("_repeat", range(260, 360), ids=lambda i: f"rep{i:02d}")
     @pytest.mark.parametrize(
         "variant",
         [
@@ -290,8 +290,13 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
         import faulthandler
         import sys
 
-        # Periodically dump all thread stacks to stderr so CI captures
-        # the exact deadlock/race site on timeout or SIGABRT.
+        # Install SIGSEGV / SIGABRT / SIGFPE handler so a native crash dumps
+        # ALL thread stacks to stderr BEFORE the process dies. Without this,
+        # `--capture=fd` swallows the crash and only "Test terminated
+        # unexpectedly" reaches the artifacts.
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        # Periodic dumps every 60s catch hangs where enable() alone would not
+        # produce output (no signal is delivered).
         faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
         try:
             with self._launch_epd(variant) as llm:
