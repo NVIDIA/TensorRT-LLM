@@ -329,7 +329,6 @@ unittest/_torch/modules/test_w4a16_nvfp4_linear.py::test_nvfp4_attention_keeps_h
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear[2-balanced] SKIP (https://nvbugs/6507113)
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
-unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part1" SKIP (https://nvbugs/6490036)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4" SKIP (https://nvbugs/6437410)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TRTLLMSampler-cuda_graph_and_overlap-None-1-1-True-True-False] SKIP (https://nvbugs/6463819)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TorchSampler-no_cuda_graph_and_overlap-stop_token_ids0-1-1-True-True-True] SKIP (https://nvbugs/6581048)
