@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# The wire schema and ZeroMQ framing in this file are adapted from vLLM's
-# vllm/distributed/kv_events.py.
+# This module defines TensorRT-LLM's KV cache event wire format: msgpack event
+# batches published over ZeroMQ. The on-wire schema and three-frame framing are
+# adapted from vLLM's vllm/distributed/kv_events.py so that external
+# KV-cache-aware routers can consume TensorRT-LLM events without translation.
 
 from __future__ import annotations
 
@@ -45,7 +47,7 @@ class EventBatch(
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
 ):
-    """vLLM-compatible event batch envelope."""
+    """KV cache event wire batch envelope."""
 
     ts: float
     events: list[Any]
@@ -58,7 +60,7 @@ class KVCacheWireEvent(
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
-    """Base class for vLLM-compatible KV cache events."""
+    """Base class for KV cache event wire messages."""
 
 
 class BlockStored(KVCacheWireEvent):
@@ -98,7 +100,7 @@ class KVEventBatch(EventBatch):
 
 
 class EventPublisher(ABC):
-    """Publishes vLLM-compatible event batches for one cache rank."""
+    """Publishes KV cache event wire batches for one cache rank."""
 
     def __init__(self, data_parallel_rank: int = 0) -> None:
         self._data_parallel_rank = data_parallel_rank
@@ -123,7 +125,7 @@ class NullEventPublisher(EventPublisher):
 
 
 class ZmqEventPublisher(EventPublisher):
-    """Publishes event batches with vLLM's three-frame ZeroMQ protocol."""
+    """Publishes event batches over the three-frame ZeroMQ wire protocol."""
 
     SHUTDOWN_TIMEOUT = 1.0
     END_SEQ = (-1).to_bytes(8, "big", signed=True)
@@ -313,7 +315,7 @@ class ZmqEventPublisher(EventPublisher):
 
     @staticmethod
     def offset_endpoint_port(endpoint: str | None, data_parallel_rank: int) -> str | None:
-        """Apply vLLM's base-port-plus-rank endpoint convention."""
+        """Apply the base-port-plus-rank endpoint convention (each rank binds base_port + rank)."""
         if not endpoint or data_parallel_rank == 0:
             return endpoint
         # Match the scheme with startswith so detection agrees with
@@ -324,9 +326,7 @@ class ZmqEventPublisher(EventPublisher):
         if endpoint.startswith("tcp://"):
             host_port = endpoint[len("tcp://") :]
             if ":" not in host_port:
-                raise ValueError(
-                    f"TCP KV event endpoint must include a port: {endpoint!r}"
-                )
+                raise ValueError(f"TCP KV event endpoint must include a port: {endpoint!r}")
             last_colon_idx = endpoint.rfind(":")
             base_addr = endpoint[:last_colon_idx]
             base_port = int(endpoint[last_colon_idx + 1 :])
@@ -336,9 +336,7 @@ class ZmqEventPublisher(EventPublisher):
                     f"KV event endpoint port exceeds 65535 for rank {data_parallel_rank}"
                 )
             return f"{base_addr}:{new_port}"
-        raise ValueError(
-            "Invalid endpoint: must start with 'inproc://', 'ipc://', or 'tcp://'"
-        )
+        raise ValueError("Invalid endpoint: must start with 'inproc://', 'ipc://', or 'tcp://'")
 
 
 def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> EventPublisher:
@@ -358,13 +356,13 @@ def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> E
     raise ValueError(f"Unsupported KV event publisher: {config.publisher!r}")
 
 
-def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
-    """Reuse an existing SHA-256 radix key as vLLM's signed integer event hash."""
+def _kv_event_wire_hash_from_radix_key(block_key: bytes) -> int:
+    """Reuse an existing SHA-256 radix key as the KV cache event's signed int64 wire hash."""
     if len(block_key) < 8:
         raise ValueError("V2 radix block keys must contain at least 8 bytes")
     # Reuse the canonical SHA-256 -> int64 truncation (first 8 bytes) shared with
     # the rest of the KV-cache-event machinery instead of a second, divergent
-    # truncation, then reinterpret the low 64 bits as vLLM's signed wire hash.
+    # truncation, then reinterpret the low 64 bits as the signed int64 wire hash.
     unsigned_hash = truncate_sha256_hash_to_int64(block_key)
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
@@ -373,13 +371,13 @@ class _MultimodalBlockError(ValueError):
     """A block token is a multimodal cache-key digest (bytes), not a wire int.
 
     ``gen_multimodal_cache_key_tokens`` stores the per-item digest as ``bytes``,
-    which has no vLLM-wire integer representation. Such blocks are skipped
+    which has no integer wire representation. Such blocks are skipped
     quietly rather than routed through the malformed-data traceback path.
     """
 
 
 class StreamingKVCacheEventManager:
-    """Scheduler-local fast path that produces vLLM wire events directly.
+    """Scheduler-local fast path that produces KV cache event wire messages directly.
 
     Implements the V2 KV-cache-manager event-sink hook interface by duck
     typing rather than inheriting ``KVCacheEventManager``: it fully replaces
@@ -523,7 +521,7 @@ class StreamingKVCacheEventManager:
                 # Multimodal cache-key digest; not representable as a wire int.
                 raise _MultimodalBlockError
             if type(token) is not int:
-                raise ValueError("vLLM-compatible KV events require integer token IDs")
+                raise ValueError("KV cache event wire format requires integer token IDs")
             token_ids.append(token)
         return token_ids
 
@@ -533,8 +531,10 @@ class StreamingKVCacheEventManager:
     ) -> tuple[int, int | None]:
         parent = block.prev
         is_root_child = getattr(parent, "ordinal", -1) == -1
-        block_hash = _vllm_wire_hash_from_radix_key(bytes(block.key))
-        parent_hash = None if is_root_child else _vllm_wire_hash_from_radix_key(bytes(parent.key))
+        block_hash = _kv_event_wire_hash_from_radix_key(bytes(block.key))
+        parent_hash = (
+            None if is_root_child else _kv_event_wire_hash_from_radix_key(bytes(parent.key))
+        )
         return block_hash, parent_hash
 
     def add_removed_event(self, block_hashes: Any) -> None:
