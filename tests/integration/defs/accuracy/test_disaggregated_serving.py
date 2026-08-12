@@ -159,6 +159,7 @@ def launch_disaggregated_llm(
     gen_extra_env: Optional[Dict[str, str]] = None,
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
     request_max_retries: Optional[int] = None,
+    assert_worker_log_contains: Optional[str] = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -346,6 +347,8 @@ def launch_disaggregated_llm(
 
         gen_servers.append((env, gen_server_args))
 
+    worker_log_paths: List[str] = []
+
     @contextlib.contextmanager
     def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
@@ -353,9 +356,12 @@ def launch_disaggregated_llm(
         try:
             for i, (env, args) in enumerate(server_configs):
                 if enable_redirect_log:
-                    f = open(f"output_{server_name}_{i}.log", "w+")
+                    log_path = os.path.join(temp_dir.name,
+                                            f"output_{server_name}_{i}.log")
+                    f = open(log_path, "w+")
                     proc = popen(args, env=env, stdout=f, stderr=f)
                     log_files.append(f)
+                    worker_log_paths.append(log_path)
                 else:
                     proc = popen(args, env=env)
                 processes.append(proc)
@@ -381,8 +387,14 @@ def launch_disaggregated_llm(
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
-            multi_popen(ctx_servers, "ctx") as ctx_processes,
-            multi_popen(gen_servers, "gen") as gen_processes,
+            multi_popen(ctx_servers,
+                        "ctx",
+                        enable_redirect_log=assert_worker_log_contains
+                        is not None) as ctx_processes,
+            multi_popen(gen_servers,
+                        "gen",
+                        enable_redirect_log=assert_worker_log_contains
+                        is not None) as gen_processes,
             multi_popen([(base_env, server_cmd)], "disagg") as server_processes,
     ):
         start_time = time.time()
@@ -512,9 +524,11 @@ def launch_disaggregated_llm(
                         print(line.strip())
 
         tokenizer = load_hf_tokenizer(model_name)
+        body_succeeded = False
         try:
             yield DuckLLM(args, tokenizer, generate_async,
                           f"http://localhost:{serve_port}")
+            body_succeeded = True
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -543,6 +557,16 @@ def launch_disaggregated_llm(
                         pass  # already exited between timeout and kill
                 except OSError:
                     pass  # process already gone
+
+            if body_succeeded and assert_worker_log_contains is not None:
+                logs = []
+                for path in worker_log_paths:
+                    with open(path) as f:
+                        logs.append(f.read())
+                assert any(assert_worker_log_contains in log for log in logs), (
+                    f"expected marker {assert_worker_log_contains!r} in a "
+                    f"CTX or GEN worker log, but it was absent from "
+                    f"{worker_log_paths}")
 
 
 def run_parallel_test(model_name: str,
@@ -2474,108 +2498,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             llm.args.quant_config.kv_cache_quant_algo = "FP8"
             llm.args.speculative_config = MTPDecodingConfig(
                 max_draft_len=speculative_config["max_draft_len"])
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
-
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-@skip_pre_blackwell
-@pytest.mark.skip_less_device_memory(140000)
-class TestMiniMaxM3(LlmapiAccuracyTestHarness):
-    # MSA operates on 128-token sparse blocks, so the KV page size is pinned
-    # to 128 as well. TRTLLM MoE is the production backend; combined with FP8
-    # main/indexer caches and the fused projection below, this also exercises
-    # the horizontal QK-norm, RoPE, and KV-write producer.
-    MODEL_NAME = "nvidia/MiniMax-M3-NVFP4"
-    MODEL_PATH = f"{llm_models_root()}/MiniMax-M3-NVFP4"
-
-    @pytest.mark.parametrize("ctx_tp,gen_tp", [
-        pytest.param(
-            2, 2, marks=pytest.mark.skip_less_device(4), id="head_matched"),
-        pytest.param(
-            2, 4, marks=pytest.mark.skip_less_device(6), id="head_mismatched"),
-    ])
-    def test_nvfp4_msa_nixl_python(self, ctx_tp: int, gen_tp: int) -> None:
-        kv_cache_config = {
-            "free_gpu_memory_fraction": 0.6,
-            "enable_block_reuse": False,
-            "dtype": "fp8",
-            "tokens_per_block": 128,
-            "use_kv_cache_manager_v2": True,
-        }
-        cache_transceiver_config = {
-            "backend": "NIXL",
-            "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 8192,
-        }
-        sparse_attention_config = {
-            "algorithm": "minimax_m3",
-            "implementation": "msa",
-            "indexer_kv_dtype": "fp8",
-            "fuse_qkv_index_projection": True,
-        }
-        moe_config = {"backend": "TRTLLM"}
-        base_server_config = {
-            "pipeline_parallel_size": 1,
-            "enable_chunked_prefill": True,
-            "trust_remote_code": True,
-            "max_num_tokens": 8192,
-            "max_seq_len": 4096,
-            "max_batch_size": 32,
-            "kv_cache_config": kv_cache_config,
-            "moe_config": moe_config,
-            "sparse_attention_config": sparse_attention_config,
-            "cache_transceiver_config": cache_transceiver_config,
-        }
-
-        def _server_config(tp_size: int) -> dict[str, Any]:
-            return {
-                **base_server_config,
-                "tensor_parallel_size": tp_size,
-                "moe_expert_parallel_size": tp_size,
-            }
-
-        ctx_server_config = {
-            **_server_config(ctx_tp),
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1, 2, 4, 8, 12, 16, 24, 32],
-            },
-            "torch_compile_config": {
-                "enable_piecewise_cuda_graph": True,
-                "capture_num_tokens": [1, 2048],
-                "max_num_streams": 3,
-            },
-        }
-        gen_server_config = {
-            **_server_config(gen_tp),
-            "disable_overlap_scheduler": False,
-            "cuda_graph_config": {
-                "enable_padding": True,
-                "batch_sizes": [1, 2, 4, 8, 12, 16, 24, 32],
-            },
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            },
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      max_workers=32,
-                                      server_waiting_timeout=1200) as llm:
-            # launch_disaggregated_llm uses a lightweight LlmArgs only for
-            # accuracy-reference selection; mirror the checkpoint's effective
-            # mixed-precision weights and FP8 KV cache there.
-            llm.args.quant_config.quant_algo = "MIXED_PRECISION"
-            llm.args.quant_config.kv_cache_quant_algo = "FP8"
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 

@@ -13,4 +13,4 @@ l0_dgx_b200_m3_8gpu:
       stage: pre_merge
       backend: pytorch
   tests:
-  - accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_nvfp4_msa_nixl_python[head_mismatched] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3_disagg_head_mismatched_bounce
