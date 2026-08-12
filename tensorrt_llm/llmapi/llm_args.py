@@ -2101,8 +2101,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = Field(
         default=True,
         description=
-        "Whether to use the faster one-model implementation (draft as submodule) or the two-model implementation."
-    )
+        "Always uses the one-model implementation (draft as submodule). "
+        "Setting False is ignored and falls back to True; the two-model path "
+        "is deprecated and will be removed in a future release.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2134,8 +2135,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("max_draft_len must be > 0 for Eagle")
         if not self.eagle3_one_model:
             logger.warning(
-                "Eagle3 2-model is deprecated and will be removed in release 1.4."
-            )
+                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
+                "ignored; falling back to eagle3_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.eagle3_one_model = True
 
         self.num_eagle_layers = self.max_draft_len
 
@@ -2543,8 +2546,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     mtp_eagle_one_model: bool = Field(
         default=True,
         description=
-        "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
-    )
+        "When using EAGLE-style MTP, always uses the one-model implementation "
+        "(drafter as submodule). Setting False is ignored and falls back to "
+        "True; the two-model path is deprecated and will be removed in a "
+        "future release.")
 
     use_dynamic_tree: bool = Field(
         default=False,
@@ -2649,8 +2654,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated and will be removed in release 1.4."
-            )
+                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
+                "and ignored; falling back to mtp_eagle_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.mtp_eagle_one_model = True
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -5868,8 +5875,6 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
-                if self.backend == "_autodeploy":
-                    self.speculative_config._draft_target_one_model = False
 
             # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
             # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.
