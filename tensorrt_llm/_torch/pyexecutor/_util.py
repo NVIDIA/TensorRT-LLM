@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
@@ -72,6 +72,9 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
+
+if TYPE_CHECKING:
+    import transformers
 
 GB = 1 << 30
 
@@ -2598,6 +2601,7 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
 ) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2619,6 +2623,7 @@ def create_kv_cache_compression_manager(
             config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=pretrained_config,
         )
 
     logger.warning(
@@ -2891,6 +2896,7 @@ def create_py_executor_instance(
             kv_cache_compression_config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (

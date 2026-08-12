@@ -3197,7 +3197,6 @@ kv_cache_compression_config:
   beta: 17
   eviction_mode: per_head
   normalize_scores: false
-  model_path: /tmp/model
   calibration_path: /tmp/calibration.pt
 """)
 

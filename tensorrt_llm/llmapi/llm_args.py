@@ -3626,11 +3626,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
     )
-    model_path: str = Field(
-        min_length=1,
-        description="Checkpoint path used to derive RoPE tables when converting "
-        "the official calibration and to classify kernel-masked sliding-attention "
-        "layers.")
     calibration_path: str = Field(
         min_length=1,
         description="Path to the official TriAttention calibration `.pt` "
