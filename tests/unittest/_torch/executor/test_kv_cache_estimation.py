@@ -754,7 +754,7 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
         patch.object(creator, "_enable_kv_cache_stats", return_value=False),
         patch.object(
             creator,
-            "_fallback_if_unsupported_kv_cache_manager_v2",
+            "_validate_or_fallback_kv_cache_manager_v2",
             return_value=KVCacheManagerV2,
         ),
         patch(

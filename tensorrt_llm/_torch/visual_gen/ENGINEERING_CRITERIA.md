@@ -70,10 +70,10 @@ Covers performance optimization and other general features.
    is preferred. General features without perf claims skip this.
 3. **Lossy work.** Quantization, sparsity, approximate kernels —
    trades quality for speed/memory. Report relevant accuracy metric
-   numbers in the PR (LPIPS, VBench, or equivalent), plus a linked
-   report with generated content alongside the reference for visual
-   comparison. The accuracy study and its acceptance bar are
-   reviewed in sync meetings before the PR lands.
+   numbers in the PR (LPIPS or equivalent), plus a linked report with
+   generated content alongside the reference for visual comparison.
+   The accuracy study and its acceptance bar are reviewed in sync
+   meetings before the PR lands.
 4. **Lossless work.** Kernel fusion, scheduling, parallelism —
    mathematically equivalent up to floating-point accumulation.
    Report LPIPS against the existing golden; a very small diff is
@@ -129,7 +129,7 @@ Where tests live:
 
 1. **Tiers.** A cheap **sanity** check (content was generated, valid
    shape, non-black frame) runs broadly; the **quality gate** (LPIPS
-   / VBench against a reference) runs where quality matters.
+   against a reference) runs where quality matters.
 2. **Keep E2E cheap.** Reduced denoising steps and resolution are
    typical (FLUX 4 steps, LTX-2 8 steps, 256×256). Variant matrices
    stay offline.

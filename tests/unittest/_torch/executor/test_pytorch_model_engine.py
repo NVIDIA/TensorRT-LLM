@@ -18,8 +18,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    CUDAGraphRunner, _restore_spec_decode_capture_state,
-    _save_spec_decode_capture_state)
+    CUDAGraphRunner, EncoderCUDAGraphRunner, KeyType,
+    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -191,7 +191,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
 
 
 def _make_forward_only_engine(
-    graph_key: tuple[int, int, bool, bool, bool] | None,
+    graph_key: KeyType | None,
     runner_enabled: bool = True,
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
@@ -616,7 +616,139 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         runner._get_seq_len_mode.assert_called_once_with(
             batch, None, promoted_ids)
-        self.assertEqual(key, (1, 0, False, True, True))
+        self.assertEqual(
+            key,
+            KeyType(batch_size=1,
+                    draft_len=0,
+                    is_first_draft=False,
+                    short_seq_len_mode=True,
+                    num_encoder_tokens=0))
+
+    def test_graph_key_aggregates_encoder_tokens(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._get_seq_len_mode.return_value = False
+        context = _make_request_stub(1)
+        context.encoder_output_len = 7
+        context.py_skip_cross_kv_projection = False
+        skipped_context = _make_request_stub(2)
+        skipped_context.encoder_output_len = 11
+        skipped_context.py_skip_cross_kv_projection = True
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [context, skipped_context]
+        batch.generation_requests = [_make_request_stub(3)]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        assert key is not None
+        self.assertEqual(key.num_contexts, 2)
+        self.assertEqual(key.context_query_len, 1)
+        self.assertEqual(key.num_encoder_tokens, 7)
+        self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
+                         3)
+
+    def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        first_context = _make_request_stub(1)
+        first_context.encoder_output_len = 7
+        first_context.py_skip_cross_kv_projection = False
+        second_context = _make_request_stub(2)
+        second_context.context_chunk_size = 2
+        second_context.encoder_output_len = 11
+        second_context.py_skip_cross_kv_projection = False
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [first_context, second_context]
+        batch.generation_requests = [_make_request_stub(3)]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        self.assertIsNone(key)
+
+    def test_graph_key_rounds_encoder_tokens_up_to_captured_extent(
+            self) -> None:
+        key = KeyType(batch_size=2,
+                      draft_len=0,
+                      is_first_draft=False,
+                      num_contexts=1,
+                      context_query_len=1,
+                      num_encoder_tokens=7)
+        smaller_key = key._replace(num_encoder_tokens=6)
+        compatible_key = key._replace(num_encoder_tokens=8)
+        larger_key = key._replace(num_encoder_tokens=16)
+        runner = SimpleNamespace(
+            padding_enabled=True,
+            _capture_allowed=False,
+            graph_metadata={},
+            graph_outputs={
+                smaller_key: object(),
+                compatible_key: object(),
+                larger_key: object(),
+            },
+        )
+
+        actual_key = CUDAGraphRunner._get_compatible_mixed_encoder_decoder_key(
+            runner, key)
+
+        self.assertEqual(actual_key, compatible_key)
+
+    def test_graph_key_includes_peft_cache_dtype(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        model_dtype_key = CUDAGraphRunner.get_graph_key(
+            runner, batch, peft_cache_data_type=torch.bfloat16)
+        fp8_key = CUDAGraphRunner.get_graph_key(
+            runner, batch, peft_cache_data_type=torch.float8_e4m3fn)
+
+        self.assertNotEqual(model_dtype_key, fp8_key)
+        self.assertEqual(
+            model_dtype_key._replace(peft_cache_data_type=None),
+            fp8_key._replace(peft_cache_data_type=None),
+        )
+
+    def test_graph_dtype_change_falls_back_to_eager(self) -> None:
+        runner = Mock()
+        runner.enabled = True
+        runner.config = SimpleNamespace(
+            enable_attention_dp=False,
+            use_mrope=False,
+        )
+        model_dtype_key = KeyType(batch_size=1,
+                                  draft_len=0,
+                                  is_first_draft=False,
+                                  peft_cache_data_type=torch.bfloat16)
+        fp8_key = KeyType(batch_size=1,
+                          draft_len=0,
+                          is_first_draft=False,
+                          peft_cache_data_type=torch.float8_e4m3fn)
+        runner.get_graph_key.return_value = fp8_key
+        runner.graph_metadata = {model_dtype_key: object()}
+        runner._capture_allowed = False
+        runner._is_mixed_encoder_decoder_batch.return_value = False
+        runner._can_run_cuda_graph_batch.return_value = True
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
+                return_value=False):
+            result = CUDAGraphRunner.maybe_get_cuda_graph(
+                runner,
+                batch,
+                enable_spec_decode=False,
+                attn_metadata=object(),
+                peft_cache_data_type=torch.float8_e4m3fn,
+            )
+
+        self.assertEqual(result, (None, None, None))
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
@@ -625,7 +757,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             enable_attention_dp=False,
             use_mrope=False,
         )
-        key = (1, 0, False, True, True)
+        key = KeyType(batch_size=1,
+                      draft_len=0,
+                      is_first_draft=False,
+                      short_seq_len_mode=True,
+                      num_encoder_tokens=0)
         graph_attn_metadata = object()
         graph_spec_metadata = object()
         runner.get_graph_key.return_value = key
@@ -636,6 +772,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 "spec_metadata": graph_spec_metadata,
             }
         }
+        runner._is_mixed_encoder_decoder_batch.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -653,12 +790,12 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids)
+                                                     promoted_ids, None)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
     def test_forward_commits_candidate_only_on_graph_hit(self) -> None:
-        key = (2, 0, False, False, True)
+        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         context = _make_request_stub(1)
@@ -717,7 +854,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:
-        key = (2, 0, False, False, True)
+        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
@@ -813,7 +950,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.replay.assert_not_called()
 
     def test_forward_allows_guided_context_logits_on_graph_hit(self) -> None:
-        key = (1, 0, False, False, True)
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         engine.guided_decoder = Mock()
@@ -866,7 +1003,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIn("multimodal_embedding", multimodal_data)
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
-        key = (1, 0, False, False, True)
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         generation = _make_request_stub(2)
         batch = ScheduledRequests()
@@ -937,6 +1074,70 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_encoder_cuda_graph_stages_and_restores_fixed_sequence_slots(
+            self) -> None:
+        runner = EncoderCUDAGraphRunner.__new__(EncoderCUDAGraphRunner)
+        runner.is_encoder_decoder = True
+        runner.use_fixed_sequence_slots = True
+        runner.supported_batch_sizes = [2]
+        runner.supported_seq_lens = [512]
+        runner.max_supported_num_tokens = 1024
+        small_key = (2, 512, 512)
+        compatible_key = (2, 1024, 512)
+        runner._capture_sequence_lengths = {
+            small_key: [511, 1],
+            compatible_key: [512, 512],
+        }
+        runner._capture_keys_by_batch_size = {
+            2: [small_key, compatible_key],
+        }
+        runner._arange_max = torch.arange(1024, dtype=torch.int32)
+
+        self.assertEqual(
+            runner._get_dynamic_capture_key([200, 300],
+                                            allow_batch_padding=False),
+            compatible_key)
+
+        source_sequence_lengths = [1, 400]
+        key = runner._get_dynamic_capture_key(source_sequence_lengths,
+                                              allow_batch_padding=False)
+        self.assertEqual(key, small_key)
+        self.assertEqual(runner._get_capture_sequence_offsets(key),
+                         [0, 511, 512])
+
+        input_ids = torch.arange(401, dtype=torch.int32)
+        inputs = runner.prepare_encoder_decoder_inputs(
+            {
+                "input_ids": input_ids,
+                "position_ids": input_ids,
+                "seq_lens": source_sequence_lengths,
+            },
+            key,
+            source_sequence_lengths,
+        )
+        self.assertEqual(inputs["seq_lens"], [400, 1])
+        self.assertEqual(inputs["_encoder_source_to_slot"], [1, 0])
+
+        static_tensors = {
+            "input_ids": torch.empty(512, dtype=torch.int32),
+            "position_ids": torch.empty((1, 512), dtype=torch.int32),
+        }
+        runner._stage_encoder_decoder_inputs(key, inputs, static_tensors)
+        expected_staged_ids = torch.zeros(512, dtype=torch.int32)
+        expected_staged_ids[:400] = input_ids[1:]
+        expected_staged_ids[511] = input_ids[0]
+        torch.testing.assert_close(static_tensors["input_ids"],
+                                   expected_staged_ids)
+        torch.testing.assert_close(static_tensors["position_ids"][0],
+                                   expected_staged_ids)
+
+        fixed_slot_output = torch.arange(512).unsqueeze(1)
+        restored_output = runner.restore_encoder_decoder_output(
+            key, fixed_slot_output, inputs)
+        expected_output = torch.cat(
+            (fixed_slot_output[511:512], fixed_slot_output[:400]))
+        torch.testing.assert_close(restored_output, expected_output)
 
     def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
@@ -1446,6 +1647,49 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             runner.graphs.clear()
             for dummy in runner.padding_dummy_requests.values():
                 kv_cache_manager.free_resources(dummy)
+            kv_cache_manager.shutdown()
+
+    def test_release_padding_dummy_covers_every_manager(self):
+        # A padding dummy's request ID is spread across several managers, so
+        # releasing only the main KV cache manager leaves the others holding
+        # it — and re-creation reuses the same ID.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        spec_manager = Mock()
+        cross_manager = Mock()
+        resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            kv_cache_manager,
+            ResourceManagerType.SPEC_RESOURCE_MANAGER:
+            spec_manager,
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER:
+            cross_manager,
+        })
+
+        runner = model_engine.cuda_graph_runner
+        try:
+            self.assertIsNotNone(
+                runner._get_or_create_padding_dummy(resource_manager, 0))
+            dummy = runner.padding_dummy_requests[0]
+
+            self.assertTrue(runner.release_padding_dummy(resource_manager, 0))
+
+            # Dropped from the runner so the lazy path re-creates it...
+            self.assertEqual({}, runner.padding_dummy_requests)
+            # ...and the spec resource manager slot is released too, not just
+            # the main KV cache manager.
+            spec_manager.free_resources.assert_called_once_with(dummy)
+            # The cross-KV manager is only involved for encoder-decoder, which
+            # this engine is not.
+            self.assertFalse(runner.is_encoder_decoder)
+            cross_manager.free_resources.assert_not_called()
+
+            # Releasing again is a no-op rather than a double free.
+            self.assertFalse(runner.release_padding_dummy(resource_manager, 0))
+            spec_manager.free_resources.assert_called_once()
+        finally:
+            for dummy in runner.padding_dummy_requests.values():
+                kv_cache_manager.free_resources(dummy)
+            runner.padding_dummy_requests.clear()
             kv_cache_manager.shutdown()
 
     def test_layerwise_nvtx_marker(self):

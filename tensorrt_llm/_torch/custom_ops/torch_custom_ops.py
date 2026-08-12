@@ -1232,7 +1232,7 @@ def nvfp4_gemm(
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
             Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
-            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
 
     Returns:
         Output tensor [m, n] with dtype=output_dtype
@@ -2094,6 +2094,8 @@ class AllReduceRunner(TunableRunner):
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
     _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
+    # Keep these buckets synchronized with kAllReduceTuningBuckets in
+    # cpp/tensorrt_llm/thop/allreduceOp.cpp.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -2106,6 +2108,7 @@ class AllReduceRunner(TunableRunner):
         self,
         tp_size: int,
         group: List[int],
+        input_dtype: torch.dtype,
         op: int,
         eps: float,
         trigger_completion_at_end: bool,
@@ -2114,13 +2117,18 @@ class AllReduceRunner(TunableRunner):
         self.tp_size = tp_size
         self.op = op
         self.group = group
+        self.input_dtype = input_dtype
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
         self.input_uses_nccl_window = input_uses_nccl_window
 
-    def unique_id(self):
+    def unique_id(self) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool]:
         return (
             self.tp_size,
+            # Keep Python cache entries aligned with the native tactic cache:
+            # groups with the same size can use distinct communicators/topologies.
+            tuple(self.group),
+            self.input_dtype,
             self.op,
             self.input_uses_nccl_window,
         )
@@ -2205,6 +2213,51 @@ class AllReduceRunner(TunableRunner):
             valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
 
         return valid_strategies
+
+    def _register_native_tactics(self, inputs: List[torch.Tensor]) -> None:
+        input, residual, norm_weight, scale, bias, workspace = inputs
+        custom_op = "trtllm::tunable_allreduce::allreduce"
+        tuning_buckets = self.tuning_config.dynamic_tensor_specs[
+            0].gen_tuning_buckets
+        # Avoid a module-import cycle during custom-op registration.
+        from tensorrt_llm._torch.distributed.ops import \
+            disable_native_allreduce_autotuner
+
+        if not hasattr(torch.ops.trtllm, "validate_allreduce_tuning_buckets"):
+            disable_native_allreduce_autotuner(
+                "native extension does not expose bucket validation")
+            return
+        try:
+            torch.ops.trtllm.validate_allreduce_tuning_buckets(tuning_buckets)
+        except RuntimeError as error:
+            if "AllReduce autotuner bucket mismatch" not in str(error):
+                raise
+            disable_native_allreduce_autotuner(str(error))
+            return
+        tuner = AutoTuner.get()
+        cache = tuner.profiling_cache
+        input_shapes = tuple(tuner._get_input_sizes(inputs))
+        # Look up the fixed set of allreduce buckets directly instead of
+        # scanning unrelated custom-op and profile entries in the full cache.
+        for bucket in tuning_buckets:
+            bucket_input_shapes = list(input_shapes)
+            bucket_input_shapes[0] = torch.Size((bucket, *input_shapes[0][1:]))
+            cache_key = cache.get_cache_key(
+                custom_op,
+                self,
+                tuple(bucket_input_shapes),
+                self.tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            cache_entry = cache.cache.get(cache_key)
+            if cache_entry is None:
+                continue
+            _, tactic, _ = cache_entry
+            torch.ops.trtllm.register_allreduce_tactic(input, residual,
+                                                       norm_weight, scale, bias,
+                                                       workspace, self.group,
+                                                       self.op, bucket,
+                                                       int(tactic))
 
     def forward(
         self,
@@ -2299,6 +2352,7 @@ def tunable_allreduce(
     allreduce_runner = AllReduceRunner(
         len(group),
         group,
+        input.dtype,
         op,
         eps,
         trigger_completion_at_end,
@@ -2337,6 +2391,8 @@ def tunable_allreduce(
         tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
+    allreduce_runner._register_native_tactics(
+        [input, residual, norm_weight, scale, bias, workspace])
 
     return allreduce_runner(
         [input, residual, norm_weight, scale, bias, workspace],

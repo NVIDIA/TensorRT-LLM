@@ -16,6 +16,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.fx import Graph, GraphModule
@@ -35,6 +36,9 @@ from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
     end_aux_stream_passthrough,
     wait_aux_stream_passthrough,
 )
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ============================================================================
 # Helpers
