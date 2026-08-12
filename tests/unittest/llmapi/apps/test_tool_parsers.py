@@ -1779,6 +1779,38 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
 
 
 # ============================================================================
+# DeepSeek streaming text preservation
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # A delta that is itself a prefix of a tool-call start token.
+        ["Use ", "<", "div> for a block element."],
+        # A delta that ends on such a prefix after other text.
+        ["The condition is a <", " b, so it holds."],
+    ],
+)
+def test_deepseek_streaming_preserves_withheld_text(sample_tools, parser_cls,
+                                                    deltas):
+    """Withholding a delta may delay text but must never drop it."""
+    parser = parser_cls()
+
+    streamed = "".join(
+        parser.parse_streaming_increment(delta, sample_tools).normal_text
+        for delta in deltas)
+
+    expected = "".join(deltas)
+    assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(expected,
+                                         sample_tools).normal_text == expected
+
+
+# ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
 

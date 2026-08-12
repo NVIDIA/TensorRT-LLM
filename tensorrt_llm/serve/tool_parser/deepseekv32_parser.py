@@ -182,11 +182,15 @@ class DeepSeekV32Parser(BaseToolParser):
         ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
 
         if not has_tool_call and not potentially_dsml and not ends_with_prefix:
+            # The guards above withhold the whole buffer, so the buffer is what has
+            # to be emitted once they clear; returning only the latest delta would
+            # drop everything withheld by an earlier increment.
+            normal_text = current_text
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                if e_token in normal_text:
+                    normal_text = normal_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
