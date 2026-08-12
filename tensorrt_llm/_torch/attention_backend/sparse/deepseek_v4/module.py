@@ -548,6 +548,8 @@ def forward_sparse_attn(
     """Run DeepSeek-V4 MLA and write into the algorithm-defined output buffers."""
     assert self.mha is None and self.mqa is not None, "DeepSeek-V4 is only supported in MQA mode"
     output = attn_output[0]
+    # A 3D token-major output is the internal fusion marker, avoiding
+    # algorithm-specific parameters in the shared MLA custom-op schema.
     enable_dsv4_epilogue_fusion = output.ndim == 3
     num_contexts = attn_metadata.num_contexts
     num_generations = attn_metadata.num_generations
