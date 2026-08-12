@@ -145,7 +145,7 @@ def test_minimax_h3_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/minimax_h3.py with --fp4 end-to-end.
 
     Exercises the example's NVFP4 flag, which shrinks the transformer to
-    ~15 GB so the whole pipeline fits on a single 96 GB accelerator.
+    about 35 GiB so the whole pipeline fits on a single 96 GiB accelerator.
     """
     checkpoint_path = _h3_checkpoint_path()
     _skip_if_missing(checkpoint_path, "MiniMax-H3 checkpoint", is_dir=True)

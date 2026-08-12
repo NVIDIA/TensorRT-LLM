@@ -13,16 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU MiniMax-H3 text-to-video+audio with online NVFP4 quantization of the
-# transformer. The 313 TRT-LLM Linear layers quantize to about 10.5 GiB, while
-# the 53 AdaLN/time-modulation nn.Linear layers remain BF16, for about 35 GiB
-# total transformer storage. The full pipeline fits on a single 96 GiB card;
-# the conditioner is swapped in per request by default (conditioner_offload: auto).
-# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+# 2-GPU MiniMax-H3 video+audio with online 128x128 block-scaled FP8 weights.
+#
+# Card 0: transformer and VAEs. Card 1: Qwen3-VL conditioner.
+# SM120 uses UE8M0 activation/weight scale layout for the block-scaled GEMM.
 quant_config:
-  quant_algo: NVFP4
+  quant_algo: FP8_BLOCK_SCALES
   dynamic: true
 pipeline_config:
-  conditioner_offload: auto
+  conditioner_offload: never
+  conditioner_device: cuda:1
 cuda_graph_config:
   enable: false

@@ -65,7 +65,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
-| **MiniMax-H3** | No | Yes | No | No | No | No | No | No | No | No | No | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | No | No | No | No | No | No | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -130,6 +130,14 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+MiniMax-H3 keeps its four latent input/output projections in FP32 and its
+AdaLN/time-modulation `nn.Linear` layers in BF16. The remaining 313 TRT-LLM
+linear layers use the selected online format. The example configurations
+`examples/visual_gen/configs/minimax-h3-t2va-fp8-2gpu.yaml` and
+`examples/visual_gen/configs/minimax-h3-t2va-fp8-block-2gpu.yaml` place the
+Qwen3-VL conditioner on `cuda:1`, leaving the quantized transformer and VAEs
+on `cuda:0`; `minimax-h3-t2va-fp4-1gpu.yaml` is the single-card NVFP4 setup.
 
 ### Quantized Attention
 

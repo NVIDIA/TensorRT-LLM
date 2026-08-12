@@ -25,11 +25,11 @@ the video VAE can decode and ``num_inference_steps`` counts sigma grid points
 The checkpoint is guidance-distilled: there is no negative prompt and no
 guidance scale, and every denoising step runs exactly one forward pass.
 
-``--fp4`` enables online NVFP4 quantization of the transformer: the bf16
-checkpoint weights are quantized to FP4 on the fly at load time, shrinking the
-~62 GB transformer to ~15 GB so the full pipeline (transformer + Qwen3-VL
-conditioner + both VAEs) fits on a single 96 GB accelerator. The conditioner
-is swapped in per request by default in that configuration.
+``--fp4`` enables online NVFP4 quantization of the transformer. The 313
+TRT-LLM Linear layers are packed to FP4 at load time; 53 AdaLN/time-modulation
+layers remain BF16, so the transformer uses about 35 GiB in total. The full
+pipeline fits on a single 96 GiB accelerator, with the conditioner swapped in
+per request by default in that configuration.
 
 Given a second accelerator the conditioner can simply live there instead
 (``conditioner_device: cuda:1``), which retires the swap; see

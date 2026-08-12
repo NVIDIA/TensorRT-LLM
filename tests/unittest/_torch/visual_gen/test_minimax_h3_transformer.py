@@ -288,14 +288,100 @@ class TestMiniMaxH3TransformerFP4Integration:
                 unquantized += 1
             else:
                 assert module.weight.dtype == fp4_utils.float4_e2m1x2
+                assert type(module.quant_method).__name__ == "NVFP4LinearMethod"
+                assert getattr(module, "weight_scale", None) is not None
                 assert getattr(module, "weight_scale_2", None) is not None
+                assert module.force_dynamic_quantization
                 quantized += 1
-        assert quantized > 100, f"expected the block stack to be NVFP4-quantized, got {quantized}"
+        assert quantized == 313, f"expected 313 NVFP4 Linears, got {quantized}"
         # proj_in / audio_proj_in / proj_out / audio_proj_out (time_embedder's
         # Linears are nn.Linear, not TRT-LLM Linear).
         assert unquantized == 4, (
             f"expected exactly the 4 fp32 head/projection Linears, got {unquantized}"
         )
+
+        torch_linears = [
+            module for module in transformer.modules() if isinstance(module, torch.nn.Linear)
+        ]
+        assert len(torch_linears) == 53
+        assert sum(module.weight.dtype == torch.float32 for module in torch_linears) == 2
+        assert sum(module.weight.dtype == torch.bfloat16 for module in torch_linears) == 51
+
+        inputs = _random_inputs(seq_len=512, seed=9, device="cuda")
+        video, audio = _run(transformer, inputs)
+        assert video.shape == (1, 256, 24 * 1 * 2 * 2)
+        assert audio.shape == (1, 128, 32)
+        assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+
+
+class TestMiniMaxH3TransformerFP8Integration:
+    """Online FP8 quantization of the transformer through the loader."""
+
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_load_and_forward_fp8(self, quant_algo):
+        checkpoint_dir = _checkpoint()
+        if not Path(checkpoint_dir).exists():
+            pytest.skip(f"checkpoint not available: {checkpoint_dir}")
+
+        from tensorrt_llm import VisualGenArgs
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.visual_gen.args import TorchCompileConfig
+
+        pipeline = PipelineLoader(
+            VisualGenArgs(
+                model=checkpoint_dir,
+                quant_config={"quant_algo": quant_algo},
+                # The SM120 compile path is covered separately by the FP8
+                # quantization regression test; this test checks model loading
+                # and eager transformer execution.
+                torch_compile_config=TorchCompileConfig(enable=False),
+            ),
+            device="cuda",
+        ).load(
+            skip_warmup=True,
+            skip_components=["vae", "audio_vae", "text_encoder", "tokenizer", "scheduler"],
+        )
+        transformer = pipeline.transformer
+        assert transformer is not None
+
+        quantized = unquantized = 0
+        for name, module in transformer.named_modules():
+            if not isinstance(module, Linear):
+                continue
+            if any(
+                frag in name for frag in ("proj_in", "audio_proj_in", "proj_out", "audio_proj_out")
+            ):
+                assert module.weight.dtype == torch.float32
+                assert not hasattr(module, "weight_scale")
+                unquantized += 1
+                continue
+
+            assert module.weight.dtype == torch.float8_e4m3fn, (
+                f"{name}: expected FP8 weight, got {module.weight.dtype}"
+            )
+            assert getattr(module, "weight_scale", None) is not None
+            if quant_algo == "FP8":
+                # Online FP8 has no calibrated activation scale, so the
+                # method must use per-call dynamic activation quantization.
+                assert module.input_scale is None, f"{name}: FP8 input scale was not cleared"
+                assert type(module.quant_method).__name__ == "FP8QDQLinearMethod"
+            else:
+                assert type(module.quant_method).__name__ == "FP8BlockScalesLinearMethod"
+                assert module.weight_scale.dtype in (torch.float32, torch.int32)
+            quantized += 1
+
+        assert quantized == 313, f"expected 313 {quant_algo} Linears, got {quantized}"
+        assert unquantized == 4, (
+            f"expected exactly the 4 fp32 head/projection Linears, got {unquantized}"
+        )
+
+        torch_linears = [
+            module for module in transformer.modules() if isinstance(module, torch.nn.Linear)
+        ]
+        assert len(torch_linears) == 53
+        assert sum(module.weight.dtype == torch.float32 for module in torch_linears) == 2
+        assert sum(module.weight.dtype == torch.bfloat16 for module in torch_linears) == 51
 
         inputs = _random_inputs(seq_len=512, seed=9, device="cuda")
         video, audio = _run(transformer, inputs)
