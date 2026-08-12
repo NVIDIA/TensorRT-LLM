@@ -61,4 +61,4 @@ tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_dsa_ctx
 #   under-reports them 60-73% and one GPU cannot produce them. e2e-only signal.
 tests/microbenchmarks/bench_moe/test_v4_trace_discrete.py::test_v4_moe_backend_honored              discrete    # silent DeepGEMM->fallback shows up e2e only as "a few % slower"
 tests/microbenchmarks/bench_moe/test_v4_trace_discrete.py::test_v4_moe_traced_gemm_shapes_present   discrete    # the two dominant grouped-GEMM instantiations still get issued
-tests/microbenchmarks/bench_moe/test_v4_trace_discrete.py::test_v4_moe_launch_count                 discrete    # fusion / graph coverage; no golden yet -> bootstrap
+tests/microbenchmarks/bench_moe/test_v4_trace_discrete.py::test_v4_moe_launch_count                 discrete    # fusion / graph coverage (golden: sm100=11, 3/3 zero variance)

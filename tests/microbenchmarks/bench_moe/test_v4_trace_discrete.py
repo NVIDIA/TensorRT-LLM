@@ -62,7 +62,15 @@ _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU"
 # test_discrete_metrics.py: an absent key makes the test print what it observed
 # and SKIP, so a new arch bootstraps instead of false-firing. Pinning a value is
 # an explicit, reviewed decision -- confirm zero variance over K runs first.
-_EXPECTED_LAUNCH_COUNT: dict[str, dict[str, int]] = {}
+#
+#   sm100 (B200, cluster): 11 kernels, 3/3 zero variance across independent
+#   container runs (builds #45, #47, #48) on wheel 1.3.0rc24 / 20260811100855_9f1eb3a6.
+#   Build #44 observed 0 on the same config and is NOT a fourth sample -- that
+#   was a broken CUPTI capture, which now fails loudly instead of looking like a
+#   bootstrap. Do not pin a count of 0; it would assert nothing and stay green.
+_EXPECTED_LAUNCH_COUNT: dict[str, dict[str, int]] = {
+    "deepgemm_e64_h4096_i2048_t128": {"sm100": 11},
+}
 
 
 def _split_template_args(s: str) -> list[str]:
