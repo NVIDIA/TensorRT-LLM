@@ -30,6 +30,13 @@ import pytest
 
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
+# Stub routers only: no engine, no GPU. The marker is load-bearing --
+# l0_cpu reaches this file solely through its `unittest/others` directory
+# entry, and tests/unittest/conftest.py's pytest_ignore_collect drops any
+# file whose source lacks this literal when pytest runs with -m cpu_only.
+# Without it these tests are collected nowhere at all.
+pytestmark = pytest.mark.cpu_only
+
 
 class _StubRouter:
     """Just the surface ``is_ready`` touches."""
