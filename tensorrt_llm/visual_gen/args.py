@@ -516,7 +516,7 @@ class CompilationConfig(StrictBaseModel):
 
 
 class RuntimeLoRAConfig(StrictBaseModel):
-    """Startup-preloaded LoRA adapter applied in transformer forward passes."""
+    """Startup-preloaded LoRA adapter fused into transformer weights."""
 
     path: str = Field(
         "",
@@ -636,8 +636,8 @@ class VisualGenArgs(StrictBaseModel):
         None,
         status="prototype",
         description=(
-            "Startup-preloaded LoRA adapter applied dynamically in "
-            "VisualGen transformer forward passes."
+            "Startup-preloaded LoRA adapter fused into VisualGen transformer "
+            "weights."
         ),
     )
 

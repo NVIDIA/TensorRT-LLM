@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Startup-preloaded, forward-time LoRA adapters for VisualGen transformers."""
+"""Startup-preloaded LoRA adapters for VisualGen transformers."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ _DEFAULT_STRIP_PREFIXES = (
 
 @dataclass(frozen=True)
 class RuntimeLoRAApplication:
-    """Summary returned after installing one runtime LoRA adapter."""
+    """Summary returned after applying one LoRA adapter."""
 
     path: str
     applied_modules: Tuple[str, ...]
@@ -223,12 +223,12 @@ def apply_runtime_lora(
     default_strip_prefixes: Iterable[str] = (),
     raise_on_no_matches: bool = True,
 ) -> RuntimeLoRAApplication:
-    """Install startup LoRA wrappers on matching transformer modules."""
+    """Fuse startup LoRA deltas into matching transformer module weights."""
 
     raw_tensors = _load_lora_tensors(config.path)
     pairs, skipped_incomplete = _extract_lora_pairs(raw_tensors, config)
     modules = dict(transformer.named_modules())
-    wrappers: Dict[str, List[_RuntimeLoRAAdapter]] = {}
+    targets: Dict[str, List[_RuntimeLoRAAdapter]] = {}
     skipped_non_targets = 0
 
     strip_prefixes = _dedupe_prefixes(
@@ -249,7 +249,7 @@ def apply_runtime_lora(
             continue
 
         if fused_suffix is None:
-            wrappers.setdefault(target_name, []).append(
+            targets.setdefault(target_name, []).append(
                 _RuntimeLoRAAdapter(pair.a, pair.b, pair.scale)
             )
         else:
@@ -262,16 +262,18 @@ def apply_runtime_lora(
         output_start = 0
         for suffix in _QKV_SUFFIXES:
             pair = parts[suffix]
-            wrappers.setdefault(target_name, []).append(
+            targets.setdefault(target_name, []).append(
                 _RuntimeLoRAAdapter(pair.a, pair.b, pair.scale, output_start=output_start)
             )
             output_start += pair.b.shape[0]
 
     applied_modules: List[str] = []
-    for module_name, adapters in wrappers.items():
+    for module_name, adapters in targets.items():
         base_module = modules[module_name]
         if isinstance(base_module, RuntimeLoRALinear):
             raise ValueError(f"Runtime LoRA target '{module_name}' is already wrapped")
+        if getattr(base_module, "_trtllm_runtime_lora_fused", False):
+            raise ValueError(f"Runtime LoRA target '{module_name}' is already fused")
         if not _is_linear_like(base_module):
             if config.strict:
                 raise ValueError(
@@ -282,13 +284,12 @@ def apply_runtime_lora(
             continue
 
         try:
-            wrapper = RuntimeLoRALinear(base_module, adapters, module_name=module_name)
+            _fuse_lora_into_linear(base_module, adapters, module_name)
         except (RuntimeError, ValueError):
             if config.strict:
                 raise
             skipped_non_targets += len(adapters)
             continue
-        _set_submodule(transformer, module_name, wrapper)
         applied_modules.append(module_name)
 
     if not applied_modules and raise_on_no_matches and config.strict:
@@ -298,7 +299,7 @@ def apply_runtime_lora(
         )
 
     logger.info(
-        f"Runtime LoRA loaded from {config.path}: applied={len(applied_modules)}, "
+        f"Runtime LoRA fused from {config.path}: applied={len(applied_modules)}, "
         f"skipped_non_targets={skipped_non_targets}, skipped_incomplete={skipped_incomplete}"
     )
     return RuntimeLoRAApplication(
@@ -306,6 +307,171 @@ def apply_runtime_lora(
         applied_modules=tuple(applied_modules),
         skipped_non_targets=skipped_non_targets,
         skipped_incomplete=skipped_incomplete,
+    )
+
+
+def _fuse_lora_into_linear(
+    base_layer: nn.Module,
+    adapters: Iterable[_RuntimeLoRAAdapter],
+    module_name: str,
+) -> None:
+    weight = getattr(base_layer, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.is_meta:
+        raise ValueError(f"Runtime LoRA target '{module_name}' has no loaded weight tensor")
+    if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError(
+            f"Runtime LoRA target '{module_name}' cannot fuse into weight dtype {weight.dtype}"
+        )
+
+    in_features = int(getattr(base_layer, "in_features", 0))
+    out_features = int(getattr(base_layer, "out_features", 0))
+    device = weight.device
+    prepared_deltas: List[Tuple[_RuntimeLoRAAdapter, torch.Tensor]] = []
+    with torch.no_grad():
+        for adapter in adapters:
+            local_adapter = _shard_adapter(base_layer, adapter, module_name, device)
+            _validate_adapter_for_fusion(
+                local_adapter, module_name, in_features, out_features
+            )
+            delta = _compute_lora_weight_delta(local_adapter, device, weight.dtype)
+            prepared_delta = _prepare_lora_delta_for_weight(
+                weight, delta, local_adapter, module_name
+            )
+            _validate_lora_delta_for_weight(
+                weight, prepared_delta, local_adapter, module_name
+            )
+            prepared_deltas.append((local_adapter, prepared_delta))
+        for local_adapter, delta in prepared_deltas:
+            _add_lora_delta_to_weight(weight, delta, local_adapter, module_name)
+    setattr(base_layer, "_trtllm_runtime_lora_fused", True)
+
+
+def _validate_adapter_for_fusion(
+    adapter: _RuntimeLoRAAdapter,
+    module_name: str,
+    in_features: int,
+    out_features: int,
+) -> None:
+    if adapter.a.ndim != 2 or adapter.b.ndim != 2:
+        raise ValueError(
+            f"Runtime LoRA target '{module_name}' requires 2D A/B tensors, "
+            f"got A={tuple(adapter.a.shape)}, B={tuple(adapter.b.shape)}"
+        )
+    if adapter.a.shape[0] != adapter.b.shape[1]:
+        raise ValueError(
+            f"Runtime LoRA rank mismatch for '{module_name}': "
+            f"A rank {adapter.a.shape[0]} != B rank {adapter.b.shape[1]}"
+        )
+    if adapter.a.shape[1] != in_features:
+        raise ValueError(
+            f"Runtime LoRA input mismatch for '{module_name}': "
+            f"A has {adapter.a.shape[1]} columns, layer expects {in_features}"
+        )
+
+    if adapter.output_start is None:
+        if adapter.b.shape[0] != out_features:
+            raise ValueError(
+                f"Runtime LoRA output mismatch for '{module_name}': "
+                f"B has {adapter.b.shape[0]} rows, expected {out_features}"
+            )
+        return
+
+    if adapter.output_start < 0 or adapter.output_end is None:
+        raise ValueError(f"Invalid Runtime LoRA output span for '{module_name}'")
+    if adapter.output_end > out_features:
+        raise ValueError(
+            f"Runtime LoRA output span for '{module_name}' exceeds layer output: "
+            f"end={adapter.output_end}, out_features={out_features}"
+        )
+
+
+def _compute_lora_weight_delta(
+    adapter: _RuntimeLoRAAdapter,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    a = adapter.a.to(device=device, dtype=dtype)
+    b = adapter.b.to(device=device, dtype=dtype)
+    return torch.matmul(b, a).mul_(float(adapter.scale))
+
+
+def _add_lora_delta_to_weight(
+    weight: torch.Tensor,
+    delta: torch.Tensor,
+    adapter: _RuntimeLoRAAdapter,
+    module_name: str,
+) -> None:
+    target = _lora_weight_target(weight, adapter, module_name)
+    _validate_lora_delta_shape(delta, target, adapter, module_name)
+    target.add_(delta)
+
+
+def _prepare_lora_delta_for_weight(
+    weight: torch.Tensor,
+    delta: torch.Tensor,
+    adapter: _RuntimeLoRAAdapter,
+    module_name: str,
+) -> torch.Tensor:
+    if weight.ndim == 2:
+        return delta
+    if weight.ndim == 3 and weight.shape[0] == 1:
+        return delta.t().unsqueeze(0)
+
+    raise ValueError(
+        f"Runtime LoRA target '{module_name}' has unsupported weight shape "
+        f"{tuple(weight.shape)}"
+    )
+
+
+def _validate_lora_delta_for_weight(
+    weight: torch.Tensor,
+    delta: torch.Tensor,
+    adapter: _RuntimeLoRAAdapter,
+    module_name: str,
+) -> None:
+    target = _lora_weight_target(weight, adapter, module_name)
+    _validate_lora_delta_shape(delta, target, adapter, module_name)
+
+
+def _lora_weight_target(
+    weight: torch.Tensor,
+    adapter: _RuntimeLoRAAdapter,
+    module_name: str,
+) -> torch.Tensor:
+    output_start = adapter.output_start
+    output_end = adapter.output_end
+    if weight.ndim == 2:
+        if output_start is None:
+            return weight
+        return weight[output_start:output_end, :]
+
+    if weight.ndim == 3 and weight.shape[0] == 1:
+        if output_start is None:
+            return weight
+        return weight[:, :, output_start:output_end]
+
+    raise ValueError(
+        f"Runtime LoRA target '{module_name}' has unsupported weight shape "
+        f"{tuple(weight.shape)}"
+    )
+
+
+def _validate_lora_delta_shape(
+    delta: torch.Tensor,
+    target: torch.Tensor,
+    adapter: _RuntimeLoRAAdapter,
+    module_name: str,
+) -> None:
+    if delta.shape == target.shape:
+        return
+    if adapter.output_start is None:
+        raise ValueError(
+            f"Runtime LoRA delta shape mismatch for '{module_name}': "
+            f"delta={tuple(delta.shape)}, weight={tuple(target.shape)}"
+        )
+    raise ValueError(
+        f"Runtime LoRA fused span mismatch for '{module_name}': "
+        f"delta={tuple(delta.shape)}, span={tuple(target.shape)}"
     )
 
 

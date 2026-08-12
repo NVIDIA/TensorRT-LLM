@@ -442,7 +442,8 @@ class BasePipeline(nn.Module):
             total_applied += len(application.applied_modules)
             if application.applied_modules:
                 logger.info(
-                    f"Runtime LoRA applied to {component_name}: {list(application.applied_modules)}"
+                    f"Runtime LoRA fused into {component_name}: "
+                    f"{list(application.applied_modules)}"
                 )
 
         if total_applied == 0 and runtime_lora.strict:

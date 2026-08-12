@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
-from tensorrt_llm._torch.visual_gen.runtime_lora import RuntimeLoRALinear, apply_runtime_lora
+from tensorrt_llm._torch.visual_gen.runtime_lora import apply_runtime_lora
 from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
 
 
@@ -23,7 +23,24 @@ class TinyAttention(nn.Module):
         self.attn.qkv_proj = nn.Linear(2, 9, bias=False)
 
 
-def test_runtime_lora_adds_forward_delta_without_mutating_base_weight(tmp_path):
+class TinyTritonLikeLinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_features = 2
+        self.out_features = 3
+        self.weight = nn.Parameter(torch.zeros(1, 2, 3), requires_grad=False)
+
+    def forward(self, x):
+        return x @ self.weight.squeeze(0)
+
+
+class TinyTritonTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = TinyTritonLikeLinear()
+
+
+def test_runtime_lora_fuses_delta_into_weight(tmp_path):
     model = TinyTransformer()
     with torch.no_grad():
         model.proj.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]))
@@ -42,13 +59,13 @@ def test_runtime_lora_adds_forward_delta_without_mutating_base_weight(tmp_path):
     report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
     assert report.applied_modules == ("proj",)
-    assert isinstance(model.proj, RuntimeLoRALinear)
-    torch.testing.assert_close(model.proj.base_layer.weight, original_weight)
+    expected_weight = original_weight + torch.tensor(
+        [[0.5, 1.0], [1.0, 2.0], [1.5, 3.0]]
+    )
+    torch.testing.assert_close(model.proj.weight, expected_weight)
 
     x = torch.tensor([[3.0, 4.0]])
-    base = x @ original_weight.T
-    lora_inner = x @ torch.tensor([[1.0], [2.0]])
-    expected = base + lora_inner @ torch.tensor([[0.5, 1.0, 1.5]])
+    expected = x @ expected_weight.T
     torch.testing.assert_close(model.proj(x), expected)
 
 
@@ -114,9 +131,88 @@ def test_runtime_lora_fuses_qkv_segments(tmp_path):
     report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
 
     assert report.applied_modules == ("attn.qkv_proj",)
+    torch.testing.assert_close(
+        model.attn.qkv_proj.weight,
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 0.0],
+                [2.0, 0.0],
+                [2.0, 0.0],
+                [3.0, 0.0],
+                [3.0, 0.0],
+                [3.0, 0.0],
+            ]
+        ),
+    )
     out = model.attn.qkv_proj(torch.tensor([[5.0, 7.0]]))
     expected = torch.tensor([[5.0, 5.0, 5.0, 10.0, 10.0, 10.0, 15.0, 15.0, 15.0]])
     torch.testing.assert_close(out, expected)
+
+
+def test_runtime_lora_fuses_triton_weight_layout(tmp_path):
+    model = TinyTritonTransformer()
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+            "proj.lora_B.weight": torch.tensor([[0.5], [1.0], [1.5]]),
+        },
+        str(lora_path),
+    )
+
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+    assert report.applied_modules == ("proj",)
+    expected_weight = torch.tensor([[[0.5, 1.0, 1.5], [1.0, 2.0, 3.0]]])
+    torch.testing.assert_close(model.proj.weight, expected_weight)
+    torch.testing.assert_close(
+        model.proj(torch.tensor([[3.0, 4.0]])),
+        torch.tensor([[5.5, 11.0, 16.5]]),
+    )
+
+
+def test_runtime_lora_rejects_double_fusion(tmp_path):
+    model = TinyTransformer()
+    with torch.no_grad():
+        model.proj.weight.zero_()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+            "proj.lora_B.weight": torch.tensor([[0.5], [1.0], [1.5]]),
+        },
+        str(lora_path),
+    )
+
+    apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+    fused_weight = model.proj.weight.detach().clone()
+
+    with pytest.raises(ValueError, match="already fused"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+    torch.testing.assert_close(model.proj.weight, fused_weight)
+
+
+def test_runtime_lora_shape_failure_does_not_mutate_weight(tmp_path):
+    model = TinyAttention()
+    with torch.no_grad():
+        model.attn.qkv_proj.weight.fill_(2.0)
+    original_weight = model.attn.qkv_proj.weight.detach().clone()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    tensors = {}
+    for suffix, value in (("to_q", 1.0), ("to_k", 2.0), ("to_v", 3.0)):
+        tensors[f"attn.{suffix}.lora_A.weight"] = torch.ones(1, 2)
+        rows = 4 if suffix == "to_v" else 3
+        tensors[f"attn.{suffix}.lora_B.weight"] = torch.full((rows, 1), value)
+    save_file(tensors, str(lora_path))
+
+    with pytest.raises(ValueError, match="output span"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+    torch.testing.assert_close(model.attn.qkv_proj.weight, original_weight)
 
 
 def test_runtime_lora_raises_when_no_modules_match(tmp_path):
