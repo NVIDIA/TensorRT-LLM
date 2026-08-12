@@ -40,6 +40,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     _build_swiglu_oai_dense_mlp,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
+    _validate_sparse_attention_runtime_config,
     _wrap_dict_as_config,
     get_moe_layer_ids,
     get_sparse_disable_index_value_layer_ids,
@@ -53,6 +54,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,31 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "sparse_attention_config",
+    [None, SimpleNamespace(algorithm="rocket")],
+)
+def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
+    sparse_attention_config,
+):
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=sparse_attention_config,
+    )
+
+    with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
+        _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_validate_sparse_attention_runtime_config_accepts_minimax_m3():
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+    )
+
+    _validate_sparse_attention_runtime_config(model_config)
 
 
 def _make_text_config():
