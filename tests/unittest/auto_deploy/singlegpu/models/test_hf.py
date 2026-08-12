@@ -93,6 +93,7 @@ def mock_factory():
         yield factory
 
 
+@pytest.mark.cpu_only
 def test_recursive_update_config(mock_factory):
     """Test that _recursive_update_config correctly updates a config object recursively."""
     # Get the mocked factory instance
@@ -150,6 +151,7 @@ def test_recursive_update_config(mock_factory):
     assert config.text_config.rope_scaling["type"] == "linear"
 
 
+@pytest.mark.cpu_only
 def test_register_custom_model_cls():
     config_cls_name = "FooConfig"
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
@@ -169,6 +171,7 @@ class FooConfig:
     pass
 
 
+@pytest.mark.cpu_only
 def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock_factory):
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM, __name__="FooModel")
     AutoModelForCausalLMFactory.register_custom_model_cls(
@@ -186,6 +189,7 @@ def test_build_model_raises_when_custom_model_cls_does_not_have_from_config(mock
         mock_factory.build_model(device="meta")
 
 
+@pytest.mark.cpu_only
 def test_build_model_uses_custom_model_cls_from_config(mock_factory):
     custom_model_cls = MagicMock(spec=AutoModelForCausalLM)
     custom_model_cls.configure_mock(_from_config=MagicMock(side_effect=MyError))
@@ -204,6 +208,7 @@ def test_build_model_uses_custom_model_cls_from_config(mock_factory):
         mock_factory.build_model(device="meta")
 
 
+@pytest.mark.cpu_only
 def test_custom_model_mapping_in_parent_does_not_affect_children():
     class Child(AutoModelForCausalLMFactory):
         pass
@@ -217,6 +222,7 @@ def test_custom_model_mapping_in_parent_does_not_affect_children():
     assert Child._custom_model_mapping == {}
 
 
+@pytest.mark.cpu_only
 def test_custom_model_mapping_in_parent_does_not_affect_parent():
     class Child(AutoModelForCausalLMFactory):
         pass

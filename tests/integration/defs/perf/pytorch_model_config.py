@@ -291,16 +291,6 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Model-specific cases with attention_dp disabled to prevent hangs
-        {
-            'patterns': [
-                'deepseek_r1_distill_llama_70b',
-            ],
-            'config': {
-                # True causes hang, needs model-specific fix.
-                'enable_attention_dp': False,
-            }
-        },
         # Qwen3 models with fp4 quantization on B200 and fp8 quantization on H200/H20
         {
             'patterns': [
@@ -321,6 +311,17 @@ def get_model_yaml_config(model_label: str,
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
+                },
+            }
+        },
+        # Qwen3.5-9B hybrid GDN: V2 KV/SSM pool split needs the real seq len.
+        {
+            'patterns': [
+                'qwen3.5_9b-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:500,2000',
+            ],
+            'config': {
+                'kv_cache_config': {
+                    'avg_seq_len': 2500,
                 },
             }
         },

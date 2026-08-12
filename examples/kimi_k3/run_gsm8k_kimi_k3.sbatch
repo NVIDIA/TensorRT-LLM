@@ -10,9 +10,15 @@
 #       --model /path/to/kimi-k3-checkpoint \
 #       --image /path/to/tensorrt-llm-container.sqsh
 #
+# Pass --sa to evaluate with suffix-automaton (SA) speculative decoding
+# (selects eval_extra_llm_options_sa.yaml, which carries the SA-required
+# max_batch_size of 8).
+#
 # Pass --reuse to additionally enable KV-cache block reuse
 # (eval_extra_llm_options_reuse.yaml); chunked prefill is enabled by
 # default.
+#
+# --sa and --reuse are mutually exclusive.
 #
 # REPO defaults to the submit directory (override by exporting REPO), and
 # must contain the built TensorRT-LLM checkout. The #SBATCH partition and
@@ -32,16 +38,19 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--reuse]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--sa | --reuse]"
 }
 
 MODEL=""
 CONTAINER_IMAGE=""
 MODE=default
+# Speculative-decoding acceptance stats: on for --sa, off otherwise.
+SPEC_STATS_DEFAULT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --reuse)
-            MODE=reuse
+        --sa|--reuse)
+            [[ "$MODE" == default ]] || { echo "error: --sa and --reuse are mutually exclusive" >&2; usage >&2; exit 2; }
+            MODE=${1#--}
             shift
             ;;
         --model)
@@ -84,8 +93,14 @@ REPO=${REPO:-$SLURM_SUBMIT_DIR}
 # Per-mode LLM options. All engine options live in the selected yaml
 # (single source of truth); trtllm-eval lets explicit CLI flags override
 # --config, so none are duplicated here.
+# - sa: suffix-automaton speculative decoding, which needs its own LLM
+#   options (overlap scheduler off, max_batch_size 8; see the yaml).
 # - reuse: KV-cache block reuse (enable_block_reuse: true in the yaml).
 case "$MODE" in
+    sa)
+        EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_sa.yaml
+        SPEC_STATS_DEFAULT=1
+        ;;
     reuse)
         EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_reuse.yaml
         ;;
@@ -143,6 +158,10 @@ srun --mpi=pmix \
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
         # Cap in-flight requests: may cost some throughput vs submit-all, but yields steady partial scores (early failure signal) instead of one burst at the end (0 = off).
         export TLLM_EVAL_MAX_IN_FLIGHT=\"\${TLLM_EVAL_MAX_IN_FLIGHT:-0}\"
+        # Speculative-decoding acceptance summary (acceptance length /
+        # rate) at eval end; on by default for --sa, off otherwise (an
+        # explicit env value still wins either way).
+        export TLLM_EVAL_SPEC_STATS=\"\${TLLM_EVAL_SPEC_STATS:-$SPEC_STATS_DEFAULT}\"
 
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;

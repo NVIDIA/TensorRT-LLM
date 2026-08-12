@@ -26,6 +26,9 @@ block, so config parity is by construction rather than by copying values.
 
 import json
 import os
+import shlex
+from collections.abc import Mapping
+from typing import Any
 
 # Optional per-yaml overrides live under a `cache_transceiver_precheck:` block.
 PRECHECK_DEFAULTS = {
@@ -61,8 +64,9 @@ PRECHECK_DEFAULTS = {
     "verify_data": True,
 }
 
-# Fallback KV shape when the model directory cannot be resolved: the precheck
-# still exercises the exact network path, just with a synthetic cache shape.
+# Fallback KV shape for dry-runs and explicitly selected manager versions when
+# the model directory cannot be resolved. Manager-version "auto" resolution
+# fails fast instead of silently pairing this shape with V1.
 FALLBACK_KV_SHAPE = {
     "num_layers": 32,
     "num_kv_heads": 8,
@@ -127,17 +131,8 @@ def default_step_timeout_s(max_world):
     return 900 + wireup_timeout_s(max_world)
 
 
-def precheck_prefix_lines(
-    cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world, stage_name=""
-):
-    """Launch-script export lines wiring the precheck gate.
-
-    Single owner of the enable/kill-switch policy, the step-timeout default,
-    and the export names the gate consumes — shared by
-    jenkins/scripts/perf/submit.py and jenkins/scripts/perf/local/submit.py.
-    `config_path_expr` and the env-var references are launch-script-side
-    expressions ($llmSrcNode etc.), expanded at sbatch runtime.
-    """
+def precheck_enabled(cfg):
+    """Resolve the shared yaml/environment enable policy."""
     knobs = cfg.get("cache_transceiver_precheck", {}) or {}
     # Off by default until the gate is validated on the post-merge stages
     # (the precheck is a launch-script gate, not a pytest case, so it cannot
@@ -160,6 +155,42 @@ def precheck_prefix_lines(
             )
     else:
         enabled = bool(knobs.get("enabled", False))
+    return enabled
+
+
+def precheck_prefix_lines(
+    cfg: Mapping[str, Any],
+    benchmark_mode: str,
+    config_path_expr: str,
+    ucx_tls_cmd: str,
+    max_world: int,
+    stage_name: str = "",
+    llm_models_root: str | None = None,
+) -> list[str]:
+    """Launch-script export lines wiring the precheck gate.
+
+    Single owner of the enable/kill-switch policy, the step-timeout default,
+    and the export names the gate consumes — shared by
+    jenkins/scripts/perf/submit.py and jenkins/scripts/perf/local/submit.py.
+
+    Args:
+        cfg: Parsed perf-sanity YAML configuration.
+        benchmark_mode: Precheck benchmark mode passed to the driver.
+        config_path_expr: Launch-script expression resolving the YAML path,
+            expanded at sbatch runtime along with its environment references.
+        ucx_tls_cmd: Shell prefix selecting the UCX transports.
+        max_world: Largest role world size, used to derive the step timeout.
+        stage_name: Optional stage name for the synthetic JUnit report.
+        llm_models_root: Model-root path exported when the precheck is enabled.
+
+    Returns:
+        Generated launch-script export lines shared by both submit modules.
+
+    Raises:
+        ValueError: If the precheck is enabled without a nonempty model root.
+    """
+    knobs = cfg.get("cache_transceiver_precheck", {}) or {}
+    enabled = precheck_enabled(cfg)
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
@@ -178,6 +209,12 @@ def precheck_prefix_lines(
         f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS {cmd} --role ctx"',
         f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS {cmd} --role gen"',
     ]
+    if enabled:
+        if not llm_models_root:
+            raise ValueError("enabled cache-transceiver precheck requires LLM_MODELS_ROOT")
+        # Keep this as a top-level assignment. shlex.quote() is not safe when
+        # nested inside the double-quoted pytestCommand exports below.
+        lines.insert(0, f"export LLM_MODELS_ROOT={shlex.quote(llm_models_root)}")
     if stage_name:
         # Suite name for the synthetic junit xml the gate writes on failure
         # (absent -> the gate falls back to $SLURM_JOB_NAME).
@@ -307,8 +344,8 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         plan[f"{role}_kv_dtype"] = str(kv_cfg.get("dtype", "auto"))
         # Tri-state, matching KvCacheConfig's pydantic default: explicit
         # True/False from the yaml wins; absent means "auto", which the
-        # driver resolves against the model class's get_model_defaults() at
-        # runtime — exactly like serving (_resolve_kv_cache_manager_v2_auto).
+        # driver resolves against the model class's manager preference at
+        # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
         plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan
