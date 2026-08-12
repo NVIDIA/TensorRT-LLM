@@ -83,9 +83,10 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     import atexit
     import configparser
     import threading
+    import time
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cbts_pystart import PyStartTracker
+    from cbts_pystart import PyStartTracker, _product_imports_settled
 
     _CONFIG = os.getenv("CBTS_COVERAGE_CONFIG")
 
@@ -165,6 +166,30 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
     _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
 
+    try:
+        _WORKER_IMPORT_MAX_SECONDS = max(
+            1.0, float(os.environ.get("CBTS_WORKER_ACTIVATE_MAX_SECONDS", "120"))
+        )
+    except ValueError:
+        _WORKER_IMPORT_MAX_SECONDS = 120.0
+    # Product top-level import names taken from the coverage source roots (e.g. "tensorrt_llm").
+    _product_tops = {os.path.basename(p.rstrip("/")) for p in _src if p}
+
+    def _wait_for_product_imports():
+        """Wait until the worker's product import chain settles, bounded by the activation deadline."""
+        deadline = time.monotonic() + _WORKER_IMPORT_MAX_SECONDS
+        settled_since = None
+        step = 0.5
+        while not _stop_event.is_set() and time.monotonic() < deadline:
+            if _product_imports_settled(_product_tops):
+                if settled_since is None:
+                    settled_since = time.monotonic()
+                elif time.monotonic() - settled_since >= 1.0:
+                    return
+            else:
+                settled_since = None
+            _stop_event.wait(step)
+
     # Subprocesses inherit the current nodeid via CBTS_TEST_ID; the outer pytest re-switches per test via the plugin.
     _initial_nodeid = os.environ.get("CBTS_TEST_ID", "").strip()
     if _initial_nodeid:
@@ -180,31 +205,9 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     if not _defer_worker_activation:
         _tracker.start()
     else:
-        try:
-            _activate_max = max(
-                1.0, float(os.environ.get("CBTS_WORKER_ACTIVATE_MAX_SECONDS", "120"))
-            )
-        except ValueError:
-            _activate_max = 120.0
-        # Product top-level import names taken from the coverage source roots (e.g. "tensorrt_llm").
-        _product_tops = {os.path.basename(p.rstrip("/")) for p in _src if p}
-
-        def _framework_imported():
-            for _name in _product_tops:
-                _mod = sys.modules.get(_name)
-                _spec = getattr(_mod, "__spec__", None) if _mod is not None else None
-                if _mod is not None and not getattr(_spec, "_initializing", False):
-                    return True
-            return False
 
         def _deferred_activate():
-            _waited = 0.0
-            _step = 0.2
-            while not _stop_event.is_set() and _waited < _activate_max:
-                if _framework_imported():
-                    break
-                _stop_event.wait(_step)
-                _waited += _step
+            _wait_for_product_imports()
             if not _stop_event.is_set():
                 _tracker.start()
 
@@ -229,6 +232,13 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     # Every instrumented process saves periodically so its coverage survives a non-clean exit;
     # pool workers in particular lose their atexit save when the pool is torn down at test end.
     def _periodic_save():
+        # Immediate MPI-worker capture starts the tracker before product imports, but saving the
+        # growing import snapshot on that latency-sensitive path can delay the first pool task and
+        # its identity barrier. Keep collecting in memory, then begin the normal save cadence only
+        # after the full product import chain settles. The bounded wait preserves periodic saves for
+        # workers that never import a configured product root.
+        if _is_mpi_pool_worker and not _defer_worker_activation:
+            _wait_for_product_imports()
         while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
             if _frozen():
                 _stop_event.set()
