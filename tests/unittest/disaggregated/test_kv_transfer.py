@@ -215,6 +215,7 @@ def _send_prefill_chunks(
     # Explicit: a MagicMock attribute never compares equal to the chunk start, so
     # _build_prefill_chunk's first-chunk branch would never be exercised.
     req.prepopulated_prompt_len = prepopulated_blocks * tokens_per_block
+    req.py_kv_prefix_sent = False
 
     first_block = min(prepopulated_blocks, total_blocks)
     if chunk_size_blocks is None or chunk_size_blocks >= total_blocks - first_block:
@@ -273,6 +274,7 @@ def test_build_prefill_chunk_projects_incremental_source_against_full_prompt():
     req.prompt_len = prompt_blocks * tokens_per_block
     req.py_beam_width = 1
     req.prepopulated_prompt_len = 0
+    req.py_kv_prefix_sent = False
 
     for chunk_idx in range(2):
         chunk_start = chunk_idx * chunk_blocks
@@ -330,6 +332,7 @@ def test_build_prefill_chunk_normalizes_swa_source_to_computed_prefix(source_blo
     req.prompt_len = prompt_blocks * tokens_per_block
     req.py_beam_width = 1
     req.prepopulated_prompt_len = 0
+    req.py_kv_prefix_sent = False
     req.py_last_context_chunk = (11 * tokens_per_block, 13 * tokens_per_block)
     req.context_remaining_length = 3 * tokens_per_block
     req.is_generation_only_request.return_value = False

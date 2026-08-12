@@ -729,7 +729,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # A ctx-side prefix-reuse hit starts the first chunk at
         # prepopulated_prompt_len, so no chunk covers [0, prepopulated_prompt_len).
         # Those blocks are resident and valid and the generation server still needs
-        # them, so the first slice extends back to block 0. req.is_first_context_chunk
+        # them, so the first slice extends back to block 0 unless the executor
+        # already shipped them as an early prefix slice. req.is_first_context_chunk
         # cannot be used here: it compares context_current_position against
         # prepopulated_prompt_len, and _update_request_states has already advanced the
         # cursor by the time _send_kv_async runs. The recorded chunk start is the
@@ -743,7 +744,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # tail past the boundary; the next chunk rewrites the whole block once it is
         # computed, and per-peer writes are serialized (see Sender._enqueue), so the
         # computed copy always lands last.
-        chunk_start_block = 0 if is_first_chunk else chunk_start_pos // tpb
+        extends_to_prefix = is_first_chunk and not req.py_kv_prefix_sent
+        chunk_start_block = 0 if extends_to_prefix else chunk_start_pos // tpb
         chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
         is_last_chunk = req.context_remaining_length == 0
 
