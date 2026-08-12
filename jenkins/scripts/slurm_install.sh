@@ -28,6 +28,11 @@ slurm_install_setup() {
     : "${resourcePathNode:?resourcePathNode is required}"
     : "${stageName:?stageName is required}"
     : "${pytestCommand:?pytestCommand is required}"
+    # Both are recomputed after the install block below, because the fat sqsh path
+    # points resourcePathNode at the pre-baked tree. Setting them here as well keeps
+    # the lock file that the SLURM_LOCALID != 0 ranks wait on in one directory: the
+    # stale-lock cleanup runs before that block, so without this cd it would look in
+    # whatever directory slurm_run.sh happened to be in.
     cd $resourcePathNode
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
@@ -49,40 +54,49 @@ slurm_install_setup() {
             rm -f "$lock_file"
         fi
 
-        archive_path="$resourcePathNode/$tarName"
-        # Job/node-specific tmp path to avoid collisions on concurrent jobs
-        archive_tmp="${archive_path}.tmp.${SLURM_JOB_ID:-local}.${SLURM_NODEID:-0}"
-        rm -f "$archive_path" "$archive_tmp"
-        # Download the artifact idempotently with retry. A bare "retry_command wget <url>" will
-        # save artifact as $tarName.1 when the first attempt fails in the middle of downloading.
-        # Here we download to the tmp path and only promote it on success
-        if ! retry_command --timeout 1800 bash -c 'wget -nv "$1" -O "$2" && mv -f "$2" "$3"' _ "$llmTarfile" "$archive_tmp" "$archive_path"; then
-            rm -f "$archive_tmp"
-            echo "Artifact download failed after retries: $llmTarfile"
-            return 1
-        fi
-        if [ ! -f "$archive_path" ]; then
-            rm -f "$archive_tmp"
-            echo "Artifact download did not produce $archive_path"
-            return 1
-        fi
-        tar -zxf "$archive_path"
-
-        which python3
-        python3 --version
-        retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-        if [[ $pytestCommand == *--run-ray* ]]; then
-            retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
-            mambaArch=$(uname -m)
-            retry_command --timeout 2700 pip3 install --retries 10 --no-deps \
-                "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl" \
-                "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl"
+        if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
+            # Fat sqsh: source tree and packages are already in the container at /tmp/TensorRT-LLM/.
+            echo "SKIP_INSTALL=1: skipping wget, tar, apt, and pip installs (pre-baked in fat sqsh at /tmp/TensorRT-LLM/)"
+            resourcePathNode=/tmp
+        else
+            cd "$resourcePathNode"
+            archive_path="$resourcePathNode/$tarName"
+            # Job/node-specific tmp path to avoid collisions on concurrent jobs
+            archive_tmp="${archive_path}.tmp.${SLURM_JOB_ID:-local}.${SLURM_NODEID:-0}"
+            rm -f "$archive_path" "$archive_tmp"
+            # Download the artifact idempotently with retry. A bare "retry_command wget <url>" will
+            # save artifact as $tarName.1 when the first attempt fails in the middle of downloading.
+            # Here we download to the tmp path and only promote it on success
+            if ! retry_command --timeout 1800 bash -c 'wget -nv "$1" -O "$2" && mv -f "$2" "$3"' _ "$llmTarfile" "$archive_tmp" "$archive_path"; then
+                rm -f "$archive_tmp"
+                echo "Artifact download failed after retries: $llmTarfile"
+                return 1
+            fi
+            if [ ! -f "$archive_path" ]; then
+                rm -f "$archive_tmp"
+                echo "Artifact download did not produce $archive_path"
+                return 1
+            fi
+            tar -zxf "$archive_path"
+            which python3
+            python3 --version
+            retry_command apt-get install -y libffi-dev
+            if [[ $pytestCommand == *--run-ray* ]]; then
+                retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
+                mambaArch=$(uname -m)
+                retry_command --timeout 2700 pip3 install --retries 10 --no-deps \
+                    "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl" \
+                    "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl"
+            fi
+            retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
+            llmSrcNode=$resourcePathNode/TensorRT-LLM/src
+            retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
+            retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
+            retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         fi
-        retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
-        retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
-        retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
-        retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
+        llmSrcNode=$resourcePathNode/TensorRT-LLM/src
+        cd $resourcePathNode
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
         echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
