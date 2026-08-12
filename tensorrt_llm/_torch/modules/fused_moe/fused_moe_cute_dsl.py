@@ -37,6 +37,7 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import MoERunContext, MoEStaticCapability, require_comm_plan
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -352,6 +353,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
     """
+
+    # ``supports_moe_lora`` is restated because CutlassFusedMoE declares True
+    # and the exact-class comparison it replaces answered False here.
+    # ``supports_dwdp`` is the capability this backend adds. CuteDslB12xFusedMoE
+    # derives from here and needs both, but must spell them out again: setting
+    # the attribute replaces the whole object rather than one field.
+    capabilities = MoEStaticCapability(supports_moe_lora=False,
+                                       supports_dwdp=True)
 
     @classmethod
     def can_implement(
@@ -796,13 +805,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: bool = False,
-        **kwargs,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with CuteDSL backend.
@@ -810,19 +815,18 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         This method encapsulates the core MoE computation logic, handling different
         quantization schemes (fp8_block_scales and nvfp4).
 
-        Args:
-            # Standard MoE interface parameters:
-            x: Input hidden states (may be pre-quantized)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (optional, for certain quantization schemes)
-            moe_output: Pre-allocated MoE output buffer (optional, for NVLINK one-sided backend).
-            enable_alltoall: Whether alltoall communication is enabled.
-
         Returns:
             final_hidden_states tensor.
         """
+        del workspace  # CuteDSL kernels allocate their own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        moe_output = plan.moe_output
+        enable_alltoall = plan.enable_alltoall
+
         # Execute MoE computation
         if self.has_nvfp4:
             weight_view = self._build_local_weight_view()
