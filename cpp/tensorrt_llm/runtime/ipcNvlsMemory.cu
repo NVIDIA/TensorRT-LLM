@@ -73,24 +73,95 @@ public:
     virtual void bcastMemHandle(IpcMemHandle* handle, int root) = 0;
 };
 
+//! McastGroupComm over a subset of the MPI session communicator. Used when the caller did not
+//! supply a collective, i.e. the process is part of an MPI job.
+class MpiSubgroupComm : public tensorrt_llm::runtime::McastGroupComm
+{
+public:
+    explicit MpiSubgroupComm(std::vector<int> const& worldRanks)
+        : mWorldRanks(worldRanks)
+    {
+        MPI_Group worldGroup;
+        MPI_Comm_group(COMM_SESSION, &worldGroup);
+        MPI_Group_incl(worldGroup, static_cast<int>(mWorldRanks.size()), mWorldRanks.data(), &mGroup);
+        MPI_Comm_create_group(COMM_SESSION, mGroup, 0, &mComm);
+        MPI_Group_free(&worldGroup);
+    }
+
+    ~MpiSubgroupComm() override
+    {
+        MPI_Comm_free(&mComm);
+        MPI_Group_free(&mGroup);
+    }
+
+    [[nodiscard]] uint32_t getSize() const override
+    {
+        int size{0};
+        MPI_Comm_size(mComm, &size);
+        return static_cast<uint32_t>(size);
+    }
+
+    [[nodiscard]] uint32_t getRank() const override
+    {
+        int rank{0};
+        MPI_Comm_rank(mComm, &rank);
+        return static_cast<uint32_t>(rank);
+    }
+
+    [[nodiscard]] int getWorldRank() const override
+    {
+        return COMM_SESSION.getRank();
+    }
+
+    void allgather(void const* sendBuf, void* recvBuf, size_t bytes) override
+    {
+        MPI_Allgather(sendBuf, bytes, MPI_BYTE, recvBuf, bytes, MPI_BYTE, mComm);
+    }
+
+    void bcast(void* buf, size_t bytes, int root) override
+    {
+        MPI_Bcast(buf, bytes, MPI_BYTE, root, mComm);
+    }
+
+    void barrier() override
+    {
+        MPI_Barrier(mComm);
+    }
+
+    [[nodiscard]] std::vector<int> getWorldRanks() const override
+    {
+        return mWorldRanks;
+    }
+
+    [[nodiscard]] bool isMpi() const override
+    {
+        return true;
+    }
+
+private:
+    std::vector<int> mWorldRanks;
+    MPI_Group mGroup;
+    MPI_Comm mComm;
+};
+
 class IpcSocketCommunicator : public IpcCommunicator
 {
 public:
-    IpcSocketCommunicator(int world_rank, int group_rank, std::vector<int> group_ranks, MPI_Comm group_comm)
-        : mGroupRank(group_rank)
-        , mGroupRanks(group_ranks)
-        , mGroupComm(group_comm)
+    //! \param worldRank Globally unique id of this process; names its own IPC socket.
+    //! \param groupWorldRanks Globally unique ids of every group member, ordered by group rank;
+    //! used to address the peers' sockets.
+    IpcSocketCommunicator(int worldRank, int groupRank, std::vector<int> groupWorldRanks,
+        std::shared_ptr<tensorrt_llm::runtime::McastGroupComm> groupComm, uint64_t uniqueOpId)
+        : mGroupRank(groupRank)
+        , mGroupWorldRanks(std::move(groupWorldRanks))
+        , mGroupComm(std::move(groupComm))
     {
-        timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        unsigned long seed = ts.tv_sec * 1000000000L + ts.tv_nsec;
-        srand(seed);
-        uint64_t unique_op_id = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
-        MPI_Bcast(&unique_op_id, sizeof(unique_op_id), MPI_BYTE, 0, group_comm);
+        // Every member must derive the same socket namespace, so the root's id wins.
+        mGroupComm->bcast(&uniqueOpId, sizeof(uniqueOpId), 0);
 
         uint32_t volatile abort_flag = 0;
-        mSocket = ncclIpcSocketInit(world_rank, unique_op_id, &abort_flag);
-        MPI_Barrier(group_comm);
+        mSocket = ncclIpcSocketInit(worldRank, uniqueOpId, &abort_flag);
+        mGroupComm->barrier();
     }
 
     ~IpcSocketCommunicator()
@@ -102,35 +173,35 @@ public:
     {
         if (mGroupRank == root)
         {
-            for (size_t i = 0; i < mGroupRanks.size(); ++i)
+            for (size_t i = 0; i < mGroupWorldRanks.size(); ++i)
             {
-                if (i != root)
+                if (static_cast<int>(i) != root)
                 {
-                    ncclIpcSocketSendFd(mSocket, handle->fd, mGroupRanks[i]);
+                    ncclIpcSocketSendFd(mSocket, handle->fd, mGroupWorldRanks[i]);
                 }
             }
-            MPI_Barrier(mGroupComm);
+            mGroupComm->barrier();
         }
         else
         {
-            MPI_Barrier(mGroupComm);
+            mGroupComm->barrier();
             handle->fd = ncclIpcSocketRecvFd(mSocket);
         }
-        MPI_Barrier(mGroupComm);
+        mGroupComm->barrier();
     }
 
 private:
     int mGroupRank;
-    std::vector<int> mGroupRanks;
-    MPI_Comm mGroupComm;
+    std::vector<int> mGroupWorldRanks;
+    std::shared_ptr<tensorrt_llm::runtime::McastGroupComm> mGroupComm;
     std::shared_ptr<NcclIpcSocket> mSocket;
 };
 
 class IpcFabricCommunicator : public IpcCommunicator
 {
 public:
-    IpcFabricCommunicator(MPI_Comm group_comm)
-        : mGroupComm(group_comm)
+    explicit IpcFabricCommunicator(std::shared_ptr<tensorrt_llm::runtime::McastGroupComm> groupComm)
+        : mGroupComm(std::move(groupComm))
     {
     }
 
@@ -138,11 +209,11 @@ public:
 
     void bcastMemHandle(IpcMemHandle* handle, int root) override
     {
-        MPI_Bcast(handle, sizeof(CUmemFabricHandle), MPI_BYTE, root, mGroupComm);
+        mGroupComm->bcast(handle, sizeof(CUmemFabricHandle), root);
     }
 
 private:
-    MPI_Comm mGroupComm;
+    std::shared_ptr<tensorrt_llm::runtime::McastGroupComm> mGroupComm;
 };
 
 // Returns CU_MEM_HANDLE_TYPE_FABRIC when fabric-handle memory can actually be
@@ -250,25 +321,28 @@ static CUmemAllocationHandleType getMemHandleType()
 class NVLSCudaAllocator
 {
 public:
-    static IpcNvlsHandle* allocate(size_t size, std::vector<int> ranks)
+    static IpcNvlsHandle* allocate(
+        size_t size, std::vector<int> ranks, std::shared_ptr<tensorrt_llm::runtime::McastGroupComm> group_comm)
     {
         auto nvls_handle = new IpcNvlsHandle();
 
-        // Create a new communicator for the subset of ranks.
-        MPI_Group world_group, new_group;
-        MPI_Comm new_comm;
-        // Get the group of the world communicator.
-        MPI_Comm_group(COMM_SESSION, &world_group);
-        // Create a new group containing only the ranks we want.
-        MPI_Group_incl(world_group, ranks.size(), ranks.data(), &new_group);
-        // Create a new communicator from the group.
-        MPI_Comm_create_group(COMM_SESSION, new_group, 0, &new_comm);
+        // Without a caller-supplied collective, build one by splitting the MPI session
+        // communicator down to the requested ranks. This is the MPI-launched path.
+        std::shared_ptr<MpiSubgroupComm> owned_mpi_comm;
+        if (group_comm == nullptr)
+        {
+            owned_mpi_comm = std::make_shared<MpiSubgroupComm>(ranks);
+            group_comm = owned_mpi_comm;
+        }
 
-        // Get rank and group rank.
-        int world_rank;
-        int group_rank;
-        MPI_Comm_rank(COMM_SESSION, &world_rank);
-        MPI_Comm_rank(new_comm, &group_rank);
+        TLLM_CHECK_WITH_INFO(group_comm->getSize() == ranks.size(),
+            "[ipcNvlsAllocate] group communicator size (%u) does not match the number of ranks (%zu).",
+            group_comm->getSize(), ranks.size());
+
+        // Globally unique process ids, used only to name the per-process IPC sockets.
+        std::vector<int> const group_world_ranks = group_comm->getWorldRanks();
+        int const group_rank = static_cast<int>(group_comm->getRank());
+        int const world_rank = group_world_ranks[group_rank];
 
         // Get runtime and driver device IDs.
         int device_id;
@@ -327,11 +401,17 @@ public:
         std::shared_ptr<IpcCommunicator> ipc_communicator;
         if (handle_type == CU_MEM_HANDLE_TYPE_FABRIC)
         {
-            ipc_communicator = std::make_shared<IpcFabricCommunicator>(new_comm);
+            ipc_communicator = std::make_shared<IpcFabricCommunicator>(group_comm);
         }
         else
         {
-            ipc_communicator = std::make_shared<IpcSocketCommunicator>(world_rank, group_rank, ranks, new_comm);
+            timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            unsigned long seed = ts.tv_sec * 1000000000L + ts.tv_nsec;
+            srand(seed);
+            uint64_t unique_op_id = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
+            ipc_communicator = std::make_shared<IpcSocketCommunicator>(
+                world_rank, group_rank, group_world_ranks, group_comm, unique_op_id);
         }
 
         // Unicast pointer exchange between ranks.
@@ -342,7 +422,7 @@ public:
         nvls_handle->ipc_uc_vas.resize(ranks.size());
         nvls_handle->ipc_uc_handles.resize(ranks.size());
 
-        for (int i = 0; i < ranks.size(); i++)
+        for (int i = 0; i < static_cast<int>(ranks.size()); i++)
         {
             IpcMemHandle peer_ipc_handle = ipc_handle;
             ipc_communicator->bcastMemHandle(&peer_ipc_handle, i);
@@ -395,10 +475,11 @@ public:
         CUCHECK(cuMemSetAccess(nvls_handle->mc_va, size, &access_desc, 1 /* count */));
         nvls_handle->mc_ptr = reinterpret_cast<uintptr_t>((void*) nvls_handle->mc_va);
 
-        // Clean up
-        MPI_Group_free(&new_group);
-        MPI_Group_free(&world_group);
-        MPI_Comm_free(&new_comm);
+        // No rank may return before every peer has finished binding and mapping the multicast
+        // object: callers start signalling through this memory right away (the GEMM-AllReduce
+        // kernels put their tile barriers here), and a rank still setting up would have those
+        // writes land in a region it has not initialized yet.
+        group_comm->barrier();
 
         return nvls_handle;
     }
@@ -547,25 +628,31 @@ bool ipcNvlsFabricUsable()
 
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
 {
+    return ipcNvlsAllocate(size, std::move(group), nullptr);
+}
+
+IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group, std::shared_ptr<McastGroupComm> group_comm)
+{
 #if ENABLE_MULTI_DEVICE
     TLLM_CHECK_WITH_INFO(ipcNvlsSupported(), "Switch multicast is not supported on this system.");
     TLLM_CHECK(size > 0);
     TLLM_CHECK(group.size() >= 2);
 
     std::vector<int> ranks(group.begin(), group.end());
-    int group_size = ranks.size();
 
-    MPI_Comm mpi_comm = COMM_SESSION;
+#if ENABLE_NVSHMEM
+    TLLM_CHECK_WITH_INFO(group_comm == nullptr || group_comm->isMpi(),
+        "[ipcNvlsAllocate] the NVSHMEM build requires an MPI communicator; a ProcessGroup-backed "
+        "collective is not supported.");
 
     // Create a new communicator with only the ranks in the group
     MPI_Group world_group, new_group;
-    MPI_Comm_group(mpi_comm, &world_group);
-    MPI_Group_incl(world_group, group_size, ranks.data(), &new_group);
+    MPI_Comm_group(COMM_SESSION, &world_group);
+    MPI_Group_incl(world_group, static_cast<int>(ranks.size()), ranks.data(), &new_group);
 
     MPI_Comm new_comm;
-    MPI_Comm_create_group(mpi_comm, new_group, 0, &new_comm);
+    MPI_Comm_create_group(COMM_SESSION, new_group, 0, &new_comm);
 
-#if ENABLE_NVSHMEM
     // Initialize NVSHMEM with the new communicator
     nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
     attr.mpi_comm = &new_comm;
@@ -580,24 +667,26 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
     handle->size = size;
     handle->uc_ptr = reinterpret_cast<uintptr_t>(ptr);
     handle->mc_ptr = reinterpret_cast<uintptr_t>(nvshmemx_mc_ptr(NVSHMEM_TEAM_WORLD, ptr));
-    for (int i = 0; i < ranks.size(); i++)
+    for (size_t i = 0; i < ranks.size(); i++)
     {
         handle->ipc_uc_ptrs.push_back(reinterpret_cast<uintptr_t>(nvshmem_ptr(ptr, i)));
     }
-#else // !ENABLE_NVSHMEM
-    auto handle = NVLSCudaAllocator::allocate(size, ranks);
-#endif
 
     TLLM_LOG_INFO("Rank %d NVLS allocate %zu bytes, uc_ptr:%p mc_ptr:%p", COMM_SESSION.getRank(), size,
         (void*) handle->uc_ptr, (void*) handle->mc_ptr);
 
-    // Cleanup
     MPI_Group_free(&new_group);
     MPI_Group_free(&world_group);
-
     MPI_Barrier(new_comm);
-
     MPI_Comm_free(&new_comm);
+#else  // !ENABLE_NVSHMEM
+    // allocate() builds an MPI subgroup itself when group_comm is null, so the whole path stays
+    // free of MPI when a ProcessGroup-backed collective is supplied.
+    auto handle = NVLSCudaAllocator::allocate(size, ranks, group_comm);
+
+    TLLM_LOG_INFO("NVLS allocate %zu bytes, uc_ptr:%p mc_ptr:%p", size, (void*) handle->uc_ptr, (void*) handle->mc_ptr);
+
+#endif // ENABLE_NVSHMEM
 
     return handle;
 #else
