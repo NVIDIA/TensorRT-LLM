@@ -442,10 +442,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.info(f"trtllm/{self.generator.llm_id} is registered")
 
             if self.disagg_cluster_config:
-                # Off the loop for the same reason: constructing the storage
-                # client dials the cluster backend.
-                self.disagg_cluster_storage = await asyncio.to_thread(
-                    create_cluster_storage_client,
+                # Deliberately ON the event loop, unlike the etcd put above.
+                # HttpClusterStorageClient.__init__ constructs an
+                # aiohttp.ClientSession, which binds to the running loop at
+                # construction; building it on a worker thread leaves it bound
+                # to no loop and every later request fails. It is also not the
+                # kind of call that needs offloading -- the constructor only
+                # builds objects, it does not dial the backend.
+                self.disagg_cluster_storage = create_cluster_storage_client(
                     self.disagg_cluster_config.cluster_uri,
                     self.disagg_cluster_config.cluster_name)
                 self.disagg_cluster_worker = DisaggClusterWorker(
