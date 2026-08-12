@@ -1140,17 +1140,25 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp and getattr(
-                self._kv_cache_manager_cls, 'supports_shared_draft_layers',
-                True):
-            # Under attention DP, draft layers share the target manager (the
-            # layout existing deployments were validated with). A manager can
-            # opt out: MiniMax-M3's coalesces an index-K pool into its KV
-            # pages and exposes only synthetic AttentionOp tensors, which the
-            # dense Eagle3 drafter cannot attend against, so it requires the
-            # separate draft manager even under attention DP.
-            logger.info("Attention DP: draft layers share the target KV "
-                        "cache manager.")
+        if getattr(self._kv_cache_manager_cls, 'supports_shared_draft_layers',
+                   True):
+            # Draft layers live in the target manager's blocks whenever the
+            # manager supports it. Sharing is what lets the drafter's KV take
+            # part in prefix reuse: with a separate manager the reused prefix
+            # is never recomputed, so the drafter enters generation blind over
+            # it and loses acceptance (measured -7.5% on a reuse-heavy
+            # workload, identically for a 64-KV-head and a 4-KV-head Eagle3
+            # head -- see the PR description).
+            #
+            # This used to be gated on attention DP, which was the layout
+            # existing deployments had been validated with rather than a
+            # technical requirement; the aggregated non-DP path silently took
+            # the separate manager and paid that acceptance cost. A manager
+            # can still opt out: MiniMax-M3's coalesces an index-K pool into
+            # its KV pages and exposes only synthetic AttentionOp tensors,
+            # which the dense Eagle3 drafter cannot attend against, so it
+            # requires the separate draft manager.
+            logger.info("Draft layers share the target KV cache manager.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
