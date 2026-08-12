@@ -123,7 +123,6 @@ class RocketKVCacheManager(KVCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager=None,
     ):
         requests = super().add_dummy_requests(
@@ -136,7 +135,6 @@ class RocketKVCacheManager(KVCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if prepare_resource:

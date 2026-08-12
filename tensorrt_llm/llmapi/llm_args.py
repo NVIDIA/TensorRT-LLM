@@ -1840,8 +1840,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
         "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
 
-    # If set, drafting is allowed to use chain drafter.
-    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
