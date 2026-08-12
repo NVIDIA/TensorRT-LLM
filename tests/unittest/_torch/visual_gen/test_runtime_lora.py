@@ -54,6 +54,7 @@ class TinyTritonTransformer(nn.Module):
 
 class TinyPipeline(BasePipeline):
     def __init__(self, runtime_lora_config):
+        nn.Module.__init__(self)
         self._runtime_lora_applications = []
         self.pipeline_config = MagicMock()
         self.pipeline_config.runtime_lora = runtime_lora_config
@@ -220,6 +221,24 @@ def test_runtime_lora_fuses_qkv_segments(tmp_path):
     torch.testing.assert_close(out, expected)
 
 
+def test_runtime_lora_rejects_mismatched_qkv_total_span(tmp_path):
+    model = TinyAttention()
+    with torch.no_grad():
+        model.attn.qkv_proj.weight.fill_(2.0)
+    original_weight = model.attn.qkv_proj.weight.detach().clone()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    tensors = {}
+    for suffix, rows in (("to_q", 3), ("to_k", 2), ("to_v", 3)):
+        tensors[f"attn.{suffix}.lora_A.weight"] = torch.ones(1, 2)
+        tensors[f"attn.{suffix}.lora_B.weight"] = torch.ones(rows, 1)
+    save_file(tensors, str(lora_path))
+
+    with pytest.raises(ValueError, match="fused-QKV spans"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+    torch.testing.assert_close(model.attn.qkv_proj.weight, original_weight)
+
+
 def test_runtime_lora_rejects_incomplete_qkv_in_strict_mode(tmp_path):
     model = TinyAttention()
     lora_path = tmp_path / "adapter.safetensors"
@@ -316,7 +335,7 @@ def test_runtime_lora_shape_failure_does_not_mutate_weight(tmp_path):
         tensors[f"attn.{suffix}.lora_B.weight"] = torch.full((rows, 1), value)
     save_file(tensors, str(lora_path))
 
-    with pytest.raises(ValueError, match="output span"):
+    with pytest.raises(ValueError, match="fused-QKV spans"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
     torch.testing.assert_close(model.attn.qkv_proj.weight, original_weight)
 

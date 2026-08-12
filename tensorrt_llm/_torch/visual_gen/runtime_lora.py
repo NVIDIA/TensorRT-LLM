@@ -119,6 +119,15 @@ def apply_runtime_lora(
             skipped_incomplete += len(parts)
             incomplete_qkv_names.append(target_name)
             continue
+        base_module = modules[target_name]
+        fused_out = int(getattr(base_module, "out_features", 0))
+        total_out = sum(parts[suffix].b.shape[0] for suffix in _QKV_SUFFIXES)
+        if total_out != fused_out:
+            raise ValueError(
+                f"Runtime LoRA fused-QKV spans for '{target_name}' sum to {total_out} "
+                f"but the layer output is {fused_out}. The adapter q/k/v split does "
+                "not match the fused layer; disable fuse_qkv or use a matching adapter."
+            )
         output_start = 0
         for suffix in _QKV_SUFFIXES:
             pair = parts[suffix]
