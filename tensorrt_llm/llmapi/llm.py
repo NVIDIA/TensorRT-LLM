@@ -140,15 +140,34 @@ class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
 
     def __init__(self, *, suppress_token_ids: List[int],
                  begin_suppress_token_ids: List[int]) -> None:
-        self.suppress_token_ids = [int(t) for t in suppress_token_ids or []]
-        self.begin_suppress_token_ids = [
-            int(t) for t in begin_suppress_token_ids or []
-        ]
+        # Stored as tuples so the device-indexed caches below can be keyed on
+        # device alone: the ids cannot be mutated in place, so a cached index
+        # tensor can never fall out of step with the list it was built from.
+        self.suppress_token_ids = tuple(
+            int(t) for t in suppress_token_ids or [])
+        self.begin_suppress_token_ids = tuple(
+            int(t) for t in begin_suppress_token_ids or [])
         # req_id -> prompt length while the begin-suppress window is open, then
         # None once it closes. Don't delete the entry: a missing key would be
         # re-captured at the current length, re-arming begin-suppression
         # mid-sequence.
         self._prompt_len_by_req: Dict[int, Optional[int]] = {}
+        # Indexing logits with a Python sequence rebuilds a CPU index tensor and
+        # blocking-copies it to the device on every call - once per request per
+        # decode step - which serializes the decode loop. Cache the index as a
+        # device tensor instead; one entry per device the processor is used on.
+        self._suppress_idx: Dict[torch.device, torch.Tensor] = {}
+        self._begin_suppress_idx: Dict[torch.device, torch.Tensor] = {}
+
+    @staticmethod
+    def _cached_index(cache: Dict[torch.device,
+                                  torch.Tensor], token_ids: Tuple[int, ...],
+                      device: torch.device) -> torch.Tensor:
+        index = cache.get(device)
+        if index is None:
+            index = torch.tensor(token_ids, dtype=torch.long, device=device)
+            cache[device] = index
+        return index
 
     def __call__(
         self,
@@ -178,10 +197,18 @@ class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
             if logits.dim() > 1 and logits.shape[0] == len(token_ids):
                 target = logits[beam_idx]
             if self.suppress_token_ids:
-                target[..., self.suppress_token_ids] = float("-inf")
+                target.index_fill_(
+                    -1,
+                    self._cached_index(self._suppress_idx,
+                                       self.suppress_token_ids, target.device),
+                    float("-inf"))
             if (prompt_len is not None and self.begin_suppress_token_ids
                     and len(beam_token_ids) == prompt_len):
-                target[..., self.begin_suppress_token_ids] = float("-inf")
+                target.index_fill_(
+                    -1,
+                    self._cached_index(self._begin_suppress_idx,
+                                       self.begin_suppress_token_ids,
+                                       target.device), float("-inf"))
         if prompt_len is not None and len(token_ids[0]) > prompt_len:
             # Begin-suppress window closed; keep the entry as a tombstone.
             self._prompt_len_by_req[req_id] = None
