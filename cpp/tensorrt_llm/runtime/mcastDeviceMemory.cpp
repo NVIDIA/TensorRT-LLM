@@ -17,6 +17,7 @@
 
 // Rest of includes
 #include "mcastDeviceMemory.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -39,6 +40,13 @@ inline size_t roundUp(size_t val, size_t gran)
 
 McastDeviceMemory::McastDeviceMemory(
     size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink, int64_t mpiCommFortranHandle)
+    : McastDeviceMemory(
+        bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle))
+{
+}
+
+McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx,
+    bool mnNvlink, std::shared_ptr<McastGroupComm> groupComm)
     : mIsMNNvlink(mnNvlink)
     , mDeviceIdx(deviceIdx)
     , mGroupSize(groupSize)
@@ -48,12 +56,18 @@ McastDeviceMemory::McastDeviceMemory(
     , mAllocationSize(0)
     , mMcPtr(0)
     , mMcHandle(0)
-#if ENABLE_MULTI_DEVICE
-    , mGroupComm(MPI_Comm_f2c(mpiCommFortranHandle), false)
-#else
-    , mGroupComm(nullptr, false)
-#endif
+    , mGroupComm(std::move(groupComm))
 {
+    TLLM_CHECK_WITH_INFO(mGroupComm != nullptr, "[McastDeviceMemory] group communicator must not be null.");
+    // A mismatch here silently corrupts the handle exchange (each rank would allocate for a
+    // different number of peers), so fail loudly instead.
+    TLLM_CHECK_WITH_INFO(mGroupComm->getSize() == mGroupSize,
+        "[McastDeviceMemory] group communicator size (%u) does not match the requested group size (%u). Under a "
+        "non-MPI orchestrator this usually means the process group passed in does not cover the TP group.",
+        mGroupComm->getSize(), mGroupSize);
+    TLLM_CHECK_WITH_INFO(mGroupComm->getRank() == mGroupRank,
+        "[McastDeviceMemory] group communicator rank (%u) does not match the requested group rank (%u).",
+        mGroupComm->getRank(), mGroupRank);
 
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
     // Check if the device support multicasting
@@ -67,12 +81,11 @@ McastDeviceMemory::McastDeviceMemory(
     // From pytorch implementation for alignment
     constexpr size_t kSignalPadAlignment = 16UL;
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
-    int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
 
     TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, isMultiNode: %d, "
+        "[McastDeviceMemory] World Rank: %d, Group Rank: %u, Group size: %u, isMultiNode: %d, "
         "device_idx: %d, Signal pad offset: %zu",
-        world_rank, mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+        mGroupComm->getWorldRank(), mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
 
     if (mIsMNNvlink)
     {
@@ -160,9 +173,10 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     TLLM_CU_CHECK(cuMemExportToShareableHandle(&myhndl, mUcHandles[mGroupRank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
     // All gather
     cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle));
-    memcpy(exphndl + mGroupRank * sizeof(CUmemFabricHandle), &myhndl, sizeof(CUmemFabricHandle));
-    mGroupComm.allgather(
-        exphndl + mGroupRank * sizeof(CUmemFabricHandle), exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
+    // Send straight from the local handle: the allgather fills every slot of `exphndl`, including
+    // this rank's, and keeping the send buffer disjoint from the receive buffer avoids the aliasing
+    // that MPI_Allgather forbids.
+    mGroupComm->allgather(&myhndl, exphndl, sizeof(CUmemFabricHandle));
     cudaDeviceSynchronize();
 
     for (uint32_t p = 0; p < mGroupSize; p++)
@@ -180,7 +194,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
         TLLM_CU_CHECK(cuMemExportToShareableHandle((void*) fabric_handle, mMcHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
     }
     // Broadcast
-    mGroupComm.bcast(fabric_handle, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR, 0);
+    mGroupComm->bcast(fabric_handle, sizeof(CUmemFabricHandle), 0);
     cudaDeviceSynchronize();
     if (mGroupRank != 0)
     {
@@ -215,11 +229,13 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
 {
-    // Get the world ranks for ranks in this group
-    auto ranks_ = tensorrt_llm::mpi::getWorldRanks(mGroupComm);
+    // Get the globally unique ids of the ranks in this group. ipcNvlsAllocate only uses the set
+    // for its size; peers are addressed by group rank through mGroupComm.
+    auto ranks_ = mGroupComm->getWorldRanks();
     std::set<int> ranks(ranks_.begin(), ranks_.end());
-    // Reuse existing implementation
-    mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks);
+    // Reuse existing implementation, handing it this group's collective so the allocation works
+    // under MPI and non-MPI (Ray) orchestrators alike.
+    mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks, mGroupComm);
     mMcHandle = mNvlsHandle->mc_handle;
     mMcPtr = mNvlsHandle->mc_va;
     mUcPtrs = mNvlsHandle->ipc_uc_vas;

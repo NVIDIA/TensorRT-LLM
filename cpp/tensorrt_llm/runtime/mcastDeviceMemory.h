@@ -17,7 +17,7 @@
 
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/mcastGroupComm.h"
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
@@ -29,9 +29,10 @@ namespace tensorrt_llm::runtime
 
 //! \brief A class that manages multicast device memory for efficient communication between GPUs.
 //!
-//! This class uses IPC-based allocation if mnNvlink is true, otherwise it uses fabric allocation.
-//! The fabric allocation can also be used for single-node/intra-node-only communication, but the machine
-//! must properly configure IMEX services. See:
+//! When mnNvlink is true the group may span nodes, so the memory is shared through fabric handles;
+//! that requires the machine to have IMEX services properly configured. Otherwise the intra-node
+//! NVLS path is used, which shares memory through fabric handles where they are available and
+//! POSIX file descriptors otherwise. See:
 //! https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html
 //!
 //! The class manages both unicast pointers (one per rank) and a single multicast pointer,
@@ -45,6 +46,12 @@ public:
 
     McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink,
         int64_t mpiCommFortranHandle);
+
+    //! \brief Constructor taking an arbitrary host collective backend.
+    //! \param groupComm Collective used to exchange the CUDA memory handles. Its size must match
+    //! \p groupSize and its rank must match \p groupRank.
+    McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink,
+        std::shared_ptr<McastGroupComm> groupComm);
 
     // We don't register the pointer in these two functions since we don't expect any python-level code would call
     // to obtain the raw pointers.
@@ -100,7 +107,7 @@ private:
     CUmemGenericAllocationHandle mMcHandle;
     std::vector<CUmemGenericAllocationHandle> mUcHandles;
 
-    tensorrt_llm::mpi::MpiComm mGroupComm; //!< The MPI communicator for the group
+    std::shared_ptr<McastGroupComm> mGroupComm; //!< Host collective used to exchange memory handles
 
     // Host array of pointers
     std::vector<CUdeviceptr> mUcPtrs;

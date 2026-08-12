@@ -18,6 +18,7 @@
 #include "bindings.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
+#include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -39,6 +40,7 @@
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
+#include "tensorrt_llm/runtime/mcastGroupCommPg.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
@@ -54,6 +56,7 @@
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
@@ -319,6 +322,21 @@ void initBindings(nb::module_& m)
         .def(nb::init<size_t, uint32_t, uint32_t, uint32_t, bool, int64_t>(), nb::arg("buf_size"),
             nb::arg("group_size"), nb::arg("group_rank"), nb::arg("device_idx"), nb::arg("mn_nvlink"),
             nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "__init__",
+            [](tensorrt_llm::runtime::McastGPUBuffer* self, size_t bufSize, uint32_t groupSize, uint32_t groupRank,
+                uint32_t deviceIdx, bool mnNvlink, nb::object pgObj, std::string const& pybind11Abi)
+            {
+                // Unboxing the pybind11-owned ProcessGroup needs the GIL; the collectives run
+                // afterwards do not.
+                auto pg = common::get_intrusive_ptr<c10d::ProcessGroup, nb::python_error>(pgObj.ptr(), pybind11Abi);
+                auto groupComm = std::make_shared<tensorrt_llm::runtime::PgMcastGroupComm>(std::move(pg));
+                nb::gil_scoped_release release;
+                new (self) tensorrt_llm::runtime::McastGPUBuffer(
+                    bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm));
+            },
+            nb::arg("buf_size"), nb::arg("group_size"), nb::arg("group_rank"), nb::arg("device_idx"),
+            nb::arg("mn_nvlink"), nb::arg("process_group"), nb::arg("pybind11_abi"))
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
