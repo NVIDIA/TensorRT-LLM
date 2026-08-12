@@ -342,6 +342,7 @@ def _synthetic_rank_info(tp: int, adp: bool):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "ctx,gen,ok",
     [
@@ -383,6 +384,7 @@ def test_kda_peer_validation_synthetic_cpu(ctx, gen, ok):
             MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
 
 
+@pytest.mark.cpu_only
 def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
     """Peer validation must not require identical layer sets.
 

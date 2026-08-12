@@ -93,6 +93,7 @@ from ....custom_ops.cute_dsl_megamoe_custom_op import megamoe_activation_sf_byte
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..impl_contract import MoERunContext
 from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
@@ -1111,13 +1112,9 @@ class MegaMoECuteDsl(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
         *,
-        output_dtype: Optional[torch.dtype] = None,
-        **unused_kwargs,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """Run the fused MegaMoE CuteDSL kernel on pre-quantized inputs.
 
@@ -1127,7 +1124,12 @@ class MegaMoECuteDsl(MoE):
         to :meth:`_run_moe`, which returns the reduced ``(T, hidden)``
         output.
         """
-        del unused_kwargs
+        del workspace  # The symmetric buffer is this backend's own workspace.
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
         if x_sf is None:
