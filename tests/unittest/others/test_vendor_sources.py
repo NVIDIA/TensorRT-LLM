@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import datetime
 import hashlib
 import importlib.util
 import os
@@ -24,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -39,7 +39,6 @@ _VENDOR_NAME = "example"
 _SOURCE = "python/example"
 _DESTINATION = "src/example"
 _INCLUDE = "**/*.py"
-_FUTURE_EXPIRY = (datetime.date.today() + datetime.timedelta(days=14)).isoformat()
 
 
 def _command_env() -> dict[str, str]:
@@ -225,6 +224,124 @@ def _load_vendor_sources_module() -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_atomic_write_syncs_file_before_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vendor_sources_module()
+    target = tmp_path / "lock" / "vendor-sources.yml"
+    target.parent.mkdir()
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def record_fsync(file_descriptor: int) -> None:
+        mode = os.fstat(file_descriptor).st_mode
+        events.append("directory-fsync" if stat.S_ISDIR(mode) else "file-fsync")
+        real_fsync(file_descriptor)
+
+    def record_replace(source: str | bytes | Path, destination: str | bytes | Path) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    with monkeypatch.context() as recording:
+        recording.setattr(module.os, "fsync", record_fsync)
+        recording.setattr(module.os, "replace", record_replace)
+        module._atomic_write(target, b"updated\n")
+
+    assert target.read_bytes() == b"updated\n"
+    assert events == ["file-fsync", "replace"]
+
+
+def test_create_and_patch_updates_do_not_sync_replacement_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
+    exact_root = tmp_path / "exact-case"
+    exact_root.mkdir()
+    exact_consumer, exact_lock = _make_consumer(exact_root)
+    patched_root = tmp_path / "patched-case"
+    patched_root.mkdir()
+    patched_consumer, patched_lock = _make_consumer(patched_root)
+    patched_destination = patched_consumer / _DESTINATION
+    _write_files(patched_destination, {"kernel.py": "VALUE = 'adopted'\n"})
+    module = _load_vendor_sources_module()
+    real_fsync = os.fsync
+    directory_syncs = 0
+
+    def reject_directory_sync(file_descriptor: int) -> None:
+        nonlocal directory_syncs
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            directory_syncs += 1
+            raise OSError("unexpected replacement-directory sync")
+        real_fsync(file_descriptor)
+
+    def create_arguments(lock: Path, *, adopt: str | None = None) -> list[str]:
+        arguments = [
+            "--lock",
+            str(lock),
+            "create",
+            _VENDOR_NAME,
+            "--url",
+            upstream.as_uri(),
+            "--commit",
+            commit,
+            "--source",
+            _SOURCE,
+            "--destination",
+            _DESTINATION,
+            "--include",
+            _INCLUDE,
+            "--repo",
+            str(upstream),
+        ]
+        if adopt is not None:
+            arguments.extend(["--adopt", adopt])
+        return arguments
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module.os, "fsync", reject_directory_sync)
+        assert module.main(create_arguments(exact_lock)) == 0
+        assert module.main(create_arguments(patched_lock, adopt="patched")) == 0
+
+        exact_destination = exact_consumer / _DESTINATION
+        (exact_destination / "kernel.py").write_text("VALUE = 'patched'\n", encoding="utf-8")
+        assert (
+            module.main(
+                [
+                    "--lock",
+                    str(exact_lock),
+                    "patch",
+                    _VENDOR_NAME,
+                    "create",
+                    "--repo",
+                    str(upstream),
+                ]
+            )
+            == 0
+        )
+        (exact_destination / "kernel.py").write_text("VALUE = 'refreshed'\n", encoding="utf-8")
+        assert (
+            module.main(
+                [
+                    "--lock",
+                    str(exact_lock),
+                    "patch",
+                    _VENDOR_NAME,
+                    "refresh",
+                    "--repo",
+                    str(upstream),
+                ]
+            )
+            == 0
+        )
+
+    assert directory_syncs == 0
+    _vendor(exact_consumer, exact_lock, "check", _VENDOR_NAME, "--repo", upstream)
+    _vendor(patched_consumer, patched_lock, "check", _VENDOR_NAME, "--repo", upstream)
 
 
 def test_exact_create_check_digest_and_sync(tmp_path: Path) -> None:
@@ -541,6 +658,12 @@ def test_lock_rejects_duplicate_keys_and_unsafe_paths(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     _assert_failure(_vendor(consumer, lock, "check", check=False), "unexpected")
+
+    lock.write_text(
+        valid_lock.replace(vendor_marker, f"{vendor_marker}    divergence: legacy\n", 1),
+        encoding="utf-8",
+    )
+    _assert_failure(_vendor(consumer, lock, "check", check=False), "divergence")
 
     lock.write_text(valid_lock, encoding="utf-8")
     unsafe_create = _vendor(
@@ -882,89 +1005,6 @@ new file mode 100644
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
 
 
-def test_divergence_capture_refresh_expiry_and_clear(tmp_path: Path) -> None:
-    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
-    consumer, lock = _make_consumer(tmp_path)
-    _copy_python_sources(upstream, consumer)
-    _create_vendor(consumer, lock, upstream, commit, mode="exact")
-    kernel = consumer / _DESTINATION / "kernel.py"
-
-    kernel.write_text("VALUE = 'urgent-fix'\n", encoding="utf-8")
-    excessive_expiry = (datetime.date.today() + datetime.timedelta(days=31)).isoformat()
-    excessive_divergence = _vendor(
-        consumer,
-        lock,
-        "divergence",
-        _VENDOR_NAME,
-        "capture",
-        "--reason",
-        "unbounded exception",
-        "--expires",
-        excessive_expiry,
-        "--repo",
-        upstream,
-        check=False,
-    )
-    _assert_failure(excessive_divergence, "30 days")
-    _vendor(
-        consumer,
-        lock,
-        "divergence",
-        _VENDOR_NAME,
-        "capture",
-        "--reason",
-        "urgent correctness fix",
-        "--expires",
-        _FUTURE_EXPIRY,
-        "--repo",
-        upstream,
-    )
-    divergence = _vendor_data(lock)["divergence"]
-    assert isinstance(divergence, dict)
-    assert divergence["reason"] == "urgent correctness fix"
-    assert divergence["files"] == ["kernel.py"]
-    assert str(divergence["digest"]).startswith("sha256-tree-v1:")
-    _vendor(consumer, lock, "check", _VENDOR_NAME)
-
-    valid_divergence_lock = lock.read_text(encoding="utf-8")
-    destination_snapshot = _tree_snapshot(consumer / _DESTINATION)
-    future_created = datetime.date.today() + datetime.timedelta(days=365)
-    future_data = _lock_data(lock)
-    future_vendor = future_data["vendors"][_VENDOR_NAME]
-    assert isinstance(future_vendor, dict)
-    future_divergence = future_vendor["divergence"]
-    assert isinstance(future_divergence, dict)
-    future_divergence["created"] = future_created.isoformat()
-    future_divergence["expires"] = (future_created + datetime.timedelta(days=30)).isoformat()
-    lock.write_text(yaml.safe_dump(future_data, sort_keys=False), encoding="utf-8")
-    future_check = _vendor(
-        consumer,
-        lock,
-        "check",
-        _VENDOR_NAME,
-        "--offline",
-        check=False,
-    )
-    _assert_failure(future_check, "creation date cannot be in the future")
-    assert _tree_snapshot(consumer / _DESTINATION) == destination_snapshot
-    lock.write_text(valid_divergence_lock, encoding="utf-8")
-
-    kernel.write_text("VALUE = 'urgent-fix-v2'\n", encoding="utf-8")
-    _assert_failure(_vendor(consumer, lock, "check", _VENDOR_NAME, check=False), "digest")
-    _vendor(consumer, lock, "divergence", _VENDOR_NAME, "refresh", "--repo", upstream)
-    _vendor(consumer, lock, "check", _VENDOR_NAME)
-
-    current_lock = lock.read_text(encoding="utf-8")
-    assert _FUTURE_EXPIRY in current_lock
-    lock.write_text(current_lock.replace(_FUTURE_EXPIRY, "2000-01-01"), encoding="utf-8")
-    _assert_failure(_vendor(consumer, lock, "check", _VENDOR_NAME, check=False), "expired")
-    lock.write_text(current_lock, encoding="utf-8")
-
-    _vendor(consumer, lock, "divergence", _VENDOR_NAME, "clear")
-    assert "divergence" not in _vendor_data(lock)
-    _assert_failure(_vendor(consumer, lock, "check", _VENDOR_NAME, check=False), "digest")
-
-
 def test_exact_adoption_rejects_unrepresented_differences(tmp_path: Path) -> None:
     upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1100,66 +1140,6 @@ def test_create_rolls_back_destination_and_patch_when_lock_save_fails(
     _create_vendor(patched_consumer, patched_lock, upstream, commit, mode="patched")
 
 
-def test_sync_rolls_back_divergence_when_lock_save_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
-    consumer, lock = _make_consumer(tmp_path)
-    _copy_python_sources(upstream, consumer)
-    _create_vendor(consumer, lock, upstream, commit, mode="exact")
-    destination = consumer / _DESTINATION
-    (destination / "kernel.py").write_text("VALUE = 'divergent'\n", encoding="utf-8")
-    (destination / "kernel.py").chmod(0o755)
-    _vendor(
-        consumer,
-        lock,
-        "divergence",
-        _VENDOR_NAME,
-        "capture",
-        "--reason",
-        "test atomic synchronization",
-        "--expires",
-        _FUTURE_EXPIRY,
-        "--repo",
-        upstream,
-    )
-    lock_snapshot = lock.read_bytes()
-    destination_snapshot = _tree_snapshot(destination)
-    parent_entries = sorted(path.name for path in destination.parent.iterdir())
-    module = _load_vendor_sources_module()
-
-    def fail_save_lock(_: object) -> None:
-        raise OSError("injected lock-save failure")
-
-    with monkeypatch.context() as failure:
-        failure.setattr(module, "_save_lock", fail_save_lock)
-        result = module.main(
-            [
-                "--lock",
-                str(lock),
-                "sync",
-                _VENDOR_NAME,
-                "--repo",
-                str(upstream),
-            ]
-        )
-
-    assert result == 1
-    captured = capsys.readouterr()
-    assert "error:" in captured.err.lower()
-    assert "injected lock-save failure" in captured.err
-    assert lock.read_bytes() == lock_snapshot
-    assert _tree_snapshot(destination) == destination_snapshot
-    assert sorted(path.name for path in destination.parent.iterdir()) == parent_entries
-    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
-
-    _vendor(consumer, lock, "sync", _VENDOR_NAME, "--repo", upstream)
-    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 'upstream'\n"
-    assert "divergence" not in _vendor_data(lock)
-
-
 def test_stale_backup_does_not_leak_staging_or_modify_trees(tmp_path: Path) -> None:
     upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1247,19 +1227,12 @@ def test_export_rejects_dirty_source_and_mismatched_head_without_changes(tmp_pat
     _create_vendor(consumer, lock, upstream, commit, mode="exact")
     destination = consumer / _DESTINATION
     (destination / "kernel.py").write_text("VALUE = 'downstream'\n", encoding="utf-8")
-    _vendor(
-        consumer,
-        lock,
-        "divergence",
-        _VENDOR_NAME,
-        "capture",
-        "--reason",
-        "test export guards",
-        "--expires",
-        _FUTURE_EXPIRY,
-        "--repo",
-        upstream,
+    _assert_failure(
+        _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline", check=False),
+        "digest mismatch",
     )
+    status = _vendor(consumer, lock, "status", _VENDOR_NAME, check=False)
+    _assert_failure(status, "fail-local-integrity")
     lock_snapshot = lock.read_bytes()
     destination_snapshot = _tree_snapshot(destination)
 
@@ -1299,6 +1272,40 @@ def test_export_rejects_dirty_source_and_mismatched_head_without_changes(tmp_pat
     assert _tree_snapshot(destination) == destination_snapshot
 
 
+def test_export_rejects_ignored_selected_source_files_without_changes(tmp_path: Path) -> None:
+    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, commit, mode="exact")
+    destination = consumer / _DESTINATION
+    (destination / "kernel.py").write_text("VALUE = 'downstream'\n", encoding="utf-8")
+    ignored_path = upstream / _SOURCE / "generated.py"
+    ignored_path.write_text("GENERATED = True\n", encoding="utf-8")
+    (upstream / ".git" / "info" / "exclude").write_text(
+        f"/{_SOURCE}/generated.py\n", encoding="utf-8"
+    )
+    assert _git(upstream, "status", "--porcelain", "--", _SOURCE) == ""
+    upstream_snapshot = _tree_snapshot(upstream / _SOURCE)
+    lock_snapshot = lock.read_bytes()
+    destination_snapshot = _tree_snapshot(destination)
+
+    result = _vendor(
+        consumer,
+        lock,
+        "export",
+        _VENDOR_NAME,
+        "--repo",
+        upstream,
+        check=False,
+    )
+
+    _assert_failure(result, "ignored untracked files")
+    assert _tree_snapshot(upstream / _SOURCE) == upstream_snapshot
+    assert ignored_path.read_text(encoding="utf-8") == "GENERATED = True\n"
+    assert lock.read_bytes() == lock_snapshot
+    assert _tree_snapshot(destination) == destination_snapshot
+
+
 def test_upstream_access_policy_export_and_pin(tmp_path: Path) -> None:
     upstream, first_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
     consumer, lock = _make_consumer(tmp_path)
@@ -1326,25 +1333,34 @@ def test_upstream_access_policy_export_and_pin(tmp_path: Path) -> None:
     )
     _assert_failure(strict, "unavailable")
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
-
-    kernel = consumer / _DESTINATION / "kernel.py"
-    kernel.write_text("VALUE = 'exported-fix'\n", encoding="utf-8")
-    _vendor(
+    no_change = _vendor(
         consumer,
         lock,
-        "divergence",
+        "export",
         _VENDOR_NAME,
-        "capture",
-        "--reason",
-        "validate downstream fix upstream",
-        "--expires",
-        _FUTURE_EXPIRY,
         "--repo",
         upstream,
+        check=False,
+    )
+    _assert_failure(no_change, "no downstream change")
+
+    kernel = consumer / _DESTINATION / "kernel.py"
+    locked_state = lock.read_bytes()
+    kernel.write_text("VALUE = 'exported-fix'\n", encoding="utf-8")
+    pending_tree = _tree_snapshot(consumer / _DESTINATION)
+    _assert_failure(
+        _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline", check=False),
+        "digest mismatch",
     )
 
     _git(upstream, "switch", "-c", "vendor-fix")
     _vendor(consumer, lock, "export", _VENDOR_NAME, "--repo", upstream)
+    assert lock.read_bytes() == locked_state
+    assert _tree_snapshot(consumer / _DESTINATION) == pending_tree
+    _assert_failure(
+        _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline", check=False),
+        "digest mismatch",
+    )
     assert (upstream / _SOURCE / "kernel.py").read_text(
         encoding="utf-8"
     ) == "VALUE = 'exported-fix'\n"
@@ -1359,8 +1375,6 @@ def test_upstream_access_policy_export_and_pin(tmp_path: Path) -> None:
         upstream.as_uri(),
         "--branch",
         "vendor-fix",
-        "--commit",
-        second_commit,
         "--repo",
         upstream,
     )
@@ -1368,7 +1382,489 @@ def test_upstream_access_policy_export_and_pin(tmp_path: Path) -> None:
     assert vendor["url"] == upstream.as_uri()
     assert vendor["branch"] == "vendor-fix"
     assert vendor["commit"] == second_commit
-    assert "divergence" not in vendor
     assert "patch" not in vendor
+    assert _tree_snapshot(consumer / _DESTINATION) == pending_tree
     _vendor(consumer, lock, "check", _VENDOR_NAME)
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_partial_upstream_acceptance_uses_temporary_branches(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(
+        tmp_path,
+        {
+            "a.py": "A = 0\n",
+            "b.py": "B = 0\n",
+        },
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    destination = consumer / _DESTINATION
+    _write_files(destination, {"a.py": "A = 1\n", "b.py": "B = 1\n"})
+    accepted_destination = _tree_snapshot(destination)
+
+    _git(upstream, "switch", "-c", "vendor-a-and-b")
+    _vendor(consumer, lock, "export", _VENDOR_NAME, "--repo", upstream)
+    temporary_ab_commit = _commit(upstream, "export A and B")
+    _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "vendor-a-and-b",
+        "--commit",
+        temporary_ab_commit,
+        "--repo",
+        upstream,
+    )
+    assert _vendor_data(lock)["commit"] == temporary_ab_commit
+    assert _tree_snapshot(destination) == accepted_destination
+
+    _git(upstream, "switch", "main")
+    _write_files(upstream / _SOURCE, {"a.py": "A = 1\n"})
+    canonical_a_commit = _commit(upstream, "accept A upstream")
+    lock_snapshot = lock.read_bytes()
+    rejected = _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "main",
+        "--commit",
+        canonical_a_commit,
+        "--repo",
+        upstream,
+        check=False,
+    )
+    _assert_failure(rejected, "b.py")
+    assert lock.read_bytes() == lock_snapshot
+    assert _tree_snapshot(destination) == accepted_destination
+
+    _git(upstream, "switch", "-c", "vendor-b")
+    _write_files(upstream / _SOURCE, {"b.py": "B = 1\n"})
+    temporary_b_commit = _commit(upstream, "carry B after A")
+    _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "vendor-b",
+        "--commit",
+        temporary_b_commit,
+        "--repo",
+        upstream,
+    )
+    assert _vendor_data(lock)["commit"] == temporary_b_commit
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+    _git(upstream, "switch", "main")
+    _write_files(upstream / _SOURCE, {"b.py": "B = 1\n"})
+    canonical_ab_commit = _commit(upstream, "accept B upstream")
+    _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "main",
+        "--commit",
+        canonical_ab_commit,
+        "--repo",
+        upstream,
+    )
+    vendor = _vendor_data(lock)
+    assert vendor["branch"] == "main"
+    assert vendor["commit"] == canonical_ab_commit
+    assert _tree_snapshot(destination) == accepted_destination
+    _vendor(consumer, lock, "check", _VENDOR_NAME)
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_export_and_pin_retain_then_drop_compatibility_patch(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(
+        tmp_path,
+        {
+            "compat.py": "MODE = 'upstream'\n",
+            "feature.py": "FEATURE = 'base'\n",
+        },
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    original_vendor = _vendor_data(lock)
+    patch_path = consumer / str(original_vendor["patch"])
+    patch_content = patch_path.read_bytes()
+    patch_mode = stat.S_IMODE(patch_path.stat().st_mode)
+    patch_digest = original_vendor["patch_digest"]
+
+    no_change = _vendor(
+        consumer,
+        lock,
+        "export",
+        _VENDOR_NAME,
+        "--repo",
+        upstream,
+        check=False,
+    )
+    _assert_failure(no_change, "no downstream change")
+
+    (destination / "feature.py").write_text("FEATURE = 'exported'\n", encoding="utf-8")
+    pending_destination = _tree_snapshot(destination)
+    lock_snapshot = lock.read_bytes()
+    _git(upstream, "switch", "-c", "feature-fix")
+    _vendor(consumer, lock, "export", _VENDOR_NAME, "--repo", upstream)
+    assert (upstream / _SOURCE / "compat.py").read_text(encoding="utf-8") == "MODE = 'upstream'\n"
+    assert (upstream / _SOURCE / "feature.py").read_text(
+        encoding="utf-8"
+    ) == "FEATURE = 'exported'\n"
+    assert lock.read_bytes() == lock_snapshot
+    assert _tree_snapshot(destination) == pending_destination
+    assert patch_path.read_bytes() == patch_content
+    feature_commit = _commit(upstream, "export feature change")
+
+    _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "feature-fix",
+        "--commit",
+        feature_commit,
+        "--repo",
+        upstream,
+    )
+    retained_vendor = _vendor_data(lock)
+    assert retained_vendor["patch"] == original_vendor["patch"]
+    assert retained_vendor["patch_digest"] == patch_digest
+    assert patch_path.read_bytes() == patch_content
+    assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
+    assert _tree_snapshot(destination) == pending_destination
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+    _git(upstream, "switch", "-c", "incomplete-pin")
+    (upstream / _SOURCE / "feature.py").write_text("FEATURE = 'wrong'\n", encoding="utf-8")
+    incomplete_commit = _commit(upstream, "candidate does not reproduce destination")
+    retained_lock = lock.read_bytes()
+    rejected = _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "incomplete-pin",
+        "--commit",
+        incomplete_commit,
+        "--repo",
+        upstream,
+        check=False,
+    )
+    _assert_failure(rejected, "feature.py")
+    assert lock.read_bytes() == retained_lock
+    assert patch_path.read_bytes() == patch_content
+    assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
+    assert _tree_snapshot(destination) == pending_destination
+
+    _git(upstream, "switch", "feature-fix")
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb TensorRT-LLM compatibility change")
+    _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "feature-fix",
+        "--commit",
+        absorbed_commit,
+        "--repo",
+        upstream,
+    )
+    exact_vendor = _vendor_data(lock)
+    assert exact_vendor["commit"] == absorbed_commit
+    assert "patch" not in exact_vendor
+    assert "patch_digest" not in exact_vendor
+    assert not patch_path.exists()
+    assert _tree_snapshot(destination) == pending_destination
+    _vendor(consumer, lock, "check", _VENDOR_NAME)
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_pin_restores_absorbed_patch_when_lock_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    patch_content = patch_path.read_bytes()
+    patch_mode = stat.S_IMODE(patch_path.stat().st_mode)
+    lock_content = lock.read_bytes()
+    destination_snapshot = _tree_snapshot(destination)
+
+    _git(upstream, "switch", "-c", "absorb-compat")
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb compatibility change")
+    module = _load_vendor_sources_module()
+
+    def fail_save_lock(_: object) -> None:
+        raise OSError("injected pin lock-save failure")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module, "_save_lock", fail_save_lock)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "pin",
+                _VENDOR_NAME,
+                "--branch",
+                "absorb-compat",
+                "--commit",
+                absorbed_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    assert result == 1
+    assert "injected pin lock-save failure" in capsys.readouterr().err
+    assert lock.read_bytes() == lock_content
+    assert patch_path.read_bytes() == patch_content
+    assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
+    assert _tree_snapshot(destination) == destination_snapshot
+
+    _vendor(
+        consumer,
+        lock,
+        "pin",
+        _VENDOR_NAME,
+        "--branch",
+        "absorb-compat",
+        "--commit",
+        absorbed_commit,
+        "--repo",
+        upstream,
+    )
+    assert not patch_path.exists()
+    assert "patch" not in _vendor_data(lock)
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_pin_directory_sync_failure_retains_absorbed_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    patch_content = patch_path.read_bytes()
+
+    _git(upstream, "switch", "-c", "absorb-compat")
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb compatibility change")
+    module = _load_vendor_sources_module()
+    real_fsync = os.fsync
+
+    def fail_directory_sync(file_descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            raise OSError("injected lock-directory sync failure")
+        real_fsync(file_descriptor)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module.os, "fsync", fail_directory_sync)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "pin",
+                _VENDOR_NAME,
+                "--branch",
+                "absorb-compat",
+                "--commit",
+                absorbed_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    assert result == 1
+    assert "injected lock-directory sync failure" in capsys.readouterr().err
+    assert patch_path.read_bytes() == patch_content
+    updated_vendor = _vendor_data(lock)
+    assert updated_vendor["commit"] == absorbed_commit
+    assert "patch" not in updated_vendor
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+
+
+def test_pin_patch_cleanup_failure_succeeds_with_orphan_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    patch_content = patch_path.read_bytes()
+
+    _git(upstream, "switch", "-c", "absorb-compat")
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb compatibility change")
+    module = _load_vendor_sources_module()
+    real_save_lock_checked = module._save_lock_checked
+    real_sync_directory = module._sync_directory
+    real_unlink = Path.unlink
+    events: list[str] = []
+
+    def record_lock_save(lock_file: object, description: str) -> None:
+        real_save_lock_checked(lock_file, description)
+        events.append("lock-save")
+
+    def record_directory_sync(path: Path) -> None:
+        real_sync_directory(path)
+        events.append("directory-sync")
+
+    def fail_patch_cleanup(path: Path, missing_ok: bool = False) -> None:
+        if path == patch_path:
+            events.append("patch-unlink")
+            raise OSError("injected absorbed-patch cleanup failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module, "_save_lock_checked", record_lock_save)
+        failure.setattr(module, "_sync_directory", record_directory_sync)
+        failure.setattr(Path, "unlink", fail_patch_cleanup)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "pin",
+                _VENDOR_NAME,
+                "--branch",
+                "absorb-compat",
+                "--commit",
+                absorbed_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "offline enforcement restored" in captured.out
+    assert "warning:" in captured.err.lower()
+    assert "lock is committed and valid" in captured.err
+    assert "unreferenced orphan" in captured.err
+    assert "delete that file manually" in captured.err.lower()
+    assert str(patch_path) in captured.err
+    assert events == ["lock-save", "directory-sync", "patch-unlink"]
+    assert patch_path.read_bytes() == patch_content
+    updated_vendor = _vendor_data(lock)
+    assert updated_vendor["commit"] == absorbed_commit
+    assert "patch" not in updated_vendor
+    assert "patch_digest" not in updated_vendor
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+
+
+def test_pin_interruption_after_lock_save_leaves_valid_lock_and_orphan_patch(
+    tmp_path: Path,
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    patch_content = patch_path.read_bytes()
+    patch_mode = stat.S_IMODE(patch_path.stat().st_mode)
+
+    _git(upstream, "switch", "-c", "absorb-compat")
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb compatibility change")
+    lock_saved = tmp_path / "pin-lock-saved"
+    interrupt_script = "\n".join(
+        [
+            "import importlib.util",
+            "import pathlib",
+            "import sys",
+            "import time",
+            "module_path, lock, upstream, commit, marker = sys.argv[1:]",
+            "spec = importlib.util.spec_from_file_location('_vendor_sources_interrupted', module_path)",
+            "assert spec is not None and spec.loader is not None",
+            "module = importlib.util.module_from_spec(spec)",
+            "sys.modules[spec.name] = module",
+            "spec.loader.exec_module(module)",
+            "save_lock_checked = module._save_lock_checked",
+            "def save_then_pause(lock_file, description):",
+            "    save_lock_checked(lock_file, description)",
+            "    pathlib.Path(marker).write_text('saved', encoding='utf-8')",
+            "    time.sleep(30)",
+            "module._save_lock_checked = save_then_pause",
+            "raise SystemExit(module.main([",
+            "    '--lock', lock, 'pin', 'example', '--branch', 'absorb-compat',",
+            "    '--commit', commit, '--repo', upstream,",
+            "]))",
+        ]
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            interrupt_script,
+            str(_VENDOR_SOURCES),
+            str(lock),
+            str(upstream),
+            absorbed_commit,
+            str(lock_saved),
+        ],
+        cwd=consumer,
+        env=_command_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not lock_saved.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not lock_saved.exists():
+            stdout, stderr = process.communicate(timeout=5)
+            pytest.fail(
+                f"Pin did not reach lock-save barrier.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        process.kill()
+        process.communicate(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+
+    assert process.returncode is not None and process.returncode < 0
+    interrupted_vendor = _vendor_data(lock)
+    assert interrupted_vendor["commit"] == absorbed_commit
+    assert "patch" not in interrupted_vendor
+    assert "patch_digest" not in interrupted_vendor
+    assert patch_path.read_bytes() == patch_content
+    assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)

@@ -382,9 +382,10 @@ The FMHA package is split by role:
   [FlashInfer PR #4357](https://github.com/flashinfer-ai/flashinfer/pull/4357) at
   commit `74790b32b55f6c45a4fee78007b4d2b2109497e3`, excludes the upstream README
   files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
-  files retain FlashInfer's headers. Do not edit this tree outside the
-  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md); use the
-  vendoring tool to refresh the patch or record a temporary divergence.
+  files retain FlashInfer's headers. Before editing this tree, read the
+  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
+  persistent patch for TRT-LLM-only adaptations, or export an upstream-worthy
+  destination change and pin its committed upstream revision.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA

@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
-import datetime
 import fnmatch
 import hashlib
 import os
@@ -45,7 +44,6 @@ _NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
 _DIGEST_PREFIX = "sha256-tree-v1:"
 _PATCH_DIGEST_PREFIX = "sha256:"
 _GIT_TIMEOUT_SECONDS = 60
-_MAX_DIVERGENCE_DAYS = 30
 _GIT_LOCAL_ENVIRONMENT_VARIABLES = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_ATTR_GLOBAL",
@@ -77,9 +75,7 @@ _VENDOR_FIELDS = {
     "patch",
     "patch_digest",
     "digest",
-    "divergence",
 }
-_DIVERGENCE_FIELDS = {"reason", "created", "expires", "files", "digest"}
 
 
 class VendorError(RuntimeError):
@@ -165,7 +161,6 @@ class Vendor:
     tag: str | None = None
     patch: str | None = None
     patch_digest: str | None = None
-    divergence: dict[str, object] | None = None
 
     def to_mapping(self) -> dict[str, object]:
         """Serialize this entry in the canonical field order."""
@@ -186,8 +181,6 @@ class Vendor:
             result["patch"] = self.patch
             result["patch_digest"] = self.patch_digest
         result["digest"] = self.digest
-        if self.divergence is not None:
-            result["divergence"] = self.divergence
         return result
 
 
@@ -291,63 +284,6 @@ def _patch_digest(content: bytes) -> str:
     return f"{_PATCH_DIGEST_PREFIX}{hashlib.sha256(content).hexdigest()}"
 
 
-def _validate_date(value: object, description: str) -> str:
-    text = _require_string(value, description)
-    try:
-        parsed = datetime.date.fromisoformat(text)
-    except ValueError as error:
-        raise VendorError(f"{description} must use YYYY-MM-DD format.") from error
-    if parsed.isoformat() != text:
-        raise VendorError(f"{description} must use canonical YYYY-MM-DD format.")
-    return text
-
-
-def _validate_divergence(value: object, vendor_name: str) -> dict[str, object]:
-    mapping = _require_mapping(value, f"Vendor {vendor_name!r} divergence")
-    fields = _validate_mapping_keys(
-        mapping, _DIVERGENCE_FIELDS, f"Vendor {vendor_name!r} divergence"
-    )
-    missing = _DIVERGENCE_FIELDS - fields
-    if missing:
-        raise VendorError(
-            f"Vendor {vendor_name!r} divergence is missing fields: {sorted(missing)}."
-        )
-    reason = _require_string(mapping["reason"], f"Vendor {vendor_name!r} divergence reason")
-    created = _validate_date(mapping["created"], f"Vendor {vendor_name!r} divergence created")
-    expires = _validate_date(mapping["expires"], f"Vendor {vendor_name!r} divergence expires")
-    created_date = datetime.date.fromisoformat(created)
-    expires_date = datetime.date.fromisoformat(expires)
-    if created_date > datetime.date.today():
-        raise VendorError(
-            f"Vendor {vendor_name!r} divergence creation date cannot be in the future."
-        )
-    if expires_date < created_date:
-        raise VendorError(
-            f"Vendor {vendor_name!r} divergence is expired or invalid: "
-            "its expiration precedes its creation."
-        )
-    if expires_date > created_date + datetime.timedelta(days=_MAX_DIVERGENCE_DAYS):
-        raise VendorError(
-            f"Vendor {vendor_name!r} divergence cannot last more than {_MAX_DIVERGENCE_DAYS} days."
-        )
-    raw_files = mapping["files"]
-    if not isinstance(raw_files, list) or not raw_files:
-        raise VendorError(f"Vendor {vendor_name!r} divergence files must be a non-empty list.")
-    files = [
-        _validate_relative_path(item, f"Vendor {vendor_name!r} divergence file")
-        for item in raw_files
-    ]
-    if files != sorted(set(files)):
-        raise VendorError(f"Vendor {vendor_name!r} divergence files must be sorted and unique.")
-    return {
-        "reason": reason,
-        "created": created,
-        "expires": expires,
-        "files": files,
-        "digest": _validate_digest(mapping["digest"], f"Vendor {vendor_name!r} divergence digest"),
-    }
-
-
 def _validate_vendor(name: object, value: object) -> Vendor:
     vendor_name = _require_string(name, "Vendor name")
     if _NAME_PATTERN.fullmatch(vendor_name) is None:
@@ -403,19 +339,6 @@ def _validate_vendor(name: object, value: object) -> Vendor:
         else _validate_patch_digest(patch_digest_value, f"Vendor {vendor_name!r} patch_digest")
     )
     include = _validate_include(mapping["include"], vendor_name)
-    divergence_value = mapping.get("divergence")
-    divergence = (
-        None if divergence_value is None else _validate_divergence(divergence_value, vendor_name)
-    )
-    if divergence is not None:
-        outside_selection = [
-            path for path in divergence["files"] if not _matches(str(path), include)
-        ]
-        if outside_selection:
-            raise VendorError(
-                f"Vendor {vendor_name!r} divergence files are outside its include set: "
-                f"{outside_selection}."
-            )
     return Vendor(
         name=vendor_name,
         url=_validate_url(mapping["url"], vendor_name),
@@ -430,7 +353,6 @@ def _validate_vendor(name: object, value: object) -> Vendor:
         patch=patch,
         patch_digest=patch_digest,
         digest=_validate_digest(mapping["digest"], f"Vendor {vendor_name!r} digest"),
-        divergence=divergence,
     )
 
 
@@ -590,6 +512,14 @@ def _atomic_write(path: Path, content: bytes) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _sync_directory(path: Path) -> None:
+    directory_descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 
 
 def _matches(path: str, patterns: Sequence[str]) -> bool:
@@ -1156,23 +1086,12 @@ def _require_vendor(lock: LockFile, name: str) -> Vendor:
     return _select_vendors(lock, name)[0]
 
 
-def _check_expiration(vendor: Vendor) -> None:
-    if vendor.divergence is None:
-        return
-    expires = datetime.date.fromisoformat(str(vendor.divergence["expires"]))
-    if datetime.date.today() > expires:
-        raise VendorError(f"Vendor {vendor.name!r} temporary divergence expired on {expires}.")
-
-
 def _verify_offline(lock: LockFile, vendor: Vendor) -> None:
-    _check_expiration(vendor)
     actual = _tree_digest(_current_tree(lock, vendor))
-    expected = vendor.digest
-    if vendor.divergence is not None:
-        expected = str(vendor.divergence["digest"])
-    if actual != expected:
+    if actual != vendor.digest:
         raise VendorError(
-            f"Vendor {vendor.name!r} destination digest mismatch: expected {expected}, got {actual}."
+            f"Vendor {vendor.name!r} destination digest mismatch: "
+            f"expected {vendor.digest}, got {actual}."
         )
 
 
@@ -1185,30 +1104,16 @@ def _verify_source(lock: LockFile, vendor: Vendor, repo: Path | None) -> None:
             f"expected {vendor.digest}, got {normal_digest}."
         )
     current = _current_tree(lock, vendor)
-    if vendor.divergence is None:
-        if current != normal:
-            raise VendorError(
-                f"Vendor {vendor.name!r} destination differs from its upstream materialization."
-            )
-        return
-    expected_files = list(vendor.divergence["files"])
-    actual_files = _changed_paths(normal, current)
-    if actual_files != expected_files:
+    if current != normal:
         raise VendorError(
-            f"Vendor {vendor.name!r} divergence files mismatch: expected {expected_files}, got {actual_files}."
+            f"Vendor {vendor.name!r} destination differs from its upstream materialization."
         )
 
 
 def _command_list(args: argparse.Namespace) -> None:
     lock = _load_lock(args.lock)
     for vendor in _select_vendors(lock, None):
-        state = (
-            "temporary-divergence"
-            if vendor.divergence is not None
-            else "patched"
-            if vendor.patch
-            else "exact"
-        )
+        state = "patched" if vendor.patch else "exact"
         print(f"{vendor.name}\t{state}\t{vendor.commit}\t{vendor.destination}")
 
 
@@ -1222,13 +1127,7 @@ def _command_status(args: argparse.Namespace) -> None:
             failed = True
             print(f"FAIL-LOCAL-INTEGRITY {vendor.name}: {error}")
         else:
-            state = (
-                "temporary-divergence"
-                if vendor.divergence is not None
-                else "patched"
-                if vendor.patch is not None
-                else "exact"
-            )
+            state = "patched" if vendor.patch is not None else "exact"
             print(f"PASS-OFFLINE {vendor.name}: {state} at {vendor.commit}")
     if failed:
         raise VendorError("One or more vendor snapshots failed offline integrity checks.")
@@ -1313,15 +1212,7 @@ def _command_sync(args: argparse.Namespace) -> None:
             f"Vendor {vendor.name!r} materializes to {digest}, but the lock records {vendor.digest}. "
             "Refresh the patch or pin instead of silently changing the accepted digest."
         )
-    previous_divergence = vendor.divergence
-    with _replace_selected_destination_transaction(lock, vendor, normal):
-        if previous_divergence is not None:
-            vendor.divergence = None
-            try:
-                _save_lock_checked(lock, f"synchronized state for vendor {vendor.name!r}")
-            except VendorError:
-                vendor.divergence = previous_divergence
-                raise
+    _replace_selected_destination(lock, vendor, normal)
     print(f"Synchronized {vendor.name} to {vendor.commit}.")
 
 
@@ -1359,10 +1250,6 @@ def _command_check(args: argparse.Namespace) -> None:
 
 
 def _update_patch(lock: LockFile, vendor: Vendor, repo: Path | None, *, create: bool) -> None:
-    if vendor.divergence is not None:
-        raise VendorError(
-            f"Vendor {vendor.name!r} has temporary divergence; clear or pin it before changing the patch."
-        )
     if create and vendor.patch is not None:
         raise VendorError(f"Vendor {vendor.name!r} already has a patch; use refresh.")
     if not create and vendor.patch is None:
@@ -1415,8 +1302,6 @@ def _command_patch(args: argparse.Namespace) -> None:
     if args.action == "refresh":
         _update_patch(lock, vendor, args.repo, create=False)
         return
-    if vendor.divergence is not None:
-        raise VendorError(f"Vendor {vendor.name!r} has temporary divergence; clear it first.")
     if vendor.patch is None:
         raise VendorError(f"Vendor {vendor.name!r} has no patch to drop.")
     raw = _source_tree(vendor, args.repo)
@@ -1434,86 +1319,13 @@ def _command_patch(args: argparse.Namespace) -> None:
     print(f"Dropped patch for {vendor.name}.")
 
 
-def _capture_divergence(
-    lock: LockFile,
-    vendor: Vendor,
-    repo: Path | None,
-    *,
-    reason: str,
-    created: str,
-    expires: str,
-) -> None:
-    normal = _normal_tree(lock, vendor, repo)
-    normal_digest = _tree_digest(normal)
-    if normal_digest != vendor.digest:
-        raise VendorError(
-            f"Vendor {vendor.name!r} normal materialization does not match its locked digest."
-        )
-    current = _current_tree(lock, vendor)
-    files = _changed_paths(normal, current)
-    if not files:
-        raise VendorError(f"Vendor {vendor.name!r} has no divergence to capture.")
-    vendor.divergence = {
-        "reason": _require_string(reason, "Divergence reason"),
-        "created": _validate_date(created, "Divergence creation date"),
-        "expires": _validate_date(expires, "Divergence expiration date"),
-        "files": files,
-        "digest": _tree_digest(current),
-    }
-    vendor.divergence = _validate_divergence(vendor.divergence, vendor.name)
-    _save_lock(lock)
-
-
-def _command_divergence(args: argparse.Namespace) -> None:
-    lock = _load_lock(args.lock)
-    vendor = _require_vendor(lock, args.name)
-    if args.action == "clear":
-        if args.repo is not None:
-            raise VendorError("divergence clear does not accept --repo.")
-        if vendor.divergence is None:
-            raise VendorError(f"Vendor {vendor.name!r} has no temporary divergence.")
-        vendor.divergence = None
-        _save_lock(lock)
-        print(f"Cleared temporary divergence for {vendor.name}; destination bytes were unchanged.")
-        return
-    if args.action == "capture":
-        if vendor.divergence is not None:
-            raise VendorError(
-                f"Vendor {vendor.name!r} already has temporary divergence; use refresh."
-            )
-        expires = _validate_date(args.expires, "Divergence expiration date")
-        if datetime.date.fromisoformat(expires) < datetime.date.today():
-            raise VendorError("Divergence expiration date cannot be in the past.")
-        _capture_divergence(
-            lock,
-            vendor,
-            args.repo,
-            reason=args.reason,
-            created=datetime.date.today().isoformat(),
-            expires=expires,
-        )
-        print(f"Captured temporary divergence for {vendor.name} through {expires}.")
-        return
-    if vendor.divergence is None:
-        raise VendorError(f"Vendor {vendor.name!r} has no temporary divergence to refresh.")
-    _capture_divergence(
-        lock,
-        vendor,
-        args.repo,
-        reason=str(vendor.divergence["reason"]),
-        created=str(vendor.divergence["created"]),
-        expires=str(vendor.divergence["expires"]),
-    )
-    print(f"Refreshed temporary divergence for {vendor.name}.")
-
-
 def _worktree_head(repo: Path) -> str:
     result = _run_git(["-C", repo, "rev-parse", "HEAD"], cwd=repo)
     assert isinstance(result, str)
     return result.strip()
 
 
-def _require_clean_source_worktree(repo: Path, source: str) -> None:
+def _require_clean_source_worktree(repo: Path, source: str, patterns: Sequence[str]) -> None:
     result = _run_git(
         ["-C", repo, "status", "--porcelain", "--untracked-files=all", "--", source],
         cwd=repo,
@@ -1521,6 +1333,47 @@ def _require_clean_source_worktree(repo: Path, source: str) -> None:
     assert isinstance(result, str)
     if result.strip():
         raise VendorError(f"Local upstream source {source!r} has uncommitted changes.")
+    ignored = _run_git(
+        [
+            "-C",
+            repo,
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+            source,
+        ],
+        cwd=repo,
+        capture_bytes=True,
+    )
+    assert isinstance(ignored, bytes)
+    if ignored and not ignored.endswith(b"\0"):
+        raise VendorError(f"Git produced an invalid ignored-file listing for source {source!r}.")
+    source_path = PurePosixPath(source)
+    selected: list[str] = []
+    for raw_path in ignored.split(b"\0")[:-1]:
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeError as error:
+            raise VendorError(
+                f"Ignored paths under local upstream source {source!r} must be valid UTF-8."
+            ) from error
+        _validate_tree_relative_path(path)
+        try:
+            relative = PurePosixPath(path).relative_to(source_path).as_posix()
+        except ValueError as error:
+            raise VendorError(
+                f"Git ignored-file entry escaped source {source!r}: {path!r}."
+            ) from error
+        if relative not in ("", ".") and _matches(relative, patterns):
+            selected.append(relative)
+    if selected:
+        raise VendorError(
+            f"Local upstream source {source!r} has ignored untracked files selected "
+            f"for export: {selected}."
+        )
 
 
 def _apply_patch_bytes(
@@ -1537,13 +1390,12 @@ def _apply_patch_bytes(
 def _command_export(args: argparse.Namespace) -> None:
     lock = _load_lock(args.lock)
     vendor = _require_vendor(lock, args.name)
-    _verify_offline(lock, vendor)
     repository = args.repo.resolve()
     if _worktree_head(repository) != vendor.commit:
         raise VendorError(
             f"Local upstream HEAD must equal locked commit {vendor.commit} before export."
         )
-    _require_clean_source_worktree(repository, vendor.source)
+    _require_clean_source_worktree(repository, vendor.source, vendor.include)
     raw = _local_source_tree(vendor, repository)
     normal = raw
     if vendor.patch is not None:
@@ -1554,14 +1406,6 @@ def _command_export(args: argparse.Namespace) -> None:
             f"Vendor {vendor.name!r} normal materialization does not match its digest."
         )
     current = _current_tree(lock, vendor)
-    if vendor.divergence is not None:
-        actual_files = _changed_paths(normal, current)
-        expected_files = list(vendor.divergence["files"])
-        if actual_files != expected_files:
-            raise VendorError(
-                f"Vendor {vendor.name!r} divergence files mismatch: "
-                f"expected {expected_files}, got {actual_files}."
-            )
     delta = _generate_patch(normal, current)
     if not delta:
         raise VendorError(f"Vendor {vendor.name!r} has no downstream change to export.")
@@ -1583,13 +1427,11 @@ def _command_export(args: argparse.Namespace) -> None:
 def _command_pin(args: argparse.Namespace) -> None:
     lock = _load_lock(args.lock)
     vendor = _require_vendor(lock, args.name)
-    _verify_offline(lock, vendor)
     repository = args.repo.resolve()
     commit = args.commit or _worktree_head(repository)
     value = vendor.to_mapping()
     value["url"] = args.url or vendor.url
     value["commit"] = commit
-    value.pop("divergence", None)
     if args.branch is not None:
         value["branch"] = args.branch
         value.pop("tag", None)
@@ -1619,7 +1461,7 @@ def _command_pin(args: argparse.Namespace) -> None:
         else:
             changed = _changed_paths(materialized, current)
             raise VendorError(
-                f"New pin does not reproduce the accepted destination for {vendor.name!r}; "
+                f"New pin does not reproduce the destination for {vendor.name!r}; "
                 f"differing files: {changed}."
             )
     old_patch = proposed.patch
@@ -1627,14 +1469,30 @@ def _command_pin(args: argparse.Namespace) -> None:
         proposed.patch = None
         proposed.patch_digest = None
     proposed.digest = _tree_digest(materialized)
-    proposed.divergence = None
     lock.vendors[vendor.name] = proposed
-    _save_lock(lock)
+    patch_path: Path | None = None
     if drop_patch and old_patch is not None:
-        _checked_root_path(lock.root, old_patch, f"Vendor {vendor.name!r} patch").unlink(
-            missing_ok=True
-        )
-    print(f"Pinned {vendor.name} to {commit}; normal enforcement restored.")
+        patch_path = _checked_root_path(lock.root, old_patch, f"Vendor {vendor.name!r} patch")
+        if patch_path.is_symlink() or not patch_path.is_file():
+            raise VendorError(f"Generated patch path must be a regular file: {patch_path}.")
+    _save_lock_checked(lock, f"new pin for vendor {vendor.name!r}")
+    if patch_path is not None:
+        try:
+            _sync_directory(lock.path.parent)
+        except OSError as error:
+            raise VendorError(
+                f"Failed to make the new pin durable for vendor {vendor.name!r}: {error}"
+            ) from error
+        try:
+            patch_path.unlink()
+        except OSError as error:
+            print(
+                f"warning: Pinned vendor {vendor.name!r}, but could not remove its absorbed "
+                f"patch {patch_path}: {error}. The lock is committed and valid; this patch is "
+                "now an unreferenced orphan. Delete that file manually.",
+                file=sys.stderr,
+            )
+    print(f"Pinned {vendor.name} to {commit}; offline enforcement restored.")
 
 
 def _command_remove(args: argparse.Namespace) -> None:
@@ -1721,17 +1579,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_repo_argument(patch)
     patch.set_defaults(handler=_command_patch)
 
-    divergence = commands.add_parser(
-        "divergence", help="Manage a time-bounded direct destination modification."
-    )
-    divergence.add_argument("name")
-    divergence.add_argument("action", choices=("capture", "refresh", "clear"))
-    divergence.add_argument("--reason")
-    divergence.add_argument("--expires")
-    _add_repo_argument(divergence)
-    divergence.set_defaults(handler=_command_divergence)
-
-    export = commands.add_parser("export", help="Export accepted local changes upstream.")
+    export = commands.add_parser("export", help="Export pending destination changes upstream.")
     export.add_argument("name")
     _add_repo_argument(export, required=True)
     export.set_defaults(handler=_command_export)
@@ -1754,16 +1602,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_action_arguments(args: argparse.Namespace) -> None:
-    if args.command != "divergence":
-        return
-    if args.action == "capture":
-        if args.reason is None or args.expires is None:
-            raise VendorError("divergence capture requires --reason and --expires.")
-    elif args.reason is not None or args.expires is not None:
-        raise VendorError(f"divergence {args.action} does not accept --reason or --expires.")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the vendoring command-line interface."""
     parser = _build_parser()
@@ -1771,7 +1609,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.lock != _DEFAULT_LOCK:
         args.lock = args.lock.resolve()
     try:
-        _validate_action_arguments(args)
         args.handler(args)
     except VendorError as error:
         print(f"error: {error}", file=sys.stderr)

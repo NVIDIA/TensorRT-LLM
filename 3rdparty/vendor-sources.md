@@ -3,56 +3,83 @@
 TensorRT-LLM keeps some upstream source trees in this repository so they can be
 built, packaged, and reviewed with the code that uses them. The generic
 vendoring tool records where each tree came from, materializes it reproducibly,
-and detects edits that are not represented by its lock entry.
+and rejects destination edits that are not represented by its lock entry.
 
 The generated lock is `3rdparty/vendor_sources.lock.yaml`. It records an
 upstream Git URL, an immutable commit, the source and destination directories,
-the selected files, any downstream patch and its content digest, and a digest
-of the materialized destination. A short branch or tag may be recorded to
-explain where the commit came from, but the full commit is authoritative.
+the selected files, any persistent compatibility patch and its content digest,
+and a digest of the materialized destination. A short branch or tag may explain
+where the commit came from, but the full commit is authoritative.
 
 Use `scripts/vendor_sources.py` for every lock or vendor-state change. Do not
-edit the YAML, generated patches, or digests by hand.
+edit the YAML, generated patches, or digests by hand. All examples below use the
+default lock. For an isolated test or another consumer repository, place
+`--lock PATH` before the subcommand.
 
-All examples below use the default lock. For an isolated test or another
-consumer repository, place `--lock PATH` before the subcommand.
+## Lock contract
 
-## Enforcement states
-
-A vendor is in one of three states:
+A locked vendor has one of two durable states:
 
 - **Exact**: the selected destination files are byte-for-byte copies of the
-  selected upstream files.
-- **Patched**: a deterministic patch records the downstream additions,
-  modifications, and deletions applied after copying the upstream files.
-- **Temporary divergence**: urgent destination edits are accepted for a
-  bounded period. The tool records the reason, creation and expiration dates,
-  affected files, and accepted digest. Pinning a commit that materializes the
-  accepted tree removes the divergence and restores exact or patched
-  enforcement.
+  selected files at the locked upstream commit.
+- **Patched**: applying a deterministic, persistent compatibility patch to
+  those upstream files reproduces the destination exactly. Use this patch only
+  for TensorRT-LLM-specific adaptations that do not belong upstream.
 
-Temporary divergence is an escape hatch, not a normal update path. Prefer to
-validate a fix locally, export it to an upstream checkout, open the upstream
-change, and pin the resulting commit.
+A destination edit is not a third state. While such an edit is pending,
+`status`, the default offline `check`, and the pre-commit check intentionally
+fail. Resolve it by discarding it with `sync`, recording a TensorRT-LLM-only
+adaptation with `patch`, or exporting an upstream-worthy change and pinning the
+resulting commit. `export` accepts this pending destination delta by default and
+does not change the lock or persistent patch.
+
+## Choose a command
+
+```mermaid
+flowchart TD
+    A{Lock entry exists?}
+    A -- No --> B{Destination exists?}
+    B -- No --> C[create]
+    B -- Yes --> D[create --adopt exact or patched]
+    A -- Yes --> E{What do you need?}
+    E -- Inspect --> F[list, status, or check]
+    E -- Restore locked bytes --> G[sync current immutable pin]
+    E -- Use a newer upstream commit --> H[Prepare matching destination, then pin]
+    E -- Destination changed --> I{Should the change go upstream?}
+    I -- No, TensorRT-LLM only --> J[patch create or refresh]
+    I -- Yes --> K[Temporary branch, export, commit and push, then pin]
+    E -- Stop vendoring --> L[remove]
+```
+
+`sync` only restores the commit and compatibility patch already recorded in the
+lock. It never discovers, imports, or pins a newer upstream commit. To move to a
+new upstream revision, first make the destination equal that revision plus the
+existing compatibility patch, then use `pin`.
 
 ## Inspect vendors
 
-List the lock entries or show their enforcement state:
+List entries, or run the offline integrity status for all or one vendor:
 
 ```bash
 python scripts/vendor_sources.py list
 python scripts/vendor_sources.py status
 python scripts/vendor_sources.py status VENDOR
+python scripts/vendor_sources.py check VENDOR
 ```
+
+`status` and the default `check` exit unsuccessfully if the destination has a
+pending delta. That failure is expected during an export workflow and remains
+until `pin` succeeds.
 
 ## Add or adopt a vendor
 
-Create a vendor from an immutable commit and a local upstream checkout:
+When neither the lock entry nor destination exists, create both from an
+immutable commit and a local upstream checkout:
 
 ```bash
 python scripts/vendor_sources.py create VENDOR \
   --url https://example.com/organization/repository.git \
-  --branch topic-branch \
+  --branch main \
   --commit FULL_COMMIT \
   --source path/in/upstream \
   --destination path/in/tensorrt-llm \
@@ -60,114 +87,123 @@ python scripts/vendor_sources.py create VENDOR \
   --repo /path/to/upstream
 ```
 
-Use `--tag TAG` instead of `--branch BRANCH` for a tagged source. Branch and
-tag names are informational; `FULL_COMMIT` remains the reproducibility pin.
-Without `--repo`, the tool obtains the commit from the recorded URL. A normal
-`create` copies the selected source into a new destination.
+Use `--tag TAG` instead of `--branch BRANCH` for a tagged source. Without
+`--repo`, the tool obtains the commit from the recorded URL.
 
-If the destination already contains the intended files, add `--adopt exact`
-to require an exact upstream match or `--adopt patched` to generate a patch
-from upstream to the existing destination. Adoption never silently accepts an
-unrepresented difference. For later destination edits, use the patch or
-temporary-divergence commands below.
+If the destination already exists but has no lock entry, adopt it. Use `exact`
+to require an exact upstream match:
 
-## Sync and patch a vendor
+```bash
+python scripts/vendor_sources.py create VENDOR \
+  --url https://example.com/organization/repository.git \
+  --commit FULL_COMMIT \
+  --source path/in/upstream \
+  --destination path/in/tensorrt-llm \
+  --include '**/*.py' \
+  --adopt exact \
+  --repo /path/to/upstream
+```
 
-Materialize the locked source and downstream patch into the destination:
+Use `--adopt patched` instead to capture intentional TensorRT-LLM compatibility
+adaptations. Adoption never silently accepts an unrepresented difference.
+
+## Restore the current lock
+
+Discard destination edits and reproduce the currently locked upstream commit
+plus its persistent patch:
 
 ```bash
 python scripts/vendor_sources.py sync VENDOR --repo /path/to/upstream
 ```
 
-After intentionally editing an exact destination, create its patch and update
-its digest together:
+This overwrites the selected destination files. It does not update the lock,
+look at a branch tip, or choose a newer commit.
+
+## Maintain a TensorRT-LLM compatibility patch
+
+After editing an exact destination for a change that must remain downstream,
+create its persistent patch:
 
 ```bash
 python scripts/vendor_sources.py patch VENDOR create --repo /path/to/upstream
 ```
 
-After intentionally editing a patched destination, regenerate its patch and
-digest together:
+After intentionally changing an already patched destination, regenerate the
+patch:
 
 ```bash
 python scripts/vendor_sources.py patch VENDOR refresh --repo /path/to/upstream
 ```
 
-Drop a no-longer-needed patch only after the destination matches the exact
-upstream selection:
+Drop a no-longer-needed patch only after the destination exactly matches the
+currently locked upstream selection:
 
 ```bash
 python scripts/vendor_sources.py patch VENDOR drop --repo /path/to/upstream
 ```
 
-Patch files are generated artifacts under `3rdparty/vendor_patches/`. Review
-them, but update them through the tool.
+Generated patches live under `3rdparty/vendor_patches/`. Review them, but update
+them only through the tool. Do not use a persistent patch for a change that
+should be contributed upstream; use the export workflow instead.
 
-## Round-trip a change through upstream
+## Export a destination change upstream
 
-To test a fix in TensorRT-LLM first, edit the destination and capture the
-temporary divergence described below. Export the accepted destination to a
-local upstream checkout:
+Start with the desired change in the TensorRT-LLM destination. The offline
+check now fails by design. In a clean upstream checkout, create a temporary
+branch at the currently locked commit **before** exporting:
 
 ```bash
+git -C /path/to/upstream switch -c trtllm-vendor-fix LOCKED_FULL_COMMIT
 python scripts/vendor_sources.py export VENDOR --repo /path/to/upstream
 ```
 
-Run upstream tests, review and commit the local checkout, then push it to a
-branch or fork. The export command changes the selected source directory in
-that checkout; it does not commit or push anything.
+The upstream checkout's selected source must be clean before export and its
+`HEAD` must equal the locked commit. `export` computes the pending destination
+delta relative to the locked materialization, applies only that delta to the
+raw upstream source, and leaves the vendor lock, destination, and persistent
+compatibility patch unchanged.
 
-After the upstream commit exists, replace the recorded URL, branch or tag, and
-commit with one validated from the local checkout:
+Run the upstream tests, review the result, then commit and push the temporary
+branch:
+
+```bash
+git -C /path/to/upstream add path/in/upstream
+git -C /path/to/upstream commit -s -m 'Apply exported fix'
+git -C /path/to/upstream push -u origin trtllm-vendor-fix
+```
+
+Finally, pin the committed revision from that checkout:
 
 ```bash
 python scripts/vendor_sources.py pin VENDOR \
   --url https://example.com/my-fork/repository.git \
-  --branch upstream-fix \
+  --branch trtllm-vendor-fix \
   --commit NEW_FULL_COMMIT \
   --repo /path/to/upstream
 ```
 
-When the new exact or patched materialization equals the checked-in
-destination, `pin` removes temporary-divergence metadata and restores normal
-enforcement. It does not silently discard a divergence that the new pin cannot
-reproduce.
+`pin` first tries the selected files at `NEW_FULL_COMMIT` plus the existing
+persistent compatibility patch. They must exactly equal the checked-in
+destination. One exception is safe: if the raw new commit itself exactly equals
+the destination, upstream has absorbed the compatibility patch, so `pin` drops
+that patch and its metadata. Otherwise `pin` does not absorb a mismatch,
+regenerate the patch, or copy candidate files into the destination. On success
+it durably updates the immutable lock before removing an absorbed patch and
+restores passing offline checks. If the patch cannot be removed after that
+commit, `pin` succeeds with a warning and leaves a safe, unreferenced orphan;
+delete the reported file manually. A failure before the durable lock commit
+does not remove the existing patch. If directory synchronization fails after
+the atomic replacement, the lock may already show the new pin, but the retained
+patch keeps either recovered lock version reproducible.
 
-## Temporary divergence
-
-Capture an urgent edit with an explicit expiration date:
-
-```bash
-python scripts/vendor_sources.py divergence VENDOR capture \
-  --reason 'Urgent correctness fix' \
-  --expires 2026-08-25 \
-  --repo /path/to/upstream
-```
-
-The tool derives the creation date, affected files, and accepted digest. If
-the urgent edit changes again, refresh those generated fields while preserving
-the reason and expiration. An exception may last at most 30 days; extending it
-requires a new, reviewed capture after the current exception is cleared.
-
-```bash
-python scripts/vendor_sources.py divergence VENDOR refresh \
-  --repo /path/to/upstream
-```
-
-Normally, use `pin` to leave this state. To discard the temporary acceptance
-without changing the destination, run:
-
-```bash
-python scripts/vendor_sources.py divergence VENDOR clear
-```
-
-The next offline check fails until the destination is synchronized or its
-change is represented by a patch or a new pin. Expired divergence always
-fails.
+The same rule applies when adopting a newer commit that was developed upstream
+first: prepare the destination to exactly match the proposed commit plus the
+existing patch, then run `pin`. Do not use `sync` to look for that commit.
 
 ## Remove a vendor
 
-Remove a lock entry and its generated patch while preserving the destination:
+Remove a lock entry and its generated compatibility patch while preserving the
+destination:
 
 ```bash
 python scripts/vendor_sources.py remove VENDOR
@@ -182,33 +218,31 @@ The default check is deliberately offline:
 
 ```bash
 python scripts/vendor_sources.py check
+python scripts/vendor_sources.py check --offline
 ```
 
-`check --offline` is an explicit spelling of the same default behavior.
+It validates the lock schema and path safety, patch metadata, and the checked-in
+destination digest. It never invokes Git, performs DNS resolution, or contacts
+a recorded URL. This is the always-run pre-commit check. A pending destination
+delta therefore blocks a commit until it is synchronized, patched, or pinned.
 
-It validates the lock schema and path safety, patch and divergence metadata,
-expiration dates, and the checked-in destination digest. It never invokes Git,
-performs DNS resolution, or contacts a recorded URL. This is the always-run
-pre-commit check, so a contributor who cannot access an internal upstream can
-still develop normally.
-
-Use the upstream check when network access is available:
+When network access is available, attempt verification against every recorded
+upstream:
 
 ```bash
 python scripts/vendor_sources.py check --upstream
 ```
 
-This verifies every accessible upstream and reports an inaccessible repository
-as unavailable rather than failing. If a commit can be obtained, a source,
-patch, or destination mismatch is an error. Trusted maintainer CI can require
-access to every source:
+An inaccessible repository is reported as unavailable rather than failing. If
+a commit can be obtained, a source, patch, or destination mismatch is an error.
+Trusted maintainer CI can require access to every source:
 
 ```bash
 python scripts/vendor_sources.py check --upstream --require-access
 ```
 
-To verify against an existing checkout without contacting the recorded URL,
-provide it explicitly:
+To verify one vendor against an existing checkout without contacting the
+recorded URL, provide it explicitly:
 
 ```bash
 python scripts/vendor_sources.py check VENDOR --repo /path/to/upstream
@@ -239,9 +273,9 @@ files that TensorRT-LLM modifies.
 The `flashinfer-prims-ts` entry selects the complete Python tree under
 `flashinfer/attention/prims_ts` and materializes it at
 `tensorrt_llm/_torch/attention_backend/prims_ts`. The `**/*.py` selection
-deliberately omits upstream README files. A generated patch contains only the
-TRT-LLM integration and compatibility changes; all other selected files remain
-exact upstream copies.
+deliberately omits upstream README files. Its persistent patch contains only
+TensorRT-LLM integration and compatibility adaptations; all other selected
+files remain exact upstream copies.
 
 Use the normal commands with `flashinfer-prims-ts`, for example:
 
