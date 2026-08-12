@@ -28,7 +28,7 @@
 # CONTRACT: total MPI ranks (nodes × ntasks-per-node) must equal
 # parallel_config.n_workers (= cfg_size × cp_size × ulysses_size × tp_size)
 # of the --visual_gen_args YAML. This script's defaults launch 2 × 4 = 8
-# ranks, matching examples/visual_gen/configs/wan2.2-t2v-mgmn-2node-8gpu.yaml
+# ranks, matching examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml
 # (cfg_size=2 × ulysses_size=4). A mismatch fails fast at startup.
 #
 # WHAT TO MODIFY:
@@ -72,7 +72,7 @@ export MOUNT_DIR="${MOUNT_DIR:-$HOME}"
 export MOUNT_DEST="${MOUNT_DEST:-$HOME}"
 
 export MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
-export VISUAL_GEN_CONFIG="${VISUAL_GEN_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/configs/wan2.2-t2v-mgmn-2node-8gpu.yaml}"
+export VISUAL_GEN_CONFIG="${VISUAL_GEN_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/configs/wan2.2-t2v-fp8-8gpu.yaml}"
 export SERVER_PORT="${SERVER_PORT:-8000}"
 
 # ---------------------------------------------------------------------------
