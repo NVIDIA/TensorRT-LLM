@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import errno
 import functools
 import os
 import platform
@@ -258,10 +259,18 @@ class MnnvlMemory:
                     remote_fd = syscall(438, pidfd, fd, 0)
                     if remote_fd < 0:
                         err = ctypes.get_errno()
-                        raise RuntimeError(
+                        error_msg = (
                             f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno "
-                            f"{err}: {os.strerror(err)}"
+                            f"{err}: {os.strerror(err)}."
                         )
+                        if err == errno.EPERM:
+                            error_msg += (
+                                " Permission denied. If running in a container, try adding "
+                                "--cap-add=SYS_PTRACE to your docker run command."
+                            )
+                        elif err == errno.ENOSYS:
+                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                        raise RuntimeError(error_msg)
                     remote_fds.append(remote_fd)
                 comm.barrier()
                 all_handles_data = remote_fds
@@ -303,11 +312,20 @@ class MnnvlMemory:
             raise
         finally:
             for pidfd in pidfds:
-                os.close(pidfd)
+                try:
+                    os.close(pidfd)
+                except OSError as error:
+                    logger.warning("Failed to close MNNVL pidfd: %s", error)
             for remote_fd in remote_fds:
-                os.close(remote_fd)
+                try:
+                    os.close(remote_fd)
+                except OSError as error:
+                    logger.warning("Failed to close imported MNNVL file descriptor: %s", error)
             if not is_fabric and exported_handle is not None:
-                os.close(int(exported_handle))
+                try:
+                    os.close(int(exported_handle))
+                except OSError as error:
+                    logger.warning("Failed to close exported MNNVL file descriptor: %s", error)
 
     @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):

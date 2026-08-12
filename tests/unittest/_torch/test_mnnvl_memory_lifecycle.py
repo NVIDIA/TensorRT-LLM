@@ -17,9 +17,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 import tensorrt_llm._mnnvl_utils as mnnvl
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 
 
 class _FakeComm:
@@ -353,6 +355,82 @@ def test_create_and_map_handles_releases_local_handle_on_export_failure(monkeypa
     release_memory.assert_called_once_with(11)
 
 
+@pytest.mark.parametrize(
+    ("errno_value", "expected_hint"),
+    [(mnnvl.errno.EPERM, "--cap-add=SYS_PTRACE"), (mnnvl.errno.ENOSYS, "requires Linux 5.6+")],
+)
+def test_create_and_map_handles_preserves_pidfd_error_hint(monkeypatch, errno_value, expected_hint):
+    comm = Mock()
+    comm.Get_rank.return_value = 0
+    comm.Get_size.return_value = 2
+    comm.allgather.side_effect = [[100, 101], [1000, 1001]]
+    allocation_prop = SimpleNamespace(
+        requestedHandleTypes=(
+            mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        ),
+        location=object(),
+    )
+    syscall = Mock(side_effect=[10, 11, -1])
+
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "dev_id", 0)
+    monkeypatch.setattr(
+        mnnvl.MnnvlMemory,
+        "get_allocation_prop",
+        Mock(return_value=allocation_prop),
+    )
+    monkeypatch.setattr(mnnvl, "_check_cu_result", lambda result: result)
+    monkeypatch.setattr(mnnvl.cuda, "cuCtxGetDevice", Mock(return_value=0))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemCreate", Mock(return_value=11))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemExportToShareableHandle", Mock(return_value=100))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemRelease", Mock(return_value=None))
+    monkeypatch.setattr(mnnvl.ctypes, "CDLL", Mock(return_value=SimpleNamespace(syscall=syscall)))
+    monkeypatch.setattr(mnnvl.ctypes, "get_errno", Mock(return_value=errno_value))
+    close_fd = Mock()
+    monkeypatch.setattr(mnnvl.os, "close", close_fd)
+
+    with pytest.raises(RuntimeError, match=expected_hint):
+        _TestMnnvlMemory._create_and_map_handles(comm, 64, 1000, 256, 32)
+
+    assert [call.args[0] for call in close_fd.call_args_list] == [10, 11, 100]
+
+
+def test_create_and_map_handles_close_failure_does_not_mask_original_error(monkeypatch):
+    comm = Mock()
+    comm.Get_rank.return_value = 0
+    comm.Get_size.return_value = 2
+    comm.allgather.side_effect = [[100, 101], [1000, 1001]]
+    allocation_prop = SimpleNamespace(
+        requestedHandleTypes=(
+            mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        ),
+        location=object(),
+    )
+    access_desc = SimpleNamespace(location=None, flags=None)
+    syscall = Mock(side_effect=[10, 11, 20, 21])
+
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "dev_id", 0)
+    monkeypatch.setattr(
+        mnnvl.MnnvlMemory,
+        "get_allocation_prop",
+        Mock(return_value=allocation_prop),
+    )
+    monkeypatch.setattr(mnnvl, "_check_cu_result", lambda result: result)
+    monkeypatch.setattr(mnnvl.cuda, "cuCtxGetDevice", Mock(return_value=0))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemCreate", Mock(return_value=11))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemExportToShareableHandle", Mock(return_value=100))
+    monkeypatch.setattr(mnnvl.cuda, "CUmemAccessDesc", Mock(return_value=access_desc))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemMap", Mock(side_effect=RuntimeError("map failed")))
+    monkeypatch.setattr(mnnvl.cuda, "cuMemRelease", Mock(return_value=None))
+    monkeypatch.setattr(mnnvl.ctypes, "CDLL", Mock(return_value=SimpleNamespace(syscall=syscall)))
+    close_fd = Mock(side_effect=[OSError("close failed"), None, None, None, None])
+    monkeypatch.setattr(mnnvl.os, "close", close_fd)
+
+    with pytest.raises(RuntimeError, match="map failed"):
+        _TestMnnvlMemory._create_and_map_handles(comm, 64, 1000, 256, 32)
+
+    assert [call.args[0] for call in close_fd.call_args_list] == [10, 11, 20, 21, 100]
+
+
 def _make_moe_alltoall_for_lifecycle():
     obj = MoeAlltoAll.__new__(MoeAlltoAll)
     obj._destroyed = True
@@ -366,3 +444,28 @@ def test_moe_alltoall_rejects_unmapped_workspace():
 
     with pytest.raises(RuntimeError, match="workspace handles are unmapped"):
         obj._require_mapped()
+
+
+def test_two_sided_combine_requires_new_prepare_before_next_dispatch(monkeypatch):
+    communication = NVLinkTwoSided.__new__(NVLinkTwoSided)
+    communication._dispatch_state = {
+        "alltoall_info": object(),
+        "original_token_count": 1,
+    }
+    communication.alltoall_workspace = object()
+    communication.ep_rank = 0
+    communication.ep_size = 1
+    communication.top_k = 1
+    communication.use_low_precision_combine = False
+    communication.alltoall_result_do_sum = True
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "require_mapped", Mock())
+    monkeypatch.setattr(
+        mnnvl.MnnvlMoe,
+        "mnnvl_moe_alltoallv_combine",
+        Mock(return_value=torch.ones(1, 1)),
+    )
+
+    communication.combine(torch.ones(1, 1))
+
+    with pytest.raises(ValueError, match=r"requires prepare_dispatch\(\) to be called first"):
+        communication.dispatch(None, None, None, None, [1])
