@@ -1982,9 +1982,13 @@ def maybe_transform_reasoning_effort(
     str_to_effort = {
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
-        "high": ReasoningEffort.HIGH
+        "high": ReasoningEffort.HIGH,
+        # Levels other model families use. Harmony has no "off" rung, so
+        # 'none' falls through to unspecified rather than raising a KeyError
+        # on a request that is merely aimed at a different model.
+        "max": ReasoningEffort.HIGH,
     }
     if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
-        return str_to_effort[reasoning_effort]
+        return str_to_effort.get(reasoning_effort)
     else:
         return reasoning_effort
