@@ -19,6 +19,7 @@ import signal
 import socket
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Callable, Optional
 
 import aiohttp
@@ -363,13 +364,31 @@ class OpenAIDisaggServer:
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
 
+    def _model_name_from_config(self) -> Optional[str]:
+        """Served model name as spelled out in the disagg config, if any.
+
+        ``server_configs`` is empty when the workers are discovered through the
+        disagg cluster instead of being listed in the config file. The name is
+        normalized the same way ``OpenAIServer`` does, so both servers report
+        the same id for a given ``model``.
+        """
+        for server_config in self._config.server_configs or []:
+            model = (server_config.other_args or {}).get("model") or ""
+            if model:
+                model_dir = Path(model)
+                return model_dir.name if model_dir.is_dir() else model
+        return None
+
     async def get_models(self) -> JSONResponse:
         """Return model list compatible with OpenAI API /v1/models endpoint.
 
-        When service discovery is enabled, server_configs is empty, so we
-        instead fetch /v1/models directly from a worker via the router.
+        The workers are the source of truth for the served model name, so
+        ``/v1/models`` is proxied from the first reachable ctx/gen worker. When
+        no worker answers -- e.g. none is up yet -- fall back to the model named
+        in the disagg config, and to ``"unknown"`` only when the config carries
+        no worker entries either (service discovery).
         """
-        for router in [self._ctx_router, self._gen_router]:
+        for router in (self._ctx_router, self._gen_router):
             servers = router.servers
             if servers:
                 server = servers[0]
@@ -382,11 +401,16 @@ class OpenAIDisaggServer:
                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 return JSONResponse(content=await resp.json())
-                except Exception as e:
+                            logger.warning(
+                                f"Worker {server} returned status {resp.status} for /v1/models"
+                            )
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
+                        ValueError) as e:
                     logger.warning(
                         f"Failed to fetch /v1/models from worker {server}: {e}"
                     )
-        model_list = ModelList(data=[ModelCard(id="unknown")])
+        model_list = ModelList(
+            data=[ModelCard(id=self._model_name_from_config() or "unknown")])
         return JSONResponse(content=model_list.model_dump())
 
     async def health(self) -> Response:
