@@ -404,6 +404,16 @@ class MXCheckpointLoader(HfCheckpointLoader):
             )
 
         source_registered = source_metadata is not None
+        if not source_registered and self._query_timeout_s == 0:
+            # A zero timeout explicitly disables source polling. Fall back
+            # before preparing post-transform receiver aliases: that setup
+            # mutates the module graph and is only safe when P2P will proceed.
+            return self._fallback_to_disk(
+                checkpoint_dir,
+                mapping,
+                reason="no MX source is registered and source polling is disabled",
+                **kwargs,
+            )
         if not source_registered and self._local_source_identity is not None:
             # ModelExpress 0.4.1 hashes every SourceIdentity field, including
             # extra_parameters. Proceed to MxLiveWeightLoader.load_weights()

@@ -1015,6 +1015,35 @@ class TestMxSourceQueryTimeoutDefault:
         mx_loader.load_weights.assert_called_once()
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
+    def test_zero_timeout_falls_back_before_receiver_preparation(self):
+        identity = _identity()
+        disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001", query_timeout_s=0)
+        fake_mx = _build_fake_modelexpress()
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        prepare_receiver.assert_not_called()
+        fake_mx.trtllm_live_transfer.MxLiveWeightLoader.assert_not_called()
+        mock_super_load.assert_called_once()
+
     def test_existing_source_keeps_upstream_default_when_unset(self):
         identity = _identity()
 
