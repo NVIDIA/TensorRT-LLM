@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import pickle
+import platform
 import sys
 import traceback
 
@@ -565,8 +566,8 @@ def test_mnnvl_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype,
 
 
 @pytest.mark.skipif(
-    os.environ.get("TRTLLM_TEST_MNNVL_CHECKPOINT") != "1",
-    reason="requires fabric-backed MNNVL checkpoint test hardware",
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 2,
+    reason="requires at least two GB200 GPUs with fabric-backed MNNVL",
 )
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @pytest.mark.parametrize("num_tokens", [1, 4096], ids=["oneshot", "twoshot"])

@@ -16,6 +16,7 @@ import math
 import os
 import platform
 import threading
+import typing
 from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
@@ -579,8 +580,14 @@ class MNNVLAllReduce(nn.Module):
     is deterministic across ranks. For TP sizes up to 8, it uses a rank-specialized
     fast path that keeps the local value in registers and volatile-loads only peers
     from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
+
+    The checkpoint hooks are internal and experimental resource hooks. They do
+    not stop admission or drain execution; an engine-level coordinator must
+    establish global quiescence before invoking them. Multi-node MPI, NCCL, and
+    RDMA process-restore semantics are not yet supported by such a coordinator.
     """
-    allreduce_mnnvl_workspaces: dict[Mapping, _MnnvlWorkspace] = {}
+    allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
+                                                     _MnnvlWorkspace]] = {}
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -640,15 +647,22 @@ class MNNVLAllReduce(nn.Module):
         return workspace_size
 
     def checkpoint_prepare(self) -> None:
-        """Collectively detach fabric handles while retaining workspace virtual addresses."""
+        """Collectively detach handles after external global quiescence.
+
+        This internal, experimental hook assumes an engine-level coordinator
+        has atomically stopped admission and drained all in-flight work on every
+        participating rank. It is not sufficient for live-serving checkpointing.
+        """
         workspace = self.allreduce_mnnvl_workspaces[self.mapping]
         workspace["handle"].checkpoint_prepare()
 
     def checkpoint_restore(self, comm: _MpiCommProtocol) -> None:
-        """Collectively recreate fabric handles using a fresh communicator.
+        """Collectively recreate handles under an external restore coordinator.
 
         This follows FlashInfer #3745 and requires a communicator created
-        after process restore for the fresh handle exchange.
+        after process restore for the fresh handle exchange. This internal,
+        experimental hook assumes every rank is still quiescent; serving must
+        resume only after all resource hooks have completed successfully.
 
         Args:
             comm: Communicator newly created after process restore.
@@ -814,7 +828,7 @@ class AllReduce(nn.Module):
                         # Keep SYMM_MEM strategy but allocate workspace for fallback to regular allreduce
                     else:
                         logger.info(
-                            f"SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
+                            "SymmetricMemoryAllReduce is disabled (not supported or unavailable), falling back to AUTO strategy"
                         )
                         # Fall back to AUTO if SYMM_MEM can't be enabled
                         self.strategy = AllReduceStrategy.AUTO
@@ -852,7 +866,7 @@ class AllReduce(nn.Module):
                         self.mnnvl_allreduce = None
                 else:
                     logger.debug(
-                        f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
+                        "MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
 
