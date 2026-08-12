@@ -126,7 +126,6 @@ disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyL
 examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph] SKIP (https://nvbugs/6426841)
 examples/test_ray.py::test_llm_inference_distributed_ray[pp2] SKIP (https://nvbugs/6427411)
 examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2] SKIP (https://nvbugs/6427411)
-examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden SKIP (https://nvbugs/6418815)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6437341)
