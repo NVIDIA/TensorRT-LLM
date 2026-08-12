@@ -327,6 +327,9 @@ def test_autotuner_do_preparation_try_block():
             [x, w])
     assert tactic == -1, \
         f"Expect the fallback tactic -1, but got tactic {tactic}."
+    assert tuner.stats.failed_profiling_count[
+        "test_autotuner_do_preparation_try_block"], \
+        "Expect the failure to be recorded."
 
 
 def test_autotuner_preparation_try_block():
@@ -389,6 +392,8 @@ def test_autotuner_preparation_try_block():
             f"{name}: expect the fallback tactic -1, but got tactic {tactic}."
         assert runner is runners[0], \
             f"{name}: expect the fallback runner, but got {runner}."
+        assert tuner.stats.failed_profiling_count[name], \
+            f"{name}: expect the failure to be recorded."
 
 
 @torch.library.custom_op("autotuner_test::recursive_get_best_gemm_tactic",
