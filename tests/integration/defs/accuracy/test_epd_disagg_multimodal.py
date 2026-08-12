@@ -207,9 +207,6 @@ class EPDVariant:
             ),
             max_batch_size=64,
             expected_quant_algo=QuantAlgo.FP8,
-            # Default 128 workers trips a native-library abort in the CPU-side
-            # multimodal preprocessing path on H100 (nvbugs/6478692).
-            max_workers=16,
         )
 
     @classmethod
@@ -269,6 +266,7 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("_repeat", range(160, 260), ids=lambda i: f"rep{i:02d}")
     @pytest.mark.parametrize(
         "variant",
         [
@@ -287,7 +285,16 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     )
     # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
     @pytest.mark.threadleak(enabled=False)
-    def test_disaggregated_videomme(self, variant: EPDVariant) -> None:
+    def test_disaggregated_videomme(self, variant: EPDVariant, _repeat: int) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
-        with self._launch_epd(variant) as llm:
-            self._run_videomme(llm, variant)
+        import faulthandler
+        import sys
+
+        # Periodically dump all thread stacks to stderr so CI captures
+        # the exact deadlock/race site on timeout or SIGABRT.
+        faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
+        try:
+            with self._launch_epd(variant) as llm:
+                self._run_videomme(llm, variant)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
