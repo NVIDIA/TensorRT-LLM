@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,14 +59,17 @@ public:
     [[nodiscard]] std::uint64_t postWrite(std::string const& peer, void const* src, std::uint64_t dstAddr,
         std::uint32_t remoteDevId, std::uint32_t bytes, cudaStream_t stream) override;
     [[nodiscard]] XferState poll(std::uint64_t handle) override;
-    void release(std::uint64_t handle) override;
+    [[nodiscard]] bool release(std::uint64_t handle) override;
 
 private:
+    void retainForRetry(void* handle);
+
     nixlAgent* mRawAgent{nullptr};
     int mDeviceId{0};
     std::mutex mMu;
     std::uint64_t mNext{1};
     std::unordered_map<std::uint64_t, void*> mHandles;      // id -> nixlXferReqH*
+    std::unordered_set<std::uint64_t> mReleasing;           // ids temporarily owned by release()
     std::vector<std::pair<void*, std::size_t>> mRegistered; // (addr,bytes) registered -> deregister in dtor
 };
 

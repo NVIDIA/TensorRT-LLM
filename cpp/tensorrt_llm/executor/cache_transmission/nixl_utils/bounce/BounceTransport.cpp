@@ -329,7 +329,16 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     job.entries = std::move(entries);
     job.nvtxQueue = bounceRangeStart(
         kNvtxScatterQueue, "scatterQueue rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
-    mScattering.emplace(job.offset, false); // a worker is about to read this incoming region (not yet orphaned)
+    // DATA is not retransmitted by this protocol. An occupied region therefore indicates stale or
+    // malformed input; drop it instead of adding replay state or risking two readers of one grant.
+    if (!mScattering.emplace(job.offset, false).second)
+    {
+        TLLM_LOG_WARNING("BounceTransport(%s): dropping duplicate DATA peer=%s rid=%llu chunk=%u region=%llu",
+            mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
+            static_cast<unsigned long long>(h.regionHandle));
+        bounceRangeEnd(job.nvtxQueue);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(mJobMu);
         mJobs.emplace_back(std::move(job));
@@ -665,7 +674,6 @@ std::shared_future<TransferState> BounceSender::submit(
 
 void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
 {
-    (void) peer; // the GRANT sender is this request's peer; we post to req.peer below
     std::vector<BounceCreditEntry> credits;
     if (!decodeCredits(blob, h, credits))
     {
@@ -678,6 +686,14 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
         return; // late grant for a finished/cancelled request
     }
     Request& req = it->second;
+    // A credit contains a peer-owned address. Never let an unrelated peer redirect this request's
+    // RDMA write, even if it guesses the request id.
+    if (peer != req.peer)
+    {
+        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer GRANT peer=%s expected=%s rid=%llu",
+            mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId));
+        return;
+    }
     bounceRangeEnd(req.nvtxGrantWait);     // first GRANT ends the credit-wait span (no-op on later GRANTs)
     bounceRangeEnd(req.nvtxCreditStarved); // a GRANT ends the current starvation period (pump may reopen one)
     for (auto const& credit : credits)
@@ -1035,7 +1051,12 @@ bool BounceSender::pollSenderHandles()
                     mCtx.channel->sendTo(
                         req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
                 }
-                mCtx.engine->release(p.xfer);
+                if (!mCtx.engine->release(p.xfer))
+                {
+                    // The write is terminal, so progress is safe; the engine retains the handle for retry.
+                    TLLM_LOG_WARNING("BounceTransport(%s): terminal write handle release deferred rid=%llu chunk=%u",
+                        mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx);
+                }
                 p.state = PostState::Sent;
                 p.nvtxAckWait = bounceRangeStart(
                     kNvtxAckWait, "ackWait rid=%llu chunk=%u", static_cast<unsigned long long>(rid), p.chunkIdx);
@@ -1062,7 +1083,6 @@ bool BounceSender::pollSenderHandles()
 
 void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
 {
-    (void) peer;
     // Starts BEFORE taking mReqMu: the span exposes ACK-processing latency INCLUDING lock wait —
     // pumpRequest holds mReqMu during gather launches, so a long onAck here means the ACK stalled
     // behind another flow's launch prep.
@@ -1075,15 +1095,19 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
         return;
     }
     Request& req = it->second;
+    if (peer != req.peer)
+    {
+        TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer ACK peer=%s expected=%s rid=%llu chunk=%u",
+            mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId),
+            h.chunkIdx);
+        return;
+    }
     bool found = false;
     for (auto pit = req.posted.begin(); pit != req.posted.end(); ++pit)
     {
-        if (pit->chunkIdx == h.chunkIdx)
+        // Only a Sent chunk has finished reading its local staging region and may recycle it on ACK.
+        if (pit->chunkIdx == h.chunkIdx && pit->remoteHandle == h.regionHandle && pit->state == PostState::Sent)
         {
-            // nvtxGather/nvtxWrite are 0 by Sent state; ending them too keeps a protocol-anomalous
-            // early ACK (which erases this Posted) from leaving their spans dangling.
-            bounceRangeEnd(pit->nvtxGather);
-            bounceRangeEnd(pit->nvtxWrite);
             bounceRangeEnd(pit->nvtxAckWait);
             // Return the gather-staging region to the shared arena; re-schedule may hand the freed
             // bytes to a waiting remote flow.
@@ -1095,6 +1119,9 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     }
     if (!found)
     {
+        TLLM_LOG_WARNING("BounceTransport(%s): dropping stale/invalid ACK peer=%s rid=%llu chunk=%u region=%llu",
+            mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
+            static_cast<unsigned long long>(h.regionHandle));
         // Duplicate / unknown ACK (zmq reconnect, retransmit). Do NOT count it — an over-count
         // could push acked past numChunks and resolve SUCCESS before all chunks actually landed.
         return;
@@ -1169,7 +1196,12 @@ bool BounceSender::drainOrphanLocal()
         }
         // Terminal (Done or Failed): the NIC is finished with the region (source AND the receiver's
         // destination) -> recycle the local source now.
-        mCtx.engine->release(o.xfer);
+        if (!mCtx.engine->release(o.xfer))
+        {
+            // The write is terminal, so recycling is safe; only the backend handle remains retained.
+            TLLM_LOG_WARNING("BounceTransport(%s): terminal orphan handle release deferred rid=%llu",
+                mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid));
+        }
         mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.offset));
         didWork = true;
     }
@@ -1286,7 +1318,11 @@ void BounceSender::failAll()
     // Fail any still-pending requests so no submit() future hangs, releasing their in-flight
     // transfer handles first (same handle-leak fix as failRequest). Called after the device has been
     // synced and the IO thread joined, so no lock contention — but keep mReqMu for consistency.
+    // cudaDeviceSynchronize covers only local kernels. NIXL_SUCCESS from releaseXferReq means an
+    // active write was canceled/released; retain failures for retry instead of polling forever and
+    // letting a failed peer/backend hang teardown.
     std::lock_guard<std::mutex> lk(mReqMu);
+    std::vector<std::uint64_t> releaseRetry;
     for (auto& [rid, req] : mRequests)
     {
         for (auto& p : req.posted)
@@ -1296,7 +1332,10 @@ void BounceSender::failAll()
             bounceRangeEnd(p.nvtxAckWait);
             if (p.state == PostState::Writing)
             {
-                mCtx.engine->release(p.xfer); // RDMA write in flight -> release its transfer handle
+                if (!mCtx.engine->release(p.xfer))
+                {
+                    releaseRetry.push_back(p.xfer);
+                }
             }
             if (p.ctx != nullptr)
             {
@@ -1319,13 +1358,26 @@ void BounceSender::failAll()
         }
     }
     mRequests.clear();
-    // Release any deferred orphan-local xfer handles (their writes are done — device was synced
-    // before this call; the arena is torn down by the caller next, so no need to recycle the regions).
+    // Cancel/release deferred writes without recycling their regions or sending deferred control
+    // messages: no producer remains, and shutdown must not grant work against an arena being torn down.
     for (auto const& o : mOrphanLocal)
     {
-        mCtx.engine->release(o.xfer);
+        if (!mCtx.engine->release(o.xfer))
+        {
+            releaseRetry.push_back(o.xfer);
+        }
     }
     mOrphanLocal.clear();
+    // Retry failed cancellations once after all producers/futures have been stopped. A persistent
+    // backend failure remains owned by the engine for its final bounded teardown attempt.
+    for (auto const handle : releaseRetry)
+    {
+        if (!mCtx.engine->release(handle))
+        {
+            TLLM_LOG_WARNING(
+                "BounceTransport(%s): NIXL handle still retained after shutdown retry", mCtx.selfName.c_str());
+        }
+    }
     // Deferred cancels aren't sent at shutdown: in-flight RDMA writes aren't drained by the device
     // sync (they're NIXL, not CUDA-stream), so a cancel could still race a write. The receiver
     // reclaims those regions via its own teardown / peer-loss path.

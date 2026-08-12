@@ -61,7 +61,56 @@ public:
         return b::XferState::kFailed; // ...but it never lands
     }
 
-    void release(std::uint64_t) override {}
+    bool release(std::uint64_t) override
+    {
+        return true;
+    }
+};
+
+// Deterministic engine for protocol and shutdown tests. It can leave a write active and reject its
+// first release, modeling a backend that cannot cancel immediately while preserving the handle for
+// a later retry.
+class ControllableTransferEngine : public b::TransferEngine
+{
+public:
+    bool registerRegion(void*, std::size_t) override
+    {
+        return true;
+    }
+
+    std::uint64_t postWrite(
+        std::string const&, void const*, std::uint64_t, std::uint32_t, std::uint32_t, cudaStream_t) override
+    {
+        auto const handle = nextHandle.fetch_add(1, std::memory_order_relaxed);
+        outstandingHandle.store(handle, std::memory_order_release);
+        postCount.fetch_add(1, std::memory_order_relaxed);
+        return handle;
+    }
+
+    b::XferState poll(std::uint64_t) override
+    {
+        return allowTerminal.load(std::memory_order_acquire) ? b::XferState::kDone : b::XferState::kInProgress;
+    }
+
+    bool release(std::uint64_t handle) override
+    {
+        releaseCount.fetch_add(1, std::memory_order_relaxed);
+        if (!releaseSucceeds.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        std::uint64_t expected = handle;
+        return outstandingHandle.compare_exchange_strong(expected, 0, std::memory_order_acq_rel) || expected == 0;
+    }
+
+    std::atomic<bool> allowTerminal{true};
+    std::atomic<bool> releaseSucceeds{true};
+    std::atomic<std::uint64_t> postCount{0};
+    std::atomic<std::uint64_t> releaseCount{0};
+    std::atomic<std::uint64_t> outstandingHandle{0};
+
+private:
+    std::atomic<std::uint64_t> nextHandle{1};
 };
 
 b::BounceConfig cfg(int timeoutMs)
@@ -148,6 +197,140 @@ TEST(BounceTransportFailure, EngineFailureFailsRequest)
     bounce_test::freeXferBufs(bufs);
 }
 
+// DATA has no retransmission path in this protocol. Receiving it twice for one granted region must
+// therefore produce one scatter and one ACK, rather than adding replay state for an impossible
+// normal-flow event.
+TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/5000);
+    b::ZmqControlChannel sender("dupDataSender");
+    b::ZmqControlChannel receiverChannel("dupDataReceiver");
+    FailingTransferEngine receiverEngine;
+    auto receiverBackend = makeBackend(c, c.maxInflightChunksPerRequest);
+    auto receiver = std::make_unique<b::BounceTransport>("dupDataReceiver", c, 0, &receiverChannel, &receiverEngine,
+        receiverBackend.arena.get(), receiverBackend.exec.get());
+    ASSERT_TRUE(sender.addPeer("dupDataReceiver", receiverChannel.localEndpoint()));
+
+    // Hold every context so both DATA messages reach the reactor before the first scatter can finish.
+    std::vector<b::ExecCtx*> heldExecContexts;
+    while (auto* ctx = receiverBackend.exec->tryAcquire())
+    {
+        heldExecContexts.push_back(ctx);
+    }
+    ASSERT_EQ(heldExecContexts.size(), receiverBackend.exec->size());
+
+    constexpr std::uint64_t rid = 17;
+    sender.sendTo("dupDataReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
+
+    b::BounceMsgHeader grantHeader{};
+    std::vector<b::BounceCreditEntry> credits;
+    auto const grantDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < grantDeadline && credits.empty())
+    {
+        std::string peer;
+        std::string blob;
+        if (sender.recv(peer, blob, 20) && b::decodeHeader(blob, grantHeader)
+            && static_cast<b::BounceMsgType>(grantHeader.msgType) == b::BounceMsgType::kGRANT)
+        {
+            EXPECT_EQ(peer, "dupDataReceiver");
+            EXPECT_TRUE(b::decodeCredits(blob, grantHeader, credits));
+        }
+    }
+    ASSERT_EQ(credits.size(), 1);
+
+    void* dst = nullptr;
+    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
+    b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
+    auto const data = b::encodeData(rid, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run});
+    sender.sendTo("dupDataReceiver", data);
+    sender.sendTo("dupDataReceiver", data);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for (auto* ctx : heldExecContexts)
+    {
+        receiverBackend.exec->release(ctx);
+    }
+
+    int ackCount = 0;
+    auto const ackDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < ackDeadline)
+    {
+        std::string peer;
+        std::string blob;
+        b::BounceMsgHeader header{};
+        if (sender.recv(peer, blob, 20) && b::decodeHeader(blob, header)
+            && static_cast<b::BounceMsgType>(header.msgType) == b::BounceMsgType::kACK && header.requestId == rid)
+        {
+            ++ackCount;
+        }
+    }
+    EXPECT_EQ(ackCount, 1);
+
+    receiver->shutdown();
+    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+}
+
+// GRANT and ACK messages carry peer-owned capabilities. Only the intended peer may grant, and an
+// ACK is valid only for the matching region after that chunk has reached Sent.
+TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/5000);
+    b::ZmqControlChannel senderChannel("validateSender");
+    b::ZmqControlChannel legitimate("validateLegitimate");
+    b::ZmqControlChannel attacker("validateAttacker");
+    ControllableTransferEngine senderEngine;
+    auto senderBackend = makeBackend(c, c.maxInflightChunksPerRequest);
+    auto sender = std::make_unique<b::BounceTransport>(
+        "validateSender", c, 0, &senderChannel, &senderEngine, senderBackend.arena.get(), senderBackend.exec.get());
+    ASSERT_TRUE(sender->addPeer("validateLegitimate", legitimate.localEndpoint()));
+    ASSERT_TRUE(legitimate.addPeer("validateSender", senderChannel.localEndpoint()));
+    ASSERT_TRUE(attacker.addPeer("validateSender", senderChannel.localEndpoint()));
+
+    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/4);
+    auto fut = sender->submit(bufs.srcDescs, bufs.dstDescs, "validateLegitimate");
+    b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/77};
+
+    attacker.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(senderEngine.postCount.load(std::memory_order_acquire), 0);
+
+    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    legitimate.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
+
+    // Seeing DATA guarantees the matching sender chunk has transitioned to Sent.
+    bool sawData = false;
+    auto const dataDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < dataDeadline && !sawData)
+    {
+        std::string peer;
+        std::string blob;
+        b::BounceMsgHeader header{};
+        if (legitimate.recv(peer, blob, 20) && b::decodeHeader(blob, header)
+            && static_cast<b::BounceMsgType>(header.msgType) == b::BounceMsgType::kDATA)
+        {
+            sawData = true;
+        }
+    }
+    ASSERT_TRUE(sawData);
+    EXPECT_EQ(senderEngine.postCount.load(std::memory_order_acquire), 1);
+
+    attacker.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle + 1));
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
+    legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+
+    sender->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}
+
 // shutdown() with an in-flight (stuck) request must resolve its future FAILURE, never leave wait() hanging.
 TEST(BounceTransportFailure, ShutdownFailsInflight)
 {
@@ -165,6 +348,51 @@ TEST(BounceTransportFailure, ShutdownFailsInflight)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "shutdown left request hanging";
     EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
 
+    bounce_test::freeXferBufs(bufs);
+}
+
+// Shutdown uses the backend's bounded cancel/release operation instead of polling forever. If the
+// backend cannot abort, the future still fails promptly and the engine retains the handle for retry.
+TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/0);
+    b::ZmqControlChannel senderChannel("shutdownReleaseSender");
+    b::ZmqControlChannel peer("shutdownReleasePeer");
+    ControllableTransferEngine senderEngine;
+    senderEngine.allowTerminal.store(false, std::memory_order_release);
+    senderEngine.releaseSucceeds.store(false, std::memory_order_release);
+    auto senderBackend = makeBackend(c, c.maxInflightChunksPerRequest);
+    auto sender = std::make_unique<b::BounceTransport>("shutdownReleaseSender", c, 0, &senderChannel, &senderEngine,
+        senderBackend.arena.get(), senderBackend.exec.get());
+    ASSERT_TRUE(sender->addPeer("shutdownReleasePeer", peer.localEndpoint()));
+    ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", senderChannel.localEndpoint()));
+
+    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/5);
+    auto fut = sender->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer");
+    b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/91};
+    peer.sendTo("shutdownReleaseSender", b::encodeGrant(/*requestId=*/1, {credit}));
+
+    auto const postDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (
+        std::chrono::steady_clock::now() < postDeadline && senderEngine.postCount.load(std::memory_order_acquire) == 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(senderEngine.postCount.load(std::memory_order_acquire), 1);
+
+    auto const start = std::chrono::steady_clock::now();
+    sender->shutdown();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+    EXPECT_EQ(senderEngine.releaseCount.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(senderEngine.outstandingHandle.load(std::memory_order_acquire), 1);
+
+    senderEngine.releaseSucceeds.store(true, std::memory_order_release);
+    EXPECT_TRUE(senderEngine.release(1));
+    EXPECT_EQ(senderEngine.outstandingHandle.load(std::memory_order_acquire), 0);
     bounce_test::freeXferBufs(bufs);
 }
 

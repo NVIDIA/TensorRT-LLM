@@ -81,8 +81,10 @@ public:
     /// Poll a posted write. kDone implies the data has landed (and is visible) at the remote.
     [[nodiscard]] virtual XferState poll(std::uint64_t handle) = 0;
 
-    /// Release handle resources after it reaches a terminal state.
-    virtual void release(std::uint64_t handle) = 0;
+    /// Release handle resources. Normal progress calls this after a terminal poll; shutdown may
+    /// call it on an active request to use the backend's bounded cancel/release operation. Returns
+    /// false when the backend did not release the handle, which must remain available for retry.
+    [[nodiscard]] virtual bool release(std::uint64_t handle) = 0;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

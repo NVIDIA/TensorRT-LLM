@@ -1635,6 +1635,7 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     # programmatically inside the child (agent.bounce_enabled / bounce_submit_count),
     # and a non-empty per-module level map can hang the child at exit (static-destruction
     # order: CudaMemPool's deleter logs through an already-destroyed Logger module map).
+    env.pop("TLLM_LOG_LEVEL_BY_MODULE", None)
     env.pop("UCX_NET_DEVICES", None)
     # Do not override TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY: the test must
     # exercise the production default, including automatic cudaMalloc fallback

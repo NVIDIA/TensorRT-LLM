@@ -31,8 +31,8 @@ namespace
 {
 // Release a transfer-request handle, reacting to both a bad status and a throw rather than silently
 // swallowing — leaking a NIXL request would otherwise go unnoticed. Used on the dtor / error /
-// release paths (all best-effort: there is nothing to retry, but it must not be silent).
-void releaseXferLogged(nixlAgent* agent, nixlXferReqH* h)
+// release paths. The caller decides whether a failed release can be retained for retry.
+bool releaseXferLogged(nixlAgent* agent, nixlXferReqH* h)
 {
     try
     {
@@ -40,15 +40,19 @@ void releaseXferLogged(nixlAgent* agent, nixlXferReqH* h)
         if (st != NIXL_SUCCESS)
         {
             TLLM_LOG_WARNING("NixlTransferEngine: releaseXferReq failed: %s", nixlEnumStrings::statusStr(st).c_str());
+            return false;
         }
+        return true;
     }
     catch (std::exception const& e)
     {
         TLLM_LOG_WARNING("NixlTransferEngine: releaseXferReq threw: %s", e.what());
+        return false;
     }
     catch (...)
     {
         TLLM_LOG_WARNING("NixlTransferEngine: releaseXferReq threw (unknown)");
+        return false;
     }
 }
 } // namespace
@@ -61,10 +65,21 @@ NixlTransferEngine::NixlTransferEngine(nixlAgent* agent, int deviceId)
 
 NixlTransferEngine::~NixlTransferEngine()
 {
-    std::lock_guard<std::mutex> lk(mMu);
-    for (auto& [id, h] : mHandles)
+    std::vector<void*> handles;
     {
-        releaseXferLogged(mRawAgent, static_cast<nixlXferReqH*>(h));
+        std::lock_guard<std::mutex> lk(mMu);
+        handles.reserve(mHandles.size());
+        for (auto const& [id, handle] : mHandles)
+        {
+            handles.push_back(handle);
+        }
+        mHandles.clear();
+    }
+    // Retry handles whose earlier cancel/release failed without holding mMu across a backend call,
+    // but keep terminal agent teardown bounded.
+    for (auto* handle : handles)
+    {
+        (void) releaseXferLogged(mRawAgent, static_cast<nixlXferReqH*>(handle));
     }
     // Deregister every region we registered, so we don't leave a stale registration on the borrowed
     // agent after the backing buffer is freed. The caller (NixlBounceState) destroys this engine
@@ -125,6 +140,10 @@ std::uint64_t NixlTransferEngine::postWrite(std::string const& peer, void const*
     {
         TLLM_LOG_WARNING(
             "NixlTransferEngine: createXferReq to %s failed: %s", peer.c_str(), nixlEnumStrings::statusStr(st).c_str());
+        if (handle != nullptr && !releaseXferLogged(mRawAgent, handle))
+        {
+            retainForRetry(handle);
+        }
         return 0; // 0 == invalid handle; poll() reports kFailed
     }
     st = mRawAgent->postXferReq(handle);
@@ -132,7 +151,10 @@ std::uint64_t NixlTransferEngine::postWrite(std::string const& peer, void const*
     {
         TLLM_LOG_WARNING(
             "NixlTransferEngine: postXferReq to %s failed: %s", peer.c_str(), nixlEnumStrings::statusStr(st).c_str());
-        releaseXferLogged(mRawAgent, handle);
+        if (!releaseXferLogged(mRawAgent, handle))
+        {
+            retainForRetry(handle);
+        }
         return 0;
     }
     std::lock_guard<std::mutex> lk(mMu);
@@ -141,11 +163,21 @@ std::uint64_t NixlTransferEngine::postWrite(std::string const& peer, void const*
     return id;
 }
 
+void NixlTransferEngine::retainForRetry(void* handle)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    mHandles.emplace(mNext++, handle);
+}
+
 XferState NixlTransferEngine::poll(std::uint64_t handle)
 {
     nixlXferReqH* h = nullptr;
     {
         std::lock_guard<std::mutex> lk(mMu);
+        if (mReleasing.count(handle) != 0)
+        {
+            return XferState::kInProgress;
+        }
         auto it = mHandles.find(handle);
         if (it == mHandles.end())
         {
@@ -165,20 +197,38 @@ XferState NixlTransferEngine::poll(std::uint64_t handle)
     return XferState::kFailed;
 }
 
-void NixlTransferEngine::release(std::uint64_t handle)
+bool NixlTransferEngine::release(std::uint64_t handle)
 {
-    nixlXferReqH* h = nullptr;
+    std::unordered_map<std::uint64_t, void*>::node_type node;
     {
         std::lock_guard<std::mutex> lk(mMu);
+        if (mReleasing.count(handle) != 0)
+        {
+            return false;
+        }
         auto it = mHandles.find(handle);
         if (it == mHandles.end())
         {
-            return;
+            return true;
         }
-        h = static_cast<nixlXferReqH*>(it->second);
-        mHandles.erase(it);
+        mReleasing.insert(handle);
+        node = mHandles.extract(it);
     }
-    releaseXferLogged(mRawAgent, h);
+
+    // releaseXferReq may cancel an active backend request, so do not hold mMu while calling it.
+    bool const released = releaseXferLogged(mRawAgent, static_cast<nixlXferReqH*>(node.mapped()));
+    {
+        std::lock_guard<std::mutex> lk(mMu);
+        mReleasing.erase(handle);
+        if (!released)
+        {
+            // Preserve the extracted node (and ownership) without allocating a replacement entry.
+            mHandles.insert(std::move(node));
+        }
+    }
+    // releaseXferReq is also NIXL's active-request cancellation hook. If the backend cannot abort
+    // it, the handle was reinserted above so teardown can retry instead of silently losing ownership.
+    return released;
 }
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce
