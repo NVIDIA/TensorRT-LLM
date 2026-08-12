@@ -221,6 +221,7 @@ def _tiny_qwen2_model(
     model_class: type[nn.Module] = modeling_qwen_mod.Qwen2ForCausalLM,
     tp_size: int = 1,
     rank: int = 0,
+    kv_cache_compression_config: object | None = None,
 ) -> nn.Module:
     qwen2_config = Qwen2Config(
         architectures=["Qwen2ForCausalLM"],
@@ -248,6 +249,7 @@ def _tiny_qwen2_model(
             ),
             max_num_tokens=16,
             max_seq_len=16,
+            kv_cache_compression_config=kv_cache_compression_config,
         )
     )
     with torch.no_grad():
@@ -441,6 +443,54 @@ def test_construct_checkpoint_loader_passes_mx_config():
     assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
+def _format_documented_values(
+    values: frozenset[object] | None,
+    *,
+    labels: dict[object, str] | None = None,
+) -> str:
+    assert values is not None
+    assert None not in values
+    labels = labels or {}
+    return " or ".join(labels.get(value, str(value)) for value in sorted(values, key=str))
+
+
+def _documented_dense_constraints(profile: PostTransformProfile) -> str:
+    constraints = profile.runtime_constraints
+    assert constraints.quant_algorithms == frozenset({"none"})
+    assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
+    assert constraints.layerwise_quantization == frozenset({False})
+    assert constraints.force_dynamic_quantization == frozenset({False})
+    assert constraints.lora_enabled == frozenset({False})
+    assert constraints.sparse_attention_enabled == frozenset({False})
+    assert constraints.attention_dp == frozenset({False})
+    assert constraints.multi_node == frozenset({False})
+    assert constraints.tied_word_embeddings == frozenset({False})
+    assert constraints.rope_types == frozenset({"default"})
+    assert constraints.rope_fusion == frozenset({True})
+    assert constraints.moe_backends is None
+    assert constraints.moe_tp_sizes is None
+    assert constraints.moe_ep_sizes is None
+    assert constraints.attention_tp_sizes == constraints.tp_sizes
+    assert constraints.attention_cp_sizes == constraints.cp_sizes
+    assert constraints.pp_sizes == constraints.cp_sizes
+    assert profile.speculative_mode is None
+    assert profile.supported_features == frozenset()
+
+    dtypes = _format_documented_values(
+        constraints.dtypes,
+        labels={"bfloat16": "BF16"},
+    )
+    attention_backends = _format_documented_values(constraints.attention_backends)
+    tp_sizes = _format_documented_values(constraints.tp_sizes)
+    pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
+    return (
+        f"Single-node dense {dtypes}, unquantized weights and KV cache, "
+        f"{attention_backends} attention, default fused RoPE, untied embeddings, "
+        f"TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
+        "attention DP, speculative mode, or separately loaded draft model"
+    )
+
+
 @pytest.mark.cpu_only
 def test_public_support_table_matches_qualified_profile_registry() -> None:
     profiles = ModelLoader._post_transform_profile_registry().profiles
@@ -462,12 +512,13 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
     assert len(table_rows) == len(profiles)
     for profile in profiles:
         scope = profile.transfer_scope.value.replace("_", " ").capitalize()
-        expected_row_prefix = (
+        expected_row = (
             f"| `{profile.profile_id}` | `{profile.root_model_class.__name__}` | "
             f"`{profile.architecture}` / `{profile.model_type}` | {scope} | "
-            f"{profile.protocol_version} | `{profile.transform_abi_id}` |"
+            f"{profile.protocol_version} | `{profile.transform_abi_id}` | "
+            f"{_documented_dense_constraints(profile)} |"
         )
-        assert any(row.startswith(expected_row_prefix) for row in table_rows)
+        assert expected_row in table_rows
 
 
 @pytest.mark.cpu_only
@@ -743,6 +794,24 @@ def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
 
 
 @pytest.mark.cpu_only
+def test_qwen2_dense_profile_rejects_effective_unfused_rope() -> None:
+    model = _tiny_qwen2_model(
+        kv_cache_compression_config=SimpleNamespace(changes_physical_kv_length=True)
+    )
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert model.model.layers[0].self_attn.rope_fusion is False
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({"rope_fusion"})
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("rank", [0, 1])
 def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
@@ -823,12 +892,6 @@ def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
         pytest.param({"pp_size": 2}, {"pp_size"}, id="pipeline-parallel"),
         pytest.param({"cp_size": 2}, {"cp_size"}, id="context-parallel"),
         pytest.param(
-            {"moe_tp_size": 4},
-            {"moe_tp_size"},
-            id="moe-tensor-parallel",
-        ),
-        pytest.param({"moe_ep_size": 2}, {"moe_ep_size"}, id="expert-parallel"),
-        pytest.param(
             {"attention_tp_size": 4},
             {"attention_tp_size"},
             id="attention-tensor-parallel",
@@ -890,6 +953,58 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
     assert decision.unsupported_runtime_dimensions == frozenset(expected_dimensions)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"moe_backend": "TRTLLM"}, id="alternate-moe-backend"),
+        pytest.param(
+            {
+                "tp_size": 2,
+                "moe_tp_size": 1,
+                "moe_ep_size": 2,
+                "attention_tp_size": 2,
+            },
+            id="alternate-moe-partition",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "root_model_class, architecture, model_type",
+    [
+        pytest.param(
+            modeling_llama_mod.LlamaForCausalLM,
+            "LlamaForCausalLM",
+            "llama",
+            id="llama",
+        ),
+        pytest.param(
+            modeling_qwen_mod.Qwen2ForCausalLM,
+            "Qwen2ForCausalLM",
+            "qwen2",
+            id="qwen2",
+        ),
+    ],
+)
+def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
+    overrides: dict[str, object],
+    root_model_class: type[nn.Module],
+    architecture: str,
+    model_type: str,
+) -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=root_model_class,
+        architecture=architecture,
+        model_type=model_type,
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(**overrides),
+    )
+
+    assert decision.qualified
 
 
 @pytest.mark.cpu_only

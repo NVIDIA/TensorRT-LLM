@@ -54,8 +54,8 @@ _KV_CACHE_MAP = {
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
-# Dense models do not consume moe_backend. Their mapping dimensions remain
-# constrained so unsupported parallel topologies still fail closed.
+# Dense models do not consume the MoE backend or MoE mapping dimensions. Their
+# runtime topology remains bounded by the general and attention dimensions.
 _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
     dtypes=frozenset({"bfloat16"}),
     quant_algorithms=frozenset({"none"}),
@@ -68,8 +68,6 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
     tp_sizes=frozenset({1, 2}),
     pp_sizes=frozenset({1}),
     cp_sizes=frozenset({1}),
-    moe_tp_sizes=frozenset({1, 2}),
-    moe_ep_sizes=frozenset({1}),
     attention_tp_sizes=frozenset({1, 2}),
     attention_cp_sizes=frozenset({1}),
     attention_dp=frozenset({False}),
@@ -1206,7 +1204,7 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
-                model.model_config),
+                model.model_config, model=model),
         )
 
     def _post_load_publish(

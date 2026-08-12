@@ -25,8 +25,8 @@ profiles:
 
 | Profile | Root class | Config identity | Scope | Protocol | Transform-layout ABI | Constraints |
 |---------|------------|-----------------|-------|----------|----------------------|-------------|
-| `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP/EP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
-| `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` (Qwen2 and Qwen2.5 dense) | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP/EP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
@@ -60,9 +60,11 @@ submodel.
 The Llama and Qwen2 profiles are text-only and do not enable reward-model, MoE,
 or vision-language roots. FP16, quantized weights or KV cache, alternate
 attention backends, YaRN or unfused RoPE, tied embeddings, TP greater than 2,
-PP greater than 1, CP greater than 1, EP greater than 1, LoRA, sparse attention,
-attention DP, multi-node transfer, and speculative decoding require separate
-qualification rows.
+PP greater than 1, CP greater than 1, LoRA, sparse attention, attention DP,
+multi-node transfer, and speculative decoding require separate qualification
+rows. The profiles do not constrain MoE-only backend and mapping settings
+because these dense roots do not consume them. `SourceIdentity` still requires
+donor and receiver configurations to match.
 
 ### Adding a Model Family
 

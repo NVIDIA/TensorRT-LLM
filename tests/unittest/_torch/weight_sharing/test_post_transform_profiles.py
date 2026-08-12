@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     PostTransformConfigIdentity,
@@ -376,6 +377,7 @@ def test_registry_rejects_overlapping_runtime_profiles() -> None:
 
 def test_runtime_config_is_captured_from_final_model_config() -> None:
     model_config = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
         pretrained_config=SimpleNamespace(
             torch_dtype=torch.bfloat16,
             tie_word_embeddings=False,
@@ -395,6 +397,7 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
         mapping=SimpleNamespace(
             world_size=2,
             gpus_per_node=8,
+            is_multi_node=lambda: False,
             tp_size=2,
             pp_size=1,
             cp_size=1,
@@ -411,6 +414,18 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
     )
 
 
+def test_runtime_config_uses_resolved_dtype_when_checkpoint_dtype_is_missing() -> None:
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(torch_dtype=None),
+    )
+
+    runtime_config = PostTransformRuntimeConfig.from_model_config(model_config)
+
+    assert model_config.pretrained_config.torch_dtype is None
+    assert model_config.torch_dtype == torch.bfloat16
+    assert runtime_config.dtype == "bfloat16"
+
+
 def test_runtime_config_distinguishes_missing_from_unquantized() -> None:
     unquantized = PostTransformRuntimeConfig.from_model_config(
         SimpleNamespace(quant_config=SimpleNamespace(quant_algo=None, kv_cache_quant_algo=None))
@@ -425,12 +440,13 @@ def test_runtime_config_distinguishes_missing_from_unquantized() -> None:
     assert missing.kv_cache_quant_algorithm is None
 
 
-def test_runtime_config_detects_multi_node_topology() -> None:
+def test_runtime_config_uses_mapping_multi_node_contract() -> None:
     runtime_config = PostTransformRuntimeConfig.from_model_config(
         SimpleNamespace(
             mapping=SimpleNamespace(
                 world_size=2,
-                gpus_per_node=1,
+                gpus_per_node=8,
+                is_multi_node=lambda: True,
             )
         )
     )

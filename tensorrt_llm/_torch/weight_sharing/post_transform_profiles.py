@@ -63,6 +63,19 @@ def _canonical_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _realized_rope_fusion(model: nn.Module) -> bool | None:
+    realized_values: set[bool] = set()
+    for module in model.modules():
+        value = getattr(module, "rope_fusion", _MISSING)
+        if value is _MISSING:
+            continue
+        canonical_value = _canonical_bool(value)
+        if canonical_value is None:
+            return None
+        realized_values.add(canonical_value)
+    return realized_values.pop() if len(realized_values) == 1 else None
+
+
 def _canonical_optional_string(container: object, attribute: str) -> str | None:
     value = getattr(container, attribute, _MISSING)
     if value is _MISSING:
@@ -122,7 +135,9 @@ class PostTransformRuntimeConfig:
     rope_fusion: bool | None
 
     @classmethod
-    def from_model_config(cls, model_config: object) -> "PostTransformRuntimeConfig":
+    def from_model_config(
+        cls, model_config: object, *, model: nn.Module | None = None
+    ) -> "PostTransformRuntimeConfig":
         """Capture the support-matrix dimensions from a final model config."""
 
         pretrained_config = getattr(model_config, "pretrained_config", None)
@@ -131,13 +146,7 @@ class PostTransformRuntimeConfig:
         lora_config = getattr(model_config, "lora_config", _MISSING)
         sparse_attention_config = getattr(model_config, "sparse_attention_config", _MISSING)
         mapping = getattr(model_config, "mapping", None)
-        world_size = _canonical_int(getattr(mapping, "world_size", None))
-        gpus_per_node = _canonical_int(getattr(mapping, "gpus_per_node", None))
-        multi_node = (
-            world_size > gpus_per_node
-            if world_size is not None and gpus_per_node is not None and gpus_per_node > 0
-            else None
-        )
+        multi_node = _canonical_bool(mapping.is_multi_node()) if mapping is not None else None
 
         if quant_config_dict is _MISSING:
             layerwise_quantization = None
@@ -158,9 +167,11 @@ class PostTransformRuntimeConfig:
 
         disable_fuse_rope = getattr(pretrained_config, "disable_fuse_rope", False)
         rope_fusion = not disable_fuse_rope if isinstance(disable_fuse_rope, bool) else None
+        if model is not None:
+            rope_fusion = _realized_rope_fusion(model)
 
         return cls(
-            dtype=_canonical_string(getattr(pretrained_config, "torch_dtype", None)),
+            dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),
             quant_algorithm=_canonical_optional_string(quant_config, "quant_algo"),
             kv_cache_quant_algorithm=_canonical_optional_string(
                 quant_config, "kv_cache_quant_algo"
