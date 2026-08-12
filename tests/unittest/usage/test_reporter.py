@@ -881,7 +881,20 @@ class TestProcessTelemetrySession:
             )
         )
 
-        assert usage_lib.get_termination_observation() == usage_lib.TerminalOutcome(
+        session = usage_lib._get_session()
+        assert session is not None
+        terminal = session.claim_terminal(
+            usage_lib.TerminalOutcome(
+                termination_kind="signal",
+                component="server",
+                exit_code_known=True,
+                exit_code=130,
+                signal_number=2,
+            )
+        )
+        assert terminal is not None
+        _, outcome = terminal
+        assert outcome == usage_lib.TerminalOutcome(
             termination_kind="worker_failure",
             component="engine_worker",
             reporting_source="executor_proxy",

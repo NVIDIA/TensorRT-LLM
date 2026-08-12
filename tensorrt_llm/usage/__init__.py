@@ -45,7 +45,6 @@ record_termination_observation = _usage_lib.record_termination_observation
 set_lifecycle_phase = _usage_lib.set_lifecycle_phase
 set_usage_context = _usage_lib.set_usage_context
 get_observed_signal = _usage_lib.get_observed_signal
-get_termination_observation = _usage_lib.get_termination_observation
 is_usage_stats_enabled = _usage_lib.is_usage_stats_enabled
 
 __all__ = [
@@ -54,7 +53,6 @@ __all__ = [
     "TerminalOutcome",
     "UsageContext",
     "get_observed_signal",
-    "get_termination_observation",
     "record_llm_initialization_attempt",
     "record_llm_initialization_failure",
     "record_llm_initialized",
