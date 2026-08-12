@@ -49,7 +49,7 @@ def _resolve_fp8_ds_mla_head_dim(
     if not use_fp8_ds_mla:
         return False, head_dim
 
-    from .inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
+    from ..inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
 
     if tokens_per_block != PAGE_SIZE:
         raise ValueError(
@@ -294,7 +294,7 @@ class DSACacheManager(KVCacheManager):
         )
         kv_cache_config = kwargs.get("kv_cache_config")
         if kv_cache_config is not None and kv_cache_config.dtype == "fp8_ds_mla":
-            from .inline_scale_kv import TOKEN_BYTES
+            from ..inline_scale_kv import TOKEN_BYTES
 
             mem_per_token = num_attention_layers * TOKEN_BYTES
         else:
