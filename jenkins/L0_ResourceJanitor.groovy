@@ -221,7 +221,13 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
                 if (!ownerUrl) {
                     return   // not a CI-tagged job -- never touch
                 }
-                if (ageMin != null && ageMin < staleMinutes) {
+                if (ageMin == null) {
+                    // Unparsable squeue %M: we can't confirm the job is past the grace
+                    // period, so fail safe and leave it (never reap on an unknown age).
+                    pipeline.echo "[JANITOR] ${clusterName}: unparsable elapsed for job ${jobId}; leaving untouched."
+                    return
+                }
+                if (ageMin < staleMinutes) {
                     return   // grace period -- too young to reap
                 }
                 if (isOwnerBuildRunning(pipeline, ownerUrl)) {
