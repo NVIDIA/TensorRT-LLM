@@ -203,6 +203,49 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
     assert events.index("runtime_lora") > events.index("post_load_weights")
 
 
+def test_vae_quant_config_is_independent_from_transformer(tmp_path):
+    """VAE and transformer precision can be selected independently."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"}),
+        encoding="utf-8",
+    )
+
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path),
+        args=VisualGenArgs(
+            model=str(tmp_path),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            vae_quant_config={
+                "quant_algo": "NVFP4",
+                "ignore": ["decoder.up_blocks.0.*"],
+            },
+        ),
+    )
+
+    assert config.quant_config.quant_algo == QuantAlgo.FP8
+    assert config.primary_model_config.quant_config.quant_algo == QuantAlgo.FP8
+    assert config.vae_quant_config is not None
+    assert config.vae_quant_config.quant_algo == QuantAlgo.NVFP4
+    assert config.vae_quant_config.is_module_excluded_from_quantization(
+        "decoder.up_blocks.0.resnets.0.conv1"
+    )
+
+
 def test_load_wan_pipeline_basic(checkpoint_exists):
     """Test basic loading without quantization using VisualGenArgs."""
     if not checkpoint_exists:

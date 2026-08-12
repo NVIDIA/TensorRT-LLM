@@ -253,6 +253,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 checkpoint_dir,
                 device,
                 dtype=self.pipeline_config.torch_dtype,
+                quant_config=self.pipeline_config.vae_quant_config,
             )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
