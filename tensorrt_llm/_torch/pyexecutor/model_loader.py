@@ -321,6 +321,77 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
+_AUTO_CHECKPOINT_IO_POLICY = "auto"
+_NATIVE_CHECKPOINT_IO_POLICY = "native"
+_RANK_STRIPED_CHECKPOINT_IO_POLICY = "rank_striped_read_ahead"
+_SUPPORTED_CHECKPOINT_IO_POLICIES = (
+    _AUTO_CHECKPOINT_IO_POLICY,
+    _NATIVE_CHECKPOINT_IO_POLICY,
+    _RANK_STRIPED_CHECKPOINT_IO_POLICY,
+)
+
+
+def _resolve_checkpoint_io_policy(
+    backend: str,
+    checkpoint_loader: Optional[BaseCheckpointLoader],
+    checkpoint_format: Optional[str],
+    load_format: LoadFormat | str,
+    requested_policy: str,
+    partial_model_loading: bool,
+) -> tuple[str, Optional[str]]:
+    """Select a safe executable policy before checkpoint loading starts."""
+    if requested_policy not in _SUPPORTED_CHECKPOINT_IO_POLICIES:
+        raise ValueError("checkpoint_io_policy must be one of "
+                         f"{_SUPPORTED_CHECKPOINT_IO_POLICIES}, got "
+                         f"{requested_policy!r}")
+    if requested_policy == _NATIVE_CHECKPOINT_IO_POLICY:
+        return _NATIVE_CHECKPOINT_IO_POLICY, None
+
+    reason = None
+    if backend != "pytorch":
+        reason = "rank-striped read-ahead requires the PyTorch backend"
+    elif checkpoint_loader is not None:
+        reason = "an explicit checkpoint loader was provided"
+    elif checkpoint_format != "HF":
+        reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
+                  f"(received {checkpoint_format!r})")
+    else:
+        normalized_load_format = getattr(load_format, "name", load_format)
+        if str(normalized_load_format).lower() != "auto":
+            reason = ("rank-striped read-ahead requires load_format='auto' "
+                      f"(received {normalized_load_format!r})")
+        elif partial_model_loading:
+            reason = "partial model loading was requested"
+
+    if reason is None:
+        from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+            HfCheckpointLoader
+        from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+            HfWeightLoader
+        from tensorrt_llm._torch.models.modeling_utils import (
+            CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
+            get_checkpoint_weight_loader)
+
+        if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get("HF")
+                is not HfCheckpointLoader):
+            reason = "the registered HF checkpoint loader is not the built-in loader"
+        elif get_checkpoint_weight_loader("HF") is not HfWeightLoader:
+            reason = "the registered HF weight loader is not the built-in loader"
+
+    if reason is not None:
+        message = ("Checkpoint I/O policy resolved before loading: "
+                   f"requested={requested_policy}, "
+                   f"selected={_NATIVE_CHECKPOINT_IO_POLICY}, "
+                   f"reason={reason}.")
+        if requested_policy == _RANK_STRIPED_CHECKPOINT_IO_POLICY:
+            logger.warning(message)
+        else:
+            logger.info(message)
+        return _NATIVE_CHECKPOINT_IO_POLICY, reason
+
+    return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+
+
 def _construct_checkpoint_loader(
     backend: str,
     checkpoint_loader: Optional[BaseCheckpointLoader],
@@ -329,8 +400,19 @@ def _construct_checkpoint_loader(
     mx_config: Optional[ModelExpressConfig] = None,
     mx_model_name: Optional[str] = None,
     checkpoint_io_policy: str = "native",
+    load_format: LoadFormat | str = LoadFormat.AUTO,
     partial_model_loading: bool = False,
 ) -> Optional[BaseCheckpointLoader]:
+    requested_checkpoint_io_policy = checkpoint_io_policy
+    checkpoint_io_policy, selection_fallback_reason = \
+        _resolve_checkpoint_io_policy(
+            backend,
+            checkpoint_loader,
+            checkpoint_format,
+            load_format,
+            requested_checkpoint_io_policy,
+            partial_model_loading,
+        )
     if backend == "_autodeploy":
         return None
 
@@ -341,38 +423,44 @@ def _construct_checkpoint_loader(
     from tensorrt_llm._torch.models.modeling_utils import (
         get_checkpoint_weight_loader, get_config_loader)
 
-    if checkpoint_loader is None:
-        checkpoint_weight_loader_cls = get_checkpoint_weight_loader(
-            checkpoint_format)
-        if (checkpoint_format == "HF"
-                and checkpoint_weight_loader_cls is HfWeightLoader):
-            checkpoint_weight_loader = checkpoint_weight_loader_cls(
-                checkpoint_io_policy=checkpoint_io_policy,
-                partial_model_loading=partial_model_loading,
+    if checkpoint_loader is not None:
+        checkpoint_weight_loader = checkpoint_loader.weight_loader
+        if type(checkpoint_weight_loader) is HfWeightLoader:
+            checkpoint_weight_loader._configure_checkpoint_io_policy(
+                checkpoint_io_policy,
+                requested_checkpoint_io_policy=requested_checkpoint_io_policy,
+                selection_fallback_reason=selection_fallback_reason,
             )
-        else:
-            if (checkpoint_format == "HF" and checkpoint_io_policy != "native"):
-                raise ValueError("rank-striped checkpoint I/O requires the "
-                                 "built-in HfWeightLoader")
-            checkpoint_weight_loader = checkpoint_weight_loader_cls()
-        config_loader = get_config_loader(checkpoint_format)()
+        return checkpoint_loader
 
-        # Pass extra kwargs for format-specific loaders (e.g. MX).
-        extra_kwargs: dict = {}
-        if checkpoint_format == "MX":
-            if mx_config is not None:
-                extra_kwargs["mx_server_url"] = mx_config.server_url
-                extra_kwargs[
-                    "query_timeout_s"] = mx_config.server_query_timeout_s
-            if mx_model_name is not None:
-                extra_kwargs["model_name"] = mx_model_name
+    checkpoint_weight_loader_cls = get_checkpoint_weight_loader(
+        checkpoint_format)
+    if checkpoint_weight_loader_cls is HfWeightLoader:
+        checkpoint_weight_loader = checkpoint_weight_loader_cls(
+            checkpoint_io_policy=checkpoint_io_policy,
+            requested_checkpoint_io_policy=requested_checkpoint_io_policy,
+            selection_fallback_reason=selection_fallback_reason,
+            partial_model_loading=partial_model_loading,
+        )
+    else:
+        checkpoint_weight_loader = checkpoint_weight_loader_cls()
+    config_loader = get_config_loader(checkpoint_format)()
 
-        checkpoint_loader = BaseCheckpointLoader.get(
-            checkpoint_format=checkpoint_format,
-            weight_loader=checkpoint_weight_loader,
-            weight_mapper=None,
-            config_loader=config_loader,
-            **extra_kwargs)
+    # Pass extra kwargs for format-specific loaders (e.g. MX).
+    extra_kwargs: dict = {}
+    if checkpoint_format == "MX":
+        if mx_config is not None:
+            extra_kwargs["mx_server_url"] = mx_config.server_url
+            extra_kwargs["query_timeout_s"] = mx_config.server_query_timeout_s
+        if mx_model_name is not None:
+            extra_kwargs["model_name"] = mx_model_name
+
+    checkpoint_loader = BaseCheckpointLoader.get(
+        checkpoint_format=checkpoint_format,
+        weight_loader=checkpoint_weight_loader,
+        weight_mapper=None,
+        config_loader=config_loader,
+        **extra_kwargs)
 
     return checkpoint_loader
 

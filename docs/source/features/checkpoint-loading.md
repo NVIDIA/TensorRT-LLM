@@ -99,8 +99,10 @@ Checkpoint format describes how weights are represented and mapped. The
 experimental `checkpoint_io_policy` independently controls how file-backed
 checkpoint bytes reach host memory:
 
-- `native` (default) preserves the existing checkpoint loader and its
-  synchronous SafeTensors prefetch.
+- `auto` (default) selects rank-striped read-ahead for compatible built-in
+  PyTorch/HF loads and selects native I/O for other configurations.
+- `native` always preserves the existing checkpoint loader and its synchronous
+  SafeTensors prefetch.
 - `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
   Node-local ranks issue disjoint background `pread` requests into the Linux
   page cache while the existing mapping, transformation, and H2D path runs.
@@ -115,15 +117,23 @@ checkpoint_io_policy: rank_striped_read_ahead
 ```
 
 The optimized path currently requires identical policy configuration across
-all ranks, the automatically constructed HF loader (`checkpoint_loader` must
-be unset), SafeTensors, and an active MPI model-load communicator for
-distributed jobs. Lazy Kimi
-loading, raw-weight caching, partial-model loading, and `.bin`/`.pth` select
-native materialization before model mutation. MX and custom or explicitly
-provided loaders are unsupported configurations and are rejected during
-argument validation. With a valid node communicator, fallback preserves native
-prefetch collectives on that load group; if communicator setup failed, it
-safely skips prefetch.
+all ranks, the automatically constructed built-in HF loader
+(`checkpoint_loader` must be unset), `load_format: auto`, SafeTensors, and an
+active MPI model-load communicator for distributed jobs. Static incompatibility
+such as MX, AutoDeploy, a custom or explicitly provided loader, a non-automatic
+load format, or known partial-model loading selects native I/O before any
+rank-striped communicator or reader setup. An explicit incompatible
+`rank_striped_read_ahead` request emits a warning instead of failing startup;
+`auto` records the native selection at info level.
+
+Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
+loading, raw-weight caching, layer overrides, insufficient host-memory
+headroom, and `.bin`/`.pth` select native materialization before readers start
+or the model is mutated. These runtime fallbacks emit a warning because the
+rank-striped policy had already been selected from configuration. With a valid
+node communicator, fallback preserves native prefetch collectives on that load
+group; if communicator setup failed or its size did not match the model-load
+mapping, native loading safely skips prefetch.
 Memory admission reserves cgroup-aware startup headroom. Reader setup failures
 also clean up and fall back before mapping; mapping, transformation, or H2D
 failure after activation never retries a partially mutated model. A later
@@ -133,9 +143,9 @@ Read-ahead is intentionally not TP/PP/CP/EP-selective: each active load group
 may warm one logical checkpoint copy per node, although the work stops when
 materialization completes. The 64-reader budget is per active load group per
 node, not a host-wide arbitration mechanism across colocated independent
-TRT-LLM instances. Rank-striped logs distinguish requested, selected,
-activated, and effective policy; activation logs also report the local reader
-assignment.
+TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
+effective policy, so `auto` selection and native fallback remain observable;
+activation logs also report the local reader assignment.
 
 This policy remains separate from future ModelStreamer, MX, GMS, or snapshot
 integration. Those systems may change the source or bypass raw loading without

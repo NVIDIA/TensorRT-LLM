@@ -698,16 +698,17 @@ def test_collect_llm_api_config_captures_gms_load_format():
 
 
 def test_collect_llm_api_config_captures_checkpoint_io_policy():
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        checkpoint_io_policy="rank_striped_read_ahead",
-    )
+    for policy in ("auto", "rank_striped_read_ahead"):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            checkpoint_io_policy=policy,
+        )
 
-    config, meta = _loads_payloads(args)
+        config, meta = _loads_payloads(args)
 
-    assert config["checkpoint_io_policy"] == "rank_striped_read_ahead"
-    assert meta["capture_succeeded"] is True
+        assert config["checkpoint_io_policy"] == policy
+        assert meta["capture_succeeded"] is True
 
 
 def _walk_captured_keys(model) -> set[str]:

@@ -47,9 +47,11 @@ from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
+_AUTO_IO_POLICY = "auto"
 _NATIVE_IO_POLICY = "native"
 _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
 _SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
+_SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -104,15 +106,41 @@ class HfWeightLoader(BaseWeightLoader):
     def __init__(self,
                  checkpoint_io_policy: str = _NATIVE_IO_POLICY,
                  *,
+                 requested_checkpoint_io_policy: str | None = None,
+                 selection_fallback_reason: str | None = None,
                  partial_model_loading: bool = False) -> None:
+        self._partial_model_loading = partial_model_loading
+        self._configure_checkpoint_io_policy(
+            checkpoint_io_policy,
+            requested_checkpoint_io_policy=requested_checkpoint_io_policy,
+            selection_fallback_reason=selection_fallback_reason,
+        )
+
+    def _configure_checkpoint_io_policy(
+        self,
+        checkpoint_io_policy: str,
+        *,
+        requested_checkpoint_io_policy: str | None = None,
+        selection_fallback_reason: str | None = None,
+    ) -> None:
+        """Apply a pre-materialization policy selection."""
         if checkpoint_io_policy not in _SUPPORTED_IO_POLICIES:
             raise ValueError("checkpoint_io_policy must be one of "
                              f"{_SUPPORTED_IO_POLICIES}, got "
                              f"{checkpoint_io_policy!r}")
+        requested_checkpoint_io_policy = (requested_checkpoint_io_policy
+                                          or checkpoint_io_policy)
+        if requested_checkpoint_io_policy not in _SUPPORTED_REQUESTED_IO_POLICIES:
+            raise ValueError("requested_checkpoint_io_policy must be one of "
+                             f"{_SUPPORTED_REQUESTED_IO_POLICIES}, got "
+                             f"{requested_checkpoint_io_policy!r}")
         self._checkpoint_io_policy = checkpoint_io_policy
-        self._partial_model_loading = partial_model_loading
+        self._requested_checkpoint_io_policy = requested_checkpoint_io_policy
+        self._selection_fallback_reason = selection_fallback_reason
         self._last_checkpoint_io_status = _CheckpointIOStatus(
-            requested=checkpoint_io_policy, selected=checkpoint_io_policy)
+            requested=requested_checkpoint_io_policy,
+            selected=checkpoint_io_policy,
+            fallback_reason=selection_fallback_reason)
 
     @property
     def checkpoint_io_policy(self) -> str:
@@ -124,8 +152,9 @@ class HfWeightLoader(BaseWeightLoader):
 
     def _reset_checkpoint_io_status(self) -> None:
         self._last_checkpoint_io_status = _CheckpointIOStatus(
-            requested=self._checkpoint_io_policy,
+            requested=self._requested_checkpoint_io_policy,
             selected=self._checkpoint_io_policy,
+            fallback_reason=self._selection_fallback_reason,
         )
 
     def _log_checkpoint_io_status(self) -> None:
@@ -383,6 +412,7 @@ class HfWeightLoader(BaseWeightLoader):
             weights = self._load_weights_native(checkpoint_dir, mapping,
                                                 use_consolidated, **kwargs)
             self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+            self._log_checkpoint_io_status()
             return weights
         with self.open_weight_session(checkpoint_dir,
                                       mapping=mapping,
@@ -402,10 +432,38 @@ class HfWeightLoader(BaseWeightLoader):
             weights = self._load_weights_native(checkpoint_dir, mapping,
                                                 use_consolidated, **kwargs)
             self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+            self._log_checkpoint_io_status()
             yield weights
             return
 
-        active_communicator = self._active_communicator(mapping)
+        active_communicator = self._active_communicator()
+        mapping_error = None
+        communicator_size = (None if active_communicator is None else
+                             active_communicator.Get_size())
+        if (communicator_size is not None
+                and mapping.world_size != communicator_size):
+            mapping_error = RuntimeError(
+                "Rank-striped read-ahead requires mapping.world_size to "
+                "match the active MPI communicator size "
+                f"({communicator_size}); received {mapping.world_size}.")
+        coordinated_mapping_error = coordinate_error(
+            active_communicator,
+            "rank-striped mapping validation",
+            mapping_error,
+        )
+        if coordinated_mapping_error is not None:
+            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            weights = self._fallback_to_native(
+                checkpoint_dir,
+                mapping,
+                use_consolidated,
+                str(coordinated_mapping_error),
+                active_communicator=active_communicator,
+                allow_native_prefetch=False,
+                **kwargs,
+            )
+            yield weights
+            return
         if mapping.world_size > 1 and active_communicator is None:
             self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
             weights = self._fallback_to_native(
@@ -465,18 +523,11 @@ class HfWeightLoader(BaseWeightLoader):
                 self._log_checkpoint_io_status()
 
     @staticmethod
-    def _active_communicator(mapping: Mapping):
-        """Return and validate the communicator used by the opt-in policy."""
+    def _active_communicator():
+        """Return the communicator used by the selected policy."""
         if not ENABLE_MULTI_DEVICE or mpi_disabled():
             return None
-        communicator = mpi_comm()
-        communicator_size = communicator.Get_size()
-        if mapping.world_size != communicator_size:
-            raise RuntimeError(
-                "Rank-striped read-ahead requires mapping.world_size to "
-                "match the active MPI communicator size "
-                f"({communicator_size}); received {mapping.world_size}.")
-        return communicator
+        return mpi_comm()
 
     @staticmethod
     def _selected_safetensors_files(checkpoint_dir: str,
@@ -519,10 +570,16 @@ class HfWeightLoader(BaseWeightLoader):
                             active_communicator=None,
                             node_communicator=None,
                             session=None,
+                            *,
+                            allow_native_prefetch: bool | None = None,
                             **kwargs) -> dict[str, Any]:
         status = self._last_checkpoint_io_status
         status.activated = False
         status.fallback_reason = reason
+        if status.requested != _NATIVE_IO_POLICY:
+            logger.warning("Checkpoint I/O policy is falling back before model "
+                           f"materialization: requested={status.requested}, "
+                           f"selected={status.selected}, reason={reason}.")
         try:
             self._close_unactivated_session(
                 session,
@@ -545,8 +602,9 @@ class HfWeightLoader(BaseWeightLoader):
                 and (active_communicator is None
                      or active_communicator.Get_size() == 1)):
             fallback_communicator = active_communicator
-        allow_prefetch = not (mapping.world_size > 1
-                              and fallback_communicator is None)
+        if allow_native_prefetch is None:
+            allow_native_prefetch = not (mapping.world_size > 1
+                                         and fallback_communicator is None)
         load_error = None
         try:
             weights = self._load_weights_native(
@@ -554,7 +612,7 @@ class HfWeightLoader(BaseWeightLoader):
                 mapping,
                 use_consolidated,
                 _local_communicator=fallback_communicator,
-                _allow_prefetch=allow_prefetch,
+                _allow_prefetch=allow_native_prefetch,
                 **kwargs)
         except BaseException as error:
             load_error = error
