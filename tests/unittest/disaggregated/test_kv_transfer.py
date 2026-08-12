@@ -1567,6 +1567,9 @@ def test_incompatible_peer_fails_only_affected_requests():
             rx1 = gen_tw.create_rx_session(make_gen_request(500))
             rx1.receive(empty_slice)
             assert rx1.wait_complete(blocking=True) == WaitResult.FAILED
+            # The non-blocking polling path must report the same terminal
+            # failure for an errored task (no None / spurious success).
+            assert rx1.wait_complete(blocking=False) == WaitResult.FAILED
             assert rx1.has_failed()
             exc = rx1._kv_tasks[0]._exception
             assert exc is not None
@@ -1580,6 +1583,7 @@ def test_incompatible_peer_fails_only_affected_requests():
             rx2 = gen_tw.create_rx_session(make_gen_request(501))
             rx2.receive(empty_slice)
             assert rx2.wait_complete(blocking=True) == WaitResult.FAILED
+            assert rx2.wait_complete(blocking=False) == WaitResult.FAILED
             assert rx2.has_failed()
             assert "synthetic recurrent-state mismatch" in str(rx2._kv_tasks[0]._exception)
             assert len(validate_calls) == 1
