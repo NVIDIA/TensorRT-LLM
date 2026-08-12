@@ -327,9 +327,7 @@ def is_tiered_topk_supported(
     key = (bs, npad, top_k)
     ok = _CAP_OK_CACHE.get(key)
     if ok is None:
-        ok = _CAP_OK_CACHE[key] = (
-            route_cluster_size(bs, npad, top_k) <= _query_max_cluster_size()
-        )
+        ok = _CAP_OK_CACHE[key] = route_cluster_size(bs, npad, top_k) <= _query_max_cluster_size()
     return ok
 
 

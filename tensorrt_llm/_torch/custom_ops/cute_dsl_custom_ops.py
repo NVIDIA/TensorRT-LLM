@@ -7272,9 +7272,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import \
         GvrTopKKernel as _GvrTopKKernel
     from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
-        tiered_topk as _tiered_topk
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
         is_tiered_topk_supported as _is_tiered_topk_supported
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+        tiered_topk as _tiered_topk
 
     class CuteDSLGvrTopKDecodeRunner:
         """Runner for the GVR Top-K cuTe DSL kernel (Blackwell SM100).
@@ -7543,11 +7543,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Host-only guard — no device sync. The op signature and output
             # contract are unchanged (unordered int32 indices, -1 pad only
             # for degenerate rows).
-            if _is_tiered_topk_supported(logits, pre_idx, seq_lens, output_indices,
-                                 top_k, next_n, compress_ratio, order_row,
-                                 counters):
+            if _is_tiered_topk_supported(logits, pre_idx, seq_lens,
+                                         output_indices, top_k, next_n,
+                                         compress_ratio, order_row, counters):
                 _tiered_topk(logits, pre_idx, seq_lens, output_indices, top_k,
-                          next_n, compress_ratio)
+                             next_n, compress_ratio)
                 return
 
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
