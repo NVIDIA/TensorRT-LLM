@@ -15,7 +15,11 @@
 """Tests for the shared Click process-exit telemetry boundary."""
 
 import os
+import signal
+import subprocess
+import sys
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import click
@@ -69,11 +73,36 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     usage_lib._PENDING_TERMINAL = None
 
 
+@pytest.fixture
+def terminal_mocks():
+    """Provide the standard fail-silent session boundary dependencies."""
+    with (
+        patch.object(_telemetry.usage, "start_usage_session", return_value=True) as start,
+        patch.object(_telemetry.usage, "set_lifecycle_phase") as set_phase,
+        patch.object(_telemetry.usage, "get_observed_signal", return_value=0) as signal,
+        patch.object(
+            _telemetry.usage,
+            "get_termination_observation",
+            return_value=None,
+        ) as observation,
+        patch.object(_telemetry.usage, "record_observed_signal") as record_signal,
+        patch.object(_telemetry.usage, "report_exit") as report_exit,
+    ):
+        yield SimpleNamespace(
+            start=start,
+            set_phase=set_phase,
+            signal=signal,
+            observation=observation,
+            record_signal=record_signal,
+            report_exit=report_exit,
+        )
+
+
 def _captured_terminal_parameters(payloads):
     """Return the parameters from one fully serialized terminal event."""
     assert len(payloads) == 1
     payload = payloads[0]
-    assert payload["eventSchemaVer"] == "0.3"
+    assert payload["eventSchemaVer"] == "0.7"
     assert len(payload["events"]) == 1
     event = payload["events"][0]
     assert event["name"] == "trtllm_exit_report"
@@ -135,233 +164,273 @@ class TestTelemetryGroup:
 
         start_session.assert_not_called()
 
-    def test_clean_exit_reports_zero(self):
-        """A normally completed CLI emits one clean terminal classification."""
-        cli = _make_cli()
-        with (
-            patch.object(_telemetry.usage, "start_usage_session", return_value=True),
-            patch.object(_telemetry.usage, "set_lifecycle_phase"),
-            patch.object(_telemetry.usage, "get_observed_signal", return_value=0),
-            patch.object(
-                _telemetry.usage,
-                "get_termination_observation",
-                return_value={
-                    "termination_kind": None,
-                    "component": None,
-                    "reporting_source": None,
-                },
+    @pytest.mark.parametrize(
+        ("yaml_config", "telemetry", "expected_disabled"),
+        [
+            ("telemetry_config:\n  disabled: true\n", True, True),
+            (
+                "context_servers:\n  telemetry_config:\n    disabled: true\n",
+                True,
+                True,
             ),
-            patch.object(_telemetry.usage, "report_exit") as report_exit,
-            pytest.raises(SystemExit) as raised,
-        ):
-            cli.main(args=["run"], prog_name="test-cli")
-
-        assert raised.value.code == 0
-        assert report_exit.call_count == 1
-        kwargs = report_exit.call_args.kwargs
-        assert kwargs["exit_code_known"] is True
-        assert kwargs["exit_code"] == 0
-        assert kwargs["termination_kind"] == "clean"
-
-    def test_parse_error_reports_cli_failure(self):
-        """Click parse failures are observed before command invocation."""
-        cli = _make_cli()
-        with (
-            patch.object(_telemetry.usage, "start_usage_session", return_value=True),
-            patch.object(_telemetry.usage, "set_lifecycle_phase"),
-            patch.object(_telemetry.usage, "get_observed_signal", return_value=0),
-            patch.object(
-                _telemetry.usage,
-                "get_termination_observation",
-                return_value={
-                    "termination_kind": None,
-                    "component": None,
-                    "reporting_source": None,
-                },
+            (
+                "generation_servers:\n  telemetry_config:\n    disabled: true\n",
+                True,
+                True,
             ),
-            patch.object(_telemetry.usage, "report_exit") as report_exit,
-            pytest.raises(SystemExit) as raised,
-        ):
-            cli.main(args=["--invalid-option"], prog_name="test-cli")
+            ("telemetry_config:\n  disabled: false\n", False, True),
+            ("telemetry_config:\n  disabled: false\n", True, False),
+        ],
+    )
+    def test_disaggregated_opt_out_precedence(
+        self,
+        monkeypatch,
+        tmp_path,
+        yaml_config,
+        telemetry,
+        expected_disabled,
+    ):
+        """An opt-out from either supported ingress disables the process tree."""
+        config_path = tmp_path / "disagg.yaml"
+        config_path.write_text(yaml_config, encoding="utf-8")
+        monkeypatch.delenv(_telemetry._TELEMETRY_OPT_OUT_ENV, raising=False)
 
-        assert raised.value.code == 2
-        kwargs = report_exit.call_args.kwargs
-        assert kwargs["exit_code"] == 2
-        assert kwargs["termination_kind"] == "exception"
+        with patch.object(_telemetry.usage, "start_usage_session") as start_session:
+            disabled = _telemetry.apply_disaggregated_telemetry_config(
+                str(config_path),
+                telemetry=telemetry,
+            )
 
-    def test_no_telemetry_is_honored_before_parsing(self):
+        assert disabled is expected_disabled
+        if expected_disabled:
+            assert os.environ[_telemetry._TELEMETRY_OPT_OUT_ENV] == "1"
+            assert start_session.call_args.args == ({"disabled": True},)
+        else:
+            assert _telemetry._TELEMETRY_OPT_OUT_ENV not in os.environ
+            start_session.assert_not_called()
+
+    def test_disaggregated_opt_out_deactivates_and_propagates(
+        self,
+        monkeypatch,
+        tmp_path,
+        captured_exit_payloads,
+    ):
+        """A YAML opt-out stops the coordinator session and reaches children."""
+        del captured_exit_payloads
+        config_path = tmp_path / "disagg.yaml"
+        config_path.write_text(
+            "telemetry_config:\n  disabled: true\n",
+            encoding="utf-8",
+        )
+        assert usage_lib.start_usage_session(default_usage_context="cli_serve")
+        assert usage_lib._get_session() is not None
+
+        assert _telemetry.apply_disaggregated_telemetry_config(
+            str(config_path),
+            telemetry=True,
+        )
+
+        assert usage_lib._get_session() is None
+        assert usage_lib._SESSION_DISABLED is True
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys; sys.exit(0 if "
+                "os.environ.get('TRTLLM_NO_USAGE_STATS') == '1' else 1)",
+            ],
+            check=False,
+            env=os.environ.copy(),
+        )
+        assert child.returncode == 0
+
+    @pytest.mark.parametrize(
+        ("args", "expected_code", "expected_kind"),
+        [
+            pytest.param(["run"], 0, "clean", id="clean"),
+            pytest.param(["--invalid-option"], 2, "exception", id="parse-error"),
+        ],
+    )
+    def test_system_exit_classification(
+        self,
+        terminal_mocks,
+        args,
+        expected_code,
+        expected_kind,
+    ):
+        """Normal completion and Click failures retain their process status."""
+        cli = _make_cli()
+        with pytest.raises(SystemExit) as raised:
+            cli.main(args=args, prog_name="test-cli")
+
+        assert raised.value.code == expected_code
+        terminal_mocks.report_exit.assert_called_once()
+        outcome = terminal_mocks.report_exit.call_args.args[0]
+        assert outcome.exit_code_known is True
+        assert outcome.exit_code == expected_code
+        assert outcome.termination_kind == expected_kind
+
+    def test_no_telemetry_is_honored_before_parsing(self, terminal_mocks):
         """The early local session sees the CLI opt-out flag."""
         cli = _make_cli()
-        with (
-            patch.object(_telemetry.usage, "start_usage_session") as start_session,
-            patch.object(_telemetry.usage, "set_lifecycle_phase"),
-            patch.object(_telemetry.usage, "get_observed_signal", return_value=0),
-            patch.object(
-                _telemetry.usage,
-                "get_termination_observation",
-                return_value={
-                    "termination_kind": None,
-                    "component": None,
-                    "reporting_source": None,
-                },
-            ),
-            patch.object(_telemetry.usage, "report_exit"),
-            pytest.raises(SystemExit),
-        ):
+        with pytest.raises(SystemExit):
             cli.main(args=["--no-telemetry", "run"], prog_name="test-cli")
 
-        config = start_session.call_args.args[0]
+        config = terminal_mocks.start.call_args.args[0]
         assert config.disabled is True
 
-    def test_keyboard_interrupt_reports_signal(self):
+    def test_keyboard_interrupt_reports_signal(self, terminal_mocks):
         """Click's wrapped KeyboardInterrupt retains a SIGINT classification."""
 
         def interrupt():
             raise KeyboardInterrupt
 
         cli = _make_cli(interrupt)
-        with (
-            patch.object(_telemetry.usage, "start_usage_session", return_value=True),
-            patch.object(_telemetry.usage, "set_lifecycle_phase"),
-            patch.object(_telemetry.usage, "get_observed_signal", return_value=0),
-            patch.object(
-                _telemetry.usage,
-                "get_termination_observation",
-                return_value={
-                    "termination_kind": None,
-                    "component": None,
-                    "reporting_source": None,
-                },
-            ),
-            patch.object(_telemetry.usage, "record_observed_signal"),
-            patch.object(_telemetry.usage, "report_exit") as report_exit,
-            pytest.raises(SystemExit),
-        ):
+        with pytest.raises(SystemExit):
             cli.main(args=["run"], prog_name="test-cli")
 
-        kwargs = report_exit.call_args.kwargs
-        assert kwargs["signal_number"] == 2
-        assert kwargs["termination_kind"] == "signal"
+        outcome = terminal_mocks.report_exit.call_args.args[0]
+        assert outcome.signal_number == 2
+        assert outcome.termination_kind == "signal"
 
-    def test_pending_worker_failure_preserves_authoritative_child_status(self):
-        """A supervised child status overrides a later generic parent error."""
+    def test_signal_exit_records_after_handler_unwinds(self, terminal_mocks):
+        """A lock-free handler hands its signal to the outer boundary."""
+
+        def terminate():
+            _telemetry.raise_signal_exit(signal.SIGTERM, None)
+
+        cli = _make_cli(terminate)
+        with pytest.raises(_telemetry.SignalExit) as raised:
+            cli.main(args=["run"], prog_name="test-cli")
+
+        assert raised.value.signal_number == signal.SIGTERM
+        assert raised.value.code == 128 + signal.SIGTERM
+        terminal_mocks.record_signal.assert_called_once_with(signal.SIGTERM)
+        outcome = terminal_mocks.report_exit.call_args.args[0]
+        assert outcome.exit_code == 128 + signal.SIGTERM
+        assert outcome.signal_number == signal.SIGTERM
+        assert outcome.termination_kind == "signal"
+
+    def test_optional_shell_exit_code_signal_inference(self, terminal_mocks):
+        """Fleet compatibility can interpret 128 + signal exit codes."""
+
+        def terminate():
+            raise SystemExit(128 + signal.SIGTERM)
+
+        with pytest.raises(SystemExit) as raised:
+            _telemetry.run_with_terminal_reporting(
+                terminate,
+                infer_signal_from_exit_code=True,
+            )
+
+        assert raised.value.code == 128 + signal.SIGTERM
+        terminal_mocks.record_signal.assert_called_once_with(signal.SIGTERM)
+        outcome = terminal_mocks.report_exit.call_args.args[0]
+        assert outcome.exit_code == 128 + signal.SIGTERM
+        assert outcome.signal_number == signal.SIGTERM
+        assert outcome.termination_kind == "signal"
+
+    @pytest.mark.parametrize(
+        ("observation", "observed_signal"),
+        [
+            pytest.param(
+                _telemetry.usage.TerminalOutcome(
+                    termination_kind="worker_failure",
+                    component="engine_worker",
+                    reporting_source="supervisor",
+                    exit_code_known=True,
+                    exit_code=137,
+                    signal_number=9,
+                ),
+                0,
+                id="authoritative-child-status",
+            ),
+            pytest.param(
+                _telemetry.usage.TerminalOutcome(
+                    termination_kind="worker_failure",
+                    component="engine_worker",
+                    reporting_source="executor_proxy",
+                    exit_code_known=False,
+                ),
+                signal.SIGINT,
+                id="liveness-only",
+            ),
+        ],
+    )
+    def test_worker_observation_overrides_boundary(
+        self,
+        terminal_mocks,
+        observation,
+        observed_signal,
+    ):
+        """The first causal worker observation overrides parent symptoms."""
 
         def fail():
             raise RuntimeError("worker unavailable")
 
+        terminal_mocks.signal.return_value = observed_signal
+        terminal_mocks.observation.return_value = observation
         cli = _make_cli(fail)
-        observation = {
-            "termination_kind": "worker_failure",
-            "component": "engine_worker",
-            "reporting_source": "supervisor",
-            "exit_code_known": True,
-            "exit_code": 137,
-            "signal_number": 9,
-        }
-        with (
-            patch.object(_telemetry.usage, "start_usage_session", return_value=True),
-            patch.object(_telemetry.usage, "set_lifecycle_phase"),
-            patch.object(_telemetry.usage, "get_observed_signal", return_value=0),
-            patch.object(
-                _telemetry.usage,
-                "get_termination_observation",
-                return_value=observation,
-            ),
-            patch.object(_telemetry.usage, "report_exit") as report_exit,
-            pytest.raises(RuntimeError),
-        ):
+        with pytest.raises(RuntimeError):
             cli.main(args=["run"], prog_name="test-cli")
 
-        kwargs = report_exit.call_args.kwargs
-        assert kwargs["exit_code_known"] is True
-        assert kwargs["exit_code"] == 137
-        assert kwargs["signal_number"] == 9
-        assert kwargs["termination_kind"] == "worker_failure"
-        assert kwargs["component"] == "engine_worker"
-        assert kwargs["reporting_source"] == "supervisor"
-
-    def test_liveness_only_worker_failure_does_not_invent_status(self):
-        """A proxy observation suppresses the synthetic shutdown signal/code."""
-
-        def fail():
-            raise RuntimeError("worker unavailable")
-
-        cli = _make_cli(fail)
-        observation = {
-            "termination_kind": "worker_failure",
-            "component": "engine_worker",
-            "reporting_source": "executor_proxy",
-            "exit_code_known": False,
-            "exit_code": 0,
-            "signal_number": 0,
-        }
-        with (
-            patch.object(_telemetry.usage, "start_usage_session", return_value=True),
-            patch.object(_telemetry.usage, "set_lifecycle_phase"),
-            patch.object(_telemetry.usage, "get_observed_signal", return_value=2),
-            patch.object(
-                _telemetry.usage,
-                "get_termination_observation",
-                return_value=observation,
-            ),
-            patch.object(_telemetry.usage, "report_exit") as report_exit,
-            pytest.raises(RuntimeError),
-        ):
-            cli.main(args=["run"], prog_name="test-cli")
-
-        kwargs = report_exit.call_args.kwargs
-        assert kwargs["exit_code_known"] is False
-        assert kwargs["exit_code"] == 0
-        assert kwargs["signal_number"] == 0
-        assert kwargs["termination_kind"] == "worker_failure"
+        assert terminal_mocks.report_exit.call_args.args[0] == observation
 
 
 class TestSerializedTerminationKinds:
     """Exercise non-signal terminal kinds through the real payload builder."""
 
-    def test_clean_callback_return_serializes_clean(self, captured_exit_payloads):
-        """A normally returning owned CLI boundary is an authoritative clean exit."""
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            pytest.param(
+                ["run"],
+                {
+                    "terminationKind": "clean",
+                    "exitCodeKnown": True,
+                    "exitCode": 0,
+                    "signalNumber": 0,
+                    "lifecyclePhase": "shutdown",
+                },
+                id="clean",
+            ),
+            pytest.param(
+                ["--invalid-option"],
+                {
+                    "terminationKind": "exception",
+                    "exitCodeKnown": True,
+                    "exitCode": 2,
+                    "signalNumber": 0,
+                    "lifecyclePhase": "cli_parsing",
+                },
+                id="parse-error",
+            ),
+        ],
+    )
+    def test_system_exit_serialization(self, captured_exit_payloads, args, expected):
+        """Clean and Click-error paths serialize their complete status."""
         cli = _make_cli()
 
         with pytest.raises(SystemExit) as raised:
-            cli.main(args=["run"], prog_name="test-cli")
+            cli.main(args=args, prog_name="test-cli")
 
-        assert raised.value.code == 0
+        assert raised.value.code == expected["exitCode"]
         params = _captured_terminal_parameters(captured_exit_payloads)
-        assert params["terminationKind"] == "clean"
-        assert params["exitCodeKnown"] is True
-        assert params["exitCode"] == 0
-        assert params["signalNumber"] == 0
-        assert params["lifecyclePhase"] == "shutdown"
+        assert {field: params[field] for field in expected} == expected
 
-    def test_click_parse_failure_serializes_exception(self, captured_exit_payloads):
-        """A CLI parse failure is an authoritative nonzero exception exit."""
-        cli = _make_cli()
-
-        with pytest.raises(SystemExit) as raised:
-            cli.main(args=["--invalid-option"], prog_name="test-cli")
-
-        assert raised.value.code == 2
-        params = _captured_terminal_parameters(captured_exit_payloads)
-        assert params["terminationKind"] == "exception"
-        assert params["exitCodeKnown"] is True
-        assert params["exitCode"] == 2
-        assert params["signalNumber"] == 0
-        assert params["lifecyclePhase"] == "cli_parsing"
-
-    def test_supervised_child_failure_serializes_worker_failure(
-        self, captured_exit_payloads
-    ):
+    def test_supervised_child_failure_serializes_worker_failure(self, captured_exit_payloads):
         """A causal child status overrides the parent's generic exception."""
 
         def fail_after_child_observation():
             _telemetry.usage.record_termination_observation(
-                termination_kind="worker_failure",
-                component="engine_worker",
-                reporting_source="supervisor",
-                exit_code_known=True,
-                exit_code=137,
-                signal_number=9,
+                _telemetry.usage.TerminalOutcome(
+                    termination_kind="worker_failure",
+                    component="engine_worker",
+                    reporting_source="supervisor",
+                    exit_code_known=True,
+                    exit_code=137,
+                    signal_number=9,
+                )
             )
             raise RuntimeError("supervised worker exited")
 

@@ -14,17 +14,31 @@
 # limitations under the License.
 """Serving-boundary telemetry helpers."""
 
-from types import FrameType
-from typing import Optional
+import socket
 
 import uvicorn
 
-from tensorrt_llm.usage import record_observed_signal
+import tensorrt_llm.usage as usage
 
 
 class TelemetryUvicornServer(uvicorn.Server):
-    """Uvicorn server that records handled signals without changing behavior."""
+    """Uvicorn server that reports captured signals after graceful shutdown."""
 
-    def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
-        record_observed_signal(sig)
-        super().handle_exit(sig, frame)
+    async def _serve(self, sockets: list[socket.socket] | None = None) -> None:
+        await super()._serve(sockets)
+        if not self._captured_signals:
+            return
+
+        # Uvicorn restores the original handlers and re-raises captured
+        # signals after _serve() returns. Report while normal coroutine
+        # control is still available, without taking locks in handle_exit().
+        signal_number = self._captured_signals[-1]
+        usage.record_observed_signal(signal_number)
+        usage.report_exit(
+            usage.TerminalOutcome(
+                termination_kind="signal",
+                exit_code_known=True,
+                exit_code=128 + signal_number,
+                signal_number=signal_number,
+            )
+        )

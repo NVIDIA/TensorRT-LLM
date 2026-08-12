@@ -14,16 +14,35 @@
 # limitations under the License.
 """Shared process-exit telemetry boundary for TRT-LLM Click CLIs."""
 
+import os
 import signal
 import sys
-from collections.abc import Mapping
-from typing import Any, Optional, Sequence
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any, Optional, Sequence, TypeVar
 
 import click
+import yaml
 
 import tensorrt_llm.usage as usage
 from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
-from tensorrt_llm.usage.schema import TerminationComponent, TerminationKind
+from tensorrt_llm.usage.schema import TerminationComponent
+
+_TELEMETRY_OPT_OUT_ENV = "TRTLLM_NO_USAGE_STATS"
+_T = TypeVar("_T")
+
+
+class SignalExit(SystemExit):
+    """Carry a handled signal to the outer telemetry boundary."""
+
+    def __init__(self, signal_number: int) -> None:
+        self.signal_number = signal_number
+        super().__init__(128 + signal_number)
+
+
+def raise_signal_exit(signal_number: int, _frame: Any) -> None:
+    """Leave synchronous signal handling without taking locks or blocking."""
+    raise SignalExit(signal_number)
 
 
 def _telemetry_disabled_from_args(args: Sequence[str]) -> bool:
@@ -74,6 +93,50 @@ def apply_raw_config_telemetry_opt_out(
         pass
 
 
+def _disagg_yaml_disables_telemetry(config_file: Optional[str]) -> bool:
+    """Read only explicit disaggregated YAML opt-outs before validation."""
+    if config_file is None:
+        return False
+    with Path(config_file).open(encoding="utf-8") as config_stream:
+        config = yaml.safe_load(config_stream)
+    if not isinstance(config, Mapping):
+        return False
+
+    scopes = (
+        config,
+        config.get("context_servers"),
+        config.get("generation_servers"),
+    )
+    for scope in scopes:
+        if not isinstance(scope, Mapping):
+            continue
+        telemetry_config = scope.get("telemetry_config")
+        if isinstance(telemetry_config, Mapping) and telemetry_config.get("disabled") is True:
+            return True
+    return False
+
+
+def apply_disaggregated_telemetry_config(
+    config_file: Optional[str],
+    *,
+    telemetry: bool,
+) -> bool:
+    """Apply CLI or YAML disaggregated opt-out to the whole process tree."""
+    disabled = not telemetry or _disagg_yaml_disables_telemetry(config_file)
+
+    if disabled:
+        # This public opt-out is checked by every telemetry API and inherited
+        # by fleet, MPI proxy, and model-worker descendants.
+        os.environ[_TELEMETRY_OPT_OUT_ENV] = "1"
+        usage.start_usage_session(
+            {"disabled": True},
+            default_usage_context=UsageContext.DISAGGREGATED.value,
+            component="server",
+            lifecycle_phase="config_validation",
+        )
+    return disabled
+
+
 def _contains_keyboard_interrupt(exc: BaseException) -> bool:
     """Detect Click's wrapped ``KeyboardInterrupt`` without reading messages."""
     pending: list[BaseException] = [exc]
@@ -90,6 +153,100 @@ def _contains_keyboard_interrupt(exc: BaseException) -> bool:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return False
+
+
+def run_with_terminal_reporting(
+    operation: Callable[[], _T],
+    *,
+    telemetry_config: Optional[TelemetryConfig] = None,
+    default_usage_context: str = "",
+    infer_signal_from_exit_code: bool = False,
+) -> _T:
+    """Run one process boundary and report its terminal outcome."""
+
+    def report(outcome: usage.TerminalOutcome) -> None:
+        try:
+            outcome = outcome.with_observation(usage.get_termination_observation())
+            usage.report_exit(
+                outcome,
+                lifecycle_phase=None,
+                telemetry_config=telemetry_config,
+                default_usage_context=default_usage_context,
+            )
+        except Exception:
+            pass
+
+    try:
+        result = operation()
+    except SystemExit as exc:
+        exit_code_known, exit_code = _system_exit_code(exc)
+        signal_number = usage.get_observed_signal()
+        if isinstance(exc, SignalExit):
+            signal_number = exc.signal_number
+            usage.record_observed_signal(signal_number)
+        elif signal_number == 0 and _contains_keyboard_interrupt(exc):
+            signal_number = signal.SIGINT
+            usage.record_observed_signal(signal_number)
+        elif signal_number == 0 and infer_signal_from_exit_code and exit_code_known:
+            inferred_signal = exit_code - 128
+            if inferred_signal in signal.valid_signals():
+                signal_number = inferred_signal
+                usage.record_observed_signal(signal_number)
+
+        if signal_number:
+            termination_kind = "signal"
+        elif exit_code == 0:
+            termination_kind = "clean"
+            usage.set_lifecycle_phase("shutdown")
+        else:
+            termination_kind = "exception"
+        report(
+            usage.TerminalOutcome(
+                termination_kind=termination_kind,
+                exit_code_known=exit_code_known,
+                exit_code=exit_code,
+                signal_number=signal_number,
+            )
+        )
+        raise
+    except KeyboardInterrupt:
+        usage.record_observed_signal(signal.SIGINT)
+        report(
+            usage.TerminalOutcome(
+                termination_kind="signal",
+                exit_code_known=True,
+                exit_code=128 + signal.SIGINT,
+                signal_number=signal.SIGINT,
+            )
+        )
+        raise
+    except Exception:
+        signal_number = usage.get_observed_signal()
+        report(
+            usage.TerminalOutcome(
+                termination_kind="signal" if signal_number else "exception",
+                exit_code_known=True,
+                exit_code=1,
+                signal_number=signal_number,
+            )
+        )
+        raise
+    else:
+        signal_number = usage.get_observed_signal()
+        if signal_number:
+            termination_kind = "signal"
+        else:
+            termination_kind = "clean"
+            usage.set_lifecycle_phase("shutdown")
+        report(
+            usage.TerminalOutcome(
+                termination_kind=termination_kind,
+                exit_code_known=True,
+                exit_code=0,
+                signal_number=signal_number,
+            )
+        )
+        return result
 
 
 class TelemetryGroup(click.Group):
@@ -125,35 +282,6 @@ class TelemetryGroup(click.Group):
         except Exception:
             self._telemetry_config = None
 
-    def _report_terminal(
-        self,
-        *,
-        exit_code_known: bool,
-        exit_code: int,
-        signal_number: int,
-        termination_kind: TerminationKind,
-    ) -> None:
-        try:
-            observation = usage.get_termination_observation()
-            if observation["termination_kind"] is not None:
-                signal_number = observation.get("signal_number", 0)
-            if observation.get("exit_code_known") is not None:
-                exit_code_known = observation["exit_code_known"]
-                exit_code = observation["exit_code"]
-            usage.report_exit(
-                exit_code_known=exit_code_known,
-                exit_code=exit_code,
-                signal_number=signal_number,
-                termination_kind=observation["termination_kind"] or termination_kind,
-                lifecycle_phase=None,
-                component=observation["component"],
-                reporting_source=observation["reporting_source"] or "self",
-                telemetry_config=self._telemetry_config,
-                default_usage_context=self._telemetry_usage_context.value,
-            )
-        except Exception:
-            pass
-
     def main(self, *args: Any, **kwargs: Any) -> Any:
         """Run Click and report the outcome before returning or re-raising."""
         cli_args = kwargs.get("args")
@@ -162,59 +290,8 @@ class TelemetryGroup(click.Group):
         if cli_args is None:
             cli_args = sys.argv[1:]
         self._start_telemetry(cli_args)
-
-        try:
-            result = super().main(*args, **kwargs)
-        except SystemExit as exc:
-            exit_code_known, exit_code = _system_exit_code(exc)
-            signal_number = usage.get_observed_signal()
-            if signal_number == 0 and _contains_keyboard_interrupt(exc):
-                signal_number = signal.SIGINT
-                usage.record_observed_signal(signal_number)
-
-            if signal_number:
-                termination_kind = "signal"
-            elif exit_code == 0:
-                termination_kind = "clean"
-                usage.set_lifecycle_phase("shutdown")
-            else:
-                termination_kind = "exception"
-            self._report_terminal(
-                exit_code_known=exit_code_known,
-                exit_code=exit_code,
-                signal_number=signal_number,
-                termination_kind=termination_kind,
-            )
-            raise
-        except KeyboardInterrupt:
-            usage.record_observed_signal(signal.SIGINT)
-            self._report_terminal(
-                exit_code_known=True,
-                exit_code=128 + signal.SIGINT,
-                signal_number=signal.SIGINT,
-                termination_kind="signal",
-            )
-            raise
-        except Exception:
-            signal_number = usage.get_observed_signal()
-            self._report_terminal(
-                exit_code_known=True,
-                exit_code=1,
-                signal_number=signal_number,
-                termination_kind="signal" if signal_number else "exception",
-            )
-            raise
-        else:
-            signal_number = usage.get_observed_signal()
-            if signal_number:
-                termination_kind = "signal"
-            else:
-                termination_kind = "clean"
-                usage.set_lifecycle_phase("shutdown")
-            self._report_terminal(
-                exit_code_known=True,
-                exit_code=0,
-                signal_number=signal_number,
-                termination_kind=termination_kind,
-            )
-            return result
+        return run_with_terminal_reporting(
+            lambda: super(TelemetryGroup, self).main(*args, **kwargs),
+            telemetry_config=self._telemetry_config,
+            default_usage_context=self._telemetry_usage_context.value,
+        )

@@ -364,31 +364,6 @@ class BaseLLM:
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
-        self._initialize(
-            model,
-            tokenizer,
-            tokenizer_mode,
-            skip_tokenizer_init,
-            trust_remote_code,
-            tensor_parallel_size,
-            dtype,
-            revision,
-            tokenizer_revision,
-            **kwargs,
-        )
-
-    def _initialize(self,
-                    model: Union[str, Path],
-                    tokenizer: Optional[Union[str, Path, TokenizerBase,
-                                              PreTrainedTokenizerBase]] = None,
-                    tokenizer_mode: Literal['auto', 'slow'] = 'auto',
-                    skip_tokenizer_init: bool = False,
-                    trust_remote_code: bool = False,
-                    tensor_parallel_size: int = 1,
-                    dtype: str = "auto",
-                    revision: Optional[str] = None,
-                    tokenizer_revision: Optional[str] = None,
-                    **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
@@ -1867,30 +1842,17 @@ class _TorchLLM(BaseLLM):
                              **kwargs)
         except Exception:
             if usage_attempt_tracked:
-                try:
-                    _usage.record_llm_initialization_failure()
-                except Exception as exc:
-                    logger.debug(
-                        "Usage telemetry initialization failure tracking failed: %s",
-                        exc,
-                    )
+                _usage.record_llm_initialization_failure()
             raise
 
         if not usage_attempt_tracked and _usage is not None:
-            try:
-                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
-                    getattr(self.args, 'telemetry_config', None),
-                    default_usage_context=_usage.UsageContext.LLM_CLASS.value,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Usage telemetry post-validation tracking failed: %s", exc)
+            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                getattr(self.args, 'telemetry_config', None),
+                default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+            )
 
         if usage_attempt_tracked:
-            try:
-                self._usage_lifecycle_active = _usage.record_llm_initialized()
-            except Exception as exc:
-                logger.debug("Usage telemetry success tracking failed: %s", exc)
+            self._usage_lifecycle_active = _usage.record_llm_initialized()
 
         self._start_usage_reporting()
 

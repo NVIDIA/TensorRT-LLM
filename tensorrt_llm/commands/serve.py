@@ -29,9 +29,8 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
+from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._serve_stability import stability_option
-from tensorrt_llm.commands._telemetry import (TelemetryGroup,
-                                              apply_raw_config_telemetry_opt_out)
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -56,10 +55,9 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.usage import (get_observed_signal,
-                                get_termination_observation,
+from tensorrt_llm.usage import (TerminalOutcome, get_observed_signal,
                                 record_observed_signal,
-                                record_termination_observation, report_exit,
+                                record_termination_observation,
                                 set_lifecycle_phase, set_usage_context,
                                 start_usage_session)
 
@@ -86,13 +84,14 @@ def _report_observed_child_failure(return_code: int, component: str,
         signal_number = 0
         exit_code = return_code
     record_termination_observation(
-        termination_kind="worker_failure",
-        component=component,
-        reporting_source="supervisor",
-        exit_code_known=True,
-        exit_code=exit_code,
-        signal_number=signal_number,
-    )
+        TerminalOutcome(
+            termination_kind="worker_failure",
+            component=component,
+            reporting_source="supervisor",
+            exit_code_known=True,
+            exit_code=exit_code,
+            signal_number=signal_number,
+        ))
     set_lifecycle_phase(lifecycle_phase)
 
 
@@ -140,43 +139,6 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
         else:
             raise ValueError(f"Invalid middleware {middleware}. "
                              "Must be a class or an async function.")
-
-
-def _signal_handler_cleanup_child(signum, frame):
-    """Signal handler to clean up the child process."""
-    global _child_p_global
-    record_observed_signal(signum)
-    if _child_p_global and _child_p_global.poll() is None:
-        logger.info(
-            f"Parent process (PID {os.getpid()}) received signal {signal.Signals(signum).name}. Terminating child process (PID {_child_p_global.pid})."
-        )
-        _child_p_global.terminate()
-        try:
-            _child_p_global.wait(
-                timeout=10)  # Allow 10 seconds for graceful termination
-        except subprocess.TimeoutExpired:
-            logger.info(
-                f"Child process (PID {_child_p_global.pid}) did not terminate gracefully after signal. Killing."
-            )
-            _child_p_global.kill()
-            try:
-                _child_p_global.wait(timeout=10)  # Allow 10 seconds for kill
-            except subprocess.TimeoutExpired:
-                logger.info(
-                    f"Child process (PID {_child_p_global.pid}) failed to die even after kill command from signal handler."
-                )
-
-        if _child_p_global.poll() is not None:
-            logger.info(
-                f"Child process (PID {_child_p_global.pid}) confirmed terminated due to signal {signal.Signals(signum).name}."
-            )
-        else:
-            logger.info(
-                f"Child process (PID {_child_p_global.pid}) is still running after cleanup attempt for signal {signal.Signals(signum).name}."
-            )
-
-    # Standard exit code for signal termination
-    sys.exit(128 + signum)
 
 
 def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
@@ -1444,7 +1406,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 llm_args_extra_dict = {}
             elif not isinstance(llm_args_extra_dict, dict):
                 raise ValueError("Configuration file root must be a mapping.")
-        apply_raw_config_telemetry_opt_out(
+        _command_telemetry.apply_raw_config_telemetry_opt_out(
             llm_args_extra_dict,
             usage_context=_telemetry_config.UsageContext.CLI_SERVE,
             component="server",
@@ -1713,7 +1675,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
             encoder_args_extra_dict = {}
         elif not isinstance(encoder_args_extra_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
-    apply_raw_config_telemetry_opt_out(
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
         encoder_args_extra_dict,
         usage_context=_telemetry_config.UsageContext.CLI_SERVE,
         component="server",
@@ -1842,7 +1804,7 @@ def serve_embedding(
             extra_dict = {}
         elif not isinstance(extra_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
-    apply_raw_config_telemetry_opt_out(
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
         extra_dict,
         usage_context=_telemetry_config.UsageContext.CLI_SERVE,
         component="server",
@@ -1927,6 +1889,11 @@ def serve_embedding(
     "This option is not connected to any functionality and will be removed in a future release.",
     status="deprecated")
 @stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
+@stability_option(
     "--report_addr",
     type=str,
     default=None,
@@ -1943,11 +1910,12 @@ def disaggregated(
     log_level: str,
     metrics_log_interval: int,
     schedule_style: str,
+    telemetry: bool,
     report_addr: Optional[str],
 ):
     """Running server in disaggregated mode"""
 
-    set_usage_context("disaggregated")
+    set_usage_context(_telemetry_config.UsageContext.DISAGGREGATED.value)
     logger.set_level(log_level)
     set_prometheus_multiproc_dir()
 
@@ -1959,6 +1927,10 @@ def disaggregated(
     if "--config_file" in sys.argv:
         logger.warning("--config_file is deprecated, use --config instead.")
 
+    _command_telemetry.apply_disaggregated_telemetry_config(
+        config_file,
+        telemetry=telemetry,
+    )
     disagg_cfg = parse_disagg_config_file(config_file)
     if schedule_style:
         disagg_cfg.schedule_style = schedule_style
@@ -2131,14 +2103,9 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 p.kill()
                 p.wait()
 
-    def _handle_signal(signum, _frame):
-        record_observed_signal(signum)
-        _cleanup()
-        raise SystemExit(128 + signum)
-
     atexit.register(_cleanup)
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _command_telemetry.raise_signal_exit)
+    signal.signal(signal.SIGINT, _command_telemetry.raise_signal_exit)
     return fleet
 
 
@@ -2344,70 +2311,16 @@ def _run_fleet_worker():
     Each ``Popen`` receives an explicit ``TLLM_DISAGG_WORKER_PROCESS_ID`` and
     binds its own ``SO_REUSEPORT`` socket on the shared public port.
     """
-    telemetry_config = _telemetry_config.TelemetryConfig(disabled=False)
     start_usage_session(
-        telemetry_config,
-        default_usage_context="disaggregated",
+        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.value,
         component="server",
         lifecycle_phase="config_validation",
     )
-
-    def _report_terminal(exit_code: int,
-                         termination_kind: str,
-                         signal_number: Optional[int] = None) -> None:
-        observation = get_termination_observation()
-        exit_code_known = True
-        if signal_number is None:
-            signal_number = get_observed_signal()
-        if observation["termination_kind"] is not None:
-            signal_number = observation.get("signal_number", 0)
-        if observation.get("exit_code_known") is not None:
-            exit_code_known = observation["exit_code_known"]
-            exit_code = observation["exit_code"]
-        effective_kind = observation["termination_kind"] or (
-            "signal" if signal_number else termination_kind)
-        report_exit(
-            exit_code_known=exit_code_known,
-            exit_code=exit_code,
-            signal_number=signal_number,
-            termination_kind=effective_kind,
-            lifecycle_phase=None,
-            component=observation["component"],
-            reporting_source=observation["reporting_source"] or "self",
-            telemetry_config=telemetry_config,
-        )
-
-    try:
-        _run_fleet_worker_impl()
-    except SystemExit as exc:
-        if exc.code is None:
-            exit_code = 0
-        else:
-            exit_code = exc.code if isinstance(exc.code, int) else 1
-        signal_number = get_observed_signal()
-        shell_signal = exit_code - 128
-        if not signal_number and shell_signal in signal.valid_signals():
-            signal_number = shell_signal
-            record_observed_signal(signal_number)
-        _report_terminal(
-            exit_code,
-            "signal" if signal_number else
-            ("clean" if exit_code == 0 else "exception"),
-            signal_number,
-        )
-        raise
-    except KeyboardInterrupt:
-        record_observed_signal(signal.SIGINT)
-        _report_terminal(128 + signal.SIGINT, "signal")
-        raise
-    except Exception:
-        _report_terminal(1, "exception")
-        raise
-    else:
-        signal_number = get_observed_signal()
-        if not signal_number:
-            set_lifecycle_phase("shutdown")
-        _report_terminal(0, "clean", signal_number)
+    return _command_telemetry.run_with_terminal_reporting(
+        _run_fleet_worker_impl,
+        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.value,
+        infer_signal_from_exit_code=True,
+    )
 
 
 def _run_fleet_worker_impl():
@@ -2462,9 +2375,19 @@ def set_cuda_device():
                   default='info',
                   help="The logging level.",
                   status="beta")
-def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
+                             telemetry: bool):
     """Launching disaggregated MPI worker"""
 
+    _command_telemetry.apply_disaggregated_telemetry_config(
+        config_file,
+        telemetry=telemetry,
+    )
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2637,8 +2560,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     original_sigint_handler = signal.getsignal(signal.SIGINT)
 
     # Register new signal handlers
-    signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
-    signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
+    signal.signal(signal.SIGTERM, _command_telemetry.raise_signal_exit)
+    signal.signal(signal.SIGINT, _command_telemetry.raise_signal_exit)
 
     try:
         _child_p_global = subprocess.Popen(
@@ -2704,7 +2627,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         )
 
 
-class DefaultGroup(TelemetryGroup):
+class DefaultGroup(_command_telemetry.TelemetryGroup):
     """Custom Click group to allow default command behavior"""
 
     def resolve_command(self, ctx, args):

@@ -246,21 +246,18 @@ class TestGxtPayload:
 
 
 class TestSchemaConstants:
-    def test_client_id(self):
-        """CLIENT_ID matches provisioned value."""
-        assert schema.CLIENT_ID == "616561816355034"
-
-    def test_event_protocol(self):
-        """EVENT_PROTOCOL is v1.6."""
-        assert schema.EVENT_PROTOCOL == "1.6"
-
-    def test_event_schema_ver(self):
-        """EVENT_SCHEMA_VER is 0.3 (matches SMS schema schemaVersion)."""
-        assert schema.EVENT_SCHEMA_VER == "0.3"
-
-    def test_event_sys_ver(self):
-        """EVENT_SYS_VER identifies the telemetry subsystem."""
-        assert schema.EVENT_SYS_VER == "trtllm-telemetry/1.0"
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("CLIENT_ID", "616561816355034"),
+            ("EVENT_PROTOCOL", "1.6"),
+            ("EVENT_SCHEMA_VER", "0.7"),
+            ("EVENT_SYS_VER", "trtllm-telemetry/1.0"),
+        ],
+    )
+    def test_constants(self, name, expected):
+        """Protocol constants retain their provisioned values."""
+        assert getattr(schema, name) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -309,41 +306,14 @@ class TestHeartbeatContent:
 class TestIngressPoint:
     """Tests for the ingressPoint field in telemetry events."""
 
-    def test_initial_report_has_ingress_point_field(self):
-        """TrtllmInitialReport has an ingressPoint field."""
-        report = schema.TrtllmInitialReport()
-        data = report.model_dump(by_alias=True)
-        assert "ingressPoint" in data
-
-    def test_ingress_point_default_empty_string(self):
-        """Default ingressPoint is empty string."""
-        report = schema.TrtllmInitialReport()
-        data = report.model_dump(by_alias=True)
-        assert data["ingressPoint"] == ""
-
-    def test_ingress_point_set_to_cli_serve(self):
-        """IngressPoint can be set to 'cli_serve'."""
-        report = schema.TrtllmInitialReport(ingressPoint="cli_serve")
-        data = report.model_dump(by_alias=True)
-        assert data["ingressPoint"] == "cli_serve"
-
-    def test_ingress_point_set_to_llm_class(self):
-        """IngressPoint can be set to 'llm_class'."""
-        report = schema.TrtllmInitialReport(ingressPoint="llm_class")
-        data = report.model_dump(by_alias=True)
-        assert data["ingressPoint"] == "llm_class"
-
-    def test_ingress_point_set_to_cli_bench(self):
-        """IngressPoint can be set to 'cli_bench'."""
-        report = schema.TrtllmInitialReport(ingressPoint="cli_bench")
-        data = report.model_dump(by_alias=True)
-        assert data["ingressPoint"] == "cli_bench"
-
-    def test_ingress_point_set_to_cli_eval(self):
-        """IngressPoint can be set to 'cli_eval'."""
-        report = schema.TrtllmInitialReport(ingressPoint="cli_eval")
-        data = report.model_dump(by_alias=True)
-        assert data["ingressPoint"] == "cli_eval"
+    @pytest.mark.parametrize(
+        "value",
+        ["", "cli_serve", "llm_class", "cli_bench", "cli_eval"],
+    )
+    def test_ingress_point_values(self, value):
+        """IngressPoint defaults to empty and accepts known ingress values."""
+        report = schema.TrtllmInitialReport(ingressPoint=value)
+        assert report.model_dump(by_alias=True)["ingressPoint"] == value
 
     def test_ingress_point_in_gxt_payload(self):
         """IngressPoint appears in the full GXT payload."""
@@ -387,7 +357,14 @@ class TestUsageContextEnum:
 
     def test_expected_contexts_exist(self):
         """All expected UsageContext values are defined."""
-        expected = {"unknown", "llm_class", "cli_serve", "cli_bench", "cli_eval"}
+        expected = {
+            "unknown",
+            "llm_class",
+            "cli_serve",
+            "cli_bench",
+            "cli_eval",
+            "disaggregated",
+        }
         actual = {ctx.value for ctx in _llm_args_mod.UsageContext}
         assert actual == expected
 
@@ -428,15 +405,17 @@ class TestSchemaCompliance:
 
     # --- Schema metadata validation ---
 
-    def test_schema_version_matches_code_constant(self):
-        """SMS schemaVersion matches EVENT_SCHEMA_VER in code."""
+    @pytest.mark.parametrize(
+        ("metadata_field", "expected"),
+        [
+            ("schemaVersion", schema.EVENT_SCHEMA_VER),
+            ("clientId", schema.CLIENT_ID),
+        ],
+    )
+    def test_schema_metadata_matches_constants(self, metadata_field, expected):
+        """SMS metadata remains synchronized with code constants."""
         sms_schema = self._load_sms_schema()
-        assert sms_schema["schemaMeta"]["schemaVersion"] == schema.EVENT_SCHEMA_VER
-
-    def test_client_id_matches_code_constant(self):
-        """SMS clientId matches CLIENT_ID in code."""
-        sms_schema = self._load_sms_schema()
-        assert sms_schema["schemaMeta"]["clientId"] == schema.CLIENT_ID
+        assert sms_schema["schemaMeta"][metadata_field] == expected
 
     def test_schema_has_draft07(self):
         """SMS schema uses JSON Schema draft-07."""
@@ -453,34 +432,18 @@ class TestSchemaCompliance:
             "trtllm_exit_report",
         }
 
-    # --- TrtllmInitialReport <-> trtllm_initial_report field sync ---
-
-    def test_initial_report_fields_match_sms(self):
-        """Every TrtllmInitialReport field (by alias) exists in SMS initial_report."""
-        sms_schema = self._load_sms_schema()
-        sms_props = set(
-            sms_schema["definitions"]["events"]["trtllm_initial_report"]["properties"].keys()
-        )
-        pydantic_aliases = self._get_pydantic_aliases(schema.TrtllmInitialReport)
-
-        missing_in_sms = pydantic_aliases - sms_props
-        assert not missing_in_sms, (
-            f"Fields in TrtllmInitialReport but missing from SMS schema: {sorted(missing_in_sms)}"
-        )
-
-    def test_sms_initial_report_fields_match_pydantic(self):
-        """Every SMS initial_report property exists in TrtllmInitialReport."""
-        sms_schema = self._load_sms_schema()
-        sms_props = set(
-            sms_schema["definitions"]["events"]["trtllm_initial_report"]["properties"].keys()
-        )
-        pydantic_aliases = self._get_pydantic_aliases(schema.TrtllmInitialReport)
-
-        missing_in_pydantic = sms_props - pydantic_aliases
-        assert not missing_in_pydantic, (
-            f"Fields in SMS schema but missing from TrtllmInitialReport: "
-            f"{sorted(missing_in_pydantic)}"
-        )
+    @pytest.mark.parametrize(
+        ("event_name", "model"),
+        [
+            ("trtllm_initial_report", schema.TrtllmInitialReport),
+            ("trtllm_heartbeat", schema.TrtllmHeartbeat),
+            ("trtllm_exit_report", schema.TrtllmExitReport),
+        ],
+    )
+    def test_event_fields_match_sms(self, event_name, model):
+        """Every event model and its SMS definition have identical fields."""
+        event = self._load_sms_schema()["definitions"]["events"][event_name]
+        assert set(event["properties"]) == self._get_pydantic_aliases(model)
 
     def test_initial_report_has_all_expected_fields(self):
         """SMS trtllm_initial_report contains all expected telemetry fields."""
@@ -532,81 +495,14 @@ class TestSchemaCompliance:
             "If intentional, add them to the expected set in this test."
         )
 
-    # --- TrtllmHeartbeat <-> trtllm_heartbeat field sync ---
-
-    def test_heartbeat_fields_match_sms(self):
-        """Every TrtllmHeartbeat field (by alias) exists in SMS heartbeat."""
-        sms_schema = self._load_sms_schema()
-        sms_props = set(
-            sms_schema["definitions"]["events"]["trtllm_heartbeat"]["properties"].keys()
-        )
-        pydantic_aliases = self._get_pydantic_aliases(schema.TrtllmHeartbeat)
-
-        missing_in_sms = pydantic_aliases - sms_props
-        assert not missing_in_sms, (
-            f"Fields in TrtllmHeartbeat but missing from SMS schema: {sorted(missing_in_sms)}"
-        )
-
-    def test_sms_heartbeat_fields_match_pydantic(self):
-        """Every SMS heartbeat property exists in TrtllmHeartbeat."""
-        sms_schema = self._load_sms_schema()
-        sms_props = set(
-            sms_schema["definitions"]["events"]["trtllm_heartbeat"]["properties"].keys()
-        )
-        pydantic_aliases = self._get_pydantic_aliases(schema.TrtllmHeartbeat)
-
-        missing_in_pydantic = sms_props - pydantic_aliases
-        assert not missing_in_pydantic, (
-            f"Fields in SMS schema but missing from TrtllmHeartbeat: {sorted(missing_in_pydantic)}"
-        )
-
-    def test_heartbeat_required_fields(self):
-        """SMS trtllm_heartbeat requires every declared snapshot field."""
-        sms_schema = self._load_sms_schema()
-        event = sms_schema["definitions"]["events"]["trtllm_heartbeat"]
+    @pytest.mark.parametrize(
+        "event_name",
+        ["trtllm_initial_report", "trtllm_heartbeat", "trtllm_exit_report"],
+    )
+    def test_all_event_fields_are_required_and_closed(self, event_name):
+        """Every SMS event requires its declared fields and rejects extras."""
+        event = self._load_sms_schema()["definitions"]["events"][event_name]
         assert set(event["required"]) == set(event["properties"])
-
-    def test_exit_report_fields_match_sms(self):
-        """The Pydantic and SMS exit-event fields stay synchronized."""
-        sms_schema = self._load_sms_schema()
-        sms_props = set(
-            sms_schema["definitions"]["events"]["trtllm_exit_report"]["properties"].keys()
-        )
-        pydantic_aliases = self._get_pydantic_aliases(schema.TrtllmExitReport)
-        assert sms_props == pydantic_aliases
-
-    def test_exit_report_requires_all_fields(self):
-        """SMS requires every declared terminal-event field."""
-        sms_schema = self._load_sms_schema()
-        event = sms_schema["definitions"]["events"]["trtllm_exit_report"]
-        assert set(event["required"]) == set(event["properties"])
-        assert event["additionalProperties"] is False
-
-    def test_initial_report_required_fields(self):
-        """SMS trtllm_initial_report requires all declared fields."""
-        sms_schema = self._load_sms_schema()
-        required = set(sms_schema["definitions"]["events"]["trtllm_initial_report"]["required"])
-        all_props = set(
-            sms_schema["definitions"]["events"]["trtllm_initial_report"]["properties"].keys()
-        )
-        assert required == all_props, (
-            f"Expected all properties to be required.\n"
-            f"  Missing from required: {all_props - required}\n"
-            f"  Extra in required: {required - all_props}"
-        )
-
-    # --- Additional properties enforcement ---
-
-    def test_initial_report_no_additional_properties(self):
-        """SMS trtllm_initial_report has additionalProperties: false."""
-        sms_schema = self._load_sms_schema()
-        event = sms_schema["definitions"]["events"]["trtllm_initial_report"]
-        assert event["additionalProperties"] is False
-
-    def test_heartbeat_no_additional_properties(self):
-        """SMS trtllm_heartbeat has additionalProperties: false."""
-        sms_schema = self._load_sms_schema()
-        event = sms_schema["definitions"]["events"]["trtllm_heartbeat"]
         assert event["additionalProperties"] is False
 
     # --- Privacy / PII guard ---

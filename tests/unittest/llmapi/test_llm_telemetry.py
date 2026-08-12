@@ -21,6 +21,7 @@ hook fires, and that telemetry_disabled flows through correctly.
 import os
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -39,6 +40,20 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+
+@pytest.fixture
+def enable_telemetry(monkeypatch):
+    """Enable telemetry for lifecycle tests in this sibling test package."""
+    monkeypatch.delenv("TRTLLM_NO_USAGE_STATS", raising=False)
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    monkeypatch.delenv("TELEMETRY_DISABLED", raising=False)
+    monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
+    monkeypatch.setattr(
+        usage_lib,
+        "_OPT_OUT_FILE",
+        Path("/nonexistent/path/do_not_track"),
+    )
 
 
 def _get_model_path():
@@ -83,7 +98,7 @@ class TestProcessLifecycleCounters:
     def test_two_live_objects_update_concurrency_counters(self, enable_telemetry):
         """Two successful constructors share one session and prove overlap."""
         with (
-            patch.object(BaseLLM, "_initialize"),
+            patch.object(BaseLLM, "__init__", return_value=None),
             patch.object(BaseLLM, "_start_usage_reporting"),
         ):
             first = LLM_torch(model="unused")
@@ -103,7 +118,7 @@ class TestProcessLifecycleCounters:
         """Constructor tracking increments the counter and re-raises unchanged."""
         error = ValueError("expected test failure")
         with (
-            patch.object(BaseLLM, "_initialize", side_effect=error),
+            patch.object(BaseLLM, "__init__", side_effect=error),
             patch.object(BaseLLM, "_start_usage_reporting"),
             pytest.raises(ValueError) as raised,
         ):
@@ -147,7 +162,7 @@ class TestProcessLifecycleCounters:
             )
 
         with (
-            patch.object(BaseLLM, "_initialize", autospec=True, side_effect=initialize),
+            patch.object(BaseLLM, "__init__", autospec=True, side_effect=initialize),
             patch.object(BaseLLM, "_start_usage_reporting"),
         ):
             llm = LLM_torch(model="unused", telemetry_config={"disabled": False})
@@ -161,7 +176,7 @@ class TestProcessLifecycleCounters:
     def test_shutdown_decrements_once_per_object(self, enable_telemetry):
         """Repeated shutdown calls cannot decrement the active gauge twice."""
         with (
-            patch.object(BaseLLM, "_initialize"),
+            patch.object(BaseLLM, "__init__", return_value=None),
             patch.object(BaseLLM, "_start_usage_reporting"),
         ):
             llm = LLM_torch(model="unused")
