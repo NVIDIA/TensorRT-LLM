@@ -507,11 +507,6 @@ class KVCacheManager(BaseResourceManager):
                 # live-state slot count must scale with ``pp_size``.
                 pp_size = self.mapping.pp_size if self.mapping is not None else 1
                 live_state_slots = self.max_batch_size * pp_size
-                # Reserve one extra slot for the ADP dummy request that may
-                # be needed when all live slots are occupied by in-transfer
-                # disagg requests (schedulable=0 triggers dummy creation).
-                if getattr(self.mapping, "enable_attention_dp", False):
-                    live_state_slots += 1
                 max_snapshots = live_state_slots
                 snapshot_interval = (
                     linear_attention_metadata.states_snapshot_interval)
