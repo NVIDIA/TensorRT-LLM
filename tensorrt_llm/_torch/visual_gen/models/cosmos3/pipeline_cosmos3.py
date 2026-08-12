@@ -49,6 +49,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
 from .defaults import (
+    COSMOS3_720P_PARAMS,
     COSMOS3_ENVELOPES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,

@@ -31,11 +31,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_GENERATION_DEFAULTS,
     VIDEO_RES_SIZE_INFO,
 )
-
-# What a plain Cosmos3 video request advertises, and so what the executor
-# merges into every request before infer() sees it.
-_ADVERTISED_VIDEO_DEFAULTS = COSMOS3_GENERATION_DEFAULTS[("qwen3", "video")]
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import DISTILLED_GUIDANCE_SCALE
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     BILATERAL_D,
     BILATERAL_SIGMA_COLOR,
@@ -48,7 +45,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     resolve_transfer_config,
     uint8_cthw_to_normalized_5d,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import DISTILLED_GUIDANCE_SCALE
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     QWEN3_RECIPE,
     TransformerOutput,
@@ -58,6 +54,10 @@ from tensorrt_llm.media.decoding import VideoStreamInfo
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
+
+# What a plain Cosmos3 video request advertises, and so what the executor
+# merges into every request before infer() sees it.
+_ADVERTISED_VIDEO_DEFAULTS = COSMOS3_GENERATION_DEFAULTS[("qwen3", "video")]
 
 
 def _ids(value: int) -> torch.Tensor:
